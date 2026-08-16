@@ -1,0 +1,742 @@
+/*
+ * Order-statistic piece tree: original mmap (or borrowed buffer) + add
+ * buffer, pieces in a red-black tree weighted by byte length and '\n' count.
+ *
+ * Offset and line lookup are O(log pieces). The original bytes never move.
+ * Edits append to the add buffer and split/insert tree nodes.
+ */
+#ifndef RTX_PIECE_TREE_H
+#define RTX_PIECE_TREE_H
+
+#include <ccc/std/prelude.cch>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define RTX_RB_RED 1
+#define RTX_RB_BLACK 0
+
+typedef enum {
+    RTX_BUF_ORIGINAL = 0,
+    RTX_BUF_ADD = 1,
+} RtxBufKind;
+
+typedef struct {
+    RtxBufKind buf;
+    size_t start;
+    size_t len;
+    uint32_t lf_count;
+} RtxPiece;
+
+typedef struct RtxNode RtxNode;
+typedef struct RtxPieceTree RtxPieceTree;
+
+struct RtxNode {
+    RtxPiece piece;
+    struct RtxNode *left;
+    struct RtxNode *right;
+    struct RtxNode *parent;
+    uint8_t color;
+    size_t subtree_len;
+    uint32_t subtree_lf;
+};
+
+struct RtxPieceTree {
+    struct RtxNode *root;
+    struct RtxNode *free_list;
+    CCArena arena_storage;
+    CCArena *arena;
+    CCSlice original;
+    void *map_ptr;
+    size_t map_len;
+    int map_owned;
+    char *add;
+    size_t add_len;
+    size_t add_cap;
+};
+
+static uint32_t rtx_count_lf(const char *p, size_t n) {
+    uint32_t c = 0;
+    size_t i;
+    if (!p) return 0;
+    for (i = 0; i < n; i++) {
+        if (p[i] == '\n') c++;
+    }
+    return c;
+}
+
+static const char *rtx_piece_ptr(const RtxPieceTree *t, const RtxPiece *p) {
+    if (!t || !p || p->len == 0) return "";
+    if (p->buf == RTX_BUF_ORIGINAL) {
+        return (const char *)t->original.ptr + p->start;
+    }
+    return t->add + p->start;
+}
+
+static void rtx_node_pull(RtxNode *n) {
+    size_t len;
+    uint32_t lf;
+    if (!n) return;
+    len = n->piece.len;
+    lf = n->piece.lf_count;
+    if (n->left) {
+        len += n->left->subtree_len;
+        lf += n->left->subtree_lf;
+    }
+    if (n->right) {
+        len += n->right->subtree_len;
+        lf += n->right->subtree_lf;
+    }
+    n->subtree_len = len;
+    n->subtree_lf = lf;
+}
+
+static void rtx_node_pull_up(RtxNode *n) {
+    while (n) {
+        rtx_node_pull(n);
+        n = n->parent;
+    }
+}
+
+static RtxNode *rtx_node_alloc(RtxPieceTree *t) {
+    RtxNode *n;
+    if (!t || !t->arena) return NULL;
+    if (t->free_list) {
+        n = t->free_list;
+        t->free_list = n->right;
+        memset(n, 0, sizeof(*n));
+        return n;
+    }
+    n = (RtxNode *)cc_arena_alloc(t->arena, sizeof(RtxNode), _Alignof(RtxNode));
+    if (n) memset(n, 0, sizeof(*n));
+    return n;
+}
+
+static void rtx_node_recycle(RtxPieceTree *t, RtxNode *n) {
+    if (!t || !n) return;
+    memset(n, 0, sizeof(*n));
+    n->right = t->free_list;
+    t->free_list = n;
+}
+
+static RtxNode *rtx_node_new_piece(RtxPieceTree *t, RtxBufKind buf, size_t start, size_t len) {
+    RtxNode *n = rtx_node_alloc(t);
+    RtxPiece piece;
+    if (!n) return NULL;
+    piece.buf = buf;
+    piece.start = start;
+    piece.len = len;
+    piece.lf_count = 0;
+    n->piece = piece;
+    n->piece.lf_count = rtx_count_lf(rtx_piece_ptr(t, &n->piece), len);
+    n->color = RTX_RB_RED;
+    n->subtree_len = len;
+    n->subtree_lf = n->piece.lf_count;
+    return n;
+}
+
+static void rtx_rotate_left(RtxPieceTree *t, RtxNode *x) {
+    RtxNode *y;
+    if (!t || !x || !x->right) return;
+    y = x->right;
+    x->right = y->left;
+    if (y->left) y->left->parent = x;
+    y->parent = x->parent;
+    if (!x->parent) t->root = y;
+    else if (x == x->parent->left) x->parent->left = y;
+    else x->parent->right = y;
+    y->left = x;
+    x->parent = y;
+    rtx_node_pull(x);
+    rtx_node_pull(y);
+}
+
+static void rtx_rotate_right(RtxPieceTree *t, RtxNode *x) {
+    RtxNode *y;
+    if (!t || !x || !x->left) return;
+    y = x->left;
+    x->left = y->right;
+    if (y->right) y->right->parent = x;
+    y->parent = x->parent;
+    if (!x->parent) t->root = y;
+    else if (x == x->parent->right) x->parent->right = y;
+    else x->parent->left = y;
+    y->right = x;
+    x->parent = y;
+    rtx_node_pull(x);
+    rtx_node_pull(y);
+}
+
+static void rtx_insert_fixup(RtxPieceTree *t, RtxNode *z) {
+    while (z->parent && z->parent->color == RTX_RB_RED) {
+        RtxNode *gp = z->parent->parent;
+        if (!gp) break;
+        if (z->parent == gp->left) {
+            RtxNode *y = gp->right;
+            if (y && y->color == RTX_RB_RED) {
+                z->parent->color = RTX_RB_BLACK;
+                y->color = RTX_RB_BLACK;
+                gp->color = RTX_RB_RED;
+                z = gp;
+            } else {
+                if (z == z->parent->right) {
+                    z = z->parent;
+                    rtx_rotate_left(t, z);
+                }
+                if (z->parent) z->parent->color = RTX_RB_BLACK;
+                if (z->parent && z->parent->parent) {
+                    z->parent->parent->color = RTX_RB_RED;
+                    rtx_rotate_right(t, z->parent->parent);
+                }
+            }
+        } else {
+            RtxNode *y = gp->left;
+            if (y && y->color == RTX_RB_RED) {
+                z->parent->color = RTX_RB_BLACK;
+                y->color = RTX_RB_BLACK;
+                gp->color = RTX_RB_RED;
+                z = gp;
+            } else {
+                if (z == z->parent->left) {
+                    z = z->parent;
+                    rtx_rotate_right(t, z);
+                }
+                if (z->parent) z->parent->color = RTX_RB_BLACK;
+                if (z->parent && z->parent->parent) {
+                    z->parent->parent->color = RTX_RB_RED;
+                    rtx_rotate_left(t, z->parent->parent);
+                }
+            }
+        }
+    }
+    if (t->root) t->root->color = RTX_RB_BLACK;
+}
+
+static void rtx_bst_insert(RtxPieceTree *t, RtxNode *z, size_t offset) {
+    RtxNode *parent = NULL;
+    RtxNode *cur = t->root;
+    size_t remaining = offset;
+    int go_left = 0;
+    while (cur) {
+        size_t left_len = cur->left ? cur->left->subtree_len : 0;
+        parent = cur;
+        if (remaining <= left_len) {
+            go_left = 1;
+            cur = cur->left;
+        } else {
+            remaining -= left_len + cur->piece.len;
+            go_left = 0;
+            cur = cur->right;
+        }
+    }
+    z->parent = parent;
+    if (!parent) t->root = z;
+    else if (go_left) parent->left = z;
+    else parent->right = z;
+    rtx_node_pull_up(z);
+    rtx_insert_fixup(t, z);
+}
+
+static RtxNode *rtx_tree_minimum(RtxNode *n) {
+    while (n && n->left) n = n->left;
+    return n;
+}
+
+static void rtx_transplant(RtxPieceTree *t, RtxNode *u, RtxNode *v) {
+    if (!u->parent) t->root = v;
+    else if (u == u->parent->left) u->parent->left = v;
+    else u->parent->right = v;
+    if (v) v->parent = u->parent;
+}
+
+static void rtx_delete_fixup(RtxPieceTree *t, RtxNode *x, RtxNode *xp) {
+    while (x != t->root && (!x || x->color == RTX_RB_BLACK)) {
+        if (x == (xp ? xp->left : NULL)) {
+            RtxNode *w = xp ? xp->right : NULL;
+            if (w && w->color == RTX_RB_RED) {
+                w->color = RTX_RB_BLACK;
+                xp->color = RTX_RB_RED;
+                rtx_rotate_left(t, xp);
+                w = xp->right;
+            }
+            if (w && (!w->left || w->left->color == RTX_RB_BLACK) &&
+                (!w->right || w->right->color == RTX_RB_BLACK)) {
+                if (w) w->color = RTX_RB_RED;
+                x = xp;
+                xp = x ? x->parent : NULL;
+            } else {
+                if (w && (!w->right || w->right->color == RTX_RB_BLACK)) {
+                    if (w->left) w->left->color = RTX_RB_BLACK;
+                    w->color = RTX_RB_RED;
+                    rtx_rotate_right(t, w);
+                    w = xp ? xp->right : NULL;
+                }
+                if (w) w->color = xp ? xp->color : RTX_RB_BLACK;
+                if (xp) xp->color = RTX_RB_BLACK;
+                if (w && w->right) w->right->color = RTX_RB_BLACK;
+                if (xp) rtx_rotate_left(t, xp);
+                x = t->root;
+                xp = NULL;
+            }
+        } else {
+            RtxNode *w = xp ? xp->left : NULL;
+            if (w && w->color == RTX_RB_RED) {
+                w->color = RTX_RB_BLACK;
+                xp->color = RTX_RB_RED;
+                rtx_rotate_right(t, xp);
+                w = xp->left;
+            }
+            if (w && (!w->right || w->right->color == RTX_RB_BLACK) &&
+                (!w->left || w->left->color == RTX_RB_BLACK)) {
+                if (w) w->color = RTX_RB_RED;
+                x = xp;
+                xp = x ? x->parent : NULL;
+            } else {
+                if (w && (!w->left || w->left->color == RTX_RB_BLACK)) {
+                    if (w->right) w->right->color = RTX_RB_BLACK;
+                    w->color = RTX_RB_RED;
+                    rtx_rotate_left(t, w);
+                    w = xp ? xp->left : NULL;
+                }
+                if (w) w->color = xp ? xp->color : RTX_RB_BLACK;
+                if (xp) xp->color = RTX_RB_BLACK;
+                if (w && w->left) w->left->color = RTX_RB_BLACK;
+                if (xp) rtx_rotate_right(t, xp);
+                x = t->root;
+                xp = NULL;
+            }
+        }
+    }
+    if (x) x->color = RTX_RB_BLACK;
+}
+
+static void rtx_rb_delete(RtxPieceTree *t, RtxNode *z) {
+    RtxNode *y = z;
+    RtxNode *x = NULL;
+    RtxNode *xp = NULL;
+    uint8_t y_color = z->color;
+    if (!z->left) {
+        x = z->right;
+        xp = z->parent;
+        rtx_transplant(t, z, z->right);
+        if (xp) rtx_node_pull_up(xp);
+    } else if (!z->right) {
+        x = z->left;
+        xp = z->parent;
+        rtx_transplant(t, z, z->left);
+        if (xp) rtx_node_pull_up(xp);
+    } else {
+        y = rtx_tree_minimum(z->right);
+        y_color = y->color;
+        x = y->right;
+        if (y->parent == z) {
+            xp = y;
+            if (x) x->parent = y;
+        } else {
+            xp = y->parent;
+            rtx_transplant(t, y, y->right);
+            y->right = z->right;
+            if (y->right) y->right->parent = y;
+        }
+        rtx_transplant(t, z, y);
+        y->left = z->left;
+        if (y->left) y->left->parent = y;
+        y->color = z->color;
+        rtx_node_pull(y);
+        rtx_node_pull_up(y->parent);
+        if (xp && xp != y) rtx_node_pull_up(xp);
+    }
+    rtx_node_recycle(t, z);
+    if (y_color == RTX_RB_BLACK) rtx_delete_fixup(t, x, xp);
+    if (t->root) t->root->color = RTX_RB_BLACK;
+}
+
+/* Node containing offset, and local byte offset inside that piece.
+ * offset == len is not in any node (append). */
+static RtxNode *rtx_find_node(const RtxPieceTree *t, size_t offset, size_t *local_out) {
+    RtxNode *cur;
+    size_t remaining;
+    if (!t || !t->root) return NULL;
+    if (offset >= t->root->subtree_len) return NULL;
+    cur = t->root;
+    remaining = offset;
+    while (cur) {
+        size_t left_len = cur->left ? cur->left->subtree_len : 0;
+        if (remaining < left_len) {
+            cur = cur->left;
+        } else if (remaining < left_len + cur->piece.len) {
+            if (local_out) *local_out = remaining - left_len;
+            return cur;
+        } else {
+            remaining -= left_len + cur->piece.len;
+            cur = cur->right;
+        }
+    }
+    return NULL;
+}
+
+static int rtx_add_append(RtxPieceTree *t, CCSlice bytes, size_t *start_out) {
+    size_t need;
+    char *grown;
+    if (!t || !start_out) return 0;
+    if (bytes.len == 0) {
+        *start_out = t->add_len;
+        return 1;
+    }
+    need = t->add_len + bytes.len;
+    if (need < t->add_len) return 0;
+    if (need > t->add_cap) {
+        size_t cap = t->add_cap ? t->add_cap : 4096;
+        while (cap < need) {
+            size_t next = cap * 2;
+            if (next < cap) return 0;
+            cap = next;
+        }
+        grown = (char *)realloc(t->add, cap);
+        if (!grown) return 0;
+        t->add = grown;
+        t->add_cap = cap;
+    }
+    if (bytes.ptr && bytes.len) memcpy(t->add + t->add_len, bytes.ptr, bytes.len);
+    *start_out = t->add_len;
+    t->add_len += bytes.len;
+    return 1;
+}
+
+static void rtx_tree_zero(RtxPieceTree *t) {
+    if (!t) return;
+    memset(t, 0, sizeof(*t));
+}
+
+static int rtx_tree_init_arena(RtxPieceTree *t) {
+    t->arena_storage = cc_arena_heap(kilobytes(64));
+    if (!t->arena_storage.base) return 0;
+    t->arena = &t->arena_storage;
+    return 1;
+}
+
+static void rtx_tree_seed_original(RtxPieceTree *t) {
+    RtxNode *n;
+    if (!t->original.len) return;
+    n = rtx_node_new_piece(t, RTX_BUF_ORIGINAL, 0, t->original.len);
+    if (!n) return;
+    n->color = RTX_RB_BLACK;
+    t->root = n;
+}
+
+static inline size_t rtx_piece_tree_len(const RtxPieceTree *t) {
+    if (!t || !t->root) return 0;
+    return t->root->subtree_len;
+}
+
+static inline size_t rtx_piece_tree_line_count(const RtxPieceTree *t) {
+    uint32_t lf = (t && t->root) ? t->root->subtree_lf : 0;
+    return (size_t)lf + 1;
+}
+
+static inline void rtx_piece_tree_destroy(RtxPieceTree *t) {
+    if (!t) return;
+    if (t->map_owned && t->map_ptr && t->map_len) {
+        munmap(t->map_ptr, t->map_len);
+    }
+    free(t->add);
+    if (t->arena && t->arena->base) {
+        /* cc_arena_destroy is the @destroy target for heap arenas. */
+        cc_arena_destroy(&t->arena_storage);
+    }
+    rtx_tree_zero(t);
+}
+
+static inline void !>(CCError) rtx_piece_tree_empty(RtxPieceTree *t) {
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
+    rtx_tree_zero(t);
+    if (!rtx_tree_init_arena(t)) {
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "piece tree arena");
+    }
+    return cc_ok();
+}
+
+static inline void !>(CCError) rtx_piece_tree_from_buffer(RtxPieceTree *t, CCSlice bytes) {
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
+    rtx_tree_zero(t);
+    if (!rtx_tree_init_arena(t)) {
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "piece tree arena");
+    }
+    t->original = cc_slice_from_buffer(bytes.ptr, bytes.len);
+    rtx_tree_seed_original(t);
+    return cc_ok();
+}
+
+static inline void !>(CCError) rtx_piece_tree_open(RtxPieceTree *t, const char *path) {
+    int fd;
+    struct stat st;
+    void *map;
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
+    rtx_tree_zero(t);
+    if (!path || !path[0]) return cc_err(CC_ERR_INVALID_ARG, "empty path");
+    if (!rtx_tree_init_arena(t)) {
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "piece tree arena");
+    }
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        rtx_piece_tree_destroy(t);
+        return cc_err(CC_ERR_IO, "open");
+    }
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        rtx_piece_tree_destroy(t);
+        return cc_err(CC_ERR_IO, "fstat");
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        rtx_piece_tree_destroy(t);
+        return cc_err(CC_ERR_INVALID_ARG, "not a regular file");
+    }
+    if (st.st_size == 0) {
+        close(fd);
+        return cc_ok();
+    }
+    map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) {
+        rtx_piece_tree_destroy(t);
+        return cc_err(CC_ERR_IO, "mmap");
+    }
+    t->map_ptr = map;
+    t->map_len = (size_t)st.st_size;
+    t->map_owned = 1;
+    t->original = cc_slice_from_buffer(map, t->map_len);
+    rtx_tree_seed_original(t);
+    return cc_ok();
+}
+
+/* Split the piece containing `offset` so a node begins at `offset`.
+ * offset == len is a no-op. */
+static int rtx_split_at(RtxPieceTree *t, size_t offset) {
+    size_t local = 0;
+    RtxNode *n;
+    RtxNode *right;
+    size_t right_len;
+    if (!t) return 0;
+    if (offset == 0 || offset == rtx_piece_tree_len(t)) return 1;
+    n = rtx_find_node(t, offset, &local);
+    if (!n) return 0;
+    if (local == 0) return 1;
+    right_len = n->piece.len - local;
+    n->piece.len = local;
+    n->piece.lf_count = rtx_count_lf(rtx_piece_ptr(t, &n->piece), n->piece.len);
+    rtx_node_pull_up(n);
+    right = rtx_node_new_piece(t, n->piece.buf, n->piece.start + local, right_len);
+    if (!right) return 0;
+    rtx_bst_insert(t, right, offset);
+    return 1;
+}
+
+static int rtx_try_extend_add(RtxPieceTree *t, size_t offset, CCSlice bytes) {
+    size_t local = 0;
+    RtxNode *n;
+    if (!t || bytes.len == 0 || offset == 0) return 0;
+    n = rtx_find_node(t, offset - 1, &local);
+    if (!n) return 0;
+    if (n->piece.buf != RTX_BUF_ADD) return 0;
+    if (n->piece.start + n->piece.len != t->add_len) return 0;
+    if (local + 1 != n->piece.len) return 0;
+    {
+        size_t start = 0;
+        if (!rtx_add_append(t, bytes, &start)) return 0;
+        (void)start;
+        n->piece.len += bytes.len;
+        n->piece.lf_count = rtx_count_lf(rtx_piece_ptr(t, &n->piece), n->piece.len);
+        rtx_node_pull_up(n);
+        return 1;
+    }
+}
+
+static inline void !>(CCError) rtx_piece_tree_insert(RtxPieceTree *t, size_t offset, CCSlice bytes) {
+    size_t start = 0;
+    RtxNode *n;
+    size_t len;
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
+    len = rtx_piece_tree_len(t);
+    if (offset > len) return cc_err(CC_ERR_INVALID_ARG, "insert past end");
+    if (bytes.len == 0) return cc_ok();
+    if (rtx_try_extend_add(t, offset, bytes)) return cc_ok();
+    if (!rtx_split_at(t, offset)) return cc_err(CC_ERR_INTERNAL, "split");
+    if (!rtx_add_append(t, bytes, &start)) {
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "add buffer");
+    }
+    n = rtx_node_new_piece(t, RTX_BUF_ADD, start, bytes.len);
+    if (!n) return cc_err(CC_ERR_OUT_OF_MEMORY, "piece node");
+    rtx_bst_insert(t, n, offset);
+    return cc_ok();
+}
+
+static inline void !>(CCError) rtx_piece_tree_erase(RtxPieceTree *t, size_t offset, size_t n) {
+    size_t len;
+    size_t end;
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
+    len = rtx_piece_tree_len(t);
+    if (offset > len || n > len - offset) {
+        return cc_err(CC_ERR_INVALID_ARG, "erase out of range");
+    }
+    if (n == 0) return cc_ok();
+    end = offset + n;
+    if (!rtx_split_at(t, offset) || !rtx_split_at(t, end)) {
+        return cc_err(CC_ERR_INTERNAL, "split");
+    }
+    while (n > 0) {
+        size_t local = 0;
+        RtxNode *node = rtx_find_node(t, offset, &local);
+        size_t piece_len;
+        if (!node || local != 0) return cc_err(CC_ERR_INTERNAL, "erase walk");
+        piece_len = node->piece.len;
+        if (piece_len > n) return cc_err(CC_ERR_INTERNAL, "erase piece");
+        rtx_rb_delete(t, node);
+        n -= piece_len;
+    }
+    return cc_ok();
+}
+
+static inline size_t rtx_piece_tree_read(const RtxPieceTree *t, size_t offset, char *dest, size_t n) {
+    size_t got = 0;
+    size_t len;
+    if (!t || !dest || n == 0) return 0;
+    len = rtx_piece_tree_len(t);
+    if (offset >= len) return 0;
+    if (n > len - offset) n = len - offset;
+    while (got < n) {
+        size_t local = 0;
+        RtxNode *node = rtx_find_node(t, offset + got, &local);
+        size_t take;
+        if (!node) break;
+        take = node->piece.len - local;
+        if (take > n - got) take = n - got;
+        memcpy(dest + got, rtx_piece_ptr(t, &node->piece) + local, take);
+        got += take;
+    }
+    return got;
+}
+
+static inline size_t rtx_piece_tree_line_start(const RtxPieceTree *t, size_t line) {
+    RtxNode *cur;
+    size_t skipped_lf = 0;
+    size_t offset = 0;
+    if (!t || !t->root || line == 0) return 0;
+    if (line >= rtx_piece_tree_line_count(t)) return rtx_piece_tree_len(t);
+    cur = t->root;
+    while (cur) {
+        size_t left_lf = cur->left ? cur->left->subtree_lf : 0;
+        size_t left_len = cur->left ? cur->left->subtree_len : 0;
+        if (skipped_lf + left_lf >= line) {
+            cur = cur->left;
+        } else if (skipped_lf + left_lf + cur->piece.lf_count >= line) {
+            size_t want = line - skipped_lf - left_lf;
+            const char *p = rtx_piece_ptr(t, &cur->piece);
+            size_t i;
+            uint32_t seen = 0;
+            for (i = 0; i < cur->piece.len; i++) {
+                if (p[i] == '\n') {
+                    seen++;
+                    if (seen == want) return offset + left_len + i + 1;
+                }
+            }
+            return offset + left_len + cur->piece.len;
+        } else {
+            skipped_lf += left_lf + cur->piece.lf_count;
+            offset += left_len + cur->piece.len;
+            cur = cur->right;
+        }
+    }
+    return offset;
+}
+
+static inline size_t rtx_piece_tree_line_of(const RtxPieceTree *t, size_t offset) {
+    RtxNode *cur;
+    size_t remaining;
+    size_t line = 0;
+    size_t len;
+    if (!t || !t->root) return 0;
+    len = rtx_piece_tree_len(t);
+    if (offset > len) offset = len;
+    if (offset == len) {
+        if (len == 0) return 0;
+        return (size_t)t->root->subtree_lf;
+    }
+    cur = t->root;
+    remaining = offset;
+    while (cur) {
+        size_t left_len = cur->left ? cur->left->subtree_len : 0;
+        size_t left_lf = cur->left ? cur->left->subtree_lf : 0;
+        if (remaining < left_len) {
+            cur = cur->left;
+        } else if (remaining < left_len + cur->piece.len) {
+            size_t local = remaining - left_len;
+            line += left_lf;
+            line += rtx_count_lf(rtx_piece_ptr(t, &cur->piece), local);
+            return line;
+        } else {
+            line += left_lf + cur->piece.lf_count;
+            remaining -= left_len + cur->piece.len;
+            cur = cur->right;
+        }
+    }
+    return line;
+}
+
+static int rtx_check_node(const RtxPieceTree *t, const RtxNode *n, const RtxNode *parent,
+                          int *black_height, int *err) {
+    int lh = 0;
+    int rh = 0;
+    size_t expect_len;
+    uint32_t expect_lf;
+    if (*err) return 0;
+    if (!n) {
+        *black_height = 1;
+        return 1;
+    }
+    if (n->parent != parent) {
+        *err = 1;
+        return 0;
+    }
+    if (n->color == RTX_RB_RED) {
+        if ((n->left && n->left->color == RTX_RB_RED) ||
+            (n->right && n->right->color == RTX_RB_RED)) {
+            *err = 2;
+            return 0;
+        }
+    }
+    if (n->piece.lf_count != rtx_count_lf(rtx_piece_ptr(t, &n->piece), n->piece.len)) {
+        *err = 3;
+        return 0;
+    }
+    rtx_check_node(t, n->left, n, &lh, err);
+    rtx_check_node(t, n->right, n, &rh, err);
+    if (*err) return 0;
+    if (lh != rh) {
+        *err = 4;
+        return 0;
+    }
+    expect_len = n->piece.len + (n->left ? n->left->subtree_len : 0) +
+                 (n->right ? n->right->subtree_len : 0);
+    expect_lf = n->piece.lf_count + (n->left ? n->left->subtree_lf : 0) +
+                (n->right ? n->right->subtree_lf : 0);
+    if (n->subtree_len != expect_len || n->subtree_lf != expect_lf) {
+        *err = 5;
+        return 0;
+    }
+    *black_height = lh + (n->color == RTX_RB_BLACK ? 1 : 0);
+    return 1;
+}
+
+static inline int rtx_piece_tree_check(const RtxPieceTree *t) {
+    int bh = 0;
+    int err = 0;
+    if (!t) return 0;
+    if (t->root && t->root->color != RTX_RB_BLACK) return 0;
+    if (t->root && t->root->parent) return 0;
+    rtx_check_node(t, t->root, NULL, &bh, &err);
+    return err == 0;
+}
+
+#endif /* RTX_PIECE_TREE_H */

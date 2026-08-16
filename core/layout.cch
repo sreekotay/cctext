@@ -1,0 +1,151 @@
+/*
+ * Measure-generic wrap + hit-test. Width and height are abstract units
+ * (pixels or cells). The frontend supplies measure/line_height.
+ */
+#ifndef RTX_LAYOUT_H
+#define RTX_LAYOUT_H
+
+#include "document.cch"
+
+typedef struct {
+    double (*measure)(void *ctx, CCSlice bytes, RtxStyle style);
+    double (*line_height)(void *ctx, RtxStyle style, RtxSectionKind sec);
+    void *ctx;
+} RtxMeasure;
+
+typedef struct {
+    size_t byte_start;
+    size_t byte_len;
+    double width;
+    double height;
+    RtxSectionKind sec;
+} RtxVisRow;
+
+typedef struct {
+    RtxVisRow *rows;
+    size_t len;
+    size_t cap;
+    double total_height;
+} RtxLayout;
+
+static void rtx_layout_destroy(RtxLayout *L) {
+    if (!L) return;
+    free(L->rows);
+    memset(L, 0, sizeof(*L));
+}
+
+static int rtx_layout_push(RtxLayout *L, RtxVisRow row) {
+    if (!rtx_doc_grow((void **)&L->rows, &L->cap, L->len + 1, sizeof(RtxVisRow))) {
+        return 0;
+    }
+    L->rows[L->len++] = row;
+    L->total_height += row.height;
+    return 1;
+}
+
+static RtxStyle rtx_style_at(const RtxDoc *d, size_t off) {
+    RtxStyle z = {0};
+    size_t i;
+    if (!d) return z;
+    for (i = 0; i < d->run_len; i++) {
+        if (off >= d->runs[i].start && off < d->runs[i].start + d->runs[i].len) {
+            if (d->runs[i].style.bold) z.bold = 1;
+            if (d->runs[i].style.italic) z.italic = 1;
+            if (d->runs[i].style.mono) z.mono = 1;
+            if (d->runs[i].style.hl != RTX_HL_NONE) z.hl = d->runs[i].style.hl;
+        }
+    }
+    return z;
+}
+
+/* Wrap [from, from+n) at max_width. One visual row per physical line in
+ * code sections (no wrap) unless max_width is used for prose. */
+static int rtx_layout_range(RtxLayout *L, const RtxDoc *d, const RtxMeasure *m,
+                            size_t from, size_t n, double max_width) {
+    size_t end;
+    size_t i;
+    char *buf;
+    if (!L || !d || !m || !m->measure || !m->line_height) return 0;
+    end = from + n;
+    if (end > rtx_piece_tree_len(&d->tree)) end = rtx_piece_tree_len(&d->tree);
+    if (from >= end) return 1;
+    n = end - from;
+    buf = (char *)malloc(n);
+    if (!buf) return 0;
+    rtx_piece_tree_read(&d->tree, from, buf, n);
+
+    i = 0;
+    while (i < n) {
+        RtxSectionKind sec = rtx_doc_section_at(d, from + i);
+        size_t row_start = i;
+        double w = 0;
+        double h = 0;
+        while (i < n && buf[i] != '\n') {
+            RtxStyle st = rtx_style_at(d, from + i);
+            CCSlice one = cc_slice_from_buffer(buf + i, 1);
+            double gw = m->measure(m->ctx, one, st);
+            double gh = m->line_height(m->ctx, st, sec);
+            if (sec == RTX_SEC_PROSE && max_width > 0 && w > 0 && w + gw > max_width) {
+                break;
+            }
+            w += gw;
+            if (gh > h) h = gh;
+            i++;
+        }
+        {
+            RtxVisRow row;
+            row.byte_start = from + row_start;
+            row.byte_len = i - row_start;
+            row.width = w;
+            row.height = h > 0 ? h : m->line_height(m->ctx, rtx_style_at(d, from + row_start), sec);
+            row.sec = sec;
+            if (!rtx_layout_push(L, row)) {
+                free(buf);
+                return 0;
+            }
+        }
+        if (i < n && buf[i] == '\n') i++;
+    }
+    free(buf);
+    return 1;
+}
+
+static int rtx_layout_doc(RtxLayout *L, const RtxDoc *d, const RtxMeasure *m, double max_width) {
+    if (!L) return 0;
+    rtx_layout_destroy(L);
+    return rtx_layout_range(L, d, m, 0, rtx_piece_tree_len(&d->tree), max_width);
+}
+
+/* Hit-test: y is in measure units from the top of L. Returns byte offset. */
+static size_t rtx_layout_hit(const RtxLayout *L, const RtxDoc *d, const RtxMeasure *m,
+                             double x, double y) {
+    size_t i;
+    double acc = 0;
+    if (!L || !d || !m || L->len == 0) return 0;
+    for (i = 0; i < L->len; i++) {
+        RtxVisRow *r = &L->rows[i];
+        if (y < acc + r->height || i + 1 == L->len) {
+            size_t k;
+            double cx = 0;
+            char *buf = (char *)malloc(r->byte_len ? r->byte_len : 1);
+            if (!buf) return r->byte_start;
+            rtx_piece_tree_read(&d->tree, r->byte_start, buf, r->byte_len);
+            for (k = 0; k < r->byte_len; k++) {
+                RtxStyle st = rtx_style_at(d, r->byte_start + k);
+                CCSlice one = cc_slice_from_buffer(buf + k, 1);
+                double gw = m->measure(m->ctx, one, st);
+                if (cx + gw / 2.0 >= x) {
+                    free(buf);
+                    return r->byte_start + k;
+                }
+                cx += gw;
+            }
+            free(buf);
+            return r->byte_start + r->byte_len;
+        }
+        acc += r->height;
+    }
+    return rtx_piece_tree_len(&d->tree);
+}
+
+#endif /* RTX_LAYOUT_H */

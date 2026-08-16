@@ -1,0 +1,272 @@
+/*
+ * Document: piece tree + section policy + style runs + caret.
+ * Intervals are byte offsets. Insert/erase shift them.
+ */
+#ifndef RTX_DOCUMENT_H
+#define RTX_DOCUMENT_H
+
+#include "piece_tree.cch"
+
+typedef enum {
+    RTX_SEC_CODE = 0,
+    RTX_SEC_PROSE = 1,
+} RtxSectionKind;
+
+typedef struct {
+    size_t start;
+    RtxSectionKind kind;
+} RtxSection;
+
+typedef enum {
+    RTX_HL_NONE = 0,
+    RTX_HL_KEYWORD,
+    RTX_HL_STRING,
+    RTX_HL_COMMENT,
+    RTX_HL_NUMBER,
+    RTX_HL_PUNCT,
+} RtxHlKind;
+
+typedef struct {
+    unsigned bold : 1;
+    unsigned italic : 1;
+    unsigned mono : 1;
+    RtxHlKind hl;
+} RtxStyle;
+
+typedef struct {
+    size_t start;
+    size_t len;
+    RtxStyle style;
+} RtxRun;
+
+typedef struct {
+    RtxPieceTree tree;
+    RtxSection *secs;
+    size_t sec_len;
+    size_t sec_cap;
+    RtxRun *runs;
+    size_t run_len;
+    size_t run_cap;
+    size_t caret;
+} RtxDoc;
+
+static int rtx_doc_grow(void **p, size_t *cap, size_t need, size_t elem) {
+    void *n;
+    size_t c;
+    if (need <= *cap) return 1;
+    c = *cap ? *cap : 8;
+    while (c < need) {
+        size_t next = c * 2;
+        if (next < c) return 0;
+        c = next;
+    }
+    n = realloc(*p, c * elem);
+    if (!n) return 0;
+    *p = n;
+    *cap = c;
+    return 1;
+}
+
+static void rtx_doc_destroy(RtxDoc *d) {
+    if (!d) return;
+    rtx_piece_tree_destroy(&d->tree);
+    free(d->secs);
+    free(d->runs);
+    memset(d, 0, sizeof(*d));
+}
+
+static void !>(CCError) rtx_doc_empty(RtxDoc *d) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    memset(d, 0, sizeof(*d));
+    rtx_piece_tree_empty(&d->tree) !>(e) return cc_err(e);
+    if (!rtx_doc_grow((void **)&d->secs, &d->sec_cap, 1, sizeof(RtxSection))) {
+        rtx_doc_destroy(d);
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "sections");
+    }
+    d->secs[0].start = 0;
+    d->secs[0].kind = RTX_SEC_PROSE;
+    d->sec_len = 1;
+    return cc_ok();
+}
+
+static RtxSectionKind rtx_doc_section_at(const RtxDoc *d, size_t off) {
+    size_t i;
+    RtxSectionKind k = RTX_SEC_PROSE;
+    if (!d) return k;
+    for (i = 0; i < d->sec_len; i++) {
+        if (d->secs[i].start <= off) k = d->secs[i].kind;
+        else break;
+    }
+    return k;
+}
+
+static void rtx_doc_shift_intervals(RtxDoc *d, size_t at, long delta) {
+    size_t i;
+    if (!d || delta == 0) return;
+    for (i = 0; i < d->sec_len; i++) {
+        if (d->secs[i].start > at) {
+            if (delta < 0 && d->secs[i].start < at + (size_t)(-delta)) d->secs[i].start = at;
+            else d->secs[i].start = (size_t)((long)d->secs[i].start + delta);
+        }
+    }
+    for (i = 0; i < d->run_len; i++) {
+        size_t end = d->runs[i].start + d->runs[i].len;
+        if (end <= at) continue;
+        if (d->runs[i].start >= at) {
+            if (delta < 0 && d->runs[i].start < at + (size_t)(-delta)) {
+                size_t cut = at + (size_t)(-delta) - d->runs[i].start;
+                if (cut >= d->runs[i].len) {
+                    d->runs[i].len = 0;
+                    continue;
+                }
+                d->runs[i].start = at;
+                d->runs[i].len -= cut;
+            } else {
+                d->runs[i].start = (size_t)((long)d->runs[i].start + delta);
+            }
+        } else {
+            /* run straddles the edit point */
+            if (delta > 0) d->runs[i].len += (size_t)delta;
+            else {
+                size_t cut = (size_t)(-delta);
+                if (d->runs[i].len > (end - at)) {
+                    /* shrink the tail that sat in the erased range */
+                    size_t tail = end - at;
+                    size_t drop = cut < tail ? cut : tail;
+                    d->runs[i].len -= drop;
+                }
+            }
+        }
+    }
+}
+
+static void !>(CCError) rtx_doc_insert(RtxDoc *d, size_t off, CCSlice bytes) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    rtx_piece_tree_insert(&d->tree, off, bytes) !>(e) return cc_err(e);
+    rtx_doc_shift_intervals(d, off, (long)bytes.len);
+    d->caret = off + bytes.len;
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_doc_erase(RtxDoc *d, size_t off, size_t n) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    rtx_piece_tree_erase(&d->tree, off, n) !>(e) return cc_err(e);
+    rtx_doc_shift_intervals(d, off, -(long)n);
+    d->caret = off;
+    return cc_ok();
+}
+
+static int rtx_doc_add_section(RtxDoc *d, size_t start, RtxSectionKind kind) {
+    if (!rtx_doc_grow((void **)&d->secs, &d->sec_cap, d->sec_len + 1, sizeof(RtxSection))) {
+        return 0;
+    }
+    d->secs[d->sec_len].start = start;
+    d->secs[d->sec_len].kind = kind;
+    d->sec_len++;
+    return 1;
+}
+
+static int rtx_doc_add_run(RtxDoc *d, size_t start, size_t len, RtxStyle style) {
+    if (!rtx_doc_grow((void **)&d->runs, &d->run_cap, d->run_len + 1, sizeof(RtxRun))) {
+        return 0;
+    }
+    d->runs[d->run_len].start = start;
+    d->runs[d->run_len].len = len;
+    d->runs[d->run_len].style = style;
+    d->run_len++;
+    return 1;
+}
+
+static int rtx_path_looks_code(const char *path) {
+    const char *dot;
+    if (!path) return 0;
+    dot = strrchr(path, '.');
+    if (!dot) return 0;
+    return strcmp(dot, ".c") == 0 || strcmp(dot, ".h") == 0 ||
+           strcmp(dot, ".ccs") == 0 || strcmp(dot, ".cch") == 0 ||
+           strcmp(dot, ".cc") == 0;
+}
+
+/* Scan markers in a flat copy. Spike sugar, not the stored format. */
+static void rtx_doc_scan_markup(RtxDoc *d) {
+    size_t n = rtx_piece_tree_len(&d->tree);
+    char *buf;
+    size_t i;
+    if (!d || n == 0) return;
+    buf = (char *)malloc(n + 1);
+    if (!buf) return;
+    rtx_piece_tree_read(&d->tree, 0, buf, n);
+    buf[n] = 0;
+    d->sec_len = 0;
+    d->run_len = 0;
+    rtx_doc_add_section(d, 0, RTX_SEC_PROSE);
+    for (i = 0; i + 13 <= n; i++) {
+        if (memcmp(buf + i, "=== code ===", 12) == 0 &&
+            (i == 0 || buf[i - 1] == '\n')) {
+            rtx_doc_add_section(d, i, RTX_SEC_CODE);
+        } else if (memcmp(buf + i, "=== prose ===", 13) == 0 &&
+                   (i == 0 || buf[i - 1] == '\n')) {
+            rtx_doc_add_section(d, i, RTX_SEC_PROSE);
+        }
+    }
+    for (i = 0; i < n; i++) {
+        if (buf[i] == '`') {
+            size_t j = i + 1;
+            while (j < n && buf[j] != '`' && buf[j] != '\n') j++;
+            if (j < n && buf[j] == '`' && j > i + 1) {
+                RtxStyle st = {0};
+                st.mono = 1;
+                rtx_doc_add_run(d, i + 1, j - (i + 1), st);
+                i = j;
+            }
+        } else if (buf[i] == '*') {
+            size_t j = i + 1;
+            while (j < n && buf[j] != '*' && buf[j] != '\n') j++;
+            if (j < n && buf[j] == '*' && j > i + 1) {
+                RtxStyle st = {0};
+                st.bold = 1;
+                rtx_doc_add_run(d, i + 1, j - (i + 1), st);
+                i = j;
+            }
+        }
+    }
+    free(buf);
+}
+
+static void rtx_doc_highlight(RtxDoc *d);
+#include "highlight.cch"
+
+static void !>(CCError) rtx_doc_open(RtxDoc *d, const char *path) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    memset(d, 0, sizeof(*d));
+    rtx_piece_tree_open(&d->tree, path) !>(e) return cc_err(e);
+    rtx_doc_scan_markup(d);
+    if (d->sec_len == 0) {
+        if (!rtx_doc_add_section(d, 0, RTX_SEC_PROSE)) {
+            rtx_doc_destroy(d);
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "sections");
+        }
+    }
+    if (d->sec_len == 1 && rtx_path_looks_code(path)) {
+        d->secs[0].kind = RTX_SEC_CODE;
+    }
+    rtx_doc_highlight(d);
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_doc_from_buffer(RtxDoc *d, CCSlice bytes) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    memset(d, 0, sizeof(*d));
+    rtx_piece_tree_from_buffer(&d->tree, bytes) !>(e) return cc_err(e);
+    rtx_doc_scan_markup(d);
+    if (d->sec_len == 0) {
+        if (!rtx_doc_add_section(d, 0, RTX_SEC_PROSE)) {
+            rtx_doc_destroy(d);
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "sections");
+        }
+    }
+    rtx_doc_highlight(d);
+    return cc_ok();
+}
+
+#endif /* RTX_DOCUMENT_H */

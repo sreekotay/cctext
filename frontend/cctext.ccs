@@ -1,0 +1,173 @@
+/*
+ * cctext — POSIX console frontend. Same document/layout as raytext.
+ * Syntax colors are ANSI from RtxHlKind. Prose wraps in columns.
+ *
+ *   cctext [file]
+ *   q quit  j/k or arrows scroll
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/script/stdio.cch>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+#include "../core/layout.cch"
+
+static struct termios g_old;
+static int g_raw = 0;
+
+static void cctext_restore(void) {
+    if (g_raw) tcsetattr(STDIN_FILENO, TCSANOW, &g_old);
+    fputs("\x1b[0m\x1b[?25h\x1b[?1049l", stdout);
+    fflush(stdout);
+    g_raw = 0;
+}
+
+static int cctext_raw(void) {
+    struct termios t;
+    if (tcgetattr(STDIN_FILENO, &g_old) != 0) return 0;
+    t = g_old;
+    t.c_lflag &= ~(ECHO | ICANON);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &t) != 0) return 0;
+    g_raw = 1;
+    fputs("\x1b[?1049h\x1b[?25l", stdout);
+    atexit(cctext_restore);
+    return 1;
+}
+
+static void cctext_winsize(int *rows, int *cols) {
+    struct winsize w;
+    *rows = 24;
+    *cols = 80;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_row && w.ws_col) {
+        *rows = w.ws_row;
+        *cols = w.ws_col;
+    }
+}
+
+static double cctext_measure(void *ctx, CCSlice bytes, RtxStyle style) {
+    (void)ctx;
+    (void)style;
+    return (double)bytes.len;
+}
+
+static double cctext_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+static const char *cctext_hl_ansi(RtxHlKind hl) {
+    switch (hl) {
+        case RTX_HL_KEYWORD: return "\x1b[36m";
+        case RTX_HL_STRING:  return "\x1b[32m";
+        case RTX_HL_COMMENT: return "\x1b[90m";
+        case RTX_HL_NUMBER:  return "\x1b[33m";
+        default:             return "\x1b[0m";
+    }
+}
+
+static void cctext_draw(RtxDoc *d, RtxLayout *L, size_t top, int rows, int cols) {
+    size_t r;
+    int vis = rows > 1 ? rows - 1 : 1;
+    fputs("\x1b[H\x1b[J", stdout);
+    for (r = 0; r < (size_t)vis; r++) {
+        size_t idx = top + r;
+        if (idx >= L->len) {
+            fputs("\x1b[0m~\n", stdout);
+            continue;
+        }
+        {
+            RtxVisRow *row = &L->rows[idx];
+            size_t k;
+            char *buf = (char *)malloc(row->byte_len ? row->byte_len : 1);
+            size_t col = 0;
+            if (!buf) continue;
+            rtx_piece_tree_read(&d->tree, row->byte_start, buf, row->byte_len);
+            for (k = 0; k < row->byte_len && col < (size_t)cols; k++) {
+                RtxStyle st = rtx_style_at(d, row->byte_start + k);
+                fputs(cctext_hl_ansi(st.hl), stdout);
+                if (st.bold) fputs("\x1b[1m", stdout);
+                fputc(buf[k], stdout);
+                fputs("\x1b[0m", stdout);
+                col++;
+            }
+            free(buf);
+            fputc('\n', stdout);
+        }
+    }
+    fprintf(stdout, "\x1b[7m cctext %zu/%zu  q quit  j/k scroll \x1b[0m",
+            top + 1 > L->len ? L->len : top + 1, L->len);
+    fflush(stdout);
+}
+
+int main(int argc, char **argv) {
+    @errhandler(CCError e) { cc_error_log(e); return 1; }
+    RtxDoc d;
+    RtxLayout L;
+    RtxMeasure m;
+    const char *path = argc > 1 ? argv[1] : "testdata/mixed.txt";
+    int rows = 24, cols = 80;
+    size_t top = 0;
+    int ch;
+
+    rtx_doc_open(&d, path) !>;
+    m.measure = cctext_measure;
+    m.line_height = cctext_lh;
+    m.ctx = NULL;
+    memset(&L, 0, sizeof(L));
+    cctext_winsize(&rows, &cols);
+    if (!rtx_layout_doc(&L, &d, &m, (double)cols)) {
+        rtx_doc_destroy(&d);
+        return 1;
+    }
+    if (!isatty(STDIN_FILENO) || !cctext_raw()) {
+        /* Non-TTY: dump highlighted rows and exit. */
+        size_t i;
+        for (i = 0; i < L.len; i++) {
+            RtxVisRow *row = &L.rows[i];
+            size_t k;
+            char *buf = (char *)malloc(row->byte_len ? row->byte_len : 1);
+            if (!buf) continue;
+            rtx_piece_tree_read(&d.tree, row->byte_start, buf, row->byte_len);
+            for (k = 0; k < row->byte_len; k++) {
+                RtxStyle st = rtx_style_at(&d, row->byte_start + k);
+                fputs(cctext_hl_ansi(st.hl), stdout);
+                if (st.bold) fputs("\x1b[1m", stdout);
+                fputc(buf[k], stdout);
+                fputs("\x1b[0m", stdout);
+            }
+            fputc('\n', stdout);
+            free(buf);
+        }
+        rtx_layout_destroy(&L);
+        rtx_doc_destroy(&d);
+        return 0;
+    }
+
+    for (;;) {
+        cctext_winsize(&rows, &cols);
+        cctext_draw(&d, &L, top, rows, cols);
+        ch = getchar();
+        if (ch == 'q' || ch == 'Q' || ch == 3) break;
+        if (ch == 'j' || ch == '\n') {
+            if (top + 1 < L.len) top++;
+        } else if (ch == 'k') {
+            if (top > 0) top--;
+        } else if (ch == 0x1b) {
+            int a = getchar();
+            int b = getchar();
+            if (a == '[' && b == 'B' && top + 1 < L.len) top++;
+            if (a == '[' && b == 'A' && top > 0) top--;
+        }
+    }
+    cctext_restore();
+    rtx_layout_destroy(&L);
+    rtx_doc_destroy(&d);
+    return 0;
+}
