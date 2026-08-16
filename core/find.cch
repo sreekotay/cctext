@@ -1,0 +1,210 @@
+/*
+ * Find epoch: query copy + hit offsets on `d.find.store`.
+ * Context is computed when drawing the visible rows, not stored.
+ * `step` scans at most `budget` bytes so a frame never stalls on a giant file.
+ */
+#ifndef RTX_FIND_H
+#define RTX_FIND_H
+
+enum {
+    RTX_FIND_CHUNK = 8192,
+    RTX_FIND_BUDGET = 262144,
+    RTX_FIND_MAX = 32768,
+    RTX_FIND_QMAX = 256
+};
+
+typedef struct {
+    size_t off;
+    size_t line1;
+    size_t col;
+    char[:] ctx;
+} RtxFindHitView;
+
+static int rtx_find_ensure(RtxDoc *d) {
+    if (!d) return 0;
+    if (d->find.store.base) return 1;
+    d->find.store = cc_arena_heap(kilobytes(16));
+    return d->find.store.base != NULL;
+}
+
+static void RtxDoc_find_invalidate(RtxDoc *d) {
+    if (!d) return;
+    d->find.len = 0;
+    d->find.scan_off = 0;
+    d->find.cur = 0;
+    d->find.truncated = 0;
+    d->find.done = (d->find.query.len == 0);
+}
+
+static int RtxDoc_find_same_query(const RtxDoc *d, char[:] q) {
+    if (!d) return 0;
+    if (q.len > RTX_FIND_QMAX) q = q.sub(0, RTX_FIND_QMAX);
+    if (d->find.query.len != q.len) return 0;
+    if (q.len == 0) return 1;
+    return memcmp(d->find.query.ptr, q.ptr, q.len) == 0;
+}
+
+static void !>(CCError) RtxDoc_find_set(RtxDoc *d, char[:] q) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (!rtx_find_ensure(d)) return cc_err(CC_ERR_OUT_OF_MEMORY, "find store");
+    d->find.store.reset();
+    d->find.query = cc_slice_empty();
+    d->find.offs = NULL;
+    d->find.len = 0;
+    d->find.cap = 0;
+    d->find.scan_off = 0;
+    d->find.cur = 0;
+    d->find.truncated = 0;
+    d->find.done = 0;
+    if (q.len > RTX_FIND_QMAX) q = q.sub(0, RTX_FIND_QMAX);
+    if (q.len == 0) {
+        d->find.done = 1;
+        return cc_ok();
+    }
+    d->find.query = d->find.store.alloc_slice_bytes(q.len);
+    if (!d->find.query.ptr || d->find.query.len < q.len) {
+        d->find.query = cc_slice_empty();
+        d->find.done = 1;
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "find query");
+    }
+    memcpy(d->find.query.ptr, q.ptr, q.len);
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_find_push(RtxDoc *d, size_t off) {
+    if (d->find.len >= RTX_FIND_MAX) {
+        d->find.truncated = 1;
+        d->find.done = 1;
+        return cc_ok();
+    }
+    if (!rtx_arena_grow(&d->find.store, (void **)&d->find.offs, &d->find.cap,
+                        d->find.len + 1, sizeof(size_t))) {
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "find hits");
+    }
+    d->find.offs[d->find.len++] = off;
+    return cc_ok();
+}
+
+/*
+ * scan_off is the next match-start to consider.
+ * A window keeps query.len-1 bytes uncommitted so a hit cannot
+ * straddle unread input. The return is how far this window commits.
+ */
+static size_t rtx_find_window_adv(size_t got, size_t qn, int last) {
+    size_t overlap = qn > 0 ? qn - 1 : 0;
+    if (last) return got;
+    return got > overlap ? got - overlap : got;
+}
+
+static void !>(CCError) RtxDoc_find_step(RtxDoc *d, size_t budget) {
+    size_t qn;
+    size_t n;
+    size_t spent = 0;
+    char buf[RTX_FIND_CHUNK];
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->find.done) return cc_ok();
+    qn = d->find.query.len;
+    if (qn == 0 || qn > d->len()) {
+        d->find.done = 1;
+        return cc_ok();
+    }
+    n = d->len();
+    if (budget == 0) budget = RTX_FIND_BUDGET;
+    while (spent < budget && !d->find.done) {
+        size_t want = RTX_FIND_CHUNK;
+        size_t got;
+        size_t adv;
+        size_t max_i;
+        size_t i;
+        int last;
+        if (d->find.scan_off + qn > n) {
+            d->find.done = 1;
+            break;
+        }
+        if (want < qn) want = qn;
+        if (d->find.scan_off + want > n) want = n - d->find.scan_off;
+        if (want > sizeof(buf)) want = sizeof(buf);
+        got = d->read_at(d->find.scan_off, buf, want);
+        spent += got;
+        if (got < qn) {
+            d->find.done = 1;
+            break;
+        }
+        last = (d->find.scan_off + got >= n);
+        adv = rtx_find_window_adv(got, qn, last);
+        max_i = got - qn;
+        for (i = 0; i <= max_i && i < adv; i++) {
+            if (memcmp(buf + i, d->find.query.ptr, qn) == 0) {
+                rtx_find_push(d, d->find.scan_off + i) !>(e) { return cc_err(e); };
+                if (d->find.done) return cc_ok();
+            }
+        }
+        d->find.scan_off += adv;
+        if (d->find.scan_off + qn > n) d->find.done = 1;
+    }
+    return cc_ok();
+}
+
+static void RtxDoc_find_goto(RtxDoc *d, size_t i) {
+    size_t n;
+    if (!d || d->find.len == 0) return;
+    if (i >= d->find.len) i = d->find.len - 1;
+    d->find.cur = i;
+    d->caret = d->find.offs[i];
+    n = d->len();
+    d->sel_anchor = d->caret + d->find.query.len;
+    if (d->sel_anchor > n) d->sel_anchor = n;
+    d->break_coalesce();
+}
+
+static void RtxDoc_find_next(RtxDoc *d) {
+    if (!d || d->find.len == 0) return;
+    d->find_goto((d->find.cur + 1) % d->find.len);
+}
+
+static void RtxDoc_find_prev(RtxDoc *d) {
+    if (!d || d->find.len == 0) return;
+    d->find_goto(d->find.cur == 0 ? d->find.len - 1 : d->find.cur - 1);
+}
+
+static void !>(CCError) RtxDoc_find_hit_view(RtxDoc *d, size_t i, CCArena *scratch,
+                                            size_t maxn, RtxFindHitView *out) {
+    size_t off;
+    size_t line;
+    size_t a;
+    size_t z;
+    size_t nlines;
+    if (!d || !scratch || !out) return cc_err(CC_ERR_INVALID_ARG, "find hit");
+    if (i >= d->find.len) return cc_err(CC_ERR_INVALID_ARG, "find hit");
+    memset(out, 0, sizeof(*out));
+    off = d->find.offs[i];
+    line = d->line_of(off);
+    nlines = d->line_count();
+    a = d->line_start(line);
+    z = (line + 1 < nlines) ? d->line_start(line + 1) : d->len();
+    if (line + 1 < nlines && z > a) z--; /* next line_start is past '\n' */
+    if (maxn < 8) maxn = 8;
+    if (z > a && z - a > maxn) {
+        size_t pad = maxn / 4;
+        size_t a2 = (off > a + pad) ? off - pad : a;
+        if (a2 + maxn > z) a2 = (z > maxn) ? z - maxn : a;
+        a = a2;
+        z = a + maxn;
+    }
+    out->off = off;
+    out->line1 = line + 1;
+    out->col = (off >= a) ? off - a : 0;
+    if (z <= a) {
+        out->ctx = cc_slice_empty();
+        return cc_ok();
+    }
+    {
+        char[:] bytes = d->scratch_span(scratch, a, z - a) !>(e) {
+            return cc_err(e);
+        };
+        out->ctx = bytes;
+    }
+    return cc_ok();
+}
+
+#endif /* RTX_FIND_H */

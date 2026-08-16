@@ -24,6 +24,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Document | piece-tree arena + mmap | `RtxDoc.destroy()` |
 | Session | `d.session` | close (path, undo) |
 | Analysis | `d.analysis` | `analysis.reset()` on reparse (sections, runs) |
+| Find | `d.find.store` | new query resets; edit invalidates (offsets only) |
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs, clipboard) |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
@@ -65,3 +66,5 @@ Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for mma
 ## Edits
 
 User changes are `replace` on the history stack (type / backspace / delete). Save streams pieces (`write_fd`), fsyncs, renames. Dirty is `hist.head != saved_head`. Offsets are bytes. Selection is `[sel_anchor, caret)`.
+
+Find stores offsets on `d.find.store`. A frame steps at most 256 KiB so a giant file does not stall. Context is a line window computed when drawing the visible hits. `f` / Ctrl-F opens the panel; up/down moves among hits.

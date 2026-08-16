@@ -26,6 +26,7 @@ smoke test: $(LARGE)
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run piece_tree_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run layout_measure_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run edit_session_smoke
+	$(CCC) $(CCC_FLAGS) build --build-file build.cc run find_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run large_file_smoke
 
 cctext:

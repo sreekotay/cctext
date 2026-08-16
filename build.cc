@@ -15,6 +15,9 @@ CC_TARGET_INCLUDE layout_measure_smoke .
 CC_TARGET edit_session_smoke exe tests/edit_session_smoke.ccs
 CC_TARGET_INCLUDE edit_session_smoke .
 
+CC_TARGET find_smoke exe tests/find_smoke.ccs
+CC_TARGET_INCLUDE find_smoke .
+
 CC_TARGET large_file_smoke exe tests/large_file_smoke.ccs
 CC_TARGET_INCLUDE large_file_smoke .
 
