@@ -1,7 +1,8 @@
-// Raytext core tests + cctext (console). GUI is a later target.
+// Raytext core tests + cctext + raytext.
 //
 //   make smoke
 //   make cctext
+//   make raytext
 
 CC_DEFAULT piece_tree_smoke
 
@@ -14,9 +15,5 @@ CC_TARGET_INCLUDE layout_measure_smoke .
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
 
-CC_TARGET rl_host obj frontend/rl_host.c
-CC_TARGET_INCLUDE rl_host frontend
-
 CC_TARGET raytext exe frontend/gui.ccs
-CC_TARGET_INCLUDE raytext . frontend
-CC_TARGET_DEPS raytext rl_host
+CC_TARGET_INCLUDE raytext .

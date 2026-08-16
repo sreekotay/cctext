@@ -29,15 +29,15 @@ make raytext                # Raylib GUI (needs `brew install raylib`)
 
 A `ccc` built from a concurrent-c checkout writes `out/` into that checkout unless `--out-dir` / `--bin-dir` are absolute. `make` passes `$(CURDIR)/out` and `$(CURDIR)/bin`. You can also set `CC_OUT_DIR` / `CC_BIN_DIR`.
 
-Sources omit the line-1 `#!ccc` header: stripping it copies the TU into a cache dir, and quoted `#include` of project `.cch` files then miss the source tree. Kind comes from the suffix; the lowerer pin is `version=0.3.3` on the `ccc` line in the Makefile.
+Sources omit the line-1 `#!ccc` header: stripping it copies the TU into a cache dir, and quoted `#include` of project `.cch` files then miss the source tree. Kind comes from the suffix. The Makefile pins `version=0.3.3-139` (passthrough C types from `#include <…>`).
 
-Install `ccc` with Homebrew (`brew tap sreekotay/concurrent-c` / `brew install --HEAD …/ccc`) or from a concurrent-c checkout (`PREFIX=$HOME/.local ./cc-install.sh`). Sources pin `version=0.3.3`.
+Install `ccc` with Homebrew (`brew tap sreekotay/concurrent-c` / `brew install --HEAD …/ccc`) or from a concurrent-c checkout (`PREFIX=$HOME/.local ./cc-install.sh`). Needs a lowerer that prefixes `0.3.3-139`.
 
 ## Layout
 
 ```
 core/         document — no raylib.h, no termios
-frontend/     Raylib FFI and TTY
+frontend/     Raylib GUI and TTY
 tests/        headless smokes
 testdata/     small fixtures; generated/ is gitignored
 ```

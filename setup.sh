@@ -18,11 +18,11 @@ echo "ccc: $ver"
 
 need_major=0
 need_minor=3
-# Pin in sources is version=0.3.3 — accept any 0.3.x prefix.
+# Makefile pins version=0.3.3-139.
 case "$ver" in
-    *0.3.*) ;;
+    *0.3.3-139*|*0.3.3-1[4-9]*|*0.3.[4-9]*) ;;
     *)
-        echo "raytext: expected ccc 0.3.x (sources pin version=0.3.3), got: $ver" >&2
+        echo "raytext: expected ccc 0.3.3-139 or newer, got: $ver" >&2
         exit 1
         ;;
 esac
