@@ -35,7 +35,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 
 A `char[:]` is `{ptr, len, id}`. Storing it does not take the bytes.
 
-- `from_path` — mmap, stamped with the tree arena. Mapping is owned (`map_owned`).
+- `from_path` — `cc_file_map`, stamped with the tree arena. The `CCMappedFile` lives on the tree until `destroy()`.
 - `from_buffer` — keeps the caller’s slice. Refuses non-empty untracked (`id == 0`).
 - `span` — empty means “not one piece” (or `n == 0`). That is a payload.
 - `scratch_span` / `analysis_span` — view if contiguous, else a copy on the named arena. `char[:] !>(CCError)`: empty is `n == 0` / past end; OOM and short `read_at` are errors.

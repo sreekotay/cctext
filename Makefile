@@ -1,10 +1,5 @@
-# ccc from a concurrent-c checkout treats --out-dir as relative to that
-# repo. Pass absolute paths so a standalone tree does not write there.
 CCC ?= ccc
-OUT := $(CURDIR)/out
-BIN := $(CURDIR)/bin
-
-CCC_FLAGS := --no-cache --out-dir $(OUT) --bin-dir $(BIN)
+CCC_FLAGS := --no-cache --out-dir out --bin-dir bin
 RAYLIB_PREFIX := $(shell brew --prefix raylib 2>/dev/null)
 RAYLIB_CFLAGS := -I$(RAYLIB_PREFIX)/include
 RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation
@@ -37,4 +32,4 @@ raytext:
 		build --build-file build.cc raytext
 
 clean:
-	rm -rf $(OUT) $(BIN) testdata/generated
+	rm -rf out bin testdata/generated

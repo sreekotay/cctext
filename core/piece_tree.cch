@@ -1,3 +1,4 @@
+#!ccc cch
 /*
  * Order-statistic piece tree: original mmap (or borrowed buffer) + add
  * buffer, pieces in a red-black tree weighted by byte length and '\n' count.
@@ -5,25 +6,22 @@
  * Offset lookup is O(log pieces). Line lookup uses a stride index so a
  * single mmap piece is not an O(file) scan. The original bytes never move.
  * Nodes, add buffer, and line index share the tree arena (document epoch).
- * A slice is a view: mmap is owned (`map_owned`) and stamped with the tree
- * arena epoch; add-backed spans carry the arena epoch. Fragmented ranges
- * copy onto caller scratch.
+ * A slice is a view: mmap is a `CCMappedFile` on the tree and stamped with
+ * the tree arena epoch; add-backed spans carry the arena epoch. Fragmented
+ * ranges copy onto caller scratch.
  */
 #ifndef RTX_PIECE_TREE_H
 #define RTX_PIECE_TREE_H
 
 #include <ccc/std/prelude.cch>
-#include <fcntl.h>
+#include <ccc/std/mmap.cch>
 #include <errno.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #include <stdlib.h>
 
 #define RTX_RB_RED 1
 #define RTX_RB_BLACK 0
 #define RTX_LINE_STRIDE 64
-/* Frame-scratch L1. Must be a constant — cc_arena_stack takes an array size. */
 #define RTX_FRAME_SCRATCH 8192
 
 typedef enum {
@@ -43,23 +41,21 @@ typedef struct RtxPieceTree RtxPieceTree;
 
 struct RtxNode {
     RtxPiece piece;
-    struct RtxNode *left;
-    struct RtxNode *right;
-    struct RtxNode *parent;
+    RtxNode *left;
+    RtxNode *right;
+    RtxNode *parent;
     uint8_t color;
     size_t subtree_len;
     uint32_t subtree_lf;
 };
 
 struct RtxPieceTree {
-    struct RtxNode *root;
-    struct RtxNode *free_list;
+    RtxNode *root;
+    RtxNode *free_list;
     CCArena arena_storage;
     CCArena *arena;
     char[:] original;
-    void *map_ptr;
-    size_t map_len;
-    int map_owned;
+    CCMappedFile map;
     char *add;
     size_t add_len;
     size_t add_cap;
@@ -426,7 +422,7 @@ static void rtx_tree_zero(RtxPieceTree *t) {
 }
 
 static int rtx_tree_is_live(const RtxPieceTree *t) {
-    return t && (t->arena != NULL || t->map_owned);
+    return t && (t->arena != NULL || t->map.ptr);
 }
 
 static int rtx_tree_init_arena(RtxPieceTree *t) {
@@ -524,9 +520,7 @@ static inline size_t RtxPieceTree_line_count(const RtxPieceTree *t) {
 
 static inline void RtxPieceTree_destroy(RtxPieceTree *t) {
     if (!t) return;
-    if (t->map_owned && t->map_ptr && t->map_len) {
-        munmap(t->map_ptr, t->map_len);
-    }
+    t->map.destroy();
     if (t->arena && t->arena->base) {
         t->arena_storage.destroy();
     }
@@ -562,9 +556,6 @@ static inline void !>(CCError) RtxPieceTree_from_buffer(RtxPieceTree *t, char[:]
 }
 
 static inline void !>(CCError) RtxPieceTree_from_path(RtxPieceTree *t, const char *path) {
-    int fd;
-    struct stat st;
-    void *map;
     if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
     if (rtx_tree_is_live(t)) return cc_err(CC_ERR_INVALID_ARG, "tree already live");
     rtx_tree_zero(t);
@@ -572,35 +563,15 @@ static inline void !>(CCError) RtxPieceTree_from_path(RtxPieceTree *t, const cha
     if (!rtx_tree_init_arena(t)) {
         return cc_err(CC_ERR_OUT_OF_MEMORY, "piece tree arena");
     }
-    fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        RtxPieceTree_destroy(t);
-        return cc_err(CC_ERR_IO, "open");
+    {
+        CCMappedFile mapped = cc_file_map(cc_slice_cstr(path)) !>(e) {
+            RtxPieceTree_destroy(t);
+            return cc_err(CC_ERR_IO, cc_io_error_str(e));
+        };
+        t->map = mapped;
     }
-    if (fstat(fd, &st) != 0) {
-        close(fd);
-        RtxPieceTree_destroy(t);
-        return cc_err(CC_ERR_IO, "fstat");
-    }
-    if (!S_ISREG(st.st_mode)) {
-        close(fd);
-        RtxPieceTree_destroy(t);
-        return cc_err(CC_ERR_INVALID_ARG, "not a regular file");
-    }
-    if (st.st_size == 0) {
-        close(fd);
-        return cc_ok();
-    }
-    map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) {
-        RtxPieceTree_destroy(t);
-        return cc_err(CC_ERR_IO, "mmap");
-    }
-    t->map_ptr = map;
-    t->map_len = (size_t)st.st_size;
-    t->map_owned = 1;
-    t->original = cc_arena_slice(t->arena, map, t->map_len);
+    if (!t->map.ptr) return cc_ok();
+    t->original = cc_arena_slice(t->arena, t->map.ptr, t->map.len);
     if (!rtx_tree_seed_original(t)) {
         RtxPieceTree_destroy(t);
         return cc_err(CC_ERR_OUT_OF_MEMORY, "seed original");

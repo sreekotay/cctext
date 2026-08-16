@@ -31,10 +31,6 @@ Piece tree, document, layout, C/CC highlight, save, undo/redo, selection, increm
 
 **raytext** has a File / Edit / View / Go menu bar (click a title, then an item). **Esc** still opens the key-binding overlay in both frontends. **g** / **Ctrl-G** jumps to a line. Line numbers are in the gutter. Ctrl/Cmd chords work while the overlay is closed. Unsaved quit asks Save / Don't save / Cancel.
 
-A `ccc` built from a concurrent-c checkout writes `out/` into that checkout unless `--out-dir` / `--bin-dir` are absolute. `./make.shcc` passes `<root>/out` and `<root>/bin`. You can also set `CC_OUT_DIR` / `CC_BIN_DIR`.
-
-Sources omit the line-1 `#!ccc` header: stripping it copies the TU into a cache dir, and quoted `#include` of project `.cch` files then miss the source tree. Kind comes from the suffix.
-
 Install `ccc` with Homebrew (`brew tap sreekotay/concurrent-c` / `brew install --HEAD …/ccc`) or from a concurrent-c checkout (`PREFIX=$HOME/.local ./cc-install.sh`). `#include <raylib.h>` needs a lowerer that seeds passthrough C types (0.3.3-139 or last-good after that).
 
 ## Layout
