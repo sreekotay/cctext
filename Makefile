@@ -7,7 +7,7 @@ BIN := $(CURDIR)/bin
 CCC_FLAGS := --no-cache --out-dir $(OUT) --bin-dir $(BIN)
 RAYLIB_PREFIX := $(shell brew --prefix raylib 2>/dev/null)
 RAYLIB_CFLAGS := -I$(RAYLIB_PREFIX)/include
-RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib
+RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation
 
 LARGE_LINES ?= 100000
 LARGE := testdata/generated/large.txt

@@ -11,6 +11,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <raylib.h>
+#include <rlgl.h>
+#if defined(__APPLE__)
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
 #include "../core/document.cch"
 #include "../core/layout.cch"
 #include "../core/workspace.cch"
@@ -57,7 +62,8 @@ enum {
     CMD_JUMP,
     CMD_FIND,
     CMD_HELP,
-    CMD_SEL_ALL
+    CMD_SEL_ALL,
+    CMD_WRAP
 };
 
 static const GuiMenuItem gui_file_items[] = {
@@ -73,6 +79,7 @@ static const GuiMenuItem gui_edit_items[] = {
     {"Paste", "Ctrl-V", CMD_PASTE},
 };
 static const GuiMenuItem gui_view_items[] = {
+    {"Wrap lines", "Ctrl-L", CMD_WRAP},
     {"Split", "Ctrl-\\", CMD_SPLIT},
     {"Next file", "Ctrl-N", CMD_NEXT},
     {"Other pane", "Ctrl-W", CMD_PANE},
@@ -86,7 +93,7 @@ static const GuiMenuItem gui_go_items[] = {
 static GuiMenu gui_menus[] = {
     {"File", gui_file_items, 2, 0, 0},
     {"Edit", gui_edit_items, 6, 0, 0},
-    {"View", gui_view_items, 4, 0, 0},
+    {"View", gui_view_items, 5, 0, 0},
     {"Go", gui_go_items, 2, 0, 0},
 };
 
@@ -135,13 +142,18 @@ static float gui_size(GuiFonts *f, RtxStyle st, RtxSectionKind sec) {
 
 static double gui_measure(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
     GuiFonts *f = (GuiFonts *)ctx;
-    char tmp[8];
-    Vector2 sz;
+    double w = 0;
+    size_t i;
     if (!f || bytes.len == 0) return 0;
-    tmp[0] = bytes.ptr ? bytes.ptr[0] : ' ';
-    tmp[1] = 0;
-    sz = MeasureTextEx(gui_font(f, style, sec), tmp, gui_size(f, style, sec), 0);
-    return (double)sz.x;
+    for (i = 0; i < bytes.len; i++) {
+        char tmp[8];
+        Vector2 sz;
+        tmp[0] = bytes.ptr ? bytes.ptr[i] : ' ';
+        tmp[1] = 0;
+        sz = MeasureTextEx(gui_font(f, style, sec), tmp, gui_size(f, style, sec), 0);
+        w += (double)sz.x;
+    }
+    return w;
 }
 
 static double gui_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
@@ -169,26 +181,428 @@ static int gui_shift(void) {
     return IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
 }
 
+static int gui_alt(void) {
+    return IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
+}
+
+/* Initial press or OS key-repeat. Commands stay on IsKeyPressed. */
+static int gui_key(int key) {
+    return IsKeyPressed(key) || IsKeyPressedRepeat(key);
+}
+
 static void !>(CCError) gui_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int vis_rows) {
     size_t nlines;
     size_t want;
+    size_t avail;
+    size_t need;
     if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
     nlines = b->line_count();
     if (vis_rows < 1) vis_rows = 1;
     if (b->top >= nlines && nlines) b->top = nlines - 1;
     want = (size_t)vis_rows + 8;
+    avail = (b->top < nlines) ? (nlines - b->top) : 0;
+    need = want < avail ? want : avail;
+    /* Rebuild on width/scroll change, and when the window grows taller. */
     if (b->layout_width != width || b->layout.from_line != b->top ||
-        b->layout.len == 0) {
-        b->layout.lines(&b->doc, m, width, b->top, want) !>(e) { return cc_err(e); };
+        b->layout.len == 0 || b->layout.nlines < need ||
+        (b->layout.wrap && b->layout.len < want + b->top_wrap)) {
+        size_t min_rows = want + b->top_wrap;
+        b->layout.fill(&b->doc, m, width, b->top, min_rows) !>(e) { return cc_err(e); };
         b->layout_width = width;
     }
     return cc_ok();
 }
 
 static void !>(CCError) gui_after_edit(RtxBuf *b, RtxMeasure *m, double width, int vis_rows) {
+    b->clear_pref();
     b->layout.view_after_edit(&b->doc, m, width) !>(e) { return cc_err(e); };
     b->layout_width = width;
+    gui_ensure_view(b, m, width, vis_rows) !>(e) { return cc_err(e); };
+    b->reveal(vis_rows);
     return gui_ensure_view(b, m, width, vis_rows);
+}
+
+static void gui_wheel(RtxBuf *b, RtxMeasure *m, double width) {
+    int wheel;
+    if (!b) return;
+    wheel = (int)GetMouseWheelMove();
+    while (wheel > 0) {
+        b->scroll_vis(m, width, -1) !>(e) { (void)e; return; };
+        wheel--;
+    }
+    while (wheel < 0) {
+        b->scroll_vis(m, width, 1) !>(e) { (void)e; return; };
+        wheel++;
+    }
+}
+
+static void gui_move_vert(RtxBuf *b, RtxMeasure *m, double width, int dir, int shift) {
+    if (!b) return;
+    b->layout.move_vert(&b->doc, m, width, dir, shift, &b->pref) !>(e) {
+        (void)e;
+    };
+}
+
+static float gui_gutter_px(GuiFonts *fonts, RtxBuf *b);
+static int gui_pane_at(RtxWs *w, int x, int pad, int inner);
+static int gui_menu_click(int mx, int my, int *open, int *cmd);
+static void gui_reveal_caret(RtxBuf *b, int vis_rows);
+static double gui_hit_y(const RtxBuf *b, double y);
+static int gui_quit_hit(int mx, int my, int ww, int hh);
+static int gui_run_cmd(int cmd, RtxWs *w, RtxBuf *act, RtxMeasure *m,
+                       double text_w, int vis_rows, RtxUi *ui,
+                       char *status, size_t status_n, size_t *quit_armed_at);
+
+static void gui_home_end(RtxBuf *b, int to_end, int shift, int physical) {
+    if (!b) return;
+    if (!physical && b->layout.wrap && b->layout.len) {
+        b->layout.move_row_edge(&b->doc, to_end, shift);
+    } else {
+        b->doc.move_line_edge(to_end, shift);
+    }
+    if (to_end) b->stick_eol();
+    else b->clear_pref();
+}
+
+/* Mouse + keys. 1 = quit. Not Result: main is already at the bind cap. */
+static int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
+                            RtxUi *ui, char *status, size_t status_n,
+                            size_t *quit_armed_at, int *menu_open, int *dragging,
+                            int pane_w, int vis_rows, int pad, int top, int inner,
+                            int hh) {
+    Vector2 mouse;
+    int key;
+    double text_w;
+    @errhandler(CCError e) {
+        snprintf(status, status_n, "%s", e.message ? e.message : "error");
+        return 0;
+    }
+    if (!w || !act || !m || !fonts || !ui) return 0;
+    text_w = (double)pane_w - (double)gui_gutter_px(fonts, act);
+    if (ui->ask_quit) {
+        int choice = 0;
+        if (IsKeyPressed(KEY_ESCAPE) || (IsKeyPressed(KEY_C) && !gui_ctrl())) {
+            choice = 3;
+        } else if (IsKeyPressed(KEY_S) || (gui_ctrl() && IsKeyPressed(KEY_S))) {
+            choice = 1;
+        } else if (IsKeyPressed(KEY_Q) || IsKeyPressed(KEY_N) ||
+                   IsKeyPressed(KEY_D) || (gui_ctrl() && IsKeyPressed(KEY_Q))) {
+            choice = 2;
+        }
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            Vector2 mp = GetMousePosition();
+            int hit = gui_quit_hit((int)mp.x, (int)mp.y, GetScreenWidth(), hh);
+            if (hit) choice = hit;
+        }
+        while (GetCharPressed() > 0) { }
+        if (choice == 3) {
+            ui->ask_quit = 0;
+            return 0;
+        }
+        if (choice == 2) return 1;
+        if (choice == 1) {
+            size_t si;
+            for (si = 0; si < w->len; si++) {
+                RtxDoc *sd = &w->bufs[si].doc;
+                if (!sd->dirty()) continue;
+                if (!sd->path.ptr || sd->path.len == 0) {
+                    snprintf(status, status_n, "untitled — save as a path first");
+                    return 0;
+                }
+                sd->save() !>;
+                sd->break_coalesce();
+            }
+            return 1;
+        }
+        return 0;
+    }
+    if (*menu_open >= 0) {
+        Vector2 hm = GetMousePosition();
+        if (hm.y >= 0 && hm.y < (float)GUI_MENU_H) {
+            int mi;
+            for (mi = 0; mi < 4; mi++) {
+                if (hm.x >= (float)gui_menus[mi].x &&
+                    hm.x < (float)(gui_menus[mi].x + gui_menus[mi].w)) {
+                    *menu_open = mi;
+                }
+            }
+        }
+    }
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        int mcmd = CMD_NONE;
+        int mhit;
+        mouse = GetMousePosition();
+        mhit = gui_menu_click((int)mouse.x, (int)mouse.y, menu_open, &mcmd);
+        if (mhit == 2) {
+            if (gui_run_cmd(mcmd, w, act, m, text_w, vis_rows, ui, status,
+                            status_n, quit_armed_at)) {
+                return 1;
+            }
+        } else if (mhit == 0 && ui->find &&
+                   mouse.y >= (float)(hh - 26 - GUI_FIND_H) &&
+                   mouse.y < (float)(hh - 26)) {
+            int row = ((int)mouse.y - (hh - 26 - GUI_FIND_H) - 8) / GUI_FIND_ROW_H;
+            if (row >= 1) {
+                size_t hit = ui->find_top + (size_t)(row - 1);
+                if (hit < act->doc.find.len) act->doc.find_goto(hit);
+            }
+        } else if (mhit == 0) {
+            w->focus = gui_pane_at(w, (int)mouse.x, pad, inner);
+            act = w->active();
+            {
+                int x0 = pad + (w->focus == 1 && w->npanes == 2 ? inner / 2 + 8 : 0);
+                double x = (double)mouse.x - (double)x0 - (double)gui_gutter_px(fonts, act);
+                double y = (double)mouse.y - (double)top;
+                if (x >= 0 && y >= 0) {
+                    size_t at = act->layout.hit(&act->doc, m, x, gui_hit_y(act, y)) !>;
+                    act->doc.caret = at;
+                    if (gui_alt()) {
+                        size_t line = act->doc.line_of(at);
+                        act->doc.sel_anchor = at;
+                        act->doc.sel_box = 1;
+                        act->pref.col = at - act->doc.line_start(line);
+                        act->pref.ok = 1;
+                        act->pref.eol = 0;
+                        act->doc.box_acol = act->pref.col;
+                        act->doc.box_ccol = act->pref.col;
+                    } else {
+                        if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
+                        act->doc.sel_box = 0;
+                        act->clear_pref();
+                    }
+                    *dragging = 1;
+                    act->doc.break_coalesce();
+                }
+            }
+        }
+    }
+    if (*dragging && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        mouse = GetMousePosition();
+        {
+            int x0 = pad + (w->focus == 1 && w->npanes == 2 ? inner / 2 + 8 : 0);
+            double x = (double)mouse.x - (double)x0 - (double)gui_gutter_px(fonts, act);
+            double y = (double)mouse.y - (double)top;
+            int ph = hh - top - 28 - (ui->find ? GUI_FIND_H : 0);
+            if (x < 0) x = 0;
+            /* Layout has no rows above the view; scroll first, then hit. */
+            if (y < 0) {
+                act->scroll_vis(m, text_w, -1) !>;
+                gui_ensure_view(act, m, text_w, vis_rows) !>;
+                y = 0;
+            } else if (ph > 0 && y >= (double)ph) {
+                act->scroll_vis(m, text_w, 1) !>;
+                gui_ensure_view(act, m, text_w, vis_rows) !>;
+                y = (double)(ph - 1);
+            }
+            size_t at = act->layout.hit(&act->doc, m, x, gui_hit_y(act, y)) !>;
+            act->doc.caret = at;
+            if (act->doc.sel_box) {
+                size_t line = act->doc.line_of(at);
+                act->pref.col = at - act->doc.line_start(line);
+                act->pref.ok = 1;
+                act->pref.eol = 0;
+                act->box_sync();
+            } else {
+                act->clear_pref();
+            }
+        }
+    }
+    if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) *dragging = 0;
+
+    if (ui->jump) {
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            rtx_ui_clear_jump(ui);
+        } else if (IsKeyPressed(KEY_ENTER)) {
+            rtx_ui_apply_jump(ui, &act->doc);
+            gui_reveal_caret(act, vis_rows);
+        } else if (gui_key(KEY_BACKSPACE) && ui->jump_len > 0) {
+            ui->jump_buf[--ui->jump_len] = 0;
+        } else {
+            key = GetCharPressed();
+            while (key > 0) {
+                rtx_ui_jump_char(ui, key);
+                key = GetCharPressed();
+            }
+        }
+        return 0;
+    }
+    if (ui->find) {
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            rtx_ui_clear_find(ui);
+        } else if (gui_key(KEY_UP)) {
+            act->doc.find_prev();
+            gui_reveal_caret(act, vis_rows);
+        } else if (gui_key(KEY_DOWN)) {
+            act->doc.find_next();
+            gui_reveal_caret(act, vis_rows);
+        } else if (gui_key(KEY_BACKSPACE) && ui->find_len > 0) {
+            ui->find_buf[--ui->find_len] = 0;
+            rtx_ui_find_apply(ui, &act->doc) !>;
+            gui_reveal_caret(act, vis_rows);
+        } else if (gui_ctrl() && (IsKeyPressed(KEY_G) || IsKeyPressed(KEY_J))) {
+            rtx_ui_start_jump(ui);
+        } else if (gui_ctrl() && IsKeyPressed(KEY_Q)) {
+            if (gui_run_cmd(CMD_QUIT, w, act, m, text_w, vis_rows, ui, status,
+                            status_n, quit_armed_at)) {
+                return 1;
+            }
+        } else if (gui_ctrl() && IsKeyPressed(KEY_S)) {
+            gui_run_cmd(CMD_SAVE, w, act, m, text_w, vis_rows, ui, status,
+                        status_n, quit_armed_at);
+        } else {
+            key = GetCharPressed();
+            while (key > 0) {
+                if (rtx_ui_find_char(ui, key)) {
+                    rtx_ui_find_apply(ui, &act->doc) !>;
+                    gui_reveal_caret(act, vis_rows);
+                }
+                key = GetCharPressed();
+            }
+        }
+        return 0;
+    }
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        *menu_open = -1;
+        ui->help = !ui->help;
+        return 0;
+    }
+    {
+        int cmd = CMD_NONE;
+        if (ui->help) {
+            if (IsKeyPressed(KEY_S)) cmd = CMD_SAVE;
+            else if (IsKeyPressed(KEY_Z)) cmd = CMD_UNDO;
+            else if (IsKeyPressed(KEY_Y)) cmd = CMD_REDO;
+            else if (IsKeyPressed(KEY_X)) cmd = CMD_CUT;
+            else if (IsKeyPressed(KEY_C)) cmd = CMD_COPY;
+            else if (IsKeyPressed(KEY_V)) cmd = CMD_PASTE;
+            else if (IsKeyPressed(KEY_W)) cmd = CMD_PANE;
+            else if (IsKeyPressed(KEY_N) || IsKeyPressed(KEY_TAB)) cmd = CMD_NEXT;
+            else if (IsKeyPressed(KEY_BACKSLASH)) cmd = CMD_SPLIT;
+            else if (IsKeyPressed(KEY_Q)) cmd = CMD_QUIT;
+            else if (IsKeyPressed(KEY_G)) cmd = CMD_JUMP;
+            else if (IsKeyPressed(KEY_F)) cmd = CMD_FIND;
+            else if (IsKeyPressed(KEY_A)) cmd = CMD_SEL_ALL;
+            else if (IsKeyPressed(KEY_L)) cmd = CMD_WRAP;
+            if (cmd == CMD_NONE) {
+                while (GetCharPressed() > 0) { }
+            } else {
+                ui->help = 0;
+            }
+        } else if (gui_ctrl() && (IsKeyPressed(KEY_G) || IsKeyPressed(KEY_J))) {
+            cmd = CMD_JUMP;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_F)) {
+            cmd = CMD_FIND;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_S)) {
+            cmd = CMD_SAVE;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_Z) && !gui_shift()) {
+            cmd = CMD_UNDO;
+        } else if ((gui_ctrl() && IsKeyPressed(KEY_Y)) ||
+                   (gui_ctrl() && gui_shift() && IsKeyPressed(KEY_Z))) {
+            cmd = CMD_REDO;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_C)) {
+            cmd = CMD_COPY;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_X)) {
+            cmd = CMD_CUT;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_V)) {
+            cmd = CMD_PASTE;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_W)) {
+            cmd = CMD_PANE;
+        } else if (gui_ctrl() && (IsKeyPressed(KEY_TAB) || IsKeyPressed(KEY_N))) {
+            cmd = CMD_NEXT;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_BACKSLASH)) {
+            cmd = CMD_SPLIT;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_Q)) {
+            cmd = CMD_QUIT;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_A)) {
+            cmd = CMD_SEL_ALL;
+        } else if (gui_ctrl() && IsKeyPressed(KEY_L)) {
+            cmd = CMD_WRAP;
+        }
+        if (cmd != CMD_NONE) {
+            while (GetCharPressed() > 0) { }
+            if (gui_run_cmd(cmd, w, act, m, text_w, vis_rows, ui, status,
+                            status_n, quit_armed_at)) {
+                return 1;
+            }
+            return 0;
+        }
+        if (ui->help) return 0;
+        if (gui_key(KEY_HOME) || (gui_ctrl() && gui_key(KEY_LEFT))) {
+            gui_home_end(act, 0, gui_shift(), gui_ctrl());
+            gui_reveal_caret(act, vis_rows);
+            while (GetCharPressed() > 0) { }
+        } else if (gui_key(KEY_END) || (gui_ctrl() && gui_key(KEY_RIGHT))) {
+            gui_home_end(act, 1, gui_shift(), gui_ctrl());
+            gui_reveal_caret(act, vis_rows);
+            while (GetCharPressed() > 0) { }
+        } else if (!gui_ctrl() && (gui_key(KEY_UP) || gui_key(KEY_DOWN))) {
+            int box = gui_alt();
+            if (box) act->box_begin();
+            gui_move_vert(act, m, text_w, gui_key(KEY_UP) ? -1 : 1,
+                          gui_shift() || box);
+            if (box) act->box_sync();
+            gui_reveal_caret(act, vis_rows);
+            while (GetCharPressed() > 0) { }
+        } else if (!gui_ctrl()) {
+            if (gui_key(KEY_LEFT)) {
+                if (gui_alt()) {
+                    act->box_move_col(-1);
+                } else if (!gui_shift() && act->doc.has_sel()) {
+                    act->doc.caret = act->doc.sel_lo();
+                    act->doc.clear_sel();
+                } else if (act->doc.caret > 0) {
+                    if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
+                    act->doc.caret--;
+                    if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
+                    act->doc.sel_box = 0;
+                }
+                act->doc.break_coalesce();
+                if (!gui_alt()) act->clear_pref();
+                gui_reveal_caret(act, vis_rows);
+            }
+            if (gui_key(KEY_RIGHT)) {
+                size_t n = act->len();
+                if (gui_alt()) {
+                    act->box_move_col(1);
+                } else if (!gui_shift() && act->doc.has_sel()) {
+                    act->doc.caret = act->doc.sel_hi();
+                    act->doc.clear_sel();
+                } else if (act->doc.caret < n) {
+                    if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
+                    act->doc.caret++;
+                    if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
+                    act->doc.sel_box = 0;
+                }
+                act->doc.break_coalesce();
+                if (!gui_alt()) act->clear_pref();
+                gui_reveal_caret(act, vis_rows);
+            }
+            if (gui_key(KEY_BACKSPACE)) {
+                act->doc.backspace() !>;
+                gui_after_edit(act, m, text_w, vis_rows) !>;
+            }
+            if (gui_key(KEY_DELETE)) {
+                act->doc.delete_forward() !>;
+                gui_after_edit(act, m, text_w, vis_rows) !>;
+            }
+            if (gui_key(KEY_ENTER)) {
+                act->doc.type("\n") !>;
+                gui_after_edit(act, m, text_w, vis_rows) !>;
+            }
+            key = GetCharPressed();
+            while (key > 0) {
+                if (key >= 32 && key < 127) {
+                    char s[2];
+                    s[0] = (char)key;
+                    s[1] = 0;
+                    act->doc.type(s.to_slice_n(1)) !>;
+                    gui_after_edit(act, m, text_w, vis_rows) !>;
+                }
+                key = GetCharPressed();
+            }
+        }
+    }
+    return 0;
 }
 
 static void gui_sync_clip(RtxWs *w) {
@@ -200,7 +614,6 @@ static void gui_sync_clip(RtxWs *w) {
             z.ptr[w->clip.len] = 0;
             SetClipboardText(z.ptr);
         }
-        scratch.destroy();
     }
 }
 
@@ -364,6 +777,78 @@ static void gui_draw_jump(GuiFonts *fonts, RtxUi *ui, int ww, int hh) {
     DrawTextEx(fonts->mono, line, pos, 22, 0, (Color){255, 220, 100, 255});
 }
 
+#define GUI_QUIT_W 460
+#define GUI_QUIT_H 168
+#define GUI_QUIT_BTN_W 120
+#define GUI_QUIT_BTN_H 32
+
+static void gui_quit_box(int ww, int hh, int *x, int *y) {
+    *x = (ww - GUI_QUIT_W) / 2;
+    *y = (hh - GUI_QUIT_H) / 2;
+    if (*x < 16) *x = 16;
+    if (*y < 16) *y = 16;
+}
+
+/* 1 = save, 2 = discard, 3 = cancel, 0 = miss. */
+static int gui_quit_hit(int mx, int my, int ww, int hh) {
+    int x, y, by, i;
+    gui_quit_box(ww, hh, &x, &y);
+    by = y + 112;
+    if (my < by || my >= by + GUI_QUIT_BTN_H) return 0;
+    for (i = 0; i < 3; i++) {
+        int bx = x + 24 + i * (GUI_QUIT_BTN_W + 12);
+        if (mx >= bx && mx < bx + GUI_QUIT_BTN_W) return i + 1;
+    }
+    return 0;
+}
+
+static void gui_draw_quit(GuiFonts *fonts, const RtxWs *w, int ww, int hh) {
+    int x, y, i;
+    size_t n;
+    char line[80];
+    Vector2 pos;
+    Vector2 mouse = GetMousePosition();
+    const char *labels[3];
+    labels[0] = "Save";
+    labels[1] = "Don't save";
+    labels[2] = "Cancel";
+    gui_quit_box(ww, hh, &x, &y);
+    n = 0;
+    if (w) {
+        size_t di;
+        for (di = 0; di < w->len; di++) {
+            if (w->bufs[di].doc.dirty()) n++;
+        }
+    }
+    DrawRectangle(0, 0, ww, hh, (Color){0, 0, 0, 160});
+    DrawRectangle(x, y, GUI_QUIT_W, GUI_QUIT_H, (Color){36, 28, 32, 255});
+    DrawRectangleLines(x, y, GUI_QUIT_W, GUI_QUIT_H, (Color){240, 140, 120, 255});
+    pos.x = (float)(x + 24);
+    pos.y = (float)(y + 18);
+    DrawTextEx(fonts->mono, "Unsaved changes", pos, 22, 0,
+               (Color){255, 230, 220, 255});
+    if (n == 1) snprintf(line, sizeof(line), "1 file has unsaved edits.");
+    else snprintf(line, sizeof(line), "%zu files have unsaved edits.", n);
+    pos.y = (float)(y + 56);
+    DrawTextEx(fonts->mono, line, pos, 16, 0, (Color){220, 210, 200, 255});
+    pos.y = (float)(y + 80);
+    DrawTextEx(fonts->mono, "Save before quitting?", pos, 16, 0,
+               (Color){200, 190, 180, 255});
+    for (i = 0; i < 3; i++) {
+        int bx = x + 24 + i * (GUI_QUIT_BTN_W + 12);
+        int by = y + 112;
+        int hot = mouse.x >= (float)bx && mouse.x < (float)(bx + GUI_QUIT_BTN_W) &&
+                  mouse.y >= (float)by && mouse.y < (float)(by + GUI_QUIT_BTN_H);
+        DrawRectangle(bx, by, GUI_QUIT_BTN_W, GUI_QUIT_BTN_H,
+                      hot ? (Color){70, 50, 48, 255} : (Color){48, 36, 40, 255});
+        DrawRectangleLines(bx, by, GUI_QUIT_BTN_W, GUI_QUIT_BTN_H,
+                           (Color){180, 120, 110, 255});
+        pos.x = (float)(bx + 12);
+        pos.y = (float)(by + 8);
+        DrawTextEx(fonts->mono, labels[i], pos, 15, 0, (Color){240, 220, 210, 255});
+    }
+}
+
 #define GUI_FIND_ROW_H 20
 #define GUI_FIND_H (RTX_UI_FIND_ROWS * GUI_FIND_ROW_H + 8)
 
@@ -390,12 +875,11 @@ static void gui_draw_find(GuiFonts *fonts, RtxUi *ui, RtxDoc *d, int ww, int hh)
             DrawRectangle(0, y - 2, ww, GUI_FIND_ROW_H, (Color){60, 70, 100, 255});
         }
         {
-            cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
             char ctx[192];
             char line[256];
             size_t line1 = 0;
             int ok = 1;
-            rtx_ui_find_row_text(d, hit, &scratch, 80, ctx, sizeof(ctx), &line1) !>(e) {
+            rtx_ui_find_row_text(d, hit, 80, ctx, sizeof(ctx), &line1) !>(e) {
                 ok = 0;
             };
             if (ok) snprintf(line, sizeof(line), "%5zu  %s", line1, ctx);
@@ -405,24 +889,27 @@ static void gui_draw_find(GuiFonts *fonts, RtxUi *ui, RtxDoc *d, int ww, int hh)
             DrawTextEx(fonts->mono, line, pos, 14, 0,
                        cur ? (Color){255, 230, 140, 255}
                            : (Color){200, 206, 220, 255});
-            scratch.destroy();
         }
     }
 }
 
 static void gui_reveal_caret(RtxBuf *b, int vis_rows) {
-    size_t line = b->line_of(b->doc.caret);
-    if (vis_rows < 1) vis_rows = 1;
-    if (line < b->top || line >= b->top + (size_t)vis_rows) {
-        if (line > (size_t)vis_rows / 2) b->top = line - (size_t)vis_rows / 2;
-        else b->top = 0;
+    b->reveal(vis_rows);
+}
+
+static double gui_hit_y(const RtxBuf *b, double y) {
+    size_t s;
+    if (!b) return y;
+    for (s = 0; s < b->top_wrap && s < b->layout.len; s++) {
+        y += b->layout.rows[s].height;
     }
+    return y;
 }
 
 /* Returns 1 if the caller should quit. */
 static int gui_run_cmd(int cmd, RtxWs *w, RtxBuf *act, RtxMeasure *m,
                        double text_w, int vis_rows, RtxUi *ui,
-                       char *status, size_t status_n, int *quit_armed) {
+                       char *status, size_t status_n, size_t *quit_armed_at) {
     @errhandler(CCError e) {
         snprintf(status, status_n, "%s", e.message ? e.message : "error");
         return 0;
@@ -431,7 +918,6 @@ static int gui_run_cmd(int cmd, RtxWs *w, RtxBuf *act, RtxMeasure *m,
         act->doc.save() !>;
         snprintf(status, status_n, "saved");
         act->doc.break_coalesce();
-        *quit_armed = 0;
     } else if (cmd == CMD_UNDO) {
         act->doc.undo() !>;
         gui_after_edit(act, m, text_w, vis_rows) !>;
@@ -455,12 +941,9 @@ static int gui_run_cmd(int cmd, RtxWs *w, RtxBuf *act, RtxMeasure *m,
     } else if (cmd == CMD_SPLIT) {
         w->toggle_split();
     } else if (cmd == CMD_QUIT) {
-        if (w->any_dirty() && !*quit_armed) {
-            snprintf(status, status_n, "unsaved — save or quit again");
-            *quit_armed = 1;
-        } else {
-            return 1;
-        }
+        (void)quit_armed_at;
+        if (rtx_ui_offer_quit(w, ui)) return 1;
+        status[0] = 0;
     } else if (cmd == CMD_JUMP) {
         rtx_ui_start_jump(ui);
     } else if (cmd == CMD_FIND) {
@@ -470,6 +953,12 @@ static int gui_run_cmd(int cmd, RtxWs *w, RtxBuf *act, RtxMeasure *m,
         ui->help = !ui->help;
     } else if (cmd == CMD_SEL_ALL) {
         act->doc.select_all();
+    } else if (cmd == CMD_WRAP) {
+        act->layout.wrap = !act->layout.wrap;
+        act->top_wrap = 0;
+        act->layout.len = 0;
+        act->clear_pref();
+        snprintf(status, status_n, act->layout.wrap ? "wrap on" : "wrap off");
     }
     return 0;
 }
@@ -478,13 +967,11 @@ static void gui_draw_buf(RtxBuf *b, GuiFonts *fonts, int focused, int x0, int y0
                          int pw, int ph, int pad) {
     size_t i;
     double acc = 0;
-    size_t lo = b->doc.sel_lo();
-    size_t hi = b->doc.sel_hi();
     int has = b->doc.has_sel();
     float gpx = gui_gutter_px(fonts, b);
     (void)pw;
     (void)pad;
-    for (i = 0; i < b->layout.len; i++) {
+    for (i = b->top_wrap; i < b->layout.len; i++) {
         RtxVisRow *row = &b->layout.rows[i];
         double y = (double)y0 + acc;
         acc += row->height;
@@ -494,7 +981,13 @@ static void gui_draw_buf(RtxBuf *b, GuiFonts *fonts, int focused, int x0, int y0
             size_t k;
             double x = (double)x0 + (double)gpx;
             size_t line = row->line;
+            size_t box_l0 = 0, box_l1 = 0;
+            int box_row = 0;
             int show_ln = (i == 0 || b->layout.rows[i - 1].line != line);
+            if (b->doc.sel_box) {
+                rtx_doc_box_lines(&b->doc, &box_l0, &box_l1);
+                box_row = (line >= box_l0 && line <= box_l1);
+            }
             cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
             if (show_ln) {
                 char ln[16];
@@ -505,7 +998,6 @@ static void gui_draw_buf(RtxBuf *b, GuiFonts *fonts, int focused, int x0, int y0
                 DrawTextEx(fonts->mono, ln, lp, 13, 0, (Color){110, 114, 128, 255});
             }
             char[:] bytes = b->scratch_span(&scratch, row->byte_start, row->byte_len) !>(e) {
-                scratch.destroy();
                 return;
             };
             for (k = 0; k < bytes.len; k++) {
@@ -520,11 +1012,13 @@ static void gui_draw_buf(RtxBuf *b, GuiFonts *fonts, int focused, int x0, int y0
                 gw = gui_measure(fonts, one, st, row->sec);
                 pos.x = (float)x;
                 pos.y = (float)y;
-                if (has && off >= lo && off < hi) {
+                if (has && b->doc.sel_covers(off)) {
                     DrawRectangle((int)x, (int)y, (int)gw + 1, (int)row->height,
                                   (Color){40, 70, 120, 255});
                 }
-                if (focused && b->doc.caret == off) {
+                if (focused && (b->doc.caret == off ||
+                    (box_row && rtx_box_col_on_line(&b->doc, line, b->doc.box_ccol) ==
+                     off - b->doc.line_start(line)))) {
                     DrawRectangle((int)x, (int)y, 2, (int)row->height,
                                   (Color){255, 200, 80, 255});
                 }
@@ -532,14 +1026,192 @@ static void gui_draw_buf(RtxBuf *b, GuiFonts *fonts, int focused, int x0, int y0
                            gui_size(fonts, st, row->sec), 0, gui_hl_color(st.hl));
                 x += gw;
             }
-            if (focused && b->doc.caret == row->byte_start + row->byte_len) {
+            if (focused && (b->doc.caret == row->byte_start + row->byte_len ||
+                (box_row &&
+                 b->doc.line_start(line) + rtx_box_col_on_line(&b->doc, line, b->doc.box_ccol) ==
+                 row->byte_start + row->byte_len))) {
                 DrawRectangle((int)x, (int)y, 2, (int)row->height,
                               (Color){255, 200, 80, 255});
             }
-            scratch.destroy();
         }
     }
 }
+
+/* Shared scene state so macOS live-resize can repaint while PollInputEvents
+ * is blocked inside AppKit's nested resize tracking loop. */
+typedef struct {
+    RtxWs *w;
+    RtxMeasure *m;
+    GuiFonts *fonts;
+    RtxUi *ui;
+    int *menu_open;
+    char *status;
+    int pad;
+    int top;
+    int ready;
+    int painting;   /* live-resize paint in progress */
+    int draw_open;  /* BeginDrawing without matching end/swap */
+    void *resize_observer;
+    void *resize_center;
+} GuiLive;
+
+static GuiLive g_live;
+
+static void gui_geom(int *ww, int *hh, int *inner, int *pane_w, int *vis_rows,
+                     int pad, int top, int find_on) {
+    *ww = GetScreenWidth();
+    *hh = GetScreenHeight();
+    *inner = *ww - 2 * pad;
+    if (*inner < 40) *inner = 40;
+    *pane_w = (g_live.w && g_live.w->npanes >= 2) ? (*inner / 2 - 8) : *inner;
+    *vis_rows = (*hh - top - 28 - (find_on ? GUI_FIND_H : 0)) / 20;
+    if (*vis_rows < 4) *vis_rows = 4;
+}
+
+static void !>(CCError) gui_relayout(int pane_w, int vis_rows) {
+    int p;
+    if (!g_live.w || !g_live.m || !g_live.fonts) {
+        return cc_err(CC_ERR_INVALID_ARG, "live layout");
+    }
+    for (p = 0; p < g_live.w->npanes; p++) {
+        RtxBuf *b = &g_live.w->bufs[g_live.w->pane[p]];
+        size_t nlines = b->line_count();
+        if (b->top >= nlines && nlines) b->top = nlines - 1;
+        gui_ensure_view(b, g_live.m,
+                        (double)pane_w - (double)gui_gutter_px(g_live.fonts, b),
+                        vis_rows) !>(e) { return cc_err(e); };
+    }
+    return cc_ok();
+}
+
+/* Draw contents only. Caller owns BeginDrawing / EndDrawing or flush+swap. */
+static void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner) {
+    int p;
+    RtxBuf *act;
+    if (!g_live.w || !g_live.fonts || !g_live.ui) return;
+    act = RtxWs_active(g_live.w);
+    ClearBackground((Color){24, 24, 28, 255});
+    for (p = 0; p < g_live.w->npanes; p++) {
+        RtxBuf *b = &g_live.w->bufs[g_live.w->pane[p]];
+        int x0 = pad + (p == 1 ? inner / 2 + 8 : 0);
+        if (g_live.w->npanes == 2 && p == 1) {
+            DrawLine(pad + inner / 2, top, pad + inner / 2,
+                     hh - 28 - (g_live.ui->find ? GUI_FIND_H : 0),
+                     (Color){80, 80, 90, 255});
+        }
+        gui_draw_buf(b, g_live.fonts, p == g_live.w->focus, x0, top, pane_w,
+                     hh - top - 28 - (g_live.ui->find ? GUI_FIND_H : 0), pad);
+    }
+    gui_draw_menubar(g_live.fonts, ww, g_live.menu_open ? *g_live.menu_open : -1,
+                     GetMousePosition());
+    if (g_live.ui->help) gui_draw_help(g_live.fonts, ww, hh);
+    if (g_live.ui->jump) gui_draw_jump(g_live.fonts, g_live.ui, ww, hh);
+    if (g_live.ui->find && act) gui_draw_find(g_live.fonts, g_live.ui, &act->doc, ww, hh);
+    if (g_live.ui->ask_quit) gui_draw_quit(g_live.fonts, g_live.w, ww, hh);
+    {
+        const char *path = (act && act->doc.path.ptr) ? act->doc.path.ptr : "(untitled)";
+        const char *star = (act && act->doc.dirty()) ? "*" : "";
+        const char *status = g_live.status ? g_live.status : "";
+        char bar[256];
+        Vector2 bp;
+        size_t cur = act ? act->line_of(act->doc.caret) + 1 : 0;
+        size_t nln = act ? act->line_count() : 0;
+        if (g_live.ui->ask_quit) {
+            snprintf(bar, sizeof(bar), "unsaved  S save  Q don't save  Esc cancel  %s",
+                     status);
+        } else if (g_live.ui->jump) {
+            snprintf(bar, sizeof(bar), "jump to line: %s_", g_live.ui->jump_buf);
+        } else if (g_live.ui->find) {
+            snprintf(bar, sizeof(bar), "find  up/down hits  Esc close  %s", status);
+        } else {
+            snprintf(bar, sizeof(bar), "%s%s  L%zu/%zu  %s",
+                     star, path, cur, nln, status);
+        }
+        DrawRectangle(0, hh - 26, ww, 26, (Color){36, 38, 46, 255});
+        bp.x = 12;
+        bp.y = (float)(hh - 22);
+        DrawTextEx(g_live.fonts->mono, bar, bp, 14, 0, (Color){170, 174, 186, 255});
+    }
+}
+
+/* Paint + swap without PollInputEvents (unsafe to nest inside a resize).
+ * Only safe when no BeginDrawing is open — EndDrawing has already swapped
+ * before it polls, so resize notifications land in that window. */
+static void gui_live_paint(void) {
+    int ww, hh, inner, pane_w, vis_rows;
+    if (!g_live.ready || g_live.painting || g_live.draw_open) return;
+    g_live.painting = 1;
+    @errhandler(CCError e) {
+        (void)e;
+        g_live.painting = 0;
+        g_live.draw_open = 0;
+        return;
+    }
+    gui_geom(&ww, &hh, &inner, &pane_w, &vis_rows, g_live.pad, g_live.top,
+             g_live.ui && g_live.ui->find);
+    gui_relayout(pane_w, vis_rows) !>;
+    BeginDrawing();
+    g_live.draw_open = 1;
+    gui_draw_body(ww, hh, g_live.pad, g_live.top, pane_w, inner);
+    rlDrawRenderBatchActive();
+    SwapScreenBuffer();
+    g_live.draw_open = 0;
+    g_live.painting = 0;
+}
+
+#if defined(__APPLE__)
+static void rtx_on_window_resize(id self, SEL cmd, id note) {
+    (void)self;
+    (void)cmd;
+    (void)note;
+    gui_live_paint();
+}
+
+static void gui_install_live_resize(void) {
+    Class cls;
+    id observer;
+    id center;
+    id name;
+    id window;
+
+    window = (id)GetWindowHandle();
+    if (!window) return;
+
+    cls = objc_allocateClassPair(objc_getClass("NSObject"), "RtxGuiResizeObserver", 0);
+    if (!cls) return;
+    class_addMethod(cls, sel_getUid("onResize:"), (IMP)rtx_on_window_resize, "v@:@");
+    objc_registerClassPair(cls);
+
+    observer = ((id (*)(id, SEL))objc_msgSend)((id)cls, sel_getUid("new"));
+    center = ((id (*)(id, SEL))objc_msgSend)(
+        (id)objc_getClass("NSNotificationCenter"), sel_getUid("defaultCenter"));
+    name = ((id (*)(id, SEL, const char *))objc_msgSend)(
+        (id)objc_getClass("NSString"), sel_getUid("stringWithUTF8String:"),
+        "NSWindowDidResizeNotification");
+    ((void (*)(id, SEL, id, SEL, id, id))objc_msgSend)(
+        center, sel_getUid("addObserver:selector:name:object:"),
+        observer, sel_getUid("onResize:"), name, window);
+    g_live.resize_observer = (void *)observer;
+    g_live.resize_center = (void *)center;
+}
+
+static void gui_uninstall_live_resize(void) {
+    id center = (id)g_live.resize_center;
+    id observer = (id)g_live.resize_observer;
+    if (center && observer) {
+        ((void (*)(id, SEL, id))objc_msgSend)(
+            center, sel_getUid("removeObserver:"), observer);
+        ((void (*)(id, SEL))objc_msgSend)(observer, sel_getUid("release"));
+    }
+    g_live.resize_observer = NULL;
+    g_live.resize_center = NULL;
+}
+#else
+static void gui_install_live_resize(void) {
+}
+static void gui_uninstall_live_resize(void) {
+}
+#endif
 
 int main(int argc, char **argv) {
     @errhandler(CCError e) { cc_error_log(e); return 1; }
@@ -554,7 +1226,8 @@ int main(int argc, char **argv) {
     int pad = 16;
     int top = GUI_MENU_H + 8;
     int dragging = 0;
-    int quit_armed = 0;
+    size_t quit_armed_at = (size_t)-1;
+    int close_held = 0;
     int menu_open = -1;
     char status[160];
     RtxUi ui;
@@ -570,6 +1243,7 @@ int main(int argc, char **argv) {
     InitWindow(ww, hh, "raytext");
     SetExitKey(0);
     SetTargetFPS(60);
+    gui_install_live_resize();
 
     {
         Vector2 dpi = GetWindowScaleDPI();
@@ -587,21 +1261,28 @@ int main(int argc, char **argv) {
     m.line_height = gui_lh;
     m.ctx = &fonts;
 
-    while (!WindowShouldClose()) {
-        Vector2 mouse;
-        int key;
+    g_live.w = &w;
+    g_live.m = &m;
+    g_live.fonts = &fonts;
+    g_live.ui = &ui;
+    g_live.menu_open = &menu_open;
+    g_live.status = status;
+    g_live.pad = pad;
+    g_live.top = top;
+    g_live.ready = 1;
+
+    for (;;) {
+        if (WindowShouldClose()) {
+            if (!w.any_dirty()) break;
+            if (!ui.ask_quit && !close_held) rtx_ui_offer_quit(&w, &ui);
+            close_held = 1;
+        }
         int p;
         int inner;
         int pane_w;
         int vis_rows;
         RtxBuf *act;
-        ww = GetScreenWidth();
-        hh = GetScreenHeight();
-        inner = ww - 2 * pad;
-        if (inner < 40) inner = 40;
-        pane_w = (w.npanes < 2) ? inner : (inner / 2 - 8);
-        vis_rows = (hh - top - 28 - (ui.find ? GUI_FIND_H : 0)) / 20;
-        if (vis_rows < 4) vis_rows = 4;
+        gui_geom(&ww, &hh, &inner, &pane_w, &vis_rows, pad, top, ui.find);
         act = w.active();
         if (act && ui.find) {
             rtx_ui_find_pump(&ui, &act->doc) !>;
@@ -611,293 +1292,32 @@ int main(int argc, char **argv) {
             RtxBuf *b = &w.bufs[w.pane[p]];
             size_t nlines = b->line_count();
             if (p == w.focus) {
-                int wheel = (int)GetMouseWheelMove();
-                if (wheel > 0 && b->top >= (size_t)wheel) b->top -= (size_t)wheel;
-                else if (wheel > 0) b->top = 0;
-                else if (wheel < 0) b->top += (size_t)(-wheel);
+                gui_wheel(b, &m, (double)pane_w - (double)gui_gutter_px(&fonts, b));
             }
             if (b->top >= nlines && nlines) b->top = nlines - 1;
-            gui_ensure_view(b, &m, (double)pane_w - (double)gui_gutter_px(&fonts, b),
-                            vis_rows) !>;
         }
+        gui_relayout(pane_w, vis_rows) !>;
         act = w.active();
 
-        if (menu_open >= 0) {
-            Vector2 hm = GetMousePosition();
-            if (hm.y >= 0 && hm.y < (float)GUI_MENU_H) {
-                int mi;
-                for (mi = 0; mi < 4; mi++) {
-                    if (hm.x >= (float)gui_menus[mi].x &&
-                        hm.x < (float)(gui_menus[mi].x + gui_menus[mi].w)) {
-                        menu_open = mi;
-                    }
-                }
-            }
+        if (gui_handle_input(&w, act, &m, &fonts, &ui, status, sizeof(status),
+                             &quit_armed_at, &menu_open, &dragging, pane_w,
+                             vis_rows, pad, top, inner, hh)) {
+            break;
         }
-
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            int mcmd = CMD_NONE;
-            int mhit;
-            mouse = GetMousePosition();
-            mhit = gui_menu_click((int)mouse.x, (int)mouse.y, &menu_open, &mcmd);
-            if (mhit == 2) {
-                if (gui_run_cmd(mcmd, &w, act, &m,
-                                (double)pane_w - (double)gui_gutter_px(&fonts, act),
-                                vis_rows, &ui, status, sizeof(status),
-                                &quit_armed)) {
-                    break;
-                }
-            } else if (mhit == 0 && ui.find &&
-                       mouse.y >= (float)(hh - 26 - GUI_FIND_H) &&
-                       mouse.y < (float)(hh - 26)) {
-                int row = ((int)mouse.y - (hh - 26 - GUI_FIND_H) - 8) / GUI_FIND_ROW_H;
-                if (row >= 1) {
-                    size_t hit = ui.find_top + (size_t)(row - 1);
-                    if (hit < act->doc.find.len) act->doc.find_goto(hit);
-                }
-            } else if (mhit == 0) {
-                w.focus = gui_pane_at(&w, (int)mouse.x, pad, inner);
-                act = w.active();
-                {
-                    int x0 = pad + (w.focus == 1 && w.npanes == 2 ? inner / 2 + 8 : 0);
-                    double x = (double)mouse.x - (double)x0 - (double)gui_gutter_px(&fonts, act);
-                    double y = (double)mouse.y - (double)top;
-                    if (x >= 0 && y >= 0) {
-                        size_t at = act->layout.hit(&act->doc, &m, x, y) !>;
-                        act->doc.caret = at;
-                        if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
-                        dragging = 1;
-                        act->doc.break_coalesce();
-                    }
-                }
-            }
-        }
-        if (dragging && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            mouse = GetMousePosition();
-            {
-                int x0 = pad + (w.focus == 1 && w.npanes == 2 ? inner / 2 + 8 : 0);
-                double x = (double)mouse.x - (double)x0 - (double)gui_gutter_px(&fonts, act);
-                double y = (double)mouse.y - (double)top;
-                if (x < 0) x = 0;
-                if (y < 0) y = 0;
-                size_t at = act->layout.hit(&act->doc, &m, x, y) !>;
-                act->doc.caret = at;
-            }
-        }
-        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) dragging = 0;
-
-        if (ui.jump) {
-            if (IsKeyPressed(KEY_ESCAPE)) {
-                rtx_ui_clear_jump(&ui);
-            } else if (IsKeyPressed(KEY_ENTER)) {
-                rtx_ui_apply_jump(&ui, &act->doc);
-                gui_reveal_caret(act, vis_rows);
-            } else if (IsKeyPressed(KEY_BACKSPACE) && ui.jump_len > 0) {
-                ui.jump_buf[--ui.jump_len] = 0;
-            } else {
-                key = GetCharPressed();
-                while (key > 0) {
-                    rtx_ui_jump_char(&ui, key);
-                    key = GetCharPressed();
-                }
-            }
-        } else if (ui.find) {
-            if (IsKeyPressed(KEY_ESCAPE)) {
-                rtx_ui_clear_find(&ui);
-            } else if (IsKeyPressed(KEY_UP)) {
-                act->doc.find_prev();
-                gui_reveal_caret(act, vis_rows);
-            } else if (IsKeyPressed(KEY_DOWN)) {
-                act->doc.find_next();
-                gui_reveal_caret(act, vis_rows);
-            } else if (IsKeyPressed(KEY_BACKSPACE) && ui.find_len > 0) {
-                ui.find_buf[--ui.find_len] = 0;
-                rtx_ui_find_apply(&ui, &act->doc) !>;
-                gui_reveal_caret(act, vis_rows);
-            } else if (gui_ctrl() && (IsKeyPressed(KEY_G) || IsKeyPressed(KEY_J))) {
-                rtx_ui_start_jump(&ui);
-            } else if (gui_ctrl() && IsKeyPressed(KEY_Q)) {
-                if (gui_run_cmd(CMD_QUIT, &w, act, &m,
-                                (double)pane_w - (double)gui_gutter_px(&fonts, act),
-                                vis_rows, &ui, status, sizeof(status),
-                                &quit_armed)) {
-                    break;
-                }
-            } else if (gui_ctrl() && IsKeyPressed(KEY_S)) {
-                gui_run_cmd(CMD_SAVE, &w, act, &m,
-                            (double)pane_w - (double)gui_gutter_px(&fonts, act),
-                            vis_rows, &ui, status, sizeof(status),
-                            &quit_armed);
-            } else {
-                key = GetCharPressed();
-                while (key > 0) {
-                    if (rtx_ui_find_char(&ui, key)) {
-                        rtx_ui_find_apply(&ui, &act->doc) !>;
-                        gui_reveal_caret(act, vis_rows);
-                    }
-                    key = GetCharPressed();
-                }
-            }
-        } else if (IsKeyPressed(KEY_ESCAPE)) {
-            menu_open = -1;
-            ui.help = !ui.help;
-        } else {
-            int cmd = CMD_NONE;
-            if (ui.help) {
-                if (IsKeyPressed(KEY_S)) cmd = CMD_SAVE;
-                else if (IsKeyPressed(KEY_Z)) cmd = CMD_UNDO;
-                else if (IsKeyPressed(KEY_Y)) cmd = CMD_REDO;
-                else if (IsKeyPressed(KEY_X)) cmd = CMD_CUT;
-                else if (IsKeyPressed(KEY_C)) cmd = CMD_COPY;
-                else if (IsKeyPressed(KEY_V)) cmd = CMD_PASTE;
-                else if (IsKeyPressed(KEY_W)) cmd = CMD_PANE;
-                else if (IsKeyPressed(KEY_N) || IsKeyPressed(KEY_TAB)) cmd = CMD_NEXT;
-                else if (IsKeyPressed(KEY_BACKSLASH)) cmd = CMD_SPLIT;
-                else if (IsKeyPressed(KEY_Q)) cmd = CMD_QUIT;
-                else if (IsKeyPressed(KEY_G)) cmd = CMD_JUMP;
-                else if (IsKeyPressed(KEY_F)) cmd = CMD_FIND;
-                else if (IsKeyPressed(KEY_A)) cmd = CMD_SEL_ALL;
-                if (cmd == CMD_NONE) {
-                    while (GetCharPressed() > 0) { }
-                } else {
-                    ui.help = 0;
-                }
-            } else if (gui_ctrl() && (IsKeyPressed(KEY_G) || IsKeyPressed(KEY_J))) {
-                cmd = CMD_JUMP;
-            } else if (gui_ctrl() && IsKeyPressed(KEY_F)) {
-                cmd = CMD_FIND;
-            } else if (gui_ctrl() && IsKeyPressed(KEY_S)) {
-                cmd = CMD_SAVE;
-            } else if (gui_ctrl() && IsKeyPressed(KEY_Z) && !gui_shift()) {
-                cmd = CMD_UNDO;
-            } else if ((gui_ctrl() && IsKeyPressed(KEY_Y)) ||
-                       (gui_ctrl() && gui_shift() && IsKeyPressed(KEY_Z))) {
-                cmd = CMD_REDO;
-            } else if (gui_ctrl() && IsKeyPressed(KEY_C)) {
-                cmd = CMD_COPY;
-            } else if (gui_ctrl() && IsKeyPressed(KEY_X)) {
-                cmd = CMD_CUT;
-            } else if (gui_ctrl() && IsKeyPressed(KEY_V)) {
-                cmd = CMD_PASTE;
-            } else if (gui_ctrl() && IsKeyPressed(KEY_W)) {
-                cmd = CMD_PANE;
-            } else if (gui_ctrl() && (IsKeyPressed(KEY_TAB) || IsKeyPressed(KEY_N))) {
-                cmd = CMD_NEXT;
-            } else if (gui_ctrl() && IsKeyPressed(KEY_BACKSLASH)) {
-                cmd = CMD_SPLIT;
-            } else if (gui_ctrl() && IsKeyPressed(KEY_Q)) {
-                cmd = CMD_QUIT;
-            } else if (gui_ctrl() && IsKeyPressed(KEY_A)) {
-                cmd = CMD_SEL_ALL;
-            }
-            if (cmd != CMD_NONE) {
-                while (GetCharPressed() > 0) { }
-                if (gui_run_cmd(cmd, &w, act, &m,
-                                (double)pane_w - (double)gui_gutter_px(&fonts, act),
-                                vis_rows, &ui, status, sizeof(status),
-                                &quit_armed)) {
-                    break;
-                }
-            } else if (!ui.help &&
-                       (IsKeyPressed(KEY_HOME) ||
-                        (gui_ctrl() && IsKeyPressed(KEY_LEFT)))) {
-                act->doc.move_line_edge(0, gui_shift());
-                while (GetCharPressed() > 0) { }
-            } else if (!ui.help &&
-                       (IsKeyPressed(KEY_END) ||
-                        (gui_ctrl() && IsKeyPressed(KEY_RIGHT)))) {
-                act->doc.move_line_edge(1, gui_shift());
-                while (GetCharPressed() > 0) { }
-            } else if (!ui.help && !gui_ctrl()) {
-            if (IsKeyPressed(KEY_LEFT)) {
-                if (!gui_shift() && act->doc.has_sel()) {
-                    act->doc.caret = act->doc.sel_lo();
-                    act->doc.clear_sel();
-                } else if (act->doc.caret > 0) {
-                    if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
-                    act->doc.caret--;
-                    if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
-                }
-                act->doc.break_coalesce();
-            }
-            if (IsKeyPressed(KEY_RIGHT)) {
-                size_t n = act->len();
-                if (!gui_shift() && act->doc.has_sel()) {
-                    act->doc.caret = act->doc.sel_hi();
-                    act->doc.clear_sel();
-                } else if (act->doc.caret < n) {
-                    if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
-                    act->doc.caret++;
-                    if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
-                }
-                act->doc.break_coalesce();
-            }
-            if (IsKeyPressed(KEY_BACKSPACE)) {
-                act->doc.backspace() !>;
-                gui_after_edit(act, &m, (double)pane_w - (double)gui_gutter_px(&fonts, act), vis_rows) !>;
-            }
-            if (IsKeyPressed(KEY_DELETE)) {
-                act->doc.delete_forward() !>;
-                gui_after_edit(act, &m, (double)pane_w - (double)gui_gutter_px(&fonts, act), vis_rows) !>;
-            }
-            if (IsKeyPressed(KEY_ENTER)) {
-                act->doc.type("\n") !>;
-                gui_after_edit(act, &m, (double)pane_w - (double)gui_gutter_px(&fonts, act), vis_rows) !>;
-            }
-            key = GetCharPressed();
-            while (key > 0) {
-                if (key >= 32 && key < 127) {
-                    char s[2];
-                    s[0] = (char)key;
-                    s[1] = 0;
-                    act->doc.type(s.to_slice_n(1)) !>;
-                    gui_after_edit(act, &m, (double)pane_w - (double)gui_gutter_px(&fonts, act), vis_rows) !>;
-                }
-                key = GetCharPressed();
-            }
-            }
+        act = w.active();
+        if (act && act->layout.from_line != act->top) {
+            gui_relayout(pane_w, vis_rows) !>;
         }
 
         BeginDrawing();
-        ClearBackground((Color){24, 24, 28, 255});
-        for (p = 0; p < w.npanes; p++) {
-            RtxBuf *b = &w.bufs[w.pane[p]];
-            int x0 = pad + (p == 1 ? inner / 2 + 8 : 0);
-            if (w.npanes == 2 && p == 1) {
-                DrawLine(pad + inner / 2, top, pad + inner / 2,
-                         hh - 28 - (ui.find ? GUI_FIND_H : 0),
-                         (Color){80, 80, 90, 255});
-            }
-            gui_draw_buf(b, &fonts, p == w.focus, x0, top, pane_w,
-                         hh - top - 28 - (ui.find ? GUI_FIND_H : 0), pad);
-        }
-        gui_draw_menubar(&fonts, ww, menu_open, GetMousePosition());
-        if (ui.help) gui_draw_help(&fonts, ww, hh);
-        if (ui.jump) gui_draw_jump(&fonts, &ui, ww, hh);
-        if (ui.find && act) gui_draw_find(&fonts, &ui, &act->doc, ww, hh);
-        {
-            const char *path = (act && act->doc.path.ptr) ? act->doc.path.ptr : "(untitled)";
-            const char *star = (act && act->doc.dirty()) ? "*" : "";
-            char bar[256];
-            Vector2 bp;
-            size_t cur = act ? act->line_of(act->doc.caret) + 1 : 0;
-            size_t nln = act ? act->line_count() : 0;
-            if (ui.jump) {
-                snprintf(bar, sizeof(bar), "jump to line: %s_", ui.jump_buf);
-            } else if (ui.find) {
-                snprintf(bar, sizeof(bar), "find  up/down hits  Esc close  %s", status);
-            } else {
-                snprintf(bar, sizeof(bar), "%s%s  L%zu/%zu  %s",
-                         star, path, cur, nln, status);
-            }
-            DrawRectangle(0, hh - 26, ww, 26, (Color){36, 38, 46, 255});
-            bp.x = 12;
-            bp.y = (float)(hh - 22);
-            DrawTextEx(fonts.mono, bar, bp, 14, 0, (Color){170, 174, 186, 255});
-        }
+        g_live.draw_open = 1;
+        gui_draw_body(ww, hh, pad, top, pane_w, inner);
+        g_live.draw_open = 0;
         EndDrawing();
     }
 
+    g_live.ready = 0;
+    gui_uninstall_live_resize();
     if (fonts.owned_mono) UnloadFont(fonts.mono);
     if (fonts.owned_prose) UnloadFont(fonts.prose);
     CloseWindow();

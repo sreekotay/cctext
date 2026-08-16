@@ -13,6 +13,14 @@ typedef struct {
     void *ctx;
 } RtxMeasure;
 
+/* Goal column for up/down. `eol` sticks to each line/row end (End key). */
+typedef struct {
+    double x;     /* measure units; wrap on */
+    size_t col;   /* bytes from physical line start; wrap off */
+    int ok;
+    int eol;
+} RtxPref;
+
 typedef struct {
     size_t byte_start;
     size_t byte_len;
@@ -30,6 +38,7 @@ typedef struct {
     double total_height;
     size_t from_line;
     size_t nlines;
+    int wrap;              /* 0 = one visual row per physical line */
 } RtxLayout;
 
 static int RtxLayout_ensure(RtxLayout *L) {
@@ -55,10 +64,11 @@ static void RtxLayout_destroy(RtxLayout *L) {
 }
 
 static int rtx_layout_push(RtxLayout *L, RtxVisRow row) {
-    if (!rtx_arena_grow(&L->store, (void **)&L->rows, &L->cap, L->len + 1,
-                        sizeof(RtxVisRow))) {
+    rtx_arena_grow(&L->store, (void **)&L->rows, &L->cap, L->len + 1,
+                   sizeof(RtxVisRow)) !>(e) {
+        (void)e;
         return 0;
-    }
+    };
     L->rows[L->len++] = row;
     L->total_height += row.height;
     return 1;
@@ -88,26 +98,55 @@ static RtxStyle RtxDoc_style_at(const RtxDoc *d, size_t off) {
     return z;
 }
 
-/* Wrap [from, from+n) at max_width. One visual row per physical line in
- * code sections (no wrap) unless max_width is used for prose. */
+static size_t RtxLayout_row_of(const RtxLayout *L, size_t off);
+
+static int rtx_layout_is_break(char c) {
+    return c == ' ' || c == '\t';
+}
+
+static int rtx_layout_push_row(RtxLayout *L, const RtxMeasure *m,
+                               size_t byte_start, size_t byte_len, size_t phys,
+                               double w, double h, RtxSectionKind sec) {
+    RtxVisRow row;
+    RtxStyle z = {0};
+    row.byte_start = byte_start;
+    row.byte_len = byte_len;
+    row.line = phys;
+    row.width = w;
+    row.height = h > 0 ? h : m->line_height(m->ctx, z, sec);
+    row.sec = sec;
+    if (!rtx_layout_push(L, row)) {
+        L->reset();
+        return 0;
+    }
+    return 1;
+}
+
+/* Wrap [from, from+n). Off: one visual row per physical line. On: last
+ * whitespace if a token fits after it, else a hard break at max_width. */
 static void !>(CCError) RtxLayout_range(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
                             size_t from, size_t n, double max_width) {
     size_t end;
     size_t i;
     size_t phys;
     char[:] bytes;
+    int wrap;
     if (!L || !d || !m || !m->measure || !m->line_height) {
         return cc_err(CC_ERR_INVALID_ARG, "layout range");
     }
     if (!L->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "layout store");
-    end = from + n;
-    if (end > d->len()) end = d->len();
+    wrap = L->wrap && max_width > 0;
+    {
+        size_t dlen = d->len();
+        if (from >= dlen) return cc_ok();
+        if (n > dlen - from) n = dlen - from;
+        end = from + n;
+    }
     if (from >= end) return cc_ok();
     n = end - from;
     {
         cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
         char[:] got = d->scratch_span(&scratch, from, n) !>(e) {
-            scratch.destroy();
             return cc_err(e);
         };
         bytes = got;
@@ -115,49 +154,65 @@ static void !>(CCError) RtxLayout_range(RtxLayout *L, RtxDocLayout d, const RtxM
         phys = from ? d->line_of(from) : 0;
         while (i < n) {
             RtxSectionKind sec = d->section_at(from + i);
-            size_t row_start = i;
             size_t line_end = i;
-            double w = 0;
-            double h = 0;
             RtxStyle z = {0};
-            char[:] line;
             while (line_end < n && bytes.ptr[line_end] != '\n') line_end++;
-            line = bytes.sub(row_start, line_end);
-            if (sec == RTX_SEC_CODE || max_width <= 0) {
-                w = m->measure(m->ctx, line, z, sec);
-                h = m->line_height(m->ctx, z, sec);
+            if (!wrap) {
+                char[:] line = bytes.sub(i, line_end);
+                double w = m->measure(m->ctx, line, z, sec);
+                double h = m->line_height(m->ctx, z, sec);
+                if (!rtx_layout_push_row(L, m, from + i, line_end - i, phys,
+                                         w, h, sec)) {
+                    return cc_err(CC_ERR_OUT_OF_MEMORY, "layout row");
+                }
                 i = line_end;
             } else {
-                w = m->measure(m->ctx, line, z, sec);
-                if (w <= max_width) {
-                    h = m->line_height(m->ctx, z, sec);
-                    i = line_end;
-                } else {
-                    w = 0;
-                    while (i < n && bytes.ptr[i] != '\n') {
+                if (i == line_end) {
+                    double h = m->line_height(m->ctx, z, sec);
+                    if (!rtx_layout_push_row(L, m, from + i, 0, phys, 0, h, sec)) {
+                        return cc_err(CC_ERR_OUT_OF_MEMORY, "layout row");
+                    }
+                }
+                while (i < line_end) {
+                    size_t row_start = i;
+                    double w = 0;
+                    double h = 0;
+                    size_t last_br = i;
+                    double last_br_w = 0;
+                    double last_br_h = 0;
+                    while (i < line_end) {
                         RtxStyle st = d->style_at(from + i);
                         char[:] one = bytes.sub(i, i + 1);
                         double gw = m->measure(m->ctx, one, st, sec);
                         double gh = m->line_height(m->ctx, st, sec);
-                        if (w > 0 && w + gw > max_width) break;
+                        if (w > 0 && w + gw > max_width) {
+                            if (last_br > row_start) {
+                                i = last_br;
+                                w = last_br_w;
+                                h = last_br_h;
+                            }
+                            break;
+                        }
                         w += gw;
                         if (gh > h) h = gh;
                         i++;
+                        if (rtx_layout_is_break(one.ptr[0])) {
+                            last_br = i;
+                            last_br_w = w;
+                            last_br_h = h;
+                        }
                     }
-                }
-            }
-            {
-                RtxVisRow row;
-                row.byte_start = from + row_start;
-                row.byte_len = i - row_start;
-                row.line = phys;
-                row.width = w;
-                row.height = h > 0 ? h : m->line_height(m->ctx, z, sec);
-                row.sec = sec;
-                if (!rtx_layout_push(L, row)) {
-                    scratch.destroy();
-                    L->reset();
-                    return cc_err(CC_ERR_OUT_OF_MEMORY, "layout row");
+                    if (i == row_start) {
+                        RtxStyle st = d->style_at(from + i);
+                        char[:] one = bytes.sub(i, i + 1);
+                        w = m->measure(m->ctx, one, st, sec);
+                        h = m->line_height(m->ctx, st, sec);
+                        i++;
+                    }
+                    if (!rtx_layout_push_row(L, m, from + row_start, i - row_start,
+                                             phys, w, h, sec)) {
+                        return cc_err(CC_ERR_OUT_OF_MEMORY, "layout row");
+                    }
                 }
             }
             if (i < n && bytes.ptr[i] == '\n') {
@@ -165,7 +220,6 @@ static void !>(CCError) RtxLayout_range(RtxLayout *L, RtxDocLayout d, const RtxM
                 phys++;
             }
         }
-        scratch.destroy();
     }
     return cc_ok();
 }
@@ -197,6 +251,76 @@ static void !>(CCError) RtxLayout_lines(RtxLayout *L, RtxDocLayout d, const RtxM
     return L->range(d, m, from, to - from, max_width);
 }
 
+/* Keep adding physical lines until at least `min_rows` visual rows exist. */
+static void !>(CCError) RtxLayout_fill(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
+                           double max_width, size_t from_line, size_t min_rows) {
+    size_t total;
+    size_t nphys;
+    size_t guard = 0;
+    if (!L || !d || !m) return cc_err(CC_ERR_INVALID_ARG, "layout fill");
+    total = d->line_count();
+    if (min_rows == 0) min_rows = 1;
+    nphys = min_rows;
+    if (!L->wrap) return L->lines(d, m, max_width, from_line, nphys);
+    for (;;) {
+        L->lines(d, m, max_width, from_line, nphys) !>(e) { return cc_err(e); };
+        if (L->len >= min_rows) return cc_ok();
+        if (from_line + nphys >= total) return cc_ok();
+        nphys += min_rows - L->len;
+        if (++guard > 24) return cc_ok();
+    }
+}
+
+static size_t !>(CCError) rtx_layout_hit_row(const RtxVisRow *r, RtxDocLayout d,
+                                            const RtxMeasure *m, double x) {
+    size_t k;
+    size_t hit;
+    double cx = 0;
+    cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+    if (!r || !d || !m) return cc_ok(0);
+    hit = r->byte_start + r->byte_len;
+    {
+        char[:] bytes = d->scratch_span(&scratch, r->byte_start, r->byte_len) !>(e) {
+            return cc_err(e);
+        };
+        for (k = 0; k < bytes.len; k++) {
+            RtxStyle st = d->style_at(r->byte_start + k);
+            char[:] one = bytes.sub(k, k + 1);
+            double gw = m->measure(m->ctx, one, st, r->sec);
+            if (cx + gw / 2.0 >= x) {
+                hit = r->byte_start + k;
+                break;
+            }
+            cx += gw;
+        }
+    }
+    return cc_ok(hit);
+}
+
+static double !>(CCError) RtxLayout_x_of(const RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
+                             size_t off) {
+    size_t i;
+    size_t k;
+    double x = 0;
+    const RtxVisRow *r;
+    cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+    if (!L || !d || !m || L->len == 0) return cc_ok(0);
+    i = L->row_of(off);
+    r = &L->rows[i];
+    if (off <= r->byte_start) return cc_ok(0);
+    {
+        char[:] bytes = d->scratch_span(&scratch, r->byte_start, r->byte_len) !>(e) {
+            return cc_err(e);
+        };
+        for (k = 0; k < bytes.len && r->byte_start + k < off; k++) {
+            RtxStyle st = d->style_at(r->byte_start + k);
+            char[:] one = bytes.sub(k, k + 1);
+            x += m->measure(m->ctx, one, st, r->sec);
+        }
+    }
+    return cc_ok(x);
+}
+
 /* Hit-test: y is in measure units from the top of L. Returns byte offset. */
 static size_t !>(CCError) RtxLayout_hit(const RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
                              double x, double y) {
@@ -206,30 +330,21 @@ static size_t !>(CCError) RtxLayout_hit(const RtxLayout *L, RtxDocLayout d, cons
     for (i = 0; i < L->len; i++) {
         RtxVisRow *r = &L->rows[i];
         if (y < acc + r->height || i + 1 == L->len) {
-            size_t k;
-            size_t hit = r->byte_start + r->byte_len;
-            double cx = 0;
-            cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
-            char[:] bytes = d->scratch_span(&scratch, r->byte_start, r->byte_len) !>(e) {
-                scratch.destroy();
-                return cc_err(e);
-            };
-            for (k = 0; k < bytes.len; k++) {
-                RtxStyle st = d->style_at(r->byte_start + k);
-                char[:] one = bytes.sub(k, k + 1);
-                double gw = m->measure(m->ctx, one, st, r->sec);
-                if (cx + gw / 2.0 >= x) {
-                    hit = r->byte_start + k;
-                    break;
-                }
-                cx += gw;
-            }
-            scratch.destroy();
-            return cc_ok(hit);
+            return rtx_layout_hit_row(r, d, m, x);
         }
         acc += r->height;
     }
     return cc_ok(d->len());
+}
+
+static size_t RtxLayout_rows_for_line(const RtxLayout *L, size_t phys) {
+    size_t i;
+    size_t n = 0;
+    if (!L) return 0;
+    for (i = 0; i < L->len; i++) {
+        if (L->rows[i].line == phys) n++;
+    }
+    return n;
 }
 
 /* Visual row containing `off`. Caret on a newline sits at the end of the
@@ -254,12 +369,105 @@ static size_t RtxLayout_row_of(const RtxLayout *L, size_t off) {
     return 0;
 }
 
+static void RtxLayout_move_row_edge(RtxLayout *L, RtxDoc *d, int to_end, int shift) {
+    size_t i;
+    size_t a, b;
+    if (!L || !d || L->len == 0) return;
+    i = L->row_of(d->caret);
+    a = L->rows[i].byte_start;
+    b = a + L->rows[i].byte_len;
+    if (!shift) d->sel_anchor = to_end ? b : a;
+    d->caret = to_end ? b : a;
+    d->break_coalesce();
+}
+
+/* Visual-row up/down when wrap is on; physical lines when it is off.
+ * `pref` keeps the goal column (or EOL) across short lines. */
+static void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
+                                double width, int dir, int shift, RtxPref *pref) {
+    size_t phys;
+    size_t nlines;
+    size_t row;
+    int capture;
+    RtxLayout one = {0} @destroy;
+    if (!L || !d || !m || !pref) return cc_err(CC_ERR_INVALID_ARG, "move vert");
+    if (!shift) {
+        d->sel_anchor = d->caret;
+        d->sel_box = 0;
+    }
+    nlines = d->line_count();
+    phys = d->line_of(d->caret);
+    capture = !pref->ok;
+    if (capture) {
+        pref->col = d->caret - d->line_start(phys);
+        pref->ok = 1;
+    }
+    if (!L->wrap) {
+        size_t next = phys;
+        size_t ns, nend, nlen;
+        if (dir < 0 && phys > 0) next = phys - 1;
+        if (dir > 0 && phys + 1 < nlines) next = phys + 1;
+        ns = d->line_start(next);
+        nend = rtx_doc_line_end_caret(d, ns);
+        nlen = nend - ns;
+        if (pref->eol) d->caret = nend;
+        else d->caret = ns + (pref->col < nlen ? pref->col : nlen);
+        if (!shift) d->sel_anchor = d->caret;
+        d->break_coalesce();
+        return cc_ok();
+    }
+    one.wrap = 1;
+    one.lines(d, m, width, phys, 1) !>(e) { return cc_err(e); };
+    if (one.len == 0) return cc_ok();
+    row = one.row_of(d->caret);
+    if (capture && !pref->eol) {
+        double x = one.x_of(d, m, d->caret) !>(e) { return cc_err(e); };
+        pref->x = x;
+    }
+    if (dir < 0) {
+        if (row > 0) row--;
+        else if (phys == 0) {
+            if (!shift) d->sel_anchor = d->caret;
+            d->break_coalesce();
+            return cc_ok();
+        } else {
+            one.reset();
+            one.wrap = 1;
+            one.lines(d, m, width, phys - 1, 1) !>(e) { return cc_err(e); };
+            row = one.len ? one.len - 1 : 0;
+        }
+    } else {
+        if (row + 1 < one.len) row++;
+        else if (phys + 1 >= nlines) {
+            if (!shift) d->sel_anchor = d->caret;
+            d->break_coalesce();
+            return cc_ok();
+        } else {
+            one.reset();
+            one.wrap = 1;
+            one.lines(d, m, width, phys + 1, 1) !>(e) { return cc_err(e); };
+            row = 0;
+        }
+    }
+    if (row >= one.len) row = one.len ? one.len - 1 : 0;
+    if (pref->eol) {
+        d->caret = one.rows[row].byte_start + one.rows[row].byte_len;
+    } else {
+        size_t at = rtx_layout_hit_row(&one.rows[row], d, m, pref->x) !>(e) {
+            return cc_err(e);
+        };
+        d->caret = at;
+    }
+    if (!shift) d->sel_anchor = d->caret;
+    d->break_coalesce();
+    return cc_ok();
+}
+
 /* Derived geometry: reset the layout epoch and rebuild the current window. */
 static void !>(CCError) RtxLayout_after_edit(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
-                                 double max_width, size_t off, long delta) {
+                                 double max_width, size_t off) {
     size_t fl, nl;
     (void)off;
-    (void)delta;
     if (!L || !d || !m) return cc_err(CC_ERR_INVALID_ARG, "layout after edit");
     fl = L->from_line;
     nl = L->nlines;
@@ -272,7 +480,7 @@ static void !>(CCError) RtxLayout_view_after_edit(RtxLayout *L, RtxDoc *d, const
     if (!d || !L || !m) return cc_err(CC_ERR_INVALID_ARG, "view after edit");
     fl = L->from_line;
     nl = L->nlines ? L->nlines : 64;
-    d->reparse_edit(d->last_off, d->last_delta, d->last_markup) !>(e) {
+    d->reparse_edit(d->last_off, d->last_markup) !>(e) {
         return cc_err(e);
     };
     return L->lines(d, m, width, fl, nl);

@@ -27,7 +27,7 @@ esac
 if test -f "$(brew --prefix raylib 2>/dev/null)/include/raylib.h"; then
     echo "raylib: $(brew --prefix raylib)"
 else
-    echo "raylib: not found (needed for make raytext). brew install raylib"
+    echo "raylib: not found (needed for ./make.shcc @raytext). brew install raylib"
 fi
 
 mkdir -p testdata/generated out bin

@@ -9,9 +9,11 @@
 typedef struct {
     RtxDoc doc;
     RtxLayout layout;
-    size_t top;
+    size_t top;            /* first physical line in the window */
+    size_t top_wrap;       /* visual rows skipped on that line */
     double scroll;
     double layout_width;
+    RtxPref pref;          /* goal column for visual up/down */
 } RtxBuf;
 
 typedef struct {
@@ -71,10 +73,10 @@ static void !>(CCError) RtxWs_add_path(RtxWs *w, const char *path) {
     RtxBuf *b;
     if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
     if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
-    if (!rtx_arena_grow(&w->session, (void **)&w->bufs, &w->cap, w->len + 1,
-                        sizeof(RtxBuf))) {
-        return cc_err(CC_ERR_OUT_OF_MEMORY, "buffers");
-    }
+    rtx_arena_grow(&w->session, (void **)&w->bufs, &w->cap, w->len + 1,
+                   sizeof(RtxBuf)) !>(e) {
+        return cc_err(e);
+    };
     b = &w->bufs[w->len];
     memset(b, 0, sizeof(*b));
     b->doc.from_path(path) !>(e) { return cc_err(e); };
@@ -153,29 +155,70 @@ static int !>(CCError) RtxWs_copy(RtxWs *w) {
     RtxDoc *d = w->doc();
     size_t lo, hi;
     if (!d || !d->has_sel()) return cc_ok(0);
+    if (d->sel_box) {
+        CCArena a = {0} @destroy;
+        char[:] bytes;
+        a = cc_arena_heap(kilobytes(8));
+        if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+        rtx_doc_box_text(d, &a, &bytes) !>(e) { return cc_err(e); };
+        w->set_clip(bytes) !>(e) { return cc_err(e); };
+        return cc_ok(1);
+    }
     lo = d->sel_lo();
     hi = d->sel_hi();
     {
         cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
         char[:] bytes = d->scratch_span(&scratch, lo, hi - lo) !>(e) {
-            scratch.destroy();
             return cc_err(e);
         };
         w->set_clip(bytes) !>(e) {
-            scratch.destroy();
             return cc_err(e);
         };
-        scratch.destroy();
     }
     return cc_ok(1);
 }
 
 static void !>(CCError) RtxWs_cut(RtxWs *w) {
     RtxDoc *d = w->doc();
+    size_t lo, hi;
+    char[:] copy = cc_slice_empty();
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "no buffer");
-    w->copy() !>(e) { return cc_err(e); };
-    if (d->has_sel()) return d->backspace();
-    return cc_ok();
+    if (!d->has_sel()) return cc_ok();
+    if (d->sel_box) {
+        CCArena a = {0} @destroy;
+        char[:] bytes;
+        a = cc_arena_heap(kilobytes(8));
+        if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+        rtx_doc_box_text(d, &a, &bytes) !>(e) { return cc_err(e); };
+        if (bytes.len) {
+            if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+            copy = w->session.alloc_slice_bytes(bytes.len);
+            if (!copy.ptr) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+            memcpy(copy.ptr, bytes.ptr, bytes.len);
+        }
+        rtx_doc_box_apply(d, cc_slice_empty()) !>(e) { return cc_err(e); };
+        d->sel_box = 0;
+        d->sel_anchor = d->caret;
+        w->clip = copy;
+        return cc_ok();
+    }
+    lo = d->sel_lo();
+    hi = d->sel_hi();
+    {
+        cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+        char[:] bytes = d->scratch_span(&scratch, lo, hi - lo) !>(e) {
+            return cc_err(e);
+        };
+        if (bytes.len) {
+            if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+            copy = w->session.alloc_slice_bytes(bytes.len);
+            if (!copy.ptr) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+            memcpy(copy.ptr, bytes.ptr, bytes.len);
+        }
+        d->replace(lo, hi - lo, cc_slice_empty()) !>(e) { return cc_err(e); };
+        w->clip = copy;
+        return cc_ok();
+    }
 }
 
 static void !>(CCError) RtxWs_paste(RtxWs *w) {
@@ -183,6 +226,155 @@ static void !>(CCError) RtxWs_paste(RtxWs *w) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "no buffer");
     if (!w->clip.ptr || w->clip.len == 0) return cc_ok();
     return d->type(w->clip);
+}
+
+static void RtxBuf_clear_pref(RtxBuf *b) {
+    if (!b) return;
+    b->pref.ok = 0;
+    b->pref.eol = 0;
+    b->pref.x = 0;
+    b->pref.col = 0;
+}
+
+static void RtxBuf_stick_eol(RtxBuf *b) {
+    if (!b) return;
+    b->pref.ok = 1;
+    b->pref.eol = 1;
+}
+
+static size_t rtx_buf_cur_col(const RtxBuf *b) {
+    size_t line;
+    if (!b) return 0;
+    line = b->doc.line_of(b->doc.caret);
+    return b->doc.caret - b->doc.line_start(line);
+}
+
+static void RtxBuf_box_begin(RtxBuf *b) {
+    if (!b || b->doc.sel_box) return;
+    b->doc.sel_box = 1;
+    if (b->pref.eol) b->doc.box_acol = (size_t)-1;
+    else if (b->pref.ok) b->doc.box_acol = b->pref.col;
+    else b->doc.box_acol = rtx_buf_cur_col(b);
+    b->doc.box_ccol = b->doc.box_acol;
+}
+
+static void RtxBuf_box_sync(RtxBuf *b) {
+    if (!b || !b->doc.sel_box) return;
+    if (b->pref.eol) b->doc.box_ccol = (size_t)-1;
+    else if (b->pref.ok) b->doc.box_ccol = b->pref.col;
+    else b->doc.box_ccol = rtx_buf_cur_col(b);
+}
+
+static void RtxBuf_box_move_col(RtxBuf *b, int dir) {
+    size_t line, start, nlen, col;
+    if (!b) return;
+    b->box_begin();
+    line = b->doc.line_of(b->doc.caret);
+    start = b->doc.line_start(line);
+    nlen = rtx_doc_line_end_caret(&b->doc, start) - start;
+    col = b->doc.box_ccol;
+    if (col == (size_t)-1) col = nlen;
+    if (dir < 0) {
+        if (col > 0) col--;
+    } else {
+        col++;
+    }
+    b->doc.box_ccol = col;
+    b->pref.col = col;
+    b->pref.ok = 1;
+    b->pref.eol = 0;
+    b->doc.caret = start + (col < nlen ? col : nlen);
+}
+
+/* First visible layout row → `top` / `top_wrap`. */
+static void rtx_buf_origin_from_row(RtxBuf *b, size_t origin) {
+    size_t first;
+    if (!b || b->layout.len == 0) return;
+    if (origin >= b->layout.len) origin = b->layout.len - 1;
+    b->top = b->layout.rows[origin].line;
+    first = origin;
+    while (first > 0 && b->layout.rows[first - 1].line == b->top) first--;
+    b->top_wrap = origin - first;
+}
+
+/* Move `top` / `top_wrap` so the caret's visual row sits in [0, vis).
+ * Scrolls by visual rows. Does not snap `top` to the caret's physical line
+ * — that made wheel-up on a wrapped line jump back and stick. */
+static void RtxBuf_reveal(RtxBuf *b, int vis) {
+    size_t cl;
+    size_t ri;
+    if (!b) return;
+    if (vis < 1) vis = 1;
+    if (!b->layout.wrap) {
+        b->top_wrap = 0;
+        cl = b->line_of(b->doc.caret);
+        if (cl < b->top) b->top = cl;
+        if (cl >= b->top + (size_t)vis) b->top = cl - (size_t)vis + 1;
+        return;
+    }
+    cl = b->line_of(b->doc.caret);
+    if (b->layout.len == 0) {
+        b->top = cl;
+        b->top_wrap = 0;
+        return;
+    }
+    if (cl < b->top || b->doc.caret < b->layout.rows[0].byte_start) {
+        b->top = cl;
+        b->top_wrap = 0;
+        return;
+    }
+    {
+        RtxVisRow *last = &b->layout.rows[b->layout.len - 1];
+        if (cl > last->line && b->doc.caret >= last->byte_start + last->byte_len) {
+            b->top = cl;
+            b->top_wrap = 0;
+            return;
+        }
+    }
+    ri = b->layout.row_of(b->doc.caret);
+    if (ri < b->top_wrap) {
+        rtx_buf_origin_from_row(b, ri);
+        return;
+    }
+    if (ri < b->top_wrap + (size_t)vis) return;
+    rtx_buf_origin_from_row(b, ri + 1 - (size_t)vis);
+}
+
+static void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double width, int dir) {
+    size_t nlines;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "scroll");
+    nlines = b->line_count();
+    if (!b->layout.wrap) {
+        b->top_wrap = 0;
+        if (dir < 0 && b->top > 0) b->top--;
+        if (dir > 0 && b->top + 1 < nlines) b->top++;
+        return cc_ok();
+    }
+    if (dir < 0) {
+        if (b->top_wrap > 0) b->top_wrap--;
+        else if (b->top > 0) {
+            RtxLayout tmp = {0} @destroy;
+            size_t wraps;
+            b->top--;
+            tmp.wrap = 1;
+            tmp.lines(&b->doc, m, width, b->top, 1) !>(e) { return cc_err(e); };
+            wraps = tmp.len ? tmp.len : 1;
+            b->top_wrap = wraps - 1;
+        }
+    } else {
+        size_t wraps = b->layout.rows_for_line(b->top);
+        if (wraps == 0) wraps = 1;
+        b->top_wrap++;
+        if (b->top_wrap >= wraps) {
+            if (b->top + 1 < nlines) {
+                b->top++;
+                b->top_wrap = 0;
+            } else {
+                b->top_wrap = wraps - 1;
+            }
+        }
+    }
+    return cc_ok();
 }
 
 static int RtxWs_any_dirty(const RtxWs *w) {

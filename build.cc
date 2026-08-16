@@ -1,8 +1,8 @@
 // Raytext core tests + cctext + raytext.
 //
-//   make smoke
-//   make cctext
-//   make raytext
+//   ./make.shcc @smoke
+//   ./make.shcc @cctext
+//   ./make.shcc @raytext
 
 CC_DEFAULT piece_tree_smoke
 

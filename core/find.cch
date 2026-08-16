@@ -20,13 +20,6 @@ typedef struct {
     char[:] ctx;
 } RtxFindHitView;
 
-static int rtx_find_ensure(RtxDoc *d) {
-    if (!d) return 0;
-    if (d->find.store.base) return 1;
-    d->find.store = cc_arena_heap(kilobytes(16));
-    return d->find.store.base != NULL;
-}
-
 static void RtxDoc_find_invalidate(RtxDoc *d) {
     if (!d) return;
     d->find.len = 0;
@@ -38,17 +31,44 @@ static void RtxDoc_find_invalidate(RtxDoc *d) {
 
 static int RtxDoc_find_same_query(const RtxDoc *d, char[:] q) {
     if (!d) return 0;
-    if (q.len > RTX_FIND_QMAX) q = q.sub(0, RTX_FIND_QMAX);
     if (d->find.query.len != q.len) return 0;
     if (q.len == 0) return 1;
     return memcmp(d->find.query.ptr, q.ptr, q.len) == 0;
 }
 
 static void !>(CCError) RtxDoc_find_set(RtxDoc *d, char[:] q) {
+    char qbuf[RTX_FIND_QMAX];
+    size_t qn;
+    CCArena fresh;
+    char[:] nq;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
-    if (!rtx_find_ensure(d)) return cc_err(CC_ERR_OUT_OF_MEMORY, "find store");
-    d->find.store.reset();
-    d->find.query = cc_slice_empty();
+    qn = q.len;
+    if (qn > RTX_FIND_QMAX) return cc_err(CC_ERR_INVALID_ARG, "find query too long");
+    if (qn) memcpy(qbuf, q.ptr, qn);
+    if (qn == 0) {
+        if (d->find.store.base) d->find.store.reset();
+        d->find.query = cc_slice_empty();
+        d->find.offs = NULL;
+        d->find.len = 0;
+        d->find.cap = 0;
+        d->find.scan_off = 0;
+        d->find.cur = 0;
+        d->find.truncated = 0;
+        d->find.done = 1;
+        return cc_ok();
+    }
+    memset(&fresh, 0, sizeof(fresh));
+    fresh = cc_arena_heap(kilobytes(16));
+    if (!fresh.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "find store");
+    nq = fresh.alloc_slice_bytes(qn);
+    if (!nq.ptr || nq.len < qn) {
+        fresh.destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "find query");
+    }
+    memcpy(nq.ptr, qbuf, qn);
+    if (d->find.store.base) d->find.store.destroy();
+    d->find.store = fresh;
+    d->find.query = nq;
     d->find.offs = NULL;
     d->find.len = 0;
     d->find.cap = 0;
@@ -56,18 +76,6 @@ static void !>(CCError) RtxDoc_find_set(RtxDoc *d, char[:] q) {
     d->find.cur = 0;
     d->find.truncated = 0;
     d->find.done = 0;
-    if (q.len > RTX_FIND_QMAX) q = q.sub(0, RTX_FIND_QMAX);
-    if (q.len == 0) {
-        d->find.done = 1;
-        return cc_ok();
-    }
-    d->find.query = d->find.store.alloc_slice_bytes(q.len);
-    if (!d->find.query.ptr || d->find.query.len < q.len) {
-        d->find.query = cc_slice_empty();
-        d->find.done = 1;
-        return cc_err(CC_ERR_OUT_OF_MEMORY, "find query");
-    }
-    memcpy(d->find.query.ptr, q.ptr, q.len);
     return cc_ok();
 }
 
@@ -77,10 +85,10 @@ static void !>(CCError) rtx_find_push(RtxDoc *d, size_t off) {
         d->find.done = 1;
         return cc_ok();
     }
-    if (!rtx_arena_grow(&d->find.store, (void **)&d->find.offs, &d->find.cap,
-                        d->find.len + 1, sizeof(size_t))) {
-        return cc_err(CC_ERR_OUT_OF_MEMORY, "find hits");
-    }
+    rtx_arena_grow(&d->find.store, (void **)&d->find.offs, &d->find.cap,
+                   d->find.len + 1, sizeof(size_t)) !>(e) {
+        return cc_err(e);
+    };
     d->find.offs[d->find.len++] = off;
     return cc_ok();
 }
@@ -125,10 +133,12 @@ static void !>(CCError) RtxDoc_find_step(RtxDoc *d, size_t budget) {
         if (d->find.scan_off + want > n) want = n - d->find.scan_off;
         if (want > sizeof(buf)) want = sizeof(buf);
         got = d->read_at(d->find.scan_off, buf, want);
+        if (got == 0 && d->find.scan_off < n) {
+            return cc_err(CC_ERR_INTERNAL, "find read");
+        }
         spent += got;
         if (got < qn) {
-            d->find.done = 1;
-            break;
+            return cc_err(CC_ERR_INTERNAL, "find read");
         }
         last = (d->find.scan_off + got >= n);
         adv = rtx_find_window_adv(got, qn, last);

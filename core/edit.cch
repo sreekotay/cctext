@@ -7,13 +7,20 @@
 #define RTX_EDIT_H
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static int RtxDoc_dirty(const RtxDoc *d) {
     return d && d->hist.head != d->saved_head;
 }
 
 static int RtxDoc_has_sel(const RtxDoc *d) {
-    return d && d->sel_anchor != d->caret;
+    if (!d) return 0;
+    if (d->sel_box) {
+        if (d->sel_anchor != d->caret) return 1;
+        return d->box_acol != d->box_ccol;
+    }
+    return d->sel_anchor != d->caret;
 }
 
 static size_t RtxDoc_sel_lo(const RtxDoc *d) {
@@ -27,15 +34,20 @@ static size_t RtxDoc_sel_hi(const RtxDoc *d) {
 }
 
 static void RtxDoc_clear_sel(RtxDoc *d) {
-    if (d) d->sel_anchor = d->caret;
+    if (!d) return;
+    d->sel_anchor = d->caret;
+    d->sel_box = 0;
 }
 
 static void RtxDoc_select_all(RtxDoc *d) {
     if (!d) return;
     d->sel_anchor = 0;
     d->caret = d->len();
+    d->sel_box = 0;
     RtxDoc_break_coalesce(d);
 }
+
+#define RTX_COL_EOL ((size_t)-1)
 
 static size_t rtx_doc_line_end_caret(const RtxDoc *d, size_t off) {
     size_t line, nlines, start, end;
@@ -51,6 +63,89 @@ static size_t rtx_doc_line_end_caret(const RtxDoc *d, size_t off) {
         return end - 1;
     }
     return end;
+}
+
+static size_t rtx_doc_line_nlen(const RtxDoc *d, size_t line) {
+    size_t s;
+    if (!d) return 0;
+    s = d->line_start(line);
+    return rtx_doc_line_end_caret(d, s) - s;
+}
+
+static size_t rtx_box_col_on_line(const RtxDoc *d, size_t line, size_t col) {
+    size_t n = rtx_doc_line_nlen(d, line);
+    if (col == RTX_COL_EOL || col > n) return n;
+    return col;
+}
+
+static void rtx_box_span_on_line(const RtxDoc *d, size_t line, size_t *a, size_t *b) {
+    size_t n, lo, hi;
+    n = rtx_doc_line_nlen(d, line);
+    lo = d->box_acol;
+    hi = d->box_ccol;
+    if (lo > hi) {
+        size_t t = lo;
+        lo = hi;
+        hi = t;
+    }
+    if (lo == RTX_COL_EOL) lo = n;
+    if (hi == RTX_COL_EOL) hi = n;
+    if (lo > n) lo = n;
+    if (hi > n) hi = n;
+    *a = lo;
+    *b = hi;
+}
+
+static void rtx_doc_box_lines(const RtxDoc *d, size_t *l0, size_t *l1) {
+    size_t a, c;
+    a = d->line_of(d->sel_anchor);
+    c = d->line_of(d->caret);
+    *l0 = a < c ? a : c;
+    *l1 = a > c ? a : c;
+}
+
+static int RtxDoc_sel_covers(const RtxDoc *d, size_t off) {
+    size_t l0, l1, line, start, a, b, col;
+    if (!d || !d->has_sel()) return 0;
+    if (!d->sel_box) {
+        return off >= d->sel_lo() && off < d->sel_hi();
+    }
+    line = d->line_of(off);
+    rtx_doc_box_lines(d, &l0, &l1);
+    if (line < l0 || line > l1) return 0;
+    start = d->line_start(line);
+    rtx_box_span_on_line(d, line, &a, &b);
+    col = off - start;
+    return col >= a && col < b;
+}
+
+static void rtx_box_nth_part(char[:] ins, size_t idx, char[:] *out) {
+    size_t i, start, n;
+    *out = cc_slice_empty();
+    if (!ins.ptr) return;
+    start = 0;
+    n = 0;
+    for (i = 0; i <= ins.len; i++) {
+        if (i == ins.len || ins.ptr[i] == '\n') {
+            if (n == idx) {
+                *out = cc_slice_from_buffer((char *)ins.ptr + start, i - start);
+                return;
+            }
+            n++;
+            start = i + 1;
+        }
+    }
+}
+
+static size_t rtx_box_part_count(char[:] ins) {
+    size_t i, n;
+    if (!ins.ptr || ins.len == 0) return 1;
+    n = 1;
+    for (i = 0; i < ins.len; i++) {
+        if (ins.ptr[i] == '\n') n++;
+    }
+    if (ins.ptr[ins.len - 1] == '\n' && n > 1) n--;
+    return n;
 }
 
 /* to_end 0 = start of line, 1 = end. shift extends the selection. */
@@ -81,7 +176,7 @@ static void rtx_hist_drop_tail(RtxHistory *h) {
     h->len = h->head;
 }
 
-static int rtx_hist_grow(RtxDoc *d) {
+static void !>(CCError) rtx_hist_grow(RtxDoc *d) {
     return rtx_arena_grow(&d->session, (void **)&d->hist.recs, &d->hist.cap,
                           d->hist.len + 1, sizeof(RtxHistRec));
 }
@@ -111,6 +206,7 @@ static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] 
     int markup;
     int coalesced = 0;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     len = d->len();
     if (off > len || n > len - off) return cc_err(CC_ERR_INVALID_ARG, "replace range");
     if (n == 0 && ins.len == 0) return cc_ok();
@@ -121,7 +217,6 @@ static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] 
         cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
         if (n) {
             char[:] got = d->scratch_span(&scratch, off, n) !>(e) {
-                scratch.destroy();
                 return cc_err(e);
             };
             del = got;
@@ -153,30 +248,23 @@ static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] 
                 rec.del = rtx_session_bytes(d, del.ptr, del.len);
                 rec.ins = rtx_session_bytes(d, ins.ptr, ins.len);
                 if ((del.len && !rec.del.ptr) || (ins.len && !rec.ins.ptr)) {
-                    scratch.destroy();
                     return cc_err(CC_ERR_OUT_OF_MEMORY, "history");
                 }
-                if (!rtx_hist_grow(d)) {
-                    scratch.destroy();
-                    return cc_err(CC_ERR_OUT_OF_MEMORY, "history");
-                }
+                rtx_hist_grow(d) !>(e) { return cc_err(e); };
             }
         }
-        if (n) d->erase(off, n) !>(e) {
-            scratch.destroy();
+        d->tree.replace(off, n, ins) !>(e) {
+            if (e.kind == CC_ERR_INTERNAL) d->broken = 1;
             return cc_err(e);
         };
-        if (ins.len) d->insert(off, ins) !>(e) {
-            scratch.destroy();
-            d->find_invalidate();
-            return cc_err(CC_ERR_INTERNAL, "replace half-applied");
-        };
+        d->edit_gen++;
+        rtx_doc_shift_intervals(d, off, n, ins.len);
         d->find_invalidate();
         d->last_off = off;
-        d->last_delta = (long)ins.len - (long)n;
         d->last_markup = markup;
         d->caret = off + ins.len;
         d->sel_anchor = d->caret;
+        d->sel_box = 0;
         if (!d->hist.applying) {
             if (coalesced == 1 && last) {
                 last->ins = coal;
@@ -199,13 +287,118 @@ static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] 
             }
             d->hist.coalesce = 1;
         }
-        scratch.destroy();
         return cc_ok();
     }
 }
 
+static int rtx_doc_line_has_nl(const RtxDoc *d, size_t line) {
+    size_t nlines, s, e, next;
+    nlines = d->line_count();
+    s = d->line_start(line);
+    e = rtx_doc_line_end_caret(d, s);
+    next = (line + 1 < nlines) ? d->line_start(line + 1) : d->len();
+    return next > e;
+}
+
+static void !>(CCError) rtx_doc_box_text(RtxDoc *d, CCArena *a, char[:] *out) {
+    size_t l0, l1, i, need, used;
+    char *p;
+    if (!d || !a || !out) return cc_err(CC_ERR_INVALID_ARG, "box text");
+    rtx_doc_box_lines(d, &l0, &l1);
+    need = 0;
+    for (i = l0; i <= l1; i++) {
+        size_t a0, b0;
+        rtx_box_span_on_line(d, i, &a0, &b0);
+        need += b0 - a0;
+        if (i < l1) need += 1;
+    }
+    if (need == 0) {
+        *out = cc_slice_empty();
+        return cc_ok();
+    }
+    p = (char *)cc_arena_alloc(a, need, 1);
+    if (!p) return cc_err(CC_ERR_OUT_OF_MEMORY, "box text");
+    used = 0;
+    for (i = l0; i <= l1; i++) {
+        size_t start, a0, b0;
+        start = d->line_start(i);
+        rtx_box_span_on_line(d, i, &a0, &b0);
+        if (b0 > a0) {
+            d->read_at(start + a0, p + used, b0 - a0);
+            used += b0 - a0;
+        }
+        if (i < l1) p[used++] = '\n';
+    }
+    *out = cc_slice_from_buffer(p, used);
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_doc_box_apply(RtxDoc *d, char[:] ins) {
+    size_t l0, l1, nlines, i, off0, off1, need, used, dest_col, parts;
+    size_t keep_l0, keep_l1;
+    char *p;
+    CCArena a = {0} @destroy;
+    char[:] built;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "box apply");
+    rtx_doc_box_lines(d, &l0, &l1);
+    nlines = d->line_count();
+    off0 = d->line_start(l0);
+    off1 = (l1 + 1 < nlines) ? d->line_start(l1 + 1) : d->len();
+    parts = rtx_box_part_count(ins);
+    need = 1;
+    for (i = l0; i <= l1; i++) {
+        size_t nlen, a0, b0;
+        char[:] part;
+        nlen = rtx_doc_line_nlen(d, i);
+        rtx_box_span_on_line(d, i, &a0, &b0);
+        if (parts <= 1) part = ins;
+        else rtx_box_nth_part(ins, i - l0, &part);
+        need += a0 + part.len + (nlen - b0) + 1;
+    }
+    a = cc_arena_heap(need + 64);
+    if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "box apply");
+    p = (char *)cc_arena_alloc(&a, need, 1);
+    if (!p) return cc_err(CC_ERR_OUT_OF_MEMORY, "box apply");
+    used = 0;
+    dest_col = 0;
+    for (i = l0; i <= l1; i++) {
+        size_t start, nlen, a0, b0;
+        char[:] part;
+        start = d->line_start(i);
+        nlen = rtx_doc_line_nlen(d, i);
+        rtx_box_span_on_line(d, i, &a0, &b0);
+        if (parts <= 1) part = ins;
+        else rtx_box_nth_part(ins, i - l0, &part);
+        if (i == l0) dest_col = a0 + part.len;
+        if (a0) {
+            d->read_at(start, p + used, a0);
+            used += a0;
+        }
+        if (part.len && part.ptr) {
+            memcpy(p + used, part.ptr, part.len);
+            used += part.len;
+        }
+        if (nlen > b0) {
+            d->read_at(start + b0, p + used, nlen - b0);
+            used += nlen - b0;
+        }
+        if (rtx_doc_line_has_nl(d, i)) p[used++] = '\n';
+    }
+    built = cc_slice_from_buffer(p, used);
+    keep_l0 = l0;
+    keep_l1 = l1;
+    d->replace(off0, off1 - off0, built) !>(e) { return cc_err(e); };
+    d->sel_box = 1;
+    d->box_acol = dest_col;
+    d->box_ccol = dest_col;
+    d->sel_anchor = d->line_start(keep_l0) + rtx_box_col_on_line(d, keep_l0, dest_col);
+    d->caret = d->line_start(keep_l1) + rtx_box_col_on_line(d, keep_l1, dest_col);
+    return cc_ok();
+}
+
 static void !>(CCError) RtxDoc_type(RtxDoc *d, char[:] bytes) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->sel_box && d->has_sel()) return rtx_doc_box_apply(d, bytes);
     if (d->has_sel()) {
         size_t lo = d->sel_lo();
         size_t hi = d->sel_hi();
@@ -216,6 +409,17 @@ static void !>(CCError) RtxDoc_type(RtxDoc *d, char[:] bytes) {
 
 static void !>(CCError) RtxDoc_backspace(RtxDoc *d) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->sel_box && d->has_sel()) {
+        size_t l0, l1, a, b;
+        rtx_doc_box_lines(d, &l0, &l1);
+        rtx_box_span_on_line(d, l0, &a, &b);
+        if (a == b) {
+            if (a == 0) return cc_ok();
+            d->box_acol = a - 1;
+            d->box_ccol = a;
+        }
+        return rtx_doc_box_apply(d, cc_slice_empty());
+    }
     if (d->has_sel()) {
         size_t lo = d->sel_lo();
         size_t hi = d->sel_hi();
@@ -228,6 +432,16 @@ static void !>(CCError) RtxDoc_backspace(RtxDoc *d) {
 static void !>(CCError) RtxDoc_delete_forward(RtxDoc *d) {
     size_t len;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->sel_box && d->has_sel()) {
+        size_t l0, l1, a, b;
+        rtx_doc_box_lines(d, &l0, &l1);
+        rtx_box_span_on_line(d, l0, &a, &b);
+        if (a == b) {
+            d->box_acol = a;
+            d->box_ccol = a + 1;
+        }
+        return rtx_doc_box_apply(d, cc_slice_empty());
+    }
     if (d->has_sel()) return d->backspace();
     len = d->len();
     if (d->caret >= len) return cc_ok();
@@ -245,20 +459,19 @@ static int RtxDoc_can_redo(const RtxDoc *d) {
 static void !>(CCError) RtxDoc_undo(RtxDoc *d) {
     RtxHistRec *r;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     if (d->hist.head == 0) return cc_ok();
     r = &d->hist.recs[d->hist.head - 1];
     d->hist.applying = 1;
     d->hist.coalesce = 0;
-    if (r->ins.len) d->erase(r->off, r->ins.len) !>(e) {
+    d->tree.replace(r->off, r->ins.len, r->del) !>(e) {
         d->hist.applying = 0;
+        if (e.kind == CC_ERR_INTERNAL) d->broken = 1;
         return cc_err(e);
     };
-    if (r->del.len) d->insert(r->off, r->del) !>(e) {
-        d->hist.applying = 0;
-        return cc_err(e);
-    };
+    d->edit_gen++;
+    rtx_doc_shift_intervals(d, r->off, r->ins.len, r->del.len);
     d->last_off = r->off;
-    d->last_delta = (long)r->del.len - (long)r->ins.len;
     d->last_markup = rtx_bytes_touch_markup(r->del.ptr, r->del.len) ||
                      rtx_bytes_touch_markup(r->ins.ptr, r->ins.len);
     d->caret = r->caret_before;
@@ -272,20 +485,19 @@ static void !>(CCError) RtxDoc_undo(RtxDoc *d) {
 static void !>(CCError) RtxDoc_redo(RtxDoc *d) {
     RtxHistRec *r;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     if (d->hist.head >= d->hist.len) return cc_ok();
     r = &d->hist.recs[d->hist.head];
     d->hist.applying = 1;
     d->hist.coalesce = 0;
-    if (r->del.len) d->erase(r->off, r->del.len) !>(e) {
+    d->tree.replace(r->off, r->del.len, r->ins) !>(e) {
         d->hist.applying = 0;
+        if (e.kind == CC_ERR_INTERNAL) d->broken = 1;
         return cc_err(e);
     };
-    if (r->ins.len) d->insert(r->off, r->ins) !>(e) {
-        d->hist.applying = 0;
-        return cc_err(e);
-    };
+    d->edit_gen++;
+    rtx_doc_shift_intervals(d, r->off, r->del.len, r->ins.len);
     d->last_off = r->off;
-    d->last_delta = (long)r->ins.len - (long)r->del.len;
     d->last_markup = rtx_bytes_touch_markup(r->del.ptr, r->del.len) ||
                      rtx_bytes_touch_markup(r->ins.ptr, r->ins.len);
     d->caret = r->caret_after;
@@ -298,37 +510,32 @@ static void !>(CCError) RtxDoc_redo(RtxDoc *d) {
 
 static void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
     char tmp[4096];
+    char[:] new_path = cc_slice_empty();
     int fd;
     size_t n;
     if (!d || !path || !path[0]) return cc_err(CC_ERR_INVALID_ARG, "save path");
+    if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     n = strlen(path);
-    if (n + 24 >= sizeof(tmp)) return cc_err(CC_ERR_INVALID_ARG, "path too long");
-    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
-    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return cc_err(CC_ERR_IO, "save open");
-    if (!d->tree.write_fd(fd)) {
-        close(fd);
-        unlink(tmp);
-        return cc_err(CC_ERR_IO, "save write");
+    if (n + 16 >= sizeof(tmp)) return cc_err(CC_ERR_INVALID_ARG, "path too long");
+    if (!d->path.ptr || !d->path.eq_cstr(path)) {
+        new_path = rtx_session_str(d, path);
+        if (!new_path.ptr) return cc_err(CC_ERR_OUT_OF_MEMORY, "save path");
     }
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
+    fd = mkstemp(tmp);
+    if (fd < 0) return cc_err(CC_ERR_IO, "save open");
+    @defer(err) unlink(tmp);
+    d->tree.write_fd(fd) !>(e) {
+        close(fd);
+        return cc_err(e);
+    };
     if (fsync(fd) != 0) {
         close(fd);
-        unlink(tmp);
         return cc_err(CC_ERR_IO, "save fsync");
     }
-    if (close(fd) != 0) {
-        unlink(tmp);
-        return cc_err(CC_ERR_IO, "save close");
-    }
-    if (rename(tmp, path) != 0) {
-        unlink(tmp);
-        return cc_err(CC_ERR_IO, "save rename");
-    }
-    if (!d->path.ptr || !d->path.eq_cstr(path)) {
-        char[:] copy = rtx_session_str(d, path);
-        if (!copy.ptr) return cc_err(CC_ERR_OUT_OF_MEMORY, "save path");
-        d->path = copy;
-    }
+    if (close(fd) != 0) return cc_err(CC_ERR_IO, "save close");
+    if (rename(tmp, path) != 0) return cc_err(CC_ERR_IO, "save rename");
+    if (new_path.ptr) d->path = new_path;
     d->saved_head = d->hist.head;
     return cc_ok();
 }
@@ -339,40 +546,37 @@ static void !>(CCError) RtxDoc_save(RtxDoc *d) {
     return d->save_as(d->path.ptr);
 }
 
-static void rtx_doc_strip_hl_in(RtxDoc *d, size_t lo, size_t hi) {
-    size_t i;
-    size_t o;
-    if (!d) return;
-    o = 0;
-    for (i = 0; i < d->run_len; i++) {
-        RtxRun r = d->runs[i];
-        int hl_only = r.style.hl != RTX_HL_NONE && !r.style.bold && !r.style.italic &&
-                      !r.style.mono;
-        size_t end = r.start + r.len;
-        if (hl_only && end > lo && r.start < hi) continue;
-        d->runs[o++] = r;
-    }
-    d->run_len = o;
-}
-
 static void !>(CCError) rtx_doc_highlight_span(RtxDoc *d, size_t lo, size_t hi) {
+    size_t saved;
     if (!d || hi <= lo) return cc_ok();
-    rtx_doc_strip_hl_in(d, lo, hi);
+    saved = d->run_len;
     {
         char[:] bytes = rtx_doc_analysis_span(d, lo, hi - lo) !>(e) {
             return cc_err(e);
         };
         rtx_hl_range(d, bytes.ptr, lo, bytes.len) !>(e) {
-            rtx_doc_strip_hl_in(d, lo, hi);
+            d->run_len = saved;
             return cc_err(e);
         };
+    }
+    {
+        size_t i;
+        size_t o = 0;
+        for (i = 0; i < d->run_len; i++) {
+            RtxRun r = d->runs[i];
+            int hl_only = r.style.hl != RTX_HL_NONE && !r.style.bold &&
+                          !r.style.italic && !r.style.mono;
+            size_t end = r.start + r.len;
+            if (i < saved && hl_only && end > lo && r.start < hi) continue;
+            d->runs[o++] = r;
+        }
+        d->run_len = o;
     }
     return cc_ok();
 }
 
-static void !>(CCError) RtxDoc_reparse_edit(RtxDoc *d, size_t off, long delta, int full_markup) {
+static void !>(CCError) RtxDoc_reparse_edit(RtxDoc *d, size_t off, int full_markup) {
     size_t s, lo, hi, n;
-    (void)delta;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     if (full_markup) return d->reparse();
     n = d->len();

@@ -47,10 +47,11 @@ Constructors assume dead. `from_path` / `from_buffer` / `empty` / `open_files` e
 A path that gives up is not success:
 
 - Seed of a non-empty original must produce a root node, or the constructor fails.
-- Scan / highlight / reparse / `ensure_hl` are `void !>(CCError)`. They do not plant markup or set `hl_done` after a missing span. A failed scan resets analysis.
+- Scan / highlight / reparse / `ensure_hl` are `void !>(CCError)`. They do not plant markup or set `hl_done` after a missing span. A failed scan resets analysis. A failed highlight strips hl-only runs and clears every `hl_done`.
 - `RtxWs_copy` is `int !>(CCError)`: `0` = no selection, `1` = copied, OOM is an error.
+- A short `read_at` mid-document is a fault, not EOF. `line_off_ok` is set only after the scan reaches `len`.
 
-Commit only after the new value exists. Hist payload is allocated before erase/insert; redo is dropped only after apply succeeds. Insert-fail after erase is `CC_ERR_INTERNAL` (half-applied), not “unchanged.” Clipboard allocs into a local, then assigns; OOM keeps the old clip. Empty source is a real clear.
+Commit only after the new value exists, in every direction: the right node before shrinking a piece; hist after `tree.replace`; clip after a successful cut replace; derived flags after the highlight / line-index pass; path+`saved_head` after a prepared rename. Unsaved quit opens a Save / Don't save / Cancel prompt. `tree.replace` rolls the deleted span back if insert fails; rollback failure sets `d.broken` and further edits refuse. Clipboard allocs into a local, then assigns; OOM keeps the old clip. Empty source is a real clear. A path that gives up is either unchanged or `broken` — never a hole that looks retryable.
 
 `len` / `line_*` / `has_sel` / `dirty` do not fail. They stay values.
 
@@ -61,10 +62,12 @@ Commit only after the new value exists. Hist payload is allocated before erase/i
 - `as: tree` on `RtxDoc`, `as: doc` on `RtxBuf` — UFCS that misses retries on the embed. A projection, not a lock.
 - `RtxDocLayout` — named allow-list: measure may `len`, `line_*`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl`. It cannot `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
 
+`L.wrap` is a layout policy, not a section kind. Off: one visual row per physical line. On: last whitespace if the next token fits after it, else a hard break at `max_width`. A token wider than the window still occupies a row. Scroll is `top` (physical line) plus `top_wrap` (visual rows skipped on that line). Up/down walk visual rows and keep a goal column.
+
 Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for mmap / insert / `write_fd`.
 
 ## Edits
 
-User changes are `replace` on the history stack (type / backspace / delete). Save streams pieces (`write_fd`), fsyncs, renames. Dirty is `hist.head != saved_head`. Offsets are bytes. Selection is `[sel_anchor, caret)`.
+User changes are `replace` on the history stack (type / backspace / delete). Save streams pieces (`write_fd`), fsyncs, renames. Dirty is `hist.head != saved_head`. Offsets are bytes. Stream selection is `[sel_anchor, caret)`. Up/down keep a goal column (`pref.col` / `pref.x`) so a short line does not forget the place; End sets `pref.eol` and sticks to each line end. Alt-arrows / Alt-drag is a column box (`sel_box`): each line contributes `[box_acol, box_ccol)` (virtual; short lines clamp). Copy joins those slices with newlines. Type/backspace apply the same column on every line as one replace.
 
 Find stores offsets on `d.find.store`. A frame steps at most 256 KiB so a giant file does not stall. Context is a line window computed when drawing the visible hits. `f` / Ctrl-F opens the panel; up/down moves among hits.

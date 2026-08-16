@@ -91,33 +91,38 @@ typedef struct {
     size_t run_cap;
     size_t caret;
     size_t sel_anchor;
+    int sel_box;           /* 0 = stream [anchor, caret); 1 = column box */
+    size_t box_acol;       /* virtual byte cols; (size_t)-1 = EOL */
+    size_t box_ccol;
     char[:] path;
     size_t saved_head;
+    size_t edit_gen;       /* bumps on every successful content change (incl. coalesce) */
     size_t last_off;
-    long last_delta;
     int last_markup;
     int hl_full;
+    int broken;            /* unrestorable tree; refuse further edits */
     RtxHistory hist;
     RtxFind find;           /* find.cch: set / step / invalidate / goto */
 } RtxDoc;
 
 /* Grow a contiguous array on `a`. Old storage is abandoned until reset/destroy. */
-static int rtx_arena_grow(CCArena *a, void **p, size_t *cap, size_t need, size_t elem) {
+static void !>(CCError) rtx_arena_grow(CCArena *a, void **p, size_t *cap, size_t need, size_t elem) {
     void *n;
     size_t c;
-    if (!a || need <= *cap) return 1;
+    if (!a) return cc_err(CC_ERR_INVALID_ARG, "grow");
+    if (need <= *cap) return cc_ok();
     c = *cap ? *cap : 8;
     while (c < need) {
         size_t next = c * 2;
-        if (next < c) return 0;
+        if (next < c) return cc_err(CC_ERR_OUT_OF_MEMORY, "grow overflow");
         c = next;
     }
     n = cc_arena_alloc(a, c * elem, 8);
-    if (!n) return 0;
+    if (!n) return cc_err(CC_ERR_OUT_OF_MEMORY, "grow");
     if (*p && *cap) memcpy(n, *p, (*cap) * elem);
     *p = n;
     *cap = c;
-    return 1;
+    return cc_ok();
 }
 
 static inline size_t RtxDoc_len(const RtxDoc *d) {
@@ -269,67 +274,69 @@ static void rtx_doc_sort_runs(RtxDoc *d) {
     }
 }
 
-static void rtx_doc_shift_intervals(RtxDoc *d, size_t at, long delta) {
+static void rtx_doc_shift_intervals(RtxDoc *d, size_t at, size_t erased, size_t inserted) {
     size_t i;
-    if (!d || delta == 0) return;
+    if (!d || (erased == 0 && inserted == 0)) return;
     for (i = 0; i < d->sec_len; i++) {
-        if (d->secs[i].start > at) {
-            if (delta < 0 && d->secs[i].start < at + (size_t)(-delta)) d->secs[i].start = at;
-            else d->secs[i].start = (size_t)((long)d->secs[i].start + delta);
-        }
+        size_t s = d->secs[i].start;
+        if (s <= at) continue;
+        if (erased && s - at < erased) d->secs[i].start = at;
+        else d->secs[i].start = s - erased + inserted;
     }
     for (i = 0; i < d->run_len; i++) {
-        size_t end = d->runs[i].start + d->runs[i].len;
+        size_t start = d->runs[i].start;
+        size_t rlen = d->runs[i].len;
+        size_t end = start + rlen;
         if (end <= at) continue;
-        if (d->runs[i].start >= at) {
-            if (delta < 0 && d->runs[i].start < at + (size_t)(-delta)) {
-                size_t cut = at + (size_t)(-delta) - d->runs[i].start;
-                if (cut >= d->runs[i].len) {
+        if (start >= at) {
+            if (erased && start - at < erased) {
+                size_t cut = at + erased - start;
+                if (cut >= rlen) {
                     d->runs[i].len = 0;
                     continue;
                 }
                 d->runs[i].start = at;
-                d->runs[i].len -= cut;
+                d->runs[i].len = rlen - cut;
             } else {
-                d->runs[i].start = (size_t)((long)d->runs[i].start + delta);
+                d->runs[i].start = start - erased + inserted;
             }
         } else {
-            /* run straddles the edit point */
-            if (delta > 0) d->runs[i].len += (size_t)delta;
-            else {
-                size_t cut = (size_t)(-delta);
-                if (d->runs[i].len > (end - at)) {
-                    /* shrink the tail that sat in the erased range */
-                    size_t tail = end - at;
-                    size_t drop = cut < tail ? cut : tail;
-                    d->runs[i].len -= drop;
-                }
+            size_t overlap = 0;
+            if (erased) {
+                size_t er_end = at + erased;
+                size_t ov_end = end < er_end ? end : er_end;
+                overlap = ov_end > at ? ov_end - at : 0;
+                if (overlap > rlen) overlap = rlen;
             }
+            d->runs[i].len = rlen - overlap + inserted;
         }
     }
 }
 
 static void !>(CCError) RtxDoc_insert(RtxDoc *d, size_t off, char[:] bytes) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     d->tree.insert(off, bytes) !>(e) { return cc_err(e); };
-    rtx_doc_shift_intervals(d, off, (long)bytes.len);
+    rtx_doc_shift_intervals(d, off, 0, bytes.len);
     d->caret = off + bytes.len;
     return cc_ok();
 }
 
 static void !>(CCError) RtxDoc_erase(RtxDoc *d, size_t off, size_t n) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     d->tree.erase(off, n) !>(e) { return cc_err(e); };
-    rtx_doc_shift_intervals(d, off, -(long)n);
+    rtx_doc_shift_intervals(d, off, n, 0);
     d->caret = off;
     return cc_ok();
 }
 
 static int rtx_doc_add_section(RtxDoc *d, size_t start, RtxSectionKind kind) {
-    if (!rtx_arena_grow(&d->analysis, (void **)&d->secs, &d->sec_cap, d->sec_len + 1,
-                        sizeof(RtxSection))) {
+    rtx_arena_grow(&d->analysis, (void **)&d->secs, &d->sec_cap, d->sec_len + 1,
+                   sizeof(RtxSection)) !>(e) {
+        (void)e;
         return 0;
-    }
+    };
     d->secs[d->sec_len].start = start;
     d->secs[d->sec_len].kind = kind;
     d->secs[d->sec_len].hl_done = 0;
@@ -338,10 +345,11 @@ static int rtx_doc_add_section(RtxDoc *d, size_t start, RtxSectionKind kind) {
 }
 
 static int rtx_doc_add_run(RtxDoc *d, size_t start, size_t len, RtxStyle style) {
-    if (!rtx_arena_grow(&d->analysis, (void **)&d->runs, &d->run_cap, d->run_len + 1,
-                        sizeof(RtxRun))) {
+    rtx_arena_grow(&d->analysis, (void **)&d->runs, &d->run_cap, d->run_len + 1,
+                   sizeof(RtxRun)) !>(e) {
+        (void)e;
         return 0;
-    }
+    };
     d->runs[d->run_len].start = start;
     d->runs[d->run_len].len = len;
     d->runs[d->run_len].style = style;

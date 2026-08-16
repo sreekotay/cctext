@@ -9,7 +9,7 @@ Standalone Concurrent-C editor. Compiler repo is a toolchain, not a parent tree.
 - Runs: style intervals inside a section (bold/italic/mono) plus syntax-token kinds.
 - Highlight: core lexer over `code` sections (C/CC keywords, strings, comments, numbers). Not a frontend concern. Later: `@grammar` or tree-sitter; same run list.
 - Layout: `measure(run, bytes) -> width` and `line_height(run) -> height`. Raylib supplies glyph advances; `cctext` supplies `wcwidth`.
-- Commands and caret are byte offsets. Selection is `[sel_anchor, caret)`.
+- Commands and caret are byte offsets. Stream selection is `[sel_anchor, caret)`. Up/down keep a goal column (or EOL after End). Alt-arrows / Alt-drag is a column box.
 - Edits are replaces on a history stack (coalesced typing). Save writes pieces to a sibling temp file, fsyncs, then renames. Dirty is `hist.head != saved_head`.
 - After an edit, highlight re-lexes the touched section (full markup scan only if the edit involved `=`, `*`, backtick, or a newline). Layout relayouts the touched physical line(s) and shifts the rest.
 - A workspace holds several documents and one or two panes.
