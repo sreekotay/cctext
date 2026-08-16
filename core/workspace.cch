@@ -1,0 +1,209 @@
+/*
+ * Several documents, one or two panes. Each pane points at a buffer.
+ */
+#ifndef RTX_WORKSPACE_H
+#define RTX_WORKSPACE_H
+
+/* RtxDoc / RtxLayout / RtxDocLayout come from document.cch + layout.cch. */
+
+typedef struct {
+    RtxDoc doc;
+    RtxLayout layout;
+    size_t top;
+    double scroll;
+    double layout_width;
+} RtxBuf;
+
+typedef struct {
+    CCArena session;       /* workspace epoch: bufs + clipboard */
+    RtxBuf *bufs;
+    size_t len;
+    size_t cap;
+    int pane[2];
+    int npanes;
+    int focus;
+    char[:] clip;
+} RtxWs;
+
+static int RtxWs_ensure(RtxWs *w) {
+    if (!w) return 0;
+    if (w->session.base) return 1;
+    w->session = cc_arena_heap(kilobytes(8));
+    return w->session.base != NULL;
+}
+
+static void RtxBuf_destroy(RtxBuf *b) {
+    if (!b) return;
+    b->layout.destroy();
+    b->doc.destroy();
+    memset(b, 0, sizeof(*b));
+}
+
+static void RtxWs_destroy(RtxWs *w) {
+    size_t i;
+    if (!w) return;
+    for (i = 0; i < w->len; i++) {
+        (&w->bufs[i])->destroy();
+    }
+    if (w->session.base) w->session.destroy();
+    memset(w, 0, sizeof(*w));
+}
+
+static RtxBuf *RtxWs_active(RtxWs *w) {
+    int bi;
+    if (!w || w->len == 0) return NULL;
+    bi = w->pane[w->focus];
+    if (bi < 0 || (size_t)bi >= w->len) return &w->bufs[0];
+    return &w->bufs[bi];
+}
+
+static RtxDoc *RtxWs_doc(RtxWs *w) {
+    RtxBuf *b = RtxWs_active(w);
+    return b ? &b->doc : NULL;
+}
+
+static RtxLayout *RtxWs_layout(RtxWs *w) {
+    RtxBuf *b = RtxWs_active(w);
+    return b ? &b->layout : NULL;
+}
+
+static void !>(CCError) RtxWs_add_path(RtxWs *w, const char *path) {
+    RtxBuf *b;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+    if (!rtx_arena_grow(&w->session, (void **)&w->bufs, &w->cap, w->len + 1,
+                        sizeof(RtxBuf))) {
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "buffers");
+    }
+    b = &w->bufs[w->len];
+    memset(b, 0, sizeof(*b));
+    b->doc.from_path(path) !>(e) { return cc_err(e); };
+    w->len++;
+    return cc_ok();
+}
+
+static void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
+    int i;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    if (w->session.base || w->len) return cc_err(CC_ERR_INVALID_ARG, "ws already live");
+    memset(w, 0, sizeof(*w));
+    w->npanes = 1;
+    w->focus = 0;
+    w->pane[0] = 0;
+    w->pane[1] = 0;
+    if (npaths <= 0) return cc_err(CC_ERR_INVALID_ARG, "no files");
+    for (i = 0; i < npaths; i++) {
+        w->add_path(paths[i]) !>(e) {
+            w->destroy();
+            return cc_err(e);
+        };
+    }
+    if (w->len >= 2) {
+        w->npanes = 2;
+        w->pane[1] = 1;
+    }
+    return cc_ok();
+}
+
+static void RtxWs_toggle_split(RtxWs *w) {
+    if (!w || w->len == 0) return;
+    if (w->npanes == 1) {
+        w->npanes = 2;
+        if (w->len >= 2) w->pane[1] = (w->pane[0] + 1) % (int)w->len;
+        else w->pane[1] = w->pane[0];
+        w->focus = 1;
+    } else {
+        w->npanes = 1;
+        w->focus = 0;
+    }
+}
+
+static void RtxWs_next_buf(RtxWs *w) {
+    if (!w || w->len == 0) return;
+    w->pane[w->focus] = (w->pane[w->focus] + 1) % (int)w->len;
+}
+
+static void RtxWs_prev_buf(RtxWs *w) {
+    if (!w || w->len == 0) return;
+    w->pane[w->focus] = (w->pane[w->focus] + (int)w->len - 1) % (int)w->len;
+}
+
+static void RtxWs_focus_other(RtxWs *w) {
+    if (!w || w->npanes < 2) return;
+    w->focus = 1 - w->focus;
+}
+
+static void !>(CCError) RtxWs_set_clip(RtxWs *w, char[:] src) {
+    char[:] copy;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    if (!src.ptr || src.len == 0) {
+        w->clip = cc_slice_empty();
+        return cc_ok();
+    }
+    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+    copy = w->session.alloc_slice_bytes(src.len);
+    if (!copy.ptr) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+    memcpy(copy.ptr, src.ptr, src.len);
+    w->clip = copy;
+    return cc_ok();
+}
+
+/* 0 = nothing to do (no selection). 1 = copied. OOM is an error. */
+static int !>(CCError) RtxWs_copy(RtxWs *w) {
+    RtxDoc *d = w->doc();
+    size_t lo, hi;
+    if (!d || !d->has_sel()) return cc_ok(0);
+    lo = d->sel_lo();
+    hi = d->sel_hi();
+    {
+        cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+        char[:] bytes = d->scratch_span(&scratch, lo, hi - lo) !>(e) {
+            scratch.destroy();
+            return cc_err(e);
+        };
+        w->set_clip(bytes) !>(e) {
+            scratch.destroy();
+            return cc_err(e);
+        };
+        scratch.destroy();
+    }
+    return cc_ok(1);
+}
+
+static void !>(CCError) RtxWs_cut(RtxWs *w) {
+    RtxDoc *d = w->doc();
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "no buffer");
+    w->copy() !>(e) { return cc_err(e); };
+    if (d->has_sel()) return d->backspace();
+    return cc_ok();
+}
+
+static void !>(CCError) RtxWs_paste(RtxWs *w) {
+    RtxDoc *d = w->doc();
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "no buffer");
+    if (!w->clip.ptr || w->clip.len == 0) return cc_ok();
+    return d->type(w->clip);
+}
+
+static int RtxWs_any_dirty(const RtxWs *w) {
+    size_t i;
+    if (!w) return 0;
+    for (i = 0; i < w->len; i++) {
+        if (w->bufs[i].doc.dirty()) return 1;
+    }
+    return 0;
+}
+
+#include "help.cch"
+
+@typeview on RtxBuf {
+    as: doc;
+};
+@typehooks on RtxBuf {
+    .destroy = RtxBuf_destroy,
+};
+@typehooks on RtxWs {
+    .destroy = RtxWs_destroy,
+};
+
+#endif /* RTX_WORKSPACE_H */

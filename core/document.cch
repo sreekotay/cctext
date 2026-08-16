@@ -1,11 +1,18 @@
 /*
- * Document: piece tree + section policy + style runs + caret.
+ * Document epochs:
+ *   tree     — mmap + add + nodes (document lifetime)
+ *   session  — path + undo log (survives reparse)
+ *   analysis — sections + style runs (reset on reparse)
+ * Frame copies never land here; they take a scratch arena.
  * Intervals are byte offsets. Insert/erase shift them.
  */
 #ifndef RTX_DOCUMENT_H
 #define RTX_DOCUMENT_H
 
 #include "piece_tree.cch"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 typedef enum {
     RTX_SEC_CODE = 0,
@@ -15,6 +22,7 @@ typedef enum {
 typedef struct {
     size_t start;
     RtxSectionKind kind;
+    unsigned hl_done : 1;
 } RtxSection;
 
 typedef enum {
@@ -40,7 +48,28 @@ typedef struct {
 } RtxRun;
 
 typedef struct {
-    RtxPieceTree tree;
+    size_t off;
+    char[:] del;
+    char[:] ins;
+    size_t caret_before;
+    size_t sel_before;
+    size_t caret_after;
+    size_t sel_after;
+} RtxHistRec;
+
+typedef struct {
+    RtxHistRec *recs;
+    size_t len;
+    size_t cap;
+    size_t head;
+    int applying;
+    int coalesce;
+} RtxHistory;
+
+typedef struct {
+    RtxPieceTree tree;     /* document epoch: mmap + add + nodes */
+    CCArena session;       /* path + hist; lives until close */
+    CCArena analysis;      /* secs + runs; reset on reparse */
     RtxSection *secs;
     size_t sec_len;
     size_t sec_cap;
@@ -48,56 +77,177 @@ typedef struct {
     size_t run_len;
     size_t run_cap;
     size_t caret;
+    size_t sel_anchor;
+    char[:] path;
+    size_t saved_head;
+    size_t last_off;
+    long last_delta;
+    int last_markup;
+    int hl_full;
+    RtxHistory hist;
 } RtxDoc;
 
-static int rtx_doc_grow(void **p, size_t *cap, size_t need, size_t elem) {
+/* Grow a contiguous array on `a`. Old storage is abandoned until reset/destroy. */
+static int rtx_arena_grow(CCArena *a, void **p, size_t *cap, size_t need, size_t elem) {
     void *n;
     size_t c;
-    if (need <= *cap) return 1;
+    if (!a || need <= *cap) return 1;
     c = *cap ? *cap : 8;
     while (c < need) {
         size_t next = c * 2;
         if (next < c) return 0;
         c = next;
     }
-    n = realloc(*p, c * elem);
+    n = cc_arena_alloc(a, c * elem, 8);
     if (!n) return 0;
+    if (*p && *cap) memcpy(n, *p, (*cap) * elem);
     *p = n;
     *cap = c;
     return 1;
 }
 
-static void rtx_doc_destroy(RtxDoc *d) {
+static inline size_t RtxDoc_len(const RtxDoc *d) {
+    return d ? RtxPieceTree_len(&d->tree) : 0;
+}
+
+static inline size_t RtxDoc_line_count(const RtxDoc *d) {
+    return d ? RtxPieceTree_line_count(&d->tree) : 1;
+}
+
+static inline size_t RtxDoc_line_start(const RtxDoc *d, size_t line) {
+    return d ? RtxPieceTree_line_start(&d->tree, line) : 0;
+}
+
+static inline size_t RtxDoc_line_of(const RtxDoc *d, size_t offset) {
+    return d ? RtxPieceTree_line_of(&d->tree, offset) : 0;
+}
+
+static inline size_t RtxDoc_read_at(const RtxDoc *d, size_t offset, char *dest, size_t n) {
+    return d ? RtxPieceTree_read_at(&d->tree, offset, dest, n) : 0;
+}
+
+static inline char[:] !>(CCError) RtxDoc_scratch_span(const RtxDoc *d, CCArena *scratch,
+                                          size_t from, size_t n) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    return RtxPieceTree_scratch_span(&d->tree, scratch, from, n);
+}
+
+static inline int RtxDoc_check(const RtxDoc *d) {
+    return d ? RtxPieceTree_check(&d->tree) : 0;
+}
+
+static int RtxDoc_init_epochs(RtxDoc *d) {
+    if (!d) return 0;
+    d->session = cc_arena_heap(kilobytes(16));
+    d->analysis = cc_arena_heap(kilobytes(16));
+    return d->session.base != NULL && d->analysis.base != NULL;
+}
+
+static char[:] rtx_session_bytes(RtxDoc *d, const char *p, size_t n) {
+    char[:] out;
+    if (!d || n == 0) return cc_slice_empty();
+    out = d->session.alloc_slice_bytes(n);
+    if (!out.ptr) return cc_slice_empty();
+    if (p) memcpy(out.ptr, p, n);
+    return out;
+}
+
+/* NUL-terminated path view; len excludes the sentinel. */
+static char[:] rtx_session_str(RtxDoc *d, const char *s) {
+    size_t n;
+    char[:] out;
+    if (!d || !s) return cc_slice_empty();
+    n = strlen(s);
+    out = d->session.alloc_slice_bytes(n + 1);
+    if (!out.ptr) return cc_slice_empty();
+    memcpy(out.ptr, s, n + 1);
+    return out.sub(0, n);
+}
+
+static int rtx_doc_add_section(RtxDoc *d, size_t start, RtxSectionKind kind);
+
+static void RtxDoc_analysis_reset(RtxDoc *d) {
     if (!d) return;
-    rtx_piece_tree_destroy(&d->tree);
-    free(d->secs);
-    free(d->runs);
+    if (d->analysis.base) d->analysis.reset();
+    d->secs = NULL;
+    d->sec_len = 0;
+    d->sec_cap = 0;
+    d->runs = NULL;
+    d->run_len = 0;
+    d->run_cap = 0;
+}
+
+static void rtx_hist_clear(RtxHistory *h) {
+    if (!h) return;
+    memset(h, 0, sizeof(*h));
+}
+
+static void RtxDoc_destroy(RtxDoc *d) {
+    if (!d) return;
+    d->tree.destroy();
+    rtx_hist_clear(&d->hist);
+    if (d->session.base) d->session.destroy();
+    if (d->analysis.base) d->analysis.destroy();
     memset(d, 0, sizeof(*d));
 }
 
-static void !>(CCError) rtx_doc_empty(RtxDoc *d) {
+static int rtx_doc_is_live(const RtxDoc *d) {
+    return d && (rtx_tree_is_live(&d->tree) || d->session.base || d->analysis.base);
+}
+
+/* Document view if contiguous; otherwise a copy on analysis (analysis epoch). */
+static char[:] !>(CCError) rtx_doc_analysis_span(RtxDoc *d, size_t from, size_t n) {
+    char[:] view;
+    char[:] copy;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
-    memset(d, 0, sizeof(*d));
-    rtx_piece_tree_empty(&d->tree) !>(e) return cc_err(e);
-    if (!rtx_doc_grow((void **)&d->secs, &d->sec_cap, 1, sizeof(RtxSection))) {
-        rtx_doc_destroy(d);
-        return cc_err(CC_ERR_OUT_OF_MEMORY, "sections");
+    if (n == 0) return cc_ok(cc_slice_empty());
+    view = RtxPieceTree_span(&d->tree, from, n);
+    if (view.ptr) return cc_ok(view);
+    copy = d->analysis.alloc_slice_bytes(n);
+    if (!copy.ptr || copy.len < n) return cc_err(CC_ERR_OUT_OF_MEMORY, "analysis span");
+    if (d->read_at(from, copy.ptr, n) != n) {
+        return cc_err(CC_ERR_INTERNAL, "analysis span read");
     }
-    d->secs[0].start = 0;
-    d->secs[0].kind = RTX_SEC_PROSE;
-    d->sec_len = 1;
+    return cc_ok(copy);
+}
+
+static void !>(CCError) RtxDoc_empty(RtxDoc *d) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (rtx_doc_is_live(d)) return cc_err(CC_ERR_INVALID_ARG, "doc already live");
+    memset(d, 0, sizeof(*d));
+    d->tree.empty() !>(e) { return cc_err(e); };
+    if (!RtxDoc_init_epochs(d) || !rtx_doc_add_section(d, 0, RTX_SEC_PROSE)) {
+        d->destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "doc epochs");
+    }
     return cc_ok();
 }
 
-static RtxSectionKind rtx_doc_section_at(const RtxDoc *d, size_t off) {
-    size_t i;
-    RtxSectionKind k = RTX_SEC_PROSE;
-    if (!d) return k;
-    for (i = 0; i < d->sec_len; i++) {
-        if (d->secs[i].start <= off) k = d->secs[i].kind;
-        else break;
+static RtxSectionKind RtxDoc_section_at(const RtxDoc *d, size_t off) {
+    size_t lo, hi;
+    if (!d || d->sec_len == 0) return RTX_SEC_PROSE;
+    lo = 0;
+    hi = d->sec_len;
+    while (lo + 1 < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (d->secs[mid].start <= off) lo = mid;
+        else hi = mid;
     }
-    return k;
+    return d->secs[lo].kind;
+}
+
+static int rtx_run_start_cmp(const void *a, const void *b) {
+    const RtxRun *ra = (const RtxRun *)a;
+    const RtxRun *rb = (const RtxRun *)b;
+    if (ra->start < rb->start) return -1;
+    if (ra->start > rb->start) return 1;
+    return 0;
+}
+
+static void rtx_doc_sort_runs(RtxDoc *d) {
+    if (d && d->run_len > 1) {
+        qsort(d->runs, d->run_len, sizeof(RtxRun), rtx_run_start_cmp);
+    }
 }
 
 static void rtx_doc_shift_intervals(RtxDoc *d, size_t at, long delta) {
@@ -140,34 +290,37 @@ static void rtx_doc_shift_intervals(RtxDoc *d, size_t at, long delta) {
     }
 }
 
-static void !>(CCError) rtx_doc_insert(RtxDoc *d, size_t off, CCSlice bytes) {
+static void !>(CCError) RtxDoc_insert(RtxDoc *d, size_t off, char[:] bytes) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
-    rtx_piece_tree_insert(&d->tree, off, bytes) !>(e) return cc_err(e);
+    d->tree.insert(off, bytes) !>(e) { return cc_err(e); };
     rtx_doc_shift_intervals(d, off, (long)bytes.len);
     d->caret = off + bytes.len;
     return cc_ok();
 }
 
-static void !>(CCError) rtx_doc_erase(RtxDoc *d, size_t off, size_t n) {
+static void !>(CCError) RtxDoc_erase(RtxDoc *d, size_t off, size_t n) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
-    rtx_piece_tree_erase(&d->tree, off, n) !>(e) return cc_err(e);
+    d->tree.erase(off, n) !>(e) { return cc_err(e); };
     rtx_doc_shift_intervals(d, off, -(long)n);
     d->caret = off;
     return cc_ok();
 }
 
 static int rtx_doc_add_section(RtxDoc *d, size_t start, RtxSectionKind kind) {
-    if (!rtx_doc_grow((void **)&d->secs, &d->sec_cap, d->sec_len + 1, sizeof(RtxSection))) {
+    if (!rtx_arena_grow(&d->analysis, (void **)&d->secs, &d->sec_cap, d->sec_len + 1,
+                        sizeof(RtxSection))) {
         return 0;
     }
     d->secs[d->sec_len].start = start;
     d->secs[d->sec_len].kind = kind;
+    d->secs[d->sec_len].hl_done = 0;
     d->sec_len++;
     return 1;
 }
 
 static int rtx_doc_add_run(RtxDoc *d, size_t start, size_t len, RtxStyle style) {
-    if (!rtx_doc_grow((void **)&d->runs, &d->run_cap, d->run_len + 1, sizeof(RtxRun))) {
+    if (!rtx_arena_grow(&d->analysis, (void **)&d->runs, &d->run_cap, d->run_len + 1,
+                        sizeof(RtxRun))) {
         return 0;
     }
     d->runs[d->run_len].start = start;
@@ -187,26 +340,23 @@ static int rtx_path_looks_code(const char *path) {
            strcmp(dot, ".cc") == 0;
 }
 
-/* Scan markers in a flat copy. Spike sugar, not the stored format. */
-static void rtx_doc_scan_markup(RtxDoc *d) {
-    size_t n = rtx_piece_tree_len(&d->tree);
-    char *buf;
+static void !>(CCError) rtx_doc_scan_buf(RtxDoc *d, const char *buf, size_t n) {
     size_t i;
-    if (!d || n == 0) return;
-    buf = (char *)malloc(n + 1);
-    if (!buf) return;
-    rtx_piece_tree_read(&d->tree, 0, buf, n);
-    buf[n] = 0;
-    d->sec_len = 0;
-    d->run_len = 0;
-    rtx_doc_add_section(d, 0, RTX_SEC_PROSE);
+    if (!rtx_doc_add_section(d, 0, RTX_SEC_PROSE)) {
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "section");
+    }
+    if (!buf || n == 0) return cc_ok();
     for (i = 0; i + 13 <= n; i++) {
         if (memcmp(buf + i, "=== code ===", 12) == 0 &&
             (i == 0 || buf[i - 1] == '\n')) {
-            rtx_doc_add_section(d, i, RTX_SEC_CODE);
+            if (!rtx_doc_add_section(d, i, RTX_SEC_CODE)) {
+                return cc_err(CC_ERR_OUT_OF_MEMORY, "section");
+            }
         } else if (memcmp(buf + i, "=== prose ===", 13) == 0 &&
                    (i == 0 || buf[i - 1] == '\n')) {
-            rtx_doc_add_section(d, i, RTX_SEC_PROSE);
+            if (!rtx_doc_add_section(d, i, RTX_SEC_PROSE)) {
+                return cc_err(CC_ERR_OUT_OF_MEMORY, "section");
+            }
         }
     }
     for (i = 0; i < n; i++) {
@@ -216,7 +366,9 @@ static void rtx_doc_scan_markup(RtxDoc *d) {
             if (j < n && buf[j] == '`' && j > i + 1) {
                 RtxStyle st = {0};
                 st.mono = 1;
-                rtx_doc_add_run(d, i + 1, j - (i + 1), st);
+                if (!rtx_doc_add_run(d, i + 1, j - (i + 1), st)) {
+                    return cc_err(CC_ERR_OUT_OF_MEMORY, "run");
+                }
                 i = j;
             }
         } else if (buf[i] == '*') {
@@ -225,54 +377,131 @@ static void rtx_doc_scan_markup(RtxDoc *d) {
             if (j < n && buf[j] == '*' && j > i + 1) {
                 RtxStyle st = {0};
                 st.bold = 1;
-                rtx_doc_add_run(d, i + 1, j - (i + 1), st);
+                if (!rtx_doc_add_run(d, i + 1, j - (i + 1), st)) {
+                    return cc_err(CC_ERR_OUT_OF_MEMORY, "run");
+                }
                 i = j;
             }
         }
     }
-    free(buf);
+    return cc_ok();
 }
 
-static void rtx_doc_highlight(RtxDoc *d);
+/* Records on analysis. Bytes are a document view or an analysis-epoch copy. */
+static void !>(CCError) rtx_doc_scan_markup(RtxDoc *d) {
+    size_t n;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    d->analysis_reset();
+    n = d->len();
+    if (n == 0) {
+        if (!rtx_doc_add_section(d, 0, RTX_SEC_PROSE)) {
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "section");
+        }
+        return cc_ok();
+    }
+    {
+        char[:] bytes = rtx_doc_analysis_span(d, 0, n) !>(e) { return cc_err(e); };
+        rtx_doc_scan_buf(d, bytes.ptr, bytes.len) !>(e) {
+            d->analysis_reset();
+            return cc_err(e);
+        };
+    }
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_doc_highlight(RtxDoc *d);
 #include "highlight.cch"
 
-static void rtx_doc_reparse(RtxDoc *d) {
-    if (!d) return;
-    rtx_doc_scan_markup(d);
-    rtx_doc_highlight(d);
+#define RTX_HL_FULL_MAX 262144
+
+static void !>(CCError) RtxDoc_reparse(RtxDoc *d) {
+    size_t n;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    rtx_doc_scan_markup(d) !>(e) { return cc_err(e); };
+    n = d->len();
+    if (n <= RTX_HL_FULL_MAX) {
+        rtx_doc_highlight(d) !>(e) { return cc_err(e); };
+        d->hl_full = 1;
+    } else {
+        d->hl_full = 0;
+    }
+    rtx_doc_sort_runs(d);
+    return cc_ok();
 }
 
-static void !>(CCError) rtx_doc_open(RtxDoc *d, const char *path) {
+static void !>(CCError) RtxDoc_from_path(RtxDoc *d, const char *path) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (rtx_doc_is_live(d)) return cc_err(CC_ERR_INVALID_ARG, "doc already live");
     memset(d, 0, sizeof(*d));
-    rtx_piece_tree_open(&d->tree, path) !>(e) return cc_err(e);
-    rtx_doc_scan_markup(d);
-    if (d->sec_len == 0) {
-        if (!rtx_doc_add_section(d, 0, RTX_SEC_PROSE)) {
-            rtx_doc_destroy(d);
-            return cc_err(CC_ERR_OUT_OF_MEMORY, "sections");
-        }
+    d->tree.from_path(path) !>(e) { return cc_err(e); };
+    if (!RtxDoc_init_epochs(d)) {
+        d->destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "doc epochs");
     }
+    d->path = rtx_session_str(d, path);
+    if (path && path[0] && !d->path.ptr) {
+        d->destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "path");
+    }
+    rtx_doc_scan_markup(d) !>(e) {
+        d->destroy();
+        return cc_err(e);
+    };
     if (d->sec_len == 1 && rtx_path_looks_code(path)) {
         d->secs[0].kind = RTX_SEC_CODE;
     }
-    rtx_doc_highlight(d);
+    {
+        size_t n = d->len();
+        if (n <= RTX_HL_FULL_MAX) {
+            rtx_doc_highlight(d) !>(e) {
+                d->destroy();
+                return cc_err(e);
+            };
+            d->hl_full = 1;
+        }
+    }
+    rtx_doc_sort_runs(d);
     return cc_ok();
 }
 
-static void !>(CCError) rtx_doc_from_buffer(RtxDoc *d, CCSlice bytes) {
+static void !>(CCError) RtxDoc_from_buffer(RtxDoc *d, char[:] bytes) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (rtx_doc_is_live(d)) return cc_err(CC_ERR_INVALID_ARG, "doc already live");
     memset(d, 0, sizeof(*d));
-    rtx_piece_tree_from_buffer(&d->tree, bytes) !>(e) return cc_err(e);
-    rtx_doc_scan_markup(d);
-    if (d->sec_len == 0) {
-        if (!rtx_doc_add_section(d, 0, RTX_SEC_PROSE)) {
-            rtx_doc_destroy(d);
-            return cc_err(CC_ERR_OUT_OF_MEMORY, "sections");
+    d->tree.from_buffer(bytes) !>(e) { return cc_err(e); };
+    if (!RtxDoc_init_epochs(d)) {
+        d->destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "doc epochs");
+    }
+    rtx_doc_scan_markup(d) !>(e) {
+        d->destroy();
+        return cc_err(e);
+    };
+    {
+        size_t n = d->len();
+        if (n <= RTX_HL_FULL_MAX) {
+            rtx_doc_highlight(d) !>(e) {
+                d->destroy();
+                return cc_err(e);
+            };
+            d->hl_full = 1;
         }
     }
-    rtx_doc_highlight(d);
+    rtx_doc_sort_runs(d);
     return cc_ok();
 }
+
+#include "edit.cch"
+
+@typehooks on RtxDoc {
+    .destroy = RtxDoc_destroy,
+};
+@typeview on RtxDoc {
+    as: tree;
+};
+typedef @typeview Layout on RtxDoc {
+    r: len, line_count, line_start, line_of, read_at, scratch_span,
+       style_at, section_at, ensure_hl;
+} *RtxDocLayout;
 
 #endif /* RTX_DOCUMENT_H */

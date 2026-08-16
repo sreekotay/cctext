@@ -9,12 +9,15 @@ Standalone Concurrent-C editor. Compiler repo is a toolchain, not a parent tree.
 - Runs: style intervals inside a section (bold/italic/mono) plus syntax-token kinds.
 - Highlight: core lexer over `code` sections (C/CC keywords, strings, comments, numbers). Not a frontend concern. Later: `@grammar` or tree-sitter; same run list.
 - Layout: `measure(run, bytes) -> width` and `line_height(run) -> height`. Raylib supplies glyph advances; `cctext` supplies `wcwidth`.
-- Commands and caret are byte offsets.
+- Commands and caret are byte offsets. Selection is `[sel_anchor, caret)`.
+- Edits are replaces on a history stack (coalesced typing). Save writes pieces to a sibling temp file, fsyncs, then renames. Dirty is `hist.head != saved_head`.
+- After an edit, highlight re-lexes the touched section (full markup scan only if the edit involved `=`, `*`, backtick, or a newline). Layout relayouts the touched physical line(s) and shifts the rest.
+- A workspace holds several documents and one or two panes.
 
 ## Frontends
 
 - `raytext` — Raylib window (`#include <raylib.h>`), GPU quads for the visible layout only. Not `DrawText` on the document.
-- `cctext` — POSIX termios + ANSI. SGR mouse (`1000`+`1006`): click is `rtx_layout_hit` → caret. Wheel scrolls. Same highlight runs as the GUI.
+- `cctext` — POSIX termios + ANSI. SGR mouse (`1000`+`1002`+`1006`): click/drag is `rtx_layout_hit` → caret/selection. Wheel scrolls. Same highlight runs as the GUI.
 
 C FFI defaults to `@blocking`. The UI loop is a blocking main. Layout may run in a nursery.
 

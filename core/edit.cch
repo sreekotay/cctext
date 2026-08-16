@@ -1,0 +1,418 @@
+/*
+ * Selection, undo/redo, save, and typed edits. Insert/erase on the tree
+ * stay the primitives; every user-facing change is a replace recorded
+ * on the history stack.
+ */
+#ifndef RTX_EDIT_H
+#define RTX_EDIT_H
+
+#include <stdio.h>
+
+static int RtxDoc_dirty(const RtxDoc *d) {
+    return d && d->hist.head != d->saved_head;
+}
+
+static int RtxDoc_has_sel(const RtxDoc *d) {
+    return d && d->sel_anchor != d->caret;
+}
+
+static size_t RtxDoc_sel_lo(const RtxDoc *d) {
+    if (!d) return 0;
+    return d->sel_anchor < d->caret ? d->sel_anchor : d->caret;
+}
+
+static size_t RtxDoc_sel_hi(const RtxDoc *d) {
+    if (!d) return 0;
+    return d->sel_anchor > d->caret ? d->sel_anchor : d->caret;
+}
+
+static void RtxDoc_clear_sel(RtxDoc *d) {
+    if (d) d->sel_anchor = d->caret;
+}
+
+static void RtxDoc_break_coalesce(RtxDoc *d) {
+    if (d) d->hist.coalesce = 0;
+}
+
+static void RtxDoc_select_all(RtxDoc *d) {
+    if (!d) return;
+    d->sel_anchor = 0;
+    d->caret = d->len();
+    RtxDoc_break_coalesce(d);
+}
+
+static size_t rtx_doc_line_end_caret(const RtxDoc *d, size_t off) {
+    size_t line, nlines, start, end;
+    char ch;
+    if (!d) return 0;
+    line = d->line_of(off);
+    nlines = d->line_count();
+    start = d->line_start(line);
+    end = (line + 1 >= nlines) ? d->len()
+                               : d->line_start(line + 1);
+    if (end > start && d->read_at(end - 1, &ch, 1) == 1 &&
+        ch == '\n') {
+        return end - 1;
+    }
+    return end;
+}
+
+/* to_end 0 = start of line, 1 = end. shift extends the selection. */
+static void RtxDoc_move_line_edge(RtxDoc *d, int to_end, int shift) {
+    size_t dest;
+    if (!d) return;
+    if (to_end) dest = rtx_doc_line_end_caret(d, d->caret);
+    else {
+        dest = d->line_start(d->line_of(d->caret));
+    }
+    if (!shift) d->sel_anchor = dest;
+    d->caret = dest;
+    RtxDoc_break_coalesce(d);
+}
+
+static int rtx_bytes_touch_markup(const char *p, size_t n) {
+    size_t i;
+    if (!p) return 0;
+    for (i = 0; i < n; i++) {
+        char c = p[i];
+        if (c == '=' || c == '*' || c == '`') return 1;
+    }
+    return 0;
+}
+
+static void rtx_hist_drop_tail(RtxHistory *h) {
+    if (!h || h->head >= h->len) return;
+    h->len = h->head;
+}
+
+static int rtx_hist_grow(RtxDoc *d) {
+    return rtx_arena_grow(&d->session, (void **)&d->hist.recs, &d->hist.cap,
+                          d->hist.len + 1, sizeof(RtxHistRec));
+}
+
+static int rtx_hist_can_coalesce_insert(const RtxHistRec *r, size_t off, char[:] ins) {
+    if (!r || r->del.len != 0 || ins.len == 0) return 0;
+    if (off != r->off + r->ins.len) return 0;
+    if (memchr(r->ins.ptr, '\n', r->ins.len) || memchr(ins.ptr, '\n', ins.len)) return 0;
+    return 1;
+}
+
+static int rtx_hist_can_coalesce_erase(const RtxHistRec *r, size_t off, char[:] del) {
+    if (!r || r->ins.len != 0 || del.len == 0) return 0;
+    if (off + del.len != r->off) return 0;
+    if (memchr(r->del.ptr, '\n', r->del.len) || memchr(del.ptr, '\n', del.len)) return 0;
+    return 1;
+}
+
+static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
+    char[:] del = cc_slice_empty();
+    RtxHistRec rec;
+    char[:] coal = cc_slice_empty();
+    RtxHistRec *last = NULL;
+    size_t len;
+    size_t caret0;
+    size_t sel0;
+    int markup;
+    int coalesced = 0;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    len = d->len();
+    if (off > len || n > len - off) return cc_err(CC_ERR_INVALID_ARG, "replace range");
+    if (n == 0 && ins.len == 0) return cc_ok();
+    caret0 = d->caret;
+    sel0 = d->sel_anchor;
+    memset(&rec, 0, sizeof(rec));
+    {
+        cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+        if (n) {
+            char[:] got = d->scratch_span(&scratch, off, n) !>(e) {
+                scratch.destroy();
+                return cc_err(e);
+            };
+            del = got;
+        }
+        markup = rtx_bytes_touch_markup(del.ptr, del.len) ||
+                 rtx_bytes_touch_markup(ins.ptr, ins.len);
+        if (!d->hist.applying) {
+            if (d->hist.coalesce && d->hist.head > 0) {
+                last = &d->hist.recs[d->hist.head - 1];
+                if (rtx_hist_can_coalesce_insert(last, off, ins)) {
+                    coal = rtx_session_bytes(d, NULL, last->ins.len + ins.len);
+                    if (coal.ptr) {
+                        if (last->ins.len) memcpy(coal.ptr, last->ins.ptr, last->ins.len);
+                        memcpy(coal.ptr + last->ins.len, ins.ptr, ins.len);
+                        coalesced = 1;
+                    }
+                } else if (rtx_hist_can_coalesce_erase(last, off, del)) {
+                    coal = rtx_session_bytes(d, NULL, last->del.len + del.len);
+                    if (coal.ptr) {
+                        memcpy(coal.ptr, del.ptr, del.len);
+                        if (last->del.len) {
+                            memcpy(coal.ptr + del.len, last->del.ptr, last->del.len);
+                        }
+                        coalesced = 2;
+                    }
+                }
+            }
+            if (!coalesced) {
+                rec.del = rtx_session_bytes(d, del.ptr, del.len);
+                rec.ins = rtx_session_bytes(d, ins.ptr, ins.len);
+                if ((del.len && !rec.del.ptr) || (ins.len && !rec.ins.ptr)) {
+                    scratch.destroy();
+                    return cc_err(CC_ERR_OUT_OF_MEMORY, "history");
+                }
+                if (!rtx_hist_grow(d)) {
+                    scratch.destroy();
+                    return cc_err(CC_ERR_OUT_OF_MEMORY, "history");
+                }
+            }
+        }
+        if (n) d->erase(off, n) !>(e) {
+            scratch.destroy();
+            return cc_err(e);
+        };
+        if (ins.len) d->insert(off, ins) !>(e) {
+            scratch.destroy();
+            return cc_err(CC_ERR_INTERNAL, "replace half-applied");
+        };
+        d->last_off = off;
+        d->last_delta = (long)ins.len - (long)n;
+        d->last_markup = markup;
+        d->caret = off + ins.len;
+        d->sel_anchor = d->caret;
+        if (!d->hist.applying) {
+            if (coalesced == 1 && last) {
+                last->ins = coal;
+                last->caret_after = d->caret;
+                last->sel_after = d->sel_anchor;
+            } else if (coalesced == 2 && last) {
+                last->del = coal;
+                last->off = off;
+                last->caret_after = d->caret;
+                last->sel_after = d->sel_anchor;
+            } else {
+                rtx_hist_drop_tail(&d->hist);
+                rec.off = off;
+                rec.caret_before = caret0;
+                rec.sel_before = sel0;
+                rec.caret_after = d->caret;
+                rec.sel_after = d->sel_anchor;
+                d->hist.recs[d->hist.len++] = rec;
+                d->hist.head = d->hist.len;
+            }
+            d->hist.coalesce = 1;
+        }
+        scratch.destroy();
+        return cc_ok();
+    }
+}
+
+static void !>(CCError) RtxDoc_type(RtxDoc *d, char[:] bytes) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->has_sel()) {
+        size_t lo = d->sel_lo();
+        size_t hi = d->sel_hi();
+        return d->replace(lo, hi - lo, bytes);
+    }
+    return d->replace(d->caret, 0, bytes);
+}
+
+static void !>(CCError) RtxDoc_backspace(RtxDoc *d) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->has_sel()) {
+        size_t lo = d->sel_lo();
+        size_t hi = d->sel_hi();
+        return d->replace(lo, hi - lo, cc_slice_empty());
+    }
+    if (d->caret == 0) return cc_ok();
+    return d->replace(d->caret - 1, 1, cc_slice_empty());
+}
+
+static void !>(CCError) RtxDoc_delete_forward(RtxDoc *d) {
+    size_t len;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->has_sel()) return d->backspace();
+    len = d->len();
+    if (d->caret >= len) return cc_ok();
+    return d->replace(d->caret, 1, cc_slice_empty());
+}
+
+static int RtxDoc_can_undo(const RtxDoc *d) {
+    return d && d->hist.head > 0;
+}
+
+static int RtxDoc_can_redo(const RtxDoc *d) {
+    return d && d->hist.head < d->hist.len;
+}
+
+static void !>(CCError) RtxDoc_undo(RtxDoc *d) {
+    RtxHistRec *r;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->hist.head == 0) return cc_ok();
+    r = &d->hist.recs[d->hist.head - 1];
+    d->hist.applying = 1;
+    d->hist.coalesce = 0;
+    if (r->ins.len) d->erase(r->off, r->ins.len) !>(e) {
+        d->hist.applying = 0;
+        return cc_err(e);
+    };
+    if (r->del.len) d->insert(r->off, r->del) !>(e) {
+        d->hist.applying = 0;
+        return cc_err(e);
+    };
+    d->last_off = r->off;
+    d->last_delta = (long)r->del.len - (long)r->ins.len;
+    d->last_markup = rtx_bytes_touch_markup(r->del.ptr, r->del.len) ||
+                     rtx_bytes_touch_markup(r->ins.ptr, r->ins.len);
+    d->caret = r->caret_before;
+    d->sel_anchor = r->sel_before;
+    d->hist.head--;
+    d->hist.applying = 0;
+    return cc_ok();
+}
+
+static void !>(CCError) RtxDoc_redo(RtxDoc *d) {
+    RtxHistRec *r;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->hist.head >= d->hist.len) return cc_ok();
+    r = &d->hist.recs[d->hist.head];
+    d->hist.applying = 1;
+    d->hist.coalesce = 0;
+    if (r->del.len) d->erase(r->off, r->del.len) !>(e) {
+        d->hist.applying = 0;
+        return cc_err(e);
+    };
+    if (r->ins.len) d->insert(r->off, r->ins) !>(e) {
+        d->hist.applying = 0;
+        return cc_err(e);
+    };
+    d->last_off = r->off;
+    d->last_delta = (long)r->ins.len - (long)r->del.len;
+    d->last_markup = rtx_bytes_touch_markup(r->del.ptr, r->del.len) ||
+                     rtx_bytes_touch_markup(r->ins.ptr, r->ins.len);
+    d->caret = r->caret_after;
+    d->sel_anchor = r->sel_after;
+    d->hist.head++;
+    d->hist.applying = 0;
+    return cc_ok();
+}
+
+static void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
+    char tmp[4096];
+    int fd;
+    size_t n;
+    if (!d || !path || !path[0]) return cc_err(CC_ERR_INVALID_ARG, "save path");
+    n = strlen(path);
+    if (n + 24 >= sizeof(tmp)) return cc_err(CC_ERR_INVALID_ARG, "path too long");
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return cc_err(CC_ERR_IO, "save open");
+    if (!d->tree.write_fd(fd)) {
+        close(fd);
+        unlink(tmp);
+        return cc_err(CC_ERR_IO, "save write");
+    }
+    if (fsync(fd) != 0) {
+        close(fd);
+        unlink(tmp);
+        return cc_err(CC_ERR_IO, "save fsync");
+    }
+    if (close(fd) != 0) {
+        unlink(tmp);
+        return cc_err(CC_ERR_IO, "save close");
+    }
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return cc_err(CC_ERR_IO, "save rename");
+    }
+    if (!d->path.ptr || !d->path.eq_cstr(path)) {
+        char[:] copy = rtx_session_str(d, path);
+        if (!copy.ptr) return cc_err(CC_ERR_OUT_OF_MEMORY, "save path");
+        d->path = copy;
+    }
+    d->saved_head = d->hist.head;
+    return cc_ok();
+}
+
+static void !>(CCError) RtxDoc_save(RtxDoc *d) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (!d->path.ptr || d->path.len == 0) return cc_err(CC_ERR_INVALID_ARG, "untitled");
+    return d->save_as(d->path.ptr);
+}
+
+static void rtx_doc_strip_hl_in(RtxDoc *d, size_t lo, size_t hi) {
+    size_t i;
+    size_t o;
+    if (!d) return;
+    o = 0;
+    for (i = 0; i < d->run_len; i++) {
+        RtxRun r = d->runs[i];
+        int hl_only = r.style.hl != RTX_HL_NONE && !r.style.bold && !r.style.italic &&
+                      !r.style.mono;
+        size_t end = r.start + r.len;
+        if (hl_only && end > lo && r.start < hi) continue;
+        d->runs[o++] = r;
+    }
+    d->run_len = o;
+}
+
+static void !>(CCError) rtx_doc_highlight_span(RtxDoc *d, size_t lo, size_t hi) {
+    if (!d || hi <= lo) return cc_ok();
+    rtx_doc_strip_hl_in(d, lo, hi);
+    {
+        char[:] bytes = rtx_doc_analysis_span(d, lo, hi - lo) !>(e) {
+            return cc_err(e);
+        };
+        rtx_hl_range(d, bytes.ptr, lo, bytes.len) !>(e) {
+            rtx_doc_strip_hl_in(d, lo, hi);
+            return cc_err(e);
+        };
+    }
+    return cc_ok();
+}
+
+static void !>(CCError) RtxDoc_reparse_edit(RtxDoc *d, size_t off, long delta, int full_markup) {
+    size_t s, lo, hi, n;
+    (void)delta;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (full_markup) return d->reparse();
+    n = d->len();
+    if (off > n) off = n;
+    lo = 0;
+    hi = n;
+    for (s = 0; s < d->sec_len; s++) {
+        if (d->secs[s].start <= off) {
+            lo = d->secs[s].start;
+            hi = (s + 1 < d->sec_len) ? d->secs[s + 1].start : n;
+        }
+    }
+    if (d->section_at(off) == RTX_SEC_CODE) {
+        rtx_doc_highlight_span(d, lo, hi) !>(e) { return cc_err(e); };
+        rtx_doc_sort_runs(d);
+        for (s = 0; s < d->sec_len; s++) {
+            if (d->secs[s].start == lo) d->secs[s].hl_done = 1;
+        }
+    }
+    return cc_ok();
+}
+
+static void !>(CCError) RtxDoc_ensure_hl(RtxDoc *d, size_t from, size_t to) {
+    size_t s, n, lo, hi;
+    int any = 0;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (d->hl_full || to <= from) return cc_ok();
+    n = d->len();
+    if (to > n) to = n;
+    for (s = 0; s < d->sec_len; s++) {
+        if (d->secs[s].kind != RTX_SEC_CODE || d->secs[s].hl_done) continue;
+        lo = d->secs[s].start;
+        hi = (s + 1 < d->sec_len) ? d->secs[s + 1].start : n;
+        if (hi <= from || lo >= to) continue;
+        rtx_doc_highlight_span(d, lo, hi) !>(e) { return cc_err(e); };
+        d->secs[s].hl_done = 1;
+        any = 1;
+    }
+    if (any) rtx_doc_sort_runs(d);
+    return cc_ok();
+}
+
+#endif /* RTX_EDIT_H */

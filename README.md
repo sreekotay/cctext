@@ -14,18 +14,21 @@ This is a standalone app. It needs `ccc` on `PATH` (or `CCC=`). It does not live
 
 ## Status
 
-Piece tree, document, layout, C/CC highlight, **cctext** (keyboard + SGR mouse caret), and **raytext** (Raylib) are in.
+Piece tree, document, layout, C/CC highlight, save, undo/redo, selection, incremental relayout, and multifile splits. **cctext** and **raytext** share that core.
 
 ## Setup
 
 ```bash
 ./setup.sh                  # checks ccc; Raylib is optional for now
-make smoke                  # piece-tree + layout/highlight tests
-make cctext                 # console editor (click to place caret)
+make smoke                  # piece-tree + layout + edit-session + large-file tests
+make large                  # testdata/generated/large.txt (100000 lines; LARGE_LINES=)
+make cctext                 # console editor
 make raytext                # Raylib GUI (needs `brew install raylib`)
-./bin/cctext testdata/mixed.txt
-./bin/raytext testdata/mixed.txt
+./bin/cctext testdata/mixed.txt testdata/small.txt
+./bin/raytext testdata/generated/large.txt
 ```
+
+**raytext** has a File / Edit / View / Go menu bar (click a title, then an item). **Esc** still opens the key-binding overlay in both frontends. **g** / **Ctrl-G** jumps to a line. Line numbers are in the gutter. Ctrl/Cmd chords work while the overlay is closed. Unsaved quit asks once.
 
 A `ccc` built from a concurrent-c checkout writes `out/` into that checkout unless `--out-dir` / `--bin-dir` are absolute. `make` passes `$(CURDIR)/out` and `$(CURDIR)/bin`. You can also set `CC_OUT_DIR` / `CC_BIN_DIR`.
 

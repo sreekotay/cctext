@@ -12,6 +12,12 @@ CC_TARGET_INCLUDE piece_tree_smoke .
 CC_TARGET layout_measure_smoke exe tests/layout_measure_smoke.ccs
 CC_TARGET_INCLUDE layout_measure_smoke .
 
+CC_TARGET edit_session_smoke exe tests/edit_session_smoke.ccs
+CC_TARGET_INCLUDE edit_session_smoke .
+
+CC_TARGET large_file_smoke exe tests/large_file_smoke.ccs
+CC_TARGET_INCLUDE large_file_smoke .
+
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
 

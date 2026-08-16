@@ -1,0 +1,216 @@
+/*
+ * Save, undo/redo, selection, incremental layout, multifile workspace.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/script/stdio.cch>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static void expect_text(RtxDoc *d, const char *want, const char *msg) {
+    size_t n = d->len();
+    char buf[4096];
+    size_t got;
+    expect(n == strlen(want), msg);
+    if (n >= sizeof(buf)) {
+        expect(0, "expect_text buffer");
+        return;
+    }
+    got = d->read_at(0, buf, n);
+    expect(got == n, msg);
+    buf[n] = 0;
+    expect(memcmp(buf, want, n) == 0, msg);
+    if (n != strlen(want) || memcmp(buf, want, n) != 0) {
+        fprintf(stderr, "  got '%s' want '%s' (%s)\n", buf, want, msg);
+    }
+}
+
+static double meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return (double)bytes.len;
+}
+
+static double lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+int main(void) {
+    @errhandler(CCError e) { cc_error_log(e); return 1; }
+    RtxMeasure m;
+    m.measure = meas;
+    m.line_height = lh;
+    m.ctx = NULL;
+
+    {
+        RtxDoc d = {0} @destroy;
+        d.from_buffer("ab") !>;
+        expect(!d.dirty(), "clean at open");
+        d.caret = d.len();
+        d.sel_anchor = d.caret;
+        d.type("X") !>;
+        expect_text(&d, "abX", "type at end");
+        expect(d.caret == 3, "caret after type");
+        expect(d.dirty(), "dirty after type");
+        d.undo() !>;
+        expect_text(&d, "ab", "undo type");
+        expect(d.caret == 2, "caret restored");
+        expect(!d.dirty(), "clean after undo to save point");
+        d.redo() !>;
+        expect_text(&d, "abX", "redo");
+        expect(d.dirty(), "dirty after redo");
+    }
+
+    {
+        RtxDoc d = {0} @destroy;
+        const char *hello = "hello";
+        size_t i;
+        d.from_buffer("") !>;
+        for (i = 0; i < 5; i++) {
+            char s[2];
+            s[0] = hello[i];
+            s[1] = 0;
+            d.type(s.to_slice_n(1)) !>;
+        }
+        expect_text(&d, "hello", "coalesced type");
+        expect(d.hist.head == 1, "one hist rec for hello");
+        d.undo() !>;
+        expect_text(&d, "", "one undo removes hello");
+        d.redo() !>;
+        expect_text(&d, "hello", "redo hello");
+    }
+
+    {
+        RtxDoc d = {0} @destroy;
+        d.from_buffer("abcdef") !>;
+        d.caret = 2;
+        d.sel_anchor = 5;
+        expect(d.has_sel(), "has sel");
+        expect(d.sel_lo() == 2 && d.sel_hi() == 5, "sel range");
+        d.type("Z") !>;
+        expect_text(&d, "abZf", "type over sel");
+        d.undo() !>;
+        expect_text(&d, "abcdef", "undo replace sel");
+        expect(d.caret == 2 && d.sel_anchor == 5, "sel restored");
+    }
+
+    {
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_roundtrip.txt";
+        FILE *f;
+        char got[64];
+        size_t n;
+        if (system("mkdir -p testdata/generated") != 0) expect(0, "mkdir");
+        d.from_buffer("orig") !>;
+        d.caret = d.len();
+        d.sel_anchor = d.caret;
+        d.type("-edit") !>;
+        d.save_as(path) !>;
+        expect(!d.dirty(), "clean after save");
+        expect(d.path.eq_cstr(path), "path set");
+        f = fopen(path, "r");
+        expect(f != NULL, "saved file");
+        n = f ? fread(got, 1, sizeof(got), f) : 0;
+        if (f) fclose(f);
+        expect(n == 9 && memcmp(got, "orig-edit", 9) == 0, "file bytes");
+        d.undo() !>;
+        expect(d.dirty(), "dirty after undo past save");
+        d.redo() !>;
+        expect(!d.dirty(), "clean after redo to save");
+        {
+            RtxDoc d2 = {0} @destroy;
+            d2.from_path(path) !>;
+            expect_text(&d2, "orig-edit", "reopen saved");
+        }
+        unlink(path);
+    }
+
+    {
+        RtxDoc d = {0} @destroy;
+        RtxLayout L = {0} @destroy;
+        size_t i;
+        uint8_t body_buf[2048];
+        CCArena body_arena = cc_arena_fixed_buffer(body_buf, sizeof(body_buf)) @destroy;
+        char[:] body;
+        size_t n = 0;
+        size_t row10_start;
+        size_t tail_start;
+        body = body_arena.alloc_slice_bytes(sizeof(body_buf));
+        expect(body.ptr != NULL, "body arena");
+        if (!body.ptr) return 1;
+        for (i = 0; i < 40; i++) {
+            n += (size_t)snprintf(body.ptr + n, body.len - n, "line-%02zu xxxx\n", i);
+        }
+        d.from_buffer(body.sub(0, n)) !>;
+        d.secs[0].kind = RTX_SEC_CODE;
+        L.doc(&d, &m, 80) !>;
+        expect(L.len == 40, "40 visual rows");
+        row10_start = L.rows[10].byte_start;
+        tail_start = L.rows[30].byte_start;
+        d.caret = row10_start + 5;
+        d.sel_anchor = d.caret;
+        d.type("Z") !>;
+        L.view_after_edit(&d, &m, 80) !>;
+        expect(L.len == 40, "row count unchanged after mid insert");
+        expect(L.rows[10].byte_start == row10_start, "edited row start");
+        expect(L.rows[30].byte_start == tail_start + 1, "tail shifted +1");
+        expect(L.rows[5].byte_start < row10_start, "head unshifted");
+    }
+
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[2];
+        paths[0] = (char *)"testdata/small.txt";
+        paths[1] = (char *)"testdata/mixed.txt";
+        w.open_files(2, paths) !>;
+        expect(w.len == 2, "two buffers");
+        expect(w.npanes == 2, "split on two files");
+        expect(w.doc() == &w.bufs[0].doc, "focus first");
+        w.focus_other();
+        expect(w.doc() == &w.bufs[1].doc, "focus second");
+        w.next_buf();
+        expect(w.pane[1] == 0, "cycle pane buffer");
+    }
+
+    {
+        RtxDoc d = {0} @destroy;
+        d.from_buffer("ab\ncd\nef") !>;
+        d.caret = 4;
+        d.sel_anchor = 4;
+        d.select_all();
+        expect(d.sel_anchor == 0 && d.caret == 8, "select all");
+        d.caret = 4;
+        d.sel_anchor = 4;
+        d.move_line_edge(0, 0);
+        expect(d.caret == 3 && d.sel_anchor == 3, "line start");
+        d.move_line_edge(1, 0);
+        expect(d.caret == 5 && d.sel_anchor == 5, "line end before nl");
+        d.caret = 4;
+        d.sel_anchor = 4;
+        d.move_line_edge(0, 1);
+        expect(d.caret == 3 && d.sel_anchor == 4, "shift to line start");
+    }
+
+    if (fails) {
+        fprintf(stderr, "%d failure(s)\n", fails);
+        return 1;
+    }
+    printf("edit_session_smoke ok\n");
+    return 0;
+}
