@@ -4,8 +4,7 @@ CCC ?= ccc
 OUT := $(CURDIR)/out
 BIN := $(CURDIR)/bin
 
-# 0.3.3-139: passthrough CamelCase C types from #include <…>.
-CCC_FLAGS := version=0.3.3-139 --no-cache --out-dir $(OUT) --bin-dir $(BIN)
+CCC_FLAGS := --no-cache --out-dir $(OUT) --bin-dir $(BIN)
 RAYLIB_PREFIX := $(shell brew --prefix raylib 2>/dev/null)
 RAYLIB_CFLAGS := -I$(RAYLIB_PREFIX)/include
 RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib

@@ -16,13 +16,10 @@ fi
 ver="$("$CCC" --version 2>/dev/null || true)"
 echo "ccc: $ver"
 
-need_major=0
-need_minor=3
-# Makefile pins version=0.3.3-139.
 case "$ver" in
-    *0.3.3-139*|*0.3.3-1[4-9]*|*0.3.[4-9]*) ;;
+    *0.3.*) ;;
     *)
-        echo "raytext: expected ccc 0.3.3-139 or newer, got: $ver" >&2
+        echo "raytext: expected ccc 0.3.x, got: $ver" >&2
         exit 1
         ;;
 esac
