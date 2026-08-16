@@ -14,15 +14,17 @@ This is a standalone app. It needs `ccc` on `PATH` (or `CCC=`). It does not live
 
 ## Status
 
-Piece tree, document (sections + runs), measure-generic layout, C/CC highlight, and **cctext** are in. Raylib GUI is next.
+Piece tree, document, layout, C/CC highlight, **cctext** (keyboard + SGR mouse caret), and **raytext** (Raylib) are in.
 
 ## Setup
 
 ```bash
 ./setup.sh                  # checks ccc; Raylib is optional for now
 make smoke                  # piece-tree + layout/highlight tests
-make cctext                 # console editor
+make cctext                 # console editor (click to place caret)
+make raytext                # Raylib GUI (needs `brew install raylib`)
 ./bin/cctext testdata/mixed.txt
+./bin/raytext testdata/mixed.txt
 ```
 
 A `ccc` built from a concurrent-c checkout writes `out/` into that checkout unless `--out-dir` / `--bin-dir` are absolute. `make` passes `$(CURDIR)/out` and `$(CURDIR)/bin`. You can also set `CC_OUT_DIR` / `CC_BIN_DIR`.

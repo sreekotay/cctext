@@ -14,7 +14,7 @@ Standalone Concurrent-C editor. Compiler repo is a toolchain, not a parent tree.
 ## Frontends
 
 - `raytext` — Raylib window, GPU quads for the visible layout only. Not `DrawText` on the document.
-- `cctext` — POSIX termios + ANSI. Same document, layout, and highlight runs. Proportional text degrades to column wrap + styles/colors.
+- `cctext` — POSIX termios + ANSI. SGR mouse (`1000`+`1006`): click is `rtx_layout_hit` → caret. Wheel scrolls. Same highlight runs as the GUI.
 
 C FFI defaults to `@blocking`. The UI loop is a blocking main. Layout may run in a nursery.
 

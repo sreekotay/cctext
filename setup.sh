@@ -27,12 +27,10 @@ case "$ver" in
         ;;
 esac
 
-if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists raylib; then
-    echo "raylib: $(pkg-config --modversion raylib)"
-elif command -v brew >/dev/null 2>&1 && brew --prefix raylib >/dev/null 2>&1; then
+if test -f "$(brew --prefix raylib 2>/dev/null)/include/raylib.h"; then
     echo "raylib: $(brew --prefix raylib)"
 else
-    echo "raylib: not found (optional until the GUI frontend). brew install raylib"
+    echo "raylib: not found (needed for make raytext). brew install raylib"
 fi
 
 mkdir -p testdata/generated out bin

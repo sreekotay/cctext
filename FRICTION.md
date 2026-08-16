@@ -8,3 +8,4 @@ Gaps found using Concurrent-C as a PATH toolchain, not a checkout-relative speci
 - **Emit can hoist a struct ahead of a type it points at** (result-payload / field rewrite to `RtxNode*`). Forward `typedef struct` tags and `struct RtxNode *` fields.
 - **No mmap helper** in stdlib. POSIX `mmap` + `cc_slice_from_buffer` (untracked).
 - **C FFI is `@blocking`.** `cctext` / Raylib loops are blocking mains.
+- **`<raylib.h>` types are invisible to shadow_lower** (angle includes passthrough). GPU calls live in `frontend/rl_host.c`; `.ccs` uses a C API.

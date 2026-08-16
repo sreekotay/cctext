@@ -1,9 +1,12 @@
 /*
  * cctext — POSIX console frontend. Same document/layout as raytext.
- * Syntax colors are ANSI from RtxHlKind. Prose wraps in columns.
  *
  *   cctext [file]
- *   q quit  j/k or arrows scroll
+ *   q quit   arrows move caret   click places caret   wheel scrolls
+ *   type to insert   backspace to delete
+ *
+ * Mouse: SGR tracking (1000+1006). Click is layout hit-test → caret.
+ * Wheel scrolls. Works in iTerm, Terminal.app, kitty, most xterms.
  */
 #include <ccc/std/prelude.cch>
 #include <ccc/script/stdio.cch>
@@ -15,12 +18,29 @@
 #include <sys/ioctl.h>
 #include "../core/layout.cch"
 
+enum {
+    KEY_QUIT = 1,
+    KEY_UP,
+    KEY_DOWN,
+    KEY_LEFT,
+    KEY_RIGHT,
+    KEY_BACKSPACE,
+    KEY_ENTER,
+    KEY_MOUSE,
+    KEY_WHEEL_UP,
+    KEY_WHEEL_DOWN,
+    KEY_CHAR
+};
+
 static struct termios g_old;
 static int g_raw = 0;
+static int g_mouse_col;
+static int g_mouse_row;
+static int g_mouse_press;
 
 static void cctext_restore(void) {
     if (g_raw) tcsetattr(STDIN_FILENO, TCSANOW, &g_old);
-    fputs("\x1b[0m\x1b[?25h\x1b[?1049l", stdout);
+    fputs("\x1b[?1000l\x1b[?1006l\x1b[0m\x1b[?25h\x1b[?1049l", stdout);
     fflush(stdout);
     g_raw = 0;
 }
@@ -34,7 +54,7 @@ static int cctext_raw(void) {
     t.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSANOW, &t) != 0) return 0;
     g_raw = 1;
-    fputs("\x1b[?1049h\x1b[?25l", stdout);
+    fputs("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h", stdout);
     atexit(cctext_restore);
     return 1;
 }
@@ -49,9 +69,10 @@ static void cctext_winsize(int *rows, int *cols) {
     }
 }
 
-static double cctext_measure(void *ctx, CCSlice bytes, RtxStyle style) {
+static double cctext_measure(void *ctx, CCSlice bytes, RtxStyle style, RtxSectionKind sec) {
     (void)ctx;
     (void)style;
+    (void)sec;
     return (double)bytes.len;
 }
 
@@ -72,6 +93,66 @@ static const char *cctext_hl_ansi(RtxHlKind hl) {
     }
 }
 
+static int cctext_read(int *ch_out) {
+    int c = getchar();
+    if (c == EOF) return KEY_QUIT;
+    if (c == 'q' || c == 'Q' || c == 3) return KEY_QUIT;
+    if (c == 127 || c == 8) return KEY_BACKSPACE;
+    if (c == '\r' || c == '\n') return KEY_ENTER;
+    if (c == 0x1b) {
+        int a = getchar();
+        if (a != '[') return KEY_QUIT;
+        {
+            int b = getchar();
+            if (b == 'A') return KEY_UP;
+            if (b == 'B') return KEY_DOWN;
+            if (b == 'C') return KEY_RIGHT;
+            if (b == 'D') return KEY_LEFT;
+            if (b == '<') {
+                int btn = 0, col = 0, row = 0, *slot = &btn;
+                int d;
+                int press = 0;
+                while ((d = getchar()) != EOF) {
+                    if (d >= '0' && d <= '9') {
+                        *slot = (*slot * 10) + (d - '0');
+                    } else if (d == ';') {
+                        if (slot == &btn) slot = &col;
+                        else slot = &row;
+                    } else if (d == 'M' || d == 'm') {
+                        press = (d == 'M');
+                        break;
+                    }
+                }
+                g_mouse_col = col;
+                g_mouse_row = row;
+                g_mouse_press = press;
+                if (btn == 64) return KEY_WHEEL_UP;
+                if (btn == 65) return KEY_WHEEL_DOWN;
+                if (press && btn == 0) return KEY_MOUSE;
+                return 0;
+            }
+        }
+        return 0;
+    }
+    if (c >= 32 && c < 127) {
+        *ch_out = c;
+        return KEY_CHAR;
+    }
+    return 0;
+}
+
+static void cctext_relayout(RtxDoc *d, RtxLayout *L, RtxMeasure *m, int cols) {
+    rtx_doc_reparse(d);
+    rtx_layout_doc(L, d, m, (double)cols);
+}
+
+static void cctext_ensure_caret(RtxLayout *L, size_t caret, size_t *top, int vis) {
+    size_t row = rtx_layout_row_of(L, caret);
+    if (vis < 1) vis = 1;
+    if (row < *top) *top = row;
+    if (row >= *top + (size_t)vis) *top = row - (size_t)vis + 1;
+}
+
 static void cctext_draw(RtxDoc *d, RtxLayout *L, size_t top, int rows, int cols) {
     size_t r;
     int vis = rows > 1 ? rows - 1 : 1;
@@ -87,22 +168,27 @@ static void cctext_draw(RtxDoc *d, RtxLayout *L, size_t top, int rows, int cols)
             size_t k;
             char *buf = (char *)malloc(row->byte_len ? row->byte_len : 1);
             size_t col = 0;
+            int caret_end = (d->caret == row->byte_start + row->byte_len);
             if (!buf) continue;
             rtx_piece_tree_read(&d->tree, row->byte_start, buf, row->byte_len);
             for (k = 0; k < row->byte_len && col < (size_t)cols; k++) {
                 RtxStyle st = rtx_style_at(d, row->byte_start + k);
+                int here = (d->caret == row->byte_start + k);
                 fputs(cctext_hl_ansi(st.hl), stdout);
                 if (st.bold) fputs("\x1b[1m", stdout);
+                if (here) fputs("\x1b[7m", stdout);
                 fputc(buf[k], stdout);
                 fputs("\x1b[0m", stdout);
                 col++;
             }
+            if (caret_end && col < (size_t)cols) fputs("\x1b[7m \x1b[0m", stdout);
             free(buf);
             fputc('\n', stdout);
         }
     }
-    fprintf(stdout, "\x1b[7m cctext %zu/%zu  q quit  j/k scroll \x1b[0m",
-            top + 1 > L->len ? L->len : top + 1, L->len);
+    fprintf(stdout,
+            "\x1b[7m cctext %zu/%zu  caret %zu  click to move  q quit \x1b[0m",
+            L->len ? (top + 1 > L->len ? L->len : top + 1) : 0, L->len, d->caret);
     fflush(stdout);
 }
 
@@ -114,7 +200,8 @@ int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : "testdata/mixed.txt";
     int rows = 24, cols = 80;
     size_t top = 0;
-    int ch;
+    int kind;
+    int ch = 0;
 
     rtx_doc_open(&d, path) !>;
     m.measure = cctext_measure;
@@ -127,7 +214,6 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (!isatty(STDIN_FILENO) || !cctext_raw()) {
-        /* Non-TTY: dump highlighted rows and exit. */
         size_t i;
         for (i = 0; i < L.len; i++) {
             RtxVisRow *row = &L.rows[i];
@@ -151,19 +237,61 @@ int main(int argc, char **argv) {
     }
 
     for (;;) {
+        int vis;
         cctext_winsize(&rows, &cols);
+        vis = rows > 1 ? rows - 1 : 1;
+        cctext_ensure_caret(&L, d.caret, &top, vis);
         cctext_draw(&d, &L, top, rows, cols);
-        ch = getchar();
-        if (ch == 'q' || ch == 'Q' || ch == 3) break;
-        if (ch == 'j' || ch == '\n') {
-            if (top + 1 < L.len) top++;
-        } else if (ch == 'k') {
-            if (top > 0) top--;
-        } else if (ch == 0x1b) {
-            int a = getchar();
-            int b = getchar();
-            if (a == '[' && b == 'B' && top + 1 < L.len) top++;
-            if (a == '[' && b == 'A' && top > 0) top--;
+        kind = cctext_read(&ch);
+        if (kind == KEY_QUIT) break;
+        if (kind == KEY_WHEEL_UP && top > 0) top--;
+        else if (kind == KEY_WHEEL_DOWN && top + 1 < L.len) top++;
+        else if (kind == KEY_MOUSE) {
+            if (g_mouse_row >= 1 && g_mouse_row <= vis) {
+                double x = (double)(g_mouse_col > 0 ? g_mouse_col - 1 : 0);
+                double y = (double)(top + (size_t)(g_mouse_row - 1));
+                d.caret = rtx_layout_hit(&L, &d, &m, x, y);
+            }
+        } else if (kind == KEY_LEFT) {
+            if (d.caret > 0) d.caret--;
+        } else if (kind == KEY_RIGHT) {
+            if (d.caret < rtx_piece_tree_len(&d.tree)) d.caret++;
+        } else if (kind == KEY_UP || kind == KEY_DOWN) {
+            size_t row = rtx_layout_row_of(&L, d.caret);
+            size_t next = (kind == KEY_UP) ? (row > 0 ? row - 1 : 0)
+                                           : (row + 1 < L.len ? row + 1 : row);
+            double x = 0;
+            double y = 0;
+            size_t i;
+            for (i = 0; i < row && i < L.len; i++) {
+                /* x: distance from start of current row to caret */
+            }
+            {
+                RtxVisRow *cr = &L.rows[row];
+                size_t k;
+                char tmp[8];
+                for (k = 0; cr->byte_start + k < d.caret && k < cr->byte_len; k++) {
+                    CCSlice one = cc_slice_from_buffer(tmp, 1);
+                    tmp[0] = ' ';
+                    x += m.measure(m.ctx, one, rtx_style_at(&d, cr->byte_start + k), cr->sec);
+                }
+            }
+            for (i = 0; i < next; i++) y += L.rows[i].height;
+            d.caret = rtx_layout_hit(&L, &d, &m, x, y);
+        } else if (kind == KEY_BACKSPACE) {
+            if (d.caret > 0) {
+                rtx_doc_erase(&d, d.caret - 1, 1) !>;
+                cctext_relayout(&d, &L, &m, cols);
+            }
+        } else if (kind == KEY_ENTER) {
+            rtx_doc_insert(&d, d.caret, cc_slice_from_buffer((void *)"\n", 1)) !>;
+            cctext_relayout(&d, &L, &m, cols);
+        } else if (kind == KEY_CHAR) {
+            char s[2];
+            s[0] = (char)ch;
+            s[1] = 0;
+            rtx_doc_insert(&d, d.caret, cc_slice_from_buffer(s, 1)) !>;
+            cctext_relayout(&d, &L, &m, cols);
         }
     }
     cctext_restore();
