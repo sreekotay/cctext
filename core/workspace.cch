@@ -19,10 +19,51 @@ typedef struct {
     size_t drag_len;
     int drag_grab;         /* thumb grab offset in track cells/pixels */
     int pin_view;          /* 1 after wheel/bar: do not reveal to the caret */
+    int unlock;            /* 1: viewport does not follow caret (find/jump still land) */
     double scroll;
     double layout_width;
     RtxPref pref;          /* goal column for visual up/down */
 } RtxBuf;
+
+#ifndef RTX_BROWSE_TYPES
+#define RTX_BROWSE_TYPES
+enum {
+    RTX_BROWSE_NAME = 256,
+    RTX_BROWSE_DIR = 1024,
+    RTX_BROWSE_GLOB = 96,
+    RTX_BROWSE_MAX = 4096,
+    RTX_BROWSE_HEAD = 2
+};
+typedef struct {
+    int is_dir;
+    char name[RTX_BROWSE_NAME];
+} RtxBrowseEnt;
+typedef struct {
+    int on;
+    int truncated;
+    char dir[RTX_BROWSE_DIR];
+    char glob[RTX_BROWSE_GLOB];
+    size_t glob_len;
+    RtxBrowseEnt *ents;
+    size_t len, cap;
+    size_t cur, top;
+    CCArena store;
+} RtxBrowse;
+#endif
+
+/* Camera + layout for the other pane when both show the same buf. */
+typedef struct {
+    int live;
+    RtxLayout layout;
+    size_t top, top_wrap, top_byte;
+    int seek_valid;
+    size_t seek_off;
+    size_t drag_vis, drag_len;
+    int drag_grab;
+    int pin_view, unlock;
+    double scroll, layout_width;
+    RtxPref pref;
+} RtxPaneSnap;
 
 typedef struct {
     CCArena session;       /* workspace epoch: bufs + clipboard */
@@ -32,11 +73,15 @@ typedef struct {
     int pane[2];
     int npanes;
     int focus;
+    RtxPaneSnap side;
+    RtxBrowse nav[2];
     char[:] clip;
     /* UI progress drawer; stamped onto each tree (and new add_path bufs). */
     RtxBusyFn busy_fn;
     void *busy_ctx;
 } RtxWs;
+
+static void rtx_browse_drop(RtxBrowse *br);
 
 static int RtxWs_ensure(RtxWs *w) {
     if (!w) return 0;
@@ -52,9 +97,56 @@ static void RtxBuf_destroy(RtxBuf *b) {
     memset(b, 0, sizeof(*b));
 }
 
+static void rtx_buf_swap_cam(RtxBuf *b, RtxPaneSnap *s) {
+    RtxLayout L;
+    size_t z;
+    int i;
+    double d;
+    RtxPref pr;
+    if (!b || !s) return;
+    L = b->layout; b->layout = s->layout; s->layout = L;
+    z = b->top; b->top = s->top; s->top = z;
+    z = b->top_wrap; b->top_wrap = s->top_wrap; s->top_wrap = z;
+    z = b->top_byte; b->top_byte = s->top_byte; s->top_byte = z;
+    i = b->seek_valid; b->seek_valid = s->seek_valid; s->seek_valid = i;
+    z = b->seek_off; b->seek_off = s->seek_off; s->seek_off = z;
+    z = b->drag_vis; b->drag_vis = s->drag_vis; s->drag_vis = z;
+    z = b->drag_len; b->drag_len = s->drag_len; s->drag_len = z;
+    i = b->drag_grab; b->drag_grab = s->drag_grab; s->drag_grab = i;
+    i = b->pin_view; b->pin_view = s->pin_view; s->pin_view = i;
+    i = b->unlock; b->unlock = s->unlock; s->unlock = i;
+    d = b->scroll; b->scroll = s->scroll; s->scroll = d;
+    d = b->layout_width; b->layout_width = s->layout_width; s->layout_width = d;
+    pr = b->pref; b->pref = s->pref; s->pref = pr;
+}
+
+static int RtxWs_same_split(const RtxWs *w) {
+    return w && w->npanes == 2 && w->pane[0] == w->pane[1] && w->side.live;
+}
+
+/* Put pane p's camera on its buf. 1 = caller must RtxWs_drop_pane. */
+static int RtxWs_hold_pane(RtxWs *w, int p) {
+    if (!RtxWs_same_split(w) || p == w->focus) return 0;
+    rtx_buf_swap_cam(&w->bufs[w->pane[p]], &w->side);
+    return 1;
+}
+
+static void RtxWs_drop_pane(RtxWs *w, int p, int held) {
+    if (held) rtx_buf_swap_cam(&w->bufs[w->pane[p]], &w->side);
+}
+
+static void rtx_ws_side_drop(RtxWs *w) {
+    if (!w || !w->side.live) return;
+    w->side.layout.destroy();
+    memset(&w->side, 0, sizeof(w->side));
+}
+
 static void RtxWs_destroy(RtxWs *w) {
     size_t i;
     if (!w) return;
+    rtx_ws_side_drop(w);
+    rtx_browse_drop(&w->nav[0]);
+    rtx_browse_drop(&w->nav[1]);
     for (i = 0; i < w->len; i++) {
         w->bufs[i].destroy();
     }
@@ -130,13 +222,30 @@ static void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
 }
 
 static void RtxWs_toggle_split(RtxWs *w) {
+    RtxBuf *b;
     if (!w || w->len == 0) return;
     if (w->npanes == 1) {
         w->npanes = 2;
         if (w->len >= 2) w->pane[1] = (w->pane[0] + 1) % (int)w->len;
         else w->pane[1] = w->pane[0];
         w->focus = 1;
+        if (w->pane[0] == w->pane[1]) {
+            b = &w->bufs[w->pane[0]];
+            memset(&w->side, 0, sizeof(w->side));
+            w->side.live = 1;
+            w->side.top = b->top;
+            w->side.top_wrap = b->top_wrap;
+            w->side.top_byte = b->top_byte;
+            w->side.unlock = b->unlock;
+            w->side.layout.view = b->layout.view;
+            w->side.layout.wrap = b->layout.wrap;
+        }
     } else {
+        if (w->side.live) {
+            b = &w->bufs[w->pane[0]];
+            if (w->focus == 1) rtx_buf_swap_cam(b, &w->side);
+            rtx_ws_side_drop(w);
+        }
         w->npanes = 1;
         w->focus = 0;
     }
@@ -144,17 +253,32 @@ static void RtxWs_toggle_split(RtxWs *w) {
 
 static void RtxWs_next_buf(RtxWs *w) {
     if (!w || w->len == 0) return;
+    if (RtxWs_same_split(w)) {
+        rtx_buf_swap_cam(&w->bufs[w->pane[0]], &w->side);
+        rtx_ws_side_drop(w);
+    }
     w->pane[w->focus] = (w->pane[w->focus] + 1) % (int)w->len;
 }
 
 static void RtxWs_prev_buf(RtxWs *w) {
     if (!w || w->len == 0) return;
+    if (RtxWs_same_split(w)) {
+        rtx_buf_swap_cam(&w->bufs[w->pane[0]], &w->side);
+        rtx_ws_side_drop(w);
+    }
     w->pane[w->focus] = (w->pane[w->focus] + (int)w->len - 1) % (int)w->len;
+}
+
+static void RtxWs_set_focus(RtxWs *w, int pane) {
+    if (!w || pane < 0 || pane >= w->npanes || pane == w->focus) return;
+    if (RtxWs_same_split(w))
+        rtx_buf_swap_cam(&w->bufs[w->pane[0]], &w->side);
+    w->focus = pane;
 }
 
 static void RtxWs_focus_other(RtxWs *w) {
     if (!w || w->npanes < 2) return;
-    w->focus = 1 - w->focus;
+    RtxWs_set_focus(w, 1 - w->focus);
 }
 
 static void !>(CCError) RtxWs_set_clip(RtxWs *w, char[:] src) {
@@ -328,10 +452,21 @@ static void rtx_buf_origin_from_row(RtxBuf *b, size_t origin) {
     b->top_wrap = origin - first;
 }
 
-/* Move `top` / `top_wrap` so the caret's visual row sits in [0, vis).
- * Scrolls by visual rows. Does not snap `top` to the caret's physical line
- * — that made wheel-up on a wrapped line jump back and stick. */
-static void !>(RtxIndexErr) RtxBuf_reveal(RtxBuf *b, int vis) {
+/* First visible byte in the current view. Does not scan. */
+static size_t RtxBuf_view_off(const RtxBuf *b) {
+    size_t i;
+    if (!b) return 0;
+    if (rtx_layout_is_hex(&b->layout)) return b->top_byte;
+    if (b->seek_valid) return b->seek_off;
+    if (b->layout.len) {
+        i = b->top_wrap < b->layout.len ? b->top_wrap : 0;
+        return b->layout.rows[i].byte_start;
+    }
+    return 0;
+}
+
+/* Move the window so `off` is on screen in the active view. Caret stays. */
+static void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
     size_t cl;
     size_t ri;
     size_t n;
@@ -339,45 +474,64 @@ static void !>(RtxIndexErr) RtxBuf_reveal(RtxBuf *b, int vis) {
     size_t top_row;
     if (!b) return cc_ok();
     if (vis < 1) vis = 1;
+    n = b->len();
+    if (off > n) off = n;
     if (rtx_layout_is_hex(&b->layout)) {
-        n = b->len();
         b->top_byte = rtx_hex_align(b->top_byte);
         if (b->top_byte > n) b->top_byte = rtx_hex_align(n);
-        row = b->doc.caret / (size_t)RTX_HEX_COLS;
+        row = off / (size_t)RTX_HEX_COLS;
         top_row = b->top_byte / (size_t)RTX_HEX_COLS;
         if (row < top_row) b->top_byte = row * (size_t)RTX_HEX_COLS;
         else if (row >= top_row + (size_t)vis) {
             b->top_byte = (row + 1 - (size_t)vis) * (size_t)RTX_HEX_COLS;
         }
+        b->seek_valid = 0;
         return cc_ok();
     }
     if (!b->layout.wrap) {
         b->top_wrap = 0;
-        cl = b->line_of(b->doc.caret) !>(e) { return cc_err(e); };
+        if (b->doc.index_covers(off)) {
+            cl = b->line_of(off) !>(e) { return cc_err(e); };
+            b->seek_valid = 0;
+        } else {
+            b->seek_off = rtx_doc_line_floor(&b->doc, off) !>(e) { return cc_err(e); };
+            b->seek_valid = 1;
+            cl = b->doc.line_guess(b->seek_off);
+        }
         if (cl < b->top) b->top = cl;
         if (cl >= b->top + (size_t)vis) b->top = cl - (size_t)vis + 1;
         return cc_ok();
     }
-    cl = b->line_of(b->doc.caret) !>(e) { return cc_err(e); };
+    if (b->doc.index_covers(off)) {
+        cl = b->line_of(off) !>(e) { return cc_err(e); };
+        b->seek_valid = 0;
+    } else {
+        b->seek_off = rtx_doc_line_floor(&b->doc, off) !>(e) { return cc_err(e); };
+        b->seek_valid = 1;
+        cl = b->doc.line_guess(b->seek_off);
+        b->top = cl;
+        b->top_wrap = 0;
+        return cc_ok();
+    }
     if (b->layout.len == 0) {
         b->top = cl;
         b->top_wrap = 0;
         return cc_ok();
     }
-    if (cl < b->top || b->doc.caret < b->layout.rows[0].byte_start) {
+    if (cl < b->top || off < b->layout.rows[0].byte_start) {
         b->top = cl;
         b->top_wrap = 0;
         return cc_ok();
     }
     {
         RtxVisRow *last = &b->layout.rows[b->layout.len - 1];
-        if (cl > last->line && b->doc.caret >= last->byte_start + last->byte_len) {
+        if (cl > last->line && off >= last->byte_start + last->byte_len) {
             b->top = cl;
             b->top_wrap = 0;
             return cc_ok();
         }
     }
-    ri = b->layout.row_of(b->doc.caret);
+    ri = b->layout.row_of(off);
     if (ri < b->top_wrap) {
         rtx_buf_origin_from_row(b, ri);
         return cc_ok();
@@ -385,6 +539,27 @@ static void !>(RtxIndexErr) RtxBuf_reveal(RtxBuf *b, int vis) {
     if (ri < b->top_wrap + (size_t)vis) return cc_ok();
     rtx_buf_origin_from_row(b, ri + 1 - (size_t)vis);
     return cc_ok();
+}
+
+/* Move `top` / `top_wrap` so the caret's visual row sits in [0, vis). */
+static void !>(RtxIndexErr) RtxBuf_reveal(RtxBuf *b, int vis) {
+    if (!b) return cc_ok();
+    return b->reveal_off(b->doc.caret, vis);
+}
+
+static void !>(RtxIndexErr) RtxBuf_cycle_view(RtxBuf *b, int vis) {
+    size_t keep;
+    if (!b) return cc_ok();
+    keep = b->view_off();
+    rtx_layout_cycle_view(&b->layout);
+    b->top_wrap = 0;
+    b->layout.len = 0;
+    b->seek_valid = 0;
+    b->drag_vis = 0;
+    b->drag_len = 0;
+    b->clear_pref();
+    if (b->unlock) return b->reveal_off(keep, vis);
+    return b->reveal_off(b->doc.caret, vis);
 }
 
 static void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double width, int dir) {
@@ -521,6 +696,64 @@ static void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double widt
     return cc_ok();
 }
 
+/* Drop this camera's vis-row epoch and refill. `edited` clears goal-column / pin
+ * (the pane the user typed in). Callers reparse first. */
+static void !>(CCError) rtx_buf_refresh_view(RtxBuf *b, RtxMeasure *m, double width, int vis,
+                                            int edited) {
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
+    if (edited) {
+        b->clear_pref();
+        b->pin_view = 0;
+    }
+    b->seek_valid = 0;
+    if (!rtx_layout_is_hex(&b->layout)) {
+        b->layout.len = 0;
+        b->layout_width = 0;
+    }
+    return RtxBuf_ensure_view(b, m, width, vis);
+}
+
+/* One camera. Same-file split: use RtxWs_after_edit so the other camera is not left
+ * with vis rows whose byte ranges predate the mutation. */
+static void !>(CCError) RtxBuf_after_edit(RtxBuf *b, RtxMeasure *m, double width, int vis) {
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
+    b->doc.reparse_edit(b->doc.last_off, b->doc.last_markup) !>;
+    return rtx_buf_refresh_view(b, m, width, vis, 1);
+}
+
+/* After a document mutation: reparse once, then rebuild every pane that shows
+ * `bufi`. ensure_view keys on width / top / row count — not the edit — so a
+ * mid-line delete looks cache-hot on the other camera until the epoch is dropped. */
+static void !>(CCError) RtxWs_after_edit(RtxWs *w, int bufi, RtxMeasure *m,
+                                        double width0, double width1, int vis) {
+    int p;
+    int parsed = 0;
+    if (!w || !m || bufi < 0 || (size_t)bufi >= w->len)
+        return cc_err(CC_ERR_INVALID_ARG, "ws after edit");
+    for (p = 0; p < w->npanes; p++) {
+        int held;
+        double width;
+        RtxBuf *b;
+        if (w->pane[p] != bufi) continue;
+        held = RtxWs_hold_pane(w, p);
+        b = &w->bufs[bufi];
+        if (!parsed) {
+            b->doc.reparse_edit(b->doc.last_off, b->doc.last_markup) !>(e) {
+                RtxWs_drop_pane(w, p, held);
+                return cc_err(e);
+            };
+            parsed = 1;
+        }
+        width = (p == 0 || w->npanes < 2) ? width0 : width1;
+        rtx_buf_refresh_view(b, m, width, vis, p == w->focus) !>(e) {
+            RtxWs_drop_pane(w, p, held);
+            return cc_err(e);
+        };
+        RtxWs_drop_pane(w, p, held);
+    }
+    return cc_ok();
+}
+
 static int RtxWs_any_dirty(const RtxWs *w) {
     size_t i;
     if (!w) return 0;
@@ -530,6 +763,7 @@ static int RtxWs_any_dirty(const RtxWs *w) {
     return 0;
 }
 
+#include "browse.cch"
 #include "ui.cch"
 
 @typeview on RtxBuf {
@@ -538,10 +772,25 @@ static int RtxWs_any_dirty(const RtxWs *w) {
 @typehooks on RtxBuf {
     .destroy = RtxBuf_destroy,
     .ensure_view = RtxBuf_ensure_view,
+    .after_edit = RtxBuf_after_edit,
 };
 @typehooks on RtxWs {
     .destroy = RtxWs_destroy,
     .busy_bind = RtxWs_busy_bind,
+    .after_edit = RtxWs_after_edit,
+    .hold_pane = RtxWs_hold_pane,
+    .drop_pane = RtxWs_drop_pane,
+    .set_focus = RtxWs_set_focus,
+    .browse = RtxWs_browse,
+    .browsing = RtxWs_browsing,
+    .browse_start = RtxWs_browse_start,
+    .browse_close = RtxWs_browse_close,
+    .browse_enter = RtxWs_browse_enter,
+    .browse_parent = RtxWs_browse_parent,
+    .browse_type = RtxWs_browse_type,
+    .browse_backspace = RtxWs_browse_backspace,
+    .browse_glob_set = RtxWs_browse_glob_set,
+    .open_in_pane = RtxWs_open_in_pane,
 };
 
 #endif /* RTX_WORKSPACE_H */
