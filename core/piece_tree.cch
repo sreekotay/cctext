@@ -447,7 +447,31 @@ static inline size_t RtxPieceTree_len(const RtxPieceTree *t) {
     return t->root->subtree_len;
 }
 
-static inline size_t RtxPieceTree_read_at(const RtxPieceTree *t, size_t offset, char *dest, size_t n);
+/* Success: got = min(n, len-off). A hole inside that range is INTERNAL. */
+static inline size_t !>(CCError) RtxPieceTree_read_at(const RtxPieceTree *t, size_t offset,
+                                                      char *dest, size_t n) {
+    size_t got = 0;
+    size_t len;
+    size_t need;
+    if (!t || !dest) return cc_err(CC_ERR_INVALID_ARG, "read_at");
+    if (n == 0) return cc_ok(0);
+    len = RtxPieceTree_len(t);
+    if (offset >= len) return cc_ok(0);
+    if (n > len - offset) n = len - offset;
+    need = n;
+    while (got < n) {
+        size_t local = 0;
+        RtxNode *node = rtx_find_node(t, offset + got, &local);
+        size_t take;
+        if (!node) return cc_err(CC_ERR_INTERNAL, "read_at hole");
+        take = node->piece.len - local;
+        if (take > n - got) take = n - got;
+        memcpy(dest + got, rtx_piece_ptr(t, &node->piece) + local, take);
+        got += take;
+    }
+    if (got != need) return cc_err(CC_ERR_INTERNAL, "read_at short");
+    return cc_ok(got);
+}
 
 /* Contiguous original bytes, or empty if the tree has been split. */
 static inline char[:] RtxPieceTree_flat(const RtxPieceTree *t) {
@@ -507,8 +531,9 @@ static inline char[:] !>(CCError) RtxPieceTree_scratch_span(const RtxPieceTree *
     if (n == 0) return cc_ok(cc_slice_empty());
     copy = scratch->alloc_slice_bytes(n);
     if (!copy.ptr || copy.len < n) return cc_err(CC_ERR_OUT_OF_MEMORY, "scratch span");
-    if (t->read_at(from, copy.ptr, n) != n) {
-        return cc_err(CC_ERR_INTERNAL, "scratch span read");
+    {
+        size_t got = t->read_at(from, copy.ptr, n) !>(e) { return cc_err(e); };
+        if (got != n) return cc_err(CC_ERR_INTERNAL, "scratch span read");
     }
     return cc_ok(copy);
 }
@@ -688,8 +713,9 @@ static inline void !>(CCError) RtxPieceTree_replace(RtxPieceTree *t, size_t off,
     if (n) {
         del = hold.alloc_slice_bytes(n);
         if (!del.ptr || del.len < n) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace del");
-        if (t->read_at(off, del.ptr, n) != n) {
-            return cc_err(CC_ERR_INTERNAL, "replace read");
+        {
+            size_t got = t->read_at(off, del.ptr, n) !>(e) { return cc_err(e); };
+            if (got != n) return cc_err(CC_ERR_INTERNAL, "replace read");
         }
         t->erase(off, n) !>(e) { return cc_err(e); };
     }
@@ -705,26 +731,6 @@ static inline void !>(CCError) RtxPieceTree_replace(RtxPieceTree *t, size_t off,
         };
     }
     return cc_ok();
-}
-
-static inline size_t RtxPieceTree_read_at(const RtxPieceTree *t, size_t offset, char *dest, size_t n) {
-    size_t got = 0;
-    size_t len;
-    if (!t || !dest || n == 0) return 0;
-    len = RtxPieceTree_len(t);
-    if (offset >= len) return 0;
-    if (n > len - offset) n = len - offset;
-    while (got < n) {
-        size_t local = 0;
-        RtxNode *node = rtx_find_node(t, offset + got, &local);
-        size_t take;
-        if (!node) break;
-        take = node->piece.len - local;
-        if (take > n - got) take = n - got;
-        memcpy(dest + got, rtx_piece_ptr(t, &node->piece) + local, take);
-        got += take;
-    }
-    return got;
 }
 
 static void !>(CCError) rtx_write_all(int fd, const char *p, size_t n) {
@@ -784,10 +790,14 @@ static void rtx_line_index_build(RtxPieceTree *t) {
     len = RtxPieceTree_len(t);
     off = 0;
     line = 0;
+    @errhandler(CCError e) {
+        (void)e;
+        return;
+    }
     while (off < len) {
-        size_t got = RtxPieceTree_read_at(t, off, buf, sizeof(buf));
+        size_t got = RtxPieceTree_read_at(t, off, buf, sizeof(buf)) !>;
         size_t i;
-        if (!got) return; /* mid-document short read: leave ok=0 */
+        if (!got) return;
         for (i = 0; i < got; i++) {
             if (buf[i] == '\n') {
                 line++;
@@ -815,12 +825,16 @@ static size_t rtx_count_lf_range(const RtxPieceTree *t, size_t from, size_t n) {
     size_t end = from + n;
     size_t len = RtxPieceTree_len(t);
     if (end > len) end = len;
+    @errhandler(CCError e) {
+        (void)e;
+        return seen;
+    }
     while (off < end) {
         size_t want = end - off;
         size_t got;
         size_t i;
         if (want > sizeof(buf)) want = sizeof(buf);
-        got = RtxPieceTree_read_at(t, off, buf, want);
+        got = RtxPieceTree_read_at(t, off, buf, want) !>;
         if (!got) break;
         for (i = 0; i < got; i++) {
             if (buf[i] == '\n') seen++;
@@ -837,8 +851,12 @@ static size_t rtx_advance_lines(const RtxPieceTree *t, size_t from, size_t nline
     size_t off = from;
     size_t len = RtxPieceTree_len(t);
     if (nlines == 0) return from;
+    @errhandler(CCError e) {
+        (void)e;
+        return len;
+    }
     while (off < len) {
-        size_t got = RtxPieceTree_read_at(t, off, buf, sizeof(buf));
+        size_t got = RtxPieceTree_read_at(t, off, buf, sizeof(buf)) !>;
         size_t i;
         if (!got) break;
         for (i = 0; i < got; i++) {

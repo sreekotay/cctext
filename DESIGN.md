@@ -31,6 +31,18 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 
 `RtxDoc d = {0} @destroy` (and the same for tree, layout, buf, workspace). No inflight counter. A buf slot destroys layout, then doc.
 
+## Surfaces
+
+Fallible APIs are Results (`T !>(CCError)`). Value returns are only pure queries of already-valid state (`len`, `line_*`, `has_sel`, `dirty`, …). OOM, IO, and a short mid-document read are errors — never a short slice or a zero that looks like success on a commit path.
+
+One document read surface: `size_t !>(CCError) read_at(off, dest, n)`. Success returns `got = min(n, len - off)` (EOF clamp is success). A hole inside that range is an error. Callers that need every byte of `n` require `off + n <= len` (or check `got == n`). There is no second “unchecked” path.
+
+If an API returns owned bytes, the destination arena is the **last** parameter (Concurrent-C convention: receiver first, arena last). That arena *is* the product’s lifetime. Call-local `@scratch` / frame stack stays inside the callee and is not returned. Views (`span`) do not take an arena.
+
+A Result failure is **unchanged** or **`broken`**. `broken` means the tree may be inconsistent — set only after a mutating step that could not be rolled back. Pre-mutation faults (failed hold alloc, short read before erase) leave the object intact and do not set `broken`.
+
+Hist (and any other commit record) stores everything the next edit needs, or undo/redo clears what it does not restore. Derived mode that affects the next op (`sel_box`, box columns, …) is either in the record or fail-closed to stream selection.
+
 ## Views
 
 A `char[:]` is `{ptr, len, id}`. Storing it does not take the bytes.
@@ -53,7 +65,7 @@ A path that gives up is not success:
 
 Commit only after the new value exists, in every direction: the right node before shrinking a piece; hist after `tree.replace`; clip after a successful cut replace; derived flags after the highlight / line-index pass; path+`saved_head` after a prepared rename. Unsaved quit opens a Save / Don't save / Cancel prompt. `tree.replace` rolls the deleted span back if insert fails; rollback failure sets `d.broken` and further edits refuse. Clipboard allocs into a local, then assigns; OOM keeps the old clip. Empty source is a real clear. A path that gives up is either unchanged or `broken` — never a hole that looks retryable.
 
-`len` / `line_*` / `has_sel` / `dirty` do not fail. They stay values.
+Host close is a one-shot offer into that prompt, not loop control. Cancel dismisses this close request; it does not promise a second chrome-X if the host latches `shouldClose`.
 
 ## Faces
 
