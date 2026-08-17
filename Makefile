@@ -1,5 +1,10 @@
 CCC ?= ccc
-CCC_FLAGS := --no-cache --out-dir out --bin-dir bin
+# Default --release: -O2 -DNDEBUG + dead-strip. `make DEBUG=1 …` keeps asserts (-g).
+ifeq ($(DEBUG),1)
+CCC_FLAGS := -g --no-cache --out-dir out --bin-dir bin
+else
+CCC_FLAGS := --release --no-cache --out-dir out --bin-dir bin
+endif
 RAYLIB_PREFIX := $(shell brew --prefix raylib 2>/dev/null)
 RAYLIB_CFLAGS := -I$(RAYLIB_PREFIX)/include
 RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation

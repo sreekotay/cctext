@@ -33,7 +33,13 @@ case "$MODE" in
 esac
 
 CCC="${CCC:-ccc}"
-CCC_FLAGS=(--no-cache --out-dir out --bin-dir bin)
+if [[ "${DEBUG:-0}" == "1" ]]; then
+    CCC_FLAGS=(-g --no-cache --out-dir out --bin-dir bin)
+    BUILD_FLAVOR=debug
+else
+    CCC_FLAGS=(--release --no-cache --out-dir out --bin-dir bin)
+    BUILD_FLAVOR=release
+fi
 LARGE="${LARGE:-testdata/generated/large.txt}"
 GIANT="${GIANT:-testdata/generated/large_8G.txt}"
 BASELINE="${RTX_PERF_BASELINE:-testdata/perf/baseline.env}"
@@ -64,9 +70,32 @@ run_one() {
     "$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc run perf_matrix_smoke -- "$path" "$label"
 }
 
+bin_bytes() {
+    local p="$1"
+    [[ -f "$p" ]] || { echo ""; return 0; }
+    if stat -f%z "$p" >/dev/null 2>&1; then
+        stat -f%z "$p"
+    else
+        stat -c%s "$p"
+    fi
+}
+
+human_bytes() {
+    awk -v b="${1:-}" 'BEGIN {
+        if (b == "" || b + 0 != b) { print "-"; exit }
+        if (b >= 1048576) printf "%.1f MiB", b / 1048576
+        else if (b >= 1024) printf "%.1f KiB", b / 1024
+        else printf "%d B", b + 0
+    }'
+}
+
 # Build once, warm once (first process pays dyld / page-cache), then measure.
-echo "perf_baseline: building perf_matrix_smoke" >&2
+echo "perf_baseline: building perf_matrix_smoke ($BUILD_FLAVOR)" >&2
 "$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc perf_matrix_smoke
+echo "perf_baseline: building cctext ($BUILD_FLAVOR)" >&2
+"$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc cctext || {
+    echo "perf_baseline: cctext build failed (binary size will omit it)" >&2
+}
 
 # Prefer an existing fixture for warmup so 2M is not the cold victim.
 warm_path="$LARGE"
@@ -81,16 +110,9 @@ if [[ -f "$warm_path" ]]; then
         "$warm_path" "$warm_label" >/dev/null
 fi
 
-{
-    echo "# raytext perf results"
-    echo "# date=$stamp_iso  host=$host"
-    echo "# note: one warmup run discarded before measuring"
-    echo "#"
-    echo "# size       op              ms"
-    echo "# --------------------------------"
-} >"$RESULTS"
-
 ALL_OUT=""
+TIME_BODY=""
+MEM_BODY=""
 for pair in "$LARGE:2M" "$GIANT:8G"; do
     path="${pair%%:*}"
     label="${pair##*:}"
@@ -104,18 +126,56 @@ for pair in "$LARGE:2M" "$GIANT:8G"; do
     }
     printf '%s\n' "$out"
     ALL_OUT+="$out"$'\n'
-    printf '%s\n' "$out" | grep '^RESULT ' | while read -r _ kv1 kv2 kv3; do
+    rss_open=""
+    rss_peak=""
+    row_size="$label"
+    while read -r _ kv1 kv2 kv3; do
+        [[ -n "${kv1:-}" ]] || continue
         size="${kv1#size=}"
         op="${kv2#op=}"
-        ms="${kv3#ms=}"
-        printf '%-10s %-14s %s\n' "$size" "$op" "$ms"
-    done >>"$RESULTS"
+        row_size="$size"
+        if [[ "${kv3:-}" == bytes=* ]]; then
+            val="${kv3#bytes=}"
+            case "$op" in
+                rss_open) rss_open="$val" ;;
+                rss_peak) rss_peak="$val" ;;
+            esac
+        elif [[ "${kv3:-}" == ms=* ]]; then
+            ms="${kv3#ms=}"
+            TIME_BODY+="$(printf '%-10s %-14s %s' "$size" "$op" "$ms")"$'\n'
+        fi
+    done < <(printf '%s\n' "$out" | grep '^RESULT ' || true)
+    if [[ -n "$rss_open" || -n "$rss_peak" ]]; then
+        MEM_BODY+="$(printf '%-10s %-13s %s' "$row_size" "$(human_bytes "$rss_open")" "$(human_bytes "$rss_peak")")"$'\n'
+    fi
 done
 
+smoke_bytes="$(bin_bytes bin/perf_matrix_smoke)"
+cctext_bytes="$(bin_bytes bin/cctext)"
 {
+    echo "# raytext perf results"
+    echo "# date=$stamp_iso  host=$host  build=$BUILD_FLAVOR"
+    echo "# note: one warmup run discarded before measuring"
+    echo "#"
+    echo "# binary                    bytes      size"
+    echo "# ------------------------------------------------"
+    if [[ -n "$smoke_bytes" ]]; then
+        printf '%-24s %-10s %s\n' "perf_matrix_smoke" "$smoke_bytes" "$(human_bytes "$smoke_bytes")"
+    fi
+    if [[ -n "$cctext_bytes" ]]; then
+        printf '%-24s %-10s %s\n' "cctext" "$cctext_bytes" "$(human_bytes "$cctext_bytes")"
+    fi
+    echo "#"
+    echo "# size       rss_open      rss_peak"
+    echo "# ------------------------------------------------"
+    printf '%s' "$MEM_BODY"
+    echo "#"
+    echo "# size       op              ms"
+    echo "# ------------------------------------------------"
+    printf '%s' "$TIME_BODY"
     echo "#"
     echo "# pins (regression): $BASELINE"
-} >>"$RESULTS"
+} >"$RESULTS"
 
 echo "perf_baseline: wrote $RESULTS" >&2
 cat "$RESULTS" >&2

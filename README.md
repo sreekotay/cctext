@@ -25,10 +25,10 @@ Piece tree, document, layout, C/CC highlight, save, undo/redo, selection, increm
 ./make.shcc @large          # testdata/generated/large.txt (100000 lines; LARGE_LINES= or @large N)
 make giant                  # testdata/generated/large_8G.txt (~8 GiB; slow)
 make giant-smoke            # open that file via page store (mid-line + tiny insert)
-make perf                   # ops×sizes table → testdata/perf/results/baseline_results_YYYY_MM_DD.txt
+make perf                   # ops×sizes + binary/RSS table → testdata/perf/results/…
 make perf-record            # that table + refresh testdata/perf/baseline.env pins
 make perf-check             # fail if 8G open/scroll/jump/insert regress
-./make.shcc @cctext         # console editor
+./make.shcc @cctext         # console editor (`--release`; DEBUG=1 keeps asserts)
 ./make.shcc @raytext        # Raylib GUI (needs `brew install raylib`)
 ./bin/cctext testdata/mixed.txt testdata/small.txt
 ./bin/raytext testdata/generated/large.txt
