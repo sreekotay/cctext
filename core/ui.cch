@@ -30,6 +30,7 @@ static const char *rtx_help_lines[] = {
     "Cmd-arrows   start/end of line",
     "click/drag   caret / selection   Alt-drag box",
     "wheel        scroll",
+    "scrollbar    jump by file bytes",
     NULL
 };
 
@@ -183,15 +184,175 @@ static int rtx_gutter_cols_buf(const RtxBuf *b, int vis) {
     return rtx_gutter_cols(need);
 }
 
-/* Status fragment: exact Lcur/total, or Lcur+ while the index is soft. */
-static void rtx_status_line_pos(const RtxDoc *d, char *dst, size_t dst_n) {
-    size_t cur;
-    if (!dst || dst_n == 0) return;
-    if (!d) {
-        snprintf(dst, dst_n, "L1");
+/* Byte-rail scrollbar. Geometry uses file bytes, never soft line_count.
+ * `ready` is the line-index mark (hex is always ready): paint cue only. */
+typedef struct {
+    size_t pos;
+    size_t vis;
+    size_t len;
+    int ready;
+} RtxScrollRail;
+
+static int rtx_scroll_rail_thumb_h(const RtxScrollRail *r, int track_h, int min_th) {
+    int th;
+    if (!r || track_h < 1) return 0;
+    if (min_th < 1) min_th = 1;
+    if (r->len == 0 || r->vis >= r->len) return track_h;
+    th = (int)((unsigned long long)track_h * r->vis / r->len);
+    if (th < min_th) th = min_th;
+    if (th > track_h) th = track_h;
+    return th;
+}
+
+static void rtx_scroll_rail_thumb(const RtxScrollRail *r, int track_h, int min_th,
+                                  int *thumb_y, int *thumb_h) {
+    int th;
+    size_t span;
+    int y = 0;
+    th = rtx_scroll_rail_thumb_h(r, track_h, min_th);
+    if (thumb_h) *thumb_h = th;
+    if (!r || track_h < 1 || r->len == 0 || r->vis >= r->len) {
+        if (thumb_y) *thumb_y = 0;
         return;
     }
-    cur = d->line_of(d->caret) + 1;
+    span = r->len - r->vis;
+    {
+        int usable = track_h - th;
+        size_t pos = r->pos > span ? span : r->pos;
+        if (usable > 0 && span)
+            y = (int)((unsigned long long)pos * (size_t)usable / span);
+        if (y < 0) y = 0;
+        if (y > usable) y = usable;
+    }
+    if (thumb_y) *thumb_y = y;
+}
+
+/* 0 if the window already covers the file — callers hide the rail. */
+static int rtx_scroll_rail_needed(const RtxScrollRail *r) {
+    return r && r->len > 0 && r->vis < r->len;
+}
+
+/* Viewport can move: unread tail, wrapped overflow, or more lines than rows.
+ * Soft line_count is not consulted until lf_ready. */
+static int RtxBuf_scroll_needed(const RtxBuf *b, int vis_rows) {
+    size_t n;
+    if (!b || vis_rows < 1) return 0;
+    n = b->len();
+    if (n == 0) return 0;
+    if (rtx_layout_is_hex(&b->layout))
+        return n > (size_t)vis_rows * (size_t)RTX_HEX_COLS;
+    if (!b->doc.lf_ready()) return 1;
+    if (b->top > 0 || b->top_wrap > 0) return 1;
+    if (b->layout.len > (size_t)vis_rows) return 1;
+    if (b->layout.len &&
+        ((b->seek_valid && b->layout.rows[0].byte_start == b->seek_off) ||
+         (!b->seek_valid && b->layout.from_line == b->top))) {
+        const RtxVisRow *last = &b->layout.rows[b->layout.len - 1];
+        if (last->byte_start + last->byte_len >= n) return 0;
+    }
+    return b->line_count() > (size_t)vis_rows;
+}
+
+/* `thumb_top` is pixels from the track origin (may be outside; clamped). */
+static size_t rtx_scroll_rail_pos_at(const RtxScrollRail *r, int track_h, int min_th,
+                                    int thumb_top) {
+    int th;
+    int usable;
+    size_t span;
+    if (!r || r->len == 0) return 0;
+    if (r->vis >= r->len) return 0;
+    span = r->len - r->vis;
+    th = rtx_scroll_rail_thumb_h(r, track_h, min_th);
+    usable = track_h - th;
+    if (usable <= 0) return 0;
+    if (thumb_top < 0) thumb_top = 0;
+    if (thumb_top > usable) thumb_top = usable;
+    return (size_t)((unsigned long long)thumb_top * span / (size_t)usable);
+}
+
+static RtxScrollRail !>(RtxIndexErr) RtxBuf_scroll_rail(const RtxBuf *b, int vis_rows) {
+    RtxScrollRail r = {0};
+    size_t n;
+    if (!b) return cc_ok(r);
+    n = b->len();
+    r.len = n;
+    if (vis_rows < 1) vis_rows = 1;
+    if (rtx_layout_is_hex(&b->layout)) {
+        r.pos = b->top_byte;
+        r.vis = (size_t)vis_rows * (size_t)RTX_HEX_COLS;
+        if (r.pos > n) r.pos = n;
+        if (r.vis > n - r.pos) r.vis = n - r.pos;
+        if (r.vis == 0 && n) r.vis = n < (size_t)RTX_HEX_COLS ? n : (size_t)RTX_HEX_COLS;
+        r.ready = 1;
+        return cc_ok(r);
+    }
+    r.ready = b->doc.lf_ready();
+    if (b->layout.len &&
+        ((b->seek_valid && b->layout.rows[0].byte_start == b->seek_off) ||
+         (!b->seek_valid && b->layout.from_line == b->top))) {
+        size_t i0 = b->top_wrap < b->layout.len ? b->top_wrap : 0;
+        size_t i1 = i0;
+        size_t shown = 1;
+        r.pos = b->layout.rows[i0].byte_start;
+        while (i1 + 1 < b->layout.len && shown < (size_t)vis_rows) {
+            i1++;
+            shown++;
+        }
+        r.vis = (b->layout.rows[i1].byte_start + b->layout.rows[i1].byte_len) - r.pos;
+    } else if (b->seek_valid) {
+        r.pos = b->seek_off;
+        r.vis = 0;
+    } else if (b->top < b->doc.line_known()) {
+        r.pos = b->line_start(b->top) !>(e) { return cc_err(e); };
+        r.vis = 0;
+    } else {
+        r.pos = 0;
+        r.vis = 0;
+    }
+    if (r.pos > n) r.pos = n;
+    if (r.vis > n - r.pos) r.vis = n - r.pos;
+    if (r.vis == 0 && n) {
+        r.vis = n < 64 ? n : 64;
+        if (r.vis > n - r.pos) r.vis = n - r.pos;
+    }
+    return cc_ok(r);
+}
+
+/* Viewport only — caret stays. Text snaps to the line at `off` (like jump %). */
+static void !>(RtxIndexErr) RtxBuf_scroll_to_off(RtxBuf *b, size_t off) {
+    size_t n;
+    if (!b) return cc_ok();
+    b->pin_view = 1;
+    n = b->len();
+    if (off > n) off = n;
+    if (rtx_layout_is_hex(&b->layout)) {
+        b->top_byte = rtx_hex_align(off);
+        b->seek_valid = 0;
+        return cc_ok();
+    }
+    if (b->doc.index_covers(off)) {
+        b->top = b->line_of(off) !>(e) { return cc_err(e); };
+        b->top_wrap = 0;
+        b->seek_valid = 0;
+        return cc_ok();
+    }
+    b->seek_off = rtx_doc_line_floor(&b->doc, off) !>(e) { return cc_err(e); };
+    b->seek_valid = 1;
+    b->top = b->doc.line_guess(b->seek_off);
+    b->top_wrap = 0;
+    return cc_ok();
+}
+
+/* Status fragment: exact Lcur/total, or Lcur+ while the index is soft. */
+static void !>(RtxIndexErr) rtx_status_line_pos(const RtxDoc *d, char *dst, size_t dst_n) {
+    size_t cur;
+    if (!dst || dst_n == 0) return cc_ok();
+    if (!d) {
+        snprintf(dst, dst_n, "L1");
+        return cc_ok();
+    }
+    cur = d->line_of(d->caret) !>(e) { return cc_err(e); };
+    cur = cur + 1;
     if (d->index_fault()) {
         snprintf(dst, dst_n, "L%zu!", cur);
     } else if (d->lf_ready()) {
@@ -199,30 +360,35 @@ static void rtx_status_line_pos(const RtxDoc *d, char *dst, size_t dst_n) {
     } else {
         snprintf(dst, dst_n, "L%zu+", cur);
     }
+    return cc_ok();
 }
 
-static void RtxDoc_goto_line(RtxDoc *d, size_t line1) {
+static void !>(RtxIndexErr) RtxDoc_goto_line(RtxDoc *d, size_t line1) {
     size_t n;
-    if (!d) return;
+    if (!d) return cc_ok();
     n = d->line_count();
-    if (n == 0) return;
+    if (n == 0) return cc_ok();
     if (line1 < 1) line1 = 1;
     if (line1 > n) line1 = n;
-    d->caret = d->line_start(line1 - 1);
+    d->caret = d->line_start(line1 - 1) !>(e) { return cc_err(e); };
     d->sel_anchor = d->caret;
     d->break_coalesce();
+    return cc_ok();
 }
 
 /* Jump: digits = 1-based line. Digits then '%' = approx that percent of the
  * file by byte offset (then snap to that line). Soft line_count is not used
  * for %, so giant progressive docs stay honest. */
-static int rtx_ui_apply_jump(RtxUi *ui, RtxDoc *d) {
+static int !>(RtxIndexErr) rtx_ui_apply_jump(RtxUi *ui, RtxDoc *d) {
     size_t val = 0;
     size_t i;
     int pct = 0;
+    @errhandler(RtxIndexErr e) {
+        return cc_err(e);
+    }
     if (!ui || !d || ui->jump_len == 0) {
         rtx_ui_clear_jump(ui);
-        return 0;
+        return cc_ok(0);
     }
     for (i = 0; i < ui->jump_len; i++) {
         char c = ui->jump_buf[i];
@@ -232,7 +398,7 @@ static int rtx_ui_apply_jump(RtxUi *ui, RtxDoc *d) {
             pct = 1;
         } else {
             rtx_ui_clear_jump(ui);
-            return 0;
+            return cc_ok(0);
         }
     }
     if (pct) {
@@ -241,15 +407,15 @@ static int rtx_ui_apply_jump(RtxUi *ui, RtxDoc *d) {
         size_t ln;
         if (val > 100) val = 100;
         off = n ? (n - 1) * val / 100 : 0;
-        ln = d->line_of(off);
-        d->caret = d->line_start(ln);
+        ln = d->line_of(off) !>;
+        d->caret = d->line_start(ln) !>;
         d->sel_anchor = d->caret;
         d->break_coalesce();
     } else {
-        d->goto_line(val);
+        d->goto_line(val) !>;
     }
     rtx_ui_clear_jump(ui);
-    return 1;
+    return cc_ok(1);
 }
 
 /* 1 = clean, quit now. 0 = ask_quit is set. */

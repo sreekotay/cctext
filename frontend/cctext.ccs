@@ -69,7 +69,7 @@ static char g_status[160];
 static volatile sig_atomic_t g_winch;
 static int g_busy_frame;
 
-/* Corner spinner while piece-tree scan/save runs (blocking). */
+/* Status-row spinner while piece-tree scan/save runs (blocking). */
 static void cctext_busy(void *ctx, const char *label, int pct) {
     struct winsize ws;
     int cols = 80;
@@ -83,7 +83,8 @@ static void cctext_busy(void *ctx, const char *label, int pct) {
         if (ws.ws_row > 0) rows = ws.ws_row;
     }
     if (!label) {
-        fprintf(stdout, "\x1b[s\x1b[1;%dH\x1b[K\x1b[u", cols > 1 ? cols - 24 : 1);
+        fprintf(stdout, "\x1b[s\x1b[%d;%dH\x1b[K\x1b[u",
+                rows, cols > 1 ? cols - 24 : 1);
         fflush(stdout);
         return;
     }
@@ -95,9 +96,10 @@ static void cctext_busy(void *ctx, const char *label, int pct) {
     }
     if (n < 0) n = 0;
     if (n > 24) n = 24;
-    fprintf(stdout, "\x1b[s\x1b[1;%dH\x1b[33;1m%.*s\x1b[0m\x1b[u",
-            cols > n ? cols - n + 1 : 1, n, msg);
-    (void)rows;
+    /* Status row, not row 1: the rail lives on the right edge and xenl
+     * already eats (1,cols). A corner overlay would hide the thumb at BOF. */
+    fprintf(stdout, "\x1b[s\x1b[%d;%dH\x1b[33;1m%.*s\x1b[0m\x1b[u",
+            rows, cols > n ? cols - n + 1 : 1, n, msg);
     fflush(stdout);
 }
 
@@ -412,6 +414,8 @@ static int cctext_read(int *ch_out) {
 
 static void !>(CCError) cctext_after_edit(RtxBuf *b, RtxMeasure *m, double width, int vis) {
     b->clear_pref();
+    b->seek_valid = 0;
+    b->pin_view = 0;
     if (!rtx_layout_is_hex(&b->layout)) {
         b->layout.view_after_edit(&b->doc, m, width) !>(e) { return cc_err(e); };
         b->layout_width = width;
@@ -420,7 +424,16 @@ static void !>(CCError) cctext_after_edit(RtxBuf *b, RtxMeasure *m, double width
 }
 
 static void cctext_ensure_caret(RtxBuf *b, int vis) {
-    b->reveal(vis);
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
+    if (!b || b->pin_view) return;
+    b->reveal(vis) !>;
+}
+
+static void cctext_follow_caret(RtxBuf *b) {
+    if (b) b->pin_view = 0;
 }
 
 static int cctext_pane_cols(RtxWs *w, int cols, int pane) {
@@ -434,11 +447,30 @@ static int cctext_pane_at_col(RtxWs *w, int cols, int col) {
     return col > cols / 2 ? 1 : 0;
 }
 
+/* Rail + blank last pane column. Writing the rail on the terminal's last
+ * column (row 1 especially) is dropped by xenl / VS Code wrap. */
+#define CCTEXT_SCROLL_W 2
+
+static int cctext_rail_w(RtxBuf *b, int vis) {
+    return (b && b->scroll_needed(vis)) ? CCTEXT_SCROLL_W : 0;
+}
+
 static int cctext_text_cols(RtxBuf *b, int pcols, int vis) {
     int g = rtx_gutter_cols_buf(b, vis);
-    if (pcols <= g + 4) return pcols;
-    return pcols - g;
+    int rw = cctext_rail_w(b, vis);
+    int inner = pcols > rw ? pcols - rw : pcols;
+    if (inner <= g + 4) return inner > 0 ? inner : 1;
+    return inner - g;
 }
+
+static int cctext_scroll_hit(int mx, int col0, int pcols, int rw) {
+    int sc;
+    if (rw < 1) return 0;
+    sc = col0 + pcols - rw;
+    return mx == sc || (rw > 1 && mx == sc + 1);
+}
+
+static void cctext_put_scroll(RtxBuf *b, int focused, int vis, int row, int col);
 
 static void cctext_style(RtxStyle st, int sel, int here) {
     fputs(cctext_hl_ansi(st.hl), stdout);
@@ -456,6 +488,13 @@ static void cctext_eol(int pad_to) {
     }
 }
 
+static void cctext_row_end(RtxBuf *b, int focused, int vis, int pcols, int col0,
+                           int pad_rest, int used, int row) {
+    int rw = cctext_rail_w(b, vis);
+    cctext_eol(pad_rest ? pcols - rw - used : 0);
+    if (rw) cctext_put_scroll(b, focused, vis, row, col0 + pcols - rw);
+}
+
 /* Hex pane: offset | 16 hex bytes | ASCII (geometry in core/hex). */
 static size_t cctext_hex_hit_byte(RtxBuf *b, int vis, int row, int col) {
     if (!b || row < 0 || row >= vis) return b ? b->doc.caret : 0;
@@ -468,6 +507,10 @@ static void cctext_draw_hex_pane(RtxBuf *b, int focused, int vis, int pcols, int
     size_t n = b->len();
     int has = b->doc.has_sel();
     static const char *hexd = "0123456789ABCDEF";
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
     b->top_byte = rtx_hex_align(b->top_byte);
     for (r = 0; r < (size_t)vis; r++) {
         size_t off = rtx_hex_row_off(b->top_byte, r);
@@ -480,7 +523,7 @@ static void cctext_draw_hex_pane(RtxBuf *b, int focused, int vis, int pcols, int
         if (off >= n && !(n == 0 && r == 0)) {
             fputs("\x1b[90m~\x1b[0m", stdout);
             used = 1;
-            cctext_eol(pad_rest ? pcols - used : 0);
+            cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
             continue;
         }
         if (take > n - off) take = n - off;
@@ -495,7 +538,7 @@ static void cctext_draw_hex_pane(RtxBuf *b, int focused, int vis, int pcols, int
         used = RTX_HEX_OFF_W;
         for (k = 0; k < (size_t)RTX_HEX_COLS; k++) {
             size_t at = off + k;
-            int sel = has && at < n && b->doc.sel_covers(at);
+            int sel = has && at < n && (b->doc.sel_covers(at) !>);
             int here = focused && b->doc.caret == at;
             if (k < got) {
                 if (sel || here) fputs(here ? "\x1b[7m" : "\x1b[44m", stdout);
@@ -515,7 +558,7 @@ static void cctext_draw_hex_pane(RtxBuf *b, int focused, int vis, int pcols, int
         }
         for (k = 0; k < (size_t)RTX_HEX_COLS; k++) {
             size_t at = off + k;
-            int sel = has && at < n && b->doc.sel_covers(at);
+            int sel = has && at < n && (b->doc.sel_covers(at) !>);
             int here = focused && b->doc.caret == at;
             char ch = (k < got) ? rtx_hex_ascii(buf[k]) : ' ';
             if (sel || here) fputs(here ? "\x1b[7m" : "\x1b[44m", stdout);
@@ -526,7 +569,7 @@ static void cctext_draw_hex_pane(RtxBuf *b, int focused, int vis, int pcols, int
         if (focused && b->doc.caret == off + got && got < (size_t)RTX_HEX_COLS) {
             /* caret past last byte on short final row — already drawn on hex gap */
         }
-        cctext_eol(pad_rest ? pcols - used : 0);
+        cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
     }
 }
 
@@ -536,6 +579,14 @@ static void cctext_draw_pane(RtxBuf *b, int focused, int vis, int pcols, int col
     int has = b->doc.has_sel();
     int g = rtx_gutter_cols_buf(b, vis);
     int tcols = cctext_text_cols(b, pcols, vis);
+    @errhandler(CCError e) {
+        snprintf(g_status, sizeof(g_status), "%s", e.message ? e.message : "span failed");
+        return;
+    }
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
     if (rtx_layout_is_hex(&b->layout)) {
         cctext_draw_hex_pane(b, focused, vis, pcols, col0, pad_rest);
         return;
@@ -552,7 +603,7 @@ static void cctext_draw_pane(RtxBuf *b, int focused, int vis, int pcols, int col
             }
             fputs("~\x1b[0m", stdout);
             used = g;
-            cctext_eol(pad_rest ? pcols - used : 0);
+            cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
             continue;
         }
         {
@@ -571,15 +622,12 @@ static void cctext_draw_pane(RtxBuf *b, int focused, int vis, int pcols, int col
                 for (i = 0; i < g - 1; i++) fputc(' ', stdout);
                 fputs(" \x1b[0m", stdout);
             }
-            char[:] bytes = b->scratch_span(&scratch, row->byte_start, row->byte_len) !>(e) {
-                snprintf(g_status, sizeof(g_status), "span failed");
-                return;
-            };
+            char[:] bytes = b->scratch_span(&scratch, row->byte_start, row->byte_len) !>;
             for (k = 0; k < bytes.len && col < (size_t)tcols; k++) {
                 size_t off = row->byte_start + k;
                 RtxStyle st = b->doc.style_at(off);
                 int here = focused && (b->doc.caret == off);
-                int sel = has && b->doc.sel_covers(off);
+                int sel = has && (b->doc.sel_covers(off) !>);
                 if ((int)st.hl != last_hl || (int)st.bold != last_bold ||
                     sel != last_sel || here != last_here) {
                     fputs("\x1b[0m", stdout);
@@ -599,9 +647,47 @@ static void cctext_draw_pane(RtxBuf *b, int focused, int vis, int pcols, int col
                 fputs("\x1b[0m", stdout);
             }
             used = g + (int)col;
-            cctext_eol(pad_rest ? pcols - used : 0);
+            cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
         }
     }
+}
+
+static void cctext_put_scroll(RtxBuf *b, int focused, int vis, int row, int col) {
+    RtxScrollRail rail;
+    int ty, th;
+    char ch;
+    const char *fg;
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
+    if (!b || vis < 1 || col < 1 || row < 0 || row >= vis) return;
+    if (!b->scroll_needed(vis) && !b->drag_len) return;
+    rail = b->scroll_rail(vis) !>;
+    if (b->drag_len) {
+        rail.vis = b->drag_vis ? b->drag_vis : rail.vis;
+        rail.len = b->drag_len;
+    }
+    rtx_scroll_rail_thumb(&rail, vis, 1, &ty, &th);
+    if (b->drag_len) {
+        int ly = g_mouse_row - 1 - b->drag_grab;
+        int usable = vis - th;
+        if (ly < 0) ly = 0;
+        if (usable > 0 && ly > usable) ly = usable;
+        ty = ly;
+    }
+    if (row >= ty && row < ty + th) {
+        ch = '#';
+        fg = rail.ready ? (focused ? "\x1b[7;37m" : "\x1b[7;90m")
+                        : (focused ? "\x1b[7;33m" : "\x1b[7;90m");
+    } else if (!rail.ready && row == vis - 1) {
+        ch = '+';
+        fg = "\x1b[33m";
+    } else {
+        ch = '|';
+        fg = "\x1b[90m";
+    }
+    fprintf(stdout, "\x1b[%d;%dH%s%c\x1b[0m", row + 1, col, fg, ch);
 }
 
 static void cctext_draw_help(int rows, int cols) {
@@ -670,6 +756,10 @@ static void cctext_draw(RtxWs *w, RtxUi *ui, int rows, int cols) {
     int vis = rows - 1 - find_h;
     int p;
     RtxBuf *act = w->active();
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
     if (vis < 1) vis = 1;
     /* Synchronized update: do not ED (erase display) — that is the flicker. */
     fputs("\x1b[?2026h", stdout);
@@ -713,7 +803,7 @@ static void cctext_draw(RtxWs *w, RtxUi *ui, int rows, int cols) {
             } else {
                 {
                     char pos[32];
-                    rtx_status_line_pos(act ? &act->doc : NULL, pos, sizeof(pos));
+                    rtx_status_line_pos(act ? &act->doc : NULL, pos, sizeof(pos)) !>;
                     fprintf(stdout,
                             "\x1b[%d;1H\x1b[7m%s%s  %s  Esc help  g jump  f find  %s\x1b[0m\x1b[K",
                             rows, star, path, pos, g_status);
@@ -725,37 +815,95 @@ static void cctext_draw(RtxWs *w, RtxUi *ui, int rows, int cols) {
     fflush(stdout);
 }
 
+static void cctext_scroll_bar(RtxBuf *b, RtxMeasure *m, int vis, int pcols, int drag) {
+    RtxScrollRail rail;
+    int ly, ty, th;
+    double tw;
+    if (!b || vis < 1) return;
+    tw = (double)cctext_text_cols(b, pcols, vis);
+    ly = g_mouse_row - 1;
+    @errhandler(CCError e) {
+        snprintf(g_status, sizeof(g_status), "%s", e.message ? e.message : "scroll");
+        return;
+    }
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
+    if (!drag || !b->drag_len) {
+        rail = b->scroll_rail(vis) !>;
+        rtx_scroll_rail_thumb(&rail, vis, 1, &ty, &th);
+        b->drag_vis = rail.vis ? rail.vis : 1;
+        b->drag_len = rail.len;
+        if (ly >= ty && ly < ty + th) b->drag_grab = ly - ty;
+        else {
+            b->drag_grab = th / 2;
+            b->scroll_to_off(rtx_scroll_rail_pos_at(&rail, vis, 1, ly - b->drag_grab)) !>;
+            b->ensure_view(m, tw, vis) !>;
+        }
+        return;
+    }
+    {
+        RtxScrollRail map;
+        size_t off, dest, cur;
+        map.pos = 0;
+        map.vis = b->drag_vis ? b->drag_vis : 1;
+        map.len = b->drag_len ? b->drag_len : b->len();
+        map.ready = 1;
+        off = rtx_scroll_rail_pos_at(&map, vis, 1, ly - b->drag_grab);
+        if (rtx_layout_is_hex(&b->layout)) {
+            dest = rtx_hex_align(off);
+            cur = b->top_byte;
+        } else {
+            dest = rtx_doc_line_floor(&b->doc, off) !>;
+            cur = b->seek_valid ? b->seek_off :
+                  (b->layout.len ? b->layout.rows[0].byte_start : (size_t)-1);
+        }
+        if (dest != cur) {
+            b->scroll_to_off(off) !>;
+            b->ensure_view(m, tw, vis) !>;
+        }
+    }
+}
+
 static void cctext_hit(RtxWs *w, RtxMeasure *m, int cols, int vis, int drag) {
     int pane = cctext_pane_at_col(w, cols, g_mouse_col);
     int pcols = cctext_pane_cols(w, cols, pane);
     int col0 = (pane == 0) ? 1 : (cols / 2 + 2);
     RtxBuf *b;
     double x, y;
+    @errhandler(CCError e) {
+        snprintf(g_status, sizeof(g_status), "%s", e.message ? e.message : "hit failed");
+        return;
+    }
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
     w->focus = pane;
     b = w->active();
     if (!b) return;
+    if (cctext_scroll_hit(g_mouse_col, col0, pcols, cctext_rail_w(b, vis)) ||
+        (drag && b->drag_len)) {
+        cctext_scroll_bar(b, m, vis, pcols, drag);
+        return;
+    }
+    cctext_follow_caret(b);
+    if (!drag) {
+        b->drag_vis = 0;
+        b->drag_len = 0;
+        b->drag_grab = 0;
+    }
     {
         double tw = (double)cctext_text_cols(b, pcols, vis);
         /* SGR never reports a row above the window; row 1 is "above". */
         if (drag && g_mouse_row <= 1) {
-            b->scroll_vis(m, tw, -1) !>(e) {
-                snprintf(g_status, sizeof(g_status), "hit failed");
-                return;
-            };
-            b->ensure_view(m, tw, vis) !>(e) {
-                snprintf(g_status, sizeof(g_status), "hit failed");
-                return;
-            };
+            b->scroll_vis(m, tw, -1) !>;
+            b->ensure_view(m, tw, vis) !>;
             g_mouse_row = 1;
         } else if (drag && g_mouse_row >= vis) {
-            b->scroll_vis(m, tw, 1) !>(e) {
-                snprintf(g_status, sizeof(g_status), "hit failed");
-                return;
-            };
-            b->ensure_view(m, tw, vis) !>(e) {
-                snprintf(g_status, sizeof(g_status), "hit failed");
-                return;
-            };
+            b->scroll_vis(m, tw, 1) !>;
+            b->ensure_view(m, tw, vis) !>;
             g_mouse_row = vis;
         } else if (g_mouse_row < 1 || g_mouse_row > vis) {
             return;
@@ -787,27 +935,25 @@ static void cctext_hit(RtxWs *w, RtxMeasure *m, int cols, int vis, int drag) {
         }
     }
     {
-        size_t at = b->layout.hit(&b->doc, m, x, y) !>(e) {
-            snprintf(g_status, sizeof(g_status), "hit failed");
-            return;
-        };
+        size_t at = b->layout.hit(&b->doc, m, x, y) !>;
         b->doc.caret = at;
     }
     if (g_alt) {
-        size_t line = b->doc.line_of(b->doc.caret);
+        size_t line = b->doc.line_of(b->doc.caret) !>;
+        size_t ls = b->doc.line_start(line) !>;
         if (!drag) {
             b->doc.sel_anchor = b->doc.caret;
             b->doc.sel_box = 1;
-            b->pref.col = b->doc.caret - b->doc.line_start(line);
+            b->pref.col = b->doc.caret - ls;
             b->pref.ok = 1;
             b->pref.eol = 0;
             b->doc.box_acol = b->pref.col;
             b->doc.box_ccol = b->pref.col;
         } else {
-            b->pref.col = b->doc.caret - b->doc.line_start(line);
+            b->pref.col = b->doc.caret - ls;
             b->pref.ok = 1;
             b->pref.eol = 0;
-            b->box_sync();
+            b->box_sync() !>;
         }
     } else {
         if (!drag && !g_shift) b->doc.sel_anchor = b->doc.caret;
@@ -822,6 +968,10 @@ int main(int argc, char **argv) {
             snprintf(g_status, sizeof(g_status), "%s",
                      e.message ? e.message : "error");
         cc_error_log(e);
+        if (!g_raw) return 1;
+    }
+    @errhandler(RtxIndexErr e) {
+        (void)e;
         if (!g_raw) return 1;
     }
     RtxWs w = {0} @destroy;
@@ -903,6 +1053,11 @@ int main(int argc, char **argv) {
         kind = cctext_read(&ch);
         act = w.active();
         if (!act) break;
+        if (!g_mouse_drag && act->drag_len) {
+            act->drag_vis = 0;
+            act->drag_len = 0;
+            act->drag_grab = 0;
+        }
         if (ui.ask_quit) {
             if (kind == KEY_HELP ||
                 (kind == KEY_CHAR && (ch == 'c' || ch == 'C'))) {
@@ -920,11 +1075,14 @@ int main(int argc, char **argv) {
                         ok = 0;
                         break;
                     }
-                    sd->save() !>(e) {
-                        snprintf(g_status, sizeof(g_status), "%s",
-                                 e.message ? e.message : "save failed");
-                        ok = 0;
-                    };
+                    {
+                        @errhandler(CCError e) {
+                            snprintf(g_status, sizeof(g_status), "%s",
+                                     e.message ? e.message : "save failed");
+                            ok = 0;
+                        }
+                        sd->save() !>;
+                    }
                     if (!ok) break;
                     sd->break_coalesce();
                 }
@@ -941,7 +1099,8 @@ int main(int argc, char **argv) {
             if (kind == KEY_HELP || kind == KEY_QUIT) {
                 rtx_ui_clear_jump(&ui);
             } else if (kind == KEY_ENTER) {
-                rtx_ui_apply_jump(&ui, &act->doc);
+                rtx_ui_apply_jump(&ui, &act->doc) !>;
+                cctext_follow_caret(act);
                 if (rtx_layout_is_hex(&act->layout)) {
                     act->top_byte = rtx_hex_align(act->doc.caret);
                 }
@@ -957,8 +1116,10 @@ int main(int argc, char **argv) {
                 rtx_ui_clear_find(&ui);
             } else if (kind == KEY_UP) {
                 act->doc.find_prev();
+                cctext_follow_caret(act);
             } else if (kind == KEY_DOWN) {
                 act->doc.find_next();
+                cctext_follow_caret(act);
             } else if (kind == KEY_BACKSPACE && ui.find_len > 0) {
                 ui.find_buf[--ui.find_len] = 0;
                 rtx_ui_find_apply(&ui, &act->doc) !>;
@@ -972,7 +1133,10 @@ int main(int argc, char **argv) {
                 int idx = g_mouse_row - vis - 2;
                 if (idx >= 0) {
                     size_t hit = ui.find_top + (size_t)idx;
-                    if (hit < act->doc.find.len) act->doc.find_goto(hit);
+                    if (hit < act->doc.find.len) {
+                        act->doc.find_goto(hit);
+                        cctext_follow_caret(act);
+                    }
                 }
             }
             continue;
@@ -1004,6 +1168,9 @@ int main(int argc, char **argv) {
             rtx_layout_cycle_view(&act->layout);
             act->top_wrap = 0;
             act->layout.len = 0;
+            act->seek_valid = 0;
+            act->drag_vis = 0;
+            act->drag_len = 0;
             act->clear_pref();
             if (rtx_layout_is_hex(&act->layout)) {
                 act->top_byte = rtx_hex_align(act->doc.caret);
@@ -1017,10 +1184,20 @@ int main(int argc, char **argv) {
             g_status[0] = 0;
             continue;
         }
+        if (kind != KEY_NONE && kind != KEY_WHEEL_UP && kind != KEY_WHEEL_DOWN &&
+            kind != KEY_MOUSE && kind != KEY_MOUSE_DRAG && kind != KEY_HELP &&
+            kind != KEY_SAVE && kind != KEY_COPY && kind != KEY_SPLIT &&
+            kind != KEY_OTHER_PANE && kind != KEY_NEXT_BUF) {
+            cctext_follow_caret(act);
+        }
         if (kind == KEY_SAVE) {
-            act->doc.save() !>(e) {
-                snprintf(g_status, sizeof(g_status), "save failed");
-            };
+            {
+                @errhandler(CCError e) {
+                    snprintf(g_status, sizeof(g_status), "%s",
+                             e.message ? e.message : "save failed");
+                }
+                act->doc.save() !>;
+            }
             if (!act->doc.dirty()) snprintf(g_status, sizeof(g_status), "saved");
             act->doc.break_coalesce();
         } else if (kind == KEY_UNDO) {
@@ -1053,6 +1230,8 @@ int main(int argc, char **argv) {
             continue;
         } else if (kind == KEY_MOUSE || kind == KEY_MOUSE_DRAG) {
             cctext_hit(&w, &m, cols, vis, kind == KEY_MOUSE_DRAG);
+            act = w.active();
+            if (act && act->drag_len) skip_reveal = 1;
         } else if (kind == KEY_SEL_ALL) {
             act->doc.select_all();
         } else if (kind == KEY_HOME) {
@@ -1066,7 +1245,7 @@ int main(int argc, char **argv) {
             } else if (act->layout.wrap && act->layout.len) {
                 act->layout.move_row_edge(&act->doc, 0, g_shift);
             } else {
-                act->doc.move_line_edge(0, g_shift);
+                act->doc.move_line_edge(0, g_shift) !>;
             }
             act->clear_pref();
         } else if (kind == KEY_END) {
@@ -1085,12 +1264,12 @@ int main(int argc, char **argv) {
                 act->layout.move_row_edge(&act->doc, 1, g_shift);
                 act->stick_eol();
             } else {
-                act->doc.move_line_edge(1, g_shift);
+                act->doc.move_line_edge(1, g_shift) !>;
                 act->stick_eol();
             }
         } else if (kind == KEY_LEFT) {
             if (g_alt) {
-                act->box_move_col(-1);
+                act->box_move_col(-1) !>;
             } else if (!g_shift && act->doc.has_sel()) {
                 act->doc.caret = act->doc.sel_lo();
                 act->doc.clear_sel();
@@ -1105,7 +1284,7 @@ int main(int argc, char **argv) {
         } else if (kind == KEY_RIGHT) {
             size_t n = act->len();
             if (g_alt) {
-                act->box_move_col(1);
+                act->box_move_col(1) !>;
             } else if (!g_shift && act->doc.has_sel()) {
                 act->doc.caret = act->doc.sel_hi();
                 act->doc.clear_sel();
@@ -1134,12 +1313,12 @@ int main(int argc, char **argv) {
                 act->doc.break_coalesce();
                 act->clear_pref();
             } else {
-                if (g_alt) act->box_begin();
+                if (g_alt) act->box_begin() !>;
                 act->layout.move_vert(&act->doc, &m,
                                       (double)cctext_text_cols(act, cctext_pane_cols(&w, cols, w.focus), vis),
                                       kind == KEY_UP ? -1 : 1, g_shift || g_alt,
                                       &act->pref) !>;
-                if (g_alt) act->box_sync();
+                if (g_alt) act->box_sync() !>;
             }
         } else if (kind == KEY_BACKSPACE) {
             act->doc.backspace() !>;

@@ -33,9 +33,11 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 
 ## Surfaces
 
-Fallible APIs are Results (`T !>(CCError)`). Value returns are only pure queries of already-valid state (`len`, `line_*`, `has_sel`, `dirty`, …). OOM, IO, and a short mid-document read are errors — never a short slice or a zero that looks like success on a commit path. `line_*` stay value returns for call-site ergonomics, but an I/O fault during a progressive scan sets `line_index_fault` (query: `index_fault()`) and clears `line_off_ok` (status shows `Lcur!`); it does not invent a successful index.
+Fallible APIs are Results (`T !>(CCError)`). Value returns are only pure queries of already-valid state (`len`, `has_sel`, `dirty`, …). OOM, IO, and a short mid-document read are errors — never a short slice or a zero that looks like success on a commit path.
 
-One document read surface: `size_t !>(CCError) read_at(off, dest, n)`. Success returns `got = min(n, len - off)` (EOF clamp is success). A hole inside that range is an error. Callers that need every byte of `n` require `off + n <= len` (or check `got == n`). There is no second “unchecked” path.
+`line_start` / `line_of` are `size_t !>(RtxIndexErr)`. `RtxIndexErr` is not a face of `CCError`. `@errhandler` matches exact `E`. Helpers that call `line_*` are `T !>(RtxIndexErr)` and pipe. A `!>(CCError)` surface that also does index work translates once (`CC_ERR_IO`). Paint / key (and test `main`) abandon the frame. A scan fault sets `line_index_fault` (query: `index_fault()`) and clears `line_off_ok` (status `Lcur!`).
+
+One document read surface: `size_t !>(CCError) read_at(off, dest, n)`. Success returns `got = min(n, len - off)` (EOF clamp is success). A hole inside that range is an error. Callers that need every byte of `n` require `off + n <= len` (or check `got == n`).
 
 If an API returns owned bytes, the destination arena is the **last** parameter (Concurrent-C convention: receiver first, arena last). That arena *is* the product’s lifetime. Call-local `@scratch` / frame stack stays inside the callee and is not returned. Views (`span`) do not take an arena.
 
@@ -61,7 +63,7 @@ A path that gives up is not success:
 - Seed of a non-empty original must produce a root node, or the constructor fails.
 - Scan / highlight / reparse / `ensure_hl` are `void !>(CCError)`. They do not plant markup or set `hl_done` after a missing span. A failed scan resets analysis. A failed highlight strips hl-only runs and clears every `hl_done`. For code sections larger than `RTX_HL_FULL_MAX`, `ensure_hl` lexes only the visible window and leaves `hl_done` clear so scroll re-lexes — it never copies the whole body for analysis.
 - `RtxWs_copy` is `int !>(CCError)`: `0` = no selection, `1` = copied, OOM is an error.
-- A short `read_at` mid-document is a fault, not EOF. Path `from_path` does not scan the body (open is O(open)). Newline weights and the stride index grow **progressively** on `line_start` / `line_of`; `line_count` stays soft until EOF is reached (`known + 1MiB` scroll budget only). `line_known` / status `Lcur+` report what the index has actually seen; `lf_ready` makes `Lcur/total` exact. `line_off_ok` is set when the scan reaches `len`. On files larger than `RTX_LINE_SOFT_MIN`, an edit scans only through the edit offset, clears `lf_ready`, and never rebuilds a suffix to EOF (typing / newline / quit stay O(local)). Small files still finish the index eagerly. Typing at EOF extends the tip add-piece without rescanning it. Long progressive scans and saves pulse the tree’s busy drawer (`t.busy_bind` / `w.busy_bind`) so both frontends can show a corner spinner; headless leaves it unbound.
+- A short `read_at` mid-document is a fault, not EOF. `line_count` is soft until EOF (`known + 1MiB` scroll budget only). `line_known` / `Lcur+` are what the index has seen; `lf_ready` makes `Lcur/total` exact. `line_off_ok` is set when the scan reaches `len`. Above `RTX_LINE_SOFT_MIN`, an edit through an offset the index has not reached still scans to that offset, then clears `lf_ready` and does not rebuild a suffix. Small files finish the index eagerly. A tip insert at EOF extends the add-piece without a rescan. Long scans and saves pulse `t.busy_bind` / `w.busy_bind`; headless leaves it unbound.
 
 Commit only after the new value exists, in every direction: the right node before shrinking a piece; hist after `tree.replace`; clip after a successful cut replace; derived flags after the highlight / line-index pass; path+`saved_head` after a prepared rename. Unsaved quit opens a Save / Don't save / Cancel prompt. `tree.replace` rolls the deleted span back if insert fails; rollback failure sets `d.broken` and further edits refuse. Clipboard allocs into a local, then assigns; OOM keeps the old clip. Empty source is a real clear. A path that gives up is either unchanged or `broken` — never a hole that looks retryable.
 
@@ -69,12 +71,12 @@ Host close is a one-shot offer into that prompt, not loop control. Cancel dismis
 
 ## Faces
 
-`@typehooks` / `@typeview` sit next to the types. UFCS keeps a type open; a `@typeview` is the reverse face: the **application** declares what a composition may safely reach — the type does not close itself. Permission gates the name before UFCS resolves it, so an extension enters a face only if the face's own grant matches. Safety is decided at the use site, like ownership.
+`@typehooks` / `@typeview` sit next to the types they name. A `@typeview` is the application’s allow-list. An `as:` embed retries UFCS on the inner type when the face grants the name.
 
-- `as: tree` on `RtxDoc`, `as: doc` on `RtxBuf` — UFCS that misses retries on the embed. A projection, not a lock.
-- `RtxDocLayout` — named allow-list: measure may `len`, `line_*`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl`. It cannot `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
+- `as: tree` on `RtxDoc`, `as: doc` on `RtxBuf` — miss on the outer retries on the embed.
+- `RtxDocLayout` — named allow-list: measure may `len`, `line_*`, `line_guess`, `index_covers`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl`. It cannot `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
 
-`L.view` is the layout policy (`RTX_VIEW_DEFAULT` / `WRAP` / `HEX`); `L.wrap` is 1 iff wrap. Default: one visual row per physical line. Wrap: last whitespace if the next token fits after it, else a hard break at `max_width`. Hex: byte rows of 16 with offset | hex | ASCII columns (synced selection); scroll via `top_byte`. A token wider than the window still occupies a row in wrap. Text scroll is `top` (physical line) plus `top_wrap`. Up/down walk visual rows (or ±16 bytes in hex) and keep a goal column in text modes. Ctrl-L cycles the three views.
+`L.view` is the layout policy (`RTX_VIEW_DEFAULT` / `WRAP` / `HEX`); `L.wrap` is 1 iff wrap. Default: one visual row per physical line. Wrap: last whitespace if the next token fits after it, else a hard break at `max_width`. Hex: byte rows of 16 with offset | hex | ASCII columns (synced selection); scroll via `top_byte`. A token wider than the window still occupies a row in wrap. Text scroll is `top` (physical line) plus `top_wrap`. Up/down walk visual rows (or ±16 bytes in hex) and keep a goal column in text modes. Ctrl-L cycles the three views. Both frontends draw a byte-rail scrollbar (`pos` / `len`, not soft `line_count`): Raylib pixels, TTY a reserved column. The rail is hidden when the pane already shows the whole file. Click/drag maps to a byte and snaps like jump `N%`. A seek past the scan frontier fills a local byte window (`fill_off` / `line_guess`) — it does not `line_of` the prefix. The rail is marked while `!lf_ready`.
 
 Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for insert / `write_fd` / page-store internals.
 
@@ -86,4 +88,4 @@ Find stores offsets on `d.find.store`. A frame steps at most 256 KiB so a giant 
 
 ## Encoding
 
-Offsets, caret, selection, and the piece tree are **bytes** today (ASCII / UTF-8 code units treated as opaque). A UTF-8 plan (grapheme-aware motion, display width, invalid sequences) is deferred: do not invent mid-edit. When it lands, it should keep the byte-offset core and add a navigation/measure layer on top — not change `read_at` into codepoints.
+Offsets, caret, selection, and the piece tree are bytes (UTF-8 code units treated as opaque). A later grapheme / display-width layer sits on top of that; `read_at` stays bytes.
