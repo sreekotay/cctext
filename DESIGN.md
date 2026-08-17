@@ -13,7 +13,7 @@ d.from_path(path) !>;
 
 or a second local (`RtxDoc d2 = {0} @destroy`). `memset` is neither.
 
-Hooks and faces live next to the type they name (`piece_tree.cch`, `document.cch`, …). A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
+Hooks and faces live next to the type they name (`page_store.cch`, `piece_tree.cch`, `document.cch`, …). A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
 
 There is no inflight counter and no drain-to-zero. A path that gives up says so at the position that caused it.
 
