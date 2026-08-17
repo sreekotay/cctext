@@ -23,6 +23,7 @@ smoke test: $(LARGE)
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run edit_session_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run find_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run hex_view_smoke
+	$(CCC) $(CCC_FLAGS) build --build-file build.cc run line_index_prop_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run large_file_smoke
 	# ~1 GiB select-all paste; for bigger: make dup-scale-8g / dup-scale-64g
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run dup_scale_smoke

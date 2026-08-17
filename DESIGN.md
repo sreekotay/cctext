@@ -13,7 +13,7 @@ d.from_path(path) !>;
 
 or a second local (`RtxDoc d2 = {0} @destroy`). `memset` is neither.
 
-Hooks and faces live next to the type they name (`page_store.cch`, `piece_tree.cch`, `document.cch`, …). The piece tree is split for size only: `piece_tree_rb.cch` (order-statistic RB + find) and `piece_tree_lines.cch` (stride index + `line_*`) are textual includes of `piece_tree.cch`, not separate TUs — same pattern as keeping one lowered unit. A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
+Hooks and faces live next to the type they name (`page_store.cch`, `piece_tree.cch`, `document.cch`, …). Leaf modules that are real linked TUs: `page_store.ccs`, `hex.ccs` (decls in the matching `.cch`). The piece tree is still split for size with textual includes (`piece_tree_rb.cch`, `piece_tree_lines.cch`) into one lowered unit with the caller. A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
 
 There is no inflight counter and no drain-to-zero. A path that gives up says so at the position that caused it.
 
@@ -21,7 +21,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 
 | Epoch | Storage | Lives until |
 |---|---|---|
-| Document | piece-tree arena + page store | `RtxDoc.destroy()` |
+| Document | piece-tree arena + page-store arena (fds + LRU page pool) | `RtxDoc.destroy()` |
 | Session | `d.session` | close (path, undo) |
 | Analysis | `d.analysis` | `analysis.reset()` on reparse (sections, runs) |
 | Find | `d.find.store` | new query resets; edit invalidates (offsets only) |
@@ -33,7 +33,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 
 ## Surfaces
 
-Fallible APIs are Results (`T !>(CCError)`). Value returns are only pure queries of already-valid state (`len`, `line_*`, `has_sel`, `dirty`, …). OOM, IO, and a short mid-document read are errors — never a short slice or a zero that looks like success on a commit path.
+Fallible APIs are Results (`T !>(CCError)`). Value returns are only pure queries of already-valid state (`len`, `line_*`, `has_sel`, `dirty`, …). OOM, IO, and a short mid-document read are errors — never a short slice or a zero that looks like success on a commit path. `line_*` stay value returns for call-site ergonomics, but an I/O fault during a progressive scan sets `line_index_fault` (query: `index_fault()`) and clears `line_off_ok` (status shows `Lcur!`); it does not invent a successful index.
 
 One document read surface: `size_t !>(CCError) read_at(off, dest, n)`. Success returns `got = min(n, len - off)` (EOF clamp is success). A hole inside that range is an error. Callers that need every byte of `n` require `off + n <= len` (or check `got == n`). There is no second “unchecked” path.
 
@@ -59,7 +59,7 @@ Constructors assume dead. `from_path` / `from_buffer` / `empty` / `open_files` e
 A path that gives up is not success:
 
 - Seed of a non-empty original must produce a root node, or the constructor fails.
-- Scan / highlight / reparse / `ensure_hl` are `void !>(CCError)`. They do not plant markup or set `hl_done` after a missing span. A failed scan resets analysis. A failed highlight strips hl-only runs and clears every `hl_done`.
+- Scan / highlight / reparse / `ensure_hl` are `void !>(CCError)`. They do not plant markup or set `hl_done` after a missing span. A failed scan resets analysis. A failed highlight strips hl-only runs and clears every `hl_done`. For code sections larger than `RTX_HL_FULL_MAX`, `ensure_hl` lexes only the visible window and leaves `hl_done` clear so scroll re-lexes — it never copies the whole body for analysis.
 - `RtxWs_copy` is `int !>(CCError)`: `0` = no selection, `1` = copied, OOM is an error.
 - A short `read_at` mid-document is a fault, not EOF. Path `from_path` does not scan the body (open is O(open)). Newline weights and the stride index grow **progressively** on `line_start` / `line_of`; `line_count` stays soft until EOF is reached (`known + 1MiB` scroll budget only). `line_known` / status `Lcur+` report what the index has actually seen; `lf_ready` makes `Lcur/total` exact. `line_off_ok` is set when the scan reaches `len`. On files larger than `RTX_LINE_SOFT_MIN`, an edit scans only through the edit offset, clears `lf_ready`, and never rebuilds a suffix to EOF (typing / newline / quit stay O(local)). Small files still finish the index eagerly. Typing at EOF extends the tip add-piece without rescanning it. Long progressive scans and saves pulse the tree’s busy drawer (`t.busy_bind` / `w.busy_bind`) so both frontends can show a corner spinner; headless leaves it unbound.
 
@@ -80,6 +80,10 @@ Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for ins
 
 ## Edits
 
-User changes are `replace` on the history stack (type / backspace / delete). Save streams pieces (`write_fd`), fsyncs, renames. Dirty is `hist.head != saved_head`. Offsets are bytes. Stream selection is `[sel_anchor, caret)`. Up/down keep a goal column (`pref.col` / `pref.x`) so a short line does not forget the place; End sets `pref.eol` and sticks to each line end. Alt-arrows / Alt-drag is a column box (`sel_box`): each line contributes `[box_acol, box_ccol)` (virtual; short lines clamp). Copy joins those slices with newlines. Type/backspace apply the same column on every line as one replace.
+User changes are `replace` on the history stack (type / backspace / delete). Large deletes (`> RTX_HIST_INLINE_MAX`) omit inline bytes — undo of those records fails closed; redo still works. Coalesced typing grows hist byte slots with capacity doubling. Save streams pieces (`write_fd`), preserves existing mode when overwriting, fsyncs the file (and best-effort the parent directory), then renames. Dirty is `hist.head != saved_head`. Offsets are bytes. Stream selection is `[sel_anchor, caret)`. Up/down keep a goal column (`pref.col` / `pref.x`) so a short line does not forget the place; End sets `pref.eol` and sticks to each line end. Alt-arrows / Alt-drag is a column box (`sel_box`): each line contributes `[box_acol, box_ccol)` (virtual; short lines clamp). Copy joins those slices with newlines. Type/backspace apply the same column on every line as one replace.
 
 Find stores offsets on `d.find.store`. A frame steps at most 256 KiB so a giant file does not stall. Context is a line window computed when drawing the visible hits. `f` / Ctrl-F opens the panel; up/down moves among hits.
+
+## Encoding
+
+Offsets, caret, selection, and the piece tree are **bytes** today (ASCII / UTF-8 code units treated as opaque). A UTF-8 plan (grapheme-aware motion, display width, invalid sequences) is deferred: do not invent mid-edit. When it lands, it should keep the byte-offset core and add a navigation/measure layer on top — not change `read_at` into codepoints.

@@ -2,20 +2,15 @@
 /*
  * Document-epoch page cache (original fd + spilled add temp file).
  *
- * Slot metadata and page bodies use malloc/free (LRU recycle), not the
- * piece-tree arena — pages outlive individual edits and must be reusable
- * without resetting the document epoch. Lifetime still ends in destroy().
+ * Types + API here; bodies live in page_store.ccs (linked TU).
+ * Cache pool lives on a store-local arena (LRU reuses slot bodies; nothing
+ * is freed per eviction). destroy() ends the arena with the store.
  */
 #ifndef RTX_PAGE_STORE_H
 #define RTX_PAGE_STORE_H
 
 #include <ccc/std/prelude.cch>
-#include <errno.h>
-#include <fcntl.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #define RTX_PAGE_SIZE (64 * 1024)
 #define RTX_PAGE_CACHE_DEFAULT 256
@@ -41,6 +36,7 @@ typedef struct {
     int add_fd; /* meaningful only if add_open */
     int add_open;
     size_t add_len;
+    CCArena arena; /* slots + page bodies; store epoch */
     RtxPageSlot *slots;
     size_t slot_n;
     size_t lru_head; /* MRU */
@@ -48,245 +44,23 @@ typedef struct {
     int slots_linked;
 } RtxPageStore;
 
-static void rtx_page_store_zero(RtxPageStore *s) {
+static inline void rtx_page_store_zero(RtxPageStore *s) {
     if (!s) return;
     memset(s, 0, sizeof(*s));
     s->orig_fd = -1;
     s->add_fd = -1;
 }
 
-static int rtx_page_store_is_open(const RtxPageStore *s) {
+static inline int rtx_page_store_is_open(const RtxPageStore *s) {
     return s && (s->orig_open || s->add_open);
 }
 
-static void rtx_page_lru_unlink(RtxPageStore *s, size_t i) {
-    RtxPageSlot *p = &s->slots[i];
-    if (p->lru_prev == (size_t)-1) s->lru_head = p->lru_next;
-    else s->slots[p->lru_prev].lru_next = p->lru_next;
-    if (p->lru_next == (size_t)-1) s->lru_tail = p->lru_prev;
-    else s->slots[p->lru_next].lru_prev = p->lru_prev;
-    p->lru_prev = (size_t)-1;
-    p->lru_next = (size_t)-1;
-}
-
-static void rtx_page_lru_push_head(RtxPageStore *s, size_t i) {
-    RtxPageSlot *p = &s->slots[i];
-    p->lru_prev = (size_t)-1;
-    p->lru_next = s->lru_head;
-    if (s->lru_head == (size_t)-1) s->lru_tail = i;
-    else s->slots[s->lru_head].lru_prev = i;
-    s->lru_head = i;
-}
-
-static void rtx_page_lru_touch(RtxPageStore *s, size_t i) {
-    if (s->lru_head == i) return;
-    rtx_page_lru_unlink(s, i);
-    rtx_page_lru_push_head(s, i);
-}
-
-static void !>(CCError) rtx_page_store_ensure_slots(RtxPageStore *s) {
-    size_t i;
-    if (!s) return cc_err(CC_ERR_INVALID_ARG, "null store");
-    if (s->slots) return cc_ok();
-    s->slot_n = RTX_PAGE_CACHE_DEFAULT;
-    s->slots = (RtxPageSlot *)calloc(s->slot_n, sizeof(RtxPageSlot));
-    if (!s->slots) return cc_err(CC_ERR_OUT_OF_MEMORY, "page slots");
-    s->lru_head = (size_t)-1;
-    s->lru_tail = (size_t)-1;
-    for (i = 0; i < s->slot_n; i++) {
-        s->slots[i].file_id = -1;
-        s->slots[i].lru_prev = (size_t)-1;
-        s->slots[i].lru_next = (size_t)-1;
-        rtx_page_lru_push_head(s, i);
-    }
-    s->slots_linked = 1;
-    return cc_ok();
-}
-
-static int rtx_page_fd(const RtxPageStore *s, RtxStoreFile f) {
-    if (f == RTX_STORE_ORIG) return s->orig_fd;
-    return s->add_fd;
-}
-
-static size_t rtx_page_file_len(const RtxPageStore *s, RtxStoreFile f) {
-    if (f == RTX_STORE_ORIG) return s->orig_len;
-    return s->add_len;
-}
-
-static void !>(CCError) rtx_page_store_ensure_add(RtxPageStore *s) {
-    char path[] = "/tmp/raytext-add-XXXXXX";
-    int fd;
-    if (!s) return cc_err(CC_ERR_INVALID_ARG, "null store");
-    if (s->add_open) return cc_ok();
-    fd = mkstemp(path);
-    if (fd < 0) return cc_err(CC_ERR_IO, "mkstemp add");
-    unlink(path);
-    s->add_fd = fd;
-    s->add_open = 1;
-    s->add_len = 0;
-    return cc_ok();
-}
-
-static void !>(CCError) RtxPageStore_open_original(RtxPageStore *s, const char *path) {
-    struct stat st;
-    int fd;
-    if (!s) return cc_err(CC_ERR_INVALID_ARG, "null store");
-    if (rtx_page_store_is_open(s)) return cc_err(CC_ERR_INVALID_ARG, "store already open");
-    if (!path || !path[0]) return cc_err(CC_ERR_INVALID_ARG, "empty path");
-    fd = open(path, O_RDONLY);
-    if (fd < 0) return cc_err(CC_ERR_IO, "open original");
-    if (fstat(fd, &st) != 0) {
-        close(fd);
-        return cc_err(CC_ERR_IO, "fstat original");
-    }
-    if (st.st_size < 0) {
-        close(fd);
-        return cc_err(CC_ERR_IO, "negative size");
-    }
-    s->orig_fd = fd;
-    s->orig_open = 1;
-    s->orig_len = (size_t)st.st_size;
-    return cc_ok();
-}
-
-static void RtxPageStore_destroy(RtxPageStore *s) {
-    size_t i;
-    if (!s) return;
-    if (s->slots) {
-        for (i = 0; i < s->slot_n; i++) {
-            free(s->slots[i].bytes);
-            s->slots[i].bytes = NULL;
-        }
-        free(s->slots);
-        s->slots = NULL;
-    }
-    if (s->orig_open) close(s->orig_fd);
-    if (s->add_open) close(s->add_fd);
-    rtx_page_store_zero(s);
-}
-
-/* Load page into slot i (may allocate bytes). Range must be inside file. */
-static void !>(CCError) rtx_page_load(RtxPageStore *s, size_t i, RtxStoreFile f,
-                                     size_t page_index) {
-    RtxPageSlot *slot;
-    size_t file_len = rtx_page_file_len(s, f);
-    size_t off = page_index * (size_t)RTX_PAGE_SIZE;
-    size_t want;
-    int fd = rtx_page_fd(s, f);
-    size_t got = 0;
-    if (fd < 0) return cc_err(CC_ERR_IO, "page load fd");
-    if (off > file_len) return cc_err(CC_ERR_INTERNAL, "page past eof");
-    want = file_len - off;
-    if (want > (size_t)RTX_PAGE_SIZE) want = (size_t)RTX_PAGE_SIZE;
-    slot = &s->slots[i];
-    if (!slot->bytes) {
-        slot->bytes = (char *)malloc(RTX_PAGE_SIZE);
-        if (!slot->bytes) return cc_err(CC_ERR_OUT_OF_MEMORY, "page body");
-    }
-    while (got < want) {
-        ssize_t r = pread(fd, slot->bytes + got, want - got, (off_t)(off + got));
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return cc_err(CC_ERR_IO, "pread");
-        }
-        if (r == 0) return cc_err(CC_ERR_IO, "pread short");
-        got += (size_t)r;
-    }
-    slot->file_id = (int)f;
-    slot->page_index = page_index;
-    slot->valid = want;
-    return cc_ok();
-}
-
-static size_t !>(CCError) rtx_page_get(RtxPageStore *s, RtxStoreFile f, size_t page_index) {
-    size_t i;
-    size_t victim;
-    rtx_page_store_ensure_slots(s) !>(e) { return cc_err(e); };
-    for (i = 0; i < s->slot_n; i++) {
-        if (s->slots[i].file_id == (int)f && s->slots[i].page_index == page_index &&
-            s->slots[i].bytes) {
-            rtx_page_lru_touch(s, i);
-            return cc_ok(i);
-        }
-    }
-    victim = s->lru_tail;
-    if (victim == (size_t)-1) return cc_err(CC_ERR_INTERNAL, "empty lru");
-    rtx_page_load(s, victim, f, page_index) !>(e) { return cc_err(e); };
-    rtx_page_lru_touch(s, victim);
-    return cc_ok(victim);
-}
-
-/* Read exactly n bytes at off from file f into dest. Mid-file short = error. */
-static void !>(CCError) RtxPageStore_read(RtxPageStore *s, RtxStoreFile f, size_t off,
-                                         char *dest, size_t n) {
-    size_t file_len;
-    size_t got = 0;
-    if (!s || !dest) return cc_err(CC_ERR_INVALID_ARG, "page read");
-    if (n == 0) return cc_ok();
-    if (f == RTX_STORE_ORIG && !s->orig_open) {
-        return cc_err(CC_ERR_INVALID_ARG, "no original");
-    }
-    if (f == RTX_STORE_ADD && !s->add_open) {
-        return cc_err(CC_ERR_INVALID_ARG, "no add file");
-    }
-    file_len = rtx_page_file_len(s, f);
-    if (off > file_len || n > file_len - off) {
-        return cc_err(CC_ERR_INTERNAL, "page read range");
-    }
-    while (got < n) {
-        size_t abs = off + got;
-        size_t page_index = abs / (size_t)RTX_PAGE_SIZE;
-        size_t local = abs % (size_t)RTX_PAGE_SIZE;
-        size_t slot_i;
-        size_t take;
-        RtxPageSlot *slot;
-        slot_i = rtx_page_get(s, f, page_index) !>(e) { return cc_err(e); };
-        slot = &s->slots[slot_i];
-        if (local >= slot->valid) return cc_err(CC_ERR_INTERNAL, "page hole");
-        take = slot->valid - local;
-        if (take > n - got) take = n - got;
-        memcpy(dest + got, slot->bytes + local, take);
-        got += take;
-    }
-    return cc_ok();
-}
-
-/* Append n bytes to the add file. Returns start offset in add file. */
-static size_t !>(CCError) RtxPageStore_append_add(RtxPageStore *s, const char *src, size_t n) {
-    size_t start;
-    size_t wrote = 0;
-    if (!s) return cc_err(CC_ERR_INVALID_ARG, "null store");
-    if (n == 0) {
-        return cc_ok(s->add_len);
-    }
-    if (!src) return cc_err(CC_ERR_INVALID_ARG, "null append");
-    rtx_page_store_ensure_add(s) !>(e) { return cc_err(e); };
-    start = s->add_len;
-    while (wrote < n) {
-        ssize_t w = pwrite(s->add_fd, src + wrote, n - wrote, (off_t)(start + wrote));
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return cc_err(CC_ERR_IO, "pwrite add");
-        }
-        if (w == 0) return cc_err(CC_ERR_IO, "pwrite add");
-        wrote += (size_t)w;
-    }
-    s->add_len = start + n;
-    /* Invalidate any cached pages overlapping the new range. */
-    if (s->slots) {
-        size_t first = start / (size_t)RTX_PAGE_SIZE;
-        size_t last = (start + n - 1) / (size_t)RTX_PAGE_SIZE;
-        size_t i;
-        for (i = 0; i < s->slot_n; i++) {
-            if (s->slots[i].file_id == (int)RTX_STORE_ADD &&
-                s->slots[i].page_index >= first && s->slots[i].page_index <= last) {
-                s->slots[i].file_id = -1;
-                s->slots[i].valid = 0;
-            }
-        }
-    }
-    return cc_ok(start);
-}
+void !>(CCError) RtxPageStore_open_original(RtxPageStore *s, const char *path);
+void RtxPageStore_destroy(RtxPageStore *s);
+void !>(CCError) RtxPageStore_read(RtxPageStore *s, RtxStoreFile f, size_t off,
+                                   char *dest, size_t n);
+size_t !>(CCError) RtxPageStore_append_add(RtxPageStore *s, const char *src,
+                                            size_t n);
 
 @typehooks on RtxPageStore {
     .destroy = RtxPageStore_destroy,

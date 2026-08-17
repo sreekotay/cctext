@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int RtxDoc_dirty(const RtxDoc *d) {
     return d && d->hist.head != d->saved_head;
@@ -187,23 +190,77 @@ static void !>(CCError) rtx_hist_grow(RtxDoc *d) {
 }
 
 static int rtx_hist_can_coalesce_insert(const RtxHistRec *r, size_t off, char[:] ins) {
-    if (!r || r->del.len != 0 || ins.len == 0) return 0;
-    if (off != r->off + r->ins.len) return 0;
-    if (memchr(r->ins.ptr, '\n', r->ins.len) || memchr(ins.ptr, '\n', ins.len)) return 0;
+    if (!r || r->large_del || r->del_used != 0 || ins.len == 0) return 0;
+    if (off != r->off + r->ins_used) return 0;
+    if (memchr(r->ins.ptr, '\n', r->ins_used) || memchr(ins.ptr, '\n', ins.len)) return 0;
     return 1;
 }
 
 static int rtx_hist_can_coalesce_erase(const RtxHistRec *r, size_t off, char[:] del) {
-    if (!r || r->ins.len != 0 || del.len == 0) return 0;
+    if (!r || r->large_del || r->ins_used != 0 || del.len == 0) return 0;
+    if (del.len > RTX_HIST_INLINE_MAX) return 0;
+    if (r->del_used + del.len > RTX_HIST_INLINE_MAX) return 0;
     if (off + del.len != r->off) return 0;
-    if (memchr(r->del.ptr, '\n', r->del.len) || memchr(del.ptr, '\n', del.len)) return 0;
+    if (memchr(r->del.ptr, '\n', r->del_used) || memchr(del.ptr, '\n', del.len)) return 0;
     return 1;
+}
+
+static char[:] rtx_hist_ins_view(const RtxHistRec *r) {
+    if (!r || !r->ins.ptr || r->ins_used == 0) return cc_slice_empty();
+    return r->ins.sub(0, r->ins_used);
+}
+
+static char[:] rtx_hist_del_view(const RtxHistRec *r) {
+    if (!r || !r->del.ptr || r->del_used == 0) return cc_slice_empty();
+    return r->del.sub(0, r->del_used);
+}
+
+/* Ensure capacity buffer has room for `need` logical bytes; keeps prior used. */
+static void !>(CCError) rtx_hist_bytes_reserve(RtxDoc *d, char[:] *slot, size_t *used,
+                                               size_t *cap, size_t need) {
+    char[:] neu;
+    size_t c;
+    if (!d || !slot || !used || !cap) return cc_err(CC_ERR_INVALID_ARG, "hist reserve");
+    if (need <= *cap && slot->ptr) return cc_ok();
+    c = *cap ? *cap : 32;
+    while (c < need) {
+        size_t next = c * 2;
+        if (next < c) return cc_err(CC_ERR_OUT_OF_MEMORY, "hist overflow");
+        c = next;
+    }
+    neu = rtx_session_bytes(d, NULL, c) !>(e) { return cc_err(e); };
+    if (*used && slot->ptr) memcpy(neu.ptr, slot->ptr, *used);
+    *slot = neu;
+    *cap = c;
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_hist_coalesce_ins_append(RtxDoc *d, RtxHistRec *last,
+                                                     char[:] ins) {
+    size_t need = last->ins_used + ins.len;
+    rtx_hist_bytes_reserve(d, &last->ins, &last->ins_used, &last->ins_cap, need) !>(e) {
+        return cc_err(e);
+    };
+    memcpy(last->ins.ptr + last->ins_used, ins.ptr, ins.len);
+    last->ins_used = need;
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_hist_coalesce_del_prepend(RtxDoc *d, RtxHistRec *last,
+                                                      char[:] del) {
+    size_t need = last->del_used + del.len;
+    rtx_hist_bytes_reserve(d, &last->del, &last->del_used, &last->del_cap, need) !>(e) {
+        return cc_err(e);
+    };
+    memmove(last->del.ptr + del.len, last->del.ptr, last->del_used);
+    memcpy(last->del.ptr, del.ptr, del.len);
+    last->del_used = need;
+    return cc_ok();
 }
 
 static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
     char[:] del = cc_slice_empty();
     RtxHistRec rec;
-    char[:] coal = cc_slice_empty();
     RtxHistRec *last = NULL;
     size_t len;
     size_t caret0;
@@ -235,31 +292,41 @@ static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] 
             if (d->hist.coalesce && d->hist.head > 0) {
                 last = &d->hist.recs[d->hist.head - 1];
                 if (rtx_hist_can_coalesce_insert(last, off, ins)) {
-                    coal = rtx_session_bytes(d, NULL, last->ins.len + ins.len) !>(e) {
+                    rtx_hist_coalesce_ins_append(d, last, ins) !>(e) {
                         return cc_err(e);
                     };
-                    if (last->ins.len) memcpy(coal.ptr, last->ins.ptr, last->ins.len);
-                    memcpy(coal.ptr + last->ins.len, ins.ptr, ins.len);
                     coalesced = 1;
                 } else if (rtx_hist_can_coalesce_erase(last, off, del)) {
-                    coal = rtx_session_bytes(d, NULL, last->del.len + del.len) !>(e) {
+                    rtx_hist_coalesce_del_prepend(d, last, del) !>(e) {
                         return cc_err(e);
                     };
-                    memcpy(coal.ptr, del.ptr, del.len);
-                    if (last->del.len) {
-                        memcpy(coal.ptr + del.len, last->del.ptr, last->del.len);
-                    }
                     coalesced = 2;
                 }
             }
             if (!coalesced) {
-                rec.del = rtx_session_bytes(d, del.ptr, del.len) !>(e) { return cc_err(e); };
-                rec.ins = rtx_session_bytes(d, ins.ptr, ins.len) !>(e) { return cc_err(e); };
+                if (del.len > RTX_HIST_INLINE_MAX) {
+                    rec.del = cc_slice_empty();
+                    rec.del_used = 0;
+                    rec.del_cap = 0;
+                    rec.large_del = del.len;
+                } else if (del.len) {
+                    rec.del = rtx_session_bytes(d, del.ptr, del.len) !>(e) {
+                        return cc_err(e);
+                    };
+                    rec.del_used = del.len;
+                    rec.del_cap = del.len;
+                }
+                if (ins.len) {
+                    rec.ins = rtx_session_bytes(d, ins.ptr, ins.len) !>(e) {
+                        return cc_err(e);
+                    };
+                    rec.ins_used = ins.len;
+                    rec.ins_cap = ins.len;
+                }
                 rtx_hist_grow(d) !>(e) { return cc_err(e); };
             }
         }
         d->tree.replace(off, n, ins) !>(e) {
-            /* Pre-mutation faults leave the tree intact; only unrestorable sets broken. */
             if (e.message && strstr(e.message, "unrestorable")) d->broken = 1;
             return cc_err(e);
         };
@@ -275,14 +342,12 @@ static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] 
         d->box_ccol = 0;
         if (!d->hist.applying) {
             if (coalesced == 1 && last) {
-                last->ins = coal;
                 last->caret_after = d->caret;
                 last->sel_after = d->sel_anchor;
                 last->sel_box_after = d->sel_box;
                 last->box_acol_after = d->box_acol;
                 last->box_ccol_after = d->box_ccol;
             } else if (coalesced == 2 && last) {
-                last->del = coal;
                 last->off = off;
                 last->caret_after = d->caret;
                 last->sel_after = d->sel_anchor;
@@ -486,22 +551,29 @@ static int RtxDoc_can_redo(const RtxDoc *d) {
 
 static void !>(CCError) RtxDoc_undo(RtxDoc *d) {
     RtxHistRec *r;
+    char[:] del;
+    char[:] ins;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     if (d->hist.head == 0) return cc_ok();
     r = &d->hist.recs[d->hist.head - 1];
+    if (r->large_del) {
+        return cc_err(CC_ERR_INVALID_ARG, "large delete not undoable");
+    }
+    del = rtx_hist_del_view(r);
+    ins = rtx_hist_ins_view(r);
     d->hist.applying = 1;
     d->hist.coalesce = 0;
-    d->tree.replace(r->off, r->ins.len, r->del) !>(e) {
+    d->tree.replace(r->off, ins.len, del) !>(e) {
         d->hist.applying = 0;
         if (e.message && strstr(e.message, "unrestorable")) d->broken = 1;
         return cc_err(e);
     };
     d->edit_gen++;
-    rtx_doc_shift_intervals(d, r->off, r->ins.len, r->del.len);
+    rtx_doc_shift_intervals(d, r->off, ins.len, del.len);
     d->last_off = r->off;
-    d->last_markup = rtx_bytes_touch_markup(r->del.ptr, r->del.len) ||
-                     rtx_bytes_touch_markup(r->ins.ptr, r->ins.len);
+    d->last_markup = rtx_bytes_touch_markup(del.ptr, del.len) ||
+                     rtx_bytes_touch_markup(ins.ptr, ins.len);
     d->caret = r->caret_before;
     d->sel_anchor = r->sel_before;
     d->sel_box = r->sel_box_before;
@@ -515,22 +587,28 @@ static void !>(CCError) RtxDoc_undo(RtxDoc *d) {
 
 static void !>(CCError) RtxDoc_redo(RtxDoc *d) {
     RtxHistRec *r;
+    char[:] del;
+    char[:] ins;
+    size_t erase_n;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     if (d->hist.head >= d->hist.len) return cc_ok();
     r = &d->hist.recs[d->hist.head];
+    del = rtx_hist_del_view(r);
+    ins = rtx_hist_ins_view(r);
+    erase_n = r->large_del ? r->large_del : del.len;
     d->hist.applying = 1;
     d->hist.coalesce = 0;
-    d->tree.replace(r->off, r->del.len, r->ins) !>(e) {
+    d->tree.replace(r->off, erase_n, ins) !>(e) {
         d->hist.applying = 0;
         if (e.message && strstr(e.message, "unrestorable")) d->broken = 1;
         return cc_err(e);
     };
     d->edit_gen++;
-    rtx_doc_shift_intervals(d, r->off, r->del.len, r->ins.len);
+    rtx_doc_shift_intervals(d, r->off, erase_n, ins.len);
     d->last_off = r->off;
-    d->last_markup = rtx_bytes_touch_markup(r->del.ptr, r->del.len) ||
-                     rtx_bytes_touch_markup(r->ins.ptr, r->ins.len);
+    d->last_markup = rtx_bytes_touch_markup(del.ptr, del.len) ||
+                     rtx_bytes_touch_markup(ins.ptr, ins.len);
     d->caret = r->caret_after;
     d->sel_anchor = r->sel_after;
     d->sel_box = r->sel_box_after;
@@ -547,6 +625,8 @@ static void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
     char[:] new_path = cc_slice_empty();
     int fd;
     size_t n;
+    mode_t mode = 0666;
+    int have_mode = 0;
     if (!d || !path || !path[0]) return cc_err(CC_ERR_INVALID_ARG, "save path");
     if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     n = strlen(path);
@@ -554,10 +634,21 @@ static void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
     if (!d->path.ptr || !d->path.eq_cstr(path)) {
         new_path = rtx_session_str(d, path) !>(e) { return cc_err(e); };
     }
+    {
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            mode = st.st_mode & 0777;
+            have_mode = 1;
+        }
+    }
     snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
     fd = mkstemp(tmp);
     if (fd < 0) return cc_err(CC_ERR_IO, "save open");
     @defer(err) unlink(tmp);
+    if (have_mode && fchmod(fd, mode) != 0) {
+        close(fd);
+        return cc_err(CC_ERR_IO, "save fchmod");
+    }
     d->tree.write_fd(fd) !>(e) {
         close(fd);
         return cc_err(e);
@@ -568,6 +659,26 @@ static void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
     }
     if (close(fd) != 0) return cc_err(CC_ERR_IO, "save close");
     if (rename(tmp, path) != 0) return cc_err(CC_ERR_IO, "save rename");
+    /* Best-effort directory fsync so the rename itself is durable. */
+    {
+        char dirbuf[4096];
+        char *slash;
+        int dfd;
+        if (n + 1 < sizeof(dirbuf)) {
+            memcpy(dirbuf, path, n + 1);
+            slash = strrchr(dirbuf, '/');
+            if (slash && slash != dirbuf) {
+                *slash = 0;
+                dfd = open(dirbuf, O_RDONLY);
+            } else {
+                dfd = open(".", O_RDONLY);
+            }
+            if (dfd >= 0) {
+                (void)fsync(dfd);
+                close(dfd);
+            }
+        }
+    }
     if (new_path.ptr) d->path = new_path;
     d->saved_head = d->hist.head;
     return cc_ok();
@@ -609,7 +720,7 @@ static void !>(CCError) rtx_doc_highlight_span(RtxDoc *d, size_t lo, size_t hi) 
 }
 
 static void !>(CCError) RtxDoc_reparse_edit(RtxDoc *d, size_t off, int full_markup) {
-    size_t s, lo, hi, n;
+    size_t s, lo, hi, n, win_lo, win_hi, sec_n;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     if (full_markup) return d->reparse();
     n = d->len();
@@ -623,17 +734,27 @@ static void !>(CCError) RtxDoc_reparse_edit(RtxDoc *d, size_t off, int full_mark
         }
     }
     if (d->section_at(off) == RTX_SEC_CODE) {
-        rtx_doc_highlight_span(d, lo, hi) !>(e) { return cc_err(e); };
-        rtx_doc_sort_runs(d);
-        for (s = 0; s < d->sec_len; s++) {
-            if (d->secs[s].start == lo) d->secs[s].hl_done = 1;
+        sec_n = hi > lo ? hi - lo : 0;
+        if (sec_n <= RTX_HL_FULL_MAX) {
+            rtx_doc_highlight_span(d, lo, hi) !>(e) { return cc_err(e); };
+            for (s = 0; s < d->sec_len; s++) {
+                if (d->secs[s].start == lo) d->secs[s].hl_done = 1;
+            }
+        } else {
+            /* Large section: only re-lex a local window around the edit. */
+            win_lo = off > 4096 ? off - 4096 : 0;
+            win_hi = off + 8192;
+            if (win_lo < lo) win_lo = lo;
+            if (win_hi > hi) win_hi = hi;
+            rtx_doc_highlight_span(d, win_lo, win_hi) !>(e) { return cc_err(e); };
         }
+        rtx_doc_sort_runs(d);
     }
     return cc_ok();
 }
 
 static void !>(CCError) RtxDoc_ensure_hl(RtxDoc *d, size_t from, size_t to) {
-    size_t s, n, lo, hi;
+    size_t s, n, lo, hi, win_lo, win_hi, sec_n;
     int any = 0;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     if (d->hl_full || to <= from) return cc_ok();
@@ -644,8 +765,17 @@ static void !>(CCError) RtxDoc_ensure_hl(RtxDoc *d, size_t from, size_t to) {
         lo = d->secs[s].start;
         hi = (s + 1 < d->sec_len) ? d->secs[s + 1].start : n;
         if (hi <= from || lo >= to) continue;
-        rtx_doc_highlight_span(d, lo, hi) !>(e) { return cc_err(e); };
-        d->secs[s].hl_done = 1;
+        sec_n = hi > lo ? hi - lo : 0;
+        if (sec_n <= RTX_HL_FULL_MAX) {
+            rtx_doc_highlight_span(d, lo, hi) !>(e) { return cc_err(e); };
+            d->secs[s].hl_done = 1;
+        } else {
+            /* Visible window only — never copy/lex the whole body. */
+            win_lo = from > lo ? from : lo;
+            win_hi = to < hi ? to : hi;
+            rtx_doc_highlight_span(d, win_lo, win_hi) !>(e) { return cc_err(e); };
+            /* Leave hl_done clear so scroll re-lexes the new window. */
+        }
         any = 1;
     }
     if (any) rtx_doc_sort_runs(d);

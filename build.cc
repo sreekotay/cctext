@@ -3,38 +3,62 @@
 //   ./make.shcc @smoke
 //   ./make.shcc @cctext
 //   ./make.shcc @raytext
+//
+// Leaf modules are real linked TUs (not textual includes):
+//   core/page_store.ccs, core/hex.ccs
 
 CC_DEFAULT piece_tree_smoke
 
+CC_TARGET rtx_page_store obj core/page_store.ccs
+CC_TARGET_INCLUDE rtx_page_store .
+
+CC_TARGET rtx_hex obj core/hex.ccs
+CC_TARGET_INCLUDE rtx_hex .
+
 CC_TARGET piece_tree_smoke exe tests/piece_tree_smoke.ccs
 CC_TARGET_INCLUDE piece_tree_smoke .
+CC_TARGET_DEPS piece_tree_smoke rtx_page_store
 
 CC_TARGET layout_measure_smoke exe tests/layout_measure_smoke.ccs
 CC_TARGET_INCLUDE layout_measure_smoke .
+CC_TARGET_DEPS layout_measure_smoke rtx_page_store rtx_hex
 
 CC_TARGET edit_session_smoke exe tests/edit_session_smoke.ccs
 CC_TARGET_INCLUDE edit_session_smoke .
+CC_TARGET_DEPS edit_session_smoke rtx_page_store rtx_hex
 
 CC_TARGET find_smoke exe tests/find_smoke.ccs
 CC_TARGET_INCLUDE find_smoke .
+CC_TARGET_DEPS find_smoke rtx_page_store rtx_hex
 
 CC_TARGET large_file_smoke exe tests/large_file_smoke.ccs
 CC_TARGET_INCLUDE large_file_smoke .
+CC_TARGET_DEPS large_file_smoke rtx_page_store rtx_hex
 
 CC_TARGET dup_scale_smoke exe tests/dup_scale_smoke.ccs
 CC_TARGET_INCLUDE dup_scale_smoke .
+CC_TARGET_DEPS dup_scale_smoke rtx_page_store
 
 CC_TARGET giant_open_smoke exe tests/giant_open_smoke.ccs
 CC_TARGET_INCLUDE giant_open_smoke .
+CC_TARGET_DEPS giant_open_smoke rtx_page_store
 
 CC_TARGET perf_matrix_smoke exe tests/perf_matrix_smoke.ccs
 CC_TARGET_INCLUDE perf_matrix_smoke .
+CC_TARGET_DEPS perf_matrix_smoke rtx_page_store
 
 CC_TARGET hex_view_smoke exe tests/hex_view_smoke.ccs
 CC_TARGET_INCLUDE hex_view_smoke .
+CC_TARGET_DEPS hex_view_smoke rtx_page_store rtx_hex
+
+CC_TARGET line_index_prop_smoke exe tests/line_index_prop_smoke.ccs
+CC_TARGET_INCLUDE line_index_prop_smoke .
+CC_TARGET_DEPS line_index_prop_smoke rtx_page_store
 
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
+CC_TARGET_DEPS cctext rtx_page_store rtx_hex
 
 CC_TARGET raytext exe frontend/gui.ccs
 CC_TARGET_INCLUDE raytext .
+CC_TARGET_DEPS raytext rtx_page_store rtx_hex
