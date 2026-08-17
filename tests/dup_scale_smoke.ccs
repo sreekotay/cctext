@@ -1,11 +1,12 @@
 #!ccc ccs
 /*
- * Select-all / copy / paste doubling up to ~1 GiB (~9 doubles of the
- * ~2 MiB seed), then time 1-byte edits on the first line, last line, and
- * EOF. Each paste copies the current prefix by chunk.
+ * Select-all / copy / paste doubling, with timed first/last/eof edits at
+ * each size checkpoint.
  *
- *   make smoke
- *   RTX_TARGET_MIB=256 RTX_DUP_ROUNDS=10 ./bin/dup_scale_smoke
+ *   make smoke                         # RTX_TARGETS=1000 (~1 GiB)
+ *   make dup-scale-8g                  # checkpoints at 1 GiB and 8 GiB
+ *   make dup-scale-64g                 # 1 → 8 → 64 GiB
+ *   RTX_TARGETS=1000,8192,65536 ./bin/dup_scale_smoke
  */
 #include <ccc/std/prelude.cch>
 #include <ccc/script/stdio.cch>
@@ -16,6 +17,8 @@
 #include <unistd.h>
 #include "../core/document.cch"
 #include "../core/edit.cch"
+
+#define RTX_MAX_TARGETS 8
 
 static int fails = 0;
 
@@ -42,10 +45,6 @@ static double mono_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
-/*
- * Append a copy of [0, src_len). Reads into the add tip (one copy), line
- * index suspended then patched once at EOF.
- */
 static void !>(CCError) paste_prefix(RtxDoc *d, size_t src_len) {
     size_t at;
     uint32_t lf;
@@ -78,11 +77,51 @@ static void time_insert_at(RtxDoc *d, size_t at, char[:] bytes, const char *labe
            label, ms, at, bytes.len, d->len(), d->line_count());
 }
 
+static void edits_at_size(RtxDoc *d, char[:] oneb) {
+    printf("edits  at ~%.2f MiB\n", (double)d->len() / (1024.0 * 1024.0));
+    time_insert_at(d, 0, oneb, "first_line");
+    {
+        size_t nlines = d->line_count();
+        size_t last_line = nlines > 0 ? nlines - 1 : 0;
+        size_t last_at = d->line_start(last_line);
+        if (last_at >= d->len() && last_line > 0) {
+            last_line--;
+            last_at = d->line_start(last_line);
+        }
+        time_insert_at(d, last_at, oneb, "last_line");
+    }
+    time_insert_at(d, d->len(), oneb, "eof");
+    expect(d->check(), "tree after edits");
+}
+
+/* Parse "1000,8192,65536" into MiB targets. */
+static int parse_targets(const char *spec, size_t *out, int maxn) {
+    int n = 0;
+    const char *p = spec;
+    if (!spec || !spec[0]) return 0;
+    while (*p && n < maxn) {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p || v < 8) return -1;
+        if (v > 262144) v = 262144; /* 256 TiB cap */
+        out[n++] = (size_t)v;
+        if (*end == ',') {
+            p = end + 1;
+            continue;
+        }
+        if (*end == 0) break;
+        return -1;
+    }
+    return n;
+}
+
 int main(int argc, char **argv) {
     const char *path = "testdata/generated/large.txt";
-    int max_rounds = 10;
-    size_t target_mib = 1000; /* ~1 GiB after nine doubles of the ~2 MiB seed */
-    size_t target, i;
+    int max_rounds = 24;
+    size_t targets[RTX_MAX_TARGETS];
+    int ntargets = 0;
+    int ti;
+    size_t paste_i = 0;
     const char *env;
     char one = 'x';
     char[:] oneb;
@@ -93,12 +132,28 @@ int main(int argc, char **argv) {
     env = getenv("RTX_DUP_ROUNDS");
     if (env && env[0]) max_rounds = atoi(env);
     if (max_rounds < 1) max_rounds = 1;
-    if (max_rounds > 20) max_rounds = 20;
-    env = getenv("RTX_TARGET_MIB");
-    if (env && env[0]) target_mib = (size_t)atoi(env);
-    if (target_mib < 8) target_mib = 8;
-    if (target_mib > 4096) target_mib = 4096;
-    target = target_mib * 1024 * 1024;
+    if (max_rounds > 32) max_rounds = 32;
+
+    env = getenv("RTX_TARGETS");
+    if (env && env[0]) {
+        ntargets = parse_targets(env, targets, RTX_MAX_TARGETS);
+        if (ntargets < 1) {
+            fprintf(stderr, "dup_scale: bad RTX_TARGETS=%s\n", env);
+            return 1;
+        }
+    } else {
+        env = getenv("RTX_TARGET_MIB");
+        if (env && env[0]) {
+            ntargets = parse_targets(env, targets, 1);
+            if (ntargets < 1) {
+                fprintf(stderr, "dup_scale: bad RTX_TARGET_MIB\n");
+                return 1;
+            }
+        } else {
+            targets[0] = 1000;
+            ntargets = 1;
+        }
+    }
 
     if (ensure_seed(path) != 0) {
         fprintf(stderr, "dup_scale: missing seed %s\n", path);
@@ -112,50 +167,53 @@ int main(int argc, char **argv) {
 
     d.from_path(path) !>;
     expect(d.len() > 0, "seed non-empty");
-    {
-        size_t nl = d.line_count();
-        (void)d.line_start(nl / 2);
+    /* Force full line index once (progressive scan to EOF). */
+    (void)d.line_of(d.len());
+    expect(d.tree.lf_ready, "index warm");
+    printf("start  bytes=%zu  lines=%zu  checkpoints=", d.len(), d.line_count());
+    for (ti = 0; ti < ntargets; ti++) {
+        printf("%zu%s", targets[ti], ti + 1 < ntargets ? "," : "");
     }
-    expect(d.tree.line_off_ok, "index warm");
-    printf("start  bytes=%zu  lines=%zu  target=%zu MiB  max_rounds=%d\n",
-           d.len(), d.line_count(), target_mib, max_rounds);
-
-    /* Select-all / copy / paste at EOF — each round doubles. */
-    printf("paste  select-all copy → EOF (double each round)\n");
-    for (i = 0; i < (size_t)max_rounds && d.len() < target; i++) {
-        size_t src = d.len();
-        double t0, ms;
-        t0 = mono_ms();
-        paste_prefix(&d, src) !>;
-        ms = mono_ms() - t0;
-        paste_total += ms;
-        expect(d.len() == src * 2, "doubled");
-        expect(d.tree.line_off_ok, "warm after paste");
-        printf("  paste[%zu]  %8.2f ms  %zu → %zu bytes  lines=%zu\n",
-               i, ms, src, d.len(), d.line_count());
-        if (d.len() >= target) break;
-    }
-    printf("paste  rounds=%zu  total=%.2f ms  bytes=%zu (%.2f MiB)\n",
-           i, paste_total, d.len(), (double)d.len() / (1024.0 * 1024.0));
-    expect(d.check(), "tree after pastes");
+    printf(" MiB  max_rounds=%d\n", max_rounds);
 
     oneb = cc_slice_from_buffer(&one, 1);
-    printf("edits  at ~%.2f MiB\n", (double)d.len() / (1024.0 * 1024.0));
-    time_insert_at(&d, 0, oneb, "first_line");
-    {
-        size_t nlines = d.line_count();
-        size_t last_line = nlines > 0 ? nlines - 1 : 0;
-        size_t last_at = d.line_start(last_line);
-        /* Trailing empty line after a final '\n' starts at len — step back. */
-        if (last_at >= d.len() && last_line > 0) {
-            last_line--;
-            last_at = d.line_start(last_line);
-        }
-        time_insert_at(&d, last_at, oneb, "last_line");
-    }
-    time_insert_at(&d, d.len(), oneb, "eof");
-    expect(d.check(), "tree after edits");
 
-    printf("dup_scale_smoke ok  final_bytes=%zu  lines=%zu\n", d.len(), d.line_count());
+    for (ti = 0; ti < ntargets; ti++) {
+        size_t target = targets[ti] * 1024 * 1024;
+        size_t seg_rounds = 0;
+        double seg_ms = 0.0;
+
+        printf("---- checkpoint %zu MiB ----\n", targets[ti]);
+        printf("paste  double until >= %zu MiB\n", targets[ti]);
+        while (d.len() < target && (int)paste_i < max_rounds) {
+            size_t src = d.len();
+            double t0, ms;
+            t0 = mono_ms();
+            paste_prefix(&d, src) !>;
+            ms = mono_ms() - t0;
+            paste_total += ms;
+            seg_ms += ms;
+            seg_rounds++;
+            expect(d.len() == src * 2, "doubled");
+            expect(d.tree.line_off_ok, "warm after paste");
+            printf("  paste[%zu]  %8.2f ms  %zu → %zu bytes (%.2f MiB)  lines=%zu\n",
+                   paste_i, ms, src, d.len(),
+                   (double)d.len() / (1024.0 * 1024.0), d.line_count());
+            paste_i++;
+            if (d.len() >= target) break;
+        }
+        if (d.len() < target) {
+            fprintf(stderr, "dup_scale: stopped early at %.2f MiB (max_rounds)\n",
+                    (double)d.len() / (1024.0 * 1024.0));
+            return 1;
+        }
+        printf("paste  seg_rounds=%zu  seg=%.2f ms  total_paste=%.2f ms  bytes=%zu\n",
+               seg_rounds, seg_ms, paste_total, d.len());
+        expect(d.check(), "tree after pastes");
+        edits_at_size(&d, oneb);
+    }
+
+    printf("dup_scale_smoke ok  final_bytes=%zu  lines=%zu  paste_total=%.2f ms\n",
+           d.len(), d.line_count(), paste_total);
     return fails ? 1 : 0;
 }

@@ -7,7 +7,7 @@ RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation
 LARGE_LINES ?= 100000
 LARGE := testdata/generated/large.txt
 
-.PHONY: setup test smoke large giant cctext raytext clean
+.PHONY: setup test smoke large giant giant-smoke dup-scale-8g dup-scale-64g cctext raytext clean
 
 setup:
 	./setup.sh
@@ -23,15 +23,29 @@ smoke test: $(LARGE)
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run edit_session_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run find_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run large_file_smoke
-	# 1 GiB select-all paste doubling — set RTX_TARGET_MIB to shrink for a quick loop
+	# ~1 GiB select-all paste; for bigger: make dup-scale-8g / dup-scale-64g
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run dup_scale_smoke
 
-# Optional multi-GiB on-disk fixture (gitignored). Slow; not part of smoke.
-#   make giant GIANT_BYTES=8G
+# Grow through checkpoints via append_copy (page-store spill). Not default smoke.
+dup-scale-8g: $(LARGE)
+	RTX_TARGETS=1000,8192 RTX_DUP_ROUNDS=24 $(CCC) $(CCC_FLAGS) \
+		build --build-file build.cc run dup_scale_smoke
+
+dup-scale-64g: $(LARGE)
+	RTX_TARGETS=1000,8192,65536 RTX_DUP_ROUNDS=24 $(CCC) $(CCC_FLAGS) \
+		build --build-file build.cc run dup_scale_smoke
+
+# Multi-GiB on-disk fixture (gitignored). Slow write; not part of smoke.
+#   make giant              # → testdata/generated/large_8G.txt
+#   make giant-smoke       # open / mid-line / tiny insert
 GIANT_BYTES ?= 8G
 GIANT := testdata/generated/large_$(GIANT_BYTES).txt
-giant:
+giant: $(GIANT)
+$(GIANT): testdata/gen_large.sh
 	./testdata/gen_large.sh --bytes $(GIANT_BYTES) $(GIANT)
+
+giant-smoke: $(GIANT)
+	$(CCC) $(CCC_FLAGS) build --build-file build.cc run giant_open_smoke -- $(GIANT)
 
 cctext:
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc cctext

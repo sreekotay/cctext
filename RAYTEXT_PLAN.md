@@ -4,7 +4,7 @@ Standalone Concurrent-C editor. Compiler repo is a toolchain, not a parent tree.
 
 ## Core
 
-- Piece tree: original mmap + add buffer, red-black order-statistic tree (byte length and `'\n'` weights).
+- Piece tree: page store (original + spilled add) + red-black order-statistic tree (byte length and `'\n'` weights).
 - Sections: layout policy (`code` / `prose`).
 - Runs: style intervals inside a section (bold/italic/mono) plus syntax-token kinds.
 - Highlight: core lexer over `code` sections (C/CC keywords, strings, comments, numbers). Not a frontend concern. Later: `@grammar` or tree-sitter; same run list.

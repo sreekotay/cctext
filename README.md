@@ -6,7 +6,7 @@ This is a standalone app. It needs `ccc` on `PATH` (or `CCC=`). It does not live
 
 ## Why
 
-- **Piece tree** over mmap (original file never moves) plus an add buffer. Offset and line lookup are O(log pieces).
+- **Piece tree** over a page store (path original + spilled add) plus borrowed buffers. Offset and line lookup are O(log pieces).
 - **Sections** set layout policy (code vs prose). **Runs** inside a section are rich text and syntax tokens.
 - **Syntax highlight** is a core pass over code sections (C/CC lexer for the spike). Frontends only map token kind → color.
 - **Measure-generic layout** so wrap and hit-test are the same algorithm in pixels (Raylib) and cells (`cctext`). Wrap is off by default (`Ctrl-L`); on, it prefers the last space and hard-breaks a token that does not fit.
@@ -23,10 +23,13 @@ Piece tree, document, layout, C/CC highlight, save, undo/redo, selection, increm
 ./make.shcc @               # list tasks
 ./make.shcc @smoke          # piece-tree + layout + edit-session + find + large-file
 ./make.shcc @large          # testdata/generated/large.txt (100000 lines; LARGE_LINES= or @large N)
+make giant                  # testdata/generated/large_8G.txt (~8 GiB; slow)
+make giant-smoke            # open that file via page store (mid-line + tiny insert)
 ./make.shcc @cctext         # console editor
 ./make.shcc @raytext        # Raylib GUI (needs `brew install raylib`)
 ./bin/cctext testdata/mixed.txt testdata/small.txt
 ./bin/raytext testdata/generated/large.txt
+# ./bin/raytext testdata/generated/large_8G.txt
 ```
 
 **raytext** has a File / Edit / View / Go menu bar (click a title, then an item). **Esc** still opens the key-binding overlay in both frontends. **g** / **Ctrl-G** jumps to a line. Line numbers are in the gutter. Ctrl/Cmd chords work while the overlay is closed. Unsaved quit asks Save / Don't save / Cancel.

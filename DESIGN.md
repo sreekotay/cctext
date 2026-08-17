@@ -21,7 +21,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 
 | Epoch | Storage | Lives until |
 |---|---|---|
-| Document | piece-tree arena + mmap | `RtxDoc.destroy()` |
+| Document | piece-tree arena + page store | `RtxDoc.destroy()` |
 | Session | `d.session` | close (path, undo) |
 | Analysis | `d.analysis` | `analysis.reset()` on reparse (sections, runs) |
 | Find | `d.find.store` | new query resets; edit invalidates (offsets only) |
@@ -47,21 +47,21 @@ Hist (and any other commit record) stores everything the next edit needs, or und
 
 A `char[:]` is `{ptr, len, id}`. Storing it does not take the bytes.
 
-- `from_path` — `cc_file_map`, stamped with the tree arena. The `CCMappedFile` lives on the tree until `destroy()`.
+- `from_path` — opens the path into the tree’s page store (fds + page cache) until `destroy()`. There is no document-wide `char[:]` over the file; bytes are reached only through `read_at` (or `scratch_span` / `analysis_span` copies onto a named arena). Open does not scan the body; newline weights and the stride index are finished on the first `line_*` or edit. Markup/`===` scan is skipped above `RTX_MARKUP_SCAN_MAX` (single section; path may still mark code).
 - `from_buffer` — keeps the caller’s slice. Refuses non-empty untracked (`id == 0`).
-- `span` — empty means “not one piece” (or `n == 0`). That is a payload.
+- `span` — empty means “not one piece” (or `n == 0`), or store-backed bytes with no stable contiguous view. That is a payload; callers use `scratch_span` / `read_at`.
 - `scratch_span` / `analysis_span` — view if contiguous, else a copy on the named arena. `char[:] !>(CCError)`: empty is `n == 0` / past end; OOM and short `read_at` are errors.
 
 ## Safety
 
-Constructors assume dead. `from_path` / `from_buffer` / `empty` / `open_files` error if the object already owns an arena or a mapping. Reopen is `d.destroy(); d.from_path(...)`.
+Constructors assume dead. `from_path` / `from_buffer` / `empty` / `open_files` error if the object already owns an arena, a page store, or a borrowed original binding. Reopen is `d.destroy(); d.from_path(...)`.
 
 A path that gives up is not success:
 
 - Seed of a non-empty original must produce a root node, or the constructor fails.
 - Scan / highlight / reparse / `ensure_hl` are `void !>(CCError)`. They do not plant markup or set `hl_done` after a missing span. A failed scan resets analysis. A failed highlight strips hl-only runs and clears every `hl_done`.
 - `RtxWs_copy` is `int !>(CCError)`: `0` = no selection, `1` = copied, OOM is an error.
-- A short `read_at` mid-document is a fault, not EOF. `line_off_ok` is set only after the scan reaches `len`. An edit with no newlines shifts later stride offsets; a newline count that is a multiple of the stride splices (scan the inserted span, reattach shifted slots); otherwise the suffix is rebuilt from the edit. Typing at EOF extends the tip add-piece without rescanning it.
+- A short `read_at` mid-document is a fault, not EOF. Path `from_path` does not scan the body (open is O(open)). Newline weights and the stride index grow **progressively** on `line_start` / `line_of`; `line_count` stays soft until EOF is reached. `line_off_ok` is set when the scan reaches `len`. An edit with no newlines shifts later stride offsets; a newline count that is a multiple of the stride splices (scan the inserted span, reattach shifted slots); otherwise the suffix is rebuilt from the edit. Typing at EOF extends the tip add-piece without rescanning it.
 
 Commit only after the new value exists, in every direction: the right node before shrinking a piece; hist after `tree.replace`; clip after a successful cut replace; derived flags after the highlight / line-index pass; path+`saved_head` after a prepared rename. Unsaved quit opens a Save / Don't save / Cancel prompt. `tree.replace` rolls the deleted span back if insert fails; rollback failure sets `d.broken` and further edits refuse. Clipboard allocs into a local, then assigns; OOM keeps the old clip. Empty source is a real clear. A path that gives up is either unchanged or `broken` — never a hole that looks retryable.
 
@@ -76,7 +76,7 @@ Host close is a one-shot offer into that prompt, not loop control. Cancel dismis
 
 `L.wrap` is a layout policy, not a section kind. Off: one visual row per physical line. On: last whitespace if the next token fits after it, else a hard break at `max_width`. A token wider than the window still occupies a row. Scroll is `top` (physical line) plus `top_wrap` (visual rows skipped on that line). Up/down walk visual rows and keep a goal column.
 
-Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for mmap / insert / `write_fd`.
+Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for insert / `write_fd` / page-store internals.
 
 ## Edits
 
