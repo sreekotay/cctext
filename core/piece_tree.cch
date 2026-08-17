@@ -630,6 +630,8 @@ static void !>(CCError) rtx_split_at(RtxPieceTree *t, size_t offset) {
     return cc_ok();
 }
 
+static void rtx_line_index_note_edit(RtxPieceTree *t, size_t off);
+
 static int rtx_try_extend_add(RtxPieceTree *t, size_t offset, char[:] bytes) {
     size_t local = 0;
     RtxNode *n;
@@ -646,7 +648,6 @@ static int rtx_try_extend_add(RtxPieceTree *t, size_t offset, char[:] bytes) {
         n->piece.len += bytes.len;
         n->piece.lf_count = rtx_count_lf(rtx_piece_ptr(t, &n->piece), n->piece.len);
         rtx_node_pull_up(n);
-        t->line_off_ok = 0;
         return 1;
     }
 }
@@ -656,11 +657,13 @@ static inline void !>(CCError) RtxPieceTree_insert(RtxPieceTree *t, size_t offse
     RtxNode *n;
     size_t len;
     if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
-    t->line_off_ok = 0;
     len = RtxPieceTree_len(t);
     if (offset > len) return cc_err(CC_ERR_INVALID_ARG, "insert past end");
     if (bytes.len == 0) return cc_ok();
-    if (rtx_try_extend_add(t, offset, bytes)) return cc_ok();
+    if (rtx_try_extend_add(t, offset, bytes)) {
+        rtx_line_index_note_edit(t, offset);
+        return cc_ok();
+    }
     rtx_split_at(t, offset) !>(e) { return cc_err(e); };
     if (!rtx_add_append(t, bytes, &start)) {
         return cc_err(CC_ERR_OUT_OF_MEMORY, "add buffer");
@@ -668,6 +671,7 @@ static inline void !>(CCError) RtxPieceTree_insert(RtxPieceTree *t, size_t offse
     n = rtx_node_new_piece(t, RTX_BUF_ADD, start, bytes.len);
     if (!n) return cc_err(CC_ERR_OUT_OF_MEMORY, "piece node");
     rtx_bst_insert(t, n, offset);
+    rtx_line_index_note_edit(t, offset);
     return cc_ok();
 }
 
@@ -680,7 +684,6 @@ static inline void !>(CCError) RtxPieceTree_erase(RtxPieceTree *t, size_t offset
         return cc_err(CC_ERR_INVALID_ARG, "erase out of range");
     }
     if (n == 0) return cc_ok();
-    t->line_off_ok = 0;
     end = offset + n;
     rtx_split_at(t, offset) !>(e) { return cc_err(e); };
     rtx_split_at(t, end) !>(e) { return cc_err(e); };
@@ -688,12 +691,19 @@ static inline void !>(CCError) RtxPieceTree_erase(RtxPieceTree *t, size_t offset
         size_t local = 0;
         RtxNode *node = rtx_find_node(t, offset, &local);
         size_t piece_len;
-        if (!node || local != 0) return cc_err(CC_ERR_INTERNAL, "erase walk");
+        if (!node || local != 0) {
+            t->line_off_ok = 0;
+            return cc_err(CC_ERR_INTERNAL, "erase walk");
+        }
         piece_len = node->piece.len;
-        if (piece_len > n) return cc_err(CC_ERR_INTERNAL, "erase piece");
+        if (piece_len > n) {
+            t->line_off_ok = 0;
+            return cc_err(CC_ERR_INTERNAL, "erase piece");
+        }
         rtx_rb_delete(t, node);
         n -= piece_len;
     }
+    rtx_line_index_note_edit(t, offset);
     return cc_ok();
 }
 
@@ -780,16 +790,19 @@ static int rtx_line_off_push(RtxPieceTree *t, size_t off) {
     return 1;
 }
 
-static void rtx_line_index_build(RtxPieceTree *t) {
+/* Rebuild stride slots from `from_slot` (inclusive) to EOF. Keeps
+ * line_off[0..from_slot]. Sets line_off_ok only if the scan reaches len. */
+static void rtx_line_index_rebuild_from(RtxPieceTree *t, size_t from_slot) {
     size_t len, off, line;
     char buf[4096];
-    if (!t) return;
-    t->line_off_len = 0;
+    if (!t || from_slot >= t->line_off_len) {
+        if (t) t->line_off_ok = 0;
+        return;
+    }
     t->line_off_ok = 0;
-    if (!rtx_line_off_push(t, 0)) return;
+    line = from_slot * RTX_LINE_STRIDE;
+    off = t->line_off[from_slot];
     len = RtxPieceTree_len(t);
-    off = 0;
-    line = 0;
     @errhandler(CCError e) {
         (void)e;
         return;
@@ -810,6 +823,29 @@ static void rtx_line_index_build(RtxPieceTree *t) {
     }
     if (off != len) return;
     t->line_off_ok = 1;
+}
+
+static void rtx_line_index_build(RtxPieceTree *t) {
+    if (!t) return;
+    t->line_off_len = 0;
+    t->line_off_ok = 0;
+    if (!rtx_line_off_push(t, 0)) return;
+    rtx_line_index_rebuild_from(t, 0);
+}
+
+/* After a mutate at `off`: drop stride slots at/after `off`, rebuild the
+ * suffix from the last still-valid slot. No-op if the index was already cold. */
+static void rtx_line_index_note_edit(RtxPieceTree *t, size_t off) {
+    size_t keep, from_slot;
+    if (!t || !t->line_off_ok || t->line_off_len == 0) {
+        if (t) t->line_off_ok = 0;
+        return;
+    }
+    keep = 0;
+    while (keep < t->line_off_len && t->line_off[keep] < off) keep++;
+    from_slot = keep > 0 ? keep - 1 : 0;
+    t->line_off_len = from_slot + 1;
+    rtx_line_index_rebuild_from(t, from_slot);
 }
 
 static void rtx_line_index_ensure(const RtxPieceTree *t) {

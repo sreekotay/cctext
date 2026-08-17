@@ -21,6 +21,9 @@ CC_TARGET_INCLUDE find_smoke .
 CC_TARGET large_file_smoke exe tests/large_file_smoke.ccs
 CC_TARGET_INCLUDE large_file_smoke .
 
+CC_TARGET dup_scale_smoke exe tests/dup_scale_smoke.ccs
+CC_TARGET_INCLUDE dup_scale_smoke .
+
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
 

@@ -61,7 +61,7 @@ A path that gives up is not success:
 - Seed of a non-empty original must produce a root node, or the constructor fails.
 - Scan / highlight / reparse / `ensure_hl` are `void !>(CCError)`. They do not plant markup or set `hl_done` after a missing span. A failed scan resets analysis. A failed highlight strips hl-only runs and clears every `hl_done`.
 - `RtxWs_copy` is `int !>(CCError)`: `0` = no selection, `1` = copied, OOM is an error.
-- A short `read_at` mid-document is a fault, not EOF. `line_off_ok` is set only after the scan reaches `len`.
+- A short `read_at` mid-document is a fault, not EOF. `line_off_ok` is set only after the scan reaches `len`. An edit truncates the stride index at the first slot at/after the edit and rebuilds only that suffix — not a full-file rescan when the index was already warm.
 
 Commit only after the new value exists, in every direction: the right node before shrinking a piece; hist after `tree.replace`; clip after a successful cut replace; derived flags after the highlight / line-index pass; path+`saved_head` after a prepared rename. Unsaved quit opens a Save / Don't save / Cancel prompt. `tree.replace` rolls the deleted span back if insert fails; rollback failure sets `d.broken` and further edits refuse. Clipboard allocs into a local, then assigns; OOM keeps the old clip. Empty source is a real clear. A path that gives up is either unchanged or `broken` — never a hole that looks retryable.
 

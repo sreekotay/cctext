@@ -7,7 +7,7 @@ RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation
 LARGE_LINES ?= 100000
 LARGE := testdata/generated/large.txt
 
-.PHONY: setup test smoke large cctext raytext clean
+.PHONY: setup test smoke large giant cctext raytext clean
 
 setup:
 	./setup.sh
@@ -23,6 +23,14 @@ smoke test: $(LARGE)
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run edit_session_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run find_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run large_file_smoke
+	$(CCC) $(CCC_FLAGS) build --build-file build.cc run dup_scale_smoke
+
+# Optional multi-GiB on-disk fixture (gitignored). Slow; not part of smoke.
+#   make giant GIANT_BYTES=8G
+GIANT_BYTES ?= 8G
+GIANT := testdata/generated/large_$(GIANT_BYTES).txt
+giant:
+	./testdata/gen_large.sh --bytes $(GIANT_BYTES) $(GIANT)
 
 cctext:
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc cctext
