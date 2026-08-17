@@ -65,6 +65,8 @@ struct RtxPieceTree {
     size_t line_off_len;
     size_t line_off_cap;
     int line_off_ok;
+    /* When set, insert/erase skip stride updates (caller patches once). */
+    int line_off_suspend;
 };
 
 static uint32_t rtx_count_lf(const char *p, size_t n) {
@@ -416,6 +418,26 @@ static int rtx_add_append(RtxPieceTree *t, char[:] bytes, size_t *start_out) {
     return 1;
 }
 
+/* Ensure add buffer can take `extra` more bytes without mid-paste growth.
+ * Leaves headroom so a later 1-byte insert does not memcpy the whole tip. */
+static int rtx_add_reserve(RtxPieceTree *t, size_t extra) {
+    size_t need;
+    size_t want;
+    char *grown;
+    if (!t) return 0;
+    need = t->add_len + extra;
+    if (need < t->add_len) return 0;
+    want = need + (need >> 3) + (1024 * 1024);
+    if (want < need) want = need;
+    if (want <= t->add_cap) return 1;
+    grown = (char *)cc_arena_alloc(t->arena, want, 1);
+    if (!grown) return 0;
+    if (t->add && t->add_len) memcpy(grown, t->add, t->add_len);
+    t->add = grown;
+    t->add_cap = want;
+    return 1;
+}
+
 static void rtx_tree_zero(RtxPieceTree *t) {
     if (!t) return;
     memset(t, 0, sizeof(*t));
@@ -471,6 +493,63 @@ static inline size_t !>(CCError) RtxPieceTree_read_at(const RtxPieceTree *t, siz
     }
     if (got != need) return cc_err(CC_ERR_INTERNAL, "read_at short");
     return cc_ok(got);
+}
+
+/*
+ * Append a copy of [from, from+n) at EOF. Reads straight into the tip of
+ * the add buffer (one copy). Does not touch the line index — set
+ * line_off_suspend and patch once afterward. Returns newlines copied.
+ */
+static uint32_t !>(CCError) RtxPieceTree_append_copy(RtxPieceTree *t, size_t from,
+                                                      size_t n) {
+    size_t off = 0;
+    size_t local = 0;
+    RtxNode *tip;
+    uint32_t lf = 0;
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
+    if (n == 0) return cc_ok((uint32_t)0);
+    if (from > RtxPieceTree_len(t) || n > RtxPieceTree_len(t) - from) {
+        return cc_err(CC_ERR_INVALID_ARG, "append_copy range");
+    }
+    if (!rtx_add_reserve(t, n)) return cc_err(CC_ERR_OUT_OF_MEMORY, "add reserve");
+
+    tip = NULL;
+    if (RtxPieceTree_len(t) > 0) {
+        tip = rtx_find_node(t, RtxPieceTree_len(t) - 1, &local);
+        if (tip && tip->piece.buf == RTX_BUF_ADD &&
+            tip->piece.start + tip->piece.len == t->add_len &&
+            local + 1 == tip->piece.len) {
+            /* extendable tip */
+        } else {
+            tip = NULL;
+        }
+    }
+    if (!tip) {
+        tip = rtx_node_new_piece(t, RTX_BUF_ADD, t->add_len, 0);
+        if (!tip) return cc_err(CC_ERR_OUT_OF_MEMORY, "append tip");
+        tip->piece.lf_count = 0;
+        rtx_bst_insert(t, tip, RtxPieceTree_len(t));
+    }
+
+    while (off < n) {
+        size_t take = n - off;
+        size_t got, i;
+        char *dest = t->add + t->add_len;
+        if (take > (1024 * 1024)) take = 1024 * 1024;
+        got = RtxPieceTree_read_at(t, from + off, dest, take) !>(e) {
+            return cc_err(e);
+        };
+        if (got != take) return cc_err(CC_ERR_INTERNAL, "append_copy read");
+        for (i = 0; i < got; i++) {
+            if (dest[i] == '\n') lf++;
+        }
+        t->add_len += got;
+        tip->piece.len += got;
+        off += got;
+    }
+    tip->piece.lf_count += lf;
+    rtx_node_pull_up(tip);
+    return cc_ok(lf);
 }
 
 /* Contiguous original bytes, or empty if the tree has been split. */
@@ -669,7 +748,10 @@ static inline void !>(CCError) RtxPieceTree_insert(RtxPieceTree *t, size_t offse
     if (offset > len) return cc_err(CC_ERR_INVALID_ARG, "insert past end");
     if (bytes.len == 0) return cc_ok();
     if (rtx_try_extend_add(t, offset, bytes)) {
-        rtx_line_index_note_insert(t, offset, bytes.len, rtx_count_lf(bytes.ptr, bytes.len));
+        if (!t->line_off_suspend) {
+            rtx_line_index_note_insert(t, offset, bytes.len,
+                                      rtx_count_lf(bytes.ptr, bytes.len));
+        }
         return cc_ok();
     }
     rtx_split_at(t, offset) !>(e) { return cc_err(e); };
@@ -679,7 +761,9 @@ static inline void !>(CCError) RtxPieceTree_insert(RtxPieceTree *t, size_t offse
     n = rtx_node_new_piece(t, RTX_BUF_ADD, start, bytes.len);
     if (!n) return cc_err(CC_ERR_OUT_OF_MEMORY, "piece node");
     rtx_bst_insert(t, n, offset);
-    rtx_line_index_note_insert(t, offset, bytes.len, n->piece.lf_count);
+    if (!t->line_off_suspend) {
+        rtx_line_index_note_insert(t, offset, bytes.len, n->piece.lf_count);
+    }
     return cc_ok();
 }
 
@@ -716,7 +800,11 @@ static inline void !>(CCError) RtxPieceTree_erase(RtxPieceTree *t, size_t offset
         rtx_rb_delete(t, node);
         n -= piece_len;
     }
-    rtx_line_index_note_erase(t, offset, erased, lf);
+    if (!t->line_off_suspend) {
+        rtx_line_index_note_erase(t, offset, erased, lf);
+    } else {
+        t->line_off_ok = 0;
+    }
     return cc_ok();
 }
 
