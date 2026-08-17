@@ -13,7 +13,7 @@ d.from_path(path) !>;
 
 or a second local (`RtxDoc d2 = {0} @destroy`). `memset` is neither.
 
-Hooks and faces live next to the type they name (`page_store.cch`, `piece_tree.cch`, `document.cch`, …). A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
+Hooks and faces live next to the type they name (`page_store.cch`, `piece_tree.cch`, `document.cch`, …). The piece tree is split for size only: `piece_tree_rb.cch` (order-statistic RB + find) and `piece_tree_lines.cch` (stride index + `line_*`) are textual includes of `piece_tree.cch`, not separate TUs — same pattern as keeping one lowered unit. A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
 
 There is no inflight counter and no drain-to-zero. A path that gives up says so at the position that caused it.
 
@@ -41,7 +41,7 @@ If an API returns owned bytes, the destination arena is the **last** parameter (
 
 A Result failure is **unchanged** or **`broken`**. `broken` means the tree may be inconsistent — set only after a mutating step that could not be rolled back. Pre-mutation faults (failed hold alloc, short read before erase) leave the object intact and do not set `broken`.
 
-Hist (and any other commit record) stores everything the next edit needs, or undo/redo clears what it does not restore. Derived mode that affects the next op (`sel_box`, box columns, …) is either in the record or fail-closed to stream selection.
+Hist (and any other commit record) stores everything the next edit needs, or undo/redo clears what it does not restore. Derived mode that affects the next op (`sel_box`, box columns, …) is in the hist record (before/after); undo/redo restores it.
 
 ## Views
 
@@ -61,7 +61,7 @@ A path that gives up is not success:
 - Seed of a non-empty original must produce a root node, or the constructor fails.
 - Scan / highlight / reparse / `ensure_hl` are `void !>(CCError)`. They do not plant markup or set `hl_done` after a missing span. A failed scan resets analysis. A failed highlight strips hl-only runs and clears every `hl_done`.
 - `RtxWs_copy` is `int !>(CCError)`: `0` = no selection, `1` = copied, OOM is an error.
-- A short `read_at` mid-document is a fault, not EOF. Path `from_path` does not scan the body (open is O(open)). Newline weights and the stride index grow **progressively** on `line_start` / `line_of`; `line_count` stays soft until EOF is reached. `line_off_ok` is set when the scan reaches `len`. On files larger than `RTX_LINE_SOFT_MIN`, an edit scans only through the edit offset, clears `lf_ready`, and never rebuilds a suffix to EOF (typing / newline / quit stay O(local)). Small files still finish the index eagerly. Typing at EOF extends the tip add-piece without rescanning it. Long progressive scans and saves pulse `rtx_busy_bind` so both frontends can show a corner spinner.
+- A short `read_at` mid-document is a fault, not EOF. Path `from_path` does not scan the body (open is O(open)). Newline weights and the stride index grow **progressively** on `line_start` / `line_of`; `line_count` stays soft until EOF is reached (`known + 1MiB` scroll budget only). `line_known` / status `Lcur+` report what the index has actually seen; `lf_ready` makes `Lcur/total` exact. `line_off_ok` is set when the scan reaches `len`. On files larger than `RTX_LINE_SOFT_MIN`, an edit scans only through the edit offset, clears `lf_ready`, and never rebuilds a suffix to EOF (typing / newline / quit stay O(local)). Small files still finish the index eagerly. Typing at EOF extends the tip add-piece without rescanning it. Long progressive scans and saves pulse the tree’s busy drawer (`t.busy_bind` / `w.busy_bind`) so both frontends can show a corner spinner; headless leaves it unbound.
 
 Commit only after the new value exists, in every direction: the right node before shrinking a piece; hist after `tree.replace`; clip after a successful cut replace; derived flags after the highlight / line-index pass; path+`saved_head` after a prepared rename. Unsaved quit opens a Save / Don't save / Cancel prompt. `tree.replace` rolls the deleted span back if insert fails; rollback failure sets `d.broken` and further edits refuse. Clipboard allocs into a local, then assigns; OOM keeps the old clip. Empty source is a real clear. A path that gives up is either unchanged or `broken` — never a hole that looks retryable.
 
