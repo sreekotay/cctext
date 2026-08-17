@@ -80,7 +80,7 @@ static const GuiMenuItem gui_edit_items[] = {
     {"Paste", "Ctrl-V", CMD_PASTE},
 };
 static const GuiMenuItem gui_view_items[] = {
-    {"Wrap lines", "Ctrl-L", CMD_WRAP},
+    {"Cycle view", "Ctrl-L", CMD_WRAP},
     {"Split", "Ctrl-\\", CMD_SPLIT},
     {"Next file", "Ctrl-N", CMD_NEXT},
     {"Other pane", "Ctrl-W", CMD_PANE},
@@ -191,14 +191,35 @@ static int gui_key(int key) {
     return IsKeyPressed(key) || IsKeyPressedRepeat(key);
 }
 
+static size_t gui_hex_hit_byte(RtxBuf *b, GuiFonts *fonts, int x0, int y0, int ph,
+                               float mx, float my);
+static void gui_draw_hex_buf(RtxBuf *b, GuiFonts *fonts, int focused, int x0, int y0,
+                             int pw, int ph);
+
 static void !>(CCError) gui_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int vis_rows) {
     size_t nlines;
     size_t want;
     size_t avail;
     size_t need;
+    size_t n;
+    size_t rows;
     if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
-    nlines = b->line_count();
     if (vis_rows < 1) vis_rows = 1;
+    if (rtx_layout_is_hex(&b->layout)) {
+        n = b->len();
+        rows = rtx_hex_row_count(n);
+        b->top_byte = rtx_hex_align(b->top_byte);
+        if (rows > 0) {
+            size_t last_top = (rows - 1) * (size_t)RTX_HEX_COLS;
+            if (b->top_byte > last_top) b->top_byte = last_top;
+        } else {
+            b->top_byte = 0;
+        }
+        (void)m;
+        (void)width;
+        return cc_ok();
+    }
+    nlines = b->line_count();
     if (b->top >= nlines && nlines) b->top = nlines - 1;
     want = (size_t)vis_rows + 8;
     avail = (b->top < nlines) ? (nlines - b->top) : 0;
@@ -216,8 +237,10 @@ static void !>(CCError) gui_ensure_view(RtxBuf *b, RtxMeasure *m, double width, 
 
 static void !>(CCError) gui_after_edit(RtxBuf *b, RtxMeasure *m, double width, int vis_rows) {
     b->clear_pref();
-    b->layout.view_after_edit(&b->doc, m, width) !>(e) { return cc_err(e); };
-    b->layout_width = width;
+    if (!rtx_layout_is_hex(&b->layout)) {
+        b->layout.view_after_edit(&b->doc, m, width) !>(e) { return cc_err(e); };
+        b->layout_width = width;
+    }
     gui_ensure_view(b, m, width, vis_rows) !>(e) { return cc_err(e); };
     b->reveal(vis_rows);
     return gui_ensure_view(b, m, width, vis_rows);
@@ -239,6 +262,23 @@ static void gui_wheel(RtxBuf *b, RtxMeasure *m, double width) {
 
 static void gui_move_vert(RtxBuf *b, RtxMeasure *m, double width, int dir, int shift) {
     if (!b) return;
+    if (rtx_layout_is_hex(&b->layout)) {
+        size_t n = b->len();
+        size_t at = b->doc.caret;
+        if (dir < 0) {
+            if (at >= (size_t)RTX_HEX_COLS) at -= (size_t)RTX_HEX_COLS;
+            else at = 0;
+        } else if (n) {
+            at += (size_t)RTX_HEX_COLS;
+            if (at >= n) at = n - 1;
+        }
+        if (!shift) b->doc.sel_anchor = at;
+        b->doc.caret = at;
+        b->doc.sel_box = 0;
+        b->doc.break_coalesce();
+        b->clear_pref();
+        return;
+    }
     b->layout.move_vert(&b->doc, m, width, dir, shift, &b->pref) !>(e) {
         (void)e;
     };
@@ -256,6 +296,23 @@ static int gui_run_cmd(int cmd, RtxWs *w, RtxBuf *act, RtxMeasure *m,
 
 static void gui_home_end(RtxBuf *b, int to_end, int shift, int physical) {
     if (!b) return;
+    if (rtx_layout_is_hex(&b->layout)) {
+        size_t n = b->len();
+        size_t row = n ? b->doc.caret / (size_t)RTX_HEX_COLS : 0;
+        size_t at;
+        if (!to_end) at = row * (size_t)RTX_HEX_COLS;
+        else {
+            at = row * (size_t)RTX_HEX_COLS + (size_t)RTX_HEX_COLS - 1;
+            if (n == 0) at = 0;
+            else if (at >= n) at = n - 1;
+        }
+        if (!shift) b->doc.sel_anchor = at;
+        b->doc.caret = at;
+        b->doc.sel_box = 0;
+        b->doc.break_coalesce();
+        b->clear_pref();
+        return;
+    }
     if (!physical && b->layout.wrap && b->layout.len) {
         b->layout.move_row_edge(&b->doc, to_end, shift);
     } else {
@@ -355,8 +412,20 @@ static int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *font
                 int x0 = pad + (w->focus == 1 && w->npanes == 2 ? inner / 2 + 8 : 0);
                 double x = (double)mouse.x - (double)x0 - (double)gui_gutter_px(fonts, act);
                 double y = (double)mouse.y - (double)top;
-                if (x >= 0 && y >= 0) {
-                    size_t at = act->layout.hit(&act->doc, m, x, gui_hit_y(act, y)) !>;
+                size_t at;
+                if (rtx_layout_is_hex(&act->layout)) {
+                    if (mouse.y >= (float)top) {
+                        at = gui_hex_hit_byte(act, fonts, x0, top,
+                                              hh - top - 28, mouse.x, mouse.y);
+                        act->doc.caret = at;
+                        if (!gui_shift()) act->doc.sel_anchor = act->doc.caret;
+                        act->doc.sel_box = 0;
+                        act->clear_pref();
+                        *dragging = 1;
+                        act->doc.break_coalesce();
+                    }
+                } else if (x >= 0 && y >= 0) {
+                    at = act->layout.hit(&act->doc, m, x, gui_hit_y(act, y)) !>;
                     act->doc.caret = at;
                     if (gui_alt()) {
                         size_t line = act->doc.line_of(at);
@@ -385,8 +454,8 @@ static int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *font
             double x = (double)mouse.x - (double)x0 - (double)gui_gutter_px(fonts, act);
             double y = (double)mouse.y - (double)top;
             int ph = hh - top - 28 - (ui->find ? GUI_FIND_H : 0);
+            size_t at;
             if (x < 0) x = 0;
-            /* Layout has no rows above the view; scroll first, then hit. */
             if (y < 0) {
                 act->scroll_vis(m, text_w, -1) !>;
                 gui_ensure_view(act, m, text_w, vis_rows) !>;
@@ -396,16 +465,23 @@ static int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *font
                 gui_ensure_view(act, m, text_w, vis_rows) !>;
                 y = (double)(ph - 1);
             }
-            size_t at = act->layout.hit(&act->doc, m, x, gui_hit_y(act, y)) !>;
-            act->doc.caret = at;
-            if (act->doc.sel_box) {
-                size_t line = act->doc.line_of(at);
-                act->pref.col = at - act->doc.line_start(line);
-                act->pref.ok = 1;
-                act->pref.eol = 0;
-                act->box_sync();
-            } else {
+            if (rtx_layout_is_hex(&act->layout)) {
+                at = gui_hex_hit_byte(act, fonts, x0, top, ph, mouse.x,
+                                      (float)top + (float)y);
+                act->doc.caret = at;
                 act->clear_pref();
+            } else {
+                at = act->layout.hit(&act->doc, m, x, gui_hit_y(act, y)) !>;
+                act->doc.caret = at;
+                if (act->doc.sel_box) {
+                    size_t line = act->doc.line_of(at);
+                    act->pref.col = at - act->doc.line_start(line);
+                    act->pref.ok = 1;
+                    act->pref.eol = 0;
+                    act->box_sync();
+                } else {
+                    act->clear_pref();
+                }
             }
         }
     }
@@ -416,6 +492,9 @@ static int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *font
             rtx_ui_clear_jump(ui);
         } else if (IsKeyPressed(KEY_ENTER)) {
             rtx_ui_apply_jump(ui, &act->doc);
+            if (rtx_layout_is_hex(&act->layout)) {
+                act->top_byte = rtx_hex_align(act->doc.caret);
+            }
             gui_reveal_caret(act, vis_rows);
         } else if (gui_key(KEY_BACKSPACE) && ui->jump_len > 0) {
             ui->jump_buf[--ui->jump_len] = 0;
@@ -773,7 +852,7 @@ static void gui_draw_jump(GuiFonts *fonts, RtxUi *ui, int ww, int hh) {
     DrawRectangleLines(x, y, box_w, box_h, (Color){240, 200, 80, 255});
     pos.x = (float)(x + 20);
     pos.y = (float)(y + 16);
-    DrawTextEx(fonts->mono, "jump to line", pos, 20, 0, (Color){240, 240, 250, 255});
+    DrawTextEx(fonts->mono, "jump to line or N%", pos, 20, 0, (Color){240, 240, 250, 255});
     snprintf(line, sizeof(line), "> %s_", ui->jump_buf);
     pos.y = (float)(y + 48);
     DrawTextEx(fonts->mono, line, pos, 22, 0, (Color){255, 220, 100, 255});
@@ -956,13 +1035,142 @@ static int gui_run_cmd(int cmd, RtxWs *w, RtxBuf *act, RtxMeasure *m,
     } else if (cmd == CMD_SEL_ALL) {
         act->doc.select_all();
     } else if (cmd == CMD_WRAP) {
-        act->layout.wrap = !act->layout.wrap;
+        rtx_layout_cycle_view(&act->layout);
         act->top_wrap = 0;
         act->layout.len = 0;
         act->clear_pref();
-        snprintf(status, status_n, act->layout.wrap ? "wrap on" : "wrap off");
+        if (rtx_layout_is_hex(&act->layout)) {
+            act->top_byte = rtx_hex_align(act->doc.caret);
+        }
+        snprintf(status, status_n, "view %s", rtx_layout_view_name(&act->layout));
     }
     return 0;
+}
+
+static void gui_draw_hex_buf(RtxBuf *b, GuiFonts *fonts, int focused, int x0, int y0,
+                             int pw, int ph) {
+    size_t r;
+    size_t n = b->len();
+    int has = b->doc.has_sel();
+    float cw;
+    float row_h = 18.0f;
+    int vis;
+    static const char *hexd = "0123456789ABCDEF";
+    Vector2 m0;
+    (void)pw;
+    m0 = MeasureTextEx(fonts->mono, "0", 14, 0);
+    cw = m0.x > 1 ? m0.x : 8.0f;
+    vis = (int)((float)ph / row_h);
+    if (vis < 1) vis = 1;
+    b->top_byte = rtx_hex_align(b->top_byte);
+    for (r = 0; r < (size_t)vis; r++) {
+        size_t off = rtx_hex_row_off(b->top_byte, r);
+        unsigned char buf[RTX_HEX_COLS];
+        size_t take = (size_t)RTX_HEX_COLS;
+        size_t got = 0;
+        size_t k;
+        float y = (float)y0 + (float)r * row_h;
+        float x;
+        char off_s[16];
+        Vector2 pos;
+        if (y > (float)(y0 + ph)) break;
+        if (off >= n && !(n == 0 && r == 0)) {
+            pos.x = (float)x0;
+            pos.y = y;
+            DrawTextEx(fonts->mono, "~", pos, 14, 0, (Color){90, 90, 100, 255});
+            continue;
+        }
+        if (take > n - off) take = n - off;
+        if (take) {
+            @errhandler(CCError e) {
+                (void)e;
+                got = 0;
+            }
+            got = b->read_at(off, (char *)buf, take) !>;
+        }
+        snprintf(off_s, sizeof(off_s), "%010zX", off);
+        pos.x = (float)x0;
+        pos.y = y;
+        DrawTextEx(fonts->mono, off_s, pos, 14, 0, (Color){100, 140, 220, 255});
+        x = (float)x0 + cw * 11.0f;
+        for (k = 0; k < (size_t)RTX_HEX_COLS; k++) {
+            size_t at = off + k;
+            char pair[4];
+            int sel = has && at < n && b->doc.sel_covers(at);
+            int here = focused && b->doc.caret == at;
+            if (k < got) {
+                pair[0] = hexd[(buf[k] >> 4) & 0xF];
+                pair[1] = hexd[buf[k] & 0xF];
+            } else {
+                pair[0] = ' ';
+                pair[1] = ' ';
+            }
+            pair[2] = 0;
+            if (sel) {
+                DrawRectangle((int)x, (int)y, (int)(cw * 2.5f), (int)row_h,
+                              (Color){40, 70, 120, 255});
+            }
+            if (here) {
+                DrawRectangle((int)x, (int)y, 2, (int)row_h, (Color){255, 200, 80, 255});
+            }
+            pos.x = x;
+            pos.y = y;
+            DrawTextEx(fonts->mono, pair, pos, 14, 0, (Color){220, 220, 230, 255});
+            x += cw * 3.0f;
+        }
+        x += cw * 2.0f;
+        for (k = 0; k < (size_t)RTX_HEX_COLS; k++) {
+            size_t at = off + k;
+            char chs[2];
+            int sel = has && at < n && b->doc.sel_covers(at);
+            int here = focused && b->doc.caret == at;
+            chs[0] = (k < got) ? rtx_hex_ascii(buf[k]) : ' ';
+            chs[1] = 0;
+            if (sel) {
+                DrawRectangle((int)x, (int)y, (int)cw + 1, (int)row_h,
+                              (Color){40, 70, 120, 255});
+            }
+            if (here) {
+                DrawRectangle((int)x, (int)y, 2, (int)row_h, (Color){255, 200, 80, 255});
+            }
+            pos.x = x;
+            pos.y = y;
+            DrawTextEx(fonts->mono, chs, pos, 14, 0, (Color){200, 210, 180, 255});
+            x += cw;
+        }
+    }
+}
+
+static size_t gui_hex_hit_byte(RtxBuf *b, GuiFonts *fonts, int x0, int y0, int ph,
+                               float mx, float my) {
+    float cw;
+    float row_h = 18.0f;
+    int row;
+    float local_x;
+    size_t base;
+    size_t n;
+    size_t at;
+    Vector2 m0;
+    m0 = MeasureTextEx(fonts->mono, "0", 14, 0);
+    cw = m0.x > 1 ? m0.x : 8.0f;
+    row = (int)((my - (float)y0) / row_h);
+    if (row < 0) row = 0;
+    n = b->len();
+    base = rtx_hex_row_off(b->top_byte, (size_t)row);
+    local_x = mx - (float)x0;
+    if (local_x < cw * 11.0f) {
+        at = base;
+    } else if (local_x < cw * 11.0f + cw * 3.0f * (float)RTX_HEX_COLS) {
+        float hx = local_x - cw * 11.0f;
+        at = base + (size_t)(hx / (cw * 3.0f));
+    } else {
+        float ax = local_x - (cw * 11.0f + cw * 3.0f * (float)RTX_HEX_COLS + cw * 2.0f);
+        if (ax < 0) ax = 0;
+        at = base + (size_t)(ax / cw);
+    }
+    if (at > n) at = n;
+    (void)ph;
+    return at;
 }
 
 static void gui_draw_buf(RtxBuf *b, GuiFonts *fonts, int focused, int x0, int y0,
@@ -973,6 +1181,10 @@ static void gui_draw_buf(RtxBuf *b, GuiFonts *fonts, int focused, int x0, int y0
     float gpx = gui_gutter_px(fonts, b);
     (void)pw;
     (void)pad;
+    if (rtx_layout_is_hex(&b->layout)) {
+        gui_draw_hex_buf(b, fonts, focused, x0, y0, pw, ph);
+        return;
+    }
     for (i = b->top_wrap; i < b->layout.len; i++) {
         RtxVisRow *row = &b->layout.rows[i];
         double y = (double)y0 + acc;
@@ -1116,8 +1328,16 @@ static void !>(CCError) gui_relayout(int pane_w, int vis_rows) {
     }
     for (p = 0; p < g_live.w->npanes; p++) {
         RtxBuf *b = &g_live.w->bufs[g_live.w->pane[p]];
-        size_t nlines = b->line_count();
-        if (b->top >= nlines && nlines) b->top = nlines - 1;
+        if (rtx_layout_is_hex(&b->layout)) {
+            gui_ensure_view(b, g_live.m,
+                            (double)pane_w - (double)gui_gutter_px(g_live.fonts, b),
+                            vis_rows) !>(e) { return cc_err(e); };
+            continue;
+        }
+        {
+            size_t nlines = b->line_count();
+            if (b->top >= nlines && nlines) b->top = nlines - 1;
+        }
         gui_ensure_view(b, g_live.m,
                         (double)pane_w - (double)gui_gutter_px(g_live.fonts, b),
                         vis_rows) !>(e) { return cc_err(e); };
@@ -1161,9 +1381,12 @@ static void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inne
             snprintf(bar, sizeof(bar), "unsaved  S save  Q don't save  Esc cancel  %s",
                      status);
         } else if (g_live.ui->jump) {
-            snprintf(bar, sizeof(bar), "jump to line: %s_", g_live.ui->jump_buf);
+            snprintf(bar, sizeof(bar), "jump line or N%%: %s_", g_live.ui->jump_buf);
         } else if (g_live.ui->find) {
             snprintf(bar, sizeof(bar), "find  up/down hits  Esc close  %s", status);
+        } else if (act && rtx_layout_is_hex(&act->layout)) {
+            snprintf(bar, sizeof(bar), "%s%s  @%zX  hex  %s",
+                     star, path, act->doc.caret, status);
         } else {
             snprintf(bar, sizeof(bar), "%s%s  L%zu/%zu  %s",
                      star, path, cur, nln, status);

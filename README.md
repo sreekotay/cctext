@@ -9,7 +9,7 @@ This is a standalone app. It needs `ccc` on `PATH` (or `CCC=`). It does not live
 - **Piece tree** over a page store (path original + spilled add) plus borrowed buffers. Offset and line lookup are O(log pieces).
 - **Sections** set layout policy (code vs prose). **Runs** inside a section are rich text and syntax tokens.
 - **Syntax highlight** is a core pass over code sections (C/CC lexer for the spike). Frontends only map token kind → color.
-- **Measure-generic layout** so wrap and hit-test are the same algorithm in pixels (Raylib) and cells (`cctext`). Wrap is off by default (`Ctrl-L`); on, it prefers the last space and hard-breaks a token that does not fit.
+- Measure-generic layout so wrap and hit-test are the same algorithm in pixels (Raylib) and cells (`cctext`). View cycles with `Ctrl-L`: default → wrap → hex (offset|hex|ASCII) → default.
 - Headless tests do not open a window.
 
 ## Status

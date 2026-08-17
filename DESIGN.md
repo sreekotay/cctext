@@ -74,7 +74,7 @@ Host close is a one-shot offer into that prompt, not loop control. Cancel dismis
 - `as: tree` on `RtxDoc`, `as: doc` on `RtxBuf` — UFCS that misses retries on the embed. A projection, not a lock.
 - `RtxDocLayout` — named allow-list: measure may `len`, `line_*`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl`. It cannot `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
 
-`L.wrap` is a layout policy, not a section kind. Off: one visual row per physical line. On: last whitespace if the next token fits after it, else a hard break at `max_width`. A token wider than the window still occupies a row. Scroll is `top` (physical line) plus `top_wrap` (visual rows skipped on that line). Up/down walk visual rows and keep a goal column.
+`L.view` is the layout policy (`RTX_VIEW_DEFAULT` / `WRAP` / `HEX`); `L.wrap` is 1 iff wrap. Default: one visual row per physical line. Wrap: last whitespace if the next token fits after it, else a hard break at `max_width`. Hex: byte rows of 16 with offset | hex | ASCII columns (synced selection); scroll via `top_byte`. A token wider than the window still occupies a row in wrap. Text scroll is `top` (physical line) plus `top_wrap`. Up/down walk visual rows (or ±16 bytes in hex) and keep a goal column in text modes. Ctrl-L cycles the three views.
 
 Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for insert / `write_fd` / page-store internals.
 

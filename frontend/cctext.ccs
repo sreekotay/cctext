@@ -416,9 +416,25 @@ static void !>(CCError) cctext_ensure_view(RtxBuf *b, RtxMeasure *m, double widt
     size_t want;
     size_t avail;
     size_t need;
+    size_t n;
+    size_t rows;
     if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
-    nlines = b->line_count();
     if (vis < 1) vis = 1;
+    if (rtx_layout_is_hex(&b->layout)) {
+        n = b->len();
+        rows = rtx_hex_row_count(n);
+        b->top_byte = rtx_hex_align(b->top_byte);
+        if (rows > 0) {
+            size_t last_top = (rows - 1) * (size_t)RTX_HEX_COLS;
+            if (b->top_byte > last_top) b->top_byte = last_top;
+        } else {
+            b->top_byte = 0;
+        }
+        (void)m;
+        (void)width;
+        return cc_ok();
+    }
+    nlines = b->line_count();
     if (b->top >= nlines && nlines) b->top = nlines - 1;
     want = (size_t)vis + 8;
     avail = (b->top < nlines) ? (nlines - b->top) : 0;
@@ -435,8 +451,10 @@ static void !>(CCError) cctext_ensure_view(RtxBuf *b, RtxMeasure *m, double widt
 
 static void !>(CCError) cctext_after_edit(RtxBuf *b, RtxMeasure *m, double width, int vis) {
     b->clear_pref();
-    b->layout.view_after_edit(&b->doc, m, width) !>(e) { return cc_err(e); };
-    b->layout_width = width;
+    if (!rtx_layout_is_hex(&b->layout)) {
+        b->layout.view_after_edit(&b->doc, m, width) !>(e) { return cc_err(e); };
+        b->layout_width = width;
+    }
     return cctext_ensure_view(b, m, width, vis);
 }
 
@@ -477,12 +495,112 @@ static void cctext_eol(int pad_to) {
     }
 }
 
+/* Hex pane: offset | 16 hex bytes | ASCII. Cols: 10+1 offset, 3*16 hex, 2 gap, 16 ascii. */
+enum { CCTEXT_HEX_OFF_W = 11, CCTEXT_HEX_GAP = 2 };
+
+static int cctext_hex_ascii_col0(void) {
+    return CCTEXT_HEX_OFF_W + (RTX_HEX_COLS * 3) + CCTEXT_HEX_GAP;
+}
+
+static size_t cctext_hex_hit_byte(RtxBuf *b, int vis, int row, int col) {
+    size_t base;
+    int ascii0;
+    size_t n;
+    size_t at;
+    if (!b || row < 0 || row >= vis) return b ? b->doc.caret : 0;
+    n = b->len();
+    base = rtx_hex_row_off(b->top_byte, (size_t)row);
+    ascii0 = cctext_hex_ascii_col0();
+    if (col >= ascii0) {
+        at = base + (size_t)(col - ascii0);
+    } else if (col >= CCTEXT_HEX_OFF_W) {
+        int h = col - CCTEXT_HEX_OFF_W;
+        at = base + (size_t)(h / 3);
+    } else {
+        at = base;
+    }
+    if (at > n) at = n;
+    return at;
+}
+
+static void cctext_draw_hex_pane(RtxBuf *b, int focused, int vis, int pcols, int col0,
+                                 int pad_rest) {
+    size_t r;
+    size_t n = b->len();
+    int has = b->doc.has_sel();
+    static const char *hexd = "0123456789ABCDEF";
+    b->top_byte = rtx_hex_align(b->top_byte);
+    for (r = 0; r < (size_t)vis; r++) {
+        size_t off = rtx_hex_row_off(b->top_byte, r);
+        unsigned char buf[RTX_HEX_COLS];
+        size_t take = (size_t)RTX_HEX_COLS;
+        size_t got = 0;
+        size_t k;
+        int used = 0;
+        fprintf(stdout, "\x1b[%zu;%dH", r + 1, col0);
+        if (off >= n && !(n == 0 && r == 0)) {
+            fputs("\x1b[90m~\x1b[0m", stdout);
+            used = 1;
+            cctext_eol(pad_rest ? pcols - used : 0);
+            continue;
+        }
+        if (take > n - off) take = n - off;
+        if (take) {
+            @errhandler(CCError e) {
+                (void)e;
+                got = 0;
+            }
+            got = b->read_at(off, (char *)buf, take) !>;
+        }
+        fprintf(stdout, "\x1b[34m%0*zX \x1b[0m", CCTEXT_HEX_OFF_W - 1, off);
+        used = CCTEXT_HEX_OFF_W;
+        for (k = 0; k < (size_t)RTX_HEX_COLS; k++) {
+            size_t at = off + k;
+            int sel = has && at < n && b->doc.sel_covers(at);
+            int here = focused && b->doc.caret == at;
+            if (k < got) {
+                if (sel || here) fputs(here ? "\x1b[7m" : "\x1b[44m", stdout);
+                fputc(hexd[(buf[k] >> 4) & 0xF], stdout);
+                fputc(hexd[buf[k] & 0xF], stdout);
+                if (sel || here) fputs("\x1b[0m", stdout);
+            } else {
+                fputs("  ", stdout);
+            }
+            fputc(k + 1 == (size_t)RTX_HEX_COLS ? ' ' : ' ', stdout);
+            used += 3;
+        }
+        {
+            int g;
+            for (g = 0; g < CCTEXT_HEX_GAP; g++) fputc(' ', stdout);
+            used += CCTEXT_HEX_GAP;
+        }
+        for (k = 0; k < (size_t)RTX_HEX_COLS; k++) {
+            size_t at = off + k;
+            int sel = has && at < n && b->doc.sel_covers(at);
+            int here = focused && b->doc.caret == at;
+            char ch = (k < got) ? rtx_hex_ascii(buf[k]) : ' ';
+            if (sel || here) fputs(here ? "\x1b[7m" : "\x1b[44m", stdout);
+            fputc(ch, stdout);
+            if (sel || here) fputs("\x1b[0m", stdout);
+            used++;
+        }
+        if (focused && b->doc.caret == off + got && got < (size_t)RTX_HEX_COLS) {
+            /* caret past last byte on short final row — already drawn on hex gap */
+        }
+        cctext_eol(pad_rest ? pcols - used : 0);
+    }
+}
+
 static void cctext_draw_pane(RtxBuf *b, int focused, int vis, int pcols, int col0,
                              int pad_rest) {
     size_t r;
     int has = b->doc.has_sel();
     int g = rtx_gutter_cols(b->line_count());
     int tcols = cctext_text_cols(b, pcols);
+    if (rtx_layout_is_hex(&b->layout)) {
+        cctext_draw_hex_pane(b, focused, vis, pcols, col0, pad_rest);
+        return;
+    }
     for (r = 0; r < (size_t)vis; r++) {
         size_t idx = r + b->top_wrap;
         int used = 0;
@@ -643,17 +761,23 @@ static void cctext_draw(RtxWs *w, RtxUi *ui, int rows, int cols) {
                     "\x1b[%d;1H\x1b[41;97m unsaved  s save  q don't save  Esc cancel  %s\x1b[0m\x1b[K",
                     rows, g_status);
         } else if (ui && ui->jump) {
-            fprintf(stdout, "\x1b[%d;1H\x1b[7m jump to line: %s_\x1b[0m\x1b[K",
+            fprintf(stdout, "\x1b[%d;1H\x1b[7m jump line or N%%: %s_\x1b[0m\x1b[K",
                     rows, ui->jump_buf);
         } else if (ui && ui->find) {
             fprintf(stdout,
                     "\x1b[%d;1H\x1b[7m find  up/down hits  Esc close  %s\x1b[0m\x1b[K",
                     rows, g_status);
         } else {
-            fprintf(stdout,
-                    "\x1b[%d;1H\x1b[7m%s%s  L%zu/%zu  Esc help  g jump  f find  %s\x1b[0m\x1b[K",
-                    rows, star, path, cur,
-                    act ? act->line_count() : 0, g_status);
+            if (act && rtx_layout_is_hex(&act->layout)) {
+                fprintf(stdout,
+                        "\x1b[%d;1H\x1b[7m%s%s  @%zX  hex  Esc help  g jump  %s\x1b[0m\x1b[K",
+                        rows, star, path, act->doc.caret, g_status);
+            } else {
+                fprintf(stdout,
+                        "\x1b[%d;1H\x1b[7m%s%s  L%zu/%zu  Esc help  g jump  f find  %s\x1b[0m\x1b[K",
+                        rows, star, path, cur,
+                        act ? act->line_count() : 0, g_status);
+            }
         }
     }
     fputs("\x1b[?2026l", stdout);
@@ -696,6 +820,19 @@ static void cctext_hit(RtxWs *w, RtxMeasure *m, int cols, int vis, int drag) {
             return;
         }
         g_drag_edge = drag && (g_mouse_row <= 1 || g_mouse_row >= vis);
+    }
+    if (rtx_layout_is_hex(&b->layout)) {
+        int col = g_mouse_col - col0;
+        int row = g_mouse_row - 1;
+        size_t at;
+        if (col < 0) col = 0;
+        at = cctext_hex_hit_byte(b, vis, row, col);
+        b->doc.caret = at;
+        if (!drag && !g_shift) b->doc.sel_anchor = b->doc.caret;
+        b->doc.sel_box = 0;
+        b->clear_pref();
+        b->doc.break_coalesce();
+        return;
     }
     x = (double)(g_mouse_col - col0);
     x -= (double)rtx_gutter_cols(b->line_count());
@@ -815,8 +952,10 @@ int main(int argc, char **argv) {
         for (p = 0; p < w.npanes; p++) {
             RtxBuf *b = &w.bufs[w.pane[p]];
             double pw = (double)cctext_pane_cols(&w, cols, p);
-            cctext_ensure_view(b, &m, (double)cctext_text_cols(b, (int)pw), vis) !>;
+            /* Reveal before fill: jump/find move the caret, then we need
+             * layout for the new top — console only redraws once per key. */
             if (p == w.focus && !skip_reveal) cctext_ensure_caret(b, vis);
+            cctext_ensure_view(b, &m, (double)cctext_text_cols(b, (int)pw), vis) !>;
         }
         skip_reveal = 0;
         cctext_draw(&w, &ui, rows, cols);
@@ -862,6 +1001,9 @@ int main(int argc, char **argv) {
                 rtx_ui_clear_jump(&ui);
             } else if (kind == KEY_ENTER) {
                 rtx_ui_apply_jump(&ui, &act->doc);
+                if (rtx_layout_is_hex(&act->layout)) {
+                    act->top_byte = rtx_hex_align(act->doc.caret);
+                }
             } else if (kind == KEY_BACKSPACE && ui.jump_len > 0) {
                 ui.jump_buf[--ui.jump_len] = 0;
             } else if (kind == KEY_CHAR) {
@@ -918,12 +1060,15 @@ int main(int argc, char **argv) {
             continue;
         }
         if (kind == KEY_WRAP) {
-            act->layout.wrap = !act->layout.wrap;
+            rtx_layout_cycle_view(&act->layout);
             act->top_wrap = 0;
             act->layout.len = 0;
             act->clear_pref();
-            snprintf(g_status, sizeof(g_status),
-                     act->layout.wrap ? "wrap on" : "wrap off");
+            if (rtx_layout_is_hex(&act->layout)) {
+                act->top_byte = rtx_hex_align(act->doc.caret);
+            }
+            snprintf(g_status, sizeof(g_status), "view %s",
+                     rtx_layout_view_name(&act->layout));
             continue;
         }
         if (kind == KEY_QUIT) {
@@ -970,19 +1115,38 @@ int main(int argc, char **argv) {
         } else if (kind == KEY_SEL_ALL) {
             act->doc.select_all();
         } else if (kind == KEY_HOME) {
-            if (act->layout.wrap && act->layout.len) {
+            if (rtx_layout_is_hex(&act->layout)) {
+                size_t row = act->doc.caret / (size_t)RTX_HEX_COLS;
+                size_t at = row * (size_t)RTX_HEX_COLS;
+                if (!g_shift) act->doc.sel_anchor = at;
+                act->doc.caret = at;
+                act->doc.sel_box = 0;
+                act->doc.break_coalesce();
+            } else if (act->layout.wrap && act->layout.len) {
                 act->layout.move_row_edge(&act->doc, 0, g_shift);
             } else {
                 act->doc.move_line_edge(0, g_shift);
             }
             act->clear_pref();
         } else if (kind == KEY_END) {
-            if (act->layout.wrap && act->layout.len) {
+            if (rtx_layout_is_hex(&act->layout)) {
+                size_t n = act->len();
+                size_t row = n ? act->doc.caret / (size_t)RTX_HEX_COLS : 0;
+                size_t at = row * (size_t)RTX_HEX_COLS + (size_t)RTX_HEX_COLS - 1;
+                if (n == 0) at = 0;
+                else if (at >= n) at = n - 1;
+                if (!g_shift) act->doc.sel_anchor = at;
+                act->doc.caret = at;
+                act->doc.sel_box = 0;
+                act->doc.break_coalesce();
+                act->clear_pref();
+            } else if (act->layout.wrap && act->layout.len) {
                 act->layout.move_row_edge(&act->doc, 1, g_shift);
+                act->stick_eol();
             } else {
                 act->doc.move_line_edge(1, g_shift);
+                act->stick_eol();
             }
-            act->stick_eol();
         } else if (kind == KEY_LEFT) {
             if (g_alt) {
                 act->box_move_col(-1);
@@ -1013,12 +1177,29 @@ int main(int argc, char **argv) {
             act->doc.break_coalesce();
             if (!g_alt) act->clear_pref();
         } else if (kind == KEY_UP || kind == KEY_DOWN) {
-            if (g_alt) act->box_begin();
-            act->layout.move_vert(&act->doc, &m,
-                                  (double)cctext_text_cols(act, cctext_pane_cols(&w, cols, w.focus)),
-                                  kind == KEY_UP ? -1 : 1, g_shift || g_alt,
-                                  &act->pref) !>;
-            if (g_alt) act->box_sync();
+            if (rtx_layout_is_hex(&act->layout)) {
+                size_t n = act->len();
+                size_t at = act->doc.caret;
+                if (kind == KEY_UP) {
+                    if (at >= (size_t)RTX_HEX_COLS) at -= (size_t)RTX_HEX_COLS;
+                    else at = 0;
+                } else if (n) {
+                    at += (size_t)RTX_HEX_COLS;
+                    if (at >= n) at = n - 1;
+                }
+                if (!g_shift) act->doc.sel_anchor = at;
+                act->doc.caret = at;
+                act->doc.sel_box = 0;
+                act->doc.break_coalesce();
+                act->clear_pref();
+            } else {
+                if (g_alt) act->box_begin();
+                act->layout.move_vert(&act->doc, &m,
+                                      (double)cctext_text_cols(act, cctext_pane_cols(&w, cols, w.focus)),
+                                      kind == KEY_UP ? -1 : 1, g_shift || g_alt,
+                                      &act->pref) !>;
+                if (g_alt) act->box_sync();
+            }
         } else if (kind == KEY_BACKSPACE) {
             act->doc.backspace() !>;
             cctext_after_edit(act, &m, (double)cctext_text_cols(act, cctext_pane_cols(&w, cols, w.focus)), vis) !>;

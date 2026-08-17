@@ -30,6 +30,9 @@ CC_TARGET_INCLUDE giant_open_smoke .
 CC_TARGET perf_matrix_smoke exe tests/perf_matrix_smoke.ccs
 CC_TARGET_INCLUDE perf_matrix_smoke .
 
+CC_TARGET hex_view_smoke exe tests/hex_view_smoke.ccs
+CC_TARGET_INCLUDE hex_view_smoke .
+
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
 
