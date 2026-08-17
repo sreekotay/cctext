@@ -31,6 +31,8 @@
 #define RTX_RB_BLACK 0
 #define RTX_LINE_STRIDE 64
 #define RTX_FRAME_SCRATCH 8192
+/* Scratch for lf counting / stride rebuilds (not the page cache). */
+#define RTX_IO_CHUNK 4096
 /* Above this size, prefer progressive line index: edits must not scan to EOF. */
 #define RTX_LINE_SOFT_MIN (32 * 1024 * 1024)
 
@@ -112,10 +114,10 @@ static void rtx_busy_end(RtxPieceTree *t) {
     t->busy_last_ms = 0.0;
 }
 
-/* Throttled progress. pct is 0..100, or -1 when total is unknown. */
-static void rtx_busy_pulse(const RtxPieceTree *ct, const char *label, size_t done,
+/* Throttled progress. pct is 0..100, or -1 when total is unknown.
+ * Mutates busy_last_ms — not const. */
+static void rtx_busy_pulse(RtxPieceTree *t, const char *label, size_t done,
                            size_t total) {
-    RtxPieceTree *t = (RtxPieceTree *)ct;
     double now;
     int pct;
     if (!t || !t->busy_fn || !label) return;
@@ -154,7 +156,7 @@ static int rtx_orig_is_mem(const RtxPieceTree *t) {
 /* Count newlines in a piece range. Store I/O surfaces as Result. */
 static uint32_t !>(CCError) rtx_buf_count_lf(const RtxPieceTree *t, RtxBufKind buf,
                                             size_t start, size_t len) {
-    char tmp[4096];
+    char tmp[RTX_IO_CHUNK];
     size_t off = 0;
     uint32_t c = 0;
     if (!t) return cc_err(CC_ERR_INVALID_ARG, "count lf");
@@ -201,24 +203,16 @@ static void !>(CCError) rtx_piece_read(const RtxPieceTree *t, const RtxPiece *p,
 #include "piece_tree_rb.cch"
 
 
-static int rtx_add_append(RtxPieceTree *t, char[:] bytes, size_t *start_out) {
+static size_t !>(CCError) rtx_add_append(RtxPieceTree *t, char[:] bytes) {
     size_t start;
-    if (!t || !start_out) return 0;
-    if (bytes.len == 0) {
-        *start_out = t->add_len;
-        return 1;
-    }
-    if (!bytes.ptr) return 0;
-    {
-        @errhandler(CCError e) {
-            (void)e;
-            return 0;
-        }
-        start = RtxPageStore_append_add(&t->store, bytes.ptr, bytes.len) !>;
-    }
-    *start_out = start;
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "add append");
+    if (bytes.len == 0) return cc_ok(t->add_len);
+    if (!bytes.ptr) return cc_err(CC_ERR_INVALID_ARG, "null add bytes");
+    start = RtxPageStore_append_add(&t->store, bytes.ptr, bytes.len) !>(e) {
+        return cc_err(e);
+    };
     t->add_len = t->store.add_len;
-    return 1;
+    return cc_ok(start);
 }
 
 static void rtx_tree_zero(RtxPieceTree *t) {
@@ -762,24 +756,21 @@ static void !>(CCError) rtx_lf_prepare_edit(RtxPieceTree *t, size_t off) {
     return cc_ok();
 }
 
-static int rtx_try_extend_add(RtxPieceTree *t, size_t offset, char[:] bytes) {
+/* 1 = tip-extended; 0 = not applicable (caller should split+insert). */
+static int !>(CCError) rtx_try_extend_add(RtxPieceTree *t, size_t offset, char[:] bytes) {
     size_t local = 0;
     RtxNode *n;
-    if (!t || bytes.len == 0 || offset == 0) return 0;
+    if (!t || bytes.len == 0 || offset == 0) return cc_ok(0);
     n = rtx_find_node(t, offset - 1, &local);
-    if (!n) return 0;
-    if (n->piece.buf != RTX_BUF_ADD) return 0;
-    if (n->piece.start + n->piece.len != t->add_len) return 0;
-    if (local + 1 != n->piece.len) return 0;
-    {
-        size_t start = 0;
-        if (!rtx_add_append(t, bytes, &start)) return 0;
-        (void)start;
-        n->piece.len += bytes.len;
-        n->piece.lf_count += rtx_count_lf(bytes.ptr, bytes.len);
-        rtx_node_pull_up(n);
-        return 1;
-    }
+    if (!n) return cc_ok(0);
+    if (n->piece.buf != RTX_BUF_ADD) return cc_ok(0);
+    if (n->piece.start + n->piece.len != t->add_len) return cc_ok(0);
+    if (local + 1 != n->piece.len) return cc_ok(0);
+    rtx_add_append(t, bytes) !>(e) { return cc_err(e); };
+    n->piece.len += bytes.len;
+    n->piece.lf_count += rtx_count_lf(bytes.ptr, bytes.len);
+    rtx_node_pull_up(n);
+    return cc_ok(1);
 }
 
 static inline void !>(CCError) RtxPieceTree_insert(RtxPieceTree *t, size_t offset, char[:] bytes) {
@@ -787,12 +778,14 @@ static inline void !>(CCError) RtxPieceTree_insert(RtxPieceTree *t, size_t offse
     RtxNode *n;
     size_t len;
     uint32_t lf;
+    int extended;
     if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
     len = RtxPieceTree_len(t);
     if (offset > len) return cc_err(CC_ERR_INVALID_ARG, "insert past end");
     if (bytes.len == 0) return cc_ok();
     rtx_lf_prepare_edit(t, offset) !>(e) { return cc_err(e); };
-    if (rtx_try_extend_add(t, offset, bytes)) {
+    extended = rtx_try_extend_add(t, offset, bytes) !>(e) { return cc_err(e); };
+    if (extended) {
         if (!t->line_off_suspend) {
             rtx_line_index_note_insert(t, offset, bytes.len,
                                       rtx_count_lf(bytes.ptr, bytes.len));
@@ -800,9 +793,7 @@ static inline void !>(CCError) RtxPieceTree_insert(RtxPieceTree *t, size_t offse
         return cc_ok();
     }
     rtx_split_at(t, offset) !>(e) { return cc_err(e); };
-    if (!rtx_add_append(t, bytes, &start)) {
-        return cc_err(CC_ERR_OUT_OF_MEMORY, "add buffer");
-    }
+    start = rtx_add_append(t, bytes) !>(e) { return cc_err(e); };
     lf = rtx_count_lf(bytes.ptr, bytes.len);
     n = rtx_node_new_piece_lf(t, RTX_BUF_ADD, start, bytes.len, lf);
     if (!n) return cc_err(CC_ERR_OUT_OF_MEMORY, "piece node");
@@ -905,7 +896,7 @@ static void !>(CCError) rtx_write_all(int fd, const char *p, size_t n) {
     return cc_ok();
 }
 
-static void !>(CCError) rtx_write_node(const RtxPieceTree *t, const RtxNode *n, int fd,
+static void !>(CCError) rtx_write_node(RtxPieceTree *t, const RtxNode *n, int fd,
                                          size_t *written, size_t total) {
     char buf[RTX_PAGE_SIZE];
     size_t off;
@@ -927,17 +918,17 @@ static void !>(CCError) rtx_write_node(const RtxPieceTree *t, const RtxNode *n, 
 }
 
 /* Stream pieces to fd. Does not load the document into one buffer. */
-static inline void !>(CCError) RtxPieceTree_write_fd(const RtxPieceTree *t, int fd) {
+static inline void !>(CCError) RtxPieceTree_write_fd(RtxPieceTree *t, int fd) {
     size_t written = 0;
     size_t total;
     if (!t || fd < 0) return cc_err(CC_ERR_INVALID_ARG, "write_fd");
     if (!t->root) return cc_ok();
     total = RtxPieceTree_len(t);
     rtx_write_node(t, t->root, fd, &written, total) !>(e) {
-        rtx_busy_end((RtxPieceTree *)t);
+        rtx_busy_end(t);
         return cc_err(e);
     };
-    rtx_busy_end((RtxPieceTree *)t);
+    rtx_busy_end(t);
     return cc_ok();
 }
 
