@@ -69,7 +69,7 @@ Host close is a one-shot offer into that prompt, not loop control. Cancel dismis
 
 ## Faces
 
-`@typehooks` / `@typeview` sit next to the types.
+`@typehooks` / `@typeview` sit next to the types. UFCS keeps a type open; a `@typeview` is the reverse face: the **application** declares what a composition may safely reach — the type does not close itself. Permission gates the name before UFCS resolves it, so an extension enters a face only if the face's own grant matches. Safety is decided at the use site, like ownership.
 
 - `as: tree` on `RtxDoc`, `as: doc` on `RtxBuf` — UFCS that misses retries on the embed. A projection, not a lock.
 - `RtxDocLayout` — named allow-list: measure may `len`, `line_*`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl`. It cannot `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
