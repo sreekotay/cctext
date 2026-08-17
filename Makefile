@@ -23,6 +23,7 @@ smoke test: $(LARGE)
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run edit_session_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run find_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run large_file_smoke
+	# 1 GiB select-all paste doubling — set RTX_TARGET_MIB to shrink for a quick loop
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run dup_scale_smoke
 
 # Optional multi-GiB on-disk fixture (gitignored). Slow; not part of smoke.
