@@ -64,13 +64,27 @@ run_one() {
     "$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc run perf_matrix_smoke -- "$path" "$label"
 }
 
-# Build once, then run each size.
+# Build once, warm once (first process pays dyld / page-cache), then measure.
 echo "perf_baseline: building perf_matrix_smoke" >&2
 "$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc perf_matrix_smoke
+
+# Prefer an existing fixture for warmup so 2M is not the cold victim.
+warm_path="$LARGE"
+warm_label="2M"
+if [[ -f "$GIANT" ]]; then
+    warm_path="$GIANT"
+    warm_label="8G"
+fi
+if [[ -f "$warm_path" ]]; then
+    echo "perf_baseline: warmup $warm_label" >&2
+    "$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc run perf_matrix_smoke -- \
+        "$warm_path" "$warm_label" >/dev/null
+fi
 
 {
     echo "# raytext perf results"
     echo "# date=$stamp_iso  host=$host"
+    echo "# note: one warmup run discarded before measuring"
     echo "#"
     echo "# size       op              ms"
     echo "# --------------------------------"
