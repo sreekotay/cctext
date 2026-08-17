@@ -7,7 +7,7 @@ RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation
 LARGE_LINES ?= 100000
 LARGE := testdata/generated/large.txt
 
-.PHONY: setup test smoke large giant giant-smoke dup-scale-8g dup-scale-64g cctext raytext clean
+.PHONY: setup test smoke large giant giant-smoke perf perf-check perf-record dup-scale-8g dup-scale-64g cctext raytext clean
 
 setup:
 	./setup.sh
@@ -46,6 +46,14 @@ $(GIANT): testdata/gen_large.sh
 
 giant-smoke: $(GIANT)
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run giant_open_smoke -- $(GIANT)
+
+# Pin / watch timings (needs large.txt; 8G if present). See scripts/perf_baseline.sh.
+perf: $(LARGE)
+	./scripts/perf_baseline.sh
+perf-check: $(GIANT)
+	./scripts/perf_baseline.sh check
+perf-record: $(LARGE)
+	./scripts/perf_baseline.sh record
 
 cctext:
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc cctext

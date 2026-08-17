@@ -27,6 +27,9 @@ CC_TARGET_INCLUDE dup_scale_smoke .
 CC_TARGET giant_open_smoke exe tests/giant_open_smoke.ccs
 CC_TARGET_INCLUDE giant_open_smoke .
 
+CC_TARGET perf_matrix_smoke exe tests/perf_matrix_smoke.ccs
+CC_TARGET_INCLUDE perf_matrix_smoke .
+
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
 
