@@ -47,6 +47,10 @@ CC_TARGET perf_matrix_smoke exe tests/perf_matrix_smoke.ccs
 CC_TARGET_INCLUDE perf_matrix_smoke .
 CC_TARGET_DEPS perf_matrix_smoke rtx_page_store
 
+CC_TARGET insert_profile exe tests/insert_profile.ccs
+CC_TARGET_INCLUDE insert_profile .
+CC_TARGET_DEPS insert_profile rtx_page_store
+
 CC_TARGET hex_view_smoke exe tests/hex_view_smoke.ccs
 CC_TARGET_INCLUDE hex_view_smoke .
 CC_TARGET_DEPS hex_view_smoke rtx_page_store rtx_hex

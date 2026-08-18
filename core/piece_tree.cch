@@ -53,8 +53,10 @@ static inline RtxIndexErr rtx_index_from_cc(CCError e) {
 #define RTX_FRAME_SCRATCH 8192
 /* Scratch for lf counting / stride rebuilds (not the page cache). */
 #define RTX_IO_CHUNK 4096
-/* Above this size, prefer progressive line index: edits must not scan to EOF. */
-#define RTX_LINE_SOFT_MIN (32 * 1024 * 1024)
+/* Above this, edits stay progressive (scan to the offset, no suffix rebuild).
+ * Same ballpark as RTX_HL_FULL_MAX / RTX_MARKUP_SCAN_MAX — a 2MiB first
+ * keystroke must not finish a full-file index. */
+#define RTX_LINE_SOFT_MIN (256 * 1024)
 
 typedef enum {
     RTX_BUF_ORIGINAL = 0,
@@ -810,33 +812,101 @@ static int !>(CCError) rtx_try_extend_add(RtxPieceTree *t, size_t offset, char[:
     return cc_ok(1);
 }
 
+typedef struct {
+    double prepare_ms;
+    double split_ms;
+    double add_ms;
+    double note_ms;
+    int lf_ready0;
+    int lf_ready1;
+    int huge;
+    int extended;
+    size_t scan0;
+    size_t scan1;
+    size_t line_off0;
+    size_t line_off1;
+} RtxInsertProf;
+
+static int rtx_ins_prof_on = 0;
+static RtxInsertProf rtx_ins_prof;
+
+static inline void RtxPieceTree_profile_insert(RtxPieceTree *t, int on) {
+    (void)t;
+    rtx_ins_prof_on = on;
+    memset(&rtx_ins_prof, 0, sizeof(rtx_ins_prof));
+}
+
+static inline RtxInsertProf RtxPieceTree_insert_prof(const RtxPieceTree *t) {
+    (void)t;
+    return rtx_ins_prof;
+}
+
 static inline void !>(CCError) RtxPieceTree_insert(RtxPieceTree *t, size_t offset, char[:] bytes) {
     size_t start = 0;
     RtxNode *n;
     size_t len;
     size_t lf;
     int extended;
+    int prof = rtx_ins_prof_on;
+    double t0 = 0.0;
     if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
     len = RtxPieceTree_len(t);
     if (offset > len) return cc_err(CC_ERR_INVALID_ARG, "insert past end");
     if (bytes.len == 0) return cc_ok();
+    if (prof) {
+        rtx_ins_prof.lf_ready0 = t->lf_ready;
+        rtx_ins_prof.huge = rtx_lf_huge(t);
+        rtx_ins_prof.scan0 = t->line_scan_off;
+        rtx_ins_prof.line_off0 = t->line_off_len;
+        t0 = rtx_mono_ms();
+    }
     rtx_lf_prepare_edit(t, offset) !>(e) { return cc_err(e); };
+    if (prof) {
+        rtx_ins_prof.prepare_ms = rtx_mono_ms() - t0;
+        t0 = rtx_mono_ms();
+    }
     extended = rtx_try_extend_add(t, offset, bytes) !>(e) { return cc_err(e); };
     if (extended) {
+        if (prof) {
+            rtx_ins_prof.add_ms = rtx_mono_ms() - t0;
+            rtx_ins_prof.extended = 1;
+            t0 = rtx_mono_ms();
+        }
         if (!t->line_off_suspend) {
             rtx_line_index_note_insert(t, offset, bytes.len,
                                       rtx_count_lf(bytes.ptr, bytes.len));
         }
+        if (prof) {
+            rtx_ins_prof.note_ms = rtx_mono_ms() - t0;
+            rtx_ins_prof.lf_ready1 = t->lf_ready;
+            rtx_ins_prof.scan1 = t->line_scan_off;
+            rtx_ins_prof.line_off1 = t->line_off_len;
+        }
         return cc_ok();
     }
     rtx_split_at(t, offset) !>(e) { return cc_err(e); };
+    if (prof) {
+        rtx_ins_prof.split_ms = rtx_mono_ms() - t0;
+        t0 = rtx_mono_ms();
+    }
     start = rtx_add_append(t, bytes) !>(e) { return cc_err(e); };
+    if (prof) {
+        rtx_ins_prof.add_ms = rtx_mono_ms() - t0;
+        t0 = rtx_mono_ms();
+    }
     lf = rtx_count_lf(bytes.ptr, bytes.len);
     n = rtx_node_new_piece_lf(t, RTX_BUF_ADD, start, bytes.len, lf);
     if (!n) return cc_err(CC_ERR_OUT_OF_MEMORY, "piece node");
     rtx_bst_insert(t, n, offset);
+    if (prof) t0 = rtx_mono_ms();
     if (!t->line_off_suspend) {
         rtx_line_index_note_insert(t, offset, bytes.len, n->piece.lf_count);
+    }
+    if (prof) {
+        rtx_ins_prof.note_ms = rtx_mono_ms() - t0;
+        rtx_ins_prof.lf_ready1 = t->lf_ready;
+        rtx_ins_prof.scan1 = t->line_scan_off;
+        rtx_ins_prof.line_off1 = t->line_off_len;
     }
     return cc_ok();
 }
