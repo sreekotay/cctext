@@ -238,27 +238,28 @@ static void !>(CCError) rtx_hist_bytes_reserve(RtxDoc *d, char[:] *slot, size_t 
     return cc_ok();
 }
 
-static void !>(CCError) rtx_hist_coalesce_ins_append(RtxDoc *d, RtxHistRec *last,
-                                                     char[:] ins) {
-    size_t need = last->ins_used + ins.len;
-    rtx_hist_bytes_reserve(d, &last->ins, &last->ins_used, &last->ins_cap, need) !>(e) {
-        return cc_err(e);
-    };
-    memcpy(last->ins.ptr + last->ins_used, ins.ptr, ins.len);
-    last->ins_used = need;
-    return cc_ok();
+/* Reserve only — used is unchanged so a failed replace leaves hist intact. */
+static void !>(CCError) rtx_hist_coalesce_ins_reserve(RtxDoc *d, RtxHistRec *last,
+                                                      size_t add) {
+    return rtx_hist_bytes_reserve(d, &last->ins, &last->ins_used, &last->ins_cap,
+                                  last->ins_used + add);
 }
 
-static void !>(CCError) rtx_hist_coalesce_del_prepend(RtxDoc *d, RtxHistRec *last,
-                                                      char[:] del) {
-    size_t need = last->del_used + del.len;
-    rtx_hist_bytes_reserve(d, &last->del, &last->del_used, &last->del_cap, need) !>(e) {
-        return cc_err(e);
-    };
+static void rtx_hist_coalesce_ins_commit(RtxHistRec *last, char[:] ins) {
+    memcpy(last->ins.ptr + last->ins_used, ins.ptr, ins.len);
+    last->ins_used += ins.len;
+}
+
+static void !>(CCError) rtx_hist_coalesce_del_reserve(RtxDoc *d, RtxHistRec *last,
+                                                      size_t add) {
+    return rtx_hist_bytes_reserve(d, &last->del, &last->del_used, &last->del_cap,
+                                  last->del_used + add);
+}
+
+static void rtx_hist_coalesce_del_commit(RtxHistRec *last, char[:] del) {
     memmove(last->del.ptr + del.len, last->del.ptr, last->del_used);
     memcpy(last->del.ptr, del.ptr, del.len);
-    last->del_used = need;
-    return cc_ok();
+    last->del_used += del.len;
 }
 
 static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
@@ -295,12 +296,12 @@ static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] 
             if (d->hist.coalesce && d->hist.head > 0) {
                 last = &d->hist.recs[d->hist.head - 1];
                 if (rtx_hist_can_coalesce_insert(last, off, ins)) {
-                    rtx_hist_coalesce_ins_append(d, last, ins) !>(e) {
+                    rtx_hist_coalesce_ins_reserve(d, last, ins.len) !>(e) {
                         return cc_err(e);
                     };
                     coalesced = 1;
                 } else if (rtx_hist_can_coalesce_erase(last, off, del)) {
-                    rtx_hist_coalesce_del_prepend(d, last, del) !>(e) {
+                    rtx_hist_coalesce_del_reserve(d, last, del.len) !>(e) {
                         return cc_err(e);
                     };
                     coalesced = 2;
@@ -330,7 +331,7 @@ static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] 
             }
         }
         d->tree.replace(off, n, ins) !>(e) {
-            if (e.message && strstr(e.message, "unrestorable")) d->broken = 1;
+            if (rtx_err_is_unrestorable(e)) d->broken = 1;
             return cc_err(e);
         };
         d->edit_gen++;
@@ -345,12 +346,14 @@ static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] 
         d->box_ccol = 0;
         if (!d->hist.applying) {
             if (coalesced == 1 && last) {
+                rtx_hist_coalesce_ins_commit(last, ins);
                 last->caret_after = d->caret;
                 last->sel_after = d->sel_anchor;
                 last->sel_box_after = d->sel_box;
                 last->box_acol_after = d->box_acol;
                 last->box_ccol_after = d->box_ccol;
             } else if (coalesced == 2 && last) {
+                rtx_hist_coalesce_del_commit(last, del);
                 last->off = off;
                 last->caret_after = d->caret;
                 last->sel_after = d->sel_anchor;
@@ -374,6 +377,14 @@ static void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] 
         }
         return cc_ok();
     }
+}
+
+static void !>(CCError) RtxDoc_insert(RtxDoc *d, size_t off, char[:] bytes) {
+    return RtxDoc_replace(d, off, 0, bytes);
+}
+
+static void !>(CCError) RtxDoc_erase(RtxDoc *d, size_t off, size_t n) {
+    return RtxDoc_replace(d, off, n, cc_slice_empty());
 }
 
 static int !>(RtxIndexErr) rtx_doc_line_has_nl(const RtxDoc *d, size_t line) {
@@ -591,7 +602,7 @@ static void !>(CCError) RtxDoc_undo(RtxDoc *d) {
     d->hist.coalesce = 0;
     d->tree.replace(r->off, ins.len, del) !>(e) {
         d->hist.applying = 0;
-        if (e.message && strstr(e.message, "unrestorable")) d->broken = 1;
+        if (rtx_err_is_unrestorable(e)) d->broken = 1;
         return cc_err(e);
     };
     d->edit_gen++;
@@ -626,7 +637,7 @@ static void !>(CCError) RtxDoc_redo(RtxDoc *d) {
     d->hist.coalesce = 0;
     d->tree.replace(r->off, erase_n, ins) !>(e) {
         d->hist.applying = 0;
-        if (e.message && strstr(e.message, "unrestorable")) d->broken = 1;
+        if (rtx_err_is_unrestorable(e)) d->broken = 1;
         return cc_err(e);
     };
     d->edit_gen++;
