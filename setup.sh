@@ -32,6 +32,6 @@ fi
 
 mkdir -p testdata/generated out bin
 if test ! -f testdata/generated/large.txt; then
-    ./testdata/gen_large.sh 100000 testdata/generated/large.txt
+    ./testdata/gen_large.sh --bytes 3M testdata/generated/large.txt
 fi
 echo "ok"

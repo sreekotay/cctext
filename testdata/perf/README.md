@@ -5,17 +5,21 @@
   `make perf` / `scripts/perf_baseline.sh`: binary sizes, peak RSS per fixture,
   then ops × sizes (ms).
 
-Ops: `open`, `scroll_40`, `wrap_40`, `jump_100k`, `wrap_100k`,
+Fixtures (same ops, same byte distance):
+
+- `3M` — mixed prose/code (`testdata/generated/large.txt`, `--bytes 3M`)
+- `8G` — same text block (`testdata/generated/large_8G.txt`)
+- `2Gjson` — JSON array (`testdata/generated/large_2G.json`) if present
+
+Ops: `open`, `scroll_40`, `wrap_40`, `jump_1m`, `wrap_1m`,
 `insert_bof`, `insert_eof`, `insert_mid`, `newline_mid`, `close`.
-`wrap_40` / `wrap_100k` fill 40 visual rows at width 40 (the generated
-prose lines wrap). Each op is timed on a fresh
+`wrap_40` fills 40 visual rows from byte 0. `jump_1m` is `line_of(1MiB)`.
+`wrap_1m` is `fill_off(1MiB)` (window only; no prefix index).
+`insert_mid` / `newline_mid` insert at 1 MiB. Each op is timed on a fresh
 `from_path` so a jump cannot cheapen a later insert (the mid insert pays
-its own scan-to-offset). Line-addressed ops (`scroll_40`, `jump_100k`)
-include frontier build; byte-addressed inserts do not unless
-`prepare_edit` must scan to the offset. `RTX_PERF_TRIALS` (default 5)
-repeats each op; the table reports the minimum ms. `jump_100k` is not
-cross-file comparable: the 2 MiB and 8 GiB fixtures have different
-bytes/line. RSS is `getrusage` max RSS after the first open and the
+its own scan-to-offset). `scroll_40` and `jump_1m` include frontier build.
+`RTX_PERF_TRIALS` (default 5) repeats each op; the table reports the
+minimum ms. RSS is `getrusage` max RSS after the first open and the
 process high-water mark (`rss_open` / `rss_peak`). Builds use
 `--release` unless `DEBUG=1`. Files above `RTX_LINE_SOFT_MIN` (256 KiB)
 stay progressive.

@@ -9,8 +9,9 @@
 # Results land in testdata/perf/results/baseline_results_YYYY_MM_DD.txt
 #
 # Env:
-#   GIANT=path            8G fixture (default: testdata/generated/large_8G.txt)
-#   LARGE=path            ~2 MiB fixture (default: testdata/generated/large.txt)
+#   GIANT=path            8G text fixture (default: testdata/generated/large_8G.txt)
+#   LARGE=path            3M text fixture (default: testdata/generated/large.txt)
+#   GIANT_JSON=path       2G JSON fixture (default: testdata/generated/large_2G.json)
 #   RTX_PERF_FACTOR=3     fail if measured > pin * factor
 #   RTX_PERF_HEADROOM=2   record stores ceil(ms * headroom)
 #   RTX_PERF_FLOOR_MS=25  min pin for ops
@@ -24,7 +25,7 @@ MODE="${1:-}"
 case "$MODE" in
     ""|run|record|check) ;;
     -h|--help)
-        sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *)
@@ -43,6 +44,7 @@ else
 fi
 LARGE="${LARGE:-testdata/generated/large.txt}"
 GIANT="${GIANT:-testdata/generated/large_8G.txt}"
+GIANT_JSON="${GIANT_JSON:-testdata/generated/large_2G.json}"
 BASELINE="${RTX_PERF_BASELINE:-testdata/perf/baseline.env}"
 RESULTS_DIR="${RTX_PERF_RESULTS:-testdata/perf/results}"
 FACTOR="${RTX_PERF_FACTOR:-3}"
@@ -60,7 +62,7 @@ RESULTS="$RESULTS_DIR/baseline_results_${stamp_day}.txt"
 mkdir -p testdata/perf "$RESULTS_DIR" testdata/generated
 
 if [[ ! -f "$LARGE" ]]; then
-    ./testdata/gen_large.sh 100000 "$LARGE"
+    ./testdata/gen_large.sh --bytes 3M "$LARGE"
 fi
 
 run_one() {
@@ -100,9 +102,13 @@ echo "perf_baseline: building cctext ($BUILD_FLAVOR)" >&2
     echo "perf_baseline: cctext build failed (binary size will omit it)" >&2
 }
 
-# Prefer an existing fixture for warmup so 2M is not the cold victim.
+# Prefer a giant fixture for warmup so the small text file is not the cold victim.
 warm_path="$LARGE"
-warm_label="2M"
+warm_label="3M"
+if [[ -f "$GIANT_JSON" ]]; then
+    warm_path="$GIANT_JSON"
+    warm_label="2Gjson"
+fi
 if [[ -f "$GIANT" ]]; then
     warm_path="$GIANT"
     warm_label="8G"
@@ -116,7 +122,7 @@ fi
 ALL_OUT=""
 TIME_BODY=""
 MEM_BODY=""
-for pair in "$LARGE:2M" "$GIANT:8G"; do
+for pair in "$LARGE:3M" "$GIANT:8G" "$GIANT_JSON:2Gjson"; do
     path="${pair%%:*}"
     label="${pair##*:}"
     if [[ ! -f "$path" ]]; then
@@ -159,8 +165,7 @@ cctext_bytes="$(bin_bytes bin/cctext)"
     echo "# raytext perf results"
     echo "# date=$stamp_iso  host=$host  build=$BUILD_FLAVOR"
     echo "# note: process warmup discarded; each op from a fresh open; best of $TRIALS"
-    echo "# note: line-addressed ops include frontier build; each op cold"
-    echo "# note: jump_100k is not cross-file comparable (2M vs 8G bytes/line)"
+    echo "# note: jump_1m / wrap_1m / insert_mid / newline_mid are 1 MiB into every file"
     echo "#"
     echo "# binary                    bytes      size"
     echo "# ------------------------------------------------"
@@ -202,7 +207,7 @@ while read -r _ kv1 kv2 kv3; do
     case "$op" in
         open) open_ms="$ms" ;;
         scroll_40) screen_ms="$ms" ;;
-        jump_100k) jump100k_ms="$ms" ;;
+        jump_1m|jump_100k) jump100k_ms="$ms" ;;
         insert_mid) insert_ms="$ms" ;;
         newline_mid) newline_ms="$ms" ;;
     esac

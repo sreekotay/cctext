@@ -24,7 +24,29 @@ typedef enum {
 
 #define RTX_HL_FULL_MAX 262144
 #define RTX_MARKUP_SCAN_MAX 262144
+#define RTX_HL_WIN_MAX RTX_MARKUP_SCAN_MAX
 #define RTX_MARKUP_LOOKBACK 16384
+
+typedef struct {
+    size_t from;
+    size_t n;
+} RtxHlWin;
+
+static RtxHlWin rtx_hl_win(size_t from, size_t n) {
+    RtxHlWin w;
+    w.from = from;
+    w.n = n > (size_t)RTX_HL_WIN_MAX ? (size_t)RTX_HL_WIN_MAX : n;
+    return w;
+}
+
+static RtxHlWin rtx_hl_span(size_t from, size_t to) {
+    return rtx_hl_win(from, to > from ? to - from : 0);
+}
+
+typedef enum {
+    RTX_TM_LOOKBACK = 0,
+    RTX_TM_CATCHUP = 1,
+} RtxTmWalk;
 #define RTX_MARKUP_WIN_SECS 64
 #define RTX_MARKUP_CACHE_WINDOWS 8
 #define RTX_TM_CKPT_STRIDE 16384
@@ -338,6 +360,7 @@ static void RtxDoc_analysis_reset(RtxDoc *d) {
     d->tm_ckpt_cap = 0;
     memset(d->hl_win, 0, sizeof(d->hl_win));
     d->hl_win_stamp = 0;
+    d->hl_full = 0;
 }
 
 static void rtx_hist_clear(RtxHistory *h) {
@@ -480,6 +503,73 @@ static void rtx_doc_sort_runs(RtxDoc *d) {
     if (d && d->run_len > 1) {
         qsort(d->runs, d->run_len, sizeof(RtxRun), rtx_run_start_cmp);
     }
+}
+
+static int rtx_run_is_hl_only(RtxRun r) {
+    return r.style.scope != RTX_SCOPE_NONE && !r.style.bold && !r.style.italic &&
+           !r.style.mono;
+}
+
+static int rtx_run_is_markup_only(RtxRun r) {
+    return (r.style.bold || r.style.italic || r.style.mono) &&
+           r.style.scope == RTX_SCOPE_NONE;
+}
+
+/* Keep prefix/suffix of overlapping pred runs; drop only [lo, hi). */
+static void !>(CCError) rtx_doc_clip_runs(RtxDoc *d, size_t lo, size_t hi,
+                                         int (*pred)(RtxRun)) {
+    RtxRun *out;
+    size_t i, n, cap;
+    if (!d || !pred || hi <= lo) return cc_ok();
+    n = 0;
+    for (i = 0; i < d->run_len; i++) {
+        RtxRun r = d->runs[i];
+        size_t end = r.start + r.len;
+        if (!pred(r) || end <= lo || r.start >= hi) n++;
+        else {
+            if (r.start < lo) n++;
+            if (end > hi) n++;
+        }
+    }
+    if (n == d->run_len) {
+        int any = 0;
+        for (i = 0; i < d->run_len; i++) {
+            RtxRun r = d->runs[i];
+            size_t end = r.start + r.len;
+            if (pred(r) && end > lo && r.start < hi) any = 1;
+        }
+        if (!any) return cc_ok();
+    }
+    cap = 0;
+    out = NULL;
+    rtx_arena_grow(&d->analysis, (void **)&out, &cap, n ? n : 1,
+                   sizeof(RtxRun)) !>(e) {
+        return cc_err(e);
+    };
+    n = 0;
+    for (i = 0; i < d->run_len; i++) {
+        RtxRun r = d->runs[i];
+        size_t end = r.start + r.len;
+        if (!pred(r) || end <= lo || r.start >= hi) {
+            out[n++] = r;
+            continue;
+        }
+        if (r.start < lo) {
+            RtxRun p = r;
+            p.len = lo - r.start;
+            out[n++] = p;
+        }
+        if (end > hi) {
+            RtxRun s = r;
+            s.start = hi;
+            s.len = end - hi;
+            out[n++] = s;
+        }
+    }
+    d->runs = out;
+    d->run_len = n;
+    d->run_cap = cap;
+    return cc_ok();
 }
 
 static void rtx_doc_shift_intervals(RtxDoc *d, size_t at, size_t erased, size_t inserted) {
@@ -796,6 +886,7 @@ static void !>(CCError) rtx_doc_window_markup(RtxDoc *d, size_t from, size_t to)
     size_t sec_lo;
     RtxMarkupWin *win;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    saved = d->run_len;
     n = d->len();
     if (from > n) from = n;
     if (to > n) to = n;
@@ -844,27 +935,32 @@ static void !>(CCError) rtx_doc_window_markup(RtxDoc *d, size_t from, size_t to)
             }
             at_bol = (bytes.ptr[i] == '\n');
         }
-        saved = d->run_len;
-        rtx_doc_scan_markup_runs(d, bytes.ptr, from, bytes.len) !>(e) {
+        {
+            RtxRun *old_runs = d->runs;
+            size_t old_len = d->run_len;
+            size_t old_cap = d->run_cap;
+            rtx_doc_clip_runs(d, from, to, rtx_run_is_markup_only) !>(e) {
+                return cc_err(e);
+            };
+            rtx_doc_scan_markup_runs(d, bytes.ptr, from, bytes.len) !>(e) {
+                d->runs = old_runs;
+                d->run_len = old_len;
+                d->run_cap = old_cap;
+                return cc_err(e);
+            };
+            rtx_doc_merge_window_secs(d, sec_lo, to, neu, nneu) !>(e) {
+                d->runs = old_runs;
+                d->run_len = old_len;
+                d->run_cap = old_cap;
+                return cc_err(e);
+            };
+        }
+    } else {
+        rtx_doc_merge_window_secs(d, sec_lo, to, neu, nneu) !>(e) {
             d->run_len = saved;
             return cc_err(e);
         };
-        {
-            size_t o = 0;
-            for (i = 0; i < d->run_len; i++) {
-                RtxRun r = d->runs[i];
-                int markup_only = (r.style.bold || r.style.italic || r.style.mono) &&
-                                  r.style.scope == RTX_SCOPE_NONE;
-                size_t end = r.start + r.len;
-                if (i < saved && markup_only && end > from && r.start < to) continue;
-                d->runs[o++] = r;
-            }
-            d->run_len = o;
-        }
     }
-    rtx_doc_merge_window_secs(d, sec_lo, to, neu, nneu) !>(e) {
-        return cc_err(e);
-    };
     win->ready = win->known;
     return cc_ok();
 }
@@ -991,6 +1087,9 @@ static void !>(CCError) RtxDoc_from_buffer(RtxDoc *d, char[:] bytes) {
 @typeview on RtxDoc {
     as: tree;
 };
+typedef @typeview Highlight on RtxDoc {
+    r: read_at, scratch_span, style_at, section_at, ensure_hl;
+} *RtxDocHighlight;
 typedef @typeview Layout on RtxDoc {
     r: len, line_count, line_start, line_of, line_guess, index_covers,
        read_at, scratch_span, style_at, section_at, ensure_hl;

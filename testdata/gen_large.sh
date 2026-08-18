@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Write a mixed prose/code fixture under testdata/generated/ (gitignored).
+# Write a mixed prose/code (or JSON) fixture under testdata/generated/ (gitignored).
 #
-#   ./testdata/gen_large.sh [lines] [outfile]     # default 100000 lines
-#   ./testdata/gen_large.sh --bytes 8G [outfile]   # ~8 GiB on disk (slow)
+#   ./testdata/gen_large.sh [lines] [outfile]      # default 100000 lines
+#   ./testdata/gen_large.sh --bytes 8G [outfile]    # ~8 GiB mixed text (slow)
+#   ./testdata/gen_large.sh --bytes 2G --json       # ~2 GiB JSON array (slow)
 #   ./testdata/gen_large.sh --bytes 256M out.txt
 set -euo pipefail
 
 bytes_target=0
+bytes_label=""
 lines=""
-out="testdata/generated/large.txt"
+kind=text
+out=""
 
 parse_size() {
     local s="$1"
@@ -28,12 +31,50 @@ parse_size() {
     esac
 }
 
-if [[ "${1:-}" == "--bytes" ]]; then
-    bytes_target="$(parse_size "${2:?gen_large: --bytes needs a size}")"
-    out="${3:-testdata/generated/large_${2}.txt}"
-elif [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+usage() {
     sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
-    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --json)
+            kind=json
+            shift
+            ;;
+        --bytes)
+            bytes_label="${2:?gen_large: --bytes needs a size}"
+            bytes_target="$(parse_size "$bytes_label")"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "gen_large: unknown flag $1" >&2
+            exit 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ "$bytes_target" -gt 0 ]]; then
+    if [[ -n "${1:-}" ]]; then
+        out="$1"
+    elif [[ "$kind" == json ]]; then
+        out="testdata/generated/large_${bytes_label}.json"
+    else
+        out="testdata/generated/large_${bytes_label}.txt"
+    fi
+elif [[ "$kind" == json ]]; then
+    echo "gen_large: --json needs --bytes (e.g. --bytes 2G --json)" >&2
+    exit 2
 else
     lines="${1:-100000}"
     out="${2:-testdata/generated/large.txt}"
@@ -42,7 +83,31 @@ fi
 dir="$(dirname "$out")"
 mkdir -p "$dir"
 
-if [[ "$bytes_target" -gt 0 ]]; then
+if [[ "$bytes_target" -gt 0 && "$kind" == json ]]; then
+    # Valid JSON array of objects. Stop before the next record would
+    # exceed the budget so the closing ] stays well-formed (may be a
+    # few hundred bytes under --bytes).
+    awk -v want="$bytes_target" '
+    BEGIN {
+        total = 1
+        b = 0
+        first = 1
+        printf "["
+        while (1) {
+            rec = sprintf("\n  {\"id\": %d, \"name\": \"item_%d\", \"ok\": %s, \"n\": -2.5, \"s\": \"a\\nb\"}", b, b, (b % 2) ? "true" : "false")
+            extra = first ? 0 : 1
+            n = length(rec) + extra
+            if (total + n + 2 > want) break
+            if (!first) printf ","
+            printf "%s", rec
+            total += n
+            first = 0
+            b++
+        }
+        printf "\n]\n"
+    }
+    ' > "$out"
+elif [[ "$bytes_target" -gt 0 ]]; then
     # Stream fixed 8-line blocks until byte budget. No line-count cap.
     awk -v want="$bytes_target" '
     BEGIN {

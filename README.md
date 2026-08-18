@@ -22,8 +22,9 @@ Piece tree, document, layout, C/CC highlight, save, undo/redo, selection, increm
 ./setup.sh                  # checks ccc; Raylib is optional for now
 ./make.shcc @               # list tasks
 ./make.shcc @smoke          # piece-tree + layout + edit-session + find + large-file
-./make.shcc @large          # testdata/generated/large.txt (100000 lines; LARGE_LINES= or @large N)
+./make.shcc @large          # testdata/generated/large.txt (~3 MiB; LARGE_BYTES= or @large)
 make giant                  # testdata/generated/large_8G.txt (~8 GiB; slow)
+make giant-json             # testdata/generated/large_2G.json (~2 GiB JSON array; slow)
 make giant-smoke            # open that file via page store (mid-line + tiny insert)
 make perf                   # ops×sizes + binary/RSS table → testdata/perf/results/…
 make perf-record            # that table + refresh testdata/perf/baseline.env pins

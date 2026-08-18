@@ -715,60 +715,80 @@ static void !>(CCError) RtxDoc_save(RtxDoc *d) {
     return d->save_as(d->path.ptr);
 }
 
+static void !>(CCError) rtx_doc_hl_bytes(RtxDoc *d, char[:] bytes, size_t start,
+                                        size_t lo, const RtxTmCkpt *seed,
+                                        RtxTmWalk walk, size_t saved_runs,
+                                        size_t saved_ckpt) {
+    size_t lex = 0;
+    if (walk == RTX_TM_LOOKBACK && start > 0 && bytes.len) {
+        while (lex < bytes.len && bytes.ptr[lex] != '\n') lex++;
+        if (lex < bytes.len && start + lex < lo) lex++;
+        else lex = 0;
+    }
+    rtx_hl_range(d, bytes.ptr + lex, start + lex, bytes.len - lex, lo, seed,
+                 walk) !>(e) {
+        d->run_len = saved_runs;
+        d->tm_ckpt_len = saved_ckpt;
+        return cc_err(e);
+    };
+    return cc_ok();
+}
+
 static void !>(CCError) rtx_doc_highlight_span(RtxDoc *d, size_t lo, size_t hi) {
-    size_t saved;
+    size_t saved_runs;
+    size_t saved_ckpt;
     size_t start;
     const RtxTmCkpt *seed;
+    RtxTmWalk walk;
     if (!d || hi <= lo) return cc_ok();
-    saved = d->run_len;
+    if (hi - lo > (size_t)RTX_HL_WIN_MAX) hi = lo + (size_t)RTX_HL_WIN_MAX;
+    saved_runs = d->run_len;
+    saved_ckpt = d->tm_ckpt_len;
+    rtx_doc_clip_runs(d, lo, hi, rtx_run_is_hl_only) !>(e) {
+        return cc_err(e);
+    };
+    saved_runs = d->run_len;
     seed = rtx_tm_ckpt_find(d, lo);
     if (seed && lo - seed->off <= (size_t)RTX_TM_CATCHUP_MAX) {
         start = seed->off;
+        walk = RTX_TM_CATCHUP;
     } else if (!seed && lo <= (size_t)RTX_TM_CATCHUP_MAX) {
         start = 0;
         seed = NULL;
+        walk = RTX_TM_CATCHUP;
     } else {
         start = lo > (size_t)RTX_MARKUP_LOOKBACK ? lo - (size_t)RTX_MARKUP_LOOKBACK
                                                  : 0;
         seed = NULL;
+        walk = RTX_TM_LOOKBACK;
     }
     {
         size_t need = hi - start;
         size_t stack_n = (size_t)RTX_MARKUP_LOOKBACK + (size_t)RTX_FRAME_SCRATCH;
-        char[:] bytes;
-        size_t lex = 0;
         if (need <= stack_n) {
             cc_arena_stack(scratch, RTX_MARKUP_LOOKBACK + RTX_FRAME_SCRATCH);
-            bytes = d->scratch_span(&scratch, start, need) !>(e) {
+            char[:] bytes = d->scratch_span(&scratch, start, need) !>(e) {
+                return cc_err(e);
+            };
+            rtx_doc_hl_bytes(d, bytes, start, lo, seed, walk, saved_runs,
+                             saved_ckpt) !>(e) {
                 return cc_err(e);
             };
         } else {
-            bytes = rtx_doc_analysis_span(d, start, need) !>(e) {
+            CCArena frame = cc_arena_heap(need + 64);
+            char[:] bytes;
+            if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "hl frame");
+            bytes = d->scratch_span(&frame, start, need) !>(e) {
+                frame.destroy();
                 return cc_err(e);
             };
+            rtx_doc_hl_bytes(d, bytes, start, lo, seed, walk, saved_runs,
+                             saved_ckpt) !>(e) {
+                frame.destroy();
+                return cc_err(e);
+            };
+            frame.destroy();
         }
-        if (!seed && start > 0 && bytes.len) {
-            while (lex < bytes.len && bytes.ptr[lex] != '\n') lex++;
-            if (lex < bytes.len) lex++;
-        }
-        rtx_hl_range(d, bytes.ptr + lex, start + lex, bytes.len - lex, lo, seed,
-                     1) !>(e) {
-            d->run_len = saved;
-            return cc_err(e);
-        };
-    }
-    {
-        size_t i;
-        size_t o = 0;
-        for (i = 0; i < d->run_len; i++) {
-            RtxRun r = d->runs[i];
-            int hl_only = r.style.scope != RTX_SCOPE_NONE && !r.style.bold &&
-                          !r.style.italic && !r.style.mono;
-            size_t end = r.start + r.len;
-            if (i < saved && hl_only && end > lo && r.start < hi) continue;
-            d->runs[o++] = r;
-        }
-        d->run_len = o;
     }
     return cc_ok();
 }
@@ -807,13 +827,18 @@ static void !>(CCError) RtxDoc_reparse_edit(RtxDoc *d, size_t off, int full_mark
     return cc_ok();
 }
 
-static void !>(CCError) RtxDoc_ensure_hl(RtxDoc *d, size_t from, size_t to) {
-    size_t s, n, lo, hi, win_lo, win_hi, sec_n;
-    int any = 0;
+static void !>(CCError) RtxDoc_ensure_hl(RtxDoc *d, RtxHlWin w) {
+    size_t s, n, lo, hi, from, to, win_lo, win_hi, sec_n;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    from = w.from;
+    to = from + w.n;
     if (d->hl_full || to <= from) return cc_ok();
     n = d->len();
+    if (from > n) from = n;
     if (to > n) to = n;
+    if (to > from && to - from > (size_t)RTX_HL_WIN_MAX) {
+        to = from + (size_t)RTX_HL_WIN_MAX;
+    }
     if (n > RTX_MARKUP_SCAN_MAX) {
         rtx_doc_window_markup(d, from, to) !>(e) { return cc_err(e); };
     }
@@ -827,15 +852,12 @@ static void !>(CCError) RtxDoc_ensure_hl(RtxDoc *d, size_t from, size_t to) {
             rtx_doc_highlight_span(d, lo, hi) !>(e) { return cc_err(e); };
             d->secs[s].hl_done = 1;
         } else {
-            /* Visible window only — never copy/lex the whole body. */
             win_lo = from > lo ? from : lo;
             win_hi = to < hi ? to : hi;
             rtx_doc_highlight_span(d, win_lo, win_hi) !>(e) { return cc_err(e); };
-            /* Leave hl_done clear so scroll re-lexes the new window. */
         }
-        any = 1;
     }
-    if (any) rtx_doc_sort_runs(d);
+    rtx_doc_sort_runs(d);
     return cc_ok();
 }
 

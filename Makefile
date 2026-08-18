@@ -9,16 +9,16 @@ RAYLIB_PREFIX := $(shell brew --prefix raylib 2>/dev/null)
 RAYLIB_CFLAGS := -I$(RAYLIB_PREFIX)/include
 RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation
 
-LARGE_LINES ?= 100000
+LARGE_BYTES ?= 3M
 LARGE := testdata/generated/large.txt
 
-.PHONY: setup test smoke large giant giant-smoke perf perf-check perf-record dup-scale-8g dup-scale-64g cctext raytext clean
+.PHONY: setup test smoke large giant giant-json giant-smoke perf perf-check perf-record dup-scale-8g dup-scale-64g cctext raytext clean
 
 setup:
 	./setup.sh
 
 $(LARGE): testdata/gen_large.sh
-	./testdata/gen_large.sh $(LARGE_LINES) $(LARGE)
+	./testdata/gen_large.sh --bytes $(LARGE_BYTES) $(LARGE)
 
 large: $(LARGE)
 
@@ -46,12 +46,19 @@ dup-scale-64g: $(LARGE)
 
 # Multi-GiB on-disk fixture (gitignored). Slow write; not part of smoke.
 #   make giant              # → testdata/generated/large_8G.txt
+#   make giant-json         # → testdata/generated/large_2G.json
 #   make giant-smoke       # open / mid-line / tiny insert
 GIANT_BYTES ?= 8G
 GIANT := testdata/generated/large_$(GIANT_BYTES).txt
 giant: $(GIANT)
 $(GIANT): testdata/gen_large.sh
 	./testdata/gen_large.sh --bytes $(GIANT_BYTES) $(GIANT)
+
+GIANT_JSON_BYTES ?= 2G
+GIANT_JSON := testdata/generated/large_$(GIANT_JSON_BYTES).json
+giant-json: $(GIANT_JSON)
+$(GIANT_JSON): testdata/gen_large.sh
+	./testdata/gen_large.sh --bytes $(GIANT_JSON_BYTES) --json $(GIANT_JSON)
 
 giant-smoke: $(GIANT)
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run giant_open_smoke -- $(GIANT)
