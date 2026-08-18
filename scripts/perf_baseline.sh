@@ -14,6 +14,7 @@
 #   RTX_PERF_FACTOR=3     fail if measured > pin * factor
 #   RTX_PERF_HEADROOM=2   record stores ceil(ms * headroom)
 #   RTX_PERF_FLOOR_MS=25  min pin for ops
+#   RTX_PERF_TRIALS=5     isolated repeats per op; RESULT is the minimum ms
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,6 +48,8 @@ RESULTS_DIR="${RTX_PERF_RESULTS:-testdata/perf/results}"
 FACTOR="${RTX_PERF_FACTOR:-3}"
 HEADROOM="${RTX_PERF_HEADROOM:-2}"
 FLOOR_MS="${RTX_PERF_FLOOR_MS:-25}"
+TRIALS="${RTX_PERF_TRIALS:-5}"
+export RTX_PERF_TRIALS="$TRIALS"
 LOG="testdata/generated/perf_runs.log"
 
 stamp_day="$(date -u +%Y_%m_%d)"
@@ -155,7 +158,7 @@ cctext_bytes="$(bin_bytes bin/cctext)"
 {
     echo "# raytext perf results"
     echo "# date=$stamp_iso  host=$host  build=$BUILD_FLAVOR"
-    echo "# note: one warmup run discarded before measuring"
+    echo "# note: process warmup discarded; each op from a fresh open; best of $TRIALS"
     echo "#"
     echo "# binary                    bytes      size"
     echo "# ------------------------------------------------"

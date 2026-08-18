@@ -4,6 +4,10 @@
  *
  *   ./bin/perf_matrix_smoke path [size_label]
  *
+ * Each op is isolated: destroy + from_path, then only that op. A prior
+ * jump must not cheapen insert_mid (prepare_edit scans to the offset).
+ * RTX_PERF_TRIALS (default 5) repeats each op; RESULT is the minimum ms.
+ *
  * Emits RESULT lines:
  *   RESULT size=8G op=open ms=0.031
  *   RESULT size=8G op=rss_open bytes=8601600
@@ -12,11 +16,15 @@
 #include <ccc/std/prelude.cch>
 #include <ccc/script/stdio.cch>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 #include "../core/document.cch"
+
+#define RTX_PERF_DEFAULT_TRIALS 5
+#define RTX_PERF_JUMP_LINE 100000
 
 static double mono_ms(void) {
     struct timespec ts;
@@ -44,15 +52,39 @@ static void emit_bytes(const char *size, const char *op, size_t bytes) {
     fflush(stdout);
 }
 
+static int trials_from_env(void) {
+    const char *e = getenv("RTX_PERF_TRIALS");
+    int n;
+    if (!e || !e[0]) return RTX_PERF_DEFAULT_TRIALS;
+    n = atoi(e);
+    if (n < 1) return 1;
+    if (n > 32) return 32;
+    return n;
+}
+
+static void best_note(double *best, double ms, size_t *rss_peak) {
+    size_t r;
+    if (ms < *best) *best = ms;
+    r = peak_rss_bytes();
+    if (r > *rss_peak) *rss_peak = r;
+}
+
+static void !>(CCError) fresh_open(RtxDoc *d, const char *src) {
+    d->destroy();
+    d->from_path(src) !>(e) { return cc_err(e); };
+    return cc_ok();
+}
+
 int main(int argc, char **argv) {
     const char *src = "testdata/generated/large.txt";
     const char *size = "large";
-    RtxDoc *d;
-    size_t n, mid, screen;
+    RtxDoc d = {0};
+    size_t n, mid, screen, rss_open, rss_peak;
     char ch = 'x';
     char nl = '\n';
-    double t0, ms;
+    double t0, ms, best;
     size_t i;
+    int trials, trial;
 
     screen = 40;
     if (argc > 1) src = argv[1];
@@ -61,6 +93,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "perf_matrix_smoke: missing %s\n", src);
         return 1;
     }
+    trials = trials_from_env();
 
     @errhandler(CCError e) {
         fprintf(stderr, "perf_matrix_smoke: %s\n", e.message ? e.message : "?");
@@ -71,60 +104,111 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    d = (RtxDoc *)calloc(1, sizeof(RtxDoc));
-    if (!d) return 1;
-
-    t0 = mono_ms();
-    d->from_path(src) !>;
-    ms = mono_ms() - t0;
-    emit(size, "open", ms);
-    emit_bytes(size, "rss_open", peak_rss_bytes());
-    n = d->len();
-
-    t0 = mono_ms();
-    for (i = 0; i <= screen; i++) {
-        size_t warm = d->line_start(i) !>;
-        (void)warm;
+    /* Probe length + mid byte offset. Not timed. rss_open before any scan. */
+    d.from_path(src) !>;
+    n = d.len();
+    rss_open = peak_rss_bytes();
+    rss_peak = rss_open;
+    mid = n / 2;
+    if (n > 0) {
+        size_t jump = d.line_start((size_t)RTX_PERF_JUMP_LINE) !>;
+        if (jump > 0 && jump < n) mid = jump;
     }
-    ms = mono_ms() - t0;
-    emit(size, "scroll_40", ms);
+    d.destroy();
 
-    t0 = mono_ms();
-    mid = d->line_start(100000) !>;
-    ms = mono_ms() - t0;
-    if (mid > 0 && mid < n) emit(size, "jump_100k", ms);
-    else emit(size, "jump_100k", ms); /* still report; may clamp on small files */
-
-    t0 = mono_ms();
-    d->insert(0, cc_slice_from_buffer(&ch, 1)) !>;
-    ms = mono_ms() - t0;
-    emit(size, "insert_bof", ms);
-
-    t0 = mono_ms();
-    d->insert(d->len(), cc_slice_from_buffer(&ch, 1)) !>;
-    ms = mono_ms() - t0;
-    emit(size, "insert_eof", ms);
-
-    if (mid > 0 && mid < d->len()) {
+    best = 1e300;
+    for (trial = 0; trial < trials; trial++) {
+        d.destroy();
         t0 = mono_ms();
-        d->insert(mid, cc_slice_from_buffer(&ch, 1)) !>;
+        d.from_path(src) !>;
         ms = mono_ms() - t0;
-        emit(size, "insert_mid", ms);
+        best_note(&best, ms, &rss_peak);
+    }
+    emit(size, "open", best);
+    emit_bytes(size, "rss_open", rss_open);
 
+    best = 1e300;
+    for (trial = 0; trial < trials; trial++) {
+        fresh_open(&d, src) !>;
         t0 = mono_ms();
-        d->insert(mid + 1, cc_slice_from_buffer(&nl, 1)) !>;
+        for (i = 0; i <= screen; i++) {
+            size_t warm = d.line_start(i) !>;
+            (void)warm;
+        }
         ms = mono_ms() - t0;
-        emit(size, "newline_mid", ms);
+        best_note(&best, ms, &rss_peak);
+    }
+    emit(size, "scroll_40", best);
+
+    best = 1e300;
+    for (trial = 0; trial < trials; trial++) {
+        fresh_open(&d, src) !>;
+        t0 = mono_ms();
+        {
+            size_t jump = d.line_start((size_t)RTX_PERF_JUMP_LINE) !>;
+            (void)jump;
+        }
+        ms = mono_ms() - t0;
+        best_note(&best, ms, &rss_peak);
+    }
+    emit(size, "jump_100k", best);
+
+    best = 1e300;
+    for (trial = 0; trial < trials; trial++) {
+        fresh_open(&d, src) !>;
+        t0 = mono_ms();
+        d.insert(0, cc_slice_from_buffer(&ch, 1)) !>;
+        ms = mono_ms() - t0;
+        best_note(&best, ms, &rss_peak);
+    }
+    emit(size, "insert_bof", best);
+
+    best = 1e300;
+    for (trial = 0; trial < trials; trial++) {
+        fresh_open(&d, src) !>;
+        t0 = mono_ms();
+        d.insert(d.len(), cc_slice_from_buffer(&ch, 1)) !>;
+        ms = mono_ms() - t0;
+        best_note(&best, ms, &rss_peak);
+    }
+    emit(size, "insert_eof", best);
+
+    if (mid > 0 && mid < n) {
+        best = 1e300;
+        for (trial = 0; trial < trials; trial++) {
+            fresh_open(&d, src) !>;
+            t0 = mono_ms();
+            d.insert(mid, cc_slice_from_buffer(&ch, 1)) !>;
+            ms = mono_ms() - t0;
+            best_note(&best, ms, &rss_peak);
+        }
+        emit(size, "insert_mid", best);
+
+        best = 1e300;
+        for (trial = 0; trial < trials; trial++) {
+            fresh_open(&d, src) !>;
+            t0 = mono_ms();
+            d.insert(mid, cc_slice_from_buffer(&nl, 1)) !>;
+            ms = mono_ms() - t0;
+            best_note(&best, ms, &rss_peak);
+        }
+        emit(size, "newline_mid", best);
     }
 
-    emit_bytes(size, "rss_peak", peak_rss_bytes());
+    emit_bytes(size, "rss_peak", rss_peak);
 
-    t0 = mono_ms();
-    d->destroy();
-    ms = mono_ms() - t0;
-    emit(size, "close", ms);
-    free(d);
+    best = 1e300;
+    for (trial = 0; trial < trials; trial++) {
+        fresh_open(&d, src) !>;
+        t0 = mono_ms();
+        d.destroy();
+        ms = mono_ms() - t0;
+        best_note(&best, ms, &rss_peak);
+    }
+    emit(size, "close", best);
 
-    printf("perf_matrix_smoke ok  path=%s  size=%s  bytes=%zu\n", src, size, n);
+    printf("perf_matrix_smoke ok  path=%s  size=%s  bytes=%zu  trials=%d  "
+           "best_of=min isolated=1\n",
+           src, size, n, trials);
     return 0;
 }
