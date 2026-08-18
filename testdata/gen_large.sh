@@ -49,7 +49,7 @@ if [[ "$bytes_target" -gt 0 ]]; then
         b = 0
         total = 0
         while (total < want) {
-            line = sprintf("=== prose ===\nBlock %d. A *bold* word and `mono` in a wrapping paragraph.\n=== code ===\nint fn_%d(void) {\n    /* block %d */\n    int x = %d;\n    return x;\n}\n", b, b, b, b)
+            line = sprintf("=== prose ===\nBlock %d. A *bold* word and `mono` in a wrapping paragraph that keeps going so an eighty-column pane actually splits this line into more than one visual row.\n=== code ===\nint fn_%d(void) {\n    /* block %d */\n    int x = %d;\n    return x;\n}\n", b, b, b, b)
             n = length(line)
             if (total + n > want) {
                 n = want - total
@@ -76,7 +76,7 @@ else
         while (n < want) {
             if (n < want) { print "=== prose ==="; n++ }
             if (n < want) {
-                printf "Block %d. A *bold* word and `mono` in a wrapping paragraph.\n", b
+                printf "Block %d. A *bold* word and `mono` in a wrapping paragraph that keeps going so an eighty-column pane actually splits this line into more than one visual row.\n", b
                 n++
             }
             if (n < want) { print "=== code ==="; n++ }

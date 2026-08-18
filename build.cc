@@ -45,7 +45,7 @@ CC_TARGET_DEPS giant_open_smoke rtx_page_store
 
 CC_TARGET perf_matrix_smoke exe tests/perf_matrix_smoke.ccs
 CC_TARGET_INCLUDE perf_matrix_smoke .
-CC_TARGET_DEPS perf_matrix_smoke rtx_page_store
+CC_TARGET_DEPS perf_matrix_smoke rtx_page_store rtx_hex
 
 CC_TARGET insert_profile exe tests/insert_profile.ccs
 CC_TARGET_INCLUDE insert_profile .
@@ -58,6 +58,14 @@ CC_TARGET_DEPS hex_view_smoke rtx_page_store rtx_hex
 CC_TARGET line_index_prop_smoke exe tests/line_index_prop_smoke.ccs
 CC_TARGET_INCLUDE line_index_prop_smoke .
 CC_TARGET_DEPS line_index_prop_smoke rtx_page_store
+
+CC_TARGET tm_grammar_smoke exe tests/tm_grammar_smoke.ccs
+CC_TARGET_INCLUDE tm_grammar_smoke .
+CC_TARGET_DEPS tm_grammar_smoke rtx_page_store rtx_hex
+
+CC_TARGET tm_lookback_probe exe tests/tm_lookback_probe.ccs
+CC_TARGET_INCLUDE tm_lookback_probe .
+CC_TARGET_DEPS tm_lookback_probe rtx_page_store rtx_hex
 
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .

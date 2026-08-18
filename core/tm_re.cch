@@ -1,0 +1,298 @@
+#ifndef RTX_TM_RE_H
+#define RTX_TM_RE_H
+
+/* Leftover TM match: literals, '.', classes, \b \d \w \s, *+?, |, ( ).
+ * No backrefs, no lookaround, no Onig. Zero-length hits are rejected. */
+
+#define RTX_RE_GROUPS 8
+
+typedef struct {
+    size_t s[RTX_RE_GROUPS];
+    size_t e[RTX_RE_GROUPS];
+} RtxReCaps;
+
+static RtxReCaps *rtx_re_caps;
+static size_t rtx_re_plen;
+
+static int rtx_re_cap_index(const char *p, size_t open_at) {
+    size_t i = 0;
+    int n = 0;
+    while (i < open_at && i < rtx_re_plen) {
+        if (p[i] == '\\') {
+            i += 2;
+            continue;
+        }
+        if (p[i] == '[') {
+            i++;
+            if (i < rtx_re_plen && p[i] == '^') i++;
+            while (i < rtx_re_plen && p[i] != ']') {
+                if (p[i] == '\\' && i + 1 < rtx_re_plen) i += 2;
+                else i++;
+            }
+            if (i < rtx_re_plen) i++;
+            continue;
+        }
+        if (p[i] == '(') n++;
+        i++;
+    }
+    return n + 1;
+}
+
+static int rtx_re_word(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+static int rtx_re_space(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f';
+}
+
+static size_t rtx_re_atom_end(const char *p, size_t i, size_t n) {
+    if (i >= n) return i;
+    if (p[i] == '\\') return i + 2 <= n ? i + 2 : n;
+    if (p[i] == '[') {
+        i++;
+        if (i < n && p[i] == '^') i++;
+        while (i < n && p[i] != ']') {
+            if (p[i] == '\\' && i + 1 < n) i += 2;
+            else i++;
+        }
+        return i < n ? i + 1 : n;
+    }
+    if (p[i] == '(') {
+        int d = 1;
+        i++;
+        while (i < n && d) {
+            if (p[i] == '\\' && i + 1 < n) {
+                i += 2;
+                continue;
+            }
+            if (p[i] == '(') d++;
+            else if (p[i] == ')') d--;
+            i++;
+        }
+        return i;
+    }
+    return i + 1;
+}
+
+static int rtx_re_class(char c, const char *p, size_t a, size_t b) {
+    int neg = 0;
+    size_t i = a;
+    if (i < b && p[i] == '^') {
+        neg = 1;
+        i++;
+    }
+    while (i < b) {
+        char x, y;
+        if (p[i] == '\\' && i + 1 < b) {
+            char e = p[i + 1];
+            i += 2;
+            if (e == 'd') {
+                if (c >= '0' && c <= '9') return !neg;
+                continue;
+            }
+            if (e == 'w') {
+                if (rtx_re_word(c)) return !neg;
+                continue;
+            }
+            if (e == 's') {
+                if (rtx_re_space(c)) return !neg;
+                continue;
+            }
+            x = e;
+        } else {
+            x = p[i++];
+        }
+        if (i + 1 < b && p[i] == '-') {
+            i++;
+            if (i < b && p[i] == '\\' && i + 1 < b) {
+                y = p[i + 1];
+                i += 2;
+            } else if (i < b) {
+                y = p[i++];
+            } else {
+                y = x;
+            }
+            if (c >= x && c <= y) return !neg;
+        } else if (c == x) {
+            return !neg;
+        }
+    }
+    return neg;
+}
+
+static int rtx_re_esc(char e, char c) {
+    if (e == 'd') return c >= '0' && c <= '9';
+    if (e == 'w') return rtx_re_word(c);
+    if (e == 's') return rtx_re_space(c);
+    if (e == 'n') return c == '\n';
+    if (e == 't') return c == '\t';
+    return c == e;
+}
+
+static int rtx_re_exec(const char *p, size_t pi, size_t pend, const char *t,
+                       size_t ti, size_t tn, size_t *out);
+
+static int rtx_re_atom(const char *p, size_t a, size_t b, const char *t,
+                       size_t ti, size_t tn, size_t *out) {
+    if (a >= b) return 0;
+    if (p[a] == '(') {
+        size_t inner = b;
+        int ok;
+        if (b > a && p[b - 1] == ')') inner = b - 1;
+        ok = rtx_re_exec(p, a + 1, inner, t, ti, tn, out);
+        if (ok && rtx_re_caps) {
+            int gid = rtx_re_cap_index(p, a);
+            if (gid > 0 && gid < RTX_RE_GROUPS) {
+                rtx_re_caps->s[gid] = ti;
+                rtx_re_caps->e[gid] = *out;
+            }
+        }
+        return ok;
+    }
+    if (p[a] == '.') {
+        if (ti >= tn || t[ti] == '\n') return 0;
+        *out = ti + 1;
+        return 1;
+    }
+    if (p[a] == '[') {
+        size_t ce = b;
+        if (ce > a && p[ce - 1] == ']') ce--;
+        if (ti >= tn) return 0;
+        if (!rtx_re_class(t[ti], p, a + 1, ce)) return 0;
+        *out = ti + 1;
+        return 1;
+    }
+    if (p[a] == '\\' && a + 1 < b) {
+        char e = p[a + 1];
+        if (e == 'b') {
+            int prev = (ti == 0) ? 0 : rtx_re_word(t[ti - 1]);
+            int cur = (ti < tn) ? rtx_re_word(t[ti]) : 0;
+            if (prev == cur) return 0;
+            *out = ti;
+            return 1;
+        }
+        if (ti >= tn) return 0;
+        if (!rtx_re_esc(e, t[ti])) return 0;
+        *out = ti + 1;
+        return 1;
+    }
+    if (ti >= tn || t[ti] != p[a]) return 0;
+    *out = ti + 1;
+    return 1;
+}
+
+static int rtx_re_seq(const char *p, size_t pi, size_t pend, const char *t,
+                      size_t ti, size_t tn, size_t *out);
+
+static int rtx_re_exec(const char *p, size_t pi, size_t pend, const char *t,
+                       size_t ti, size_t tn, size_t *out) {
+    size_t best = (size_t)-1;
+    size_t i = pi;
+    int any = 0;
+    while (i <= pend) {
+        size_t bar = i;
+        int d = 0;
+        while (bar < pend) {
+            if (p[bar] == '\\' && bar + 1 < pend) {
+                bar += 2;
+                continue;
+            }
+            if (p[bar] == '(') d++;
+            else if (p[bar] == ')') {
+                if (d) d--;
+            } else if (p[bar] == '|' && d == 0) {
+                break;
+            }
+            bar++;
+        }
+        {
+            size_t end;
+            if (rtx_re_seq(p, i, bar, t, ti, tn, &end)) {
+                if (!any || end > best) best = end;
+                any = 1;
+            }
+        }
+        if (bar >= pend) break;
+        i = bar + 1;
+    }
+    if (!any) return 0;
+    *out = best;
+    return 1;
+}
+
+static int rtx_re_seq(const char *p, size_t pi, size_t pend, const char *t,
+                      size_t ti, size_t tn, size_t *out) {
+    size_t ae, qend, cur, n, min, max, nends, k, nx, rest;
+    size_t ends[64];
+    char q;
+    if (pi >= pend) {
+        *out = ti;
+        return 1;
+    }
+    ae = rtx_re_atom_end(p, pi, pend);
+    q = 0;
+    qend = ae;
+    if (ae < pend && (p[ae] == '*' || p[ae] == '+' || p[ae] == '?')) {
+        q = p[ae];
+        qend = ae + 1;
+    }
+    if (!q) {
+        if (!rtx_re_atom(p, pi, ae, t, ti, tn, &nx)) return 0;
+        return rtx_re_seq(p, ae, pend, t, nx, tn, out);
+    }
+    min = (q == '+') ? 1 : 0;
+    max = (q == '?') ? 1 : 63;
+    nends = 0;
+    cur = ti;
+    n = 0;
+    if (min == 0) ends[nends++] = ti;
+    while (n < max) {
+        if (!rtx_re_atom(p, pi, ae, t, cur, tn, &nx)) break;
+        if (nx == cur) break;
+        n++;
+        cur = nx;
+        if (n >= min && nends < 64) ends[nends++] = cur;
+    }
+    if (nends == 0) return 0;
+    for (k = nends; k > 0; k--) {
+        if (rtx_re_seq(p, qend, pend, t, ends[k - 1], tn, &rest)) {
+            *out = rest;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int rtx_re_match(const char *pat, size_t plen, const char *t, size_t at,
+                        size_t n, size_t *end) {
+    size_t e;
+    if (!pat || plen == 0 || !t || !end) return 0;
+    rtx_re_caps = NULL;
+    rtx_re_plen = plen;
+    if (!rtx_re_exec(pat, 0, plen, t, at, n, &e)) return 0;
+    if (e <= at) return 0;
+    *end = e;
+    return 1;
+}
+
+static int rtx_re_match_caps(const char *pat, size_t plen, const char *t,
+                             size_t at, size_t n, size_t *end, RtxReCaps *caps) {
+    size_t e;
+    if (!rtx_re_match(pat, plen, t, at, n, &e)) return 0;
+    *end = e;
+    if (!caps) return 1;
+    memset(caps, 0, sizeof(*caps));
+    caps->s[0] = at;
+    caps->e[0] = e;
+    rtx_re_plen = plen;
+    rtx_re_caps = caps;
+    (void)rtx_re_exec(pat, 0, plen, t, at, n, &e);
+    rtx_re_caps = NULL;
+    caps->s[0] = at;
+    caps->e[0] = e;
+    return 1;
+}
+
+#endif /* RTX_TM_RE_H */

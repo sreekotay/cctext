@@ -7,7 +7,7 @@ Standalone Concurrent-C editor. Compiler repo is a toolchain, not a parent tree.
 - Piece tree: page store (original + spilled add) + red-black order-statistic tree (byte length and `'\n'` weights).
 - Sections: layout policy (`code` / `prose`).
 - Runs: style intervals inside a section (bold/italic/mono) plus syntax-token kinds.
-- Highlight: core lexer over `code` sections (C/CC keywords, strings, comments, numbers). Not a frontend concern. Later: `@grammar` or tree-sitter; same run list.
+- Highlight: interned scopes on runs; frontends theme a prefix. Spike lexer or a lowered TextMate table (`@grammar` parses `.tmLanguage.json`). Same run list.
 - Layout: `measure(run, bytes) -> width` and `line_height(run) -> height`. Raylib supplies glyph advances; `cctext` supplies `wcwidth`.
 - Commands and caret are byte offsets. Stream selection is `[sel_anchor, caret)`. Up/down keep a goal column (or EOL after End). Alt-arrows / Alt-drag is a column box.
 - Edits are replaces on a history stack (coalesced typing; large deletes omit inline hist bytes). Save writes pieces to a sibling temp file, preserves mode, fsyncs (file + best-effort dir), then renames. Dirty is `hist.head != saved_head`.

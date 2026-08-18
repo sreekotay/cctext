@@ -1,0 +1,360 @@
+#!ccc ccs
+/*
+ * Parse testdata/grammars/c.tmLanguage.json with @grammar(schema),
+ * lower each pattern, and agree with the hand-lowered C runtime.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/script/stdio.cch>
+#include <stdio.h>
+#include <string.h>
+#include <ccc/std/json.cch>
+#include "../core/document.cch"
+
+@grammar(rules) Json {~~~~
+    include JsonKeep
+    string:  [#'"' keep/decode(jstr)/encode(jstr_enc) any [some strchar | esc] #'"']
+~~~~}
+
+@grammar(schema) TmPattern {~~~~
+    use Json
+    Json.object [
+        "name"    name:    Json.string
+        "match"   match:   Json.string
+        "begin"   begin:   Json.string
+        "end"     end:     Json.string
+        "include" include: Json.string
+    ]
+~~~~}
+
+@grammar(schema) TmGrammar {~~~~
+    use Json
+    Json.ws
+    Json.object [
+        "name"      name:      Json.string
+        "scopeName" scopeName: Json.string
+        "patterns"  patterns:  Json.array of TmPattern
+    ]
+    Json.ws
+~~~~}
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static int slice_eq(CCSlice s, const char *lit) {
+    size_t n = strlen(lit);
+    return s.len == n && s.ptr && memcmp(s.ptr, lit, n) == 0;
+}
+
+static void slice_cpy(CCSlice s, char *dst, size_t cap) {
+    size_t n = s.len < cap - 1 ? s.len : cap - 1;
+    if (s.ptr && n) memcpy(dst, s.ptr, n);
+    dst[n] = 0;
+}
+
+static int join2(char *dst, size_t cap, const char *a, const char *b) {
+    int n = snprintf(dst, cap, "%s/%s", a, b);
+    return n > 0 && (size_t)n < cap;
+}
+
+int main(void) {
+    @errhandler(CCError e) { cc_error_log(e); return 1; }
+    char path[512];
+    FILE *fp;
+    char *buf = NULL;
+    long sz = 0;
+    CCArena arena = {0};
+    TmGrammar g;
+    RtxTmRt *want;
+    size_t i;
+
+    want = rtx_tm_c_rt();
+    expect(rtx_tm_load_dir[0] == '/', "grammar dir is absolute");
+    expect(rtx_tm_load_files == 3 && rtx_tm_nlangs == 3, "runtime loaded 3");
+    if (!want) {
+        fprintf(stderr, "no C grammar (dir=%s files=%zu us=%zu)\n",
+                rtx_tm_load_dir, rtx_tm_load_files, rtx_tm_load_us);
+        return 1;
+    }
+    expect(join2(path, sizeof path, rtx_tm_load_dir, "c.tmLanguage.json"),
+           "c grammar path");
+    fp = fopen(path, "rb");
+    expect(fp != NULL, "open c.tmLanguage.json");
+    if (!fp) return 1;
+    if (fseek(fp, 0, SEEK_END) != 0) return 1;
+    sz = ftell(fp);
+    if (sz <= 0) return 1;
+    rewind(fp);
+    buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) return 1;
+    if (fread(buf, 1, (size_t)sz, fp) != (size_t)sz) return 1;
+    buf[sz] = 0;
+    fclose(fp);
+
+    arena = cc_arena_create(1 << 20);
+    memset(&g, 0, sizeof g);
+    expect(TmGrammar_parse(buf, (size_t)sz, &arena, &g), "parse TmGrammar");
+    expect(slice_eq(g.name, "C"), "name C");
+    expect(slice_eq(g.scopeName, "source.c"), "scopeName source.c");
+    expect(g.patterns_n == 7, "seven top-level patterns");
+
+    expect(want && want->n >= 6, "flattened rules");
+    expect(want->n_exts >= 5, "fileTypes loaded");
+    {
+        int saw_inc = 0, saw_kw = 0, saw_re = 0;
+        for (i = 0; i < g.patterns_n; i++) {
+            char incl[64];
+            slice_cpy(g.patterns[i].include, incl, sizeof incl);
+            if (incl[0] == '#') saw_inc = 1;
+        }
+        expect(saw_inc, "schema saw include");
+        for (i = 0; i < want->n; i++) {
+            if (want->rules[i].op == RTX_TM_KEYWORDS) saw_kw = 1;
+            if (want->rules[i].op == RTX_TM_REGEX) saw_re = 1;
+        }
+        expect(saw_kw, "lowered keywords");
+        expect(saw_re, "leftover regex directive");
+        {
+            int saw_inner = 0;
+            for (i = 0; i < want->n; i++) {
+                if (want->rules[i].op == RTX_TM_LIT_SPAN &&
+                    want->rules[i].innern > 0) {
+                    saw_inner = 1;
+                }
+            }
+            expect(saw_inner, "string has nested patterns");
+        }
+    }
+    {
+        size_t end = 0;
+        const char *line = "#include <stdio.h>";
+        const char *pat = "#[ \\t]*(include|define)\\b";
+        expect(rtx_re_match(pat, strlen(pat), line, 0, strlen(line), &end),
+               "re match #include");
+        expect(end == 8, "#include length");
+        {
+            const char *p2 = "a*ab";
+            const char *t2 = "aaab";
+            end = 0;
+            expect(rtx_re_match(p2, 4, t2, 0, 4, &end) && end == 4,
+                   "re backtrack a*ab");
+        }
+        {
+            const char *pk = "\"([^\"]+)\"\\s*:";
+            const char *tk = "\"n\": -2.5";
+            RtxReCaps caps;
+            end = 0;
+            expect(rtx_re_match_caps(pk, strlen(pk), tk, 0, strlen(tk), &end,
+                                     &caps) &&
+                   end == 4 && caps.s[1] == 1 && caps.e[1] == 2,
+                   "re capture JSON key");
+        }
+    }
+
+    {
+        RtxDoc d = {0} @destroy;
+        size_t k;
+        int saw_kw = 0, saw_cmt = 0;
+        expect(join2(path, sizeof path, rtx_tm_load_dir, "../mixed.txt"),
+               "mixed path");
+        d.from_path(path) !>;
+        expect(d.path.ptr == NULL || !rtx_tm_for_path(d.path.ptr),
+               "txt uses spike");
+        d.destroy();
+        d.from_buffer("=== code ===\nint x; /* c */\n") !>;
+        expect(d.sec_len >= 2, "sections");
+        for (k = 0; k < d.run_len; k++) {
+            if (rtx_scope_kind(d.runs[k].style.scope) == RTX_HL_KEYWORD) {
+                saw_kw = 1;
+            }
+            if (rtx_scope_kind(d.runs[k].style.scope) == RTX_HL_COMMENT) {
+                saw_cmt = 1;
+            }
+        }
+        expect(saw_kw && saw_cmt, "spike scopes on from_buffer");
+    }
+
+    {
+        char cpath[512];
+        RtxDoc d = {0} @destroy;
+        size_t k;
+        int saw_kw = 0, saw_dir = 0, saw_esc = 0;
+        const char *nm = NULL;
+        expect(join2(cpath, sizeof cpath, rtx_tm_load_dir, "../samples/hello.c"),
+               "hello.c path");
+        d.from_path(cpath) !>;
+        expect(rtx_tm_for_path(d.path.ptr) == want, "c sample uses C TM");
+        for (k = 0; k < d.run_len; k++) {
+            const char *s = rtx_scope_name(d.runs[k].style.scope);
+            if (rtx_scope_kind(d.runs[k].style.scope) == RTX_HL_KEYWORD) {
+                saw_kw = 1;
+                if (s && strstr(s, "directive")) saw_dir = 1;
+                else nm = s;
+            }
+            if (s && strstr(s, "escape")) saw_esc = 1;
+        }
+        expect(saw_kw, "TM lexed int");
+        expect(saw_dir, "TM leftover #include");
+        expect(saw_esc, "nested string escape");
+        expect(nm && strncmp(nm, "keyword", 7) == 0, "keyword.control.c");
+    }
+
+    {
+        char jpath[512];
+        FILE *jf;
+        expect(join2(jpath, sizeof jpath, rtx_tm_load_dir, "json.tmLanguage.json"),
+               "json grammar path");
+        jf = fopen(jpath, "rb");
+        char *jbuf = NULL;
+        long jsz = 0;
+        TmGrammar jg;
+        RtxTmRt *jrt;
+        expect(jf != NULL, "open json.tmLanguage.json");
+        if (jf) {
+            if (fseek(jf, 0, SEEK_END) != 0) return 1;
+            jsz = ftell(jf);
+            if (jsz <= 0) return 1;
+            rewind(jf);
+            jbuf = (char *)malloc((size_t)jsz + 1);
+            if (!jbuf) return 1;
+            if (fread(jbuf, 1, (size_t)jsz, jf) != (size_t)jsz) return 1;
+            jbuf[jsz] = 0;
+            fclose(jf);
+            memset(&jg, 0, sizeof jg);
+            expect(TmGrammar_parse(jbuf, (size_t)jsz, &arena, &jg),
+                   "parse JSON TmGrammar");
+            expect(slice_eq(jg.name, "JSON"), "name JSON");
+            expect(slice_eq(jg.scopeName, "source.json"), "scopeName source.json");
+            expect(jg.patterns_n == 4, "four top-level JSON patterns");
+            jrt = rtx_tm_json_rt();
+            expect(jrt && jrt->n >= 4, "flattened JSON rules");
+            {
+                int saw_cap = 0;
+                for (i = 0; i < jrt->n; i++) {
+                    if (jrt->rules[i].op == RTX_TM_REGEX &&
+                        jrt->rules[i].cap[1] != RTX_SCOPE_NONE) {
+                        saw_cap = 1;
+                    }
+                }
+                expect(saw_cap, "JSON key captures interned");
+            }
+            expect(jrt->n_exts >= 1, "json fileTypes");
+            expect(rtx_tm_for_path("x.json") == jrt, "json path uses JSON TM");
+            expect(rtx_tm_for_path("x.c") == want, "c path still C TM");
+            free(jbuf);
+        }
+    }
+
+    {
+        char spath[512];
+        RtxDoc d = {0} @destroy;
+        size_t k;
+        int saw_str = 0, saw_num = 0, saw_kw = 0, saw_esc = 0, saw_prop = 0;
+        expect(join2(spath, sizeof spath, rtx_tm_load_dir,
+                     "../samples/config.json"),
+               "config.json path");
+        d.from_path(spath) !>;
+        expect(rtx_tm_for_path(d.path.ptr) == rtx_tm_json_rt(),
+               "json sample uses JSON TM");
+        expect(d.sec_len >= 1 && d.secs[0].kind == RTX_SEC_CODE, "json is code");
+        for (k = 0; k < d.run_len; k++) {
+            const char *s = rtx_scope_name(d.runs[k].style.scope);
+            if (rtx_scope_kind(d.runs[k].style.scope) == RTX_HL_STRING) {
+                saw_str = 1;
+            }
+            if (rtx_scope_kind(d.runs[k].style.scope) == RTX_HL_NUMBER) {
+                saw_num = 1;
+            }
+            if (rtx_scope_kind(d.runs[k].style.scope) == RTX_HL_KEYWORD) {
+                saw_kw = 1;
+            }
+            if (s && strstr(s, "escape")) saw_esc = 1;
+            if (s && strstr(s, "variable")) saw_prop = 1;
+        }
+        expect(saw_str, "JSON string");
+        expect(saw_num, "JSON number leftover regex");
+        expect(saw_kw, "JSON true");
+        expect(saw_esc, "JSON string escape");
+        expect(saw_prop, "JSON key capture");
+    }
+
+    {
+        char mpath[512];
+        FILE *mf;
+        expect(join2(mpath, sizeof mpath, rtx_tm_load_dir,
+                     "markdown.tmLanguage.json"),
+               "md grammar path");
+        mf = fopen(mpath, "rb");
+        char *mbuf = NULL;
+        long msz = 0;
+        TmGrammar mg;
+        RtxTmRt *mrt;
+        expect(mf != NULL, "open markdown.tmLanguage.json");
+        if (mf) {
+            if (fseek(mf, 0, SEEK_END) != 0) return 1;
+            msz = ftell(mf);
+            if (msz <= 0) return 1;
+            rewind(mf);
+            mbuf = (char *)malloc((size_t)msz + 1);
+            if (!mbuf) return 1;
+            if (fread(mbuf, 1, (size_t)msz, mf) != (size_t)msz) return 1;
+            mbuf[msz] = 0;
+            fclose(mf);
+            memset(&mg, 0, sizeof mg);
+            expect(TmGrammar_parse(mbuf, (size_t)msz, &arena, &mg),
+                   "parse Markdown TmGrammar");
+            expect(slice_eq(mg.name, "Markdown"), "name Markdown");
+            expect(slice_eq(mg.scopeName, "text.markdown"),
+                   "scopeName text.markdown");
+            expect(mg.patterns_n == 7, "seven top-level Markdown patterns");
+            mrt = rtx_tm_md_rt();
+            expect(mrt && mrt->n >= 6, "flattened Markdown rules");
+            expect(rtx_tm_for_path("x.md") == mrt, "md path uses Markdown TM");
+            expect(rtx_tm_for_path("x.markdown") == mrt,
+                   "markdown path uses Markdown TM");
+            expect(rtx_tm_for_path("x.c") == want, "c path still C after md");
+            free(mbuf);
+        }
+    }
+
+    {
+        char spath[512];
+        RtxDoc d = {0} @destroy;
+        size_t k;
+        int saw_h = 0, saw_bold = 0, saw_code = 0, saw_q = 0, saw_link = 0;
+        expect(join2(spath, sizeof spath, rtx_tm_load_dir, "../samples/readme.md"),
+               "readme.md path");
+        d.from_path(spath) !>;
+        expect(rtx_tm_for_path(d.path.ptr) == rtx_tm_md_rt(),
+               "md sample uses Markdown TM");
+        expect(d.sec_len >= 1 && d.secs[0].kind == RTX_SEC_CODE, "md is code");
+        for (k = 0; k < d.run_len; k++) {
+            const char *s = rtx_scope_name(d.runs[k].style.scope);
+            if (s && strstr(s, "heading")) saw_h = 1;
+            if (s && strstr(s, "bold")) saw_bold = 1;
+            if (s && strstr(s, "raw")) saw_code = 1;
+            if (s && strstr(s, "quote")) saw_q = 1;
+            if (s && strstr(s, "link")) saw_link = 1;
+        }
+        expect(saw_h, "Markdown heading");
+        expect(saw_bold, "Markdown bold");
+        expect(saw_code, "Markdown code");
+        expect(saw_q, "Markdown quote");
+        expect(saw_link, "Markdown link");
+    }
+
+    free(buf);
+    if (arena.base) arena.destroy();
+    if (fails) {
+        fprintf(stderr, "%d failure(s)\n", fails);
+        return 1;
+    }
+    printf("tm_grammar_smoke ok  patterns=%zu  langs=%zu  load_us=%zu  dir=%s\n",
+           g.patterns_n, rtx_tm_nlangs, rtx_tm_load_us, rtx_tm_load_dir);
+    return 0;
+}

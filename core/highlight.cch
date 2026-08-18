@@ -1,11 +1,14 @@
 #!ccc cch
 /*
- * Syntax highlight for code sections. Spike lexer: C / Concurrent-C keywords,
- * strings, comments, numbers. Produces RtxRun entries with .style.hl set.
- * Frontends map hl → color (ANSI or GPU). Not tree-sitter; replace later.
+ * Syntax highlight for code sections. Spike lexer emits interned scopes;
+ * a lowered TextMate runtime is used when the path matches a loaded grammar.
+ * Frontends theme scope → color. Window lex + lookback replay, plus
+ * stride checkpoints so a later window can restore the begin/end stack.
  */
 #ifndef RTX_HIGHLIGHT_H
 #define RTX_HIGHLIGHT_H
+
+#include "tm.cch"
 
 static int rtx_hl_ident_start(char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
@@ -32,22 +35,35 @@ static int rtx_hl_is_keyword(const char *s, size_t n) {
     return 0;
 }
 
-static int rtx_hl_add(RtxDoc *d, size_t start, size_t len, RtxHlKind hl) {
+static int rtx_hl_add_scope(RtxDoc *d, size_t start, size_t len, size_t emit_from,
+                            RtxScope scope) {
     RtxStyle st = {0};
-    if (!d || len == 0 || hl == RTX_HL_NONE) return 1;
-    st.hl = hl;
+    size_t end;
+    if (!d || len == 0 || scope == RTX_SCOPE_NONE) return 1;
+    end = start + len;
+    if (end <= emit_from) return 1;
+    if (start < emit_from) {
+        len = end - emit_from;
+        start = emit_from;
+    }
+    st.scope = scope;
     return rtx_doc_add_run(d, start, len, st);
 }
 
-static void !>(CCError) rtx_hl_range(RtxDoc *d, const char *buf, size_t base, size_t n) {
+static void !>(CCError) rtx_hl_spike(RtxDoc *d, const char *buf, size_t base,
+                                    size_t n, size_t emit_from) {
     size_t i = 0;
+    RtxScope sc_comment = rtx_scope_intern("comment");
+    RtxScope sc_string = rtx_scope_intern("string");
+    RtxScope sc_number = rtx_scope_intern("constant.numeric");
+    RtxScope sc_keyword = rtx_scope_intern("keyword");
     if (!d || !buf || n == 0) return cc_ok();
     while (i < n) {
         char c = buf[i];
         if (c == '/' && i + 1 < n && buf[i + 1] == '/') {
             size_t j = i + 2;
             while (j < n && buf[j] != '\n') j++;
-            if (!rtx_hl_add(d, base + i, j - i, RTX_HL_COMMENT)) {
+            if (!rtx_hl_add_scope(d, base + i, j - i, emit_from, sc_comment)) {
                 return cc_err(CC_ERR_OUT_OF_MEMORY, "hl run");
             }
             i = j;
@@ -56,7 +72,7 @@ static void !>(CCError) rtx_hl_range(RtxDoc *d, const char *buf, size_t base, si
             while (j + 1 < n && !(buf[j] == '*' && buf[j + 1] == '/')) j++;
             if (j + 1 < n) j += 2;
             else j = n;
-            if (!rtx_hl_add(d, base + i, j - i, RTX_HL_COMMENT)) {
+            if (!rtx_hl_add_scope(d, base + i, j - i, emit_from, sc_comment)) {
                 return cc_err(CC_ERR_OUT_OF_MEMORY, "hl run");
             }
             i = j;
@@ -67,7 +83,7 @@ static void !>(CCError) rtx_hl_range(RtxDoc *d, const char *buf, size_t base, si
                 else j++;
             }
             if (j < n) j++;
-            if (!rtx_hl_add(d, base + i, j - i, RTX_HL_STRING)) {
+            if (!rtx_hl_add_scope(d, base + i, j - i, emit_from, sc_string)) {
                 return cc_err(CC_ERR_OUT_OF_MEMORY, "hl run");
             }
             i = j;
@@ -78,7 +94,7 @@ static void !>(CCError) rtx_hl_range(RtxDoc *d, const char *buf, size_t base, si
                 else j++;
             }
             if (j < n) j++;
-            if (!rtx_hl_add(d, base + i, j - i, RTX_HL_STRING)) {
+            if (!rtx_hl_add_scope(d, base + i, j - i, emit_from, sc_string)) {
                 return cc_err(CC_ERR_OUT_OF_MEMORY, "hl run");
             }
             i = j;
@@ -89,7 +105,7 @@ static void !>(CCError) rtx_hl_range(RtxDoc *d, const char *buf, size_t base, si
                              (buf[j] >= 'A' && buf[j] <= 'F'))) {
                 j++;
             }
-            if (!rtx_hl_add(d, base + i, j - i, RTX_HL_NUMBER)) {
+            if (!rtx_hl_add_scope(d, base + i, j - i, emit_from, sc_number)) {
                 return cc_err(CC_ERR_OUT_OF_MEMORY, "hl run");
             }
             i = j;
@@ -97,7 +113,7 @@ static void !>(CCError) rtx_hl_range(RtxDoc *d, const char *buf, size_t base, si
             size_t j = i + 1;
             while (j < n && rtx_hl_ident(buf[j])) j++;
             if (rtx_hl_is_keyword(buf + i, j - i)) {
-                if (!rtx_hl_add(d, base + i, j - i, RTX_HL_KEYWORD)) {
+                if (!rtx_hl_add_scope(d, base + i, j - i, emit_from, sc_keyword)) {
                     return cc_err(CC_ERR_OUT_OF_MEMORY, "hl run");
                 }
             }
@@ -109,13 +125,23 @@ static void !>(CCError) rtx_hl_range(RtxDoc *d, const char *buf, size_t base, si
     return cc_ok();
 }
 
+static void !>(CCError) rtx_hl_range(RtxDoc *d, const char *buf, size_t base,
+                                    size_t n, size_t emit_from,
+                                    const RtxTmCkpt *seed, int plant) {
+    const RtxTmRt *rt;
+    if (!d || !buf || n == 0) return cc_ok();
+    rt = rtx_tm_for_path(d->path.ptr);
+    if (rt) return rtx_tm_lex(d, rt, buf, base, n, emit_from, seed, plant);
+    return rtx_hl_spike(d, buf, base, n, emit_from);
+}
+
 static void rtx_doc_hl_abort(RtxDoc *d) {
     size_t i;
     size_t o = 0;
     if (!d) return;
     for (i = 0; i < d->run_len; i++) {
         RtxRun r = d->runs[i];
-        int hl_only = r.style.hl != RTX_HL_NONE && !r.style.bold &&
+        int hl_only = r.style.scope != RTX_SCOPE_NONE && !r.style.bold &&
                       !r.style.italic && !r.style.mono;
         if (hl_only) continue;
         d->runs[o++] = r;
@@ -141,7 +167,9 @@ static void !>(CCError) rtx_doc_highlight(RtxDoc *d) {
             char[:] bytes = rtx_doc_analysis_span(d, lo, hi - lo) !>(e) {
                 return cc_err(e);
             };
-            rtx_hl_range(d, bytes.ptr, lo, bytes.len) !>(e) { return cc_err(e); };
+            rtx_hl_range(d, bytes.ptr, lo, bytes.len, lo, NULL, 1) !>(e) {
+                return cc_err(e);
+            };
         }
     }
     for (s = 0; s < d->sec_len; s++) {

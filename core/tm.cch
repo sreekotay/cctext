@@ -1,0 +1,925 @@
+#ifndef RTX_TM_H
+#define RTX_TM_H
+
+/*
+ * Lowered TextMate runtime: classified matchers + a begin/end stack.
+ * Grammars are *.tmLanguage.json loaded at first use. Directory is
+ * RTX_GRAMMARS, else <exe>/grammars, else <exe>/../testdata/grammars.
+ * Leftover match patterns use the tiny regex in tm_re.cch (not Onig).
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <time.h>
+#include <limits.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+#include "tm_re.cch"
+
+typedef enum {
+    RTX_TM_SKIP = 0,
+    RTX_TM_LIT_LINE,   /* literal, then to end of line */
+    RTX_TM_LIT_SPAN,   /* begin literal … end literal (stack) */
+    RTX_TM_KEYWORDS,   /* identifier in a '|' list */
+    RTX_TM_DIGITS,
+    RTX_TM_REGEX,      /* leftover TM match */
+} RtxTmOp;
+
+#define RTX_TM_CAPS 8
+
+typedef struct {
+    RtxTmOp op;
+    RtxScope scope;
+    const char *a;
+    const char *b;
+    size_t alen;
+    size_t blen;
+    unsigned short inner0;
+    unsigned short innern;
+    RtxScope cap[RTX_TM_CAPS];
+} RtxTmRule;
+
+typedef struct {
+    RtxTmRule *rules;
+    size_t n;
+    RtxTmRule inners[32];
+    size_t n_inners;
+    char exts[8][16];
+    size_t n_exts;
+} RtxTmRt;
+
+#define RTX_TM_STACK 32
+#define RTX_TM_RULES_MAX 64
+#define RTX_TM_REPO_MAX 16
+#define RTX_TM_KIDS 4
+#define RTX_TM_KIDPOOL 32
+
+static int rtx_tm_starts(const char *buf, size_t i, size_t n, const char *lit,
+                         size_t ln) {
+    if (!lit || ln == 0 || i + ln > n) return 0;
+    return memcmp(buf + i, lit, ln) == 0;
+}
+
+/* Classify one TM pattern. Unused fields are empty strings. */
+static int rtx_tm_lower_rule(const char *name, const char *match,
+                             const char *begin, const char *end,
+                             const char *incl, RtxTmRule *out) {
+    RtxTmRule z = {0};
+    if (!out) return 0;
+    *out = z;
+    if (incl && incl[0]) {
+        *out = z;
+        return 1;
+    }
+    if (name && name[0]) z.scope = rtx_scope_intern(name);
+    if (begin && begin[0] && end && end[0]) {
+        z.op = RTX_TM_LIT_SPAN;
+        z.a = begin;
+        z.b = end;
+        z.alen = strlen(begin);
+        z.blen = strlen(end);
+        *out = z;
+        return 1;
+    }
+    if (match && match[0]) {
+        size_t mlen = strlen(match);
+        if (mlen >= 3 && match[mlen - 1] == '*' && match[mlen - 2] == '.') {
+            size_t k;
+            int meta = 0;
+            for (k = 0; k + 2 < mlen; k++) {
+                char ch = match[k];
+                if (ch == '\\' || ch == '+' || ch == '*' || ch == '?' ||
+                    ch == '[' || ch == '(' || ch == '|' || ch == '.') {
+                    meta = 1;
+                    break;
+                }
+            }
+            if (!meta) {
+                z.op = RTX_TM_LIT_LINE;
+                z.a = match;
+                z.alen = mlen - 2;
+                *out = z;
+                return 1;
+            }
+        }
+        if (strcmp(match, "\\b[0-9]+\\b") == 0 ||
+            strcmp(match, "[0-9]+") == 0 || strcmp(match, "\\d+") == 0 ||
+            strcmp(match, "\\b\\d+\\b") == 0) {
+            z.op = RTX_TM_DIGITS;
+            *out = z;
+            return 1;
+        }
+        if (mlen >= 4 && match[0] == '\\' && match[1] == 'b' &&
+            match[2] == '(') {
+            const char *close = strstr(match, ")\\b");
+            if (close && close > match + 3) {
+                z.op = RTX_TM_KEYWORDS;
+                z.a = match + 3;
+                z.alen = (size_t)(close - (match + 3));
+                *out = z;
+                return 1;
+            }
+        }
+        z.op = RTX_TM_REGEX;
+        z.a = match;
+        z.alen = mlen;
+        *out = z;
+        return 1;
+    }
+    return 1;
+}
+
+static int rtx_tm_word_in_list(const char *word, size_t n, const char *list,
+                               size_t list_n) {
+    size_t i = 0;
+    if (!word || !list || n == 0) return 0;
+    while (i < list_n) {
+        size_t j = i;
+        while (j < list_n && list[j] != '|') j++;
+        if (j - i == n && memcmp(list + i, word, n) == 0) return 1;
+        i = j < list_n ? j + 1 : j;
+    }
+    return 0;
+}
+
+static int rtx_tm_add(RtxDoc *d, size_t start, size_t end, size_t emit_from,
+                      RtxScope scope) {
+    RtxStyle st = {0};
+    if (!d || end <= start || scope == RTX_SCOPE_NONE) return 1;
+    if (end <= emit_from) return 1;
+    if (start < emit_from) start = emit_from;
+    if (end <= start) return 1;
+    st.scope = scope;
+    return rtx_doc_add_run(d, start, end - start, st);
+}
+
+static int rtx_tm_try_rule(RtxDoc *d, const RtxTmRt *rt, const RtxTmRule *rule,
+                           const char *buf, size_t base, size_t n, size_t emit_from,
+                           size_t *i, size_t *sp, size_t *stk_rule, size_t *stk_off,
+                           int allow_span) {
+    char c;
+    if (!rule || !i) return 0;
+    c = buf[*i];
+    if (rule->op == RTX_TM_LIT_LINE &&
+        rtx_tm_starts(buf, *i, n, rule->a, rule->alen)) {
+        size_t j = *i + rule->alen;
+        while (j < n && buf[j] != '\n') j++;
+        if (!rtx_tm_add(d, base + *i, base + j, emit_from, rule->scope)) return -1;
+        *i = j;
+        return 1;
+    }
+    if (allow_span && rule->op == RTX_TM_LIT_SPAN &&
+        rtx_tm_starts(buf, *i, n, rule->a, rule->alen)) {
+        if (*sp >= RTX_TM_STACK) return -1;
+        stk_rule[*sp] = (size_t)(rule - rt->rules);
+        stk_off[*sp] = *i;
+        (*sp)++;
+        *i += rule->alen;
+        return 1;
+    }
+    if (rule->op == RTX_TM_DIGITS && c >= '0' && c <= '9') {
+        size_t j = *i + 1;
+        while (j < n && ((buf[j] >= '0' && buf[j] <= '9') || buf[j] == 'x' ||
+                         (buf[j] >= 'a' && buf[j] <= 'f') ||
+                         (buf[j] >= 'A' && buf[j] <= 'F'))) {
+            j++;
+        }
+        if (!rtx_tm_add(d, base + *i, base + j, emit_from, rule->scope)) return -1;
+        *i = j;
+        return 1;
+    }
+    if (rule->op == RTX_TM_REGEX) {
+        size_t e = 0;
+        RtxReCaps caps;
+        if (rtx_re_match_caps(rule->a, rule->alen, buf, *i, n, &e, &caps)) {
+            int g;
+            if (!rtx_tm_add(d, base + *i, base + e, emit_from, rule->scope)) {
+                return -1;
+            }
+            for (g = 1; g < RTX_RE_GROUPS && g < RTX_TM_CAPS; g++) {
+                if (rule->cap[g] && caps.e[g] > caps.s[g]) {
+                    if (!rtx_tm_add(d, base + caps.s[g], base + caps.e[g],
+                                    emit_from, rule->cap[g])) {
+                        return -1;
+                    }
+                }
+            }
+            *i = e;
+            return 1;
+        }
+    }
+    if (rule->op == RTX_TM_KEYWORDS &&
+        ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_')) {
+        size_t j = *i + 1;
+        while (j < n && ((buf[j] >= 'A' && buf[j] <= 'Z') ||
+                         (buf[j] >= 'a' && buf[j] <= 'z') ||
+                         (buf[j] >= '0' && buf[j] <= '9') || buf[j] == '_')) {
+            j++;
+        }
+        if (rtx_tm_word_in_list(buf + *i, j - *i, rule->a, rule->alen)) {
+            if (!rtx_tm_add(d, base + *i, base + j, emit_from, rule->scope)) {
+                return -1;
+            }
+        }
+        *i = j;
+        return 1;
+    }
+    return 0;
+}
+
+static void !>(CCError) rtx_tm_lex(RtxDoc *d, const RtxTmRt *rt, const char *buf,
+                                  size_t base, size_t n, size_t emit_from,
+                                  const RtxTmCkpt *seed, int plant) {
+    size_t i = 0;
+    size_t sp = 0;
+    size_t stk_rule[RTX_TM_STACK];
+    size_t stk_off[RTX_TM_STACK];
+    size_t next_stride;
+    if (!d || !rt || !buf || n == 0) return cc_ok();
+    if (seed && seed->n) {
+        size_t k, lim;
+        lim = seed->n < (unsigned char)RTX_TM_STACK ? seed->n
+                                                    : (unsigned char)RTX_TM_STACK;
+        for (k = 0; k < lim; k++) {
+            stk_rule[k] = seed->rule[k];
+            stk_off[k] = 0;
+        }
+        sp = lim;
+    }
+    next_stride = ((base / (size_t)RTX_TM_CKPT_STRIDE) + 1) *
+                  (size_t)RTX_TM_CKPT_STRIDE;
+    while (i < n) {
+        if (sp > 0) {
+            RtxTmRule *fr = &rt->rules[stk_rule[sp - 1]];
+            size_t k;
+            int inner_hit = 0;
+            for (k = 0; k < fr->innern; k++) {
+                int t = rtx_tm_try_rule(d, rt, &rt->inners[fr->inner0 + k], buf,
+                                        base, n, emit_from, &i, &sp, stk_rule,
+                                        stk_off, 0);
+                if (t < 0) return cc_err(CC_ERR_OUT_OF_MEMORY, "tm run");
+                if (t > 0) {
+                    inner_hit = 1;
+                    break;
+                }
+            }
+            if (inner_hit) continue;
+            if (fr->blen == 1 && buf[i] == '\\' && i + 1 < n) {
+                i += 2;
+                continue;
+            }
+            if (fr->op == RTX_TM_LIT_SPAN &&
+                rtx_tm_starts(buf, i, n, fr->b, fr->blen)) {
+                if (!rtx_tm_add(d, base + stk_off[sp - 1],
+                                base + i + fr->blen, emit_from, fr->scope)) {
+                    return cc_err(CC_ERR_OUT_OF_MEMORY, "tm run");
+                }
+                i += fr->blen;
+                sp--;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        {
+            size_t r;
+            int hit = 0;
+            for (r = 0; r < rt->n; r++) {
+                int t = rtx_tm_try_rule(d, rt, &rt->rules[r], buf, base, n,
+                                        emit_from, &i, &sp, stk_rule, stk_off, 1);
+                if (t < 0) return cc_err(CC_ERR_OUT_OF_MEMORY, "tm run");
+                if (t > 0) {
+                    hit = 1;
+                    break;
+                }
+            }
+            if (!hit) i++;
+        }
+        if (plant && base + i >= next_stride) {
+            rtx_tm_ckpt_add(d, base + i, sp, stk_rule);
+            next_stride += (size_t)RTX_TM_CKPT_STRIDE;
+        }
+    }
+    if (plant) rtx_tm_ckpt_add(d, base + n, sp, stk_rule);
+    if (sp > 0) {
+        RtxTmRule *fr = &rt->rules[stk_rule[sp - 1]];
+        if (!rtx_tm_add(d, base + stk_off[sp - 1], base + n, emit_from,
+                        fr->scope)) {
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "tm run");
+        }
+    }
+    return cc_ok();
+}
+
+typedef struct {
+    char name[128];
+    char match[512];
+    char begin[64];
+    char end[64];
+    char incl[64];
+    char capn[RTX_TM_CAPS][128];
+    unsigned char n_kids;
+    unsigned short kids[RTX_TM_KIDS];
+} RtxTmPat;
+
+typedef struct {
+    char key[64];
+    RtxTmPat pat;
+} RtxTmRepoEnt;
+
+#define RTX_TM_LANGS 8
+
+typedef struct {
+    RtxTmPat pats[RTX_TM_RULES_MAX];
+    size_t patn;
+    RtxTmRule rules[RTX_TM_RULES_MAX];
+    RtxTmPat kids[RTX_TM_KIDPOOL];
+    size_t kidn;
+    RtxTmRt rt;
+    int ready;
+} RtxTmLang;
+
+static RtxTmLang rtx_tm_langs[RTX_TM_LANGS];
+static size_t rtx_tm_nlangs;
+static int rtx_tm_reg_ready;
+static RtxTmLang *rtx_tm_cur;
+static char *rtx_tm_load_file;
+static char rtx_tm_load_dir[256];
+static size_t rtx_tm_load_us;
+static size_t rtx_tm_load_files;
+
+typedef struct {
+    const char *s;
+    size_t n;
+    size_t i;
+} RtxJw;
+
+static void rtx_jw_ws(RtxJw *j) {
+    while (j->i < j->n) {
+        char c = j->s[j->i];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+        j->i++;
+    }
+}
+
+static int rtx_jw_eat(RtxJw *j, char c) {
+    rtx_jw_ws(j);
+    if (j->i >= j->n || j->s[j->i] != c) return 0;
+    j->i++;
+    return 1;
+}
+
+static int rtx_jw_string(RtxJw *j, char *dst, size_t cap) {
+    size_t o = 0;
+    rtx_jw_ws(j);
+    if (j->i >= j->n || j->s[j->i] != '"') return 0;
+    j->i++;
+    while (j->i < j->n && j->s[j->i] != '"') {
+        char c = j->s[j->i++];
+        if (c == '\\' && j->i < j->n) {
+            char e = j->s[j->i++];
+            if (e == 'n') c = '\n';
+            else if (e == 't') c = '\t';
+            else if (e == 'r') c = '\r';
+            else c = e;
+        }
+        if (o + 1 < cap) dst[o++] = c;
+    }
+    if (j->i >= j->n || j->s[j->i] != '"') return 0;
+    j->i++;
+    if (dst && cap) dst[o] = 0;
+    return 1;
+}
+
+static int rtx_jw_skip(RtxJw *j);
+
+static int rtx_jw_skip_object(RtxJw *j) {
+    if (!rtx_jw_eat(j, '{')) return 0;
+    rtx_jw_ws(j);
+    if (rtx_jw_eat(j, '}')) return 1;
+    for (;;) {
+        char k[64];
+        if (!rtx_jw_string(j, k, sizeof k) || !rtx_jw_eat(j, ':') ||
+            !rtx_jw_skip(j)) {
+            return 0;
+        }
+        rtx_jw_ws(j);
+        if (rtx_jw_eat(j, '}')) return 1;
+        if (!rtx_jw_eat(j, ',')) return 0;
+    }
+}
+
+static int rtx_jw_skip(RtxJw *j) {
+    rtx_jw_ws(j);
+    if (j->i >= j->n) return 0;
+    if (j->s[j->i] == '"') {
+        char tmp[8];
+        return rtx_jw_string(j, tmp, sizeof tmp);
+    }
+    if (j->s[j->i] == '{') return rtx_jw_skip_object(j);
+    if (j->s[j->i] == '[') {
+        j->i++;
+        rtx_jw_ws(j);
+        if (rtx_jw_eat(j, ']')) return 1;
+        for (;;) {
+            if (!rtx_jw_skip(j)) return 0;
+            rtx_jw_ws(j);
+            if (rtx_jw_eat(j, ']')) return 1;
+            if (!rtx_jw_eat(j, ',')) return 0;
+        }
+    }
+    while (j->i < j->n) {
+        char c = j->s[j->i];
+        if (c == ',' || c == '}' || c == ']' || c == ' ' || c == '\n' ||
+            c == '\t' || c == '\r') {
+            break;
+        }
+        j->i++;
+    }
+    return 1;
+}
+
+static void rtx_tm_pat_clear(RtxTmPat *p) {
+    size_t i;
+    if (!p) return;
+    p->name[0] = p->match[0] = p->begin[0] = p->end[0] = p->incl[0] = 0;
+    p->n_kids = 0;
+    for (i = 0; i < (size_t)RTX_TM_CAPS; i++) p->capn[i][0] = 0;
+}
+
+static int rtx_jw_pattern(RtxJw *j, RtxTmPat *p);
+
+static int rtx_jw_pattern_fields(RtxJw *j, RtxTmPat *p) {
+    rtx_tm_pat_clear(p);
+    if (!rtx_jw_eat(j, '{')) return 0;
+    rtx_jw_ws(j);
+    if (rtx_jw_eat(j, '}')) return 1;
+    for (;;) {
+        char key[32];
+        if (!rtx_jw_string(j, key, sizeof key) || !rtx_jw_eat(j, ':')) return 0;
+        if (strcmp(key, "name") == 0) {
+            if (!rtx_jw_string(j, p->name, sizeof p->name)) return 0;
+        } else if (strcmp(key, "match") == 0) {
+            if (!rtx_jw_string(j, p->match, sizeof p->match)) return 0;
+        } else if (strcmp(key, "begin") == 0) {
+            if (!rtx_jw_string(j, p->begin, sizeof p->begin)) return 0;
+        } else if (strcmp(key, "end") == 0) {
+            if (!rtx_jw_string(j, p->end, sizeof p->end)) return 0;
+        } else if (strcmp(key, "include") == 0) {
+            if (!rtx_jw_string(j, p->incl, sizeof p->incl)) return 0;
+        } else if (strcmp(key, "patterns") == 0) {
+            if (!rtx_jw_eat(j, '[')) return 0;
+            rtx_jw_ws(j);
+            if (!rtx_jw_eat(j, ']')) {
+                for (;;) {
+                    if (!rtx_tm_cur || rtx_tm_cur->kidn >= RTX_TM_KIDPOOL ||
+                        p->n_kids >= RTX_TM_KIDS) {
+                        return 0;
+                    }
+                    if (!rtx_jw_pattern(j, &rtx_tm_cur->kids[rtx_tm_cur->kidn])) {
+                        return 0;
+                    }
+                    p->kids[p->n_kids++] = (unsigned short)rtx_tm_cur->kidn;
+                    rtx_tm_cur->kidn++;
+                    rtx_jw_ws(j);
+                    if (rtx_jw_eat(j, ']')) break;
+                    if (!rtx_jw_eat(j, ',')) return 0;
+                }
+            }
+        } else if (strcmp(key, "captures") == 0) {
+            if (!rtx_jw_eat(j, '{')) return 0;
+            rtx_jw_ws(j);
+            if (!rtx_jw_eat(j, '}')) {
+                for (;;) {
+                    char gk[8];
+                    int gi;
+                    RtxTmPat cap;
+                    if (!rtx_jw_string(j, gk, sizeof gk) || !rtx_jw_eat(j, ':')) {
+                        return 0;
+                    }
+                    gi = atoi(gk);
+                    if (!rtx_jw_pattern(j, &cap)) return 0;
+                    if (gi >= 0 && gi < RTX_TM_CAPS && cap.name[0]) {
+                        strncpy(p->capn[gi], cap.name, 127);
+                        p->capn[gi][127] = 0;
+                    }
+                    rtx_jw_ws(j);
+                    if (rtx_jw_eat(j, '}')) break;
+                    if (!rtx_jw_eat(j, ',')) return 0;
+                }
+            }
+        } else if (!rtx_jw_skip(j)) {
+            return 0;
+        }
+        rtx_jw_ws(j);
+        if (rtx_jw_eat(j, '}')) return 1;
+        if (!rtx_jw_eat(j, ',')) return 0;
+    }
+}
+
+static int rtx_jw_pattern(RtxJw *j, RtxTmPat *p) {
+    return rtx_jw_pattern_fields(j, p);
+}
+
+static int rtx_tm_add_lowered(RtxTmRt *rt, const RtxTmPat *p) {
+    RtxTmRule rule;
+    if (!rt || !p || rt->n >= RTX_TM_RULES_MAX) return 0;
+    if (!rtx_tm_lower_rule(p->name, p->match, p->begin, p->end, p->incl, &rule)) {
+        return 0;
+    }
+    if (rule.op == RTX_TM_SKIP) return 1;
+    rt->rules[rt->n] = rule;
+    rt->n++;
+    return 1;
+}
+
+static void rtx_tm_intern_caps(RtxTmRule *rule, const RtxTmPat *p) {
+    size_t i;
+    if (!rule || !p) return;
+    for (i = 0; i < (size_t)RTX_TM_CAPS; i++) {
+        rule->cap[i] = p->capn[i][0] ? rtx_scope_intern(p->capn[i])
+                                     : RTX_SCOPE_NONE;
+    }
+}
+
+static void rtx_tm_bind_rule(RtxTmRule *rule, RtxTmPat *stable) {
+    if (!rule || !stable) return;
+    if (rule->op == RTX_TM_LIT_LINE || rule->op == RTX_TM_KEYWORDS ||
+        rule->op == RTX_TM_REGEX) {
+        rule->a = stable->match;
+        if (rule->op == RTX_TM_LIT_LINE) {
+            size_t m = strlen(rule->a);
+            rule->alen = (m >= 2) ? m - 2 : m;
+        } else if (rule->op == RTX_TM_KEYWORDS) {
+            const char *m = stable->match;
+            const char *close = strstr(m, ")\\b");
+            if (m[0] == '\\' && m[1] == 'b' && m[2] == '(' && close) {
+                rule->a = m + 3;
+                rule->alen = (size_t)(close - (m + 3));
+            }
+        } else {
+            rule->a = stable->match;
+            rule->alen = strlen(rule->a);
+        }
+    }
+    if (rule->op == RTX_TM_LIT_SPAN) {
+        rule->a = stable->begin;
+        rule->b = stable->end;
+        rule->alen = strlen(rule->a);
+        rule->blen = strlen(rule->b);
+    }
+}
+
+static int rtx_tm_add_inner(RtxTmRt *rt, const RtxTmPat *p) {
+    RtxTmRule rule;
+    size_t slot;
+    if (!rt || !p || !rtx_tm_cur || rt->n_inners >= 32 ||
+        rtx_tm_cur->patn >= RTX_TM_RULES_MAX) {
+        return 0;
+    }
+    slot = rtx_tm_cur->patn++;
+    rtx_tm_cur->pats[slot] = *p;
+    if (!rtx_tm_lower_rule(rtx_tm_cur->pats[slot].name,
+                           rtx_tm_cur->pats[slot].match,
+                           rtx_tm_cur->pats[slot].begin,
+                           rtx_tm_cur->pats[slot].end,
+                           rtx_tm_cur->pats[slot].incl, &rule)) {
+        return 0;
+    }
+    if (rule.op == RTX_TM_SKIP) return 1;
+    rtx_tm_bind_rule(&rule, &rtx_tm_cur->pats[slot]);
+    rtx_tm_intern_caps(&rule, &rtx_tm_cur->pats[slot]);
+    rt->inners[rt->n_inners++] = rule;
+    return 1;
+}
+
+static int rtx_tm_flatten(RtxTmRt *rt, const RtxTmPat *src, size_t nsrc,
+                          const RtxTmRepoEnt *repo, size_t nrepo, int depth) {
+    size_t i;
+    if (depth > 8) return 0;
+    for (i = 0; i < nsrc; i++) {
+        const RtxTmPat *p = &src[i];
+        if (p->incl[0] == '#' && p->incl[1]) {
+            size_t r;
+            int found = 0;
+            for (r = 0; r < nrepo; r++) {
+                if (strcmp(repo[r].key, p->incl + 1) == 0) {
+                    if (!rtx_tm_flatten(rt, &repo[r].pat, 1, repo, nrepo,
+                                        depth + 1)) {
+                        return 0;
+                    }
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) continue;
+            continue;
+        }
+        if (rt->n >= RTX_TM_RULES_MAX || !rtx_tm_cur ||
+            rtx_tm_cur->patn >= RTX_TM_RULES_MAX) {
+            return 0;
+        }
+        {
+            size_t at = rtx_tm_cur->patn++;
+            size_t before = rt->n;
+            rtx_tm_cur->pats[at] = *p;
+            if (!rtx_tm_add_lowered(rt, &rtx_tm_cur->pats[at])) return 0;
+            if (rt->n == before) continue;
+            rtx_tm_bind_rule(&rt->rules[rt->n - 1], &rtx_tm_cur->pats[at]);
+            rtx_tm_intern_caps(&rt->rules[rt->n - 1], &rtx_tm_cur->pats[at]);
+            if (rt->rules[rt->n - 1].op == RTX_TM_LIT_SPAN && p->n_kids) {
+                size_t k;
+                rt->rules[rt->n - 1].inner0 = (unsigned short)rt->n_inners;
+                for (k = 0; k < p->n_kids; k++) {
+                    if (!rtx_tm_add_inner(rt, &rtx_tm_cur->kids[p->kids[k]])) {
+                        return 0;
+                    }
+                }
+                rt->rules[rt->n - 1].innern =
+                    (unsigned short)(rt->n_inners - rt->rules[rt->n - 1].inner0);
+            }
+        }
+    }
+    return 1;
+}
+
+static int rtx_tm_load_json(const char *json, size_t n, RtxTmLang *lang) {
+    RtxJw j;
+    RtxTmPat top[RTX_TM_RULES_MAX];
+    RtxTmRepoEnt repo[RTX_TM_REPO_MAX];
+    size_t ntop = 0;
+    size_t nrepo = 0;
+    int ok = 0;
+    if (!json || !lang) return 0;
+    memset(lang, 0, sizeof(*lang));
+    lang->rt.rules = lang->rules;
+    rtx_tm_cur = lang;
+    j.s = json;
+    j.n = n;
+    j.i = 0;
+    if (!rtx_jw_eat(&j, '{')) goto done;
+    rtx_jw_ws(&j);
+    if (rtx_jw_eat(&j, '}')) {
+        ok = 1;
+        goto done;
+    }
+    for (;;) {
+        char key[32];
+        if (!rtx_jw_string(&j, key, sizeof key) || !rtx_jw_eat(&j, ':')) goto done;
+        if (strcmp(key, "fileTypes") == 0) {
+            if (!rtx_jw_eat(&j, '[')) goto done;
+            rtx_jw_ws(&j);
+            if (!rtx_jw_eat(&j, ']')) {
+                for (;;) {
+                    char ext[16];
+                    if (!rtx_jw_string(&j, ext, sizeof ext)) goto done;
+                    if (lang->rt.n_exts < 8) {
+                        strncpy(lang->rt.exts[lang->rt.n_exts], ext, 15);
+                        lang->rt.exts[lang->rt.n_exts][15] = 0;
+                        lang->rt.n_exts++;
+                    }
+                    rtx_jw_ws(&j);
+                    if (rtx_jw_eat(&j, ']')) break;
+                    if (!rtx_jw_eat(&j, ',')) goto done;
+                }
+            }
+        } else if (strcmp(key, "patterns") == 0) {
+            if (!rtx_jw_eat(&j, '[')) goto done;
+            rtx_jw_ws(&j);
+            if (!rtx_jw_eat(&j, ']')) {
+                for (;;) {
+                    if (ntop >= RTX_TM_RULES_MAX) goto done;
+                    if (!rtx_jw_pattern(&j, &top[ntop])) goto done;
+                    ntop++;
+                    rtx_jw_ws(&j);
+                    if (rtx_jw_eat(&j, ']')) break;
+                    if (!rtx_jw_eat(&j, ',')) goto done;
+                }
+            }
+        } else if (strcmp(key, "repository") == 0) {
+            if (!rtx_jw_eat(&j, '{')) goto done;
+            rtx_jw_ws(&j);
+            if (!rtx_jw_eat(&j, '}')) {
+                for (;;) {
+                    if (nrepo >= RTX_TM_REPO_MAX) goto done;
+                    if (!rtx_jw_string(&j, repo[nrepo].key, sizeof repo[nrepo].key)) {
+                        goto done;
+                    }
+                    if (!rtx_jw_eat(&j, ':')) goto done;
+                    if (!rtx_jw_pattern(&j, &repo[nrepo].pat)) goto done;
+                    nrepo++;
+                    rtx_jw_ws(&j);
+                    if (rtx_jw_eat(&j, '}')) break;
+                    if (!rtx_jw_eat(&j, ',')) goto done;
+                }
+            }
+        } else if (!rtx_jw_skip(&j)) {
+            goto done;
+        }
+        rtx_jw_ws(&j);
+        if (rtx_jw_eat(&j, '}')) break;
+        if (!rtx_jw_eat(&j, ',')) goto done;
+    }
+    ok = rtx_tm_flatten(&lang->rt, top, ntop, repo, nrepo, 0);
+done:
+    rtx_tm_cur = NULL;
+    return ok;
+}
+
+static int rtx_tm_load_path(const char *path, RtxTmLang *lang) {
+    FILE *fp;
+    long sz;
+    if (!path || !lang) return 0;
+    fp = fopen(path, "rb");
+    if (!fp) return 0;
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return 0;
+    }
+    sz = ftell(fp);
+    if (sz <= 0) {
+        fclose(fp);
+        return 0;
+    }
+    rewind(fp);
+    free(rtx_tm_load_file);
+    rtx_tm_load_file = (char *)malloc((size_t)sz + 1);
+    if (!rtx_tm_load_file) {
+        fclose(fp);
+        return 0;
+    }
+    if (fread(rtx_tm_load_file, 1, (size_t)sz, fp) != (size_t)sz) {
+        fclose(fp);
+        return 0;
+    }
+    fclose(fp);
+    rtx_tm_load_file[sz] = 0;
+    return rtx_tm_load_json(rtx_tm_load_file, (size_t)sz, lang);
+}
+
+static int rtx_tm_reg_add_path(const char *path) {
+    if (rtx_tm_nlangs >= RTX_TM_LANGS) return 0;
+    if (!rtx_tm_load_path(path, &rtx_tm_langs[rtx_tm_nlangs])) return 0;
+    rtx_tm_langs[rtx_tm_nlangs].ready = 1;
+    rtx_tm_nlangs++;
+    return 1;
+}
+
+static int rtx_tm_is_tmlang(const char *name) {
+    const char *suf = ".tmLanguage.json";
+    size_t n, sn;
+    if (!name) return 0;
+    n = strlen(name);
+    sn = strlen(suf);
+    return n > sn && strcmp(name + n - sn, suf) == 0;
+}
+
+static size_t rtx_tm_reg_load_dir(const char *dir) {
+    DIR *d;
+    struct dirent *e;
+    size_t added = 0;
+    if (!dir || !dir[0]) return 0;
+    d = opendir(dir);
+    if (!d) return 0;
+    while ((e = readdir(d))) {
+        char path[512];
+        int n;
+        if (!rtx_tm_is_tmlang(e->d_name)) continue;
+        n = snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        if (n < 0 || (size_t)n >= sizeof path) continue;
+        if (rtx_tm_reg_add_path(path)) added++;
+    }
+    closedir(d);
+    return added;
+}
+
+static int rtx_tm_copy_path(char *dst, size_t cap, const char *src) {
+    size_t n;
+    if (!dst || !src || cap == 0) return 0;
+    n = strlen(src);
+    if (n + 1 > cap) return 0;
+    memcpy(dst, src, n + 1);
+    return 1;
+}
+
+static int rtx_tm_exe_dir(char *dst, size_t cap) {
+    char exe[PATH_MAX];
+    char *slash;
+#ifdef __APPLE__
+    char raw[PATH_MAX];
+    uint32_t n = (uint32_t)sizeof raw;
+    if (_NSGetExecutablePath(raw, &n) != 0) return 0;
+    if (!realpath(raw, exe)) return 0;
+#else
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return 0;
+    exe[n] = 0;
+#endif
+    slash = strrchr(exe, '/');
+    if (!slash || slash == exe) return 0;
+    *slash = 0;
+    return rtx_tm_copy_path(dst, cap, exe);
+}
+
+static int rtx_tm_dir_has_tmlang(const char *dir) {
+    DIR *d;
+    struct dirent *e;
+    if (!dir || !dir[0]) return 0;
+    d = opendir(dir);
+    if (!d) return 0;
+    while ((e = readdir(d))) {
+        if (rtx_tm_is_tmlang(e->d_name)) {
+            closedir(d);
+            return 1;
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+static int rtx_tm_store_dir(char *dst, size_t cap, const char *path) {
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved)) return rtx_tm_copy_path(dst, cap, resolved);
+    return rtx_tm_copy_path(dst, cap, path);
+}
+
+static int rtx_tm_pick_dir(char *dst, size_t cap) {
+    const char *env = getenv("RTX_GRAMMARS");
+    char exe[PATH_MAX];
+    char cand[PATH_MAX];
+    int n;
+    if (env && env[0]) return rtx_tm_store_dir(dst, cap, env);
+    if (!rtx_tm_exe_dir(exe, sizeof exe)) return 0;
+    n = snprintf(cand, sizeof cand, "%s/grammars", exe);
+    if (n > 0 && (size_t)n < sizeof cand && rtx_tm_dir_has_tmlang(cand)) {
+        return rtx_tm_store_dir(dst, cap, cand);
+    }
+    n = snprintf(cand, sizeof cand, "%s/../testdata/grammars", exe);
+    if (n > 0 && (size_t)n < sizeof cand && rtx_tm_dir_has_tmlang(cand)) {
+        return rtx_tm_store_dir(dst, cap, cand);
+    }
+    n = snprintf(cand, sizeof cand, "%s/grammars", exe);
+    if (n <= 0 || (size_t)n >= sizeof cand) return 0;
+    return rtx_tm_store_dir(dst, cap, cand);
+}
+
+static void rtx_tm_reg_init(void) {
+    struct timespec a, b;
+    if (rtx_tm_reg_ready) return;
+    if (!rtx_tm_pick_dir(rtx_tm_load_dir, sizeof rtx_tm_load_dir)) {
+        rtx_tm_load_dir[0] = 0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    rtx_tm_load_files = rtx_tm_reg_load_dir(rtx_tm_load_dir);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    rtx_tm_load_us = (size_t)((b.tv_sec - a.tv_sec) * 1000000L +
+                              (b.tv_nsec - a.tv_nsec) / 1000L);
+    rtx_tm_reg_ready = 1;
+}
+
+static int rtx_tm_ext_ok(const RtxTmRt *rt, const char *ext) {
+    size_t i;
+    if (!rt || !ext || rt->n_exts == 0) return 0;
+    for (i = 0; i < rt->n_exts; i++) {
+        if (strcmp(rt->exts[i], ext) == 0) return 1;
+    }
+    return 0;
+}
+
+static RtxTmRt *rtx_tm_rt_for_ext(const char *ext) {
+    size_t i;
+    rtx_tm_reg_init();
+    if (!ext) return NULL;
+    for (i = 0; i < rtx_tm_nlangs; i++) {
+        if (rtx_tm_langs[i].ready && rtx_tm_ext_ok(&rtx_tm_langs[i].rt, ext)) {
+            return &rtx_tm_langs[i].rt;
+        }
+    }
+    return NULL;
+}
+
+static RtxTmRt *rtx_tm_c_rt(void) {
+    return rtx_tm_rt_for_ext("c");
+}
+
+static RtxTmRt *rtx_tm_json_rt(void) {
+    return rtx_tm_rt_for_ext("json");
+}
+
+static RtxTmRt *rtx_tm_md_rt(void) {
+    return rtx_tm_rt_for_ext("md");
+}
+
+static const RtxTmRt *rtx_tm_for_path(const char *path) {
+    const char *dot;
+    if (!path) return NULL;
+    dot = strrchr(path, '.');
+    if (!dot || !dot[1]) return NULL;
+    return rtx_tm_rt_for_ext(dot + 1);
+}
+
+#endif /* RTX_TM_H */
