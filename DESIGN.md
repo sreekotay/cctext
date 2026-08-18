@@ -1,6 +1,6 @@
 # Design
 
-One document core, two frontends (`cctext`, `raytext`). Memory is owned or it is a view. Lifetime is a field, not a protocol. The document type is as wide as the domain — a face is reach at the call site, not a smaller struct. A TU’s write is the function that accepts only legal values for that unit; that is what the header exports. Ownership is handled at the call site.
+One document core, two frontends (`cctext`, `raytext`). Memory is owned or it is a view. Lifetime is a field, not a protocol. The document type is as wide as the domain — a face is reach at the call site, not a smaller struct. Epochs say what dies when; faces say what this call may do. A TU’s write is the function that accepts only legal values for that unit; that is what the header exports. Ownership is handled at the call site.
 
 ## Locality
 
@@ -13,7 +13,7 @@ d.from_path(path) !>;
 
 or a second local (`RtxDoc d2 = {0} @destroy`). `memset` is neither.
 
-Hooks and faces live next to the type they name (`page_store.cch`, `piece_tree.cch`, `document.cch`, …). Leaf modules that are real linked TUs: `page_store.ccs`, `hex.ccs`, `piece_tree.ccs` (the matching `.cch` is the allow-list — the write that accepts only legal values for that unit, not every helper the TU uses). The piece tree is still split for readability (`piece_tree_rb.cch`, `piece_tree_lines.cch`) into that one tree TU — the file cut is not an API. `RtxNode` lives in `piece_tree_priv.cch`, not the public header. A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
+Hooks and faces live next to the type they name. A file cut is not an API — chapters of one TU stay chapters (`piece_tree_rb` / `piece_tree_lines` are not their own products). Do not extract the next linked TU (document, layout, workspace) because the tree did; wait until compile time hurts. The header exports the legal write (`replace`), not `insert` / `erase` because a rope usually does. Do not split `RtxDoc` into history/selection types because it is wide. A label on a shared record is an enum (closed dispatch, no `default:`); a value that is one of several payloads is a `@variant` — do not variant-shape every classifier. A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
 
 There is no inflight counter and no drain-to-zero. A path that gives up says so at the position that caused it.
 
@@ -23,76 +23,60 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 |---|---|---|
 | Document | piece-tree arena + page-store arena (fds + LRU page pool) | `RtxDoc.destroy()` |
 | Session | `d.session` | close (path, undo) |
-| Analysis | `d.analysis` | `analysis.reset()` on reparse (sections, runs, `hl_full`, `tm_ckpt`, `hl_win`) |
+| Analysis | `d.analysis` | `analysis.reset()` on reparse |
 | Find | `d.find.store` | new query resets; edit invalidates (offsets only) |
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs, clipboard) |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
 
-`RtxDoc d = {0} @destroy` (and the same for tree, layout, buf, workspace). No inflight counter. A buf slot destroys layout, then doc.
+`RtxDoc d = {0} @destroy` (and the same for tree, layout, buf, workspace). A buf slot destroys layout, then doc.
 
 ## Surfaces
 
 Fallible APIs are Results (`T !>(CCError)`). Value returns are only pure queries of already-valid state (`len`, `has_sel`, `dirty`, …). OOM, IO, and a short mid-document read are errors — never a short slice or a zero that looks like success on a commit path.
 
-`line_start` / `line_of` are `size_t !>(RtxIndexErr)`. `RtxIndexErr` is not a face of `CCError`. `@errhandler` matches exact `E`. Helpers that call `line_*` are `T !>(RtxIndexErr)` and pipe. A `!>(CCError)` surface that also does index work translates once (`CC_ERR_IO`). Paint / key (and test `main`) abandon the frame. A scan fault sets `line_index_fault` (query: `index_fault()`) and clears `line_off_ok` (status `Lcur!`).
+`line_start` / `line_of` are `size_t !>(RtxIndexErr)`. `RtxIndexErr` is not a face of `CCError` — do not `@typeview { as: base; }` so save/edit handlers cannot swallow an index fault. Helpers that call `line_*` are `T !>(RtxIndexErr)` and pipe. A `!>(CCError)` surface that also does index work translates once.
 
 One document read surface: `size_t !>(CCError) read_at(off, dest, n)`. Success returns `got = min(n, len - off)` (EOF clamp is success). A hole inside that range is an error. Callers that need every byte of `n` require `off + n <= len` (or check `got == n`).
 
-If an API returns owned bytes, the destination arena is the **last** parameter (Concurrent-C convention: receiver first, arena last). That arena *is* the product’s lifetime. Call-local `@scratch` / frame stack stays inside the callee and is not returned. Views (`span`) do not take an arena.
+If an API returns owned bytes, the destination arena is the **last** parameter (receiver first, arena last). That arena *is* the product’s lifetime. Call-local `@scratch` / frame stack stays inside the callee and is not returned. Views (`span`) do not take an arena.
 
-A Result failure is **unchanged** or **`broken`**. `broken` means the tree may be inconsistent — set only after a mutating step that could not be rolled back. The latch is `RTX_ERR_UNRESTORABLE` (`CC_ERR_USER + 1`), not a message. Pre-mutation faults (failed hold alloc, short read before erase) leave the object intact and do not set `broken`.
+A Result failure is **unchanged** or **`broken`**. `broken` means the tree may be inconsistent — set only after a mutating step that could not be rolled back. The latch is a kind (`RTX_ERR_UNRESTORABLE`), not a message. Pre-mutation faults leave the object intact and do not set `broken`.
 
-Hist (and any other commit record) stores everything the next edit needs, or undo/redo clears what it does not restore. Derived mode that affects the next op (`sel_box`, box columns, …) is in the hist record (before/after); undo/redo restores it.
+Hist stores everything the next edit needs, or undo/redo clears what it does not restore. Derived mode that affects the next op is in the hist record; undo/redo restores it.
 
 ## Views
 
 A `char[:]` is `{ptr, len, id}`. Storing it does not take the bytes.
 
-- `from_path` — opens the path into the tree’s page store (fds + page cache) until `destroy()`. There is no document-wide `char[:]` over the file; bytes are reached only through `read_at` (or `scratch_span` / `analysis_span` copies onto a named arena). Open does not scan the body; newline weights and the stride index grow **progressively** on `line_start` / `line_of`. Above `RTX_MARKUP_SCAN_MAX`, open plants one section (path may still mark code). Highlight’s only argument is `RtxHlWin {from, n}` — `n` is clamped to `RTX_HL_WIN_MAX`. Layout may read `len`; it must not pass `len` as a highlight bound. `ensure_hl` classifies `===` in that window and searches backward one bounded chunk per call. Until a header or BOF proves the kind, the section is `UNKNOWN` (neutral rendering, no syntax lex) — never a fabricated path-default fact.
+- `from_path` — page store until `destroy()`. No document-wide `char[:]` over the file; bytes are `read_at` (or a named-arena copy). Open does not scan the body; the line index grows on `line_start` / `line_of`.
 - `from_buffer` — keeps the caller’s slice. Refuses non-empty untracked (`id == 0`).
-- `span` — empty means “not one piece” (or `n == 0`), or store-backed bytes with no stable contiguous view. That is a payload; callers use `scratch_span` / `read_at`.
-- `scratch_span` / `analysis_span` — view if contiguous, else a copy on the named arena. `char[:] !>(CCError)`: empty is `n == 0` / past end; OOM and short `read_at` are errors.
+- `span` — empty means “not one piece” (or `n == 0`), or store-backed bytes with no stable view. That is a payload; callers use `scratch_span` / `read_at`.
+- `scratch_span` / `analysis_span` — view if contiguous, else a copy on the named arena. Empty is `n == 0` / past end; OOM and short `read_at` are errors.
 
 ## Safety
 
-Constructors assume dead. `from_path` / `from_buffer` / `empty` / `open_files` error if the object already owns an arena, a page store, or a borrowed original binding. Reopen is `d.destroy(); d.from_path(...)`.
+Constructors assume dead. Reopen is `d.destroy(); d.from_path(...)`.
 
-A path that gives up is not success:
+A path that gives up is not success: a non-empty original must produce a root; scan / highlight / reparse do not plant markup or set `hl_done` after a missing span. Lex a window, not the body — do not pass `len` as a highlight bound. Until a header or BOF proves the kind, the section is `UNKNOWN` — never a fabricated path-default. Lex copies die with the frame, not an `analysis` bump. A short `read_at` mid-document is a fault, not EOF. `line_count` is soft until the index reaches EOF.
 
-- Seed of a non-empty original must produce a root node, or the constructor fails.
-- Scan / highlight / reparse / `ensure_hl(RtxHlWin)` are `void !>(CCError)`. They do not plant markup or set `hl_done` after a missing span. A failed scan resets analysis. A failed highlight restores runs and checkpoints and clears every `hl_done`. For code sections larger than `RTX_HL_FULL_MAX`, `ensure_hl` lexes only the window and leaves `hl_done` clear so scroll re-lexes — it never copies the whole body, including when the last known line runs to `len`. Above `RTX_MARKUP_SCAN_MAX`, that window also gets a frame-scratch `===` / `*bold*` / `` `mono` `` pass. A bounded LRU retains visited window intervals (including both cameras); an unresolved interval advances backward by `RTX_MARKUP_LOOKBACK` on later layout passes. Window re-lex clips overlapping runs first (prefix/suffix stay), then emits the new window tokens; it does not delete a run that still covers bytes on screen. `ensure_hl` always sorts runs (`style_at` binary-searches by `start`).
-- Lex copies are frame-owned (stack or a call-local arena), never an `analysis` bump that survives the call. Interned scopes (`RtxStyle.scope`) live on a process intern arena backed by a static slab (`cc_arena_buffer`) — not `malloc`, not `d.analysis`. `rtx_scope_put` returns 0 on table-full or arena OOM (empty name is `SCOPE_NONE`); `ensure_hl` and grammar load turn that into `CCError`. Frontends theme a prefix.
-- A path whose extension is in a loaded grammar’s `fileTypes` uses that lowered TextMate table. `*.tmLanguage.json` is loaded at first TM-candidate path (not `.txt`) from `RTX_GRAMMARS`, else `<exe>/grammars`, else `<exe>/../testdata/grammars`. `include` / `repository` flatten, including a repo entry that is only a `patterns` list; `fileTypes` past the slot cap fails the load (no silent spike). Begin/end may run nested `patterns`; leftover `match` uses a tiny regex with backtracking, not Onig; `captures` overlay the winning alternative’s groups. Otherwise the spike lexer.
-- Window lex is `RTX_TM_CATCHUP` or `RTX_TM_LOOKBACK`. Catch-up (seeded stride or BOF within `RTX_TM_CATCHUP_MAX`) may plant checkpoints. Lookback must not. If the lookback edge is mid-line and the next newline is still before the window, skip that incomplete first line; if the lookback span is one line, lex from the lookback edge (do not snap to the current line). Farther than catch-up, lookback only.
-- `RtxWs_copy` is `int !>(CCError)`: `0` = no selection, `1` = copied, OOM is an error.
-- A short `read_at` mid-document is a fault, not EOF. `line_count` is soft until EOF (`known + 1MiB` scroll budget only). `line_known` / `Lcur+` are what the index has seen; `lf_ready` makes `Lcur/total` exact. `line_off_ok` is set when the scan reaches `len`. Above `RTX_LINE_SOFT_MIN` (256 KiB), an edit through an offset the index has not reached still scans to that offset, then clears `lf_ready` and does not rebuild a suffix. Smaller files finish the index eagerly. A tip insert at EOF extends the add-piece without a rescan. Long scans and saves pulse `t.busy_bind` / `w.busy_bind`; headless leaves it unbound.
-
-Commit only after the new value exists, in every direction: the right node before shrinking a piece; hist after `tree.replace`; clip after a successful cut replace; derived flags after the highlight / line-index pass; path+`saved_head` after a prepared rename. Unsaved quit opens a Save / Don't save / Cancel prompt. `tree.replace` rolls the deleted span back if insert fails; rollback failure is `RTX_ERR_UNRESTORABLE` and the doc sets `d.broken` — further edits refuse. Hist bytes for a coalesced type/backspace are reserved before `tree.replace` and committed after. Clipboard allocs into a local, then assigns; OOM keeps the old clip. Empty source is a real clear. A path that gives up is either unchanged or `broken` — never a hole that looks retryable.
-
-Host close is a one-shot offer into that prompt, not loop control. Cancel dismisses this close request; it does not promise a second chrome-X if the host latches `shouldClose`.
+Commit only after the new value exists: hist after `tree.replace` (reserve coalesced bytes before, commit after); clip after a successful cut; path + `saved_head` after a prepared rename. Rollback failure is `RTX_ERR_UNRESTORABLE` and sets `d.broken` — further edits refuse. Clipboard allocs into a local, then assigns. Empty source is a real clear. A path that gives up is unchanged or `broken` — never a hole that looks retryable.
 
 ## Faces
 
-`@typehooks` / `@typeview` sit next to the types they name. A `@typeview` is the application’s allow-list. An `as:` embed retries UFCS on the inner type when the face grants the name.
+`@typehooks` / `@typeview` sit next to the types they name. A `@typeview` is the application’s allow-list. An `as:` embed retries UFCS on the inner type when the face grants the name. A face fences callers that take the face, not every `RtxDoc *` in the same file. Field writes and `as:` embeds are not gated unless the parameter is the face. Add the next face when a new function would otherwise take `RtxDoc *` and only need a slice — not a suite of faces because the type is wide.
 
 - `as: tree` on `RtxDoc`, `as: doc` on `RtxBuf` — miss on the outer retries on the embed.
-- `RtxDocHighlight` — named allow-list: `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl`. `ensure_hl` takes `RtxHlWin` only (`n` clamped). It cannot `len` / `line_*` / `insert` / `type` / `save`.
-- `RtxDocLayout` — named allow-list: measure may `len`, `line_*`, `line_guess`, `index_covers`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl`. `ensure_hl` takes `RtxHlWin` only (`n` clamped). It cannot `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
+- `RtxDocHighlight` — `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`. It cannot `len` / `line_*` / `insert` / `type` / `save`.
+- `RtxDocLayout` — measure may `len`, `line_*`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`. It cannot `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
 
-`L.view` is the layout policy (`RTX_VIEW_DEFAULT` / `WRAP` / `HEX`); `L.wrap` is 1 iff wrap. Default: one visual row per physical line. Wrap: last whitespace if the next token fits after it, else a hard break at `max_width`. Hex: byte rows of 16 with offset | hex | ASCII columns (synced selection); scroll via `top_byte`. A token wider than the window still occupies a row in wrap. Text scroll is `top` (physical line) plus `top_wrap`. Up/down walk visual rows (or ±16 bytes in hex) and keep a goal column in text modes. Ctrl-L cycles the three views. Ctrl-U toggles follow lock: off, the pane does not chase the caret (wheel / rail stay); find and jump still `reveal_off` in the active view (hex `%` keeps the byte). Both frontends blink the caret (400 ms) and skip a full relayout while idle. Both draw a byte-rail scrollbar (`pos` / `len`, not soft `line_count`): Raylib pixels, TTY a reserved column. The rail is hidden when the pane already shows the whole file. Click/drag maps to a byte and snaps like jump `N%`. A seek past the scan frontier fills a local byte window (`fill_off` / `line_guess`) — it does not `line_of` the prefix. The rail is marked while `!lf_ready`.
-
-Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for `write_fd` / page-store internals. Tree content mutation is `replace` (byte range in `[0, len]`); `insert` / `erase` stay in the tree TU.
+Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for `write_fd` / page-store internals.
 
 ## Edits
 
-A same-file split is two cameras on one document. After a mutation, `RtxWs_after_edit` reparses once and drops every matching camera's vis-row epoch — `ensure_view`'s width/top cache is not an edit stamp, so a mid-line delete would otherwise leave the unfocused pane painting stale byte ranges.
+A same-file split is two cameras on one document. After a mutation, reparse once and drop every matching camera’s vis-row epoch — a width/top cache is not an edit stamp.
 
-The document write is `replace` (same range rule). `insert` / `erase` on the doc call it. User changes are `replace` on the history stack (type / backspace / delete). Large deletes (`> RTX_HIST_INLINE_MAX`) omit inline bytes — undo of those records fails closed; redo still works. Coalesced typing grows hist byte slots with capacity doubling. Save streams pieces (`write_fd`), preserves existing mode when overwriting, fsyncs the file (and best-effort the parent directory), then renames. Dirty is `hist.head != saved_head`. Offsets are bytes. Stream selection is `[sel_anchor, caret)`. Up/down keep a goal column (`pref.col` / `pref.x`) so a short line does not forget the place; End sets `pref.eol` and sticks to each line end. Alt-arrows / Alt-drag is a column box (`sel_box`): each line contributes `[box_acol, box_ccol)` (virtual; short lines clamp). Copy joins those slices with newlines. Type/backspace apply the same column on every line as one replace.
-
-Find stores offsets on `d.find.store`. A frame steps at most 256 KiB so a giant file does not stall. Context is a line window computed when drawing the visible hits. `f` / Ctrl-F opens the panel; up/down moves among hits.
-
-`o` / Ctrl-O opens a file in the focused view. The TTY uses a per-pane browser (directory listing + glob). The GUI Open… command is the system file dialog and still calls `RtxWs_open_in_pane` (live; no restart). Ctrl-Shift-O keeps the in-app browser as a reference. The listing starts on the current file when that name is present. Enter on a directory walks; Enter on a file points that pane at the path. A same-file split keeps the other camera on the old buf. The process cwd does not change. CLI `--wrap` / `--hex` / `--view` apply to the files that follow (`--wrap a --hex b` is a two-pane split).
+The document write is `replace` (byte range in `[0, len]`). `insert` / `erase` on the doc call it. User changes are `replace` on the history stack. Dirty is `hist.head != saved_head`. Offsets, caret, and selection are bytes. Save streams pieces (`write_fd`).
 
 ## Encoding
 
