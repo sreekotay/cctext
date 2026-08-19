@@ -47,6 +47,7 @@ typedef struct {
     RtxBrowseEnt *ents;
     size_t len, cap;
     size_t cur, top;
+    int boot;              /* 1: started with no file; close without a pick quits */
     CCArena store;
 } RtxBrowse;
 #endif
@@ -188,6 +189,58 @@ static void !>(CCError) RtxWs_add_path(RtxWs *w, const char *path) {
     return cc_ok();
 }
 
+static void !>(CCError) RtxWs_add_empty(RtxWs *w) {
+    RtxBuf *b;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+    rtx_arena_grow(&w->session, (void **)&w->bufs, &w->cap, w->len + 1,
+                   sizeof(RtxBuf)) !>(e) {
+        return cc_err(e);
+    };
+    b = &w->bufs[w->len];
+    memset(b, 0, sizeof(*b));
+    b->doc.empty() !>(e) { return cc_err(e); };
+    b->doc.tree.busy_bind(w->busy_fn, w->busy_ctx);
+    w->len++;
+    return cc_ok();
+}
+
+static int RtxWs_untitled(const RtxWs *w) {
+    return w && w->len == 1 &&
+           (!w->bufs[0].doc.path.ptr || w->bufs[0].doc.path.len == 0);
+}
+
+/* TTY only. Scripts keep the not-found error. */
+static int rtx_ws_ask_create(const char *path) {
+    char line[8];
+    if (!path || !path[0]) return 0;
+    if (!isatty(STDIN_FILENO) || !isatty(STDERR_FILENO)) return 0;
+    fprintf(stderr, "cctext: '%s' not found. Create? [y/n] ", path);
+    fflush(stderr);
+    if (!fgets(line, sizeof(line), stdin)) return 0;
+    return line[0] == 'y' || line[0] == 'Y';
+}
+
+static int rtx_ws_touch_empty(const char *path) {
+    int fd;
+    if (!path || !path[0]) return 0;
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
+
+static void !>(CCError) rtx_ws_add_path_or_create(RtxWs *w, const char *path) {
+    w->add_path(path) !>(e) {
+        if (e.kind != CC_ERR_NOT_FOUND) return cc_err(e);
+        if (!rtx_ws_ask_create(path)) return cc_err(e);
+        if (!rtx_ws_touch_empty(path))
+            return cc_err(CC_ERR_IO, "create file");
+        return w->add_path(path);
+    };
+    return cc_ok();
+}
+
 static void RtxWs_busy_bind(RtxWs *w, RtxBusyFn fn, void *ctx) {
     size_t i;
     if (!w) return;
@@ -207,9 +260,24 @@ static void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
     w->focus = 0;
     w->pane[0] = 0;
     w->pane[1] = 0;
-    if (npaths <= 0) return cc_err(CC_ERR_INVALID_ARG, "no files");
+    if (npaths <= 0) {
+        w->add_empty() !>(e) {
+            w->destroy();
+            return cc_err(e);
+        };
+        return cc_ok();
+    }
     for (i = 0; i < npaths; i++) {
-        w->add_path(paths[i]) !>(e) {
+        rtx_ws_add_path_or_create(w, paths[i]) !>(e) {
+            if (e.kind == CC_ERR_NOT_FOUND &&
+                isatty(STDIN_FILENO) && isatty(STDERR_FILENO))
+                continue;
+            w->destroy();
+            return cc_err(e);
+        };
+    }
+    if (w->len == 0) {
+        w->add_empty() !>(e) {
             w->destroy();
             return cc_err(e);
         };
@@ -939,6 +1007,7 @@ static int RtxWs_any_dirty(const RtxWs *w) {
     .browse_backspace = RtxWs_browse_backspace,
     .browse_glob_set = RtxWs_browse_glob_set,
     .open_in_pane = RtxWs_open_in_pane,
+    .untitled = RtxWs_untitled,
 };
 
 #endif /* RTX_WORKSPACE_H */

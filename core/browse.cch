@@ -6,6 +6,9 @@
 #ifndef RTX_BROWSE_H
 #define RTX_BROWSE_H
 
+#include <limits.h>
+#include <stdlib.h>
+
 #ifndef RTX_BROWSE_TYPES
 #define RTX_BROWSE_TYPES
 enum {
@@ -76,11 +79,45 @@ static void rtx_browse_dirname(char *dst, size_t n, const char *path) {
     dst[len] = 0;
 }
 
+/* Process cwd if `path` is empty or `.`; else cwd/`path` when relative. */
+static int rtx_browse_abs(char *dst, size_t n, const char *path) {
+    char raw[RTX_BROWSE_DIR];
+    char resolved[PATH_MAX];
+    if (!dst || n == 0) return 0;
+    dst[0] = 0;
+    if (!path || !path[0] || strcmp(path, ".") == 0) {
+        cc_arena_stack(scratch, 1024);
+        CCSlice cwd = cc_dir_cwd(&scratch);
+        if (!(cwd.ptr && cwd.len)) return 0;
+        snprintf(raw, sizeof(raw), "%s", cwd.ptr);
+    } else if (path[0] == '/') {
+        snprintf(raw, sizeof(raw), "%s", path);
+    } else {
+        cc_arena_stack(scratch, 1024);
+        CCSlice cwd = cc_dir_cwd(&scratch);
+        if (cwd.ptr && cwd.len)
+            snprintf(raw, sizeof(raw), "%s/%s", cwd.ptr, path);
+        else
+            snprintf(raw, sizeof(raw), "%s", path);
+    }
+    if (realpath(raw, resolved) && resolved[0]) {
+        if (strlen(resolved) >= n) return 0;
+        snprintf(dst, n, "%s", resolved);
+        return 1;
+    }
+    if (!raw[0] || strlen(raw) >= n) return 0;
+    snprintf(dst, n, "%s", raw);
+    return 1;
+}
+
 static int rtx_browse_join(char *dst, size_t n, const char *dir, const char *name) {
     int wr;
+    char abs[RTX_BROWSE_DIR];
     if (!dst || n == 0 || !dir || !name) return 0;
     if (strcmp(name, "..") == 0) {
-        rtx_browse_dirname(dst, n, dir);
+        /* Relative `testdata` has no slash: dirname is `.` and `..` stuck. */
+        if (!rtx_browse_abs(abs, sizeof(abs), dir)) return 0;
+        rtx_browse_dirname(dst, n, abs);
         return dst[0] != 0;
     }
     if (strcmp(dir, "/") == 0) wr = snprintf(dst, n, "/%s", name);
@@ -275,7 +312,13 @@ static void !>(CCError) RtxWs_open_in_pane(RtxWs *w, const char *path) {
     pane = w->focus;
     found = rtx_ws_find_path(w, path);
     if (found >= 0) bufi = found;
-    else {
+    else if (RtxWs_untitled(w)) {
+        w->bufs[0].destroy();
+        memset(&w->bufs[0], 0, sizeof(w->bufs[0]));
+        w->len = 0;
+        w->add_path(path) !>(e) { return cc_err(e); };
+        bufi = 0;
+    } else {
         w->add_path(path) !>(e) { return cc_err(e); };
         bufi = (int)w->len - 1;
     }
@@ -306,16 +349,16 @@ static void !>(CCError) RtxWs_browse_start(RtxWs *w) {
     want[0] = 0;
     rtx_browse_drop(br);
     br->on = 1;
+    br->boot = RtxWs_untitled(w);
     if (b && b->doc.path.ptr && b->doc.path.len) {
-        rtx_browse_dirname(br->dir, sizeof(br->dir), b->doc.path.ptr);
+        char rel[RTX_BROWSE_DIR];
+        rtx_browse_dirname(rel, sizeof(rel), b->doc.path.ptr);
         rtx_browse_basename(want, sizeof(want), b->doc.path.ptr);
+        if (!rtx_browse_abs(br->dir, sizeof(br->dir), rel))
+            snprintf(br->dir, sizeof(br->dir), "%s", rel);
     }
     if (!br->dir[0] || strcmp(br->dir, ".") == 0) {
-        cc_arena_stack(scratch, 1024);
-        CCSlice cwd = cc_dir_cwd(&scratch);
-        if (cwd.ptr && cwd.len)
-            snprintf(br->dir, sizeof(br->dir), "%s", cwd.ptr);
-        else
+        if (!rtx_browse_abs(br->dir, sizeof(br->dir), "."))
             snprintf(br->dir, sizeof(br->dir), ".");
     }
     rtx_browse_refresh(br) !>(e) { return cc_err(e); };
@@ -323,9 +366,13 @@ static void !>(CCError) RtxWs_browse_start(RtxWs *w) {
     return cc_ok();
 }
 
-static void RtxWs_browse_close(RtxWs *w) {
-    if (!w) return;
+/* 1 = no file was picked from a boot browser; the host should exit. */
+static int RtxWs_browse_close(RtxWs *w) {
+    int quit = 0;
+    if (!w) return 0;
+    quit = w->nav[w->focus].boot && RtxWs_untitled(w);
     rtx_browse_drop(&w->nav[w->focus]);
+    return quit;
 }
 
 static void !>(CCError) RtxWs_browse_enter(RtxWs *w) {
@@ -339,7 +386,8 @@ static void !>(CCError) RtxWs_browse_enter(RtxWs *w) {
     if (!rtx_browse_join(full, sizeof(full), br->dir, ent->name))
         return cc_err(CC_ERR_INVALID_ARG, "browse path");
     if (ent->is_dir) {
-        snprintf(br->dir, sizeof(br->dir), "%s", full);
+        if (!rtx_browse_abs(br->dir, sizeof(br->dir), full))
+            snprintf(br->dir, sizeof(br->dir), "%s", full);
         return rtx_browse_refresh(br);
     }
     return RtxWs_open_in_pane(w, full);

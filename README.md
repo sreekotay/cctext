@@ -4,6 +4,20 @@ A text editor in [Concurrent-C](https://github.com/sreekotay/concurrent-c): one 
 
 This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). **cctext** also ships as a prebuilt on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler). It does not live inside the compiler repository.
 
+![cctext TUI on a 2 GiB JSON file — syntax highlight, column select, byte-rail scrollbar](docs/cctext-tui.png)
+
+## Getting started
+
+Unpack a [release](https://github.com/sreekotay/cctext/releases) (no compiler) and run it in place:
+
+```bash
+tar -xzf cctext-macos-arm64.tar.gz
+./cctext-macos-arm64/cctext            # file browser
+./cctext-macos-arm64/cctext file.txt   # missing path asks to create
+```
+
+From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`.
+
 ## Features
 
 - **Fast on huge files.** An 8 GiB open is 0.006 ms; first-screen scroll is 0.039 ms. The body stays on disk (page store + progressive line index). Numbers, including syntax highlight: [Perf](#perf).
@@ -12,9 +26,10 @@ This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`)
 - **TUI and GUI.** Same document core: **cctext** (POSIX console) and **cctext-ray** (Raylib).
 - **Hex.** `Ctrl-L` cycles default → wrap → hex (offset | hex | ASCII).
 - **Multiview.** Several files, splits, two cameras on one document. Unlock (`Ctrl-U`) lets a pane scroll off the caret.
+- **File browser.** No filename opens it. `o` / `Ctrl-O` opens the built-in browser (glob, walk directories) into the focused view. The GUI uses the system dialog; `Ctrl-Shift-O` keeps the in-app browser there too. A missing path asks to create an empty file.
 - **TextMate grammars.** Drop any `.tmLanguage.json` into `grammars/` (or `RTX_GRAMMARS`) — loaded live, no rebuild. Window lex, not a full-file pass.
 - **Rectangular selection.** Alt-arrows / Alt-drag is a column box.
-- **TUI mouse.** SGR click, drag, and wheel; hit-test is the same layout as the GUI.
+- **TUI mouse.** SGR click, drag, and wheel; a byte-rail scrollbar jumps by file offset (not a soft line count). Hit-test is the same layout as the GUI.
 - **High-performance scroll.** Only the visible window is measured and highlighted. Idle frames skip relayout.
 
 ## Why
