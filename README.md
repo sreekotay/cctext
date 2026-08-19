@@ -6,6 +6,8 @@ This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`)
 
 ![cctext TUI on a 2 GiB JSON file — syntax highlight, column select, byte-rail scrollbar](docs/cctext-tui.png)
 
+![cctext file browser — name, size, and mtime](docs/cctext-browse.png)
+
 ## Getting started
 
 Unpack a [release](https://github.com/sreekotay/cctext/releases) (no compiler) and run it in place:
