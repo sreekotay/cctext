@@ -1,9 +1,10 @@
 CCC ?= ccc
 # Default --release: -O2 -DNDEBUG + dead-strip. `make DEBUG=1 …` keeps asserts (-g).
+# Emit cache is on so unchanged TUs skip shadow_lower. Cold rebuild: CC_NO_CACHE=1.
 ifeq ($(DEBUG),1)
-CCC_FLAGS := -g --no-cache --out-dir out --bin-dir bin
+CCC_FLAGS := -g --out-dir out --bin-dir bin
 else
-CCC_FLAGS := --release --no-cache --out-dir out --bin-dir bin
+CCC_FLAGS := --release --out-dir out --bin-dir bin
 endif
 RAYLIB_PREFIX := $(shell brew --prefix raylib 2>/dev/null)
 RAYLIB_CFLAGS := -I$(RAYLIB_PREFIX)/include
@@ -12,7 +13,7 @@ RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation
 LARGE_BYTES ?= 3M
 LARGE := testdata/generated/large.txt
 
-.PHONY: setup test smoke large giant giant-json giant-smoke perf perf-check perf-record dup-scale-8g dup-scale-64g cctext raytext clean
+.PHONY: setup test smoke large giant giant-json giant-smoke perf perf-check perf-record dup-scale-8g dup-scale-64g cctext raytext dist-cctext clean
 
 setup:
 	./setup.sh
@@ -74,9 +75,13 @@ perf-record: $(LARGE)
 cctext:
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc cctext
 
+# Binary + grammars/ → dist/cctext-<os>-<arch>.tar.gz (not committed).
+dist-cctext: cctext
+	./scripts/dist_cctext.sh
+
 raytext:
 	$(CCC) $(CCC_FLAGS) --cc-flags "$(RAYLIB_CFLAGS)" --ld-flags "$(RAYLIB_LIBS)" \
 		build --build-file build.cc raytext
 
 clean:
-	rm -rf out bin testdata/generated
+	rm -rf out bin dist testdata/generated

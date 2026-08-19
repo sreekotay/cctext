@@ -36,10 +36,10 @@ esac
 
 CCC="${CCC:-ccc}"
 if [[ "${DEBUG:-0}" == "1" ]]; then
-    CCC_FLAGS=(-g --no-cache --out-dir out --bin-dir bin)
+    CCC_FLAGS=(-g --out-dir out --bin-dir bin)
     BUILD_FLAVOR=debug
 else
-    CCC_FLAGS=(--release --no-cache --out-dir out --bin-dir bin)
+    CCC_FLAGS=(--release --out-dir out --bin-dir bin)
     BUILD_FLAVOR=release
 fi
 LARGE="${LARGE:-testdata/generated/large.txt}"

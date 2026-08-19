@@ -8,8 +8,12 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
-enum { RTX_UI_FIND_ROWS = 8 };
+enum {
+    RTX_UI_FIND_ROWS = 8,
+    RTX_UI_BLINK_MS = 400
+};
 
 static const char *rtx_help_lines[] = {
     "Esc          toggle this menu",
@@ -49,7 +53,57 @@ typedef struct {
     size_t find_len;
     size_t find_top;
     int ask_quit;
+    int blink;           /* 1 = caret / prompt visible */
+    long blink_at;       /* monotonic ms; 0 = not started (visible) */
 } RtxUi;
+
+static long rtx_ui_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void rtx_ui_blink_show(RtxUi *ui) {
+    if (!ui) return;
+    ui->blink = 1;
+    ui->blink_at = rtx_ui_now_ms();
+}
+
+static int rtx_ui_blink_step(RtxUi *ui) {
+    long now;
+    if (!ui) return 0;
+    now = rtx_ui_now_ms();
+    if (ui->blink_at == 0) {
+        ui->blink = 1;
+        ui->blink_at = now;
+        return 0;
+    }
+    if (now - ui->blink_at >= RTX_UI_BLINK_MS) {
+        ui->blink = !ui->blink;
+        ui->blink_at = now;
+        return 1;
+    }
+    return 0;
+}
+
+static int rtx_ui_blink(const RtxUi *ui) {
+    if (!ui || ui->blink_at == 0) return 1;
+    return ui->blink;
+}
+
+/* Find / jump own the blinking caret. The document does not. */
+static int rtx_ui_prompting(const RtxUi *ui) {
+    return ui && (ui->find || ui->jump);
+}
+
+static int rtx_ui_here(const RtxUi *ui, int focused, int at) {
+    return focused && at && !rtx_ui_prompting(ui) && rtx_ui_blink(ui);
+}
+
+/* Find / jump / browse field caret. Same clock; only these draw it. */
+static const char *rtx_ui_prompt_caret(const RtxUi *ui) {
+    return rtx_ui_blink(ui) ? "_" : " ";
+}
 
 static void rtx_ui_clear_jump(RtxUi *ui) {
     if (!ui) return;
@@ -70,6 +124,14 @@ static void rtx_ui_start_jump(RtxUi *ui) {
     ui->jump = 1;
     ui->jump_len = 0;
     ui->jump_buf[0] = 0;
+    rtx_ui_blink_show(ui);
+}
+
+static void rtx_ui_jump_header(const RtxUi *ui, char *dst, size_t n) {
+    if (!dst || n == 0) return;
+    snprintf(dst, n, "jump line or N%%: %s%s",
+             ui ? ui->jump_buf : "",
+             rtx_ui_prompt_caret(ui));
 }
 
 static void rtx_ui_start_find(RtxUi *ui) {
@@ -77,6 +139,7 @@ static void rtx_ui_start_find(RtxUi *ui) {
     ui->help = 0;
     rtx_ui_clear_jump(ui);
     ui->find = 1;
+    rtx_ui_blink_show(ui);
 }
 
 static int rtx_ui_find_rows(const RtxUi *ui, int rows) {
@@ -97,11 +160,13 @@ static void rtx_ui_find_scroll(RtxUi *ui, const RtxDoc *d, size_t vis_hits) {
 
 static void rtx_ui_find_header(const RtxUi *ui, const RtxDoc *d, char *dst, size_t n) {
     if (!dst || n == 0) return;
-    snprintf(dst, n, "find: %s_  %zu/%zu%s%s",
+    snprintf(dst, n, "find: %s%s  %zu/%zu%s%s",
              ui ? ui->find_buf : "",
+             rtx_ui_prompt_caret(ui),
              d && d->find.len ? d->find.cur + 1 : 0,
              d ? d->find.len : 0,
-             d && !d->find.done ? "  scanning..." : "",
+             d && !d->find.done && !d->find.idle && !d->find.cancel
+                 ? "  scanning..." : "",
              d && d->find.truncated ? "  capped" : "");
 }
 
@@ -148,13 +213,12 @@ static void !>(CCError) rtx_ui_find_apply(RtxUi *ui, RtxDoc *d) {
 }
 
 /*
- * Host gate: whether to enter one interval. Leaving is the join.
- * cancel is written when a cancel key is consumed — not a stdin poll.
- * A 0-commit step is not progress; do not enter again.
+ * Host gate: one wait-for. Leaving is the join.
+ * cancel is a written bit — not a stdin poll.
  */
 static void !>(CCError) rtx_ui_find_pump(RtxUi *ui, RtxDoc *d) {
     if (!ui || !ui->find || !d) return cc_ok();
-    if (d->find.done || d->find.idle || d->find.cancel) {
+    if (d->find.done || d->find.cancel) {
         rtx_find_auto_land(d);
         return cc_ok();
     }
@@ -183,14 +247,22 @@ static int rtx_gutter_cols(size_t nlines) {
     return w + 1;
 }
 
-/* Digit width from known lines (and a little past `top`), not soft +1MiB. */
+/* Digit width from the current camera, not a growing scan frontier.
+ * A live seek uses the line stamp from the last fill_off — that number
+ * does not move when the index later learns more lines. */
 static int rtx_gutter_cols_buf(const RtxBuf *b, int vis) {
     size_t need;
+    size_t extra = (vis > 0 ? (size_t)vis : 32) + 8;
     if (!b) return 2;
+    if (b->seek_valid) {
+        need = b->layout.from_line + extra;
+        if (need < extra) need = extra;
+        return rtx_gutter_cols(need);
+    }
     need = b->doc.line_known();
     if (b->doc.lf_ready()) need = b->line_count();
     else {
-        size_t tip = b->top + (vis > 0 ? (size_t)vis : 32) + 8;
+        size_t tip = b->top + extra;
         if (tip > need) need = tip;
     }
     return rtx_gutter_cols(need);
@@ -363,7 +435,10 @@ static void !>(RtxIndexErr) rtx_status_line_pos(const RtxDoc *d, char *dst, size
         snprintf(dst, dst_n, "L1");
         return cc_ok();
     }
-    cur = d->line_of(d->caret) !>(e) { return cc_err(e); };
+    if (d->index_covers(d->caret))
+        cur = d->line_of(d->caret) !>(e) { return cc_err(e); };
+    else
+        cur = d->line_guess(d->caret);
     cur = cur + 1;
     if (d->index_fault()) {
         snprintf(dst, dst_n, "L%zu!", cur);
