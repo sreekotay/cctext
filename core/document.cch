@@ -175,7 +175,7 @@ typedef struct {
     size_t saved_head;
     size_t edit_gen;       /* bumps on every successful content change (incl. coalesce) */
     size_t last_off;
-    int last_markup;
+    int last_markup;       /* `=` / large delete — sections may have moved */
     int hl_full;
     RtxMarkupWin hl_win[RTX_MARKUP_CACHE_WINDOWS]; /* bounded visited-window cache */
     size_t hl_win_stamp;
@@ -723,6 +723,7 @@ static int rtx_doc_add_run(RtxDoc *d, size_t start, size_t len, RtxStyle style) 
 }
 
 static int rtx_path_looks_code(const char *path);
+static RtxSectionKind rtx_doc_path_kind(const RtxDoc *d);
 
 static int rtx_markup_header_at(const char *buf, size_t i, size_t n, int at_bol,
                                 RtxSectionKind *kind) {
@@ -770,9 +771,45 @@ static void !>(CCError) rtx_doc_scan_markup_runs(RtxDoc *d, const char *buf,
     return cc_ok();
 }
 
+/* Rebuild * / ` runs in [lo, hi). CODE uses highlight_span instead. */
+static void !>(CCError) rtx_doc_refresh_prose_runs(RtxDoc *d, size_t lo, size_t hi) {
+    size_t n, need;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "prose runs");
+    n = d->len();
+    if (lo > n) lo = n;
+    if (hi > n) hi = n;
+    if (hi <= lo) return cc_ok();
+    rtx_doc_clip_runs(d, lo, hi, rtx_run_is_markup_only) !>(e) {
+        return cc_err(e);
+    };
+    need = hi - lo;
+    if (need <= (size_t)RTX_FRAME_SCRATCH) {
+        cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+        char[:] bytes = d->scratch_span(&scratch, lo, need) !>(e) {
+            return cc_err(e);
+        };
+        return rtx_doc_scan_markup_runs(d, bytes.ptr, lo, bytes.len);
+    }
+    {
+        CCArena frame = cc_arena_heap(need + 64);
+        char[:] bytes;
+        if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "prose runs");
+        bytes = d->scratch_span(&frame, lo, need) !>(e) {
+            frame.destroy();
+            return cc_err(e);
+        };
+        rtx_doc_scan_markup_runs(d, bytes.ptr, lo, bytes.len) !>(e) {
+            frame.destroy();
+            return cc_err(e);
+        };
+        frame.destroy();
+        return cc_ok();
+    }
+}
+
 static void !>(CCError) rtx_doc_scan_buf(RtxDoc *d, const char *buf, size_t n) {
     size_t i;
-    if (!rtx_doc_add_section(d, 0, RTX_SEC_PROSE)) {
+    if (!rtx_doc_add_section(d, 0, rtx_doc_path_kind(d))) {
         return cc_err(CC_ERR_OUT_OF_MEMORY, "section");
     }
     if (!buf || n == 0) return cc_ok();
@@ -1044,14 +1081,8 @@ static void !>(CCError) rtx_doc_scan_markup(RtxDoc *d) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     d->analysis_reset();
     n = d->len();
-    if (n == 0) {
-        if (!rtx_doc_add_section(d, 0, RTX_SEC_PROSE)) {
-            return cc_err(CC_ERR_OUT_OF_MEMORY, "section");
-        }
-        return cc_ok();
-    }
-    if (n > RTX_MARKUP_SCAN_MAX) {
-        if (!rtx_doc_add_section(d, 0, RTX_SEC_PROSE)) {
+    if (n == 0 || n > RTX_MARKUP_SCAN_MAX) {
+        if (!rtx_doc_add_section(d, 0, rtx_doc_path_kind(d))) {
             return cc_err(CC_ERR_OUT_OF_MEMORY, "section");
         }
         return cc_ok();
@@ -1073,18 +1104,10 @@ static int rtx_path_looks_code(const char *path) {
     return rtx_tm_for_path(path) != NULL;
 }
 
-/* One unmarked file with a grammar is CODE (same rule as open). */
-static void rtx_doc_apply_path_section(RtxDoc *d) {
-    if (d && d->sec_len == 1 && d->path.ptr && rtx_path_looks_code(d->path.ptr)) {
-        d->secs[0].kind = RTX_SEC_CODE;
-    }
-}
-
 static void !>(CCError) RtxDoc_reparse(RtxDoc *d) {
     size_t n;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     rtx_doc_scan_markup(d) !>(e) { return cc_err(e); };
-    rtx_doc_apply_path_section(d);
     n = d->len();
     if (n <= RTX_HL_FULL_MAX) {
         rtx_doc_highlight(d) !>(e) { return cc_err(e); };
@@ -1113,7 +1136,6 @@ static void !>(CCError) RtxDoc_from_path(RtxDoc *d, const char *path) {
         d->destroy();
         return cc_err(e);
     };
-    rtx_doc_apply_path_section(d);
     {
         size_t n = d->len();
         if (n <= RTX_HL_FULL_MAX) {

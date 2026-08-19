@@ -1,6 +1,8 @@
 # cctext 0.1
 
-A text editor in [Concurrent-C](https://github.com/sreekotay/concurrent-c): one document core, two frontends — **cctext** (POSIX console) and **cctext-ray** (Raylib GPU). Built with Concurrent-C — a strict C11-superset preprocessor: `.ccs` lowers to plain C and compiles with your host C compiler.
+A text editor in [Concurrent-C](https://github.com/sreekotay/concurrent-c) — a strict C11-superset preprocessor: `.ccs` lowers to plain C and compiles with your host C compile.
+
+CCText has one document core, two frontends — **cctext** (POSIX console) and **cctext-ray** (Raylib GPU).
 
 This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). **cctext** also ships as a prebuilt on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler). It does not live inside the compiler repository.
 
