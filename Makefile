@@ -13,7 +13,7 @@ RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation
 LARGE_BYTES ?= 3M
 LARGE := testdata/generated/large.txt
 
-.PHONY: setup test smoke large giant giant-json giant-smoke perf perf-check perf-record dup-scale-8g dup-scale-64g cctext raytext dist-cctext clean
+.PHONY: setup test smoke large giant giant-json giant-smoke perf perf-check perf-record dup-scale-8g dup-scale-64g cctext cctext-ray dist-cctext clean
 
 setup:
 	./setup.sh
@@ -79,9 +79,11 @@ cctext:
 dist-cctext: cctext
 	./scripts/dist_cctext.sh
 
-raytext:
+# ccc target is cctext_ray (identifier); the installed name is cctext-ray.
+cctext-ray:
 	$(CCC) $(CCC_FLAGS) --cc-flags "$(RAYLIB_CFLAGS)" --ld-flags "$(RAYLIB_LIBS)" \
-		build --build-file build.cc raytext
+		build --build-file build.cc cctext_ray
+	mv -f bin/cctext_ray bin/cctext-ray
 
 clean:
 	rm -rf out bin dist testdata/generated

@@ -162,7 +162,7 @@ done
 smoke_bytes="$(bin_bytes bin/perf_matrix_smoke)"
 cctext_bytes="$(bin_bytes bin/cctext)"
 {
-    echo "# raytext perf results"
+    echo "# cctext perf results"
     echo "# date=$stamp_iso  host=$host  build=$BUILD_FLAVOR"
     echo "# note: process warmup discarded; each op from a fresh open; best of $TRIALS"
     echo "# note: jump_1m / wrap_1m / insert_mid / newline_mid are 1 MiB into every file"

@@ -38,8 +38,8 @@ cp bin/cctext "$stage/cctext"
 chmod +x "$stage/cctext"
 cp testdata/grammars/*.tmLanguage.json "$stage/grammars/"
 {
-    echo "cctext — console frontend of raytext"
-    echo "https://github.com/sreekotay/raytext"
+    echo "cctext — console frontend"
+    echo "https://github.com/sreekotay/cctext"
     echo
     echo "  ./cctext file.txt"
     echo "  ./cctext --wrap file.txt"

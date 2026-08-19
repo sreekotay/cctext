@@ -1,4 +1,4 @@
-# Raytext plan
+# cctext plan
 
 Standalone Concurrent-C editor. Compiler repo is a toolchain, not a parent tree.
 
@@ -17,7 +17,7 @@ Standalone Concurrent-C editor. Compiler repo is a toolchain, not a parent tree.
 
 ## Frontends
 
-- `raytext` — Raylib window (`#include <raylib.h>`), GPU quads for the visible layout only. Not `DrawText` on the document.
+- `cctext-ray` — Raylib window (`#include <raylib.h>`), GPU quads for the visible layout only. Not `DrawText` on the document.
 - `cctext` — POSIX termios + ANSI. SGR mouse (`1000`+`1002`+`1006`): click/drag is `rtx_layout_hit` → caret/selection. Wheel scrolls. Same highlight runs as the GUI.
 
 C FFI defaults to `@blocking`. The UI loop is a blocking main. Layout may run in a nursery.

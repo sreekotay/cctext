@@ -1,8 +1,8 @@
-# Raytext
+# cctext
 
-A text editor in [Concurrent-C](https://github.com/sreekotay/concurrent-c): one document core, two frontends — **raytext** (Raylib GPU) and **cctext** (POSIX console).
+A text editor in [Concurrent-C](https://github.com/sreekotay/concurrent-c): one document core, two frontends — **cctext** (POSIX console) and **cctext-ray** (Raylib GPU).
 
-This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). **cctext** also ships as a prebuilt on [GitHub Releases](https://github.com/sreekotay/raytext/releases) (no compiler). It does not live inside the compiler repository.
+This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). **cctext** also ships as a prebuilt on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler). It does not live inside the compiler repository.
 
 ## Why
 
@@ -14,7 +14,7 @@ This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`)
 
 ## Status
 
-Piece tree, document, layout, C/CC highlight, save, undo/redo, selection, incremental relayout, and multifile splits. **cctext** and **raytext** share that core.
+Piece tree, document, layout, C/CC highlight, save, undo/redo, selection, incremental relayout, and multifile splits. **cctext** and **cctext-ray** share that core.
 
 ## Setup
 
@@ -31,20 +31,20 @@ make perf-record            # that table + refresh testdata/perf/baseline.env pi
 make perf-check             # fail if 8G open/scroll/jump/insert regress
 ./make.shcc @cctext         # console editor (`--release`; DEBUG=1 keeps asserts)
 make dist-cctext            # dist/cctext-<os>-<arch>.tar.gz (binary + grammars/)
-./make.shcc @raytext        # Raylib GUI (needs `brew install raylib`)
+./make.shcc @cctext_ray     # Raylib GUI (needs `brew install raylib`)
 ./bin/cctext testdata/mixed.txt testdata/small.txt
 ./bin/cctext --wrap testdata/wrap.txt --hex testdata/mixed.txt
-./bin/raytext --view=hex testdata/generated/large.txt
-# ./bin/raytext testdata/generated/large_8G.txt
+./bin/cctext-ray --view=hex testdata/generated/large.txt
+# ./bin/cctext-ray testdata/generated/large_8G.txt
 ```
 
-**raytext** has a File / Edit / View / Go menu bar (click a title, then an item). The GUI matches **cctext**: blinking caret, idle skip-layout, unlock scroll. **Esc** still opens the key-binding overlay in both frontends. **g** / **Ctrl-G** jumps to a line (or `N%`). **o** / **Ctrl-O** opens a file in the focused view — the GUI uses the system dialog (live, no restart); **cctext** uses the in-app browser. **Ctrl-Shift-O** keeps that browser in the GUI as a reference (glob, walk directories). **l** / **Ctrl-L** cycles default / wrap / hex. **u** / **Ctrl-U** unlocks the pane from the caret; find and jump still land in the active view. Line numbers are in the gutter. Ctrl/Cmd chords work while the overlay is closed. Unsaved quit asks Save / Don't save / Cancel.
+**cctext-ray** has a File / Edit / View / Go menu bar (click a title, then an item). The GUI matches **cctext**: blinking caret, idle skip-layout, unlock scroll. **Esc** still opens the key-binding overlay in both frontends. **g** / **Ctrl-G** jumps to a line (or `N%`). **o** / **Ctrl-O** opens a file in the focused view — the GUI uses the system dialog (live, no restart); **cctext** uses the in-app browser. **Ctrl-Shift-O** keeps that browser in the GUI as a reference (glob, walk directories). **l** / **Ctrl-L** cycles default / wrap / hex. **u** / **Ctrl-U** unlocks the pane from the caret; find and jump still land in the active view. Line numbers are in the gutter. Ctrl/Cmd chords work while the overlay is closed. Unsaved quit asks Save / Don't save / Cancel.
 
 Install `ccc` with Homebrew (`brew tap sreekotay/concurrent-c` / `brew install --HEAD …/ccc`) or from a concurrent-c checkout (`PREFIX=$HOME/.local ./cc-install.sh`). TextMate schema parse uses `<ccc/std/json.cch>` / `include JsonKeep` (closed `TmGrammar` stays in-tree). `#include <raylib.h>` needs a lowerer that seeds passthrough C types (0.3.3-139 or last-good after that).
 
 ## Releases
 
-Prebuilt **cctext** only — not raytext. Each GitHub Release attaches:
+Prebuilt **cctext** only — not cctext-ray. Each GitHub Release attaches:
 
 | Artifact | Host |
 |---|---|
@@ -81,7 +81,7 @@ tests/        headless smokes
 testdata/     small fixtures; generated/ is gitignored
 ```
 
-See [RAYTEXT_PLAN.md](RAYTEXT_PLAN.md).
+See [CCTEXT_PLAN.md](CCTEXT_PLAN.md).
 
 ## Perf
 

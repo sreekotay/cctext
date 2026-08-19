@@ -1,8 +1,8 @@
-// Raytext core tests + cctext + raytext.
+// cctext core tests + console + Raylib GUI (cctext-ray).
 //
 //   ./make.shcc @smoke
 //   ./make.shcc @cctext
-//   ./make.shcc @raytext
+//   ./make.shcc @cctext_ray
 //
 // Leaf modules are real linked TUs (not textual includes):
 //   core/page_store.ccs, core/hex.ccs, core/piece_tree.ccs
@@ -76,6 +76,6 @@ CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
 CC_TARGET_DEPS cctext rtx_piece_tree rtx_hex
 
-CC_TARGET raytext exe frontend/gui.ccs
-CC_TARGET_INCLUDE raytext .
-CC_TARGET_DEPS raytext rtx_piece_tree rtx_hex
+CC_TARGET cctext_ray exe frontend/gui.ccs
+CC_TARGET_INCLUDE cctext_ray .
+CC_TARGET_DEPS cctext_ray rtx_piece_tree rtx_hex
