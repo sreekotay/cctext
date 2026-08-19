@@ -85,22 +85,23 @@ See [CCTEXT_PLAN.md](CCTEXT_PLAN.md).
 
 ## Perf
 
-Release, best of 5, each op from a fresh `from_path`. `jump_1m` / `wrap_1m` / `insert_mid` / `newline_mid` are **1 MiB into every file** so the sizes are comparable. 2026-08-18 on Srees-MacBook-Air. Full table: [testdata/perf/results/baseline_results_2026_08_18.txt](testdata/perf/results/baseline_results_2026_08_18.txt). How to re-run: [testdata/perf/README.md](testdata/perf/README.md).
+Release, best of 5, each op from a fresh `from_path`. Times include syntax highlighting. `jump_1m` / `wrap_1m` / `insert_mid` / `newline_mid` are **1 MiB into every file** so the sizes are comparable. `jump_50pct` is `g` + `50%` (byte mid; scales). 2026-08-19 on Srees-MacBook-Air. Full table: [testdata/perf/results/baseline_results_2026_08_19.txt](testdata/perf/results/baseline_results_2026_08_19.txt). How to re-run: [testdata/perf/README.md](testdata/perf/README.md).
 
-`perf_matrix_smoke` 119.6 KiB · `cctext` 189.4 KiB
+`perf_matrix_smoke` 137.1 KiB · `cctext` 301.8 KiB
 
 | | 3M text | 8G text | 2G JSON |
 |---|---:|---:|---:|
-| rss_open | 1.4 MiB | 1.5 MiB | 2.1 MiB |
-| rss_peak | 2.8 MiB | 3.0 MiB | 3.3 MiB |
-| open | 0.005 ms | 0.006 ms | 0.006 ms |
-| scroll_40 | 0.039 ms | 0.038 ms | 0.048 ms |
-| wrap_40 | 0.053 ms | 0.034 ms | 0.177 ms |
-| jump_1m | 0.456 ms | 0.586 ms | 0.433 ms |
-| wrap_1m | 0.761 ms | 0.718 ms | 0.022 ms |
-| insert_bof | 0.084 ms | 0.083 ms | 0.080 ms |
-| insert_eof | 0.088 ms | 0.087 ms | 0.083 ms |
-| insert_mid | 0.529 ms | 0.676 ms | 0.481 ms |
-| newline_mid | 0.517 ms | 0.658 ms | 0.478 ms |
+| rss_open | 1.5 MiB | 1.5 MiB | 2.1 MiB |
+| rss_peak | 3.2 MiB | 55.8 MiB | 27.8 MiB |
+| open | 0.005 ms | 0.006 ms | 0.007 ms |
+| scroll_40 | 0.039 ms | 0.039 ms | 0.046 ms |
+| wrap_40 | 0.050 ms | 0.056 ms | 0.173 ms |
+| jump_1m | 0.452 ms | 0.457 ms | 0.399 ms |
+| jump_50pct | 0.688 ms | 2197 ms | 454 ms |
+| wrap_1m | 0.845 ms | 0.752 ms | 0.829 ms |
+| insert_bof | 0.072 ms | 0.090 ms | 0.079 ms |
+| insert_eof | 0.066 ms | 0.088 ms | 0.076 ms |
+| insert_mid | 0.510 ms | 0.534 ms | 0.456 ms |
+| newline_mid | 0.513 ms | 0.525 ms | 0.449 ms |
 
-JSON `rss_open` includes grammar load on the first `.json` path. `wrap_40` there is the TextMate window lex; `wrap_1m` is cheaper because the JSON lines are short.
+JSON `rss_open` includes grammar load on the first `.json` path. `wrap_40` there is the TextMate window lex; `wrap_1m` is cheaper because the JSON lines are short. `rss_peak` on 8G / 2G JSON is the half-file `jump_50pct` index.
