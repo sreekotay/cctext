@@ -1,8 +1,21 @@
 # cctext
 
-A text editor in [Concurrent-C](https://github.com/sreekotay/concurrent-c): one document core, two frontends — **cctext** (POSIX console) and **cctext-ray** (Raylib GPU).
+A text editor in [Concurrent-C](https://github.com/sreekotay/concurrent-c): one document core, two frontends — **cctext** (POSIX console) and **cctext-ray** (Raylib GPU). Built with Concurrent-C — a strict C11-superset preprocessor: `.ccs` lowers to plain C and compiles with your host C compiler.
 
 This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). **cctext** also ships as a prebuilt on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler). It does not live inside the compiler repository.
+
+## Features
+
+- **Fast on huge files.** An 8 GiB open is 0.006 ms; first-screen scroll is 0.039 ms. The body stays on disk (page store + progressive line index). Numbers, including syntax highlight: [Perf](#perf).
+- **Small.** Release `cctext` is 302 KiB. Open RSS is ~1.5 MiB on 3 MiB and on 8 GiB.
+- **UTF-8.** Caret, wrap, hit-test, and backspace walk clusters (scalar + combining marks). Hex stays a byte camera.
+- **TUI and GUI.** Same document core: **cctext** (POSIX console) and **cctext-ray** (Raylib).
+- **Hex.** `Ctrl-L` cycles default → wrap → hex (offset | hex | ASCII).
+- **Multiview.** Several files, splits, two cameras on one document. Unlock (`Ctrl-U`) lets a pane scroll off the caret.
+- **TextMate grammars.** Drop any `.tmLanguage.json` into `grammars/` (or `RTX_GRAMMARS`) — loaded live, no rebuild. Window lex, not a full-file pass.
+- **Rectangular selection.** Alt-arrows / Alt-drag is a column box.
+- **TUI mouse.** SGR click, drag, and wheel; hit-test is the same layout as the GUI.
+- **High-performance scroll.** Only the visible window is measured and highlighted. Idle frames skip relayout.
 
 ## Why
 

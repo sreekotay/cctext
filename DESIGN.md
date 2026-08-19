@@ -80,4 +80,10 @@ The document write is `replace` (byte range in `[0, len]`). `insert` / `erase` o
 
 ## Encoding
 
-Offsets, caret, selection, and the piece tree are bytes (UTF-8 code units treated as opaque). A later grapheme / display-width layer sits on top of that; `read_at` stays bytes.
+Offsets, caret, selection, and the piece tree are bytes. Text views walk
+**clusters** for motion, wrap, hit-test, backspace, and measure (a UTF-8 scalar
+plus following combining marks / variation selectors). Hex views stay a byte
+camera: left/right, backspace, delete, box, and home/end step one byte; the
+ASCII dump is one cell per byte. Leaving hex with a collapsed caret snaps it
+to a cluster start. `read_at` stays bytes. Invalid bytes are one-byte clusters
+(U+FFFD, width 1). Full UAX #29 graphemes (ZWJ emoji, flags) are later.

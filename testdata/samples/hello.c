@@ -2,5 +2,5 @@
 
 int main(void) {
     const char *s = "hi\n";
-    return 0; /* done */
+    return 0; /* done 🎉 */
 }
