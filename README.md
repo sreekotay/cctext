@@ -1,4 +1,4 @@
-# cctext
+# cctext 0.1
 
 A text editor in [Concurrent-C](https://github.com/sreekotay/concurrent-c): one document core, two frontends — **cctext** (POSIX console) and **cctext-ray** (Raylib GPU). Built with Concurrent-C — a strict C11-superset preprocessor: `.ccs` lowers to plain C and compiles with your host C compiler.
 
@@ -12,11 +12,12 @@ Unpack a [release](https://github.com/sreekotay/cctext/releases) (no compiler) a
 
 ```bash
 tar -xzf cctext-macos-arm64.tar.gz
+./cctext-macos-arm64/cctext --version
 ./cctext-macos-arm64/cctext            # file browser
 ./cctext-macos-arm64/cctext file.txt   # missing path asks to create
 ```
 
-From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`.
+From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`. `-v` / `--version` prints `cctext 0.1`.
 
 ## Features
 
