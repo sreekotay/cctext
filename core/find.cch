@@ -14,7 +14,6 @@
 #include <string.h>
 
 enum {
-    RTX_FIND_CHUNK = 8192,
     RTX_FIND_BUDGET = 262144,
     RTX_FIND_BLOCK = RTX_FIND_BUDGET,
     RTX_FIND_WAVE = 8,
@@ -23,8 +22,6 @@ enum {
     RTX_FIND_QMAX = 256
 };
 
-/* Turnstile depth is the wave: every ticket is admitted before any pread,
- * so the ready queue stays empty and sysmon will not kidnap a blocker. */
 _Static_assert(RTX_FIND_BLOCK == RTX_FIND_BUDGET, "one wave is one budget");
 
 typedef struct {
@@ -155,54 +152,20 @@ static size_t rtx_find_finish_step(RtxDoc *d, size_t committed) {
     return committed;
 }
 
-static size_t !>(CCError) rtx_find_step_serial(RtxDoc *d, size_t budget) {
-    size_t qn = d->find.query.len;
-    size_t n = d->len();
-    size_t spent = 0;
-    size_t committed = 0;
-    char q[RTX_FIND_QMAX];
-    char buf[RTX_FIND_CHUNK];
-    size_t hits[RTX_FIND_CHUNK];
-    memcpy(q, d->find.query.ptr, qn);
-    while (spent < budget && !d->find.done) {
-        size_t want = RTX_FIND_CHUNK;
-        size_t got;
-        size_t adv;
-        size_t nloc;
-        int last;
-        if (d->find.scan_off + qn > n) {
-            d->find.done = 1;
-            break;
-        }
-        if (want < qn) want = qn;
-        if (d->find.scan_off + want > n) want = n - d->find.scan_off;
-        if (want > sizeof(buf)) want = sizeof(buf);
-        got = d->read_at(d->find.scan_off, buf, want) !>(e) { return cc_err(e); };
-        if (got == 0 && d->find.scan_off < n) {
-            return cc_err(CC_ERR_INTERNAL, "find read");
-        }
-        spent += got;
-        if (got < qn) {
-            return cc_err(CC_ERR_INTERNAL, "find read");
-        }
-        last = (d->find.scan_off + got >= n);
-        adv = rtx_find_window_adv(got, qn, last);
-        nloc = rtx_find_collect(buf, got, qn, q, adv, hits,
-                               sizeof(hits) / sizeof(hits[0]));
-        rtx_find_commit(d, d->find.scan_off, hits, nloc) !>(e) { return cc_err(e); };
-        d->find.scan_off += adv;
-        committed++;
-        if (d->find.scan_off + qn > n) d->find.done = 1;
-    }
-    return cc_ok(rtx_find_finish_step(d, committed));
-}
-
-/* Same collect + commit as serial. `seq` is the denial; `wait` is file
- * order. collect runs on the worker; commit is the write ticket. */
-static size_t !>(CCError) rtx_find_step_parallel(RtxDoc *d) {
+/* One wave. `seq` is the denial; `wait` is file order. collect is the
+ * worker; commit is the write ticket. */
+static size_t !>(CCError) RtxDoc_find_step(RtxDoc *d, size_t budget) {
     @errhandler(CCError e) { return cc_err(e); }
-    size_t qn = d->find.query.len;
-    size_t n = d->len();
+    size_t qn;
+    size_t n;
+    (void)budget;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    qn = d->find.query.len;
+    n = d->len();
+    if (qn == 0 || qn > n) {
+        d->find.done = 1;
+        return cc_ok(rtx_find_finish_step(d, 0));
+    }
     size_t start = d->find.scan_off;
     size_t committed = start;
     size_t stages = 0;
@@ -225,7 +188,7 @@ static size_t !>(CCError) rtx_find_step_parallel(RtxDoc *d) {
         char *bufs = wave.allocT((size_t)nb
             * ((size_t)RTX_FIND_BLOCK + (size_t)RTX_FIND_QMAX));
         size_t *hitss = wave.allocT((size_t)nb * (size_t)RTX_FIND_COLLECT);
-        /* n == cap: all tickets admitted, ready queue empty during pread. */
+        /* Depth is the wave: every block is in flight. */
         CCTurnstileRW ts@(nb, nb, &wave) @destroy;
         if (!ts.core.excl || !bufs || !hitss)
             return cc_err(CC_ERR_OUT_OF_MEMORY, "find wave");
@@ -273,18 +236,6 @@ static size_t !>(CCError) rtx_find_step_parallel(RtxDoc *d) {
     }
 }
 
-static size_t !>(CCError) RtxDoc_find_step(RtxDoc *d, size_t budget) {
-    size_t qn;
-    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
-    qn = d->find.query.len;
-    if (qn == 0 || qn > d->len()) {
-        d->find.done = 1;
-        return cc_ok(rtx_find_finish_step(d, 0));
-    }
-    if (budget == 0) budget = RTX_FIND_BUDGET;
-    if (budget >= RTX_FIND_BUDGET) return rtx_find_step_parallel(d);
-    return rtx_find_step_serial(d, budget);
-}
 
 static size_t rtx_find_near(const RtxDoc *d) {
     size_t i;

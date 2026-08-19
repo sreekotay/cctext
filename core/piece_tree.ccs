@@ -887,11 +887,131 @@ static void !>(CCError) rtx_tree_erase(RtxPieceTree *t, size_t offset, size_t n)
     return cc_ok();
 }
 
-/* One user-visible change. Holds a copy of `del` so rollback survives
- * add-buffer growth. Insert-fail re-inserts that copy. */
+/* Walk [off, off+n) without splitting. One entry per covering piece. */
+static size_t !>(CCError) rtx_range_piece_count(const RtxPieceTree *t, size_t off,
+                                                size_t n) {
+    size_t np = 0;
+    size_t at = off;
+    size_t remain = n;
+    size_t len;
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
+    len = RtxPieceTree_len(t);
+    if (off > len || n > len - off) return cc_err(CC_ERR_INVALID_ARG, "capture range");
+    if (n == 0) return cc_ok((size_t)0);
+    while (remain) {
+        size_t local = 0;
+        size_t take;
+        RtxNode *node = rtx_find_node(t, at, &local);
+        if (!node) return cc_err(CC_ERR_INTERNAL, "capture walk");
+        take = node->piece.len - local;
+        if (take > remain) take = remain;
+        if (take == 0) return cc_err(CC_ERR_INTERNAL, "capture take");
+        np++;
+        at += take;
+        remain -= take;
+    }
+    return cc_ok(np);
+}
+
+static void !>(CCError) rtx_range_piece_fill(const RtxPieceTree *t, size_t off, size_t n,
+                                            RtxPieceRef *out, size_t nout) {
+    size_t at = off;
+    size_t remain = n;
+    size_t i = 0;
+    if (!t || !out) return cc_err(CC_ERR_INVALID_ARG, "capture fill");
+    while (remain) {
+        size_t local = 0;
+        size_t take;
+        size_t lf;
+        RtxNode *node = rtx_find_node(t, at, &local);
+        if (!node || i >= nout) return cc_err(CC_ERR_INTERNAL, "capture fill");
+        take = node->piece.len - local;
+        if (take > remain) take = remain;
+        out[i].buf = (unsigned char)node->piece.buf;
+        out[i].start = node->piece.start + local;
+        out[i].len = take;
+        if (local == 0 && take == node->piece.len) {
+            lf = node->piece.lf_count;
+        } else if (t->lf_ready) {
+            lf = rtx_buf_count_lf(t, node->piece.buf, out[i].start, take) !>(e) {
+                return cc_err(e);
+            };
+        } else {
+            lf = 0;
+        }
+        out[i].lf_count = lf;
+        i++;
+        at += take;
+        remain -= take;
+    }
+    if (i != nout) return cc_err(CC_ERR_INTERNAL, "capture count");
+    return cc_ok();
+}
+
+void !>(CCError) RtxPieceTree_capture_range(const RtxPieceTree *t, size_t off, size_t n,
+                                            CCArena *a, RtxPieceRef **out, size_t *nout) {
+    size_t np;
+    RtxPieceRef *refs;
+    if (!t || !a || !out || !nout) return cc_err(CC_ERR_INVALID_ARG, "capture");
+    *out = NULL;
+    *nout = 0;
+    np = rtx_range_piece_count(t, off, n) !>(e) { return cc_err(e); };
+    if (np == 0) return cc_ok();
+    refs = (RtxPieceRef *)cc_arena_alloc(a, np * sizeof(RtxPieceRef), 8);
+    if (!refs) return cc_err(CC_ERR_OUT_OF_MEMORY, "capture refs");
+    rtx_range_piece_fill(t, off, n, refs, np) !>(e) { return cc_err(e); };
+    *out = refs;
+    *nout = np;
+    return cc_ok();
+}
+
+/* Insert captured pieces at `off` (does not erase). Original/add bytes stay. */
+void !>(CCError) RtxPieceTree_splice_refs(RtxPieceTree *t, size_t off,
+                                          const RtxPieceRef *refs, size_t nrefs) {
+    size_t i;
+    size_t at;
+    size_t len;
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
+    if (nrefs == 0) return cc_ok();
+    if (!refs) return cc_err(CC_ERR_INVALID_ARG, "splice refs");
+    len = RtxPieceTree_len(t);
+    if (off > len) return cc_err(CC_ERR_INVALID_ARG, "splice off");
+    rtx_lf_prepare_edit(t, off) !>(e) { return cc_err(e); };
+    rtx_split_at(t, off) !>(e) { return cc_err(e); };
+    at = off;
+    for (i = 0; i < nrefs; i++) {
+        RtxNode *node;
+        size_t lf;
+        unsigned char buf = refs[i].buf;
+        if (refs[i].len == 0) continue;
+        if (buf != RTX_BUF_ORIGINAL && buf != RTX_BUF_ADD) {
+            return cc_err(CC_ERR_INVALID_ARG, "splice buf");
+        }
+        if (buf == RTX_BUF_ORIGINAL) {
+            if (refs[i].start + refs[i].len > rtx_original_len(t)) {
+                return cc_err(CC_ERR_INVALID_ARG, "splice orig");
+            }
+        } else if (refs[i].start + refs[i].len > t->add_len) {
+            return cc_err(CC_ERR_INVALID_ARG, "splice add");
+        }
+        lf = t->lf_ready ? refs[i].lf_count : 0;
+        node = rtx_node_new_piece_lf(t, (RtxBufKind)buf, refs[i].start, refs[i].len, lf);
+        if (!node) return cc_err(CC_ERR_OUT_OF_MEMORY, "splice node");
+        rtx_bst_insert(t, node, at);
+        if (!t->line_off_suspend) {
+            rtx_line_index_note_insert(t, at, refs[i].len, node->piece.lf_count);
+        }
+        at += refs[i].len;
+    }
+    return cc_ok();
+}
+
+/* One user-visible change. Pure erase recycles nodes; original/add bytes stay.
+ * Insert-fail splices captured piece refs back (no byte hold of `del`). */
 void !>(CCError) RtxPieceTree_replace(RtxPieceTree *t, size_t off, size_t n,
                                                    char[:] ins) {
-    char[:] del = cc_slice_empty();
+    RtxPieceRef *refs = NULL;
+    size_t nrefs = 0;
     CCArena hold = {0};
     if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
     if (rtx_fail_replace) {
@@ -908,24 +1028,26 @@ void !>(CCError) RtxPieceTree_replace(RtxPieceTree *t, size_t off, size_t n,
         }
     }
     if (n == 0 && ins.len == 0) return cc_ok();
-    if (n) {
-        hold = cc_arena_heap(n + 64);
+    if (n && ins.len) {
+        size_t np = rtx_range_piece_count(t, off, n) !>(e) { return cc_err(e); };
+        size_t need = np * sizeof(RtxPieceRef) + 64;
+        if (need < 64) need = 64;
+        hold = cc_arena_heap(need);
         if (!hold.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace hold");
     }
     @defer { if (hold.base) hold.destroy(); };
+    if (n && ins.len) {
+        RtxPieceTree_capture_range(t, off, n, &hold, &refs, &nrefs) !>(e) {
+            return cc_err(e);
+        };
+    }
     if (n) {
-        del = hold.alloc_slice_bytes(n);
-        if (!del.ptr || del.len < n) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace del");
-        {
-            size_t got = t->read_at(off, del.ptr, n) !>(e) { return cc_err(e); };
-            if (got != n) return cc_err(CC_ERR_INTERNAL, "replace read");
-        }
         rtx_tree_erase(t, off, n) !>(e) { return cc_err(e); };
     }
     if (ins.len) {
         rtx_tree_insert(t, off, ins) !>(e) {
-            if (n && del.ptr) {
-                rtx_tree_insert(t, off, del) !>(e2) {
+            if (n && nrefs) {
+                RtxPieceTree_splice_refs(t, off, refs, nrefs) !>(e2) {
                     (void)e2;
                     return cc_err(RTX_ERR_UNRESTORABLE, "replace unrestorable");
                 };

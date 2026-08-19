@@ -10,7 +10,7 @@ Standalone Concurrent-C editor. Compiler repo is a toolchain, not a parent tree.
 - Highlight: interned scopes on runs; frontends theme a prefix. Spike lexer or a lowered TextMate table (`@grammar` parses `.tmLanguage.json`). Same run list.
 - Layout: `measure(run, bytes) -> width` and `line_height(run) -> height`. Raylib supplies glyph advances; `cctext` supplies `wcwidth`.
 - Commands and caret are byte offsets. Stream selection is `[sel_anchor, caret)`. Up/down keep a goal column (or EOL after End). Alt-arrows / Alt-drag is a column box.
-- Edits are replaces on a history stack (coalesced typing; large deletes omit inline hist bytes). Save writes pieces to a sibling temp file, preserves mode, fsyncs (file + best-effort dir), then renames. Dirty is `hist.head != saved_head`.
+- Edits are replaces on a history stack (coalesced typing; large deletes keep piece refs so undo/redo can splice them back). Save writes pieces to a sibling temp file, preserves mode, fsyncs (file + best-effort dir), then renames. Dirty is `hist.head != saved_head`.
 - Offsets are bytes. Text views walk UTF-8 clusters for motion / measure / wrap; hex stays a byte camera. See DESIGN Encoding.
 - After an edit, highlight re-lexes the touched section (full markup scan only if the edit involved `=`, `*`, backtick, or a newline). Layout relayouts the touched physical line(s) and shifts the rest.
 - A workspace holds several documents and one or two panes.

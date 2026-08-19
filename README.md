@@ -23,7 +23,7 @@ From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt
 
 - **Fast on huge files.** An 8 GiB open is 0.006 ms; first-screen scroll is 0.039 ms. The body stays on disk (page store + progressive line index). Numbers, including syntax highlight: [Perf](#perf).
 - **Small.** Release `cctext` is 302 KiB. Open RSS is ~1.5 MiB on 3 MiB and on 8 GiB.
-- **UTF-8.** Caret, wrap, hit-test, and backspace walk clusters (scalar + combining marks). Hex stays a byte camera.
+- **UTF-8.** Caret, wrap, hit-test, and backspace walk clusters (scalar + combining marks / variation selectors). Full UAX #29 graphemes (ZWJ emoji, flags) are pending. Hex stays a byte camera.
 - **TUI and GUI.** Same document core: **cctext** (POSIX console) and **cctext-ray** (Raylib).
 - **Hex.** `Ctrl-L` cycles default → wrap → hex (offset | hex | ASCII).
 - **Multiview.** Several files, splits, two cameras on one document. Unlock (`Ctrl-U`) lets a pane scroll off the caret.
@@ -110,7 +110,7 @@ tests/        headless smokes
 testdata/     small fixtures; generated/ is gitignored
 ```
 
-See [CCTEXT_PLAN.md](CCTEXT_PLAN.md).
+See [CCTEXT_PLAN.md](CCTEXT_PLAN.md). MIT — [LICENSE](LICENSE).
 
 ## Perf
 
