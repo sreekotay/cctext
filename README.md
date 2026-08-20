@@ -33,7 +33,7 @@ From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt
 - **Multiview.** Several files, splits, two cameras on one document. Unlock (`Ctrl-U`) lets a pane scroll off the caret.
 - **File browser.** No filename opens it. `o` / `Ctrl-O` opens the built-in browser (glob, walk directories) into the focused view. The GUI uses the system dialog; `Ctrl-Shift-O` keeps the in-app browser there too. A missing path asks to create an empty file.
 - **Deep search.** `>` in the file browser walks the tree (pumped, parallel). A fragment is case-insensitive; `*.txt` is a real glob.
-- **TextMate grammars.** Drop any `.tmLanguage.json` into `grammars/` (or `RTX_GRAMMARS`) — loaded live, no rebuild. Window lex, not a full-file pass.
+- **TextMate grammars.** Drop any `.tmLanguage.json` into `grammars/` (or `RTX_GRAMMARS`) — loaded live, no rebuild. Window lex, not a full-file pass. Shipped: C/CC, JSON, Markdown, CSS, CSV/TSV/pipe, HTML, YAML, shell, Python, JS/TS.
 - **Marks and folds.** `Ctrl-K/B` steps highlight marks already in the window (`Ctrl-E/R` for `invalid`). `Ctrl-T` folds a heading or a `{}`/`[]`/`()` pair whose other end is within a page of the caret (256KiB analysis page, plus one neighbor). The matching pair is painted while the caret sits in it. No scan, no AST.
 - **TUI mouse.** SGR click, drag, and wheel; a byte-rail scrollbar jumps by file offset (not a soft line count). Hit-test is the same layout as the GUI.
 - **Byte jump.** `g 50%` snaps to the mid-file line with a local read (8 KiB). The gutter shows `+1`… / `-L` until the line index catches up; arrows and wheel stay on that camera — they do not `line_of` the prefix. Absolute `g L` still uses the index.
