@@ -1,10 +1,13 @@
 #!ccc ccs
 /*
  * cctext-ray host loop. Paint is gui_draw.ccs; keys/mouse are gui_input.ccs.
+ * Frame: input → pump → layout → paint (DESIGN.md Interactive). TUI is the
+ * same cycle with input last because read blocks.
  */
 #include <ccc/std/prelude.cch>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include <raylib.h>
 #include <rlgl.h>
 #include "../core/document.cch"
@@ -101,6 +104,13 @@ static void gui_geom(int *ww, int *hh, int *inner, int *pane_w, int *vis_rows,
     *pane_w = (g_live.w && g_live.w->npanes >= 2) ? (*inner / 2 - 8) : *inner;
     *vis_rows = (*hh - top - 28 - (find_on ? GUI_FIND_H : 0)) / 20;
     if (*vis_rows < 4) *vis_rows = 4;
+}
+
+static int gui_view_stale(const RtxBuf *b) {
+    if (!b || b->layout.len == 0) return 1;
+    if (b->seek_valid && b->layout.rows[0].byte_start != b->seek_off)
+        return 1;
+    return 0;
 }
 
 static void !>(CCError) gui_relayout(int pane_w, int vis_rows) {
@@ -211,6 +221,7 @@ int main(int argc, char **argv) {
     memset(&ui, 0, sizeof(ui));
     if (cli.nfiles == 0 || w.untitled()) w.browse_start() !>;
 
+    SetTraceLogLevel(LOG_NONE);
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI);
     InitWindow(ww, hh, "cctext");
     SetExitKey(0);
@@ -270,75 +281,54 @@ int main(int argc, char **argv) {
         if (saw) gui_blink_show(&ui);
         gui_geom(&ww, &hh, &inner, &pane_w, &vis_rows, pad, top, ui.find);
         act = w.active();
-        if (act && ui.find) {
-            size_t caret0 = act->doc.caret;
-            rtx_ui_find_pump(&ui, &act->doc) !>;
-            if (act->doc.caret != caret0) {
-                gui_land(act, vis_rows);
-                g_need_layout = 1;
-            }
-            g_dirty = 1;
-        }
-        RtxWs_browse_pump(&w) !>;
-        if (act) {
-            int isle_was = rtx_line_isle_pumping(&act->doc.tree);
-            long now;
-            rtx_ui_line_isle_pump(&act->doc, gui_isle_yield);
-            now = rtx_ui_now_ms();
-            if (isle_was && !rtx_line_isle_pumping(&act->doc.tree)) {
-                g_dirty = 1;
-                g_need_layout = 1;
-            } else if (rtx_line_isle_pumping(&act->doc.tree) &&
-                       (g_isle_paint_at == 0 ||
-                        now - g_isle_paint_at >= (long)RTX_LINE_ISLE_PAINT_MS)) {
-                g_dirty = 1;
-                g_isle_paint_at = now;
-            }
-        }
-
-        if (saw || g_need_layout) {
-            for (p = 0; p < w.npanes; p++) {
-                RtxBuf *b = &w.bufs[w.pane[p]];
-                int held = w.hold_pane(p);
-                size_t nlines = b->line_count();
-                if (p == w.focus && dragging != GUI_DRAG_SCROLL) {
-                    if (w.nav[p].on) {
-                        int wheel = (int)GetMouseWheelMove();
-                        int list_h = vis_rows > RTX_BROWSE_HEAD ? vis_rows : 8;
-                        while (wheel > 0) {
-                            rtx_browse_move(&w.nav[p], -1, list_h);
-                            wheel--;
-                        }
-                        while (wheel < 0) {
-                            rtx_browse_move(&w.nav[p], 1, list_h);
-                            wheel++;
-                        }
-                    } else {
-                        gui_wheel(b, &m, gui_text_w(&fonts, b, pane_w, vis_rows));
-                    }
-                }
-                if (!b->seek_valid && b->top >= nlines && nlines) b->top = nlines - 1;
-                w.drop_pane(p, held);
-            }
-            gui_relayout(pane_w, vis_rows) !>;
-            g_need_layout = 0;
-        }
-        act = w.active();
-
         if (gui_handle_input(&w, act, &m, &fonts, &ui, status, sizeof(status),
                              &quit_armed_at, &menu_open, &dragging, &scroll_grab,
                              pane_w, vis_rows, pad, top, inner, hh)) {
             break;
         }
         act = w.active();
-        if (g_need_layout || (act && !act->seek_valid &&
-            (act->layout.len == 0 || act->layout.from_line != act->top))) {
+        if (act) {
+            size_t caret0 = act->doc.caret;
+            int isle_was = rtx_line_isle_pumping(&act->doc.tree);
+            long now;
+            @errhandler(RtxIndexErr e) {
+                snprintf(status, sizeof(status), "%s",
+                         e.message ? e.message : "scan");
+            }
+            rtx_ui_work_pump(&ui, act, vis_rows, gui_isle_yield) !>;
+            if (act->doc.caret != caret0) {
+                if (ui.find) gui_land(act, vis_rows);
+                else if (!act->unlock) act->pin_view = 0;
+                g_need_layout = 1;
+            }
+            now = rtx_ui_now_ms();
+            if (isle_was && !rtx_line_isle_pumping(&act->doc.tree)) {
+                g_dirty = 1;
+                g_need_layout = 1;
+            } else if (rtx_ui_work_pumping(&ui, &act->doc) &&
+                       (g_isle_paint_at == 0 ||
+                        now - g_isle_paint_at >= (long)RTX_LINE_ISLE_PAINT_MS)) {
+                g_dirty = 1;
+                g_isle_paint_at = now;
+            }
+        }
+        RtxWs_browse_pump(&w) !>;
+
+        if (saw || g_need_layout || (act && gui_view_stale(act))) {
+            for (p = 0; p < w.npanes; p++) {
+                RtxBuf *b = &w.bufs[w.pane[p]];
+                int held = w.hold_pane(p);
+                size_t nlines = b->line_count();
+                if (!b->seek_valid && b->top >= nlines && nlines)
+                    b->top = nlines - 1;
+                w.drop_pane(p, held);
+            }
             gui_relayout(pane_w, vis_rows) !>;
             g_need_layout = 0;
         }
 
         if (rtx_ui_blink_step(&ui)) g_dirty = 1;
-        if (ui.find && act && !act->doc.find.done) g_dirty = 1;
+        if (rtx_ui_work_pumping(&ui, act ? &act->doc : NULL)) g_dirty = 1;
         if (RtxWs_browse_busy(&w)) g_dirty = 1;
         if (g_busy_show && !(act && rtx_line_isle_pumping(&act->doc.tree)))
             g_dirty = 1;
@@ -364,5 +354,6 @@ int main(int argc, char **argv) {
     if (fonts.owned_mono) UnloadFont(fonts.mono);
     if (fonts.owned_prose) UnloadFont(fonts.prose);
     CloseWindow();
+    if (rtx_ws_close_heavy(&w)) _exit(0);
     return 0;
 }

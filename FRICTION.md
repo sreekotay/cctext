@@ -18,11 +18,10 @@ sit on the cctext include TU.
 The scope intern table is `core/scope.ccs` — paint and lex must share IDs
 (GUI draw is a separate TU). Help strings are `core/ui_help.ccs`.
 Brace-pair paint (`rtx_nav_pair_ends`) is declared in `nav_pair.cch`, not
-`nav.cch`. TUI pane paint is `frontend/cctext_draw.ccs` (same cut as
-`gui_draw`); the host loop stays in `cctext.ccs`. Find/browse chapter bodies live in the sibling `.ccs` (CCC will not
-keep impl-grade statics in a header included from two TUs). TUI draw
-includes `ui_types.cch` via workspace, not `find.cch` / `ui.cch` /
-`browse.cch`.
+`nav.cch`. TUI pane + chrome paint is `frontend/cctext_draw.ccs` (same cut as
+`gui_draw`); keys/mouse are `frontend/cctext_input.ccs`; the host loop stays
+in `cctext.ccs`. Find/browse chapter bodies live in the sibling `.ccs` (CCC
+will not keep impl-grade statics in a header included from two TUs).
 GUI paint is `frontend/gui_draw.ccs`; keys/mouse are `frontend/gui_input.ccs`;
 the host loop stays in `frontend/gui.ccs` (same cut as hex / browse). Do not
 add `@typehooks` fields on the GUI TUs. Chrome (menus / fonts / help) is
@@ -34,4 +33,4 @@ bit inverted — same kick / step / yield (DESIGN.md Scan). Do not add a
 shared `RtxScan` type. `#define` before `#include "….cch"` does not survive
 into the generated C include — listing-only helpers belong in `browse.ccs`.
 Workspace helpers (`RtxWs_browse_*`) live in `workspace.cch` so the listing
-TU does not lower the hook table.
+TU does not lower the hook table. 

@@ -9,7 +9,10 @@
 #include "../core/nav_pair.cch"
 #include "../core/layout.cch"
 #include "../core/workspace.cch"
-#include "cctext_draw.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+#include "../core/browse.cch"
+#include "cctext.cch"
 
 static int g_draw_mouse_row;
 
@@ -127,16 +130,28 @@ static void cctext_put_scroll(RtxBuf *b, int focused, int vis, int row, int col)
         if (usable > 0 && ly > usable) ly = usable;
         ty = ly;
     }
-    if (row >= ty && row < ty + th) {
-        ch = '#';
-        fg = rail.ready ? (focused ? "\x1b[7;37m" : "\x1b[7;90m")
-                        : (focused ? "\x1b[7;33m" : "\x1b[7;90m");
-    } else if (!rail.ready && row == vis - 1) {
-        ch = '+';
-        fg = "\x1b[33m";
-    } else {
-        ch = '|';
-        fg = "\x1b[90m";
+    {
+        int on_thumb = (row >= ty && row < ty + th);
+        int rel = rtx_buf_scroll_rel(b);
+            int mark = rtx_buf_scroll_rel_mark_y(b, vis, vis);
+        int on_mark = rel && row == mark;
+        if (on_thumb) {
+            ch = '#';
+            if (on_mark)
+                fg = focused ? "\x1b[7;31m" : "\x1b[7;91m";
+            else
+                fg = rail.ready ? (focused ? "\x1b[7;37m" : "\x1b[7;90m")
+                                : (focused ? "\x1b[7;33m" : "\x1b[7;90m");
+        } else if (on_mark) {
+            ch = '-';
+            fg = focused ? "\x1b[31m" : "\x1b[91m";
+        } else if (!rail.ready && row == vis - 1) {
+            ch = '+';
+            fg = "\x1b[33m";
+        } else {
+            ch = '|';
+            fg = "\x1b[90m";
+        }
     }
     fprintf(stdout, "\x1b[%d;%dH%s%c\x1b[0m", row + 1, col, fg, ch);
 }
@@ -579,4 +594,517 @@ void cctext_draw_stats(RtxBuf *b, int rows, int cols) {
         }
         fputs("\x1b[0m", stdout);
     }
+}
+
+int cctext_pane_cols(RtxWs *w, int cols, int pane) {
+    if (w->npanes < 2) return cols;
+    if (pane == 0) return cols / 2 - 1;
+    return cols - (cols / 2) - 1;
+}
+
+void cctext_draw_jump_status(RtxUi *ui, RtxDoc *d, int rows) {
+    char jump[80];
+    rtx_ui_jump_header(ui, d, jump, sizeof(jump));
+    fprintf(stdout, "\x1b[%d;1H\x1b[7m %s\x1b[0m\x1b[K", rows, jump);
+    fflush(stdout);
+}
+
+void cctext_draw_isle_status(RtxBuf *act, int rows) {
+    char pos[48];
+    const char *path = (act && act->doc.path.ptr) ? act->doc.path.ptr : "(untitled)";
+    const char *star = (act && act->doc.dirty()) ? "*" : " ";
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return;
+    }
+    rtx_status_line_pos(act, pos, sizeof(pos)) !>;
+    fprintf(stdout,
+            "\x1b[%d;1H\x1b[7m%s%s  %s%s  Esc help  g jump  f find  %s\x1b[0m\x1b[K",
+            rows, star, path, pos,
+            (act && act->unlock) ? "  unlock" : "", g_status);
+    fflush(stdout);
+}
+
+static int cctext_put_field(RtxField f, const RtxUi *ui, const char *restore,
+                            int used, int maxc) {
+    size_t i, n, lo, hi;
+    char[:] bytes;
+    const char *caret = ui ? rtx_ui_prompt_caret(ui) : "";
+    int has;
+    rtx_field_clamp(f);
+    n = f.len ? *f.len : 0;
+    bytes = rtx_field_bytes(f);
+    lo = rtx_field_lo(f);
+    hi = rtx_field_hi(f);
+    has = rtx_field_has_sel(f);
+    i = 0;
+    while (i <= n && used < maxc) {
+        if (f.caret && *f.caret == i && caret && caret[0]) {
+            fputs(caret, stdout);
+            used++;
+            if (used >= maxc) break;
+        }
+        if (i >= n) break;
+        {
+            RtxUtf8Cl cl = rtx_utf8_cluster(bytes, i);
+            size_t step = cl.n ? cl.n : 1;
+            int sel = has && i >= lo && i < hi;
+            if (cl.cols > 0 && used + cl.cols > maxc) break;
+            if (sel) fputs("\x1b[7m", stdout);
+            if (f.buf) fwrite(f.buf + i, 1, step, stdout);
+            if (sel) fputs(restore ? restore : "\x1b[0m", stdout);
+            used += cl.cols;
+            i += step;
+        }
+    }
+    return used;
+}
+
+static void cctext_browse_face(int selected, RtxBrowseFace face) {
+    fputs("\x1b[0m", stdout);
+    if (selected) fputs("\x1b[44m", stdout);
+    fputs(rtx_browse_face(face).ansi, stdout);
+}
+
+static void cctext_browse_pad(int n, int selected) {
+    int i;
+    fputs("\x1b[0m", stdout);
+    if (selected) fputs("\x1b[44m", stdout);
+    for (i = 0; i < n; i++) fputc(' ', stdout);
+}
+
+static void cctext_browse_text(const char *s, int maxc) {
+    int n = 0;
+    if (!s) return;
+    while (s[n] && n < maxc) {
+        fputc(s[n], stdout);
+        n++;
+    }
+}
+
+static void cctext_browse_row(int row, int col0, int pcols, int pad_rest,
+                              int selected, const char *text, RtxBrowseFace face) {
+    int n = 0;
+    fprintf(stdout, "\x1b[%d;%dH", row, col0);
+    cctext_browse_face(selected, face);
+    if (text) {
+        while (text[n] && n < pcols) {
+            fputc(text[n], stdout);
+            n++;
+        }
+    }
+    cctext_browse_pad(pcols - n, selected);
+    fputs("\x1b[0m", stdout);
+    if (!pad_rest) fputs("\x1b[K", stdout);
+}
+
+static void cctext_browse_ent(int row, int col0, int pcols, int pad_rest,
+                              int selected, const RtxBrowse *br,
+                              const RtxBrowseEnt *e) {
+    char name[RTX_BROWSE_NAME + 2];
+    char size[12];
+    char when[24];
+    int meta = RTX_BROWSE_SIZE_W + 2 + RTX_BROWSE_MTIME_W;
+    int show = pcols >= 10 + meta;
+    int size_at = show ? pcols - meta : pcols;
+    int name_w = size_at - 2;
+    int used;
+    if (name_w < 1) name_w = 1;
+    fprintf(stdout, "\x1b[%d;%dH", row, col0);
+    cctext_browse_pad(1, selected);
+    snprintf(name, sizeof(name), "%s%s", e->name, e->is_dir ? "/" : "");
+    {
+        size_t pref = rtx_browse_dir_prefix(name);
+        size_t hit = 0, hn = 0, i = 0;
+        int left = name_w;
+        rtx_browse_hit_span(br, name, &hit, &hn);
+        while (left > 0 && name[i]) {
+            RtxBrowseFace fa, fb;
+            size_t j = i;
+            int n;
+            if (hn && i >= hit && i < hit + hn) fa = RTX_BROWSE_FACE_HIT;
+            else if (i < pref || e->is_dir) fa = RTX_BROWSE_FACE_DIR;
+            else fa = RTX_BROWSE_FACE_FILE;
+            j++;
+            while (name[j]) {
+                if (hn && j >= hit && j < hit + hn) fb = RTX_BROWSE_FACE_HIT;
+                else if (j < pref || e->is_dir) fb = RTX_BROWSE_FACE_DIR;
+                else fb = RTX_BROWSE_FACE_FILE;
+                if (fb != fa) break;
+                j++;
+            }
+            n = (int)(j - i);
+            if (n > left) n = left;
+            cctext_browse_face(selected, fa);
+            cctext_browse_text(name + i, n);
+            left -= n;
+            i = j;
+        }
+    }
+    used = 1 + (int)strlen(name);
+    if (used > 1 + name_w) used = 1 + name_w;
+    if (used < size_at) cctext_browse_pad(size_at - used, selected);
+    if (show) {
+        rtx_browse_fmt_size(size, sizeof(size), e);
+        rtx_browse_fmt_mtime(when, sizeof(when), e);
+        cctext_browse_face(selected, RTX_BROWSE_FACE_SIZE);
+        cctext_browse_text(size, RTX_BROWSE_SIZE_W);
+        cctext_browse_pad(2, selected);
+        cctext_browse_face(selected, RTX_BROWSE_FACE_DATE);
+        cctext_browse_text(when, RTX_BROWSE_MTIME_W);
+        used = size_at + meta;
+    }
+    if (used < pcols) cctext_browse_pad(pcols - used, selected);
+    fputs("\x1b[0m", stdout);
+    if (!pad_rest) fputs("\x1b[K", stdout);
+}
+
+static void cctext_draw_browse(RtxBrowse *br, const RtxUi *ui, int focused, int vis,
+                               int pcols, int col0, int pad_rest) {
+    char line[512];
+    int r;
+    size_t list, i;
+    if (!br) return;
+    rtx_browse_scroll(br, vis);
+    snprintf(line, sizeof(line), " %s", br->dir);
+    cctext_browse_row(1, col0, pcols, pad_rest, 0, line, RTX_BROWSE_FACE_PATH);
+    {
+        int used = 0;
+        int i;
+        fprintf(stdout, "\x1b[%d;%dH", 2, col0);
+        cctext_browse_face(0, RTX_BROWSE_FACE_GLOB);
+        fputs(" glob: ", stdout);
+        used = 7;
+        used = cctext_put_field(rtx_browse_field(br), focused ? ui : NULL,
+                                rtx_browse_face(RTX_BROWSE_FACE_GLOB).ansi, used, pcols);
+        cctext_browse_pad(pcols - used, 0);
+        fputs("\x1b[0m", stdout);
+        if (!pad_rest) fputs("\x1b[K", stdout);
+    }
+    {
+        int head = rtx_browse_head(br);
+        if (br->flat)
+            cctext_browse_row(3, col0, pcols, pad_rest, 0, " > Flattened search",
+                              RTX_BROWSE_FACE_GLOB);
+        list = (vis > head) ? (size_t)(vis - head) : 0;
+        for (i = 0; i < list; i++) {
+            size_t idx = br->top + i;
+            r = head + 1 + (int)i;
+            if (idx >= br->len) {
+                cctext_browse_row(r, col0, pcols, pad_rest, 0, "",
+                                  RTX_BROWSE_FACE_FILE);
+                continue;
+            }
+            cctext_browse_ent(r, col0, pcols, pad_rest,
+                              focused && idx == br->cur, br, &br->ents[idx]);
+        }
+    }
+}
+
+/* 1 if the caret is on a cell in this pane. Hex sits on the first nibble. */
+static int cctext_caret_cell(RtxBuf *b, int vis, int pcols, int col0, int *row, int *col) {
+    size_t caret;
+    int g, tcols;
+    size_t r;
+    if (!b || vis < 1 || !row || !col) return 0;
+    caret = b->doc.caret;
+    if (rtx_layout_is_hex(&b->layout)) {
+        size_t top = rtx_hex_align(b->top_byte);
+        size_t crow = caret / (size_t)RTX_HEX_COLS;
+        size_t trow = top / (size_t)RTX_HEX_COLS;
+        size_t k;
+        if (crow < trow || crow >= trow + (size_t)vis) return 0;
+        k = caret - crow * (size_t)RTX_HEX_COLS;
+        *row = (int)(crow - trow) + 1;
+        *col = col0 + RTX_HEX_OFF_W + (int)k * 3;
+        return 1;
+    }
+    g = rtx_gutter_cols_buf(b, vis);
+    tcols = cctext_text_cols(b, pcols, vis);
+    for (r = 0; r < (size_t)vis; r++) {
+        size_t idx = r + b->top_wrap;
+        RtxVisRow *vr;
+        size_t at;
+        int span_ok = 1;
+        if (idx >= b->layout.len) break;
+        vr = &b->layout.rows[idx];
+        if (caret < vr->byte_start) continue;
+        if (caret > vr->byte_start + vr->byte_len) continue;
+        at = caret - vr->byte_start;
+        {
+            cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+            char[:] bytes = cc_slice_empty();
+            @errhandler(CCError e) {
+                (void)e;
+                span_ok = 0;
+            }
+            bytes = b->scratch_span(&scratch, vr->byte_start, vr->byte_len) !>;
+            if (span_ok) at = (size_t)rtx_utf8_prefix_cols(bytes, at);
+        }
+        if (at > (size_t)tcols) at = (size_t)tcols;
+        *row = (int)r + 1;
+        *col = col0 + g + (int)at;
+        return 1;
+    }
+    return 0;
+}
+
+static void cctext_place_cursor(RtxWs *w, RtxUi *ui, int vis, int cols) {
+    RtxBuf *act;
+    int pane, pcols, col0, row, col;
+    if (!w) return;
+    act = w->active();
+    if (!act || rtx_ui_prompting(ui) || (ui && (ui->help || ui->ask_quit)) ||
+        (w && w->browsing())) {
+        fputs("\x1b[?25l", stdout);
+        return;
+    }
+    pane = w->focus;
+    pcols = cctext_pane_cols(w, cols, pane);
+    col0 = (pane == 0) ? 1 : (cols / 2 + 2);
+    if (rtx_ui_blink(ui) && cctext_caret_cell(act, vis, pcols, col0, &row, &col)) {
+        fprintf(stdout, "\x1b[%d;%dH\x1b[?25h", row, col);
+    } else {
+        fputs("\x1b[?25l", stdout);
+    }
+}
+
+/* Last "  " is the key / action split. A line with no gap is all action. */
+static void cctext_help_split(const char *line, size_t *key_n, const char **desc) {
+    const char *last = NULL;
+    const char *p;
+    size_t kn;
+    if (!key_n || !desc) return;
+    *key_n = 0;
+    *desc = line ? line : "";
+    if (!line || !line[0]) return;
+    for (p = line; p[0] && p[1]; p++) {
+        if (p[0] == ' ' && p[1] == ' ') last = p;
+    }
+    if (!last) return;
+    while (*last == ' ') last++;
+    kn = (size_t)(last - line);
+    while (kn && line[kn - 1] == ' ') kn--;
+    *key_n = kn;
+    *desc = last;
+}
+
+static void cctext_help_pad(int n) {
+    int i;
+    for (i = 0; i < n; i++) fputc(' ', stdout);
+}
+
+static void cctext_draw_help(int rows, int cols) {
+    int i;
+    int n = 0;
+    int box_w = 50;
+    int box_h;
+    int r0, c0;
+    int key_w = 13;
+    while (rtx_help_line((size_t)n)) n++;
+    box_h = n + 4;
+    if (box_w > cols - 2) box_w = cols - 2;
+    if (box_h > rows - 2) box_h = rows - 2;
+    r0 = (rows - box_h) / 2;
+    if (r0 < 1) r0 = 1;
+    c0 = (cols - box_w) / 2;
+    if (c0 < 1) c0 = 1;
+    for (i = 0; i < box_h; i++) {
+        fprintf(stdout, "\x1b[%d;%dH", r0 + i, c0);
+        if (i == 0) {
+            fputs("\x1b[44;33;1m key bindings", stdout);
+            cctext_help_pad(box_w - 13);
+        } else if (i == 1) {
+            int d;
+            fputs("\x1b[44;34m ", stdout);
+            for (d = 1; d < box_w - 1; d++) fputc('-', stdout);
+            fputc(' ', stdout);
+        } else if (i - 2 >= 0 && i - 2 < n && i < box_h - 1) {
+            size_t kn = 0;
+            const char *desc = "";
+            int used = 1;
+            int dn, room;
+            cctext_help_split(rtx_help_line((size_t)(i - 2)), &kn, &desc);
+            fputs("\x1b[44m ", stdout);
+            if (kn) {
+                int kw = (int)kn < key_w ? (int)kn : key_w;
+                fputs("\x1b[36;1m", stdout);
+                fwrite(rtx_help_line((size_t)(i - 2)), 1, (size_t)kw, stdout);
+                fputs("\x1b[44m", stdout);
+                cctext_help_pad(key_w - kw);
+                used += key_w;
+                fputs("\x1b[37m ", stdout);
+                used++;
+            } else {
+                fputs("\x1b[37m", stdout);
+            }
+            room = box_w - used - 1;
+            dn = (int)strlen(desc);
+            if (dn > room) dn = room;
+            if (dn > 0) fwrite(desc, 1, (size_t)dn, stdout);
+            used += dn;
+            fputs("\x1b[44m", stdout);
+            cctext_help_pad(box_w - used);
+        } else {
+            fputs("\x1b[44m", stdout);
+            cctext_help_pad(box_w);
+        }
+        fputs("\x1b[0m", stdout);
+    }
+}
+
+static int cctext_find_span(const char *ctx, size_t n, const char *q, size_t qn,
+                            size_t *at, size_t *len, int *hit) {
+    size_t i, j;
+    if (!ctx || !at || !len || !hit || *at >= n) return 0;
+    i = *at;
+    if (q && qn && i + qn <= n && memcmp(ctx + i, q, qn) == 0) {
+        *len = qn;
+        *hit = 1;
+        *at = i + qn;
+        return 1;
+    }
+    j = i + 1;
+    while (j < n && !(q && qn && j + qn <= n && memcmp(ctx + j, q, qn) == 0))
+        j++;
+    *len = j - i;
+    *hit = 0;
+    *at = j;
+    return 1;
+}
+
+static void cctext_draw_find(RtxDoc *d, RtxUi *ui, int rows, int cols, int find_h) {
+    int r0 = rows - find_h;
+    int vis_hits = find_h > 1 ? find_h - 1 : 0;
+    int i;
+    char head[256];
+    size_t ctxn = (size_t)(cols > 16 ? cols - 10 : 8);
+    if (r0 < 1) r0 = 1;
+    rtx_ui_find_scroll(ui, d, (size_t)vis_hits);
+    rtx_ui_find_stats(d, head, sizeof(head));
+    fprintf(stdout, "\x1b[%d;1H\x1b[44;37m find: ", r0);
+    cctext_put_field(rtx_ui_find_field(ui), ui, "\x1b[44;37m", 7, cols > 2 ? cols - 1 : 1);
+    fprintf(stdout, "  %s\x1b[0m\x1b[K", head);
+    for (i = 0; i < vis_hits; i++) {
+        size_t hit = ui->find_top + (size_t)i;
+        int row = r0 + 1 + i;
+        int cur = d && hit == d->find.cur;
+        fprintf(stdout, "\x1b[%d;1H%s", row, cur ? "\x1b[7m" : "\x1b[0m");
+        if (!d || hit >= d->find.len) {
+            fputs("\x1b[K\x1b[0m", stdout);
+            continue;
+        }
+        {
+            char ctx[256];
+            size_t line1 = 0;
+            int ok = 1;
+            rtx_ui_find_row_text(d, hit, ctxn, ctx, sizeof(ctx), &line1) !>(e) {
+                ok = 0;
+            };
+            if (!ok) {
+                fprintf(stdout, "  %zu\x1b[K\x1b[0m", hit + 1);
+            } else {
+                const char *q = d->find.query.ptr;
+                size_t qn = d->find.query.len;
+                size_t at = 0, n = strlen(ctx), len;
+                int is_hit;
+                fprintf(stdout, " %5zu  ", line1);
+                while (cctext_find_span(ctx, n, q, qn, &at, &len, &is_hit)) {
+                    fputs(is_hit ? "\x1b[43;30m" : (cur ? "\x1b[7m" : "\x1b[0m"),
+                          stdout);
+                    fwrite(ctx + at - len, 1, len, stdout);
+                }
+                fputs("\x1b[K\x1b[0m", stdout);
+            }
+        }
+    }
+}
+
+void cctext_draw(RtxWs *w, RtxUi *ui, int rows, int cols) {
+    int find_h = rtx_ui_find_rows(ui, rows);
+    int vis = rows - 1 - find_h;
+    int p;
+    RtxBuf *act = w->active();
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
+    if (vis < 1) vis = 1;
+    rtx_ui_blink_step(ui);
+    /* Synchronized update: do not ED (erase display) — that is the flicker. */
+    fputs("\x1b[?2026h", stdout);
+    for (p = 0; p < w->npanes; p++) {
+        int bi = w->pane[p];
+        RtxBuf *b = &w->bufs[bi];
+        int pcols = cctext_pane_cols(w, cols, p);
+        int col0 = (p == 0) ? 1 : (cols / 2 + 2);
+        int pad_left = (w->npanes == 2 && p == 0);
+        {
+            RtxBrowse *br = &w->nav[p];
+            int held = w->hold_pane(p);
+            if (br && br->on)
+                cctext_draw_browse(br, ui, p == w->focus, vis, pcols, col0, pad_left);
+            else
+                cctext_draw_pane(b, ui, p == w->focus, vis, pcols, col0, pad_left,
+                                 g_status, sizeof(g_status), g_mouse_row);
+            w->drop_pane(p, held);
+        }
+        if (w->npanes == 2 && p == 0) {
+            size_t r;
+            int gap = cols / 2;
+            for (r = 0; r < (size_t)vis; r++) {
+                fprintf(stdout, "\x1b[%zu;%dH\x1b[0m \x1b[90m│\x1b[0m", r + 1, gap);
+            }
+        }
+    }
+    if (ui && ui->find && act && find_h > 0) {
+        cctext_draw_find(&act->doc, ui, rows, cols, find_h);
+    }
+    if (ui && ui->help) cctext_draw_help(rows, cols);
+    if (ui && ui->stats) cctext_draw_stats(act, rows, cols);
+    {
+        const char *path = (act && act->doc.path.ptr) ? act->doc.path.ptr : "(untitled)";
+        const char *star = (act && act->doc.dirty()) ? "*" : " ";
+        if (ui && ui->ask_quit) {
+            fprintf(stdout,
+                    "\x1b[%d;1H\x1b[41;97m unsaved  s save  q don't save  Esc cancel  %s\x1b[0m\x1b[K",
+                    rows, g_status);
+        } else if (ui && ui->jump) {
+            char jump[80];
+            rtx_ui_jump_header(ui, act ? &act->doc : NULL, jump, sizeof(jump));
+            fprintf(stdout, "\x1b[%d;1H\x1b[7m %s\x1b[0m\x1b[K", rows, jump);
+        } else if (w && w->browsing()) {
+            RtxBrowse *br = RtxWs_browse(w);
+            fprintf(stdout,
+                    "\x1b[%d;1H\x1b[7m browse  %zu/%zu%s  enter open  Esc %s  %s\x1b[0m\x1b[K",
+                    rows, br && br->len ? br->cur + 1 : 0, br ? br->len : 0,
+                    br && br->scanning ? "  scanning..." :
+                    (br && br->truncated ? "  capped" : ""),
+                    br && br->boot ? "quit" : "close", g_status);
+        } else if (ui && ui->find) {
+            fprintf(stdout,
+                    "\x1b[%d;1H\x1b[7m find  up/down hits  Esc close  %s\x1b[0m\x1b[K",
+                    rows, g_status);
+        } else {
+            if (act && rtx_layout_is_hex(&act->layout)) {
+                fprintf(stdout,
+                        "\x1b[%d;1H\x1b[7m%s%s  @%zX  hex %s%s  Esc help  g jump  %s\x1b[0m\x1b[K",
+                        rows, star, path, act->doc.caret,
+                        act->hex_nib ? "lo" : "hi",
+                        act->unlock ? "  unlock" : "", g_status);
+            } else {
+                {
+                    char pos[48];
+                    rtx_status_line_pos(act, pos, sizeof(pos)) !>;
+                    fprintf(stdout,
+                            "\x1b[%d;1H\x1b[7m%s%s  %s%s  Esc help  g jump  f find  %s\x1b[0m\x1b[K",
+                            rows, star, path, pos,
+                            (act && act->unlock) ? "  unlock" : "", g_status);
+                }
+            }
+        }
+    }
+    fputs("\x1b[?2026l", stdout);
+    cctext_place_cursor(w, ui, vis, cols);
+    fflush(stdout);
 }

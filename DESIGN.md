@@ -11,7 +11,8 @@ d.destroy();
 d.from_path(path) !>;
 ```
 
-or a second local (`RtxDoc d2 = {0} @destroy`). `memset` is neither.
+or a second local (`RtxDoc d2 = {0} @destroy`). Same for tree, layout, buf,
+workspace. A buf slot destroys layout, then doc. `memset` is neither.
 
 Hooks and faces live next to the type they name. A file cut is not an API — chapters of one TU stay chapters (`piece_tree_rb` / `piece_tree_lines` are not their own products). Do not extract the next linked TU (document, layout, workspace) because the tree did; wait until compile time hurts. The header exports the legal write (`replace`), not `insert` / `erase` because a rope usually does. Do not split `RtxDoc` into history/selection types because it is wide. A label on a shared record is an enum (closed dispatch, no `default:`); a value that is one of several payloads is a `@variant` — do not variant-shape every classifier. A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
 
@@ -30,35 +31,69 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
 
+## Interactive
+
+The UI thread does not wait on the line index. Open, paint, hit, select,
+arrow, wheel, `%` jump, and a gap edit are bytes: `line_floor` / `line_next`
+(local 8KiB), `fill_off`, window lex. Gutter is `+N` / `-L` until the
+island meets the prefix.
+
+Two cameras, two window writes — do not mix them.
+
+| camera | origin | fill |
+|---|---|---|
+| seek | `seek_off` | `fill_off` |
+| line | `top` | `fill` |
+
+`line_of(seek_off)` hands off to the line camera (`top` / `fill`).
+`index_covers` alone does not — that wrote `line_guess` into `top`.
+Unlabeled stays a seek.
+
+| window | caret already visible | else |
+|---|---|---|
+| `reveal` (follow) | keep | scroll / `seek_set` |
+| `land` | snap that line to top | `seek_set` |
+
+Click, type, and `ensure_caret` follow. Jump `%` and find hits land.
+`if (seek) land else reveal` is the bug: a seek is a camera, not
+“index incomplete”. After handoff, wrap follow owns `top_wrap` again.
+
+`line_of` is a covered lookup. Uncovered is an error — it does not scan.
+`RtxDocLayout` does not grant it. Box select is two floors and columns,
+not line numbers. `line_count` is soft until EOF. `line_start` may extend
+the prefix; do not call it from a gap camera.
+
+`g N%` is a byte snap plus island (backfill). `g L` is a prefix pump
+(`want_line`), same host gate as find — not a guess.
+
+Host frame: mutations, then one window write. TUI read blocks, so
+`pump → layout+paint → input`. GUI events are already polled, so
+`input → pump → layout → paint`. Do not layout, then handle, then
+layout again — a command that forgets a dirty bit paints the old camera.
+
 ## Scan
 
-Find and browse (and the next long walk) share one pump. Do not extract a
-shared type — `find.done` vs `browse.scanning` stay local bits (GUI AST).
-The model is the names:
+Backfill is a pump. The host yields (`rtx_ui_work_pump`). Do not extract a
+shared type — bits stay local (`find.done`, `browse.scanning`, GUI AST).
+The next walk copies this table.
 
 | | start | one wave | live | resume | deny |
 |---|---|---|---|---|---|
 | find | `find_set` | `find_step` | `!done && !cancel` | `scan_off` | `RTX_FIND_SEQ` |
+| jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
+| island | `isle_kick` | `isle_step` | `isle_pumping` | `isle_from` | — |
 | browse | `rtx_browse_kick` | `rtx_browse_pump` | `scanning` | job queue | `RTX_BROWSE_SEQ` |
 
-Kick plants the first paint and returns. One closed interval per step.
-Returning is the yield. A longer query that extends the last one filters
-hits and keeps `scan_off`; a cap resumes from the last accepted hit. A
-shorter or non-prefix query resets. The host decides whether to enter —
-`find_apply` enters once; `find_pump` may enter again up to `RTX_FIND_PUMP`
-while `RTX_FIND_PUMP_MS` remains, then lands. The step returns how many staged
-hops ran; 0 is not progress. `cancel` is a written bit — not a stdin poll.
-Hosts pump while live and show `scanning...` / `capped`. Tests call
-`finish` (drain). Do not drain the first screen before first paint.
-
-The next scan (index, grep, …) copies this table, not a new protocol.
-
-`g N%` is a byte camera: snap with `line_floor` (local 8KiB), paint `+1`… /
-`-L` in the gutter until the island meets the prefix, and pump backward.
-Scroll and arrows stay on `line_floor` / `line_next` — do not `line_of` to
-follow the caret. Absolute `g L` still uses `line_start` / `line_of`.
-
-`RtxDoc d = {0} @destroy` (and the same for tree, layout, buf, workspace). A buf slot destroys layout, then doc.
+Kick plants the first paint and returns. One closed interval per step;
+returning is the yield. A longer prefix query filters hits and keeps
+`scan_off`; a cap resumes from the last accepted hit; a shorter or
+non-prefix query resets. `find_apply` enters once; `find_pump` may enter
+again up to `RTX_FIND_PUMP` while `RTX_FIND_PUMP_MS` remains, then lands.
+The step returns staged hops; 0 is not progress. `cancel` is a written
+bit, not a stdin poll. Chrome that owns the walk shows `scanning...` /
+`capped`. Tests call `finish` (drain). Do not drain the first screen
+before first paint. Tests that need a covered `line_of` call
+`rtx_line_scan_to` (or a pump) first.
 
 ## Surfaces
 
@@ -78,7 +113,7 @@ Hist stores everything the next edit needs, or undo/redo clears what it does not
 
 A `char[:]` is `{ptr, len, id}`. Storing it does not take the bytes.
 
-- `from_path` — page store until `destroy()`. No document-wide `char[:]` over the file; bytes are `read_at` (or a named-arena copy). Open does not scan the body; the line index grows on `line_start` / `line_of`.
+- `from_path` — page store until `destroy()`. No document-wide `char[:]` over the file; bytes are `read_at` (or a named-arena copy). Open does not scan the body.
 - `from_buffer` — keeps the caller’s slice. Refuses non-empty untracked (`id == 0`).
 - `span` — empty means “not one piece” (or `n == 0`), or store-backed bytes with no stable view. That is a payload; callers use `scratch_span` / `read_at`.
 - `scratch_span` / `analysis_span` — view if contiguous, else a copy on the named arena. Empty is `n == 0` / past end; OOM and short `read_at` are errors.
@@ -87,7 +122,7 @@ A `char[:]` is `{ptr, len, id}`. Storing it does not take the bytes.
 
 Constructors assume dead. Reopen is `d.destroy(); d.from_path(...)`.
 
-A path that gives up is not success: a non-empty original must produce a root; scan / highlight / reparse do not plant markup or set `hl_done` after a missing span. Lex a window, not the body — do not pass `len` as a highlight bound. The **root section is the path kind** (`CODE` if a grammar matches, else `PROSE`). `===` headers still split. Mixed markup stays `UNKNOWN` until a header or BOF — do not invent a path-default for a file with no grammar. `*` / `` ` `` refresh style runs; `=` or a large delete rescans sections. Lex copies die with the frame, not an `analysis` bump. A short `read_at` mid-document is a fault, not EOF. `line_count` is soft until the index reaches EOF.
+A path that gives up is not success: a non-empty original must produce a root; scan / highlight / reparse do not plant markup or set `hl_done` after a missing span. Lex a window, not the body — do not pass `len` as a highlight bound. The **root section is the path kind** (`CODE` if a grammar matches, else `PROSE`). `===` headers still split. Mixed markup stays `UNKNOWN` until a header or BOF — do not invent a path-default for a file with no grammar. `*` / `` ` `` refresh style runs; `=` or a large delete rescans sections. Lex copies die with the frame, not an `analysis` bump. A short `read_at` mid-document is a fault, not EOF.
 
 Commit only after the new value exists: hist after `tree.replace` (reserve coalesced bytes before, commit after); clip after a successful cut; path + `saved_head` after a prepared rename. Rollback failure is `RTX_ERR_UNRESTORABLE` and sets `d.broken` — further edits refuse. Clipboard allocs into a local, then assigns. Empty source is a real clear. A path that gives up is unchanged or `broken` — never a hole that looks retryable.
 
@@ -97,7 +132,7 @@ Commit only after the new value exists: hist after `tree.replace` (reserve coale
 
 - `as: tree` on `RtxDoc`, `as: doc` on `RtxBuf` — miss on the outer retries on the embed.
 - `RtxDocHighlight` — `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`. It cannot `len` / `line_*` / `insert` / `type` / `save`.
-- `RtxDocLayout` — measure may `len`, `line_*`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`, `fold_covers`. It cannot `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
+- `RtxDocLayout` — measure may `len`, `line_count`, `line_start`, `line_guess`, `index_covers`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`, `fold_covers`. It cannot `line_of` / `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
 
 Mark motion and fold walk the runs `ensure_hl` already produced. They do not lex ahead, pump, or keep a file-shaped table. Heading pairs use those runs; brace pairs (`{}` `[]` `()`) match on the caret’s 256KiB analysis page plus at most one neighbor page each side (same grain as `RTX_HL_WIN_MAX`, not the 64KiB store). Paint does not `ensure_hl` that span — skip uses whatever runs the layout window already has. A fold is stored only when both ends are in that window. Layout skips interiors; caret and scroll jump to the fold edge; hex ignores folds.
 

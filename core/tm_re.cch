@@ -1,8 +1,10 @@
 #ifndef RTX_TM_RE_H
 #define RTX_TM_RE_H
 
-/* Leftover TM match: literals, '.', classes, \b \d \w \s, *+?, |, ( ).
- * No backrefs, no lookaround, no Onig. Zero-length hits are rejected. */
+/* Leftover TM match: literals, '.', classes, \b \d \w \s, *+? {n,m}, |, ( ).
+ * {n} {n,} {n,m}; max clamped to 63. Bare `{` is a quantifier, not text
+ * (`\{` for a brace). No backrefs, no lookaround, no Onig. Zero-length
+ * hits are rejected. */
 
 #define RTX_RE_GROUPS 8
 
@@ -74,6 +76,59 @@ static size_t rtx_re_atom_end(const char *p, size_t i, size_t n) {
         return i;
     }
     return i + 1;
+}
+
+#define RTX_RE_REP 63
+
+/* Digits for {n,m}. Values above RTX_RE_REP stay 100 so `{100}` is one token. */
+static int rtx_re_digits(const char *p, size_t i, size_t n, size_t *out_i,
+                         size_t *val) {
+    size_t v = 0;
+    int any = 0;
+    while (i < n && p[i] >= '0' && p[i] <= '9') {
+        if (v <= 99) v = v * 10 + (size_t)(p[i] - '0');
+        i++;
+        any = 1;
+    }
+    if (!any) return 0;
+    *out_i = i;
+    *val = v;
+    return 1;
+}
+
+/* 1 = *+? or {n,m}; -1 = `{` that is not a count; 0 = no quantifier. */
+static int rtx_re_quant(const char *p, size_t ae, size_t pend, size_t *min,
+                        size_t *max, size_t *qend) {
+    size_t i, n, m;
+    char q;
+    if (ae >= pend) return 0;
+    q = p[ae];
+    if (q == '*' || q == '+' || q == '?') {
+        *min = (q == '+') ? 1 : 0;
+        *max = (q == '?') ? 1 : (size_t)RTX_RE_REP;
+        *qend = ae + 1;
+        return 1;
+    }
+    if (q != '{') return 0;
+    i = ae + 1;
+    if (!rtx_re_digits(p, i, pend, &i, &n)) return -1;
+    if (i < pend && p[i] == ',') {
+        i++;
+        if (i < pend && p[i] >= '0' && p[i] <= '9') {
+            if (!rtx_re_digits(p, i, pend, &i, &m)) return -1;
+        } else {
+            m = (size_t)RTX_RE_REP;
+        }
+    } else {
+        m = n;
+    }
+    if (i >= pend || p[i] != '}') return -1;
+    if (n > (size_t)RTX_RE_REP || m < n) return -1;
+    if (m > (size_t)RTX_RE_REP) m = (size_t)RTX_RE_REP;
+    *min = n;
+    *max = m;
+    *qend = i + 1;
+    return 1;
 }
 
 static int rtx_re_class(char c, const char *p, size_t a, size_t b) {
@@ -235,24 +290,20 @@ static int rtx_re_seq(const char *p, size_t pi, size_t pend, const char *t,
                       size_t ti, size_t tn, size_t *out) {
     size_t ae, qend, cur, n, min, max, nends, k, nx, rest;
     size_t ends[64];
-    char q;
     if (pi >= pend) {
         *out = ti;
         return 1;
     }
     ae = rtx_re_atom_end(p, pi, pend);
-    q = 0;
     qend = ae;
-    if (ae < pend && (p[ae] == '*' || p[ae] == '+' || p[ae] == '?')) {
-        q = p[ae];
-        qend = ae + 1;
+    {
+        int qok = rtx_re_quant(p, ae, pend, &min, &max, &qend);
+        if (qok < 0) return 0;
+        if (!qok) {
+            if (!rtx_re_atom(p, pi, ae, t, ti, tn, &nx)) return 0;
+            return rtx_re_seq(p, ae, pend, t, nx, tn, out);
+        }
     }
-    if (!q) {
-        if (!rtx_re_atom(p, pi, ae, t, ti, tn, &nx)) return 0;
-        return rtx_re_seq(p, ae, pend, t, nx, tn, out);
-    }
-    min = (q == '+') ? 1 : 0;
-    max = (q == '?') ? 1 : 63;
     nends = 0;
     cur = ti;
     n = 0;
@@ -284,6 +335,80 @@ static int rtx_re_match(const char *pat, size_t plen, const char *t, size_t at,
     if (e <= at) return 0;
     *end = e;
     return 1;
+}
+
+/* First consuming byte, or -1 if the pattern can start on more than one.
+ * Optional first atoms (`-?`, `[ \t]*`) and disagreeing alts are -1. */
+static int rtx_re_first_atom(const char *p, size_t a, size_t b);
+
+static int rtx_re_first_seq(const char *p, size_t pi, size_t pend) {
+    size_t ae, qend, min, max;
+    int qok;
+    while (pi < pend) {
+        if (p[pi] == '\\' && pi + 1 < pend && p[pi + 1] == 'b') {
+            pi += 2;
+            continue;
+        }
+        ae = rtx_re_atom_end(p, pi, pend);
+        qok = rtx_re_quant(p, ae, pend, &min, &max, &qend);
+        if (qok < 0) return -1;
+        if (qok && min == 0) return -1;
+        return rtx_re_first_atom(p, pi, ae);
+    }
+    return -1;
+}
+
+static int rtx_re_first_range(const char *p, size_t pi, size_t pend) {
+    int common = -2;
+    size_t i = pi;
+    while (i <= pend) {
+        size_t bar = i;
+        int d = 0;
+        int f;
+        while (bar < pend) {
+            if (p[bar] == '\\' && bar + 1 < pend) {
+                bar += 2;
+                continue;
+            }
+            if (p[bar] == '(') d++;
+            else if (p[bar] == ')') {
+                if (d) d--;
+            } else if (p[bar] == '|' && d == 0) {
+                break;
+            }
+            bar++;
+        }
+        f = rtx_re_first_seq(p, i, bar);
+        if (common == -2) common = f;
+        else if (common != f) return -1;
+        if (bar >= pend) break;
+        i = bar + 1;
+    }
+    return common == -2 ? -1 : common;
+}
+
+static int rtx_re_first_atom(const char *p, size_t a, size_t b) {
+    if (a >= b) return -1;
+    if (p[a] == '(') {
+        size_t inner = b;
+        if (b > a && p[b - 1] == ')') inner = b - 1;
+        return rtx_re_first_range(p, a + 1, inner);
+    }
+    if (p[a] == '\\' && a + 1 < b) {
+        char e = p[a + 1];
+        if (e == 'b' || e == 'd' || e == 'w' || e == 's' || e == 'n' ||
+            e == 't') {
+            return -1;
+        }
+        return (unsigned char)e;
+    }
+    if (p[a] == '[' || p[a] == '.') return -1;
+    return (unsigned char)p[a];
+}
+
+static int rtx_re_first(const char *p, size_t n) {
+    if (!p || n == 0) return -1;
+    return rtx_re_first_range(p, 0, n);
 }
 
 static int rtx_re_match_caps(const char *pat, size_t plen, const char *t,
