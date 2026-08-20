@@ -13,6 +13,7 @@ Standalone Concurrent-C editor. Compiler repo is a toolchain, not a parent tree.
 - Edits are replaces on a history stack (coalesced typing; large deletes keep piece refs so undo/redo can splice them back). Save writes pieces to a sibling temp file, preserves mode, fsyncs (file + best-effort dir), then renames. Dirty is `hist.head != saved_head`.
 - Offsets are bytes. Text views walk UTF-8 clusters for motion / measure / wrap; hex stays a byte camera. See DESIGN Encoding.
 - After an edit, highlight re-lexes the touched section. A full section rescan is only for `=` (or a large delete) — `*` / `` ` `` are style. Layout relayouts the touched physical line(s) and shifts the rest.
+- Mark motion (`Ctrl-K/B`) and invalid step (`Ctrl-E/R`) walk current highlight runs only. Fold (`Ctrl-T`) stores an in-window heading region and layout skips its interior. No scan, no AST.
 - A workspace holds several documents and one or two panes.
 
 ## Frontends

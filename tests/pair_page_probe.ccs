@@ -1,0 +1,162 @@
+#!ccc ccs
+/*
+ * Open a giant JSON, jump (line 1000 and 50%), then lex the pair window.
+ *
+ *   ./bin/pair_page_probe testdata/generated/large_2G.json
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/script/stdio.cch>
+#include <stdio.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/nav_pair.cch"
+
+static double probe_meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return (double)bytes.len;
+}
+
+static double probe_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+static double mono_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static size_t rss_now(void) {
+#ifdef __APPLE__
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info,
+                  &count) != KERN_SUCCESS)
+        return 0;
+    return (size_t)info.resident_size;
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+    return (size_t)ru.ru_maxrss * 1024;
+#endif
+}
+
+static void show_rss(const char *label) {
+    printf("  %-18s rss=%6.2f MiB\n", label, (double)rss_now() / (1024.0 * 1024.0));
+}
+
+static void paint_pair(RtxDoc *d, const char *label) {
+    size_t from = 0, to = 0, plo = 0, phi = 0;
+    int have;
+    double t0, ms;
+    if (!rtx_nav_brace_pages(d->caret, d->len(), &from, &to)) {
+        printf("  %-18s no pair window\n", label);
+        return;
+    }
+    printf("  %-18s caret=%zu  pair-pages=[%zu, %zu)  span=%zu  runs=%zu\n",
+           label, d->caret, from, to, to - from, d->run_len);
+    t0 = mono_ms();
+    have = rtx_nav_pair_ends(&d->tree, d->runs, d->run_len, d->caret, d->edit_gen,
+                             d->run_len, &plo, &phi);
+    ms = mono_ms() - t0;
+    printf("  %-18s paint-pair %7.3f ms  pair=%d", label, ms, have);
+    if (have) printf("  {%zu,%zu}", plo, phi);
+    printf("\n");
+    show_rss(label);
+}
+
+int main(int argc, char **argv) {
+    const char *src = "testdata/generated/large_2G.json";
+    RtxDoc d = {0} @destroy;
+    size_t n, at;
+    double t0, ms;
+
+    if (argc > 1) src = argv[1];
+    if (access(src, R_OK) != 0) {
+        fprintf(stderr, "pair_page_probe: missing %s\n", src);
+        return 1;
+    }
+
+    @errhandler(CCError e) {
+        fprintf(stderr, "pair_page_probe: %s\n", e.message ? e.message : "?");
+        return 1;
+    }
+    @errhandler(RtxIndexErr e) {
+        fprintf(stderr, "%s\n", e.message ? e.message : "index");
+        return 1;
+    }
+
+    t0 = mono_ms();
+    d.from_path(src) !>;
+    ms = mono_ms() - t0;
+    n = d.len();
+    printf("open               %8.3f ms  bytes=%zu  hl_full=%d\n", ms, n, d.hl_full);
+    show_rss("open");
+
+    t0 = mono_ms();
+    d.caret = d.line_start(999) !>;
+    d.sel_anchor = d.caret;
+    ms = mono_ms() - t0;
+    printf("goto L1000         %8.3f ms  caret=%zu  scan_off=%zu  scan_line=%zu  "
+           "lf_ready=%d\n",
+           ms, d.caret, d.tree.line_scan_off, d.tree.scan_line, d.tree.lf_ready);
+    show_rss("L1000 jump");
+    paint_pair(&d, "L1000 pair");
+
+    t0 = mono_ms();
+    at = n ? (n - 1) * 50 / 100 : 0;
+    d.caret = rtx_doc_line_floor(&d, at) !>;
+    d.sel_anchor = d.caret;
+    rtx_line_isle_kick(&d.tree, d.caret);
+    ms = mono_ms() - t0;
+    printf("goto 50%%           %8.3f ms  off=%zu  caret=%zu  "
+           "scan_off=%zu  scan_line=%zu  isle=%zu..%zu  lf_ready=%d\n",
+           ms, at, d.caret, d.tree.line_scan_off, d.tree.scan_line,
+           d.tree.isle_from, d.tree.isle_to, d.tree.lf_ready);
+    if (d.tree.line_scan_off > (size_t)2 * 1024 * 1024) {
+        fprintf(stderr, "pair_page_probe: 50%% scanned the prefix (%zu)\n",
+                d.tree.line_scan_off);
+        return 1;
+    }
+    show_rss("50% jump");
+    paint_pair(&d, "50% pair");
+
+    {
+        RtxLayout L = {0} @destroy;
+        RtxMeasure meas;
+        RtxPref pref = {0};
+        size_t scan0 = d.tree.line_scan_off;
+        meas.measure = probe_meas;
+        meas.line_height = probe_lh;
+        meas.ctx = NULL;
+        t0 = mono_ms();
+        L.move_vert(&d, &meas, 80.0, -1, 0, &pref) !>;
+        L.move_vert(&d, &meas, 80.0, 1, 0, &pref) !>;
+        ms = mono_ms() - t0;
+        printf("move_vert 50%%     %8.3f ms  scan_off=%zu\n", ms,
+               d.tree.line_scan_off);
+        if (d.tree.line_scan_off != scan0) {
+            fprintf(stderr, "pair_page_probe: move_vert scanned the prefix (%zu)\n",
+                    d.tree.line_scan_off);
+            return 1;
+        }
+        if (ms > 50.0) {
+            fprintf(stderr, "pair_page_probe: move_vert too slow (%.1f ms)\n", ms);
+            return 1;
+        }
+    }
+
+    printf("pair_page_probe ok  path=%s\n", src);
+    return 0;
+}

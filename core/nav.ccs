@@ -1,0 +1,427 @@
+#!ccc ccs
+/*
+ * In-window mark / fold (linked TU; see nav.cch).
+ * Walks runs the host already lexed. No extra scan. Types here must match
+ * RtxRun / RtxFold in document.cch (tm_grammar_smoke checks sizes).
+ */
+#include <ccc/std/prelude.cch>
+#include <stdlib.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "scope.cch"
+
+size_t rtx_tree_read(void *tree, size_t off, char *dst, size_t n);
+size_t rtx_tree_len(void *tree);
+
+typedef uint32_t RtxNavScope;
+
+typedef struct {
+    unsigned bold : 1;
+    unsigned italic : 1;
+    unsigned mono : 1;
+    RtxNavScope scope;
+} RtxNavStyle;
+
+typedef struct {
+    size_t start;
+    size_t len;
+    RtxNavStyle style;
+} RtxNavRun;
+
+typedef struct {
+    size_t lo;
+    size_t hi;
+} RtxNavFold;
+
+typedef struct {
+    size_t lo;
+    size_t hi;
+    size_t at;
+    size_t edit;
+    size_t runs;
+    const void *runp;
+    unsigned have : 1;
+    unsigned ready : 1;
+} RtxNavPair;
+
+static int nav_hidden(const RtxNavFold *folds, size_t fold_n, size_t off) {
+    size_t i;
+    if (!folds) return 0;
+    for (i = 0; i < fold_n; i++) {
+        if (off > folds[i].lo && off < folds[i].hi) return 1;
+    }
+    return 0;
+}
+
+size_t rtx_nav_run_bytes(void) {
+    return sizeof(RtxNavRun);
+}
+
+size_t rtx_nav_fold_bytes(void) {
+    return sizeof(RtxNavFold);
+}
+
+size_t rtx_nav_snap(const void *folds_v, size_t fold_n, size_t off, int dir) {
+    const RtxNavFold *folds = (const RtxNavFold *)folds_v;
+    size_t i;
+    if (!folds) return off;
+    for (i = 0; i < fold_n; i++) {
+        if (off > folds[i].lo && off < folds[i].hi)
+            return dir < 0 ? folds[i].lo : folds[i].hi;
+    }
+    return off;
+}
+
+int rtx_nav_from_ctrl(int c) {
+    if (c == 11) return 1;
+    if (c == 2) return 2;
+    if (c == 5) return 3;
+    if (c == 18) return 4;
+    if (c == 20) return 5;
+    return 0;
+}
+
+int rtx_nav_from_letter(int c) {
+    if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+    if (c == 'k') return 1;
+    if (c == 'b') return 2;
+    if (c == 'e') return 3;
+    if (c == 'r') return 4;
+    if (c == 't') return 5;
+    return 0;
+}
+
+const char *rtx_nav_msg(int cmd, int r, int hex) {
+    if (cmd == 5) {
+        if (hex) return "hex has no fold";
+        if (r == 1) return "folded";
+        if (r == 2) return "unfolded";
+        return "no region";
+    }
+    if (cmd == 3 || cmd == 4) return r ? "invalid" : "no invalid";
+    return r ? "mark" : "no mark";
+}
+
+int rtx_nav_step_at(const void *runs_v, size_t n, size_t *caret, size_t *anchor,
+                    int *box, int dir, int (*want)(uint32_t),
+                    const void *folds_v, size_t fold_n) {
+    const RtxNavRun *runs = (const RtxNavRun *)runs_v;
+    const RtxNavFold *folds = (const RtxNavFold *)folds_v;
+    size_t i;
+    size_t at;
+    size_t best;
+    if (!runs || !caret || !want || n == 0) return 0;
+    at = *caret;
+    best = (size_t)-1;
+    for (i = 0; i < n; i++) {
+        size_t s = runs[i].start;
+        if (runs[i].len == 0 || runs[i].style.scope == 0) continue;
+        if (!want(runs[i].style.scope)) continue;
+        if (nav_hidden(folds, fold_n, s)) continue;
+        if (dir < 0) {
+            if (s < at && (best == (size_t)-1 || s > best)) best = s;
+        } else if (s > at && (best == (size_t)-1 || s < best)) {
+            best = s;
+        }
+    }
+    if (best == (size_t)-1) return 0;
+    *caret = best;
+    if (anchor) *anchor = best;
+    if (box) *box = 0;
+    return 1;
+}
+
+static int nav_region(const RtxNavRun *runs, size_t n, size_t at,
+                      size_t *lo, size_t *hi) {
+    size_t i;
+    size_t prev = (size_t)-1;
+    size_t last = 0;
+    if (!runs || !lo || !hi || n == 0) return 0;
+    last = runs[n - 1].start + runs[n - 1].len;
+    for (i = 0; i < n; i++) {
+        size_t a = runs[i].start;
+        if (!rtx_scope_is_heading(runs[i].style.scope)) continue;
+        if (prev != (size_t)-1 && at >= prev && at < a && a > prev + 1) {
+            *lo = prev;
+            *hi = a;
+            return 1;
+        }
+        prev = a;
+    }
+    if (prev != (size_t)-1 && at >= prev && at < last && last > prev + 1) {
+        *lo = prev;
+        *hi = last;
+        return 1;
+    }
+    return 0;
+}
+
+/* Analysis page (RTX_HL_WIN_MAX), not the 64KiB store page. */
+#define RTX_NAV_BRACE_PAGE 262144
+
+int rtx_nav_brace_pages(size_t caret, size_t doc_len, size_t *from, size_t *to) {
+    size_t page = (size_t)RTX_NAV_BRACE_PAGE;
+    size_t p;
+    size_t lo;
+    size_t hi;
+    if (!from || !to || !doc_len) return 0;
+    if (caret > doc_len) caret = doc_len;
+    p = caret / page;
+    lo = p > 0 ? (p - 1) * page : 0;
+    hi = (p + 2) * page; /* pages p-1, p, p+1 */
+    if (hi > doc_len) hi = doc_len;
+    if (hi <= lo) return 0;
+    *from = lo;
+    *to = hi;
+    return 1;
+}
+
+static int nav_is_open(char c) {
+    return c == '{' || c == '[' || c == '(';
+}
+
+static int nav_is_close(char c) {
+    return c == '}' || c == ']' || c == ')';
+}
+
+static char nav_mate(char c) {
+    if (c == '{') return '}';
+    if (c == '[') return ']';
+    if (c == '(') return ')';
+    if (c == '}') return '{';
+    if (c == ']') return '[';
+    if (c == ')') return '(';
+    return 0;
+}
+
+static int nav_skip_at(const RtxNavRun *runs, size_t n, size_t off, size_t *hint) {
+    size_t i;
+    int k;
+    if (!runs || n == 0) return 0;
+    i = hint && *hint < n ? *hint : 0;
+    while (i + 1 < n && runs[i + 1].start <= off) i++;
+    while (i > 0 && runs[i].start > off) i--;
+    if (hint) *hint = i;
+    if (off >= runs[i].start && off < runs[i].start + runs[i].len) {
+        k = rtx_scope_kind(runs[i].style.scope);
+        return k == RTX_HL_STRING || k == RTX_HL_COMMENT;
+    }
+    return 0;
+}
+
+static int nav_brace_win(const RtxNavRun *runs, size_t n, size_t caret,
+                         size_t doc_len, size_t *from, size_t *to) {
+    (void)runs;
+    (void)n;
+    return rtx_nav_brace_pages(caret, doc_len, from, to);
+}
+
+static size_t nav_brace_close(const char *bytes, size_t from, size_t to,
+                              const RtxNavRun *runs, size_t n,
+                              size_t opener) {
+    char stk[64];
+    size_t sp = 1;
+    size_t off;
+    size_t hint = 0;
+    stk[0] = bytes[opener - from];
+    for (off = opener + 1; off < to; off++) {
+        char c;
+        if (nav_skip_at(runs, n, off, &hint)) continue;
+        c = bytes[off - from];
+        if (nav_is_open(c)) {
+            if (sp >= 64) return (size_t)-1;
+            stk[sp] = c;
+            sp++;
+            continue;
+        }
+        if (!nav_is_close(c)) continue;
+        if (sp == 0 || nav_mate(stk[sp - 1]) != c) return (size_t)-1;
+        sp--;
+        if (sp == 0) return off;
+    }
+    return (size_t)-1;
+}
+
+static size_t nav_brace_open(const char *bytes, size_t from, size_t to,
+                             const RtxNavRun *runs, size_t n, size_t at) {
+    size_t off;
+    size_t hint = 0;
+    int depth = 0;
+    if (at >= from && at < to && !nav_skip_at(runs, n, at, &hint)) {
+        char c = bytes[at - from];
+        if (nav_is_open(c)) return at;
+        if (nav_is_close(c)) {
+            char want = nav_mate(c);
+            for (off = at; off > from; ) {
+                char b;
+                off--;
+                if (nav_skip_at(runs, n, off, &hint)) continue;
+                b = bytes[off - from];
+                if (nav_is_close(b)) {
+                    depth++;
+                    continue;
+                }
+                if (!nav_is_open(b)) continue;
+                if (depth) {
+                    depth--;
+                    continue;
+                }
+                if (b == want) return off;
+                return (size_t)-1;
+            }
+            return (size_t)-1;
+        }
+    }
+    if (at == 0) return (size_t)-1;
+    off = at < to ? at : to;
+    for (; off > from; ) {
+        char b;
+        off--;
+        if (nav_skip_at(runs, n, off, &hint)) continue;
+        b = bytes[off - from];
+        if (nav_is_close(b)) {
+            depth++;
+            continue;
+        }
+        if (!nav_is_open(b)) continue;
+        if (depth) {
+            depth--;
+            continue;
+        }
+        return off;
+    }
+    return (size_t)-1;
+}
+
+/* Opener and closer bytes. Same-line pairs are a hit (fold may still refuse). */
+static int nav_brace_ends(const RtxNavRun *runs, size_t n, size_t at,
+                          void *tree, size_t doc_len, size_t *lo, size_t *hi) {
+    size_t from = 0;
+    size_t to = 0;
+    size_t got = 0;
+    size_t opener;
+    size_t closer;
+    char *buf;
+    if (!tree || !lo || !hi) return 0;
+    if (!nav_brace_win(runs, n, at, doc_len, &from, &to)) return 0;
+    buf = (char *)malloc(to - from);
+    if (!buf) return 0;
+    got = rtx_tree_read(tree, from, buf, to - from);
+    if (got < to - from) to = from + got;
+    opener = nav_brace_open(buf, from, to, runs, n, at);
+    if (opener == (size_t)-1) {
+        free(buf);
+        return 0;
+    }
+    closer = nav_brace_close(buf, from, to, runs, n, opener);
+    free(buf);
+    if (closer == (size_t)-1) return 0;
+    *lo = opener;
+    *hi = closer;
+    return 1;
+}
+
+static int nav_brace_region(const RtxNavRun *runs, size_t n, size_t at,
+                            void *tree, size_t doc_len, size_t *lo, size_t *hi) {
+    size_t opener;
+    size_t closer;
+    size_t line;
+    char c;
+    if (!nav_brace_ends(runs, n, at, tree, doc_len, &opener, &closer))
+        return 0;
+    line = closer;
+    while (line > opener) {
+        if (rtx_tree_read(tree, line - 1, &c, 1) != 1) break;
+        if (c == '\n') break;
+        line--;
+    }
+    if (line <= opener) return 0;
+    *lo = opener;
+    *hi = line;
+    return 1;
+}
+
+static RtxNavPair g_pair_slot[4];
+static void *g_pair_key[4];
+static unsigned g_pair_clock;
+
+int rtx_nav_pair_ends(void *tree, const void *runs, size_t n, size_t caret,
+                      size_t edit, size_t run_len, size_t *lo, size_t *hi) {
+    RtxNavPair *p;
+    unsigned i;
+    if (!tree) return 0;
+    p = NULL;
+    for (i = 0; i < 4; i++) {
+        if (g_pair_key[i] == tree) {
+            p = &g_pair_slot[i];
+            break;
+        }
+    }
+    if (!p) {
+        i = g_pair_clock++ & 3;
+        g_pair_key[i] = tree;
+        p = &g_pair_slot[i];
+        p->ready = 0;
+    }
+    if (p->ready && p->at == caret && p->edit == edit && p->runs == run_len &&
+        p->runp == runs) {
+        if (!p->have) return 0;
+        if (lo) *lo = p->lo;
+        if (hi) *hi = p->hi;
+        return 1;
+    }
+    p->at = caret;
+    p->edit = edit;
+    p->runs = run_len;
+    p->runp = runs;
+    p->ready = 1;
+    p->have = nav_brace_ends((const RtxNavRun *)runs, n, caret, tree,
+                             rtx_tree_len(tree), &p->lo, &p->hi);
+    if (!p->have) return 0;
+    if (lo) *lo = p->lo;
+    if (hi) *hi = p->hi;
+    return 1;
+}
+
+int rtx_nav_fold_at(size_t *caret, size_t *anchor, const void *runs_v, size_t n,
+                    void *tree, void *folds_v, size_t *fold_n, size_t fold_max) {
+    RtxNavRun *runs = (RtxNavRun *)runs_v;
+    RtxNavFold *folds = (RtxNavFold *)folds_v;
+    size_t lo = 0;
+    size_t hi = 0;
+    size_t i;
+    size_t at;
+    if (!caret || !folds || !fold_n) return 0;
+    at = *caret;
+    for (i = 0; i < *fold_n; i++) {
+        int hit = (at >= folds[i].lo && at < folds[i].hi);
+        /* Closer sits at hi (line start). Pair paint lands there; that
+         * must unfold, not add a second fold of the same pair. */
+        if (!hit && tree) {
+            size_t o = 0, c = 0;
+            if (nav_brace_ends(runs, n, at, tree, rtx_tree_len(tree), &o, &c) &&
+                o == folds[i].lo)
+                hit = 1;
+        }
+        if (hit) {
+            for (; i + 1 < *fold_n; i++) folds[i] = folds[i + 1];
+            (*fold_n)--;
+            return 2;
+        }
+    }
+    if (n) nav_region(runs, n, at, &lo, &hi);
+    if (!hi) {
+        size_t doc_len = tree ? rtx_tree_len(tree) : 0;
+        if (!nav_brace_region(runs, n, at, tree, doc_len, &lo, &hi))
+            return 0;
+    }
+    if (*fold_n >= fold_max) return 0;
+    folds[*fold_n].lo = lo;
+    folds[*fold_n].hi = hi;
+    (*fold_n)++;
+    if (at > lo && at < hi) {
+        *caret = lo;
+        if (anchor) *anchor = lo;
+    }
+    return 1;
+}

@@ -18,6 +18,7 @@ typedef struct {
     size_t top_byte;       /* first byte row start when view == HEX (16-aligned) */
     int seek_valid;        /* byte camera. The line index does not replace it. */
     size_t seek_off;       /* first visible byte while seek_valid */
+    long seek_rel;         /* lines from isle/origin; gutter +N / -L */
     size_t drag_vis;       /* scrollbar map frozen at press; 0 if not dragging */
     size_t drag_len;
     int drag_grab;         /* thumb grab offset in track cells/pixels */
@@ -71,6 +72,7 @@ typedef struct {
     size_t top, top_wrap, top_byte;
     int seek_valid;
     size_t seek_off;
+    long seek_rel;
     size_t drag_vis, drag_len;
     int drag_grab;
     int pin_view, unlock;
@@ -95,7 +97,14 @@ typedef struct {
     void *busy_ctx;
 } RtxWs;
 
-static void rtx_browse_drop(RtxBrowse *br);
+void rtx_browse_drop(RtxBrowse *br);
+void rtx_browse_dirname(char *dst, size_t n, const char *path);
+void rtx_browse_basename(char *dst, size_t n, const char *path);
+int rtx_browse_abs(char *dst, size_t n, const char *path);
+int rtx_browse_join(char *dst, size_t n, const char *dir, const char *name);
+void rtx_browse_keep_set(RtxBrowse *br, const char *name);
+void !>(CCError) rtx_browse_kick(RtxBrowse *br);
+size_t !>(CCError) rtx_browse_pump(RtxBrowse *br);
 
 static int RtxWs_ensure(RtxWs *w) {
     if (!w) return 0;
@@ -124,6 +133,11 @@ static void rtx_buf_swap_cam(RtxBuf *b, RtxPaneSnap *s) {
     z = b->top_byte; b->top_byte = s->top_byte; s->top_byte = z;
     i = b->seek_valid; b->seek_valid = s->seek_valid; s->seek_valid = i;
     z = b->seek_off; b->seek_off = s->seek_off; s->seek_off = z;
+    {
+        long rel = b->seek_rel;
+        b->seek_rel = s->seek_rel;
+        s->seek_rel = rel;
+    }
     z = b->drag_vis; b->drag_vis = s->drag_vis; s->drag_vis = z;
     z = b->drag_len; b->drag_len = s->drag_len; s->drag_len = z;
     i = b->drag_grab; b->drag_grab = s->drag_grab; s->drag_grab = i;
@@ -491,12 +505,27 @@ static void RtxBuf_stick_eol(RtxBuf *b) {
 }
 
 static size_t !>(RtxIndexErr) rtx_buf_cur_col(const RtxBuf *b) {
-    size_t line;
     size_t start;
     if (!b) return cc_ok((size_t)0);
-    line = b->doc.line_of(b->doc.caret) !>(e) { return cc_err(e); };
-    start = b->doc.line_start(line) !>(e) { return cc_err(e); };
+    start = rtx_doc_line_floor(&b->doc, b->doc.caret) !>(e) { return cc_err(e); };
     return cc_ok(b->doc.caret - start);
+}
+
+/* Keep seek_rel in lockstep with seek_off. A jump wider than the local
+ * floor window starts a new +1 origin (do not line_of the span). */
+static void rtx_buf_seek_set(RtxBuf *b, size_t floor) {
+    size_t a, z;
+    if (!b) return;
+    if (b->seek_valid) {
+        a = b->seek_off < floor ? b->seek_off : floor;
+        z = b->seek_off < floor ? floor : b->seek_off;
+        if (z - a > (size_t)RTX_LINE_FLOOR_MAX) b->seek_rel = 0;
+        else b->seek_rel += rtx_doc_lf_delta_local(&b->doc, b->seek_off, floor);
+    } else {
+        b->seek_rel = 0;
+    }
+    b->seek_off = floor;
+    b->seek_valid = 1;
 }
 
 static void !>(RtxIndexErr) RtxBuf_box_begin(RtxBuf *b) {
@@ -518,7 +547,7 @@ static void !>(RtxIndexErr) RtxBuf_box_sync(RtxBuf *b) {
 }
 
 static void !>(RtxIndexErr) RtxBuf_box_move_col(RtxBuf *b, int dir) {
-    size_t line, start, nlen, col, end;
+    size_t start, nlen, col, end;
     @errhandler(RtxIndexErr e) {
         return cc_err(e);
     }
@@ -539,13 +568,12 @@ static void !>(RtxIndexErr) RtxBuf_box_move_col(RtxBuf *b, int dir) {
         b->pref.col = at;
         b->pref.ok = 1;
         b->pref.eol = 0;
-        b->doc.caret = at;
+        b->doc.caret = b->doc.fold_snap(at, dir);
         rtx_buf_hex_nib_reset(b);
         return cc_ok();
     }
     b->box_begin() !>;
-    line = b->doc.line_of(b->doc.caret) !>;
-    start = b->doc.line_start(line) !>;
+    start = rtx_doc_line_floor(&b->doc, b->doc.caret) !>;
     end = rtx_doc_line_end_caret(&b->doc, start) !>;
     nlen = end - start;
     col = b->doc.box_ccol;
@@ -567,7 +595,7 @@ static void !>(RtxIndexErr) RtxBuf_box_move_col(RtxBuf *b, int dir) {
     b->pref.col = col;
     b->pref.ok = 1;
     b->pref.eol = 0;
-    b->doc.caret = start + (col < nlen ? col : nlen);
+    b->doc.caret = b->doc.fold_snap(start + (col < nlen ? col : nlen), dir);
     return cc_ok();
 }
 
@@ -606,6 +634,10 @@ static void !>(CCError) RtxBuf_move_horiz(RtxBuf *b, int dir, int shift) {
         };
         if (!shift) b->doc.sel_anchor = b->doc.caret;
         b->doc.sel_box = 0;
+    }
+    if (!rtx_buf_byte_units(b)) {
+        b->doc.caret = b->doc.fold_snap(b->doc.caret, dir);
+        if (!shift) b->doc.sel_anchor = b->doc.caret;
     }
     b->doc.break_coalesce();
     b->clear_pref();
@@ -729,7 +761,7 @@ static void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
             size_t z = last->byte_start + last->byte_len;
             if (off >= b->seek_off && off < z) return cc_ok();
         }
-        b->seek_off = floor;
+        rtx_buf_seek_set(b, floor);
         b->top_wrap = 0;
         return cc_ok();
     }
@@ -739,10 +771,12 @@ static void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
             cl = b->line_of(off) !>(e) { return cc_err(e); };
             b->seek_valid = 0;
         } else {
-            b->seek_off = rtx_doc_line_floor_local(&b->doc, off) !>(e) {
-                return cc_err(e);
-            };
-            b->seek_valid = 1;
+            {
+                size_t floor = rtx_doc_line_floor_local(&b->doc, off) !>(e) {
+                    return cc_err(e);
+                };
+                rtx_buf_seek_set(b, floor);
+            }
             cl = b->doc.line_guess(b->seek_off);
         }
         if (cl < b->top) b->top = cl;
@@ -753,8 +787,12 @@ static void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
         cl = b->line_of(off) !>(e) { return cc_err(e); };
         b->seek_valid = 0;
     } else {
-        b->seek_off = rtx_doc_line_floor(&b->doc, off) !>(e) { return cc_err(e); };
-        b->seek_valid = 1;
+        {
+            size_t floor = rtx_doc_line_floor(&b->doc, off) !>(e) {
+                return cc_err(e);
+            };
+            rtx_buf_seek_set(b, floor);
+        }
         cl = b->doc.line_guess(b->seek_off);
         b->top = cl;
         b->top_wrap = 0;
@@ -809,8 +847,12 @@ static void !>(RtxIndexErr) RtxBuf_reveal_guess(RtxBuf *b, size_t off, int vis) 
         b->seek_valid = 0;
         return cc_ok();
     }
-    b->seek_off = rtx_doc_line_floor_local(&b->doc, off) !>(e) { return cc_err(e); };
-    b->seek_valid = 1;
+    {
+        size_t floor = rtx_doc_line_floor_local(&b->doc, off) !>(e) {
+            return cc_err(e);
+        };
+        rtx_buf_seek_set(b, floor);
+    }
     b->top_wrap = 0;
     return cc_ok();
 }
@@ -847,6 +889,24 @@ static void !>(RtxIndexErr) RtxBuf_cycle_view(RtxBuf *b, int vis) {
     return b->reveal_off(b->doc.caret, vis);
 }
 
+static void !>(RtxIndexErr) rtx_buf_fold_skip_cam(RtxBuf *b, int dir) {
+    size_t off;
+    size_t snap;
+    if (!b || !b->doc.fold_n) return cc_ok();
+    if (rtx_layout_is_hex(&b->layout)) return cc_ok();
+    if (b->seek_valid) {
+        rtx_buf_seek_set(b, b->doc.fold_snap(b->seek_off, dir));
+        return cc_ok();
+    }
+    off = b->doc.line_start(b->top) !>;
+    snap = b->doc.fold_snap(off, dir);
+    if (snap != off) {
+        b->top = b->doc.line_of(snap) !>;
+        b->top_wrap = 0;
+    }
+    return cc_ok();
+}
+
 static void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double width, int dir) {
     size_t nlines;
     size_t n;
@@ -876,14 +936,18 @@ static void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double
     if (b->seek_valid && !b->doc.index_covers(b->seek_off)) {
         size_t nlen = b->len();
         if (dir < 0) {
-            if (b->seek_off > 0)
-                b->seek_off = rtx_doc_line_floor(&b->doc, b->seek_off - 1) !>;
+            if (b->seek_off > 0) {
+                size_t floor = rtx_doc_line_floor(&b->doc, b->seek_off - 1) !>;
+                rtx_buf_seek_set(b, floor);
+            }
         } else if (b->seek_off < nlen) {
-            size_t next = rtx_doc_line_next(&b->doc, b->seek_off) !>;
-            if (next > b->seek_off) b->seek_off = next;
+            size_t next;
+            int has = rtx_doc_next_line_start(&b->doc, b->seek_off, &next) !>;
+            if (has) rtx_buf_seek_set(b, next);
         }
         b->top = b->doc.line_guess(b->seek_off);
         b->top_wrap = 0;
+        rtx_buf_fold_skip_cam(b, dir) !>;
         return cc_ok();
     }
     b->seek_valid = 0;
@@ -892,6 +956,7 @@ static void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double
         b->top_wrap = 0;
         if (dir < 0 && b->top > 0) b->top--;
         if (dir > 0 && b->top + 1 < nlines) b->top++;
+        rtx_buf_fold_skip_cam(b, dir) !>;
         return cc_ok();
     }
     if (dir < 0) {
@@ -918,6 +983,7 @@ static void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double
             }
         }
     }
+    rtx_buf_fold_skip_cam(b, dir) !>;
     return cc_ok();
 }
 
@@ -1034,6 +1100,22 @@ static void !>(CCError) RtxWs_after_edit(RtxWs *w, int bufi, RtxMeasure *m,
     return cc_ok();
 }
 
+/* Fold is not an edit. Drop vis-row caches so the next ensure_view skips. */
+static void RtxWs_invalidate_buf_views(RtxWs *w, int bufi) {
+    int p;
+    if (!w || bufi < 0 || (size_t)bufi >= w->len) return;
+    for (p = 0; p < w->npanes; p++) {
+        RtxBuf *b;
+        int held;
+        if (w->pane[p] != bufi) continue;
+        held = RtxWs_hold_pane(w, p);
+        b = &w->bufs[bufi];
+        b->layout.len = 0;
+        b->layout_width = 0;
+        RtxWs_drop_pane(w, p, held);
+    }
+}
+
 static int RtxWs_any_dirty(const RtxWs *w) {
     size_t i;
     if (!w) return 0;
@@ -1049,8 +1131,6 @@ static int RtxWs_any_dirty(const RtxWs *w) {
 @typehooks on RtxBuf {
     .destroy = RtxBuf_destroy,
 };
-
-#include "browse.cch"
 
 static void !>(CCError) RtxWs_browse_pump(RtxWs *w) {
     int p;
@@ -1246,7 +1326,7 @@ static void !>(CCError) RtxWs_browse_backspace(RtxWs *w) {
     return rtx_browse_kick(br);
 }
 
-#include "ui.cch"
+#include "ui_types.cch"
 
 @typehooks on RtxWs {
     .destroy = RtxWs_destroy,

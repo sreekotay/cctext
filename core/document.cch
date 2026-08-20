@@ -4,7 +4,8 @@
  *   tree     — page store + add + nodes (document lifetime)
  *   session  — path + undo log (survives reparse)
  *   analysis — sections + style runs (reset on reparse)
- *   find     — query + hit offsets (reset on new query; invalidate on edit)
+ *   find     — query + hit offsets (reset unless the query only lengthens
+ *              a prefix; invalidate on edit)
  * Frame copies never land here; they take a scratch arena.
  * Intervals are byte offsets. Insert/erase shift them.
  */
@@ -54,6 +55,12 @@ typedef enum {
 #define RTX_TM_CKPT_MAX 256
 #define RTX_TM_CKPT_DEPTH 32
 #define RTX_TM_CATCHUP_MAX (512 * 1024)
+#define RTX_FOLD_MAX 8
+
+typedef struct {
+    size_t lo;
+    size_t hi;
+} RtxFold;
 
 typedef struct {
     size_t off;
@@ -69,15 +76,6 @@ typedef struct {
     RtxSectionKind kind;
     unsigned hl_done : 1;
 } RtxSection;
-
-typedef enum {
-    RTX_HL_NONE = 0,
-    RTX_HL_KEYWORD,
-    RTX_HL_STRING,
-    RTX_HL_COMMENT,
-    RTX_HL_NUMBER,
-    RTX_HL_PUNCT,
-} RtxHlKind;
 
 #include "scope.cch"
 
@@ -140,6 +138,19 @@ typedef struct {
     int coalesce;
 } RtxHistory;
 
+#ifndef RTX_FIND_BUDGET
+enum {
+    RTX_FIND_BUDGET = 262144,
+    RTX_FIND_BLOCK = RTX_FIND_BUDGET,
+    RTX_FIND_WAVE = 8,
+    RTX_FIND_PUMP = 8,
+    RTX_FIND_PUMP_MS = 8,
+    RTX_FIND_MAX = 32768,
+    RTX_FIND_COLLECT = RTX_FIND_MAX + 1,
+    RTX_FIND_QMAX = 256
+};
+#endif
+
 typedef struct {
     CCArena store;         /* created on first find_set */
     char[:] query;
@@ -185,6 +196,8 @@ typedef struct {
     int broken;            /* unrestorable tree; refuse further edits */
     RtxHistory hist;
     RtxFind find;           /* find.cch: set / step / invalidate / goto */
+    RtxFold folds[RTX_FOLD_MAX]; /* session; in-window regions only */
+    size_t fold_n;
 } RtxDoc;
 
 /* Grow a contiguous array on `a`. Old storage is abandoned until reset/destroy. */
@@ -387,6 +400,59 @@ static size_t !>(RtxIndexErr) rtx_doc_line_next(const RtxDoc *d, size_t off) {
     return cc_ok(at < n ? at : n);
 }
 
+/* 1 and *next_out = first byte of the next line. 0 = this is the last line. */
+static int !>(RtxIndexErr) rtx_doc_next_line_start(const RtxDoc *d, size_t start,
+                                                   size_t *next_out) {
+    size_t next;
+    char ch = 0;
+    size_t got;
+    if (!d) return cc_ok(0);
+    next = rtx_doc_line_next(d, start) !>(e) { return cc_err(e); };
+    if (next_out) *next_out = next;
+    if (next <= start) return cc_ok(0);
+    got = d->read_at(next - 1, &ch, 1) !>(e) {
+        return cc_err(rtx_index_from_cc(e));
+    };
+    return cc_ok(got == 1 && ch == '\n' ? 1 : 0);
+}
+
+/* Signed newline count in [from, to) (or reverse). 0 if the span is wider
+ * than the local floor window — do not scan the prefix. */
+static long rtx_doc_lf_delta_local(const RtxDoc *d, size_t from, size_t to) {
+    char buf[512];
+    size_t a, b, left, seen;
+    int neg;
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    if (!d || from == to) return 0;
+    if (to < from) {
+        a = to;
+        b = from;
+        neg = 1;
+    } else {
+        a = from;
+        b = to;
+        neg = 0;
+    }
+    if (b - a > (size_t)RTX_LINE_FLOOR_MAX) return 0;
+    left = b - a;
+    seen = 0;
+    while (left) {
+        size_t take = left > sizeof(buf) ? sizeof(buf) : left;
+        size_t got, i;
+        got = d->read_at(a, buf, take) !>;
+        if (!got) break;
+        for (i = 0; i < got; i++) {
+            if (buf[i] == '\n') seen++;
+        }
+        a += got;
+        left -= got;
+    }
+    return neg ? -(long)seen : (long)seen;
+}
+
 static inline char[:] !>(CCError) RtxDoc_scratch_span(const RtxDoc *d, CCArena *scratch,
                                           size_t from, size_t n) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
@@ -443,6 +509,7 @@ static void RtxDoc_analysis_reset(RtxDoc *d) {
     memset(d->hl_win, 0, sizeof(d->hl_win));
     d->hl_win_stamp = 0;
     d->hl_full = 0;
+    d->fold_n = 0;
 }
 
 static void rtx_hist_clear(RtxHistory *h) {
@@ -654,12 +721,43 @@ static void !>(CCError) rtx_doc_clip_runs(RtxDoc *d, size_t lo, size_t hi,
     return cc_ok();
 }
 
+static int RtxDoc_fold_covers(const RtxDoc *d, size_t off) {
+    size_t i;
+    if (!d) return 0;
+    for (i = 0; i < d->fold_n; i++) {
+        if (off > d->folds[i].lo && off < d->folds[i].hi) return 1;
+    }
+    return 0;
+}
+
+static void rtx_doc_fold_shift(RtxDoc *d, size_t at, size_t erased, size_t inserted) {
+    size_t i;
+    size_t o = 0;
+    if (!d) return;
+    for (i = 0; i < d->fold_n; i++) {
+        size_t lo = d->folds[i].lo;
+        size_t hi = d->folds[i].hi;
+        if (hi <= at) {
+            d->folds[o++] = d->folds[i];
+            continue;
+        }
+        if (lo >= at + erased) {
+            d->folds[o].lo = lo - erased + inserted;
+            d->folds[o].hi = hi - erased + inserted;
+            o++;
+            continue;
+        }
+    }
+    d->fold_n = o;
+}
+
 static void rtx_doc_shift_intervals(RtxDoc *d, size_t at, size_t erased, size_t inserted) {
     size_t i;
     if (!d || (erased == 0 && inserted == 0)) return;
     memset(d->hl_win, 0, sizeof(d->hl_win));
     d->hl_win_stamp = 0;
     rtx_tm_ckpt_drop_from(d, at);
+    rtx_doc_fold_shift(d, at, erased, inserted);
     for (i = 0; i < d->sec_len; i++) {
         size_t s = d->secs[i].start;
         if (s <= at) continue;
@@ -1177,7 +1275,20 @@ static void !>(CCError) RtxDoc_from_buffer(RtxDoc *d, char[:] bytes) {
     return cc_ok();
 }
 
-#include "find.cch"
+/* Scan-state wipe. Lives here so edit.cch UFCS works without find.cch. */
+static void RtxDoc_find_invalidate(RtxDoc *d) {
+    if (!d) return;
+    d->find.len = 0;
+    d->find.scan_off = 0;
+    d->find.cur = 0;
+    d->find.origin = d->caret;
+    d->find.pinned = 0;
+    d->find.truncated = 0;
+    d->find.done = (d->find.query.len == 0);
+    d->find.cancel = 0;
+    d->find.idle = 0;
+}
+#include "nav.cch"
 #include "edit.cch"
 
 @typehooks on RtxDoc {
@@ -1191,7 +1302,7 @@ typedef @typeview Highlight on RtxDoc {
 } *RtxDocHighlight;
 typedef @typeview Layout on RtxDoc {
     r: len, line_count, line_start, line_of, line_guess, index_covers,
-       read_at, scratch_span, style_at, section_at, ensure_hl;
+       read_at, scratch_span, style_at, section_at, ensure_hl, fold_covers;
 } *RtxDocLayout;
 
 #endif /* RTX_DOCUMENT_H */

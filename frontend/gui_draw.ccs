@@ -1,0 +1,995 @@
+#!ccc ccs
+/*
+ * cctext-ray paint (linked TU; see gui.cch).
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <string.h>
+#include <raylib.h>
+#include "../core/document.cch"
+#include "../core/nav_pair.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+#include "../core/browse.cch"
+#include "gui.cch"
+
+static size_t gui_stat_push(char *dst, size_t cap, size_t used, char *one) {
+    size_t i = 0;
+    if (!dst || !one || cap == 0) return used;
+    while (one[i] && used + 1 < cap) {
+        dst[used] = one[i];
+        used++;
+        i++;
+    }
+    if (used + 1 < cap) {
+        dst[used] = '\n';
+        used++;
+    }
+    if (used < cap) dst[used] = 0;
+    return used;
+}
+
+static void gui_stat_line(char *text, int idx, char *out, size_t cap) {
+    int n = 0;
+    size_t i = 0, o = 0;
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    if (!text) return;
+    while (text[i]) {
+        if (n == idx) {
+            while (text[i] && text[i] != '\n' && o + 1 < cap) {
+                out[o] = text[i];
+                o++;
+                i++;
+            }
+            out[o] = 0;
+            return;
+        }
+        if (text[i] == '\n') n++;
+        i++;
+    }
+}
+
+static void gui_stat_bytes(char *dst, size_t n, size_t v) {
+    if (!dst || n == 0) return;
+    if (v >= (size_t)1024 * 1024 * 1024)
+        snprintf(dst, n, "%.2f GiB", (double)v / (1024.0 * 1024.0 * 1024.0));
+    else if (v >= (size_t)1024 * 1024)
+        snprintf(dst, n, "%.2f MiB", (double)v / (1024.0 * 1024.0));
+    else if (v >= 1024)
+        snprintf(dst, n, "%.1f KiB", (double)v / 1024.0);
+    else
+        snprintf(dst, n, "%zu B", v);
+}
+
+static void gui_stat_pct(char *dst, size_t n, size_t a, size_t b) {
+    if (!dst || n == 0) return;
+    if (!b) {
+        snprintf(dst, n, "-");
+        return;
+    }
+    snprintf(dst, n, "%.1f%%", (double)a * 100.0 / (double)b);
+}
+
+static Font gui_font(GuiFonts *f, RtxStyle st, RtxSectionKind sec) {
+    if (sec == RTX_SEC_CODE || st.mono) return f->mono;
+    return f->prose;
+}
+
+static float gui_size(GuiFonts *f, RtxStyle st, RtxSectionKind sec) {
+    if (sec == RTX_SEC_CODE || st.mono) return f->mono_sz;
+    return f->prose_sz;
+}
+
+double gui_measure(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    GuiFonts *f = (GuiFonts *)ctx;
+    double w = 0;
+    size_t i;
+    if (!f || !bytes.ptr || bytes.len == 0) return 0;
+    i = 0;
+    while (i < bytes.len) {
+        RtxUtf8Cl cl = rtx_utf8_cluster(bytes, i);
+        size_t step = cl.n ? cl.n : 1;
+        char tmp[RTX_UTF8_LOOK + 1];
+        Vector2 sz;
+        if (step > RTX_UTF8_LOOK) step = RTX_UTF8_LOOK;
+        memcpy(tmp, bytes.ptr + i, step);
+        tmp[step] = 0;
+        sz = MeasureTextEx(gui_font(f, style, sec), tmp, gui_size(f, style, sec), 0);
+        w += (double)sz.x;
+        i += cl.n ? cl.n : 1;
+    }
+    return w;
+}
+
+double gui_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    GuiFonts *f = (GuiFonts *)ctx;
+    if (!f) return 20;
+    return (double)gui_size(f, style, sec) * 1.25;
+}
+
+static Color gui_hl_color(RtxScope scope) {
+    RtxThemeColor c = rtx_theme_color(scope);
+    return (Color){c.r, c.g, c.b, 255};
+}
+
+static Color gui_pair_color(void) {
+    RtxThemeColor c = rtx_theme_pair();
+    return (Color){c.r, c.g, c.b, 255};
+}
+
+static Color gui_face(RtxBrowseFace face) {
+    RtxThemeColor c = rtx_browse_face(face);
+    return (Color){c.r, c.g, c.b, 255};
+}
+int gui_pane_at(RtxWs *w, int x, int pad, int inner) {
+    if (w->npanes < 2) return 0;
+    return x >= pad + inner / 2 ? 1 : 0;
+}
+
+int gui_pane_x0(RtxWs *w, int pane, int pad, int inner) {
+    return pad + (pane == 1 && w && w->npanes == 2 ? inner / 2 + 8 : 0);
+}
+
+int gui_text_ph(int hh, int top, int find_on) {
+    int ph = hh - top - 28 - (find_on ? GUI_FIND_H : 0);
+    return ph > 0 ? ph : 0;
+}
+
+int gui_scroll_hit(int mx, int my, int x0, int y0, int pane_w, int ph,
+                          RtxBuf *b, int vis_rows) {
+    int sx;
+    if (!b || !b->scroll_needed(vis_rows)) return 0;
+    sx = x0 + pane_w - GUI_SCROLL_W;
+    return ph > 0 && mx >= sx && mx < x0 + pane_w && my >= y0 && my < y0 + ph;
+}
+
+float gui_gutter_px(GuiFonts *fonts, RtxBuf *b, int vis_rows) {
+    int g = rtx_gutter_cols_buf(b, vis_rows);
+    return fonts->mono_sz * 0.6f * (float)g + 10.0f;
+}
+
+double gui_text_w(GuiFonts *fonts, RtxBuf *b, int pane_w, int vis_rows) {
+    int rw = (b && b->scroll_needed(vis_rows)) ? GUI_SCROLL_W : 0;
+    double w = (double)pane_w - (double)gui_gutter_px(fonts, b, vis_rows) - (double)rw;
+    return w < 8.0 ? 8.0 : w;
+}
+
+void gui_draw_stats(GuiFonts *fonts, RtxBuf *b, int ww, int hh) {
+    char text[768];
+    char one[96];
+    char a[32], c[32], e[32], f[32];
+    int n = 0, i, box_w = 560, box_h, x, y, have = 0, covered = 0;
+    size_t used = 0, from = 0, to = 0, plo = 0, phi = 0, live = 0, si;
+    size_t livew = 0, walk = 0, wi;
+    const char *lf = "soft";
+    const char *kindn = "unk";
+    const char *winst = "walk";
+    const char *findst = "walk";
+    char lkind, wkind, fkind;
+    Color col;
+    RtxDoc *d = b ? &b->doc : NULL;
+    RtxPageStore *st = d ? &d->tree.store : NULL;
+    RtxMarkupWin *last = NULL;
+    text[0] = 0;
+    if (st && st->slots) {
+        for (si = 0; si < st->slot_n; si++)
+            if (st->slots[si].file_id >= 0) live++;
+    }
+    if (d) {
+        rtx_nav_brace_pages(d->caret, d->len(), &from, &to);
+        have = rtx_nav_pair_ends(&d->tree, d->runs, d->run_len, d->caret,
+                                 d->edit_gen, d->run_len, &plo, &phi);
+        covered = d->index_covers(d->caret);
+        if (d->tree.lf_ready) lf = "ready";
+        for (wi = 0; wi < (size_t)RTX_MARKUP_CACHE_WINDOWS; wi++) {
+            RtxMarkupWin *mw = &d->hl_win[wi];
+            if (!mw->live) continue;
+            livew++;
+            if (!mw->ready) walk++;
+            if (!last || mw->stamp >= last->stamp) last = mw;
+        }
+    }
+    lkind = (d && !d->tree.lf_ready) ? '!' : '.';
+    wkind = walk ? '!' : '.';
+    snprintf(one, sizeof one, "#FILE");
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    gui_stat_bytes(a, sizeof a, d ? d->len() : 0);
+    snprintf(c, sizeof c, "%zu", d ? d->caret : 0);
+    snprintf(one, sizeof one, ".%-8s %-16s %-8s %s", "bytes", a, "caret", c);
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(a, sizeof a, "%zu / %zu", live, st ? st->slot_n : 0);
+    if (st && st->orig_open && st->add_open)
+        snprintf(c, sizeof c, "orig + add");
+    else if (st && st->orig_open)
+        snprintf(c, sizeof c, "orig");
+    else if (st && st->add_open)
+        snprintf(c, sizeof c, "add");
+    else
+        snprintf(c, sizeof c, "-");
+    snprintf(one, sizeof one, ".%-8s %-16s %-8s %s", "pages", a, "store", c);
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(one, sizeof one, "#LINES");
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    gui_stat_bytes(a, sizeof a, d ? d->tree.line_scan_off : 0);
+    gui_stat_pct(c, sizeof c, d ? d->tree.line_scan_off : 0, d ? d->len() : 0);
+    snprintf(e, sizeof e, "%s %s", a, c);
+    snprintf(c, sizeof c, "L%zu", d ? d->tree.scan_line : 0);
+    snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s", lkind, "scan", e,
+             "line", c);
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(a, sizeof a, "%s · %zu slots", lf, d ? d->tree.line_off_len : 0);
+    snprintf(c, sizeof c, "%s", covered ? "known" : "gap");
+    snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s",
+             covered ? lkind : '!', "index", a, "caret", c);
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    if (b && b->seek_valid)
+        snprintf(c, sizeof c, "%zu", b->seek_off);
+    else
+        snprintf(c, sizeof c, "-");
+    snprintf(one, sizeof one, ".%-8s %s", "seek", c);
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    if (d && rtx_line_isle_live(&d->tree)) {
+        const char *ist = rtx_line_isle_connected(&d->tree) ? "met" : "back";
+        gui_stat_bytes(a, sizeof a, d->tree.isle_from);
+        gui_stat_bytes(c, sizeof c, d->tree.isle_anchor);
+        snprintf(e, sizeof e, "%s .. %s", a, c);
+        snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s",
+                 rtx_line_isle_pumping(&d->tree) ? '!' : '.', "island", e,
+                 "state", ist);
+        used = gui_stat_push(text, sizeof text, used, one);
+        n++;
+    }
+    snprintf(one, sizeof one, "#GRAMMAR");
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(a, sizeof a, "%zu · %zu sec", d ? d->run_len : 0,
+             d ? d->sec_len : 0);
+    snprintf(c, sizeof c, "%zu", d ? d->fold_n : 0);
+    snprintf(one, sizeof one, ".%-8s %-16s %-8s %s", "runs", a, "folds", c);
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(a, sizeof a, "%zu / %d", livew, RTX_MARKUP_CACHE_WINDOWS);
+    snprintf(c, sizeof c, walk ? "walk %zu" : "idle", walk);
+    snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s", wkind, "windows", a,
+             "state", c);
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(a, sizeof a, "%s", d && d->hl_full ? "full" : "windowed");
+    snprintf(c, sizeof c, "%zu", d ? d->tm_ckpt_len : 0);
+    snprintf(one, sizeof one, ".%-8s %-16s %-8s %s", "mode", a, "ckpt", c);
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    if (last) {
+        if (last->kind == RTX_SEC_CODE) kindn = "code";
+        else if (last->kind == RTX_SEC_PROSE) kindn = "prose";
+        if (last->ready) winst = "ready";
+        gui_stat_bytes(a, sizeof a, last->from);
+        gui_stat_bytes(c, sizeof c, last->to);
+        snprintf(e, sizeof e, "%s .. %s", a, c);
+        snprintf(f, sizeof f, "%s %s", kindn, winst);
+        snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s",
+                 last->ready ? '.' : '!', "last", e, "kind", f);
+        used = gui_stat_push(text, sizeof text, used, one);
+        n++;
+    }
+    if (d && d->find.query.len) {
+        if (d->find.done) findst = d->find.truncated ? "trunc" : "done";
+        fkind = d->find.done ? '.' : '!';
+        snprintf(one, sizeof one, "#FIND");
+        used = gui_stat_push(text, sizeof text, used, one);
+        n++;
+        snprintf(a, sizeof a, "%zu", d->find.len);
+        gui_stat_pct(c, sizeof c, d->find.scan_off, d->len());
+        snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s", fkind, "hits", a,
+                 "scan", c);
+        used = gui_stat_push(text, sizeof text, used, one);
+        n++;
+        snprintf(one, sizeof one, "%c%-8s %s", fkind, "state", findst);
+        used = gui_stat_push(text, sizeof text, used, one);
+        n++;
+    }
+    snprintf(one, sizeof one, "#PAIR");
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    gui_stat_bytes(a, sizeof a, to > from ? to - from : 0);
+    if (have)
+        snprintf(c, sizeof c, "%zu .. %zu", plo, phi);
+    else
+        snprintf(c, sizeof c, "-");
+    snprintf(one, sizeof one, ".%-8s %-16s %-8s %s", "span", a, "match", c);
+    used = gui_stat_push(text, sizeof text, used, one);
+    n++;
+    (void)used;
+    box_h = 48 + n * 20;
+    x = (ww - box_w) / 2;
+    y = (hh - box_h) / 2;
+    if (x < 16) x = 16;
+    if (y < 16) y = 16;
+    DrawRectangle(0, 0, ww, hh, (Color){0, 0, 0, 140});
+    DrawRectangle(x, y, box_w, box_h, (Color){28, 32, 48, 255});
+    DrawRectangleLines(x, y, box_w, box_h, (Color){180, 160, 220, 255});
+    DrawTextEx(fonts->mono, "engine", (Vector2){(float)(x + 20), (float)(y + 12)},
+               20, 0, (Color){240, 230, 255, 255});
+    for (i = 0; i < n; i++) {
+        char kind;
+        char *body;
+        gui_stat_line(text, i, one, sizeof one);
+        kind = one[0];
+        body = one[0] ? one + 1 : one;
+        if (kind == '#') col = (Color){160, 210, 255, 255};
+        else if (kind == '!') col = (Color){255, 210, 90, 255};
+        else col = (Color){230, 230, 236, 255};
+        DrawTextEx(fonts->mono, body,
+                   (Vector2){(float)(x + 24), (float)(y + 42 + i * 20)}, 15, 0,
+                   col);
+    }
+}
+
+static void gui_draw_jump(GuiFonts *fonts, RtxUi *ui, int ww, int hh) {
+    char line[64];
+    int box_w = 420;
+    int box_h = 88;
+    int x = (ww - box_w) / 2;
+    int y = (hh - box_h) / 2;
+    Vector2 pos;
+    if (x < 16) x = 16;
+    if (y < 16) y = 16;
+    DrawRectangle(0, 0, ww, hh, (Color){0, 0, 0, 140});
+    DrawRectangle(x, y, box_w, box_h, (Color){28, 36, 56, 255});
+    DrawRectangleLines(x, y, box_w, box_h, (Color){240, 200, 80, 255});
+    pos.x = (float)(x + 20);
+    pos.y = (float)(y + 16);
+    DrawTextEx(fonts->mono, "jump to line or N%", pos, 20, 0, (Color){240, 240, 250, 255});
+    snprintf(line, sizeof(line), "> %s%s", ui->jump_buf, rtx_ui_prompt_caret(ui));
+    pos.y = (float)(y + 48);
+    DrawTextEx(fonts->mono, line, pos, 22, 0, (Color){255, 220, 100, 255});
+}
+
+#define GUI_QUIT_W 460
+#define GUI_QUIT_H 168
+#define GUI_QUIT_BTN_W 120
+#define GUI_QUIT_BTN_H 32
+
+static void gui_quit_box(int ww, int hh, int *x, int *y) {
+    *x = (ww - GUI_QUIT_W) / 2;
+    *y = (hh - GUI_QUIT_H) / 2;
+    if (*x < 16) *x = 16;
+    if (*y < 16) *y = 16;
+}
+
+/* 1 = save, 2 = discard, 3 = cancel, 0 = miss. */
+int gui_quit_hit(int mx, int my, int ww, int hh) {
+    int x, y, by, i;
+    gui_quit_box(ww, hh, &x, &y);
+    by = y + 112;
+    if (my < by || my >= by + GUI_QUIT_BTN_H) return 0;
+    for (i = 0; i < 3; i++) {
+        int bx = x + 24 + i * (GUI_QUIT_BTN_W + 12);
+        if (mx >= bx && mx < bx + GUI_QUIT_BTN_W) return i + 1;
+    }
+    return 0;
+}
+
+static void gui_draw_quit(GuiFonts *fonts, const RtxWs *w, int ww, int hh) {
+    int x, y, i;
+    size_t n;
+    char line[80];
+    Vector2 pos;
+    Vector2 mouse = GetMousePosition();
+    const char *labels[3];
+    labels[0] = "Save";
+    labels[1] = "Don't save";
+    labels[2] = "Cancel";
+    gui_quit_box(ww, hh, &x, &y);
+    n = 0;
+    if (w) {
+        size_t di;
+        for (di = 0; di < w->len; di++) {
+            if (w->bufs[di].doc.dirty()) n++;
+        }
+    }
+    DrawRectangle(0, 0, ww, hh, (Color){0, 0, 0, 160});
+    DrawRectangle(x, y, GUI_QUIT_W, GUI_QUIT_H, (Color){36, 28, 32, 255});
+    DrawRectangleLines(x, y, GUI_QUIT_W, GUI_QUIT_H, (Color){240, 140, 120, 255});
+    pos.x = (float)(x + 24);
+    pos.y = (float)(y + 18);
+    DrawTextEx(fonts->mono, "Unsaved changes", pos, 22, 0,
+               (Color){255, 230, 220, 255});
+    if (n == 1) snprintf(line, sizeof(line), "1 file has unsaved edits.");
+    else snprintf(line, sizeof(line), "%zu files have unsaved edits.", n);
+    pos.y = (float)(y + 56);
+    DrawTextEx(fonts->mono, line, pos, 16, 0, (Color){220, 210, 200, 255});
+    pos.y = (float)(y + 80);
+    DrawTextEx(fonts->mono, "Save before quitting?", pos, 16, 0,
+               (Color){200, 190, 180, 255});
+    for (i = 0; i < 3; i++) {
+        int bx = x + 24 + i * (GUI_QUIT_BTN_W + 12);
+        int by = y + 112;
+        int hot = mouse.x >= (float)bx && mouse.x < (float)(bx + GUI_QUIT_BTN_W) &&
+                  mouse.y >= (float)by && mouse.y < (float)(by + GUI_QUIT_BTN_H);
+        DrawRectangle(bx, by, GUI_QUIT_BTN_W, GUI_QUIT_BTN_H,
+                      hot ? (Color){70, 50, 48, 255} : (Color){48, 36, 40, 255});
+        DrawRectangleLines(bx, by, GUI_QUIT_BTN_W, GUI_QUIT_BTN_H,
+                           (Color){180, 120, 110, 255});
+        pos.x = (float)(bx + 12);
+        pos.y = (float)(by + 8);
+        DrawTextEx(fonts->mono, labels[i], pos, 15, 0, (Color){240, 220, 210, 255});
+    }
+}
+float gui_mono_w(GuiFonts *fonts, float sz, const char *s) {
+    Vector2 m;
+    if (!fonts) return 0;
+    m = MeasureTextEx(fonts->mono, s ? s : "", sz, 0);
+    return m.x;
+}
+
+static float gui_field_cw(GuiFonts *fonts, float sz) {
+    float cw = gui_mono_w(fonts, sz, "0");
+    return cw > 1 ? cw : 8;
+}
+
+size_t gui_field_hit_x(GuiFonts *fonts, float sz, RtxField f, float x) {
+    float cw = gui_field_cw(fonts, sz);
+    int col = x > 0 && cw > 0 ? (int)(x / cw + 0.5f) : 0;
+    return rtx_utf8_hit_col(rtx_field_bytes(f), col);
+}
+
+static void gui_draw_field(GuiFonts *fonts, float sz, Vector2 pos, RtxField f,
+                           const RtxUi *ui, Color fg) {
+    char tmp[RTX_FIND_QMAX];
+    size_t n = f.len ? *f.len : 0;
+    float cw = gui_field_cw(fonts, sz);
+    rtx_field_clamp(f);
+    if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+    if (rtx_field_has_sel(f)) {
+        float x1 = pos.x + cw * (float)rtx_utf8_prefix_cols(rtx_field_bytes(f),
+                                                            rtx_field_lo(f));
+        float x2 = pos.x + cw * (float)rtx_utf8_prefix_cols(rtx_field_bytes(f),
+                                                            rtx_field_hi(f));
+        if (x2 > x1)
+            DrawRectangle((int)x1, (int)pos.y - 1, (int)(x2 - x1) + 1,
+                          (int)sz + 4, (Color){60, 70, 110, 255});
+    }
+    if (f.buf && n) memcpy(tmp, f.buf, n);
+    tmp[n] = 0;
+    DrawTextEx(fonts->mono, tmp, pos, sz, 0, fg);
+    if (ui && rtx_ui_blink(ui) && f.caret) {
+        float cx = pos.x + cw * (float)rtx_utf8_prefix_cols(rtx_field_bytes(f),
+                                                            *f.caret);
+        DrawRectangle((int)cx, (int)pos.y, 2, (int)sz + 2,
+                      (Color){255, 200, 80, 255});
+    }
+}
+static void gui_draw_find(GuiFonts *fonts, RtxUi *ui, RtxDoc *d, int ww, int hh) {
+    int y0 = hh - 26 - GUI_FIND_H;
+    int vis_hits = RTX_UI_FIND_ROWS - 1;
+    int i;
+    char stats[64];
+    Vector2 pos;
+    float lab;
+    if (y0 < GUI_MENU_H) y0 = GUI_MENU_H;
+    rtx_ui_find_scroll(ui, d, (size_t)vis_hits);
+    rtx_ui_find_stats(d, stats, sizeof(stats));
+    DrawRectangle(0, y0, ww, GUI_FIND_H, (Color){28, 32, 44, 255});
+    DrawLine(0, y0, ww, y0, (Color){80, 90, 110, 255});
+    pos.x = 12;
+    pos.y = (float)(y0 + 4);
+    DrawTextEx(fonts->mono, "find: ", pos, 15, 0, (Color){255, 220, 100, 255});
+    lab = gui_mono_w(fonts, 15, "find: ");
+    pos.x = 12 + lab;
+    gui_draw_field(fonts, 15, pos, rtx_ui_find_field(ui), ui,
+                   (Color){255, 220, 100, 255});
+    pos.x = 12 + lab + gui_mono_w(fonts, 15, ui->find_buf) + 16;
+    DrawTextEx(fonts->mono, stats, pos, 15, 0, (Color){255, 220, 100, 255});
+    for (i = 0; i < vis_hits; i++) {
+        size_t hit = ui->find_top + (size_t)i;
+        int y = y0 + 8 + (i + 1) * GUI_FIND_ROW_H;
+        int cur = d && hit == d->find.cur;
+        if (!d || hit >= d->find.len) continue;
+        if (cur) {
+            DrawRectangle(0, y - 2, ww, GUI_FIND_ROW_H, (Color){60, 70, 100, 255});
+        }
+        {
+            char ctx[192];
+            char line[256];
+            size_t line1 = 0;
+            int ok = 1;
+            rtx_ui_find_row_text(d, hit, 80, ctx, sizeof(ctx), &line1) !>(e) {
+                ok = 0;
+            };
+            if (ok) snprintf(line, sizeof(line), "%5zu  %s", line1, ctx);
+            else snprintf(line, sizeof(line), "  %zu", hit + 1);
+            pos.x = 12;
+            pos.y = (float)y;
+            DrawTextEx(fonts->mono, line, pos, 14, 0,
+                       cur ? (Color){255, 230, 140, 255}
+                           : (Color){200, 206, 220, 255});
+        }
+    }
+}
+static void gui_draw_hex_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focused,
+                             int x0, int y0, int pw, int ph) {
+    size_t r;
+    size_t n = b->len();
+    int has = b->doc.has_sel();
+    size_t plo = 0, phi = 0;
+    int phave;
+    float cw;
+    float row_h = 18.0f;
+    int vis;
+    static const char *hexd = "0123456789ABCDEF";
+    Vector2 m0;
+    (void)pw;
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
+    phave = rtx_nav_pair_ends(&b->doc.tree, b->doc.runs, b->doc.run_len,
+                             b->doc.caret, b->doc.edit_gen, b->doc.run_len,
+                             &plo, &phi);
+    m0 = MeasureTextEx(fonts->mono, "0", 14, 0);
+    cw = m0.x > 1 ? m0.x : 8.0f;
+    vis = (int)((float)ph / row_h);
+    if (vis < 1) vis = 1;
+    b->top_byte = rtx_hex_align(b->top_byte);
+    for (r = 0; r < (size_t)vis; r++) {
+        size_t off = rtx_hex_row_off(b->top_byte, r);
+        unsigned char win[RTX_HEX_DUMP_WIN];
+        unsigned char *row;
+        RtxHexDumpCell dump[RTX_HEX_COLS];
+        size_t take = (size_t)RTX_HEX_COLS;
+        size_t look = 0;
+        size_t tail = 0;
+        size_t got = 0;
+        size_t k;
+        float y = (float)y0 + (float)r * row_h;
+        float x;
+        char off_s[16];
+        Vector2 pos;
+        if (y > (float)(y0 + ph)) break;
+        if (off >= n && !(n == 0 && r == 0)) {
+            pos.x = (float)x0;
+            pos.y = y;
+            DrawTextEx(fonts->mono, "~", pos, 14, 0, (Color){90, 90, 100, 255});
+            continue;
+        }
+        if (take > n - off) take = n - off;
+        look = rtx_hex_dump_look(off);
+        tail = rtx_hex_dump_tail(off, take, n);
+        {
+            size_t wn = 0;
+            size_t want = look + take + tail;
+            if (want) {
+                @errhandler(CCError e) {
+                    (void)e;
+                    wn = 0;
+                }
+                wn = b->read_at(off - look, (char *)win, want) !>;
+            }
+            if (wn > look) {
+                got = wn - look;
+                if (got > take) got = take;
+            }
+            rtx_hex_dump_row(win, wn, look, got, dump);
+        }
+        row = win + look;
+        snprintf(off_s, sizeof(off_s), "%010zX", off);
+        pos.x = (float)x0;
+        pos.y = y;
+        DrawTextEx(fonts->mono, off_s, pos, 14, 0, (Color){100, 140, 220, 255});
+        x = (float)x0 + cw * 11.0f;
+        for (k = 0; k < (size_t)RTX_HEX_COLS; k++) {
+            size_t at = off + k;
+            char hex2[4];
+            int sel = has && at < n && (b->doc.sel_covers(at) !>);
+            int here = rtx_ui_here(ui, focused, b->doc.caret == at);
+            int match = phave && at < n && (at == plo || at == phi);
+            int nib = here && b->hex_nib;
+            if (k < got) {
+                hex2[0] = hexd[(row[k] >> 4) & 0xF];
+                hex2[1] = hexd[row[k] & 0xF];
+            } else {
+                hex2[0] = ' ';
+                hex2[1] = ' ';
+            }
+            hex2[2] = 0;
+            if (sel) {
+                DrawRectangle((int)x, (int)y, (int)(cw * 2.5f), (int)row_h,
+                              (Color){40, 70, 120, 255});
+            } else if (match) {
+                DrawRectangle((int)x, (int)y, (int)(cw * 2.5f), (int)row_h,
+                              gui_pair_color());
+            }
+            if (here) {
+                DrawRectangle((int)(x + (nib ? cw : 0.0f)), (int)y, 2, (int)row_h,
+                              (Color){255, 200, 80, 255});
+            }
+            pos.x = x;
+            pos.y = y;
+            DrawTextEx(fonts->mono, hex2, pos, 14, 0, (Color){220, 220, 230, 255});
+            x += cw * 3.0f;
+        }
+        x += cw * 2.0f;
+        for (k = 0; k < (size_t)RTX_HEX_COLS; k++) {
+            size_t at = off + k;
+            const char *chs;
+            Color fg;
+            int sel = has && at < n && (b->doc.sel_covers(at) !>);
+            int here = rtx_ui_here(ui, focused, b->doc.caret == at);
+            int match = phave && at < n && (at == plo || at == phi);
+            if (k >= got || dump[k].kind == RTX_HEX_DUMP_EMPTY) chs = " ";
+            else chs = dump[k].utf8;
+            if (dump[k].kind == RTX_HEX_DUMP_CONT) fg = (Color){140, 150, 130, 255};
+            else fg = (Color){200, 210, 180, 255};
+            if (sel) {
+                DrawRectangle((int)x, (int)y, (int)cw + 1, (int)row_h,
+                              (Color){40, 70, 120, 255});
+            } else if (match) {
+                DrawRectangle((int)x, (int)y, (int)cw + 1, (int)row_h,
+                              gui_pair_color());
+            }
+            if (here) {
+                DrawRectangle((int)x, (int)y, 2, (int)row_h, (Color){255, 200, 80, 255});
+            }
+            pos.x = x;
+            pos.y = y;
+            DrawTextEx(fonts->mono, chs, pos, 14, 0, fg);
+            x += cw;
+        }
+    }
+}
+
+size_t gui_hex_hit_byte(RtxBuf *b, GuiFonts *fonts, int x0, int y0, int ph,
+                               float mx, float my) {
+    float cw;
+    float row_h = 18.0f;
+    int row;
+    Vector2 m0;
+    if (!b) return 0;
+    m0 = MeasureTextEx(fonts->mono, "0", 14, 0);
+    cw = m0.x > 1 ? m0.x : 8.0f;
+    row = (int)((my - (float)y0) / row_h);
+    if (row < 0) row = 0;
+    (void)ph;
+    b->hex_nib = rtx_hex_nib_from_x(mx - (float)x0, cw);
+    return rtx_hex_hit_x(b->top_byte, b->len(), row, mx - (float)x0, cw);
+}
+
+static void gui_draw_browse(RtxBrowse *br, const RtxUi *ui, GuiFonts *fonts, int focused,
+                            int x0, int y0, int pw, int ph, int vis_rows) {
+    char line[512];
+    char name[RTX_BROWSE_NAME + 2];
+    char meta[40];
+    size_t i, list;
+    float row_h = 20.0f;
+    float cw;
+    int cols, meta_w;
+    Vector2 m0;
+    if (!br || !fonts) return;
+    rtx_browse_scroll(br, vis_rows);
+    m0 = MeasureTextEx(fonts->mono, "0", 14, 0);
+    cw = m0.x > 1 ? m0.x : 8.0f;
+    cols = (int)(((float)pw - 16.0f) / cw);
+    if (cols < 2) cols = 2;
+    meta_w = RTX_BROWSE_SIZE_W + 2 + RTX_BROWSE_MTIME_W;
+    DrawRectangle(x0, y0, pw, ph, (Color){22, 24, 30, 255});
+    snprintf(line, sizeof(line), "%s", br->dir);
+    DrawTextEx(fonts->mono, line, (Vector2){(float)x0 + 8, (float)y0 + 2}, 14, 0,
+               gui_face(RTX_BROWSE_FACE_PATH));
+    {
+        Vector2 gp;
+        float lab;
+        gp.x = (float)x0 + 8;
+        gp.y = (float)y0 + row_h + 2;
+        DrawTextEx(fonts->mono, "glob: ", gp, 14, 0, gui_face(RTX_BROWSE_FACE_GLOB));
+        lab = gui_mono_w(fonts, 14, "glob: ");
+        gp.x += lab;
+        gui_draw_field(fonts, 14, gp, rtx_browse_field(br),
+                       focused ? ui : NULL, gui_face(RTX_BROWSE_FACE_GLOB));
+    }
+    list = (vis_rows > RTX_BROWSE_HEAD) ? (size_t)(vis_rows - RTX_BROWSE_HEAD) : 0;
+    for (i = 0; i < list; i++) {
+        size_t idx = br->top + i;
+        float y = (float)y0 + (float)(RTX_BROWSE_HEAD + i) * row_h;
+        Color name_c;
+        if (y > (float)(y0 + ph)) break;
+        if (idx >= br->len) continue;
+        if (focused && idx == br->cur) {
+            DrawRectangle(x0, (int)y, pw, (int)row_h, (Color){40, 70, 120, 255});
+        }
+        snprintf(name, sizeof(name), "%s%s", br->ents[idx].name,
+                 br->ents[idx].is_dir ? "/" : "");
+        if (cols >= 10 + meta_w) {
+            int name_max = cols - meta_w - 2;
+            if (name_max < 1) name_max = 1;
+            if ((int)strlen(name) > name_max) name[name_max] = 0;
+        }
+        name_c = gui_face(br->ents[idx].is_dir ? RTX_BROWSE_FACE_DIR
+                                              : RTX_BROWSE_FACE_FILE);
+        DrawTextEx(fonts->mono, name, (Vector2){(float)x0 + 8, y + 2}, 14, 0, name_c);
+        if (cols >= 10 + meta_w) {
+            Vector2 mw;
+            rtx_browse_fmt_meta(meta, sizeof(meta), &br->ents[idx]);
+            mw = MeasureTextEx(fonts->mono, meta, 14, 0);
+            DrawTextEx(fonts->mono, meta,
+                       (Vector2){(float)x0 + (float)pw - 8.0f - mw.x, y + 2},
+                       14, 0, gui_face(RTX_BROWSE_FACE_DATE));
+        }
+    }
+}
+
+static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focused,
+                         int x0, int y0, int pw, int ph, int pad) {
+    size_t i;
+    double acc = 0;
+    int has = b->doc.has_sel();
+    size_t plo = 0, phi = 0;
+    int phave;
+    int vis_rows = ph > 0 ? (int)((float)ph / 18.0f) : 32;
+    float gpx = gui_gutter_px(fonts, b, vis_rows);
+    @errhandler(CCError e) {
+        (void)e;
+        return;
+    }
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
+    (void)pad;
+    if (pw > 0 && ph > 0) {
+        DrawRectangle(x0, y0, pw, ph,
+                      focused ? (Color){28, 30, 36, 255} : (Color){16, 16, 20, 255});
+        if (focused) DrawRectangle(x0, y0, 3, ph, (Color){80, 200, 220, 255});
+    }
+    if (rtx_layout_is_hex(&b->layout)) {
+        gui_draw_hex_buf(b, ui, fonts, focused, x0, y0, pw, ph);
+        return;
+    }
+    phave = rtx_nav_pair_ends(&b->doc.tree, b->doc.runs, b->doc.run_len,
+                             b->doc.caret, b->doc.edit_gen, b->doc.run_len,
+                             &plo, &phi);
+    for (i = b->top_wrap; i < b->layout.len; i++) {
+        RtxVisRow *row = &b->layout.rows[i];
+        double y = (double)y0 + acc;
+        acc += row->height;
+        if (y + row->height < (double)y0) continue;
+        if (y > (double)(y0 + ph)) break;
+        {
+            size_t k;
+            double x = (double)x0 + (double)gpx;
+            size_t line = row->line;
+            size_t box_l0 = 0, box_l1 = 0;
+            int box_row = 0;
+            int show_ln = (i == 0 || b->layout.rows[i - 1].line != line);
+            if (b->doc.sel_box) {
+                rtx_doc_box_lines(&b->doc, &box_l0, &box_l1) !>;
+                box_row = (line >= box_l0 && line <= box_l1);
+            }
+            cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+            if (show_ln) {
+                char ln[16];
+                Vector2 lp;
+                size_t abs = 0, plus = 0;
+                int gap = rtx_gutter_gap(b, row->byte_start, line, &abs, &plus);
+                if (gap) snprintf(ln, sizeof(ln), gap < 0 ? "-%zu" : "+%zu", plus);
+                else snprintf(ln, sizeof(ln), "%zu", abs);
+                lp.x = (float)x0 + (focused ? 4.0f : 0);
+                lp.y = (float)y;
+                DrawTextEx(fonts->mono, ln, lp, 13, 0,
+                           gap ? (Color){220, 70, 70, 255}
+                               : (focused ? (Color){168, 172, 184, 255}
+                                          : (Color){78, 82, 94, 255}));
+            }
+            {
+                size_t line_off = row->byte_start;
+                if (box_row) {
+                    size_t j = i;
+                    while (j > 0 && b->layout.rows[j - 1].line == line) j--;
+                    line_off = b->layout.rows[j].byte_start;
+                }
+            int span_ok = 1;
+            char[:] bytes = cc_slice_empty();
+            {
+                @errhandler(CCError e) {
+                    (void)e;
+                    span_ok = 0;
+                }
+                bytes = b->scratch_span(&scratch, row->byte_start, row->byte_len) !>;
+            }
+            if (!span_ok) continue;
+            k = 0;
+            while (k < bytes.len) {
+                RtxUtf8Cl cl = rtx_utf8_cluster(bytes, k);
+                size_t step = cl.n ? cl.n : 1;
+                size_t off = row->byte_start + k;
+                RtxStyle st = b->doc.style_at(off);
+                char tmp[RTX_UTF8_LOOK + 1];
+                Vector2 pos;
+                double gw;
+                char[:] one = bytes.sub(k, k + step);
+                if (step > RTX_UTF8_LOOK) step = RTX_UTF8_LOOK;
+                memcpy(tmp, bytes.ptr + k, step);
+                tmp[step] = 0;
+                gw = gui_measure(fonts, one, st, row->sec);
+                pos.x = (float)x;
+                pos.y = (float)y;
+                if (has && (b->doc.sel_covers(off) !>)) {
+                    DrawRectangle((int)x, (int)y, (int)gw + 1, (int)row->height,
+                                  (Color){40, 70, 120, 255});
+                } else if (phave && (off == plo || off == phi)) {
+                    DrawRectangle((int)x, (int)y, (int)gw + 1, (int)row->height,
+                                  gui_pair_color());
+                }
+                if (rtx_ui_here(ui, focused, b->doc.caret == off ||
+                    (box_row && (rtx_box_col_on_line(&b->doc, line, b->doc.box_ccol) !>) ==
+                     off - line_off))) {
+                    DrawRectangle((int)x, (int)y, 2, (int)row->height,
+                                  (Color){255, 200, 80, 255});
+                }
+                DrawTextEx(gui_font(fonts, st, row->sec), tmp, pos,
+                           gui_size(fonts, st, row->sec), 0, gui_hl_color(st.scope));
+                x += gw;
+                k += cl.n ? cl.n : 1;
+            }
+            if (rtx_ui_here(ui, focused, b->doc.caret == row->byte_start + row->byte_len ||
+                (box_row &&
+                 line_off + (rtx_box_col_on_line(&b->doc, line, b->doc.box_ccol) !>) ==
+                 row->byte_start + row->byte_len))) {
+                DrawRectangle((int)x, (int)y, 2, (int)row->height,
+                              (Color){255, 200, 80, 255});
+            }
+            }
+        }
+    }
+}
+
+void gui_draw_busy_badge(void) {
+    Vector2 pos;
+    Color bg = {40, 36, 20, 230};
+    Color fg = {255, 210, 80, 255};
+    int ww;
+    if (!g_busy_show || !g_busy_msg[0]) return;
+    ww = GetScreenWidth();
+    pos = (Vector2){(float)ww - 160.0f, 8.0f};
+    if (pos.x < 8) pos.x = 8;
+    DrawRectangle((int)pos.x - 8, (int)pos.y - 2, 152, 22, bg);
+    if (g_live.fonts) {
+        DrawTextEx(g_live.fonts->mono, g_busy_msg, pos, 14, 0, fg);
+    } else {
+        DrawText(g_busy_msg, (int)pos.x, (int)pos.y, 14, fg);
+    }
+}
+static void gui_draw_scroll(RtxBuf *b, int focused, int x0, int y0, int pane_w,
+                            int ph, int vis_rows) {
+    RtxScrollRail rail;
+    int ty, th;
+    int sx;
+    Color track, thumb;
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
+    if (!b || ph < 1) return;
+    if (!b->scroll_needed(vis_rows) && !b->drag_len) return;
+    rail = b->scroll_rail(vis_rows) !>;
+    if (focused && g_live.dragging && *g_live.dragging == GUI_DRAG_SCROLL &&
+        b->drag_len) {
+        rail.vis = b->drag_vis ? b->drag_vis : rail.vis;
+        rail.len = b->drag_len;
+    }
+    rtx_scroll_rail_thumb(&rail, ph, GUI_SCROLL_MIN_TH, &ty, &th);
+    if (focused && g_live.dragging && *g_live.dragging == GUI_DRAG_SCROLL &&
+        g_live.scroll_grab) {
+        int ly = (int)GetMouseY() - y0 - *g_live.scroll_grab;
+        int usable = ph - th;
+        if (ly < 0) ly = 0;
+        if (usable > 0 && ly > usable) ly = usable;
+        ty = ly;
+    }
+    sx = x0 + pane_w - GUI_SCROLL_W;
+    if (rail.ready) {
+        track = (Color){32, 34, 40, 255};
+        thumb = focused ? (Color){90, 96, 112, 255} : (Color){70, 74, 86, 255};
+        DrawRectangle(sx, y0, GUI_SCROLL_W, ph, track);
+        DrawRectangle(sx + 2, y0 + ty, GUI_SCROLL_W - 4, th, thumb);
+    } else {
+        track = (Color){28, 30, 36, 255};
+        thumb = focused ? (Color){70, 78, 96, 255} : (Color){56, 60, 72, 255};
+        DrawRectangle(sx, y0, GUI_SCROLL_W, ph, track);
+        DrawRectangle(sx + 3, y0 + ty, GUI_SCROLL_W - 6, th, thumb);
+        DrawRectangle(sx + 2, y0 + ph - 3, GUI_SCROLL_W - 4, 2,
+                      (Color){110, 90, 50, 255});
+    }
+}
+
+/* Draw contents only. Caller owns BeginDrawing / EndDrawing or flush+swap. */
+void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner,
+                          int vis_rows) {
+    int p;
+    RtxBuf *act;
+    int ph;
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return; /* fault already set by line_* on err */
+    }
+    if (!g_live.w || !g_live.fonts || !g_live.ui) return;
+    act = RtxWs_active(g_live.w);
+    ph = gui_text_ph(hh, top, g_live.ui->find);
+    ClearBackground((Color){24, 24, 28, 255});
+    for (p = 0; p < g_live.w->npanes; p++) {
+        RtxBuf *b = &g_live.w->bufs[g_live.w->pane[p]];
+        int x0 = gui_pane_x0(g_live.w, p, pad, inner);
+        if (g_live.w->npanes == 2 && p == 1) {
+            DrawLine(pad + inner / 2, top, pad + inner / 2,
+                     hh - 28 - (g_live.ui->find ? GUI_FIND_H : 0),
+                     (Color){80, 80, 90, 255});
+        }
+        {
+            RtxBrowse *br = &g_live.w->nav[p];
+            int held = RtxWs_hold_pane(g_live.w, p);
+            if (br && br->on) {
+                gui_draw_browse(br, g_live.ui, g_live.fonts, p == g_live.w->focus,
+                                x0, top, pane_w, ph, vis_rows);
+            } else {
+                gui_draw_buf(b, g_live.ui, g_live.fonts, p == g_live.w->focus,
+                             x0, top, pane_w, ph, pad);
+                gui_draw_scroll(b, p == g_live.w->focus, x0, top, pane_w, ph, vis_rows);
+            }
+            RtxWs_drop_pane(g_live.w, p, held);
+        }
+    }
+    gui_draw_menubar(g_live.fonts, ww, g_live.menu_open ? *g_live.menu_open : -1,
+                     GetMousePosition());
+    if (g_live.ui->help) gui_draw_help(g_live.fonts, ww, hh);
+    if (g_live.ui->stats) gui_draw_stats(g_live.fonts, act, ww, hh);
+    if (g_live.ui->jump) gui_draw_jump(g_live.fonts, g_live.ui, ww, hh);
+    if (g_live.ui->find && act) gui_draw_find(g_live.fonts, g_live.ui, &act->doc, ww, hh);
+    if (g_live.ui->ask_quit) gui_draw_quit(g_live.fonts, g_live.w, ww, hh);
+    {
+        const char *path = (act && act->doc.path.ptr) ? act->doc.path.ptr : "(untitled)";
+        const char *star = (act && act->doc.dirty()) ? "*" : "";
+        const char *status = g_live.status ? g_live.status : "";
+        char bar[256];
+        Vector2 bp;
+        if (g_live.ui->ask_quit) {
+            snprintf(bar, sizeof(bar), "unsaved  S save  Q don't save  Esc cancel  %s",
+                     status);
+        } else if (g_live.ui->jump) {
+            rtx_ui_jump_header(g_live.ui, bar, sizeof(bar));
+        } else if (g_live.ui->find) {
+            snprintf(bar, sizeof(bar), "find  up/down hits  Esc close  %s", status);
+        } else if (RtxWs_browsing(g_live.w)) {
+            RtxBrowse *br = RtxWs_browse(g_live.w);
+            snprintf(bar, sizeof(bar), "browse  %zu/%zu%s  enter open  Esc %s  %s",
+                     br && br->len ? br->cur + 1 : 0, br ? br->len : 0,
+                     br && br->truncated ? "  capped" : "",
+                     br && br->boot ? "quit" : "close", status);
+        } else if (act && rtx_layout_is_hex(&act->layout)) {
+            snprintf(bar, sizeof(bar), "%s%s  @%zX  hex %s%s  %s",
+                     star, path, act->doc.caret,
+                     act->hex_nib ? "lo" : "hi",
+                     act->unlock ? "  unlock" : "", status);
+        } else {
+            char pos[48];
+            rtx_status_line_pos(act, pos, sizeof(pos)) !>;
+            snprintf(bar, sizeof(bar), "%s%s  %s%s  %s",
+                     star, path, pos,
+                     (act && act->unlock) ? "  unlock" : "", status);
+        }
+        DrawRectangle(0, hh - 26, ww, 26, (Color){36, 38, 46, 255});
+        bp.x = 12;
+        bp.y = (float)(hh - 22);
+        DrawTextEx(g_live.fonts->mono, bar, bp, 14, 0, (Color){170, 174, 186, 255});
+    }
+    gui_draw_busy_badge();
+}

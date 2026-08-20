@@ -1,10 +1,8 @@
 #!ccc cch
 /*
  * Find epoch: query copy + hit offsets on `d.find.store`.
- * Context is computed when drawing the visible rows, not stored.
+ * Bodies in find.ccs (linked TU). Kick / step / refine share that TU.
  * Scan model (DESIGN.md): kick = find_set, step = find_step, live = !done.
- * One closed interval per step. Returning is the yield; scan_off is resume.
- * Workers pread (no LRU).
  */
 #ifndef RTX_FIND_H
 #define RTX_FIND_H
@@ -12,17 +10,6 @@
 #include <ccc/cc_turnstile.cch>
 #include <stdlib.h>
 #include <string.h>
-
-enum {
-    RTX_FIND_BUDGET = 262144,
-    RTX_FIND_BLOCK = RTX_FIND_BUDGET,
-    RTX_FIND_WAVE = 8,
-    RTX_FIND_PUMP = 8,     /* max wait-fors per host enter */
-    RTX_FIND_PUMP_MS = 8,  /* yield before the next wave if the slice is gone */
-    RTX_FIND_MAX = 32768,
-    RTX_FIND_COLLECT = RTX_FIND_MAX + 1,
-    RTX_FIND_QMAX = 256
-};
 
 _Static_assert(RTX_FIND_BLOCK == RTX_FIND_BUDGET, "one wave is one budget");
 
@@ -33,292 +20,18 @@ typedef struct {
     char[:] ctx;
 } RtxFindHitView;
 
-/* Scan-state wipe only. Query and store stay; empty query marks done. */
-static void RtxDoc_find_invalidate(RtxDoc *d) {
-    if (!d) return;
-    d->find.len = 0;
-    d->find.scan_off = 0;
-    d->find.cur = 0;
-    d->find.origin = d->caret;
-    d->find.pinned = 0;
-    d->find.truncated = 0;
-    d->find.done = (d->find.query.len == 0);
-    d->find.cancel = 0;
-    d->find.idle = 0;
-}
+/* RtxDoc_find_invalidate is in document.cch (edit.cch UFCS). */
 
-static int RtxDoc_find_same_query(const RtxDoc *d, char[:] q) {
-    if (!d) return 0;
-    if (d->find.query.len != q.len) return 0;
-    if (q.len == 0) return 1;
-    return memcmp(d->find.query.ptr, q.ptr, q.len) == 0;
-}
-
-static void !>(CCError) RtxDoc_find_set(RtxDoc *d, char[:] q) {
-    char qbuf[RTX_FIND_QMAX];
-    size_t qn;
-    CCArena fresh;
-    char[:] nq;
-    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
-    qn = q.len;
-    if (qn > RTX_FIND_QMAX) return cc_err(CC_ERR_INVALID_ARG, "find query too long");
-    if (qn) memcpy(qbuf, q.ptr, qn);
-    if (qn == 0) {
-        if (d->find.store.base) d->find.store.reset();
-        d->find.query = cc_slice_empty();
-        d->find.offs = NULL;
-        d->find.cap = 0;
-        d->find_invalidate();
-        return cc_ok();
-    }
-    memset(&fresh, 0, sizeof(fresh));
-    fresh = cc_arena_heap(kilobytes(16));
-    if (!fresh.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "find store");
-    nq = fresh.alloc_slice_bytes(qn);
-    if (!nq.ptr || nq.len < qn) {
-        fresh.destroy();
-        return cc_err(CC_ERR_OUT_OF_MEMORY, "find query");
-    }
-    memcpy(nq.ptr, qbuf, qn);
-    if (d->find.store.base) d->find.store.destroy();
-    d->find.store = fresh;
-    d->find.query = nq;
-    d->find.offs = NULL;
-    d->find.cap = 0;
-    d->find_invalidate();
-    return cc_ok();
-}
-
-static void !>(CCError) rtx_find_push(RtxDoc *d, size_t off) {
-    if (d->find.len >= RTX_FIND_MAX) {
-        d->find.truncated = 1;
-        d->find.done = 1;
-        return cc_ok();
-    }
-    rtx_arena_grow(&d->find.store, (void **)&d->find.offs, &d->find.cap,
-                   d->find.len + 1, sizeof(size_t)) !>(e) {
-        return cc_err(e);
-    };
-    d->find.offs[d->find.len++] = off;
-    return cc_ok();
-}
-
-/*
- * scan_off is the next match-start to consider.
- * A window keeps query.len-1 bytes uncommitted so a hit cannot
- * straddle unread input. The return is how far this window commits.
- */
-static size_t rtx_find_window_adv(size_t got, size_t qn, int last) {
-    size_t overlap = qn > 0 ? qn - 1 : 0;
-    if (last) return got;
-    return got > overlap ? got - overlap : got;
-}
-
-/* One walk. Parallel passes COLLECT (MAX+1) so find_push sees overflow. */
-static size_t rtx_find_collect(const char *buf, size_t got, size_t qn,
-                               const char *q, size_t adv,
-                               size_t *hits, size_t maxh) {
-    size_t i;
-    size_t n;
-    size_t lim;
-    if (!buf || !q || got < qn || maxh == 0 || adv == 0) return 0;
-    lim = got - qn + 1;
-    if (adv < lim) lim = adv;
-    n = 0;
-    i = 0;
-    while (i < lim && n < maxh) {
-        const char *p = (const char *)memmem(buf + i, got - i, q, qn);
-        size_t at;
-        if (!p) break;
-        at = (size_t)(p - buf);
-        if (at >= lim) break;
-        hits[n++] = at;
-        i = at + 1;
-    }
-    return n;
-}
-
-static void !>(CCError) rtx_find_commit(RtxDoc *d, size_t base,
-                                        const size_t *rel, size_t n) {
-    size_t k;
-    for (k = 0; k < n && !d->find.truncated; k++) {
-        rtx_find_push(d, base + rel[k]) !>(e) { return cc_err(e); };
-    }
-    return cc_ok();
-}
-
-static size_t rtx_find_finish_step(RtxDoc *d, size_t committed) {
-    /* idle is "this step did nothing and the epoch is over". A 0-commit
-     * mid-file is not a park — the next host enter retries. */
-    d->find.idle = (committed == 0 && d->find.done);
-    return committed;
-}
-
-/* One wave. `seq` is the denial; `wait` is file order. collect is the
- * worker; one stage publishes hits and the scan prefix. */
-static size_t !>(CCError) RtxDoc_find_step(RtxDoc *d, size_t budget) {
-    @errhandler(CCError e) { return cc_err(e); }
-    size_t qn;
-    size_t n;
-    (void)budget;
-    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
-    qn = d->find.query.len;
-    n = d->len();
-    if (qn == 0 || qn > n) {
-        d->find.done = 1;
-        return cc_ok(rtx_find_finish_step(d, 0));
-    }
-    size_t start = d->find.scan_off;
-    size_t committed = start;
-    size_t stages = 0;
-    size_t remain;
-    char q[RTX_FIND_QMAX];
-    int nb, use_par, i;
-    memcpy(q, d->find.query.ptr, qn);
-    if (start + qn > n) {
-        d->find.done = 1;
-        return cc_ok(rtx_find_finish_step(d, 0));
-    }
-    remain = n - start;
-    nb = (int)((remain + (size_t)RTX_FIND_BLOCK - 1) / (size_t)RTX_FIND_BLOCK);
-    if (nb < 1) nb = 1;
-    if (nb > RTX_FIND_WAVE) nb = RTX_FIND_WAVE;
-    {
-        size_t ticket = (size_t)RTX_FIND_BLOCK + (size_t)RTX_FIND_QMAX
-            + (size_t)RTX_FIND_COLLECT * sizeof(size_t);
-        CCArena wave = cc_arena_heap((size_t)nb * ticket + kilobytes(16)) @destroy;
-        char *bufs = wave.allocT((size_t)nb
-            * ((size_t)RTX_FIND_BLOCK + (size_t)RTX_FIND_QMAX));
-        size_t *hitss = wave.allocT((size_t)nb * (size_t)RTX_FIND_COLLECT);
-        /* Depth is the wave: every block is in flight. One stage — the
-         * serial hop (append hits, publish scan_off). */
-        CCTurnstile ts@(nb, 1, &wave) @destroy;
-        if (!ts.excl || !bufs || !hitss)
-            return cc_err(CC_ERR_OUT_OF_MEMORY, "find wave");
-        use_par = (nb > 1);
-        {
-            const char *seq = getenv("RTX_FIND_SEQ");
-            if (seq && seq[0] && atoi(seq) > 0) use_par = 0;
-        }
-        bool fin = @parallel seq (use_par) wait (ts) for (i in 0..nb) {
-        size_t base = start + (size_t)i * (size_t)RTX_FIND_BLOCK;
-        size_t commit = (size_t)RTX_FIND_BLOCK;
-        size_t want, got, adv, nloc;
-        char *buf = bufs + (size_t)i * ((size_t)RTX_FIND_BLOCK + (size_t)RTX_FIND_QMAX);
-        size_t *hits = hitss + (size_t)i * (size_t)RTX_FIND_COLLECT;
-        nloc = 0;
-        got = 0;
-        adv = 0;
-        if (base < n && commit > n - base) commit = n - base;
-        want = commit;
-        if (qn > 1 && want > 0) want += qn - 1;
-        if (base < n && want > n - base) want = n - base;
-        if (want < qn) want = 0;
-        if (want) {
-            got = d->tree.read_uncached(base, buf, want) !>;
-            adv = rtx_find_window_adv(got, qn, base + got >= n);
-            if (adv > commit) adv = commit;
-            nloc = rtx_find_collect(buf, got, qn, q, adv, hits,
-                                   (size_t)RTX_FIND_COLLECT);
-        }
-        @stage (ts, 0, i) {
-            rtx_find_commit(d, base, hits, nloc) !>;
-            committed = start + (size_t)(i + 1) * (size_t)RTX_FIND_BLOCK;
-            if (committed > n) committed = n;
-            stages++;
-        }
-        if (d->find.truncated) break;
-    } !>;
-        if (!fin) d->find.done = 1;
-        d->find.scan_off = committed;
-        if (d->find.scan_off + qn > n) {
-            d->find.scan_off = n;
-            d->find.done = 1;
-        }
-        return cc_ok(rtx_find_finish_step(d, stages));
-    }
-}
-
-
-static size_t rtx_find_near(const RtxDoc *d) {
-    size_t i;
-    if (!d || d->find.len == 0) return (size_t)-1;
-    for (i = 0; i < d->find.len; i++) {
-        if (d->find.offs[i] >= d->find.origin) return i;
-    }
-    if (d->find.done) return 0;
-    return (size_t)-1;
-}
-
-static void rtx_find_place(RtxDoc *d, size_t i) {
-    size_t n;
-    if (!d || d->find.len == 0) return;
-    if (i >= d->find.len) i = d->find.len - 1;
-    d->find.cur = i;
-    d->caret = d->find.offs[i];
-    n = d->len();
-    d->sel_anchor = d->caret + d->find.query.len;
-    if (d->sel_anchor > n) d->sel_anchor = n;
-    d->break_coalesce();
-}
-
-static void rtx_find_auto_land(RtxDoc *d) {
-    size_t i;
-    if (!d || d->find.pinned) return;
-    i = rtx_find_near(d);
-    if (i == (size_t)-1) return;
-    if (d->find.cur == i && d->caret == d->find.offs[i]) return;
-    rtx_find_place(d, i);
-}
-
-static void RtxDoc_find_goto(RtxDoc *d, size_t i) {
-    if (!d) return;
-    d->find.pinned = 1;
-    rtx_find_place(d, i);
-}
-
-static void RtxDoc_find_next(RtxDoc *d) {
-    if (!d || d->find.len == 0) return;
-    d->find_goto((d->find.cur + 1) % d->find.len);
-}
-
-static void RtxDoc_find_prev(RtxDoc *d) {
-    if (!d || d->find.len == 0) return;
-    d->find_goto(d->find.cur == 0 ? d->find.len - 1 : d->find.cur - 1);
-}
-
-static void !>(CCError) RtxDoc_find_hit_view(RtxDoc *d, size_t i, CCArena *scratch,
-                                            size_t maxn, RtxFindHitView *out) {
-    size_t off;
-    size_t n;
-    size_t a;
-    size_t z;
-    size_t pad;
-    @errhandler(CCError e) {
-        return cc_err(e);
-    }
-    if (!d || !scratch || !out) return cc_err(CC_ERR_INVALID_ARG, "find hit");
-    if (i >= d->find.len) return cc_err(CC_ERR_INVALID_ARG, "find hit");
-    memset(out, 0, sizeof(*out));
-    off = d->find.offs[i];
-    n = d->len();
-    if (maxn < 8) maxn = 8;
-    pad = maxn / 4;
-    a = (off > pad) ? off - pad : 0;
-    z = a + maxn;
-    if (z > n) z = n;
-    out->off = off;
-    out->line1 = d->line_guess(off) + 1;
-    out->col = (off >= a) ? off - a : 0;
-    if (z <= a) {
-        out->ctx = cc_slice_empty();
-        return cc_ok();
-    }
-    {
-        char[:] bytes = d->scratch_span(scratch, a, z - a) !>;
-        out->ctx = bytes;
-    }
-    return cc_ok();
-}
+int RtxDoc_find_same_query(const RtxDoc *d, char[:] q);
+int rtx_find_is_extend(const RtxDoc *d, char[:] q);
+void !>(CCError) rtx_find_refine(RtxDoc *d, char[:] q);
+void !>(CCError) RtxDoc_find_set(RtxDoc *d, char[:] q);
+size_t !>(CCError) RtxDoc_find_step(RtxDoc *d, size_t budget);
+void rtx_find_auto_land(RtxDoc *d);
+void RtxDoc_find_goto(RtxDoc *d, size_t i);
+void RtxDoc_find_next(RtxDoc *d);
+void RtxDoc_find_prev(RtxDoc *d);
+void !>(CCError) RtxDoc_find_hit_view(RtxDoc *d, size_t i, CCArena *scratch,
+                                      size_t maxn, RtxFindHitView *out);
 
 #endif /* RTX_FIND_H */

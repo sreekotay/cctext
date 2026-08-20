@@ -8,9 +8,12 @@
 #include <ccc/cc_turnstile.cch>
 #include <ctype.h>
 #include <dirent.h>
+#include <limits.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "browse.cch"
 
 enum {
@@ -598,4 +601,238 @@ void !>(CCError) rtx_browse_finish(RtxBrowse *br) {
     while (br->scanning && n++ < 100000)
         rtx_browse_pump(br) !>(e) { return cc_err(e); };
     return cc_ok();
+}
+
+void rtx_browse_drop(RtxBrowse *br) {
+    if (!br) return;
+    rtx_browse_walk_stop(br);
+    if (br->store.base) br->store.destroy();
+    memset(br, 0, sizeof(*br));
+}
+
+int rtx_browse_is_root(const char *dir) {
+    return dir && dir[0] == '/' && dir[1] == 0;
+}
+
+void rtx_browse_basename(char *dst, size_t n, const char *path) {
+    const char *slash;
+    if (!dst || n == 0) return;
+    dst[0] = 0;
+    if (!path || !path[0]) return;
+    slash = strrchr(path, '/');
+    snprintf(dst, n, "%s", slash ? slash + 1 : path);
+}
+
+void rtx_browse_dirname(char *dst, size_t n, const char *path) {
+    const char *slash;
+    size_t len;
+    if (!dst || n == 0) return;
+    if (!path || !path[0]) {
+        snprintf(dst, n, ".");
+        return;
+    }
+    slash = strrchr(path, '/');
+    if (!slash) {
+        snprintf(dst, n, ".");
+        return;
+    }
+    if (slash == path) {
+        snprintf(dst, n, "/");
+        return;
+    }
+    len = (size_t)(slash - path);
+    if (len >= n) len = n - 1;
+    memcpy(dst, path, len);
+    dst[len] = 0;
+}
+
+int rtx_browse_abs(char *dst, size_t n, const char *path) {
+    char raw[RTX_BROWSE_DIR];
+    char resolved[PATH_MAX];
+    if (!dst || n == 0) return 0;
+    dst[0] = 0;
+    if (!path || !path[0] || strcmp(path, ".") == 0) {
+        cc_arena_stack(scratch, 1024);
+        CCSlice cwd = cc_dir_cwd(&scratch);
+        if (!(cwd.ptr && cwd.len)) return 0;
+        snprintf(raw, sizeof(raw), "%s", cwd.ptr);
+    } else if (path[0] == '/') {
+        snprintf(raw, sizeof(raw), "%s", path);
+    } else {
+        cc_arena_stack(scratch, 1024);
+        CCSlice cwd = cc_dir_cwd(&scratch);
+        if (cwd.ptr && cwd.len)
+            snprintf(raw, sizeof(raw), "%s/%s", cwd.ptr, path);
+        else
+            snprintf(raw, sizeof(raw), "%s", path);
+    }
+    if (realpath(raw, resolved) && resolved[0]) {
+        if (strlen(resolved) >= n) return 0;
+        snprintf(dst, n, "%s", resolved);
+        return 1;
+    }
+    if (!raw[0] || strlen(raw) >= n) return 0;
+    snprintf(dst, n, "%s", raw);
+    return 1;
+}
+
+int rtx_browse_join(char *dst, size_t n, const char *dir, const char *name) {
+    int wr;
+    char abs[RTX_BROWSE_DIR];
+    if (!dst || n == 0 || !dir || !name) return 0;
+    if (strcmp(name, "..") == 0) {
+        if (!rtx_browse_abs(abs, sizeof(abs), dir)) return 0;
+        rtx_browse_dirname(dst, n, abs);
+        return dst[0] != 0;
+    }
+    if (strcmp(dir, "/") == 0) wr = snprintf(dst, n, "/%s", name);
+    else wr = snprintf(dst, n, "%s/%s", dir, name);
+    return wr > 0 && (size_t)wr < n;
+}
+
+RtxThemeColor rtx_browse_face(RtxBrowseFace face) {
+    RtxThemeColor z;
+    z.r = 230; z.g = 230; z.b = 230; z.ansi = "\x1b[0m";
+    switch (face) {
+    case RTX_BROWSE_FACE_PATH:
+        z.r = 120; z.g = 160; z.b = 210; z.ansi = "\x1b[34m";
+        break;
+    case RTX_BROWSE_FACE_GLOB:
+        z.r = 220; z.g = 180; z.b = 80; z.ansi = "\x1b[33m";
+        break;
+    case RTX_BROWSE_FACE_DIR:
+        z.r = 80; z.g = 200; z.b = 220; z.ansi = "\x1b[36;1m";
+        break;
+    case RTX_BROWSE_FACE_FILE:
+        z.r = 230; z.g = 230; z.b = 230; z.ansi = "\x1b[37m";
+        break;
+    case RTX_BROWSE_FACE_SIZE:
+        z.r = 220; z.g = 180; z.b = 80; z.ansi = "\x1b[33m";
+        break;
+    case RTX_BROWSE_FACE_DATE:
+        z.r = 140; z.g = 140; z.b = 140; z.ansi = "\x1b[90m";
+        break;
+    case RTX_BROWSE_FACE_HIT:
+        z.r = 255; z.g = 220; z.b = 80; z.ansi = "\x1b[43;30m";
+        break;
+    }
+    return z;
+}
+
+void rtx_browse_fmt_size(char *dst, size_t n, const RtxBrowseEnt *e) {
+    uint64_t s;
+    double v;
+    char u;
+    if (!dst || n == 0) return;
+    if (!e || !e->has_stat || e->is_dir) {
+        snprintf(dst, n, "%*s", RTX_BROWSE_SIZE_W, "");
+        return;
+    }
+    s = e->size;
+    if (s < 1024ull) {
+        snprintf(dst, n, "%*llu", RTX_BROWSE_SIZE_W, (unsigned long long)s);
+        return;
+    }
+    if (s < 1024ull * 1024) {
+        v = (double)s / 1024.0;
+        u = 'K';
+    } else if (s < 1024ull * 1024 * 1024) {
+        v = (double)s / (1024.0 * 1024.0);
+        u = 'M';
+    } else {
+        v = (double)s / (1024.0 * 1024.0 * 1024.0);
+        u = 'G';
+    }
+    snprintf(dst, n, "%*.1f%c", RTX_BROWSE_SIZE_W - 1, v, u);
+}
+
+void rtx_browse_fmt_mtime(char *dst, size_t n, const RtxBrowseEnt *e) {
+    struct tm tm;
+    if (!dst || n == 0) return;
+    if (!e || !e->has_stat || !localtime_r(&e->mtime, &tm) ||
+        strftime(dst, n, "%Y-%m-%d %H:%M", &tm) == 0) {
+        snprintf(dst, n, "%*s", RTX_BROWSE_MTIME_W, "");
+    }
+}
+
+void rtx_browse_fmt_meta(char *dst, size_t n, const RtxBrowseEnt *e) {
+    char size[12];
+    char when[24];
+    rtx_browse_fmt_size(size, sizeof(size), e);
+    rtx_browse_fmt_mtime(when, sizeof(when), e);
+    snprintf(dst, n, "%s  %s", size, when);
+}
+
+void rtx_browse_fmt_row(char *dst, size_t n, int cols, const RtxBrowseEnt *e) {
+    char name[RTX_BROWSE_NAME + 2];
+    char size[12];
+    char when[24];
+    int meta = RTX_BROWSE_SIZE_W + 2 + RTX_BROWSE_MTIME_W;
+    int name_w, i, show, size_at;
+
+    if (!dst || n == 0) return;
+    dst[0] = 0;
+    if (!e) return;
+    if (cols < 2) cols = 2;
+    if ((size_t)cols >= n) cols = (int)n - 1;
+    memset(dst, ' ', (size_t)cols);
+    dst[cols] = 0;
+
+    snprintf(name, sizeof(name), "%s%s", e->name, e->is_dir ? "/" : "");
+    show = cols >= 10 + meta;
+    size_at = show ? cols - meta : cols;
+    name_w = size_at - 2;
+    if (name_w < 1) name_w = 1;
+    for (i = 0; name[i] && i < name_w; i++)
+        dst[1 + i] = name[i];
+    if (!show) return;
+    rtx_browse_fmt_size(size, sizeof(size), e);
+    rtx_browse_fmt_mtime(when, sizeof(when), e);
+    for (i = 0; size[i] && size_at + i < cols; i++)
+        dst[size_at + i] = size[i];
+    for (i = 0; when[i] && cols - RTX_BROWSE_MTIME_W + i < cols; i++)
+        dst[cols - RTX_BROWSE_MTIME_W + i] = when[i];
+}
+
+size_t rtx_browse_dir_prefix(const char *name) {
+    const char *slash;
+    if (!name) return 0;
+    slash = strrchr(name, '/');
+    if (!slash) return 0;
+    return (size_t)(slash - name + 1);
+}
+
+void rtx_browse_scroll(RtxBrowse *br, int vis) {
+    size_t list;
+    if (!br) return;
+    list = (vis > RTX_BROWSE_HEAD) ? (size_t)(vis - RTX_BROWSE_HEAD) : 1;
+    if (br->len == 0) {
+        br->cur = 0;
+        br->top = 0;
+        return;
+    }
+    if (br->cur >= br->len) br->cur = br->len - 1;
+    if (br->cur < br->top) br->top = br->cur;
+    if (br->cur >= br->top + list) br->top = br->cur - list + 1;
+}
+
+void rtx_browse_move(RtxBrowse *br, int dir, int vis) {
+    if (br) br->glob_focus = 0;
+    if (!br || br->len == 0) return;
+    if (dir < 0) {
+        if (br->cur > 0) br->cur--;
+    } else if (br->cur + 1 < br->len) {
+        br->cur++;
+    }
+    rtx_browse_scroll(br, vis);
+}
+
+int rtx_browse_hit(const RtxBrowse *br, int row, int vis) {
+    size_t list, idx;
+    (void)vis;
+    if (!br || row < RTX_BROWSE_HEAD) return -1;
+    list = (size_t)(row - RTX_BROWSE_HEAD);
+    idx = br->top + list;
+    if (idx >= br->len) return -1;
+    return (int)idx;
 }

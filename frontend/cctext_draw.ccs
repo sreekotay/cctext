@@ -1,0 +1,582 @@
+#!ccc ccs
+/*
+ * cctext text/hex pane paint (linked TU; see cctext_draw.cch).
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <string.h>
+#include "../core/document.cch"
+#include "../core/nav_pair.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "cctext_draw.cch"
+
+static int g_draw_mouse_row;
+
+static size_t cctext_stat_push(char *dst, size_t cap, size_t used, char *one) {
+    size_t i = 0;
+    if (!dst || !one || cap == 0) return used;
+    while (one[i] && used + 1 < cap) {
+        dst[used] = one[i];
+        used++;
+        i++;
+    }
+    if (used + 1 < cap) {
+        dst[used] = '\n';
+        used++;
+    }
+    if (used < cap) dst[used] = 0;
+    return used;
+}
+
+static void cctext_stat_line(char *text, int idx, char *out, size_t cap) {
+    int n = 0;
+    size_t i = 0, o = 0;
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    if (!text) return;
+    while (text[i]) {
+        if (n == idx) {
+            while (text[i] && text[i] != '\n' && o + 1 < cap) {
+                out[o] = text[i];
+                o++;
+                i++;
+            }
+            out[o] = 0;
+            return;
+        }
+        if (text[i] == '\n') n++;
+        i++;
+    }
+}
+
+static void cctext_stat_bytes(char *dst, size_t n, size_t v) {
+    if (!dst || n == 0) return;
+    if (v >= (size_t)1024 * 1024 * 1024)
+        snprintf(dst, n, "%.2f GiB", (double)v / (1024.0 * 1024.0 * 1024.0));
+    else if (v >= (size_t)1024 * 1024)
+        snprintf(dst, n, "%.2f MiB", (double)v / (1024.0 * 1024.0));
+    else if (v >= 1024)
+        snprintf(dst, n, "%.1f KiB", (double)v / 1024.0);
+    else
+        snprintf(dst, n, "%zu B", v);
+}
+
+static void cctext_stat_pct(char *dst, size_t n, size_t a, size_t b) {
+    if (!dst || n == 0) return;
+    if (!b) {
+        snprintf(dst, n, "-");
+        return;
+    }
+    snprintf(dst, n, "%.1f%%", (double)a * 100.0 / (double)b);
+}
+
+int cctext_rail_w(RtxBuf *b, int vis) {
+    return (b && b->scroll_needed(vis)) ? CCTEXT_SCROLL_W : 0;
+}
+
+int cctext_text_cols(RtxBuf *b, int pcols, int vis) {
+    int g = rtx_gutter_cols_buf(b, vis);
+    int rw = cctext_rail_w(b, vis);
+    int inner = pcols > rw ? pcols - rw : pcols;
+    if (inner <= g + 4) return inner > 0 ? inner : 1;
+    return inner - g;
+}
+
+static const char *cctext_hl_ansi(RtxScope scope) {
+    return rtx_theme_color(scope).ansi;
+}
+
+static void cctext_style(RtxStyle st, int sel, int here) {
+    fputs(cctext_hl_ansi(st.scope), stdout);
+    if (st.bold) fputs("\x1b[1m", stdout);
+    if (sel) fputs("\x1b[44m", stdout);
+    if (here) fputs("\x1b[7m", stdout);
+}
+
+static void cctext_eol(int pad_to) {
+    if (pad_to > 0) {
+        int i;
+        for (i = 0; i < pad_to; i++) fputc(' ', stdout);
+    } else {
+        fputs("\x1b[K", stdout);
+    }
+}
+
+static void cctext_put_scroll(RtxBuf *b, int focused, int vis, int row, int col) {
+    RtxScrollRail rail;
+    int ty, th;
+    char ch;
+    const char *fg;
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return;
+    }
+    if (!b || vis < 1 || col < 1 || row < 0 || row >= vis) return;
+    if (!b->scroll_needed(vis) && !b->drag_len) return;
+    rail = b->scroll_rail(vis) !>;
+    if (b->drag_len) {
+        rail.vis = b->drag_vis ? b->drag_vis : rail.vis;
+        rail.len = b->drag_len;
+    }
+    rtx_scroll_rail_thumb(&rail, vis, 1, &ty, &th);
+    if (b->drag_len) {
+        int ly = g_draw_mouse_row - 1 - b->drag_grab;
+        int usable = vis - th;
+        if (ly < 0) ly = 0;
+        if (usable > 0 && ly > usable) ly = usable;
+        ty = ly;
+    }
+    if (row >= ty && row < ty + th) {
+        ch = '#';
+        fg = rail.ready ? (focused ? "\x1b[7;37m" : "\x1b[7;90m")
+                        : (focused ? "\x1b[7;33m" : "\x1b[7;90m");
+    } else if (!rail.ready && row == vis - 1) {
+        ch = '+';
+        fg = "\x1b[33m";
+    } else {
+        ch = '|';
+        fg = "\x1b[90m";
+    }
+    fprintf(stdout, "\x1b[%d;%dH%s%c\x1b[0m", row + 1, col, fg, ch);
+}
+
+static void cctext_row_end(RtxBuf *b, int focused, int vis, int pcols, int col0,
+                           int pad_rest, int used, int row) {
+    int rw = cctext_rail_w(b, vis);
+    cctext_eol(pad_rest ? pcols - rw - used : 0);
+    if (rw) cctext_put_scroll(b, focused, vis, row, col0 + pcols - rw);
+}
+
+static void cctext_draw_hex_pane(RtxBuf *b, const RtxUi *ui, int focused, int vis,
+                                 int pcols, int col0, int pad_rest) {
+    size_t r;
+    size_t n = b->len();
+    int has = b->doc.has_sel();
+    size_t plo = 0, phi = 0;
+    int phave;
+    static const char *hexd = "0123456789ABCDEF";
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return;
+    }
+    phave = rtx_nav_pair_ends(&b->doc.tree, b->doc.runs, b->doc.run_len,
+                             b->doc.caret, b->doc.edit_gen, b->doc.run_len,
+                             &plo, &phi);
+    b->top_byte = rtx_hex_align(b->top_byte);
+    for (r = 0; r < (size_t)vis; r++) {
+        size_t off = rtx_hex_row_off(b->top_byte, r);
+        unsigned char win[RTX_HEX_DUMP_WIN];
+        unsigned char *row;
+        RtxHexDumpCell dump[RTX_HEX_COLS];
+        size_t take = (size_t)RTX_HEX_COLS;
+        size_t look = 0;
+        size_t tail = 0;
+        size_t got = 0;
+        size_t k;
+        int used = 0;
+        fprintf(stdout, "\x1b[%zu;%dH", r + 1, col0);
+        if (off >= n && !(n == 0 && r == 0)) {
+            fputs("\x1b[90m~\x1b[0m", stdout);
+            used = 1;
+            cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
+            continue;
+        }
+        if (take > n - off) take = n - off;
+        look = rtx_hex_dump_look(off);
+        tail = rtx_hex_dump_tail(off, take, n);
+        {
+            size_t wn = 0;
+            size_t want = look + take + tail;
+            if (want) {
+                @errhandler(CCError e) {
+                    (void)e;
+                    wn = 0;
+                }
+                wn = b->read_at(off - look, (char *)win, want) !>;
+            }
+            if (wn > look) {
+                got = wn - look;
+                if (got > take) got = take;
+            }
+            rtx_hex_dump_row(win, wn, look, got, dump);
+        }
+        row = win + look;
+        fprintf(stdout, "\x1b[34m%0*zX \x1b[0m", RTX_HEX_OFF_W - 1, off);
+        used = RTX_HEX_OFF_W;
+        for (k = 0; k < (size_t)RTX_HEX_COLS; k++) {
+            size_t at = off + k;
+            int sel = has && at < n && (b->doc.sel_covers(at) !>);
+            int here = rtx_ui_here(ui, focused, b->doc.caret == at);
+            int match = phave && at < n && (at == plo || at == phi);
+            int nib0 = here && !b->hex_nib;
+            int nib1 = here && b->hex_nib;
+            if (k < got) {
+                if (sel || nib0 || match)
+                    fputs(nib0 ? "\x1b[7m" : sel ? "\x1b[44m"
+                                                : rtx_theme_pair().ansi,
+                          stdout);
+                fputc(hexd[(row[k] >> 4) & 0xF], stdout);
+                if (sel || nib0 || match) fputs("\x1b[0m", stdout);
+                if (sel || nib1 || match)
+                    fputs(nib1 ? "\x1b[7m" : sel ? "\x1b[44m"
+                                                : rtx_theme_pair().ansi,
+                          stdout);
+                fputc(hexd[row[k] & 0xF], stdout);
+                if (sel || nib1 || match) fputs("\x1b[0m", stdout);
+            } else {
+                fputs("  ", stdout);
+            }
+            fputc(' ', stdout);
+            used += 3;
+        }
+        {
+            int g;
+            for (g = 0; g < RTX_HEX_GAP; g++) fputc(' ', stdout);
+            used += RTX_HEX_GAP;
+        }
+        for (k = 0; k < (size_t)RTX_HEX_COLS; k++) {
+            size_t at = off + k;
+            int sel = has && at < n && (b->doc.sel_covers(at) !>);
+            int here = rtx_ui_here(ui, focused, b->doc.caret == at);
+            int match = phave && at < n && (at == plo || at == phi);
+            int cont = k < got && dump[k].kind == RTX_HEX_DUMP_CONT;
+            if (k >= got || dump[k].kind == RTX_HEX_DUMP_EMPTY) {
+                fputc(' ', stdout);
+            } else {
+                if (here) fputs("\x1b[7m", stdout);
+                else if (sel) fputs("\x1b[44m", stdout);
+                else if (match) fputs(rtx_theme_pair().ansi, stdout);
+                else if (cont) fputs("\x1b[90m", stdout);
+                fwrite(dump[k].utf8, 1, (size_t)(dump[k].n > 0 ? dump[k].n : 1),
+                       stdout);
+                if (here || sel || match || cont) fputs("\x1b[0m", stdout);
+            }
+            used++;
+        }
+        cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
+    }
+}
+
+void cctext_draw_pane(RtxBuf *b, const RtxUi *ui, int focused, int vis,
+                      int pcols, int col0, int pad_rest, char *status,
+                      size_t statusn, int mouse_row) {
+    size_t r;
+    int has = b->doc.has_sel();
+    int g = rtx_gutter_cols_buf(b, vis);
+    int tcols = cctext_text_cols(b, pcols, vis);
+    size_t plo = 0, phi = 0;
+    int phave;
+    g_draw_mouse_row = mouse_row;
+    @errhandler(CCError e) {
+        if (status && statusn)
+            snprintf(status, statusn, "%s", e.message ? e.message : "span failed");
+        fputs("\x1b[0m", stdout);
+        return;
+    }
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return;
+    }
+    if (rtx_layout_is_hex(&b->layout)) {
+        cctext_draw_hex_pane(b, ui, focused, vis, pcols, col0, pad_rest);
+        return;
+    }
+    phave = rtx_nav_pair_ends(&b->doc.tree, b->doc.runs, b->doc.run_len,
+                             b->doc.caret, b->doc.edit_gen, b->doc.run_len,
+                             &plo, &phi);
+    for (r = 0; r < (size_t)vis; r++) {
+        size_t idx = r + b->top_wrap;
+        int used = 0;
+        fprintf(stdout, "\x1b[%zu;%dH", r + 1, col0);
+        if (idx >= b->layout.len) {
+            fputs("\x1b[90m", stdout);
+            {
+                int i;
+                for (i = 0; i < g - 1; i++) fputc(' ', stdout);
+            }
+            fputs("~\x1b[0m", stdout);
+            used = g;
+            cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
+            continue;
+        }
+        {
+            RtxVisRow *row = &b->layout.rows[idx];
+            size_t k;
+            size_t col = 0;
+            size_t line = row->line;
+            int show_ln = (idx == 0 || b->layout.rows[idx - 1].line != line);
+            int caret_end = rtx_ui_here(ui, focused,
+                                       b->doc.caret == row->byte_start + row->byte_len);
+            int last_sel = -1, last_here = -1, last_pair = -1, last_bold = -1;
+            RtxScope last_scope = (RtxScope)-1;
+            int span_ok = 1;
+            cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+            if (show_ln) {
+                size_t abs = 0, plus = 0;
+                int gap = rtx_gutter_gap(b, row->byte_start, line, &abs, &plus);
+                if (gap) {
+                    char gn[16];
+                    snprintf(gn, sizeof gn, gap < 0 ? "-%zu" : "+%zu", plus);
+                    fprintf(stdout, "\x1b[31m%*s \x1b[0m", g - 1, gn);
+                } else
+                    fprintf(stdout, "\x1b[90m%*zu \x1b[0m", g - 1, abs);
+            }
+            else {
+                int i;
+                fputs("\x1b[90m", stdout);
+                for (i = 0; i < g - 1; i++) fputc(' ', stdout);
+                fputs(" \x1b[0m", stdout);
+            }
+            char[:] bytes = cc_slice_empty();
+            {
+                @errhandler(CCError e) {
+                    (void)e;
+                    span_ok = 0;
+                }
+                bytes = b->scratch_span(&scratch, row->byte_start, row->byte_len) !>;
+            }
+            if (!span_ok) {
+                fputs("\x1b[0m", stdout);
+                used = g;
+                cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
+                continue;
+            }
+            k = 0;
+            while (k < bytes.len && col < (size_t)tcols) {
+                RtxUtf8Cl cl = rtx_utf8_cluster(bytes, k);
+                size_t step = cl.n ? cl.n : 1;
+                size_t off = row->byte_start + k;
+                RtxStyle st = b->doc.style_at(off);
+                int here = rtx_ui_here(ui, focused, b->doc.caret == off);
+                int sel = has && (b->doc.sel_covers(off) !>);
+                int pair = phave && (off == plo || off == phi);
+                if ((size_t)cl.cols > 0 && col + (size_t)cl.cols > (size_t)tcols) break;
+                if (st.scope != last_scope || (int)st.bold != last_bold ||
+                    sel != last_sel || here != last_here || pair != last_pair) {
+                    fputs("\x1b[0m", stdout);
+                    cctext_style(st, sel, here);
+                    if (pair && !sel) fputs(rtx_theme_pair().ansi, stdout);
+                    last_scope = st.scope;
+                    last_bold = (int)st.bold;
+                    last_sel = sel;
+                    last_here = here;
+                    last_pair = pair;
+                }
+                if (cl.cp == RTX_UTF8_FFFD && step == 1 &&
+                    (unsigned char)bytes.ptr[k] >= 0x80) {
+                    fputs("\xEF\xBF\xBD", stdout);
+                } else {
+                    fwrite(bytes.ptr + k, 1, step, stdout);
+                }
+                col += (size_t)cl.cols;
+                k += step;
+            }
+            if (caret_end && col < (size_t)tcols) {
+                fputs("\x1b[0m\x1b[7m \x1b[0m", stdout);
+                col++;
+            } else {
+                fputs("\x1b[0m", stdout);
+            }
+            used = g + (int)col;
+            cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
+        }
+    }
+}
+
+void cctext_draw_stats(RtxBuf *b, int rows, int cols) {
+    char text[768];
+    char one[96];
+    char a[32], c[32], e[32], f[32];
+    int n = 0, i, box_w = 54, box_h, r0, c0;
+    size_t used = 0, from = 0, to = 0, plo = 0, phi = 0, live = 0, si;
+    int have = 0, covered = 0;
+    const char *lf = "soft";
+    const char *kindn = "unk";
+    const char *winst = "walk";
+    const char *findst = "walk";
+    char lkind, wkind, fkind;
+    RtxDoc *d = b ? &b->doc : NULL;
+    RtxPageStore *st = d ? &d->tree.store : NULL;
+    RtxMarkupWin *last = NULL;
+    size_t livew = 0, walk = 0, wi;
+    text[0] = 0;
+    if (st && st->slots) {
+        for (si = 0; si < st->slot_n; si++)
+            if (st->slots[si].file_id >= 0) live++;
+    }
+    if (d) {
+        rtx_nav_brace_pages(d->caret, d->len(), &from, &to);
+        have = rtx_nav_pair_ends(&d->tree, d->runs, d->run_len, d->caret,
+                                 d->edit_gen, d->run_len, &plo, &phi);
+        covered = d->index_covers(d->caret);
+        if (d->tree.lf_ready) lf = "ready";
+        for (wi = 0; wi < (size_t)RTX_MARKUP_CACHE_WINDOWS; wi++) {
+            RtxMarkupWin *mw = &d->hl_win[wi];
+            if (!mw->live) continue;
+            livew++;
+            if (!mw->ready) walk++;
+            if (!last || mw->stamp >= last->stamp) last = mw;
+        }
+    }
+    lkind = (d && !d->tree.lf_ready) ? '!' : '.';
+    wkind = walk ? '!' : '.';
+    snprintf(one, sizeof one, "#FILE");
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    cctext_stat_bytes(a, sizeof a, d ? d->len() : 0);
+    snprintf(c, sizeof c, "%zu", d ? d->caret : 0);
+    snprintf(one, sizeof one, ".%-8s %-16s %-8s %s", "bytes", a, "caret", c);
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(a, sizeof a, "%zu / %zu", live, st ? st->slot_n : 0);
+    if (st && st->orig_open && st->add_open)
+        snprintf(c, sizeof c, "orig + add");
+    else if (st && st->orig_open)
+        snprintf(c, sizeof c, "orig");
+    else if (st && st->add_open)
+        snprintf(c, sizeof c, "add");
+    else
+        snprintf(c, sizeof c, "-");
+    snprintf(one, sizeof one, ".%-8s %-16s %-8s %s", "pages", a, "store", c);
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(one, sizeof one, "#LINES");
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    cctext_stat_bytes(a, sizeof a, d ? d->tree.line_scan_off : 0);
+    cctext_stat_pct(c, sizeof c, d ? d->tree.line_scan_off : 0,
+                    d ? d->len() : 0);
+    snprintf(e, sizeof e, "%s %s", a, c);
+    snprintf(c, sizeof c, "L%zu", d ? d->tree.scan_line : 0);
+    snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s", lkind, "scan", e,
+             "line", c);
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(a, sizeof a, "%s · %zu slots", lf, d ? d->tree.line_off_len : 0);
+    snprintf(c, sizeof c, "%s", covered ? "known" : "gap");
+    snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s",
+             covered ? lkind : '!', "index", a, "caret", c);
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    if (b && b->seek_valid)
+        snprintf(c, sizeof c, "%zu", b->seek_off);
+    else
+        snprintf(c, sizeof c, "-");
+    snprintf(one, sizeof one, ".%-8s %s", "seek", c);
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    if (d && rtx_line_isle_live(&d->tree)) {
+        const char *ist = rtx_line_isle_connected(&d->tree) ? "met" : "back";
+        cctext_stat_bytes(a, sizeof a, d->tree.isle_from);
+        cctext_stat_bytes(c, sizeof c, d->tree.isle_anchor);
+        snprintf(e, sizeof e, "%s .. %s", a, c);
+        snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s",
+                 rtx_line_isle_pumping(&d->tree) ? '!' : '.', "island", e,
+                 "state", ist);
+        used = cctext_stat_push(text, sizeof text, used, one);
+        n++;
+    }
+    snprintf(one, sizeof one, "#GRAMMAR");
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(a, sizeof a, "%zu · %zu sec", d ? d->run_len : 0,
+             d ? d->sec_len : 0);
+    snprintf(c, sizeof c, "%zu", d ? d->fold_n : 0);
+    snprintf(one, sizeof one, ".%-8s %-16s %-8s %s", "runs", a, "folds", c);
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(a, sizeof a, "%zu / %d", livew, RTX_MARKUP_CACHE_WINDOWS);
+    snprintf(c, sizeof c, walk ? "walk %zu" : "idle", walk);
+    snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s", wkind, "windows", a,
+             "state", c);
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    snprintf(a, sizeof a, "%s", d && d->hl_full ? "full" : "windowed");
+    snprintf(c, sizeof c, "%zu", d ? d->tm_ckpt_len : 0);
+    snprintf(one, sizeof one, ".%-8s %-16s %-8s %s", "mode", a, "ckpt", c);
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    if (last) {
+        if (last->kind == RTX_SEC_CODE) kindn = "code";
+        else if (last->kind == RTX_SEC_PROSE) kindn = "prose";
+        if (last->ready) winst = "ready";
+        cctext_stat_bytes(a, sizeof a, last->from);
+        cctext_stat_bytes(c, sizeof c, last->to);
+        snprintf(e, sizeof e, "%s .. %s", a, c);
+        snprintf(f, sizeof f, "%s %s", kindn, winst);
+        snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s",
+                 last->ready ? '.' : '!', "last", e, "kind", f);
+        used = cctext_stat_push(text, sizeof text, used, one);
+        n++;
+    }
+    if (d && d->find.query.len) {
+        if (d->find.done) findst = d->find.truncated ? "trunc" : "done";
+        fkind = d->find.done ? '.' : '!';
+        snprintf(one, sizeof one, "#FIND");
+        used = cctext_stat_push(text, sizeof text, used, one);
+        n++;
+        snprintf(a, sizeof a, "%zu", d->find.len);
+        cctext_stat_pct(c, sizeof c, d->find.scan_off, d->len());
+        snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s", fkind, "hits", a,
+                 "scan", c);
+        used = cctext_stat_push(text, sizeof text, used, one);
+        n++;
+        snprintf(one, sizeof one, "%c%-8s %s", fkind, "state", findst);
+        used = cctext_stat_push(text, sizeof text, used, one);
+        n++;
+    }
+    snprintf(one, sizeof one, "#PAIR");
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    cctext_stat_bytes(a, sizeof a, to > from ? to - from : 0);
+    if (have)
+        snprintf(c, sizeof c, "%zu .. %zu", plo, phi);
+    else
+        snprintf(c, sizeof c, "-");
+    snprintf(one, sizeof one, ".%-8s %-16s %-8s %s", "span", a, "match", c);
+    used = cctext_stat_push(text, sizeof text, used, one);
+    n++;
+    (void)used;
+    box_h = n + 3;
+    if (box_w > cols - 2) box_w = cols - 2;
+    if (box_h > rows - 2) box_h = rows - 2;
+    r0 = (rows - box_h) / 2;
+    if (r0 < 1) r0 = 1;
+    c0 = (cols - box_w) / 2;
+    if (c0 < 1) c0 = 1;
+    for (i = 0; i < box_h; i++) {
+        fprintf(stdout, "\x1b[%d;%dH", r0 + i, c0);
+        if (i == 0) {
+            fputs("\x1b[45;97;1m  engine", stdout);
+            {
+                int p;
+                for (p = 8; p < box_w; p++) fputc(' ', stdout);
+            }
+        } else if (i == 1 || i == box_h - 1) {
+            fputs("\x1b[45;35m ", stdout);
+            {
+                int p;
+                for (p = 1; p < box_w - 1; p++) fputc('-', stdout);
+            }
+            fputc(' ', stdout);
+        } else if (i - 2 < n) {
+            int pad;
+            char kind;
+            char *body;
+            cctext_stat_line(text, i - 2, one, sizeof one);
+            kind = one[0];
+            body = one[0] ? one + 1 : one;
+            if (kind == '#') fputs("\x1b[45;96;1m ", stdout);
+            else if (kind == '!') fputs("\x1b[45;93m ", stdout);
+            else fputs("\x1b[45;97m ", stdout);
+            fputs(body, stdout);
+            pad = 1 + (int)strlen(body);
+            while (pad < box_w) {
+                fputc(' ', stdout);
+                pad++;
+            }
+        }
+        fputs("\x1b[0m", stdout);
+    }
+}

@@ -6,12 +6,28 @@ cctext (include lowering, sugar, arenas, etc.).
 Recipes live in Concurrent-C `docs/cheatsheet.md` (Arenas: `@scratch` is
 call-local; pass a named arena last to keep a product).
 
-`@typehooks` accepts only create / destroy / ufcs / ufcs_sink / niche.
-Method names (`RtxBuf_type_cp`, `RtxWs_browse_start`) install by declaration.
-Listing them in the hooks object still fails on the GUI TU (`unsupported
-cc_type_register hook field`).
+`@typehooks` is lifecycle only (create / destroy / ufcs / ufcs_sink / niche).
+Methods are `Type_name` declarations, not hook fields. see Concurrent-C 
+`docs/typehooks-typeviews.md`
 
-`frontend/gui.ccs` sits on the 8192 AST-node cap (one TU with the core).
+`frontend/gui.ccs` and `frontend/cctext.ccs` sit on the 8192 AST-node cap
+(one TU with the core). Mark/fold bodies live in `core/nav.ccs` (linked TU,
+same cut as hex / browse); `nav.cch` is only decls plus thin wrappers.
+Find refine (`rtx_find_refine`) is `core/find.ccs` so prefix-extend does not
+sit on the cctext include TU.
+The scope intern table is `core/scope.ccs` — paint and lex must share IDs
+(GUI draw is a separate TU). Help strings are `core/ui_help.ccs`.
+Brace-pair paint (`rtx_nav_pair_ends`) is declared in `nav_pair.cch`, not
+`nav.cch`. TUI pane paint is `frontend/cctext_draw.ccs` (same cut as
+`gui_draw`); the host loop stays in `cctext.ccs`. Find/browse chapter bodies live in the sibling `.ccs` (CCC will not
+keep impl-grade statics in a header included from two TUs). TUI draw
+includes `ui_types.cch` via workspace, not `find.cch` / `ui.cch` /
+`browse.cch`.
+GUI paint is `frontend/gui_draw.ccs`; keys/mouse are `frontend/gui_input.ccs`;
+the host loop stays in `frontend/gui.ccs` (same cut as hex / browse). Do not
+add `@typehooks` fields on the GUI TUs. Chrome (menus / fonts / help) is
+`frontend/gui_chrome.ccs`; `objc_msgSend` (file picker / live resize) is
+`frontend/gui_osx.ccs`.
 Browse listing (`rtx_browse_kick` / pump / `>` walk) is a linked TU
 (`core/browse.ccs`), same cut as hex. Browse `scanning` is the find `done`
 bit inverted — same kick / step / yield (DESIGN.md Scan). Do not add a

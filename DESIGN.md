@@ -42,14 +42,21 @@ The model is the names:
 | browse | `rtx_browse_kick` | `rtx_browse_pump` | `scanning` | job queue | `RTX_BROWSE_SEQ` |
 
 Kick plants the first paint and returns. One closed interval per step.
-Returning is the yield. The host decides whether to enter — `find_apply`
-enters once; `find_pump` may enter again up to `RTX_FIND_PUMP` while
-`RTX_FIND_PUMP_MS` remains, then lands. The step returns how many staged
+Returning is the yield. A longer query that extends the last one filters
+hits and keeps `scan_off`; a cap resumes from the last accepted hit. A
+shorter or non-prefix query resets. The host decides whether to enter —
+`find_apply` enters once; `find_pump` may enter again up to `RTX_FIND_PUMP`
+while `RTX_FIND_PUMP_MS` remains, then lands. The step returns how many staged
 hops ran; 0 is not progress. `cancel` is a written bit — not a stdin poll.
 Hosts pump while live and show `scanning...` / `capped`. Tests call
 `finish` (drain). Do not drain the first screen before first paint.
 
 The next scan (index, grep, …) copies this table, not a new protocol.
+
+`g N%` is a byte camera: snap with `line_floor` (local 8KiB), paint `+1`… /
+`-L` in the gutter until the island meets the prefix, and pump backward.
+Scroll and arrows stay on `line_floor` / `line_next` — do not `line_of` to
+follow the caret. Absolute `g L` still uses `line_start` / `line_of`.
 
 `RtxDoc d = {0} @destroy` (and the same for tree, layout, buf, workspace). A buf slot destroys layout, then doc.
 
@@ -90,7 +97,9 @@ Commit only after the new value exists: hist after `tree.replace` (reserve coale
 
 - `as: tree` on `RtxDoc`, `as: doc` on `RtxBuf` — miss on the outer retries on the embed.
 - `RtxDocHighlight` — `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`. It cannot `len` / `line_*` / `insert` / `type` / `save`.
-- `RtxDocLayout` — measure may `len`, `line_*`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`. It cannot `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
+- `RtxDocLayout` — measure may `len`, `line_*`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`, `fold_covers`. It cannot `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
+
+Mark motion and fold walk the runs `ensure_hl` already produced. They do not lex ahead, pump, or keep a file-shaped table. Heading pairs use those runs; brace pairs (`{}` `[]` `()`) match on the caret’s 256KiB analysis page plus at most one neighbor page each side (same grain as `RTX_HL_WIN_MAX`, not the 64KiB store). Paint does not `ensure_hl` that span — skip uses whatever runs the layout window already has. A fold is stored only when both ends are in that window. Layout skips interiors; caret and scroll jump to the fold edge; hex ignores folds.
 
 Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for `write_fd` / page-store internals.
 
