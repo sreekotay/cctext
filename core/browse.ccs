@@ -1,0 +1,184 @@
+#!ccc ccs
+/*
+ * Directory listing (linked TU; see browse.cch).
+ * Hosts include the header for types/chrome; this file owns refresh.
+ */
+#include <ccc/std/prelude.cch>
+#include <string.h>
+#include <sys/stat.h>
+#include "document.cch"
+#include "layout.cch"
+#include "workspace.cch"
+
+enum { RTX_BROWSE_WALK = 24 };
+
+static int rtx_browse_grow(RtxBrowse *br, size_t need) {
+    void *n;
+    size_t c;
+    if (!br) return -1;
+    if (need <= br->cap) return 0;
+    c = br->cap ? br->cap : 8;
+    while (c < need) {
+        size_t next = c * 2;
+        if (next < c) return -1;
+        c = next;
+    }
+    n = cc_arena_alloc(&br->store, c * sizeof(RtxBrowseEnt), 8);
+    if (!n) return -1;
+    if (br->ents && br->cap) memcpy(n, br->ents, br->cap * sizeof(RtxBrowseEnt));
+    br->ents = (RtxBrowseEnt *)n;
+    br->cap = c;
+    return 0;
+}
+
+/* Same idea as find_push: MAX is a stop, not an error. Status shows "capped". */
+static int rtx_browse_push(RtxBrowse *br, const RtxBrowseEnt *rec) {
+    if (!br || !rec) return -1;
+    if (br->len >= (size_t)RTX_BROWSE_MAX) {
+        br->truncated = 1;
+        return 0;
+    }
+    if (rtx_browse_grow(br, br->len + 1) < 0) return -1;
+    br->ents[br->len] = *rec;
+    br->len++;
+    return 0;
+}
+
+static int rtx_browse_walk(RtxBrowse *br, const char *abs, const char *rel, int depth) {
+    CCDirIter *it;
+    cc_arena_stack(scratch, 16384);
+    if (!br || !abs || !abs[0] || br->truncated || depth > RTX_BROWSE_WALK) return 0;
+    it = cc_dir_open(&scratch, cc_slice_cstr(abs)) !>(e) {
+        (void)e;
+        return 0;
+    };
+    for (;;) {
+        int eof = 0;
+        CCDirEntry ent;
+        const char *name;
+        char full[RTX_BROWSE_DIR];
+        char child[RTX_BROWSE_NAME];
+        RtxBrowseEnt rec;
+        struct stat st;
+        int wr;
+        ent = cc_dir_next(it, &scratch) !>(e) {
+            eof = 1;
+            if (e.os_code != 0) {
+                cc_dir_close(it);
+                return -1;
+            }
+        };
+        if (eof) break;
+        name = ent.name.ptr;
+        if (!name || name[0] == '.') continue;
+        wr = (rel && rel[0]) ? snprintf(child, sizeof(child), "%s/%s", rel, name)
+                             : snprintf(child, sizeof(child), "%s", name);
+        if (wr <= 0 || (size_t)wr >= sizeof(child)) continue;
+        if (!rtx_browse_join(full, sizeof(full), abs, name)) continue;
+        if (lstat(full, &st) != 0 || S_ISLNK(st.st_mode)) continue;
+        memset(&rec, 0, sizeof(rec));
+        snprintf(rec.name, sizeof(rec.name), "%s", child);
+        rec.has_stat = 1;
+        rec.is_dir = S_ISDIR(st.st_mode);
+        rec.size = (uint64_t)st.st_size;
+        rec.mtime = st.st_mtime;
+        if (rec.is_dir) {
+            if (rtx_browse_walk(br, full, child, depth + 1) < 0) {
+                cc_dir_close(it);
+                return -1;
+            }
+            if (br->truncated) break;
+            continue;
+        }
+        if (!rtx_browse_show_name(br, child, 0)) continue;
+        if (rtx_browse_push(br, &rec) < 0) {
+            cc_dir_close(it);
+            return -1;
+        }
+        if (br->truncated) break;
+    }
+    cc_dir_close(it);
+    return 0;
+}
+
+void !>(CCError) rtx_browse_refresh(RtxBrowse *br) {
+    char keep[RTX_BROWSE_NAME];
+    CCDirIter *it;
+    cc_arena_stack(scratch, 16384);
+    if (!br || !br->dir[0]) return cc_err(CC_ERR_INVALID_ARG, "browse dir");
+    keep[0] = 0;
+    if (br->ents && br->cur < br->len)
+        snprintf(keep, sizeof(keep), "%s", br->ents[br->cur].name);
+    if (br->store.base) br->store.reset();
+    else {
+        br->store = cc_arena_heap(kilobytes(8));
+        if (!br->store.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "browse");
+    }
+    br->ents = NULL;
+    br->len = 0;
+    br->cap = 0;
+    br->truncated = 0;
+    if (!rtx_browse_is_root(br->dir)) {
+        char parent[RTX_BROWSE_DIR];
+        if (rtx_browse_grow(br, 1) < 0)
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "browse");
+        memset(&br->ents[0], 0, sizeof(br->ents[0]));
+        snprintf(br->ents[0].name, sizeof(br->ents[0].name), "..");
+        br->ents[0].is_dir = 1;
+        if (rtx_browse_join(parent, sizeof(parent), br->dir, ".."))
+            rtx_browse_stat_path(parent, &br->ents[0]);
+        br->ents[0].is_dir = 1;
+        br->len = 1;
+    }
+    if (rtx_browse_deep(br)) {
+        if (rtx_browse_walk(br, br->dir, "", 0) < 0)
+            return cc_err(CC_ERR_IO, "browse walk");
+    } else {
+        it = cc_dir_open(&scratch, cc_slice_cstr(br->dir)) !>(e) {
+            return cc_err(e.base);
+        };
+        for (;;) {
+            int eof = 0;
+            CCDirEntry ent;
+            const char *name;
+            char full[RTX_BROWSE_DIR];
+            RtxBrowseEnt rec;
+            int is_dir;
+            ent = cc_dir_next(it, &scratch) !>(e) {
+                if (e.os_code == 0) eof = 1;
+                else {
+                    cc_dir_close(it);
+                    return cc_err(e.base);
+                }
+            };
+            if (eof) break;
+            name = ent.name.ptr;
+            if (!name) continue;
+            is_dir = 0;
+            memset(&rec, 0, sizeof(rec));
+            snprintf(rec.name, sizeof(rec.name), "%s", name);
+            if (rtx_browse_join(full, sizeof(full), br->dir, name)) {
+                if (rtx_browse_stat_path(full, &rec)) is_dir = rec.is_dir;
+                else if (ent.type == CC_DIRENT_DIR) is_dir = 1;
+            } else if (ent.type == CC_DIRENT_DIR) {
+                is_dir = 1;
+            }
+            rec.is_dir = is_dir;
+            if (!rtx_browse_show_name(br, name, is_dir)) continue;
+            if (rtx_browse_push(br, &rec) < 0) {
+                cc_dir_close(it);
+                return cc_err(CC_ERR_OUT_OF_MEMORY, "browse");
+            }
+            if (br->truncated) break;
+        }
+        cc_dir_close(it);
+    }
+    if (br->len > 1) {
+        size_t from = rtx_browse_is_root(br->dir) ? 0 : 1;
+        if (br->len > from)
+            qsort(br->ents + from, br->len - from, sizeof(RtxBrowseEnt),
+                  rtx_browse_cmp);
+    }
+    rtx_browse_keep_cur(br, keep);
+    return cc_ok();
+}

@@ -1,7 +1,9 @@
 #!ccc cch
 /*
- * Per-pane directory listing. Glob filters files; directories stay so you
- * can walk. Does not chdir the process.
+ * Per-pane directory listing. A real glob (* ? [) filters files and leaves
+ * directories so you can walk. A fragment like "R" matches any name that
+ * contains it. `>` walks every subfolder and flattens files as `dir/name`;
+ * text after `>` is the same glob. Does not chdir the process.
  */
 #ifndef RTX_BROWSE_H
 #define RTX_BROWSE_H
@@ -38,6 +40,9 @@ typedef struct {
     char dir[RTX_BROWSE_DIR];
     char glob[RTX_BROWSE_GLOB];
     size_t glob_len;
+    size_t glob_caret;
+    size_t glob_sel;
+    int glob_focus;        /* 1: arrows edit the glob, not the list */
     RtxBrowseEnt *ents;
     size_t len, cap;
     size_t cur, top;
@@ -138,6 +143,44 @@ enum {
     RTX_BROWSE_MTIME_W = 16 /* YYYY-MM-DD HH:MM */
 };
 
+/* Closed chrome palette. Same RGB + ANSI for both frontends. */
+typedef enum {
+    RTX_BROWSE_FACE_PATH = 0,
+    RTX_BROWSE_FACE_GLOB,
+    RTX_BROWSE_FACE_DIR,
+    RTX_BROWSE_FACE_FILE,
+    RTX_BROWSE_FACE_SIZE,
+    RTX_BROWSE_FACE_DATE
+} RtxBrowseFace;
+
+#ifndef RTX_BROWSE_LIST
+static RtxThemeColor rtx_browse_face(RtxBrowseFace face) {
+    RtxThemeColor z;
+    z.r = 230; z.g = 230; z.b = 230; z.ansi = "\x1b[0m";
+    switch (face) {
+    case RTX_BROWSE_FACE_PATH:
+        z.r = 120; z.g = 160; z.b = 210; z.ansi = "\x1b[34m";
+        break;
+    case RTX_BROWSE_FACE_GLOB:
+        z.r = 220; z.g = 180; z.b = 80; z.ansi = "\x1b[33m";
+        break;
+    case RTX_BROWSE_FACE_DIR:
+        z.r = 80; z.g = 200; z.b = 220; z.ansi = "\x1b[36;1m";
+        break;
+    case RTX_BROWSE_FACE_FILE:
+        z.r = 230; z.g = 230; z.b = 230; z.ansi = "\x1b[37m";
+        break;
+    case RTX_BROWSE_FACE_SIZE:
+        z.r = 220; z.g = 180; z.b = 80; z.ansi = "\x1b[33m";
+        break;
+    case RTX_BROWSE_FACE_DATE:
+        z.r = 140; z.g = 140; z.b = 140; z.ansi = "\x1b[90m";
+        break;
+    }
+    return z;
+}
+#endif
+
 static int rtx_browse_stat_path(const char *path, RtxBrowseEnt *e) {
     struct stat st;
     if (!path || !path[0] || !e) return 0;
@@ -232,15 +275,75 @@ static int rtx_browse_cmp(const void *a, const void *b) {
     return strcmp(x->name, y->name);
 }
 
+static int rtx_browse_deep(const RtxBrowse *br) {
+    return br && br->glob_len && br->glob[0] == '>';
+}
+
+static const char *rtx_browse_filter(const RtxBrowse *br) {
+    if (!br || !br->glob_len) return "";
+    if (br->glob[0] == '>') return br->glob + 1;
+    return br->glob;
+}
+
+static const char *rtx_browse_rel_base(const char *name) {
+    const char *slash;
+    if (!name) return "";
+    slash = strrchr(name, '/');
+    return slash ? slash + 1 : name;
+}
+
+/* Bytes of `dir/` on a flattened `dir/name`. 0 if this row is top-level. */
+static size_t rtx_browse_dir_prefix(const char *name) {
+    const char *slash;
+    if (!name) return 0;
+    slash = strrchr(name, '/');
+    if (!slash) return 0;
+    return (size_t)(slash - name + 1);
+}
+
+static int rtx_browse_glob_meta(const char *pat) {
+    const char *p;
+    if (!pat) return 0;
+    for (p = pat; *p; p++) {
+        if (*p == '*' || *p == '?' || *p == '[') return 1;
+    }
+    return 0;
+}
+
+static int rtx_browse_glob_match(const char *pat, const char *name) {
+    char wrapped[RTX_BROWSE_GLOB + 2];
+    if (!pat || !pat[0] || !name) return 1;
+    if (rtx_browse_glob_meta(pat))
+        return cc_glob_match(cc_slice_cstr(pat), cc_slice_cstr(name));
+    /* Typing "R" should keep README.md, not only a file named R. */
+    if (strlen(pat) + 2 >= sizeof(wrapped)) return strstr(name, pat) != NULL;
+    snprintf(wrapped, sizeof(wrapped), "*%s*", pat);
+    return cc_glob_match(cc_slice_cstr(wrapped), cc_slice_cstr(name));
+}
+
+static int rtx_browse_hidden(const RtxBrowse *br, const char *name) {
+    const char *base = rtx_browse_rel_base(name);
+    const char *filter = rtx_browse_filter(br);
+    if (!base || base[0] != '.') return 0;
+    if (filter[0] == '.') return 0;
+    return 1;
+}
+
 static int rtx_browse_show_name(const RtxBrowse *br, const char *name, int is_dir) {
-    char pat[RTX_BROWSE_GLOB];
+    const char *filter;
     if (!name || name[0] == 0) return 0;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
-    if (name[0] == '.' && (!br->glob_len || br->glob[0] != '.')) return 0;
-    if (is_dir) return 1;
-    if (!br->glob_len) return 1;
-    snprintf(pat, sizeof(pat), "%s", br->glob);
-    return cc_glob_match(cc_slice_cstr(pat), cc_slice_cstr(name));
+    if (rtx_browse_hidden(br, name)) return 0;
+    filter = rtx_browse_filter(br);
+    if (!filter[0]) return 1;
+    /* `*.md` keeps every directory so you can still walk. Flattened `>`
+     * lists files only; the walk itself decides which folders to enter. */
+    if (is_dir && !rtx_browse_deep(br) && rtx_browse_glob_meta(filter)) return 1;
+    if (rtx_browse_glob_match(filter, name)) return 1;
+    /* `>*.md` is a normal glob on the basename, not only the relative path. */
+    if (rtx_browse_deep(br))
+        return rtx_browse_glob_match(filter, rtx_browse_rel_base(name));
+    return 0;
 }
 
 static void rtx_browse_keep_cur(RtxBrowse *br, const char *keep) {
@@ -258,6 +361,8 @@ static void rtx_browse_keep_cur(RtxBrowse *br, const char *keep) {
     if (br->cur >= br->len) br->cur = br->len - 1;
 }
 
+void !>(CCError) rtx_browse_refresh(RtxBrowse *br);
+
 static void rtx_browse_scroll(RtxBrowse *br, int vis) {
     size_t list;
     if (!br) return;
@@ -272,90 +377,8 @@ static void rtx_browse_scroll(RtxBrowse *br, int vis) {
     if (br->cur >= br->top + list) br->top = br->cur - list + 1;
 }
 
-static void !>(CCError) rtx_browse_refresh(RtxBrowse *br) {
-    char keep[RTX_BROWSE_NAME];
-    CCDirIter *it;
-    cc_arena_stack(scratch, 16384);
-    if (!br || !br->dir[0]) return cc_err(CC_ERR_INVALID_ARG, "browse dir");
-    keep[0] = 0;
-    if (br->ents && br->cur < br->len)
-        snprintf(keep, sizeof(keep), "%s", br->ents[br->cur].name);
-    if (br->store.base) br->store.reset();
-    else {
-        br->store = cc_arena_heap(kilobytes(8));
-        if (!br->store.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "browse");
-    }
-    br->ents = NULL;
-    br->len = 0;
-    br->cap = 0;
-    br->truncated = 0;
-    if (!rtx_browse_is_root(br->dir)) {
-        char parent[RTX_BROWSE_DIR];
-        rtx_arena_grow(&br->store, (void **)&br->ents, &br->cap, 1,
-                       sizeof(RtxBrowseEnt)) !>(e) { return cc_err(e); };
-        memset(&br->ents[0], 0, sizeof(br->ents[0]));
-        snprintf(br->ents[0].name, sizeof(br->ents[0].name), "..");
-        br->ents[0].is_dir = 1;
-        if (rtx_browse_join(parent, sizeof(parent), br->dir, ".."))
-            rtx_browse_stat_path(parent, &br->ents[0]);
-        br->ents[0].is_dir = 1;
-        br->len = 1;
-    }
-    it = cc_dir_open(&scratch, cc_slice_cstr(br->dir)) !>(e) {
-        return cc_err(e.base);
-    };
-    for (;;) {
-        int eof = 0;
-        CCDirEntry ent;
-        const char *name;
-        char full[RTX_BROWSE_DIR];
-        RtxBrowseEnt rec;
-        int is_dir;
-        ent = cc_dir_next(it, &scratch) !>(e) {
-            if (e.os_code == 0) eof = 1;
-            else {
-                cc_dir_close(it);
-                return cc_err(e.base);
-            }
-        };
-        if (eof) break;
-        name = ent.name.ptr;
-        if (!name) continue;
-        is_dir = 0;
-        memset(&rec, 0, sizeof(rec));
-        snprintf(rec.name, sizeof(rec.name), "%s", name);
-        if (rtx_browse_join(full, sizeof(full), br->dir, name)) {
-            if (rtx_browse_stat_path(full, &rec)) is_dir = rec.is_dir;
-            else if (ent.type == CC_DIRENT_DIR) is_dir = 1;
-        } else if (ent.type == CC_DIRENT_DIR) {
-            is_dir = 1;
-        }
-        rec.is_dir = is_dir;
-        if (!rtx_browse_show_name(br, name, is_dir)) continue;
-        if (br->len >= (size_t)RTX_BROWSE_MAX) {
-            br->truncated = 1;
-            break;
-        }
-        rtx_arena_grow(&br->store, (void **)&br->ents, &br->cap, br->len + 1,
-                       sizeof(RtxBrowseEnt)) !>(e) {
-            cc_dir_close(it);
-            return cc_err(e);
-        };
-        br->ents[br->len] = rec;
-        br->len++;
-    }
-    cc_dir_close(it);
-    if (br->len > 1) {
-        size_t from = rtx_browse_is_root(br->dir) ? 0 : 1;
-        if (br->len > from)
-            qsort(br->ents + from, br->len - from, sizeof(RtxBrowseEnt),
-                  rtx_browse_cmp);
-    }
-    rtx_browse_keep_cur(br, keep);
-    return cc_ok();
-}
-
 static void rtx_browse_move(RtxBrowse *br, int dir, int vis) {
+    if (br) br->glob_focus = 0;
     if (!br || br->len == 0) return;
     if (dir < 0) {
         if (br->cur > 0) br->cur--;
@@ -375,6 +398,7 @@ static int rtx_browse_hit(const RtxBrowse *br, int row, int vis) {
     return (int)idx;
 }
 
+#ifndef RTX_BROWSE_LIST
 static RtxBrowse *RtxWs_browse_at(RtxWs *w, int pane) {
     if (!w || pane < 0 || pane >= 2) return NULL;
     return &w->nav[pane];
@@ -521,7 +545,20 @@ static void !>(CCError) RtxWs_browse_glob_set(RtxWs *w, const char *glob) {
     if (!glob) glob = "";
     snprintf(br->glob, sizeof(br->glob), "%s", glob);
     br->glob_len = strlen(br->glob);
+    br->glob_caret = br->glob_len;
+    br->glob_sel = br->glob_len;
     return rtx_browse_refresh(br);
+}
+
+static RtxField rtx_browse_field(RtxBrowse *br) {
+    RtxField f = {0};
+    if (!br) return f;
+    f.buf = br->glob;
+    f.len = &br->glob_len;
+    f.cap = sizeof(br->glob);
+    f.caret = &br->glob_caret;
+    f.sel = &br->glob_sel;
+    return f;
 }
 
 static void !>(CCError) RtxWs_browse_type(RtxWs *w, int ch) {
@@ -529,24 +566,23 @@ static void !>(CCError) RtxWs_browse_type(RtxWs *w, int ch) {
     if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
     br = &w->nav[w->focus];
     if (!br->on) return cc_ok();
-    if (ch >= 32 && ch != 127 &&
-        rtx_utf8_append(br->glob, &br->glob_len, sizeof(br->glob), (uint32_t)ch) > 0) {
+    if (rtx_field_type_cp(rtx_browse_field(br), (uint32_t)ch))
         return rtx_browse_refresh(br);
-    }
     return cc_ok();
 }
 
 static void !>(CCError) RtxWs_browse_backspace(RtxWs *w) {
     RtxBrowse *br;
+    RtxField f;
     if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
     br = &w->nav[w->focus];
     if (!br->on) return cc_ok();
-    if (br->glob_len > 0) {
-        br->glob_len = rtx_utf8_prev(br->glob.to_slice_n(br->glob_len), br->glob_len);
-        br->glob[br->glob_len] = 0;
-        return rtx_browse_refresh(br);
-    }
-    return RtxWs_browse_parent(w);
+    f = rtx_browse_field(br);
+    if (br->glob_len == 0 && !rtx_field_has_sel(f))
+        return RtxWs_browse_parent(w);
+    rtx_field_backspace(f);
+    return rtx_browse_refresh(br);
 }
 
+#endif /* RTX_BROWSE_LIST */
 #endif /* RTX_BROWSE_H */

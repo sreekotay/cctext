@@ -3,8 +3,8 @@
  * UTF-8 navigation / display-width chapter of the document TU.
  * Offsets stay bytes. A cluster is a scalar plus following combining
  * marks and variation selectors — not full UAX #29 (no ZWJ / flags).
- * Invalid bytes are one-byte clusters (U+FFFD, width 1). Hex views
- * keep walking bytes and do not call this.
+ * Invalid bytes are one-byte clusters (U+FFFD, width 1). Hex motion
+ * stays bytes; the dump column decodes with these helpers.
  */
 #ifndef RTX_UTF8_H
 #define RTX_UTF8_H
@@ -343,6 +343,23 @@ static int rtx_utf8_prefix_cols(char[:] bytes, size_t n) {
     return cols;
 }
 
+/* Display column → byte. Lands on the nearer cluster edge. */
+static size_t rtx_utf8_hit_col(char[:] bytes, int col) {
+    size_t i = 0;
+    int x = 0;
+    if (!bytes.ptr || col <= 0) return 0;
+    while (i < bytes.len) {
+        RtxUtf8Cl cl = rtx_utf8_cluster(bytes, i);
+        size_t step = cl.n ? cl.n : 1;
+        int next = x + cl.cols;
+        if (col <= x + cl.cols / 2) return i;
+        if (col <= next) return i + step;
+        x = next;
+        i += step;
+    }
+    return bytes.len;
+}
+
 static int rtx_utf8_append(char *buf, size_t *len, size_t cap, uint32_t cp) {
     char tmp[4];
     int n;
@@ -354,6 +371,188 @@ static int rtx_utf8_append(char *buf, size_t *len, size_t cap, uint32_t cp) {
     *len += (size_t)n;
     buf[*len] = 0;
     return n;
+}
+
+/* One-line prompt (find / glob). Bytes; motion is clusters. */
+typedef struct {
+    char *buf;
+    size_t *len;
+    size_t cap;
+    size_t *caret;
+    size_t *sel;
+} RtxField;
+
+static char[:] rtx_field_bytes(RtxField f) {
+    char[:] s = {0};
+    if (f.buf && f.len) {
+        s.ptr = f.buf;
+        s.len = *f.len;
+    }
+    return s;
+}
+
+static void rtx_field_clamp(RtxField f) {
+    size_t n;
+    char[:] bytes;
+    if (!f.len || !f.caret || !f.sel) return;
+    n = *f.len;
+    if (*f.caret > n) *f.caret = n;
+    if (*f.sel > n) *f.sel = n;
+    bytes = rtx_field_bytes(f);
+    *f.caret = rtx_utf8_align(bytes, *f.caret);
+    *f.sel = rtx_utf8_align(bytes, *f.sel);
+}
+
+static int rtx_field_has_sel(RtxField f) {
+    return f.caret && f.sel && *f.caret != *f.sel;
+}
+
+static size_t rtx_field_lo(RtxField f) {
+    if (!f.caret || !f.sel) return 0;
+    return *f.caret < *f.sel ? *f.caret : *f.sel;
+}
+
+static size_t rtx_field_hi(RtxField f) {
+    if (!f.caret || !f.sel) return 0;
+    return *f.caret > *f.sel ? *f.caret : *f.sel;
+}
+
+static char[:] rtx_field_sel_bytes(RtxField f) {
+    char[:] s = {0};
+    size_t lo, hi;
+    if (!f.buf || !rtx_field_has_sel(f)) return s;
+    lo = rtx_field_lo(f);
+    hi = rtx_field_hi(f);
+    s.ptr = f.buf + lo;
+    s.len = hi - lo;
+    return s;
+}
+
+static void rtx_field_collapse(RtxField f) {
+    if (!f.caret || !f.sel) return;
+    rtx_field_clamp(f);
+    *f.sel = *f.caret;
+}
+
+static void rtx_field_select_all(RtxField f) {
+    if (!f.len || !f.caret || !f.sel) return;
+    *f.sel = 0;
+    *f.caret = *f.len;
+}
+
+static int rtx_field_delete_sel(RtxField f) {
+    size_t lo, hi, n;
+    if (!f.buf || !f.len || !rtx_field_has_sel(f)) return 0;
+    lo = rtx_field_lo(f);
+    hi = rtx_field_hi(f);
+    n = *f.len;
+    if (hi > n) hi = n;
+    if (lo >= hi) return 0;
+    if (hi < n) memmove(f.buf + lo, f.buf + hi, n - hi);
+    *f.len = lo + (n - hi);
+    f.buf[*f.len] = 0;
+    *f.caret = lo;
+    *f.sel = lo;
+    return 1;
+}
+
+static void rtx_field_move(RtxField f, int dir, int shift) {
+    char[:] bytes;
+    if (!f.caret || !f.sel || !f.len) return;
+    rtx_field_clamp(f);
+    bytes = rtx_field_bytes(f);
+    if (dir < 0) *f.caret = rtx_utf8_prev(bytes, *f.caret);
+    else *f.caret = rtx_utf8_next(bytes, *f.caret);
+    if (!shift) *f.sel = *f.caret;
+}
+
+static void rtx_field_edge(RtxField f, int to_end, int shift) {
+    if (!f.caret || !f.sel || !f.len) return;
+    *f.caret = to_end ? *f.len : 0;
+    if (!shift) *f.sel = *f.caret;
+}
+
+static void rtx_field_click(RtxField f, int col, int shift, int drag) {
+    size_t at;
+    if (!f.caret || !f.sel) return;
+    at = rtx_utf8_hit_col(rtx_field_bytes(f), col);
+    *f.caret = at;
+    if (!drag && !shift) *f.sel = at;
+}
+
+static void rtx_field_backspace(RtxField f) {
+    size_t prev, n;
+    if (!f.buf || !f.len || !f.caret || !f.sel) return;
+    if (rtx_field_delete_sel(f)) return;
+    rtx_field_clamp(f);
+    if (*f.caret == 0) return;
+    n = *f.len;
+    prev = rtx_utf8_prev(rtx_field_bytes(f), *f.caret);
+    if (prev >= *f.caret) return;
+    if (*f.caret < n) memmove(f.buf + prev, f.buf + *f.caret, n - *f.caret);
+    *f.len = prev + (n - *f.caret);
+    f.buf[*f.len] = 0;
+    *f.caret = prev;
+    *f.sel = prev;
+}
+
+static void rtx_field_delete(RtxField f) {
+    size_t next, n;
+    if (!f.buf || !f.len || !f.caret || !f.sel) return;
+    if (rtx_field_delete_sel(f)) return;
+    rtx_field_clamp(f);
+    n = *f.len;
+    if (*f.caret >= n) return;
+    next = rtx_utf8_next(rtx_field_bytes(f), *f.caret);
+    if (next <= *f.caret) return;
+    if (next < n) memmove(f.buf + *f.caret, f.buf + next, n - next);
+    *f.len = *f.caret + (n - next);
+    f.buf[*f.len] = 0;
+    *f.sel = *f.caret;
+}
+
+static size_t rtx_field_sanitize(const char *src, size_t n, char *dst, size_t cap) {
+    size_t i, o = 0;
+    if (!dst || cap == 0) return 0;
+    for (i = 0; i < n && o + 1 < cap; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+        else if (c < 32) continue;
+        dst[o++] = (char)c;
+    }
+    return o;
+}
+
+static int rtx_field_insert(RtxField f, const char *p, size_t n) {
+    char tmp[256];
+    size_t sn, room, caret, rest;
+    if (!f.buf || !f.len || !f.caret || !f.sel || f.cap < 2) return 0;
+    rtx_field_delete_sel(f);
+    rtx_field_clamp(f);
+    sn = rtx_field_sanitize(p, n, tmp, sizeof(tmp));
+    room = f.cap - 1;
+    if (*f.len >= room) return 0;
+    room -= *f.len;
+    if (sn > room) sn = room;
+    if (sn == 0) return 0;
+    caret = *f.caret;
+    rest = *f.len - caret;
+    if (rest) memmove(f.buf + caret + sn, f.buf + caret, rest);
+    memcpy(f.buf + caret, tmp, sn);
+    *f.len += sn;
+    f.buf[*f.len] = 0;
+    *f.caret = caret + sn;
+    *f.sel = *f.caret;
+    return 1;
+}
+
+static int rtx_field_type_cp(RtxField f, uint32_t cp) {
+    char tmp[4];
+    int n;
+    if (cp < 32 || cp == 127) return 0;
+    n = rtx_utf8_encode(cp, tmp);
+    if (n <= 0) return 0;
+    return rtx_field_insert(f, tmp, (size_t)n);
 }
 
 #endif /* RTX_UTF8_H */

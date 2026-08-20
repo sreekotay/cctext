@@ -6,7 +6,7 @@ CCText has one document core, two frontends — **cctext** (POSIX console) and *
 
 This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). **cctext** also ships as a prebuilt on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler). It does not live inside the compiler repository.
 
-![cctext TUI on a 2 GiB JSON file — syntax highlight, column select, byte-rail scrollbar](docs/cctext-tui.png)
+![cctext TUI — README.md with the key-bindings overlay](docs/cctext-tui.png)
 
 ![cctext file browser — name, size, and mtime](docs/cctext-browse.png)
 
@@ -29,7 +29,7 @@ From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt
 - **Small.** Release `cctext` is 302 KiB. Open RSS is ~1.5 MiB on 3 MiB and on 8 GiB.
 - **UTF-8.** Caret, wrap, hit-test, and backspace walk clusters (scalar + combining marks / variation selectors). Full UAX #29 graphemes (ZWJ emoji, flags) are pending. Hex stays a byte camera.
 - **TUI and GUI.** Same document core: **cctext** (POSIX console) and **cctext-ray** (Raylib).
-- **Hex.** `Ctrl-L` cycles default → wrap → hex (offset | hex | ASCII).
+- **Hex.** `Ctrl-L` cycles default → wrap → hex (offset | hex | UTF-8 dump).
 - **Multiview.** Several files, splits, two cameras on one document. Unlock (`Ctrl-U`) lets a pane scroll off the caret.
 - **File browser.** No filename opens it. `o` / `Ctrl-O` opens the built-in browser (glob, walk directories) into the focused view. The GUI uses the system dialog; `Ctrl-Shift-O` keeps the in-app browser there too. A missing path asks to create an empty file.
 - **TextMate grammars.** Drop any `.tmLanguage.json` into `grammars/` (or `RTX_GRAMMARS`) — loaded live, no rebuild. Window lex, not a full-file pass.
@@ -42,7 +42,7 @@ From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt
 - **Piece tree** over a page store (path original + spilled add) plus borrowed buffers. Offset and line lookup are O(log pieces).
 - **Sections** set layout policy (code vs prose). **Runs** inside a section are rich text and syntax tokens.
 - **Syntax highlight** is a core pass over code sections. Runs carry interned scopes; frontends theme a prefix. Spike lexer, or a lowered TextMate table when the path’s extension is in a grammar loaded at runtime (`RTX_GRAMMARS`, else `<exe>/grammars`, else `<exe>/../testdata/grammars`). Open `testdata/samples/` to try them.
-- Measure-generic layout so wrap and hit-test are the same algorithm in pixels (Raylib) and cells (`cctext`). View cycles with `Ctrl-L`: default → wrap → hex (offset|hex|ASCII) → default.
+- Measure-generic layout so wrap and hit-test are the same algorithm in pixels (Raylib) and cells (`cctext`). View cycles with `Ctrl-L`: default → wrap → hex (offset|hex|UTF-8 dump) → default.
 - Headless tests do not open a window.
 
 ## Status
@@ -119,6 +119,8 @@ See [CCTEXT_PLAN.md](CCTEXT_PLAN.md). MIT — [LICENSE](LICENSE).
 ## Perf
 
 Release, best of 5, each op from a fresh `from_path`. Times include syntax highlighting. `jump_1m` / `wrap_1m` / `insert_mid` / `newline_mid` are **1 MiB into every file** so the sizes are comparable. `jump_50pct` is `g` + `50%` (byte mid; scales). 2026-08-19 on Srees-MacBook-Air. Full table: [testdata/perf/results/baseline_results_2026_08_19.txt](testdata/perf/results/baseline_results_2026_08_19.txt). How to re-run: [testdata/perf/README.md](testdata/perf/README.md).
+
+All tests are with syntax hilighting fully active.
 
 `perf_matrix_smoke` 137.1 KiB · `cctext` 301.8 KiB
 

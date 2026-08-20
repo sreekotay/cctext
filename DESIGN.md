@@ -86,6 +86,7 @@ Offsets, caret, selection, and the piece tree are bytes. Text views walk
 **clusters** for motion, wrap, hit-test, backspace, and measure (a UTF-8 scalar
 plus following combining marks / variation selectors). Hex views stay a byte
 camera: left/right, backspace, delete, box, and home/end step one byte; the
-ASCII dump is one cell per byte. Leaving hex with a collapsed caret snaps it
-to a cluster start. `read_at` stays bytes. Invalid bytes are one-byte clusters
-(U+FFFD, width 1). Full UAX #29 graphemes (ZWJ emoji, flags) are later.
+text dump is one cell per byte (UTF-8 lead, continuation ·, else .). Leaving
+hex with a collapsed caret snaps it to a cluster start. `read_at` stays bytes.
+Invalid bytes are one-byte clusters (U+FFFD, width 1). Full UAX #29 graphemes
+(ZWJ emoji, flags) are later.
