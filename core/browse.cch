@@ -2,8 +2,11 @@
 /*
  * Per-pane directory listing. A real glob (* ? [) filters files and leaves
  * directories so you can walk. A fragment like "R" matches any name that
- * contains it. `>` walks every subfolder and flattens files as `dir/name`;
- * text after `>` is the same glob. Does not chdir the process.
+ * contains it (case-insensitive). `>` walks every subfolder and flattens
+ * files as `dir/name`; text after `>` is the same glob. Leading `.` reveals
+ * dotfiles; it is not a fragment — it does not match extension dots.
+ * Does not chdir.
+ * Scan model (DESIGN.md): kick / pump / scanning — same epoch as find.
  */
 #ifndef RTX_BROWSE_H
 #define RTX_BROWSE_H
@@ -37,6 +40,7 @@ typedef struct {
 typedef struct {
     int on;
     int truncated;
+    int scanning;          /* 1 while pump has work — same epoch as find */
     char dir[RTX_BROWSE_DIR];
     char glob[RTX_BROWSE_GLOB];
     size_t glob_len;
@@ -46,12 +50,18 @@ typedef struct {
     RtxBrowseEnt *ents;
     size_t len, cap;
     size_t cur, top;
+    int boot;              /* 1: started with no file; close without a pick quits */
     CCArena store;
+    void *wk;              /* RtxBrowseWalk in browse.ccs */
 } RtxBrowse;
 #endif
 
+void rtx_browse_walk_stop(RtxBrowse *br);
+void rtx_browse_keep_set(RtxBrowse *br, const char *name);
+
 static void rtx_browse_drop(RtxBrowse *br) {
     if (!br) return;
+    rtx_browse_walk_stop(br);
     if (br->store.base) br->store.destroy();
     memset(br, 0, sizeof(*br));
 }
@@ -150,10 +160,18 @@ typedef enum {
     RTX_BROWSE_FACE_DIR,
     RTX_BROWSE_FACE_FILE,
     RTX_BROWSE_FACE_SIZE,
-    RTX_BROWSE_FACE_DATE
+    RTX_BROWSE_FACE_DATE,
+    RTX_BROWSE_FACE_HIT
 } RtxBrowseFace;
 
-#ifndef RTX_BROWSE_LIST
+#ifndef RTX_THEME_COLOR_TYPE
+#define RTX_THEME_COLOR_TYPE
+typedef struct {
+    unsigned char r, g, b;
+    const char *ansi;
+} RtxThemeColor;
+#endif
+
 static RtxThemeColor rtx_browse_face(RtxBrowseFace face) {
     RtxThemeColor z;
     z.r = 230; z.g = 230; z.b = 230; z.ansi = "\x1b[0m";
@@ -176,20 +194,11 @@ static RtxThemeColor rtx_browse_face(RtxBrowseFace face) {
     case RTX_BROWSE_FACE_DATE:
         z.r = 140; z.g = 140; z.b = 140; z.ansi = "\x1b[90m";
         break;
+    case RTX_BROWSE_FACE_HIT:
+        z.r = 255; z.g = 220; z.b = 80; z.ansi = "\x1b[43;30m";
+        break;
     }
     return z;
-}
-#endif
-
-static int rtx_browse_stat_path(const char *path, RtxBrowseEnt *e) {
-    struct stat st;
-    if (!path || !path[0] || !e) return 0;
-    if (stat(path, &st) != 0) return 0;
-    e->has_stat = 1;
-    e->is_dir = S_ISDIR(st.st_mode);
-    e->size = (uint64_t)st.st_size;
-    e->mtime = st.st_mtime;
-    return 1;
 }
 
 static void rtx_browse_fmt_size(char *dst, size_t n, const RtxBrowseEnt *e) {
@@ -268,29 +277,9 @@ static void rtx_browse_fmt_row(char *dst, size_t n, int cols, const RtxBrowseEnt
         dst[cols - RTX_BROWSE_MTIME_W + i] = when[i];
 }
 
-static int rtx_browse_cmp(const void *a, const void *b) {
-    const RtxBrowseEnt *x = (const RtxBrowseEnt *)a;
-    const RtxBrowseEnt *y = (const RtxBrowseEnt *)b;
-    if (x->is_dir != y->is_dir) return y->is_dir - x->is_dir;
-    return strcmp(x->name, y->name);
-}
-
-static int rtx_browse_deep(const RtxBrowse *br) {
-    return br && br->glob_len && br->glob[0] == '>';
-}
-
-static const char *rtx_browse_filter(const RtxBrowse *br) {
-    if (!br || !br->glob_len) return "";
-    if (br->glob[0] == '>') return br->glob + 1;
-    return br->glob;
-}
-
-static const char *rtx_browse_rel_base(const char *name) {
-    const char *slash;
-    if (!name) return "";
-    slash = strrchr(name, '/');
-    return slash ? slash + 1 : name;
-}
+/* First match span in a displayed name. 0 if the glob is empty. */
+int rtx_browse_hit_span(const RtxBrowse *br, const char *name,
+                        size_t *off, size_t *n);
 
 /* Bytes of `dir/` on a flattened `dir/name`. 0 if this row is top-level. */
 static size_t rtx_browse_dir_prefix(const char *name) {
@@ -301,67 +290,9 @@ static size_t rtx_browse_dir_prefix(const char *name) {
     return (size_t)(slash - name + 1);
 }
 
-static int rtx_browse_glob_meta(const char *pat) {
-    const char *p;
-    if (!pat) return 0;
-    for (p = pat; *p; p++) {
-        if (*p == '*' || *p == '?' || *p == '[') return 1;
-    }
-    return 0;
-}
-
-static int rtx_browse_glob_match(const char *pat, const char *name) {
-    char wrapped[RTX_BROWSE_GLOB + 2];
-    if (!pat || !pat[0] || !name) return 1;
-    if (rtx_browse_glob_meta(pat))
-        return cc_glob_match(cc_slice_cstr(pat), cc_slice_cstr(name));
-    /* Typing "R" should keep README.md, not only a file named R. */
-    if (strlen(pat) + 2 >= sizeof(wrapped)) return strstr(name, pat) != NULL;
-    snprintf(wrapped, sizeof(wrapped), "*%s*", pat);
-    return cc_glob_match(cc_slice_cstr(wrapped), cc_slice_cstr(name));
-}
-
-static int rtx_browse_hidden(const RtxBrowse *br, const char *name) {
-    const char *base = rtx_browse_rel_base(name);
-    const char *filter = rtx_browse_filter(br);
-    if (!base || base[0] != '.') return 0;
-    if (filter[0] == '.') return 0;
-    return 1;
-}
-
-static int rtx_browse_show_name(const RtxBrowse *br, const char *name, int is_dir) {
-    const char *filter;
-    if (!name || name[0] == 0) return 0;
-    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
-    if (rtx_browse_hidden(br, name)) return 0;
-    filter = rtx_browse_filter(br);
-    if (!filter[0]) return 1;
-    /* `*.md` keeps every directory so you can still walk. Flattened `>`
-     * lists files only; the walk itself decides which folders to enter. */
-    if (is_dir && !rtx_browse_deep(br) && rtx_browse_glob_meta(filter)) return 1;
-    if (rtx_browse_glob_match(filter, name)) return 1;
-    /* `>*.md` is a normal glob on the basename, not only the relative path. */
-    if (rtx_browse_deep(br))
-        return rtx_browse_glob_match(filter, rtx_browse_rel_base(name));
-    return 0;
-}
-
-static void rtx_browse_keep_cur(RtxBrowse *br, const char *keep) {
-    size_t i;
-    if (!br || !keep || !keep[0] || br->len == 0) {
-        if (br) br->cur = 0;
-        return;
-    }
-    for (i = 0; i < br->len; i++) {
-        if (strcmp(br->ents[i].name, keep) == 0) {
-            br->cur = i;
-            return;
-        }
-    }
-    if (br->cur >= br->len) br->cur = br->len - 1;
-}
-
-void !>(CCError) rtx_browse_refresh(RtxBrowse *br);
+void !>(CCError) rtx_browse_kick(RtxBrowse *br);
+size_t !>(CCError) rtx_browse_pump(RtxBrowse *br);
+void !>(CCError) rtx_browse_finish(RtxBrowse *br);
 
 static void rtx_browse_scroll(RtxBrowse *br, int vis) {
     size_t list;
@@ -398,191 +329,4 @@ static int rtx_browse_hit(const RtxBrowse *br, int row, int vis) {
     return (int)idx;
 }
 
-#ifndef RTX_BROWSE_LIST
-static RtxBrowse *RtxWs_browse_at(RtxWs *w, int pane) {
-    if (!w || pane < 0 || pane >= 2) return NULL;
-    return &w->nav[pane];
-}
-
-static RtxBrowse *RtxWs_browse(RtxWs *w) {
-    if (!w) return NULL;
-    return &w->nav[w->focus];
-}
-
-static int RtxWs_browsing(const RtxWs *w) {
-    return w && w->nav[w->focus].on;
-}
-
-static void rtx_ws_same_split_seed(RtxWs *w) {
-    RtxBuf *b;
-    if (!w || w->npanes != 2 || w->pane[0] != w->pane[1] || w->side.live) return;
-    b = &w->bufs[w->pane[0]];
-    memset(&w->side, 0, sizeof(w->side));
-    w->side.live = 1;
-    w->side.top = b->top;
-    w->side.top_wrap = b->top_wrap;
-    w->side.top_byte = b->top_byte;
-    w->side.unlock = b->unlock;
-    w->side.layout.view = b->layout.view;
-    w->side.layout.wrap = b->layout.wrap;
-}
-
-static int rtx_ws_find_path(const RtxWs *w, const char *path) {
-    size_t i;
-    if (!w || !path || !path[0]) return -1;
-    for (i = 0; i < w->len; i++) {
-        char[:] p = w->bufs[i].doc.path;
-        if (p.ptr && strcmp(p.ptr, path) == 0) return (int)i;
-    }
-    return -1;
-}
-
-/* Point the focused pane at `path`. Same-file split keeps the other camera
- * on the old buf. A second pane on a different file is two ordinary bufs. */
-static void !>(CCError) RtxWs_open_in_pane(RtxWs *w, const char *path) {
-    int pane, bufi, found;
-    if (!w || !path || !path[0]) return cc_err(CC_ERR_INVALID_ARG, "open path");
-    pane = w->focus;
-    found = rtx_ws_find_path(w, path);
-    if (found >= 0) bufi = found;
-    else if (RtxWs_untitled(w)) {
-        w->bufs[0].destroy();
-        memset(&w->bufs[0], 0, sizeof(w->bufs[0]));
-        w->len = 0;
-        w->add_path(path) !>(e) { return cc_err(e); };
-        bufi = 0;
-    } else {
-        w->add_path(path) !>(e) { return cc_err(e); };
-        bufi = (int)w->len - 1;
-    }
-    if (RtxWs_same_split(w) && w->pane[pane] != bufi) {
-        if (w->focus == pane)
-            rtx_buf_swap_cam(&w->bufs[w->pane[0]], &w->side);
-        rtx_ws_side_drop(w);
-    }
-    w->pane[pane] = bufi;
-    rtx_ws_same_split_seed(w);
-    rtx_browse_drop(&w->nav[pane]);
-    return cc_ok();
-}
-
-static void !>(CCError) RtxWs_browse_refresh(RtxWs *w, int pane) {
-    RtxBrowse *br = RtxWs_browse_at(w, pane);
-    if (!br) return cc_err(CC_ERR_INVALID_ARG, "browse pane");
-    return rtx_browse_refresh(br);
-}
-
-static void !>(CCError) RtxWs_browse_start(RtxWs *w) {
-    RtxBrowse *br;
-    RtxBuf *b;
-    char want[RTX_BROWSE_NAME];
-    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
-    br = &w->nav[w->focus];
-    b = RtxWs_active(w);
-    want[0] = 0;
-    rtx_browse_drop(br);
-    br->on = 1;
-    br->boot = RtxWs_untitled(w);
-    if (b && b->doc.path.ptr && b->doc.path.len) {
-        char rel[RTX_BROWSE_DIR];
-        rtx_browse_dirname(rel, sizeof(rel), b->doc.path.ptr);
-        rtx_browse_basename(want, sizeof(want), b->doc.path.ptr);
-        if (!rtx_browse_abs(br->dir, sizeof(br->dir), rel))
-            snprintf(br->dir, sizeof(br->dir), "%s", rel);
-    }
-    if (!br->dir[0] || strcmp(br->dir, ".") == 0) {
-        if (!rtx_browse_abs(br->dir, sizeof(br->dir), "."))
-            snprintf(br->dir, sizeof(br->dir), ".");
-    }
-    rtx_browse_refresh(br) !>(e) { return cc_err(e); };
-    if (want[0]) rtx_browse_keep_cur(br, want);
-    return cc_ok();
-}
-
-/* 1 = no file was picked from a boot browser; the host should exit. */
-static int RtxWs_browse_close(RtxWs *w) {
-    int quit = 0;
-    if (!w) return 0;
-    quit = w->nav[w->focus].boot && RtxWs_untitled(w);
-    rtx_browse_drop(&w->nav[w->focus]);
-    return quit;
-}
-
-static void !>(CCError) RtxWs_browse_enter(RtxWs *w) {
-    RtxBrowse *br;
-    RtxBrowseEnt *ent;
-    char full[RTX_BROWSE_DIR];
-    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
-    br = &w->nav[w->focus];
-    if (!br->on || br->len == 0 || br->cur >= br->len) return cc_ok();
-    ent = &br->ents[br->cur];
-    if (!rtx_browse_join(full, sizeof(full), br->dir, ent->name))
-        return cc_err(CC_ERR_INVALID_ARG, "browse path");
-    if (ent->is_dir) {
-        if (!rtx_browse_abs(br->dir, sizeof(br->dir), full))
-            snprintf(br->dir, sizeof(br->dir), "%s", full);
-        return rtx_browse_refresh(br);
-    }
-    return RtxWs_open_in_pane(w, full);
-}
-
-static void !>(CCError) RtxWs_browse_parent(RtxWs *w) {
-    RtxBrowse *br;
-    char next[RTX_BROWSE_DIR];
-    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
-    br = &w->nav[w->focus];
-    if (!br->on) return cc_ok();
-    if (!rtx_browse_join(next, sizeof(next), br->dir, "..")) return cc_ok();
-    snprintf(br->dir, sizeof(br->dir), "%s", next);
-    return rtx_browse_refresh(br);
-}
-
-static void !>(CCError) RtxWs_browse_glob_set(RtxWs *w, const char *glob) {
-    RtxBrowse *br;
-    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
-    br = &w->nav[w->focus];
-    if (!br->on) return cc_ok();
-    if (!glob) glob = "";
-    snprintf(br->glob, sizeof(br->glob), "%s", glob);
-    br->glob_len = strlen(br->glob);
-    br->glob_caret = br->glob_len;
-    br->glob_sel = br->glob_len;
-    return rtx_browse_refresh(br);
-}
-
-static RtxField rtx_browse_field(RtxBrowse *br) {
-    RtxField f = {0};
-    if (!br) return f;
-    f.buf = br->glob;
-    f.len = &br->glob_len;
-    f.cap = sizeof(br->glob);
-    f.caret = &br->glob_caret;
-    f.sel = &br->glob_sel;
-    return f;
-}
-
-static void !>(CCError) RtxWs_browse_type(RtxWs *w, int ch) {
-    RtxBrowse *br;
-    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
-    br = &w->nav[w->focus];
-    if (!br->on) return cc_ok();
-    if (rtx_field_type_cp(rtx_browse_field(br), (uint32_t)ch))
-        return rtx_browse_refresh(br);
-    return cc_ok();
-}
-
-static void !>(CCError) RtxWs_browse_backspace(RtxWs *w) {
-    RtxBrowse *br;
-    RtxField f;
-    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
-    br = &w->nav[w->focus];
-    if (!br->on) return cc_ok();
-    f = rtx_browse_field(br);
-    if (br->glob_len == 0 && !rtx_field_has_sel(f))
-        return RtxWs_browse_parent(w);
-    rtx_field_backspace(f);
-    return rtx_browse_refresh(br);
-}
-
-#endif /* RTX_BROWSE_LIST */
 #endif /* RTX_BROWSE_H */

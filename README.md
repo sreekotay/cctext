@@ -32,6 +32,7 @@ From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt
 - **Hex.** `Ctrl-L` cycles default → wrap → hex (offset | hex | UTF-8 dump).
 - **Multiview.** Several files, splits, two cameras on one document. Unlock (`Ctrl-U`) lets a pane scroll off the caret.
 - **File browser.** No filename opens it. `o` / `Ctrl-O` opens the built-in browser (glob, walk directories) into the focused view. The GUI uses the system dialog; `Ctrl-Shift-O` keeps the in-app browser there too. A missing path asks to create an empty file.
+- **Deep search.** `>` in the file browser walks the tree (pumped, parallel). A fragment is case-insensitive; `*.txt` is a real glob.
 - **TextMate grammars.** Drop any `.tmLanguage.json` into `grammars/` (or `RTX_GRAMMARS`) — loaded live, no rebuild. Window lex, not a full-file pass.
 - **Rectangular selection.** Alt-arrows / Alt-drag is a column box.
 - **TUI mouse.** SGR click, drag, and wheel; a byte-rail scrollbar jumps by file offset (not a soft line count). Hit-test is the same layout as the GUI.

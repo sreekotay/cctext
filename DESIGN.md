@@ -27,7 +27,29 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Find | `d.find.store` | new query resets; edit invalidates (offsets only) |
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs, clipboard) |
+| Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
+
+## Scan
+
+Find and browse (and the next long walk) share one pump. Do not extract a
+shared type — `find.done` vs `browse.scanning` stay local bits (GUI AST).
+The model is the names:
+
+| | start | one wave | live | resume | deny |
+|---|---|---|---|---|---|
+| find | `find_set` | `find_step` | `!done && !cancel` | `scan_off` | `RTX_FIND_SEQ` |
+| browse | `rtx_browse_kick` | `rtx_browse_pump` | `scanning` | job queue | `RTX_BROWSE_SEQ` |
+
+Kick plants the first paint and returns. One closed interval per step.
+Returning is the yield. The host decides whether to enter — `find_apply`
+enters once; `find_pump` may enter again up to `RTX_FIND_PUMP` while
+`RTX_FIND_PUMP_MS` remains, then lands. The step returns how many staged
+hops ran; 0 is not progress. `cancel` is a written bit — not a stdin poll.
+Hosts pump while live and show `scanning...` / `capped`. Tests call
+`finish` (drain). Do not drain the first screen before first paint.
+
+The next scan (index, grep, …) copies this table, not a new protocol.
 
 `RtxDoc d = {0} @destroy` (and the same for tree, layout, buf, workspace). A buf slot destroys layout, then doc.
 
@@ -84,9 +106,12 @@ Save is a **safe rename**, not inode preservation: sibling `path.tmp.XXXXXX`, st
 
 Offsets, caret, selection, and the piece tree are bytes. Text views walk
 **clusters** for motion, wrap, hit-test, backspace, and measure (a UTF-8 scalar
-plus following combining marks / variation selectors). Hex views stay a byte
-camera: left/right, backspace, delete, box, and home/end step one byte; the
-text dump is one cell per byte (UTF-8 lead, continuation ·, else .). Leaving
-hex with a collapsed caret snaps it to a cluster start. `read_at` stays bytes.
+plus following combining marks / variation selectors). Hex is a paint of that same editor, not a second one: caret, selection,
+and unlock stay on the camera / document. A split is two editors (same
+file or another path); focus is which pane. Hex motion already steps one
+byte (and resets to the high nibble). On a hex pane, `type` accepts only
+`0-9a-fA-F` and overwrites that nibble. The dump is display (UTF-8 lead,
+continuation ·, else .), not a caret of its own. Leaving hex with a
+collapsed caret snaps it to a cluster start. `read_at` stays bytes.
 Invalid bytes are one-byte clusters (U+FFFD, width 1). Full UAX #29 graphemes
 (ZWJ emoji, flags) are later.

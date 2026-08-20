@@ -6,9 +6,16 @@ cctext (include lowering, sugar, arenas, etc.).
 Recipes live in Concurrent-C `docs/cheatsheet.md` (Arenas: `@scratch` is
 call-local; pass a named arena last to keep a product).
 
-`frontend/gui.ccs` sits on the 8192 AST-node cap (one TU with the core).
-Find/glob field keys there stay compact; the TUI has the full set.
-Browse listing (`rtx_browse_refresh` / `>` walk) is a linked TU (`core/browse.ccs`), same cut as hex.
+`@typehooks` accepts only create / destroy / ufcs / ufcs_sink / niche.
+Method names (`RtxBuf_type_cp`, `RtxWs_browse_start`) install by declaration.
+Listing them in the hooks object still fails on the GUI TU (`unsupported
+cc_type_register hook field`).
 
-`make.shcc` cannot `@string(..., @scratch)` — shcc does not declare
-`__cc_str_scratch`. Pass a named `cc_arena_stack` (or heap) instead.
+`frontend/gui.ccs` sits on the 8192 AST-node cap (one TU with the core).
+Browse listing (`rtx_browse_kick` / pump / `>` walk) is a linked TU
+(`core/browse.ccs`), same cut as hex. Browse `scanning` is the find `done`
+bit inverted — same kick / step / yield (DESIGN.md Scan). Do not add a
+shared `RtxScan` type. `#define` before `#include "….cch"` does not survive
+into the generated C include — listing-only helpers belong in `browse.ccs`.
+Workspace helpers (`RtxWs_browse_*`) live in `workspace.cch` so the listing
+TU does not lower the hook table.
