@@ -25,7 +25,8 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Document | piece-tree arena + page-store arena (fds + LRU page pool) | `RtxDoc.destroy()` |
 | Session | `d.session` | close (path, undo) |
 | Analysis | `d.analysis` | `analysis.reset()` on reparse |
-| Find | `d.find.store` | new query resets; edit invalidates (offsets only) |
+| Find | `d.find.store` (query + offs) | new query resets; `RtxDoc.destroy()`; edit invalidates offsets |
+| Find wave | call-local heap in `find_step` | end of the step (~4 MiB; not the find store) |
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs, clipboard) |
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
@@ -88,10 +89,13 @@ The next walk copies this table.
 | browse | `rtx_browse_kick` | `rtx_browse_pump` | `scanning` | job queue | `RTX_BROWSE_SEQ` |
 
 Kick plants the first paint and returns. One closed interval per step;
-returning is the yield. A longer prefix query filters hits and keeps
-`scan_off`; a cap resumes from the last accepted hit; a shorter or
-non-prefix query resets. `find_apply` enters once; `find_pump` may enter
-again up to `RTX_FIND_PUMP` while `RTX_FIND_PUMP_MS` remains, then lands.
+returning is the yield. The find wave is a heap arena the step frees
+before it returns — `@destroy` through `@parallel` does not. Query copy
+and hit offsets stay on `d.find.store` and die with the document. A
+longer prefix query filters hits and keeps `scan_off`; a cap resumes
+from the last accepted hit; a shorter or non-prefix query resets.
+`find_apply` enters once; `find_pump` may enter again up to
+`RTX_FIND_PUMP` while `RTX_FIND_PUMP_MS` remains, then lands.
 The step returns staged hops; 0 is not progress. `cancel` is a written
 bit, not a stdin poll. Chrome that owns the walk shows `scanning...` /
 `capped`. Tests call `finish` (drain). Do not drain the first screen
