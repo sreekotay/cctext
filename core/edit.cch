@@ -51,6 +51,99 @@ static void RtxDoc_select_all(RtxDoc *d) {
     RtxDoc_break_coalesce(d);
 }
 
+static int !>(CCError) rtx_doc_cluster_at(const RtxDoc *d, size_t off,
+                                         size_t *start, RtxUtf8Cl *cl) {
+    char buf[RTX_UTF8_LOOK * 2];
+    size_t base, got, rel, n, a;
+    RtxUtf8Cl z = {0};
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    n = d->len();
+    if (off >= n) {
+        if (start) *start = n;
+        if (cl) *cl = z;
+        return cc_ok(0);
+    }
+    a = d->cluster_align(off) !>;
+    got = rtx_doc_utf8_win(d, a, buf, sizeof(buf), &base) !>;
+    rel = a - base;
+    if (rel > got) rel = got;
+    z = rtx_utf8_cluster(buf.to_slice_n(got), rel);
+    if (start) *start = a;
+    if (cl) *cl = z;
+    return cc_ok(z.n ? 1 : 0);
+}
+
+/* Double-click: run of the same class (word / space / punct). No newline. */
+static void !>(RtxIndexErr) RtxDoc_select_word(RtxDoc *d, size_t off) {
+    size_t a, lo, hi, n;
+    RtxUtf8Cl cl;
+    int have, cls;
+    @errhandler(CCError e) {
+        return cc_err(rtx_index_from_cc(e));
+    }
+    if (!d) return cc_ok();
+    n = d->len();
+    if (off > n) off = n;
+    have = rtx_doc_cluster_at(d, off, &a, &cl) !>;
+    if (!have) {
+        if (n == 0) {
+            d->sel_anchor = 0;
+            d->caret = 0;
+            d->sel_box = 0;
+            d->break_coalesce();
+            return cc_ok();
+        }
+        off = d->cluster_prev(n) !>;
+        have = rtx_doc_cluster_at(d, off, &a, &cl) !>;
+        if (!have) return cc_ok();
+    }
+    if (cl.cp == '\n' || cl.cp == '\r') {
+        d->sel_anchor = a;
+        d->caret = a + cl.n;
+        d->sel_box = 0;
+        d->break_coalesce();
+        return cc_ok();
+    }
+    cls = rtx_utf8_click_class(cl.cp);
+    lo = a;
+    hi = a + (cl.n ? cl.n : 1);
+    while (lo > 0) {
+        size_t p = d->cluster_prev(lo) !>;
+        RtxUtf8Cl pcl;
+        size_t ps;
+        if (!rtx_doc_cluster_at(d, p, &ps, &pcl) !>) break;
+        if (pcl.cp == '\n' || pcl.cp == '\r') break;
+        if (rtx_utf8_click_class(pcl.cp) != cls) break;
+        lo = ps;
+    }
+    while (hi < n) {
+        RtxUtf8Cl ncl;
+        size_t ns;
+        if (!rtx_doc_cluster_at(d, hi, &ns, &ncl) !>) break;
+        if (ncl.cp == '\n' || ncl.cp == '\r') break;
+        if (rtx_utf8_click_class(ncl.cp) != cls) break;
+        hi = ns + (ncl.n ? ncl.n : 1);
+    }
+    d->sel_anchor = lo;
+    d->caret = hi;
+    d->sel_box = 0;
+    d->break_coalesce();
+    return cc_ok();
+}
+
+/* Triple-click: the physical line, including the trailing newline. */
+static void !>(RtxIndexErr) RtxDoc_select_line(RtxDoc *d, size_t off) {
+    size_t start, next;
+    if (!d) return cc_ok();
+    start = rtx_doc_line_floor(d, off) !>(e) { return cc_err(e); };
+    rtx_doc_next_line_start(d, start, &next) !>(e) { return cc_err(e); };
+    d->sel_anchor = start;
+    d->caret = next;
+    d->sel_box = 0;
+    d->break_coalesce();
+    return cc_ok();
+}
+
 #define RTX_COL_EOL ((size_t)-1)
 
 static size_t !>(RtxIndexErr) rtx_doc_line_end_caret(const RtxDoc *d, size_t off) {
@@ -840,7 +933,7 @@ static void !>(CCError) rtx_doc_hl_bytes(RtxDoc *d, char[:] bytes, size_t start,
     return cc_ok();
 }
 
-static void !>(CCError) rtx_doc_highlight_span(RtxDoc *d, size_t lo, size_t hi) {
+static void !>(CCError) rtx_doc_highlight_span_raw(RtxDoc *d, size_t lo, size_t hi) {
     size_t saved_runs;
     size_t saved_ckpt;
     size_t start;
@@ -894,6 +987,28 @@ static void !>(CCError) rtx_doc_highlight_span(RtxDoc *d, size_t lo, size_t hi) 
                 return cc_err(e);
             };
             frame.destroy();
+        }
+    }
+    return cc_ok();
+}
+
+/* Only CODE subsections. A window that still thinks CODE runs to EOF must
+ * not keep number/keyword runs after === prose === is classified. */
+static void !>(CCError) rtx_doc_highlight_span(RtxDoc *d, size_t lo, size_t hi) {
+    size_t s, n, a, b;
+    if (!d || hi <= lo) return cc_ok();
+    n = d->len();
+    if (hi > n) hi = n;
+    if (d->sec_len == 0) return rtx_doc_highlight_span_raw(d, lo, hi);
+    for (s = 0; s < d->sec_len; s++) {
+        if (d->secs[s].kind != RTX_SEC_CODE) continue;
+        a = d->secs[s].start;
+        b = (s + 1 < d->sec_len) ? d->secs[s + 1].start : n;
+        if (b <= lo || a >= hi) continue;
+        if (a < lo) a = lo;
+        if (b > hi) b = hi;
+        if (a < b) {
+            rtx_doc_highlight_span_raw(d, a, b) !>(e) { return cc_err(e); };
         }
     }
     return cc_ok();
@@ -955,6 +1070,15 @@ static void !>(CCError) RtxDoc_ensure_hl(RtxDoc *d, RtxHlWin w) {
     }
     if (n > RTX_MARKUP_SCAN_MAX) {
         rtx_doc_window_markup(d, from, to) !>(e) { return cc_err(e); };
+    }
+    for (s = 0; s < d->sec_len; s++) {
+        if (d->secs[s].kind != RTX_SEC_PROSE) continue;
+        lo = d->secs[s].start;
+        hi = (s + 1 < d->sec_len) ? d->secs[s + 1].start : n;
+        if (hi <= from || lo >= to) continue;
+        rtx_doc_clip_runs(d, lo, hi, rtx_run_is_hl_only) !>(e) {
+            return cc_err(e);
+        };
     }
     for (s = 0; s < d->sec_len; s++) {
         if (d->secs[s].kind != RTX_SEC_CODE || d->secs[s].hl_done) continue;
