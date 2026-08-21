@@ -7,6 +7,7 @@
 #define RTX_LAYOUT_H
 
 #include "hex.cch"
+#include "grid.cch"
 
 /* RtxDoc + RtxDocLayout come from document.cch. */
 
@@ -28,6 +29,7 @@ typedef struct {
     size_t byte_start;
     size_t byte_len;
     size_t line;
+    size_t wrap_i; /* grid: wrap line of this vis row; 0 otherwise */
     double width;
     double height;
     RtxSectionKind sec;
@@ -36,7 +38,8 @@ typedef struct {
 enum {
     RTX_VIEW_DEFAULT = 0,
     RTX_VIEW_WRAP = 1,
-    RTX_VIEW_HEX = 2
+    RTX_VIEW_HEX = 2,
+    RTX_VIEW_GRID = 3
 };
 
 typedef struct {
@@ -49,11 +52,15 @@ typedef struct {
     size_t nlines;
     int view;              /* RTX_VIEW_* */
     int wrap;              /* 1 iff view == RTX_VIEW_WRAP (existing call sites) */
+    char grid_delim;       /* sticky; 0 = probe the next fill */
+    RtxGridGeom grid;      /* fill epoch; valid when view == GRID */
+    size_t grid_hdr_end;   /* first-record bytes (no NL); 0 if none */
+    int grid_hdr_on;       /* 1: paint a sticky header row */
 } RtxLayout;
 
 static void rtx_layout_set_view(RtxLayout *L, int view) {
     if (!L) return;
-    if (view < RTX_VIEW_DEFAULT || view > RTX_VIEW_HEX) view = RTX_VIEW_DEFAULT;
+    if (view < RTX_VIEW_DEFAULT || view > RTX_VIEW_GRID) view = RTX_VIEW_DEFAULT;
     L->view = view;
     L->wrap = (view == RTX_VIEW_WRAP);
 }
@@ -62,6 +69,7 @@ static void rtx_layout_cycle_view(RtxLayout *L) {
     if (!L) return;
     if (L->view == RTX_VIEW_DEFAULT) rtx_layout_set_view(L, RTX_VIEW_WRAP);
     else if (L->view == RTX_VIEW_WRAP) rtx_layout_set_view(L, RTX_VIEW_HEX);
+    else if (L->view == RTX_VIEW_HEX) rtx_layout_set_view(L, RTX_VIEW_GRID);
     else rtx_layout_set_view(L, RTX_VIEW_DEFAULT);
 }
 
@@ -69,10 +77,20 @@ static int rtx_layout_is_hex(const RtxLayout *L) {
     return L && L->view == RTX_VIEW_HEX;
 }
 
+static int rtx_layout_is_grid(const RtxLayout *L) {
+    return L && L->view == RTX_VIEW_GRID;
+}
+
+/* Wrap view or grid: more than one vis row per physical line. */
+static int rtx_layout_soft_wrap(const RtxLayout *L) {
+    return L && (L->wrap || L->view == RTX_VIEW_GRID);
+}
+
 static const char *rtx_layout_view_name(const RtxLayout *L) {
     if (!L) return "default";
     if (L->view == RTX_VIEW_WRAP) return "wrap";
     if (L->view == RTX_VIEW_HEX) return "hex";
+    if (L->view == RTX_VIEW_GRID) return "grid";
     return "default";
 }
 
@@ -90,6 +108,9 @@ static void RtxLayout_reset(RtxLayout *L) {
     L->len = 0;
     L->cap = 0;
     L->total_height = 0;
+    memset(&L->grid, 0, sizeof(L->grid));
+    L->grid_hdr_end = 0;
+    L->grid_hdr_on = 0;
 }
 
 static void RtxLayout_destroy(RtxLayout *L) {
@@ -153,6 +174,7 @@ static int rtx_layout_push_row(RtxLayout *L, const RtxMeasure *m,
     row.byte_start = byte_start;
     row.byte_len = byte_len;
     row.line = phys;
+    row.wrap_i = 0;
     row.width = w;
     row.height = h > 0 ? h : m->line_height(m->ctx, z, sec);
     row.sec = sec;
@@ -161,6 +183,211 @@ static int rtx_layout_push_row(RtxLayout *L, const RtxMeasure *m,
         return 0;
     }
     return 1;
+}
+
+static int rtx_layout_push_grid_row(RtxLayout *L, const RtxMeasure *m,
+                                    size_t byte_start, size_t byte_len,
+                                    size_t phys, size_t wrap_i, double h,
+                                    RtxSectionKind sec) {
+    RtxVisRow row;
+    RtxStyle z = {0};
+    row.byte_start = byte_start;
+    row.byte_len = byte_len;
+    row.line = phys;
+    row.wrap_i = wrap_i;
+    row.width = (double)rtx_grid_geom_width(&L->grid);
+    row.height = h > 0 ? h : m->line_height(m->ctx, z, sec);
+    row.sec = sec;
+    if (!rtx_layout_push(L, row)) {
+        L->reset();
+        return 0;
+    }
+    return 1;
+}
+
+static int rtx_layout_grid_held(RtxDocLayout d, size_t off) {
+    return d && rtx_scope_kind(d->style_at(off).scope) == RTX_HL_STRING;
+}
+
+/* Mid-field camera → record start: previous unheld NL. Cap so a gap or
+ * a string longer than the lookback is leftover. No line_start, no prefix.
+ * `nls_back` is how many physical lines the walk crossed (gutter, not line_of). */
+static size_t !>(CCError) rtx_layout_grid_cam_lo(RtxDocLayout d, size_t off,
+                                                size_t *nls_back) {
+    size_t lo = off;
+    size_t steps = 0;
+    size_t win;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (nls_back) *nls_back = 0;
+    if (!d) return cc_ok(off);
+    win = off > (size_t)RTX_MARKUP_LOOKBACK ? off - (size_t)RTX_MARKUP_LOOKBACK : 0;
+    d->ensure_hl(rtx_hl_win(win, (off - win) + 1)) !>;
+    while (lo > 0 && steps < (size_t)RTX_FRAME_SCRATCH) {
+        char c = 0;
+        size_t got = d->read_at(lo - 1, &c, 1) !>;
+        if (!got) break;
+        if (c == '\n' && !rtx_layout_grid_held(d, lo - 1)) break;
+        if (c == '\n' && nls_back) (*nls_back)++;
+        lo--;
+        steps++;
+        if (lo < win) {
+            win = lo > (size_t)RTX_MARKUP_LOOKBACK ? lo - (size_t)RTX_MARKUP_LOOKBACK
+                                                   : 0;
+            d->ensure_hl(rtx_hl_win(win, (off - win) + 1)) !>;
+        }
+    }
+    return cc_ok(lo);
+}
+
+static size_t rtx_layout_grid_rec_n(RtxDocLayout d, size_t from, const char *s,
+                                   size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (s[i] == '\n' && !rtx_layout_grid_held(d, from + i)) return i;
+    }
+    return n;
+}
+
+/* Next/prev record line. Embedded string NLs are not a step. */
+static size_t !>(CCError) rtx_layout_grid_next_line(RtxDocLayout d, size_t from_line) {
+    size_t from, rec_n, nls, i, take, dlen, next_off;
+    char buf[RTX_FRAME_SCRATCH];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    if (!d) return cc_ok(from_line);
+    from = d->line_start(from_line) !>;
+    dlen = d->len();
+    take = dlen > from ? dlen - from : 0;
+    if (take > sizeof(buf)) take = sizeof(buf);
+    if (take) {
+        size_t win = from > 256 ? from - 256 : 0;
+        d->ensure_hl(rtx_hl_win(win, take + (from - win))) !>;
+        take = d->read_at(from, buf, take) !>;
+    }
+    rec_n = rtx_layout_grid_rec_n(d, from, buf, take);
+    nls = 0;
+    for (i = 0; i < rec_n; i++)
+        if (buf[i] == '\n') nls++;
+    next_off = from + rec_n;
+    if (next_off < dlen) {
+        char c = 0;
+        size_t got = d->read_at(next_off, &c, 1) !>;
+        if (got && c == '\n') next_off++;
+    }
+    if (next_off >= dlen) return cc_ok(from_line);
+    return cc_ok(from_line + 1 + nls);
+}
+
+static size_t !>(CCError) rtx_layout_grid_prev_line(RtxDocLayout d, size_t from_line) {
+    size_t from, nls_back = 0;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    if (!d || from_line == 0) return cc_ok(0);
+    from = d->line_start(from_line) !>;
+    if (from == 0) return cc_ok(0);
+    from = rtx_layout_grid_cam_lo(d, from - 1, &nls_back) !>;
+    (void)from;
+    if (from_line < 1 + nls_back) return cc_ok(0);
+    return cc_ok(from_line - 1 - nls_back);
+}
+
+static void !>(CCError) rtx_layout_grid_walk(RtxLayout *L, RtxDocLayout d,
+                                            const RtxMeasure *m, size_t from,
+                                            size_t n, double max_width,
+                                            char[:] bytes) {
+    size_t i = 0;
+    size_t phys = L->from_line;
+    char delim;
+    int pane;
+    char hdr[RTX_FRAME_SCRATCH];
+    size_t hgot = 0, hlen, hi;
+    RtxStyle z = {0};
+    if (!L || !d || !m) return cc_err(CC_ERR_INVALID_ARG, "grid walk");
+    delim = L->grid_delim;
+    if (!delim) delim = rtx_grid_probe(bytes.ptr, n);
+    if (!delim) delim = ',';
+    L->grid_delim = delim;
+    rtx_grid_geom_init(&L->grid, delim);
+    pane = (int)max_width;
+    if (pane < RTX_GRID_MIN_COL) pane = RTX_GRID_MIN_COL;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            hgot = 0;
+        }
+        hgot = d->read_at(0, hdr, sizeof(hdr)) !>;
+    }
+    d->ensure_hl(rtx_hl_span(0, hgot ? hgot : 1)) !>;
+    {
+        unsigned char *hold =
+            (unsigned char *)cc_arena_alloc(&L->store, n ? n : 1, 1);
+        L->grid.hold_from = from;
+        L->grid.hold_n = n;
+        if (hold)
+            for (hi = 0; hi < n; hi++)
+                hold[hi] = rtx_layout_grid_held(d, from + hi) ? 1 : 0;
+        L->grid.hold = hold;
+    }
+    hlen = rtx_layout_grid_rec_n(d, 0, hdr, hgot);
+    if (hlen && hdr[hlen - 1] == '\r') hlen--;
+    L->grid_hdr_end = hlen;
+    L->grid_hdr_on = d->len() > 0;
+    if (L->grid_hdr_on) {
+        rtx_grid_bind_span(&L->grid, 0, hlen);
+        rtx_grid_geom_add(&L->grid, hdr, hlen);
+    }
+    while (i < n) {
+        size_t rec_n = rtx_layout_grid_rec_n(d, from + i, bytes.ptr + i, n - i);
+        rtx_grid_bind_span(&L->grid, from + i, rec_n);
+        if (!d->fold_covers(from + i) && from + i != 0)
+            rtx_grid_geom_add(&L->grid, bytes.ptr + i, rec_n);
+        i += rec_n;
+        if (i < n && bytes.ptr[i] == '\n') i++;
+    }
+    rtx_grid_geom_fit(&L->grid, pane);
+    i = 0;
+    phys = L->from_line;
+    while (i < n) {
+        size_t rec_n = rtx_layout_grid_rec_n(d, from + i, bytes.ptr + i, n - i);
+        size_t nls = 0, k;
+        RtxSectionKind sec = d->section_at(from + i);
+        double h;
+        int rec_h, wr;
+        for (k = 0; k < rec_n; k++)
+            if (bytes.ptr[i + k] == '\n') nls++;
+        rtx_grid_bind_span(&L->grid, from + i, rec_n);
+        if (d->fold_covers(from + i) || from + i == 0) {
+            i += rec_n + ((i + rec_n < n && bytes.ptr[i + rec_n] == '\n') ? 1 : 0);
+            phys += 1 + nls;
+            continue;
+        }
+        h = m->line_height(m->ctx, z, sec);
+        rec_h = rtx_grid_record_height(bytes.ptr + i, rec_n, &L->grid);
+        for (wr = 0; wr < rec_h; wr++) {
+            if (!rtx_layout_push_grid_row(L, m, from + i, rec_n, phys,
+                                          (size_t)wr, h, sec)) {
+                return cc_err(CC_ERR_OUT_OF_MEMORY, "grid row");
+            }
+        }
+        i += rec_n;
+        if (i < n && bytes.ptr[i] == '\n') {
+            i++;
+            phys += 1 + nls;
+        } else {
+            phys += nls;
+        }
+    }
+    return cc_ok();
 }
 
 /* Walk already-copied bytes. Heap fallback lives in RtxLayout_range. */
@@ -280,6 +507,8 @@ static void !>(CCError) RtxLayout_range(RtxLayout *L, RtxDocLayout d, const RtxM
         bytes = d->scratch_span(&scratch, from, n) !>(e) {
             return cc_err(e);
         };
+        if (L->view == RTX_VIEW_GRID)
+            return rtx_layout_grid_walk(L, d, m, from, n, max_width, bytes);
         return rtx_layout_range_walk(L, d, m, from, n, max_width, wrap, bytes);
     }
     {
@@ -289,10 +518,17 @@ static void !>(CCError) RtxLayout_range(RtxLayout *L, RtxDocLayout d, const RtxM
             frame.destroy();
             return cc_err(e);
         };
-        rtx_layout_range_walk(L, d, m, from, n, max_width, wrap, bytes) !>(e) {
-            frame.destroy();
-            return cc_err(e);
-        };
+        if (L->view == RTX_VIEW_GRID) {
+            rtx_layout_grid_walk(L, d, m, from, n, max_width, bytes) !>(e) {
+                frame.destroy();
+                return cc_err(e);
+            };
+        } else {
+            rtx_layout_range_walk(L, d, m, from, n, max_width, wrap, bytes) !>(e) {
+                frame.destroy();
+                return cc_err(e);
+            };
+        }
         frame.destroy();
         return cc_ok();
     }
@@ -321,10 +557,19 @@ static void !>(CCError) RtxLayout_lines(RtxLayout *L, RtxDocLayout d, const RtxM
     total = d->line_count();
     if (from_line >= total) from_line = total ? total - 1 : 0;
     if (from_line + nlines > total) nlines = total - from_line;
-    from = d->line_start(from_line) !>;
-    /* Soft line_count is known+1MiB. `to = len` laid out the rest of
-     * a 2G file after an edit reported one line. */
-    to = d->line_start(from_line + nlines) !>;
+    {
+        size_t want_line = from_line;
+        from = d->line_start(from_line) !>;
+        if (L->view == RTX_VIEW_GRID) {
+            size_t nls_back = 0;
+            from = rtx_layout_grid_cam_lo(d, from, &nls_back) !>;
+            if (from_line >= nls_back) from_line -= nls_back;
+            else from_line = 0;
+        }
+        /* Soft line_count is known+1MiB. `to = len` laid out the rest of
+         * a 2G file after an edit reported one line. */
+        to = d->line_start(want_line + nlines) !>;
+    }
     if (to < from) to = from;
     if (to - from > (size_t)RTX_HL_WIN_MAX) to = from + (size_t)RTX_HL_WIN_MAX;
     d->ensure_hl(rtx_hl_span(from, to)) !>;
@@ -368,9 +613,10 @@ static void !>(CCError) RtxLayout_fill_off(RtxLayout *L, RtxDocLayout d, const R
     if (min_rows == 0) min_rows = 1;
     len = d->len();
     if (from > len) from = len;
+    @errhandler(CCError e) { return cc_err(e); }
+    if (L->view == RTX_VIEW_GRID) from = rtx_layout_grid_cam_lo(d, from, NULL) !>;
     off = from;
     seen = 0;
-    @errhandler(CCError e) { return cc_err(e); }
     while (off < len && seen < min_rows && (off - from) < (size_t)RTX_FILL_OFF_CAP) {
         size_t take = len - off;
         size_t got, i;
@@ -421,6 +667,35 @@ static size_t !>(CCError) rtx_layout_hit_bytes(const RtxVisRow *r, RtxDocLayout 
         k += step;
     }
     return cc_ok(hit);
+}
+
+static size_t !>(CCError) rtx_layout_grid_hit_row(const RtxLayout *L, const RtxVisRow *r,
+                                                 RtxDocLayout d, double x) {
+    if (!L || !r || !d) return cc_ok(r ? r->byte_start : 0);
+    if (r->byte_len <= (size_t)RTX_FRAME_SCRATCH) {
+        cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+        char[:] bytes = d->scratch_span(&scratch, r->byte_start, r->byte_len) !>(e) {
+            return cc_err(e);
+        };
+        rtx_grid_bind_span((RtxGridGeom *)&L->grid, r->byte_start, bytes.len);
+        return cc_ok(r->byte_start + rtx_grid_hit(bytes.ptr, bytes.len, &L->grid,
+                                                 (int)r->wrap_i, x));
+    }
+    {
+        CCArena frame = cc_arena_heap(r->byte_len + 64);
+        char[:] bytes;
+        size_t hit;
+        if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "layout span");
+        bytes = d->scratch_span(&frame, r->byte_start, r->byte_len) !>(e) {
+            frame.destroy();
+            return cc_err(e);
+        };
+        rtx_grid_bind_span((RtxGridGeom *)&L->grid, r->byte_start, bytes.len);
+        hit = r->byte_start + rtx_grid_hit(bytes.ptr, bytes.len, &L->grid,
+                                          (int)r->wrap_i, x);
+        frame.destroy();
+        return cc_ok(hit);
+    }
 }
 
 static size_t !>(CCError) rtx_layout_hit_row(const RtxVisRow *r, RtxDocLayout d,
@@ -482,6 +757,31 @@ static double !>(CCError) RtxLayout_x_of(const RtxLayout *L, RtxDocLayout d, con
     if (!L || !d || !m || L->len == 0) return cc_ok(0);
     i = L->row_of(off);
     r = &L->rows[i];
+    if (L->view == RTX_VIEW_GRID) {
+        if (r->byte_len <= (size_t)RTX_FRAME_SCRATCH) {
+            cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+            char[:] bytes = d->scratch_span(&scratch, r->byte_start, r->byte_len) !>(e) {
+                return cc_err(e);
+            };
+            rtx_grid_bind_span((RtxGridGeom *)&L->grid, r->byte_start, bytes.len);
+            return cc_ok(rtx_grid_x_of(bytes.ptr, bytes.len, &L->grid,
+                                       off - r->byte_start));
+        }
+        {
+            CCArena frame = cc_arena_heap(r->byte_len + 64);
+            char[:] bytes;
+            double x;
+            if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "layout span");
+            bytes = d->scratch_span(&frame, r->byte_start, r->byte_len) !>(e) {
+                frame.destroy();
+                return cc_err(e);
+            };
+            rtx_grid_bind_span((RtxGridGeom *)&L->grid, r->byte_start, bytes.len);
+            x = rtx_grid_x_of(bytes.ptr, bytes.len, &L->grid, off - r->byte_start);
+            frame.destroy();
+            return cc_ok(x);
+        }
+    }
     if (off <= r->byte_start) return cc_ok(0);
     if (r->byte_len <= (size_t)RTX_FRAME_SCRATCH) {
         cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
@@ -514,6 +814,8 @@ static size_t !>(CCError) RtxLayout_hit(const RtxLayout *L, RtxDocLayout d, cons
     for (i = 0; i < L->len; i++) {
         RtxVisRow *r = &L->rows[i];
         if (y < acc + r->height || i + 1 == L->len) {
+            if (L->view == RTX_VIEW_GRID)
+                return rtx_layout_grid_hit_row(L, r, d, x);
             return rtx_layout_hit_row(r, d, m, x);
         }
         acc += r->height;
@@ -533,10 +835,78 @@ static size_t RtxLayout_rows_for_line(const RtxLayout *L, size_t phys) {
 
 /* Visual row containing `off`. Caret on a newline sits at the end of the
  * preceding row. At a wrap boundary, prefers the later row. */
+static size_t rtx_layout_grid_row_of(const RtxLayout *L, RtxDocLayout d, size_t off) {
+    size_t i, rec;
+    int wr = 0;
+    if (!L || L->len == 0) return 0;
+    rec = (size_t)-1;
+    for (i = 0; i < L->len; i++) {
+        size_t a = L->rows[i].byte_start;
+        size_t b = a + L->rows[i].byte_len;
+        if (off >= a && off <= b) {
+            rec = i;
+            break;
+        }
+    }
+    if (rec == (size_t)-1) {
+        if (off >= L->rows[L->len - 1].byte_start) return L->len - 1;
+        return 0;
+    }
+    while (rec > 0 && L->rows[rec - 1].byte_start == L->rows[rec].byte_start)
+        rec--;
+    if (d) {
+        const RtxVisRow *r = &L->rows[rec];
+        if (r->byte_len <= (size_t)RTX_FRAME_SCRATCH) {
+            cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+            char[:] bytes = cc_slice_empty();
+            int ok = 1;
+            {
+                @errhandler(CCError e) {
+                    (void)e;
+                    ok = 0;
+                }
+                bytes = d->scratch_span(&scratch, r->byte_start, r->byte_len) !>;
+            }
+            if (ok) {
+                rtx_grid_bind_span((RtxGridGeom *)&L->grid, r->byte_start,
+                                   bytes.len);
+                wr = rtx_grid_wrap_at(bytes.ptr, bytes.len, &L->grid,
+                                      off - r->byte_start);
+            }
+        } else {
+            CCArena frame = cc_arena_heap(r->byte_len + 64);
+            if (frame.base) {
+                char[:] bytes = cc_slice_empty();
+                int ok = 1;
+                {
+                    @errhandler(CCError e) {
+                        (void)e;
+                        ok = 0;
+                    }
+                    bytes = d->scratch_span(&frame, r->byte_start, r->byte_len) !>;
+                }
+                if (ok) {
+                    rtx_grid_bind_span((RtxGridGeom *)&L->grid, r->byte_start,
+                                       bytes.len);
+                    wr = rtx_grid_wrap_at(bytes.ptr, bytes.len, &L->grid,
+                                          off - r->byte_start);
+                }
+                frame.destroy();
+            }
+        }
+    }
+    for (i = rec; i < L->len && L->rows[i].byte_start == L->rows[rec].byte_start;
+         i++) {
+        if ((int)L->rows[i].wrap_i == wr) return i;
+    }
+    return rec;
+}
+
 static size_t RtxLayout_row_of(const RtxLayout *L, size_t off) {
     size_t i;
     size_t at_end = (size_t)-1;
     if (!L || L->len == 0) return 0;
+    if (L->view == RTX_VIEW_GRID) return rtx_layout_grid_row_of(L, NULL, off);
     for (i = 0; i < L->len; i++) {
         size_t a = L->rows[i].byte_start;
         size_t b = a + L->rows[i].byte_len;
@@ -590,6 +960,81 @@ static void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMe
     if (capture) {
         pref->col = d->caret - start;
         pref->ok = 1;
+    }
+    if (L->view == RTX_VIEW_GRID) {
+        size_t nlen, rec_n, dlen, lo;
+        int wr, h;
+        char[:] line = cc_slice_empty();
+        cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+        lo = start;
+        d->ensure_hl(rtx_hl_win(lo > 256 ? lo - 256 : 0,
+                                (d->caret > lo ? d->caret - lo : 0) + 257)) !>;
+        while (lo > 0 && rtx_layout_grid_held(d, lo - 1)) {
+            lo = rtx_doc_line_floor(d, lo - 1) !>;
+        }
+        start = lo;
+        dlen = d->len();
+        nlen = dlen > start ? dlen - start : 0;
+        if (nlen > (size_t)RTX_FRAME_SCRATCH) nlen = (size_t)RTX_FRAME_SCRATCH;
+        if (nlen) line = d->scratch_span(&scratch, start, nlen) !>;
+        rec_n = rtx_layout_grid_rec_n(d, start, line.ptr, line.len);
+        if (rec_n < line.len) line = line.sub(0, rec_n);
+        rtx_grid_bind_span(&L->grid, start, rec_n);
+        wr = rtx_grid_wrap_at(line.ptr, line.len, &L->grid, d->caret - start);
+        h = rtx_grid_record_height(line.ptr, line.len, &L->grid);
+        if (capture && !pref->eol)
+            pref->x = rtx_grid_x_of(line.ptr, line.len, &L->grid, d->caret - start);
+        if (dir < 0) {
+            if (wr > 0) wr--;
+            else if (start == 0) {
+                if (!shift) d->sel_anchor = d->caret;
+                d->break_coalesce();
+                return cc_ok();
+            } else {
+                start = rtx_doc_line_floor(d, start - 1) !>;
+                while (start > 0 && rtx_layout_grid_held(d, start - 1))
+                    start = rtx_doc_line_floor(d, start - 1) !>;
+                nlen = dlen > start ? dlen - start : 0;
+                if (nlen > (size_t)RTX_FRAME_SCRATCH)
+                    nlen = (size_t)RTX_FRAME_SCRATCH;
+                if (nlen) line = d->scratch_span(&scratch, start, nlen) !>;
+                else line = cc_slice_empty();
+                rec_n = rtx_layout_grid_rec_n(d, start, line.ptr, line.len);
+                if (rec_n < line.len) line = line.sub(0, rec_n);
+                rtx_grid_bind_span(&L->grid, start, rec_n);
+                wr = rtx_grid_record_height(line.ptr, line.len, &L->grid) - 1;
+            }
+        } else {
+            if (wr + 1 < h) wr++;
+            else {
+                size_t next = start + line.len;
+                if (next < dlen) next++;
+                if (next >= dlen) {
+                    if (!shift) d->sel_anchor = d->caret;
+                    d->break_coalesce();
+                    return cc_ok();
+                }
+                start = next;
+                nlen = dlen > start ? dlen - start : 0;
+                if (nlen > (size_t)RTX_FRAME_SCRATCH)
+                    nlen = (size_t)RTX_FRAME_SCRATCH;
+                if (nlen) line = d->scratch_span(&scratch, start, nlen) !>;
+                else line = cc_slice_empty();
+                rec_n = rtx_layout_grid_rec_n(d, start, line.ptr, line.len);
+                if (rec_n < line.len) line = line.sub(0, rec_n);
+                rtx_grid_bind_span(&L->grid, start, rec_n);
+                wr = 0;
+            }
+        }
+        if (pref->eol)
+            d->caret = start + line.len;
+        else
+            d->caret = start + rtx_grid_hit(line.ptr, line.len, &L->grid, wr,
+                                            pref->x);
+        d->caret = d->fold_snap(d->caret, dir);
+        if (!shift) d->sel_anchor = d->caret;
+        d->break_coalesce();
+        return cc_ok();
     }
     if (!L->wrap) {
         size_t ns = start;

@@ -30,7 +30,10 @@ enum {
     RTX_BROWSE_BATCH = 64,
     RTX_BROWSE_LOCAL = 512,
     RTX_BROWSE_CHILD = 256,
-    RTX_BROWSE_DU_HOLD = 8
+    RTX_BROWSE_DU = 4,      /* opendir + lstat per interval */
+    RTX_BROWSE_DU_MS = 8,   /* yield if a syscall already burned this */
+    RTX_BROWSE_DU_HOLD = 8, /* paused live stacks */
+    RTX_BROWSE_DU_HAVE = 64 /* finished abs totals; survive kick */
 };
 
 typedef struct {
@@ -40,14 +43,26 @@ typedef struct {
 } RtxBrowseJob;
 
 typedef struct {
-    char name[RTX_BROWSE_NAME];
+    char abs[RTX_BROWSE_DIR];
     char skip[RTX_BROWSE_NAME];
+    int depth;
+} RtxBrowseDuFrame;
+
+typedef struct {
+    char name[RTX_BROWSE_NAME];
+    char abs[RTX_BROWSE_DIR];
     uint64_t size;
-    RtxBrowseJob *jobs;
-    size_t jlen, jcap, jhead;
+    RtxBrowseDuFrame stk[RTX_BROWSE_WALK];
+    size_t sp;
     int done;
     int denied;
 } RtxBrowseDuHold;
+
+typedef struct {
+    char abs[RTX_BROWSE_DIR];
+    uint64_t size;
+    int denied;
+} RtxBrowseDuHave;
 
 typedef struct RtxBrowseWalk {
     CCArena arena;
@@ -56,16 +71,24 @@ typedef struct RtxBrowseWalk {
     DIR *dp;
     char keep[RTX_BROWSE_NAME];
     char du_name[RTX_BROWSE_NAME];
-    char du_abs[RTX_BROWSE_DIR];
-    RtxBrowseJob *du_jobs;
-    size_t du_jlen, du_jcap, du_jhead;
+    RtxBrowseDuFrame du_stk[RTX_BROWSE_WALK];
+    size_t du_sp;
     DIR *du_dp;
     char du_last[RTX_BROWSE_NAME];
     char du_skip[RTX_BROWSE_NAME];
     RtxBrowseDuHold hold[RTX_BROWSE_DU_HOLD];
     size_t nhold;
+    RtxBrowseDuHave have[RTX_BROWSE_DU_HAVE];
+    size_t nhave;
+    int du_defer;          /* 1: movement owns this turn; no du I/O */
     int deep_phase;        /* 1: local listing done, appending flatten */
 } RtxBrowseWalk;
+
+static long rtx_browse_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
 
 static RtxBrowseWalk *rtx_br_wk(RtxBrowse *br) {
     return br ? (RtxBrowseWalk *)br->wk : NULL;
@@ -389,27 +412,83 @@ static int rtx_browse_du_hold_i(RtxBrowseWalk *wk, const char *name) {
     return -1;
 }
 
-static int rtx_browse_du_job_push(RtxBrowse *br, const char *abs, int depth) {
-    RtxBrowseWalk *wk;
-    RtxBrowseJob *n;
-    size_t c;
-    if (!br || !br->wk || !abs || !abs[0]) return -1;
-    wk = br->wk;
-    if (wk->du_jlen >= wk->du_jcap) {
-        c = wk->du_jcap ? wk->du_jcap * 2 : 8;
-        n = (RtxBrowseJob *)cc_arena_alloc(&wk->arena, c * sizeof(RtxBrowseJob), 8);
-        if (!n) return -1;
-        if (wk->du_jobs && wk->du_jcap)
-            memcpy(n, wk->du_jobs, wk->du_jcap * sizeof(RtxBrowseJob));
-        wk->du_jobs = n;
-        wk->du_jcap = c;
+static int rtx_browse_du_have_i(const RtxBrowseWalk *wk, const char *abs) {
+    size_t i;
+    if (!wk || !abs || !abs[0]) return -1;
+    for (i = 0; i < wk->nhave; i++) {
+        if (strcmp(wk->have[i].abs, abs) == 0) return (int)i;
     }
-    memset(&wk->du_jobs[wk->du_jlen], 0, sizeof(wk->du_jobs[wk->du_jlen]));
-    snprintf(wk->du_jobs[wk->du_jlen].abs, sizeof(wk->du_jobs[wk->du_jlen].abs),
-             "%s", abs);
-    wk->du_jobs[wk->du_jlen].depth = depth;
-    wk->du_jlen++;
-    return 0;
+    return -1;
+}
+
+static void rtx_browse_du_have_put(RtxBrowseWalk *wk, const char *abs,
+                                  uint64_t size, int denied) {
+    int slot;
+    if (!wk || !abs || !abs[0]) return;
+    slot = rtx_browse_du_have_i(wk, abs);
+    if (slot < 0) {
+        if (wk->nhave >= (size_t)RTX_BROWSE_DU_HAVE) {
+            memmove(&wk->have[0], &wk->have[1],
+                    (wk->nhave - 1) * sizeof(wk->have[0]));
+            wk->nhave--;
+        }
+        slot = (int)wk->nhave;
+        wk->nhave++;
+        memset(&wk->have[slot], 0, sizeof(wk->have[slot]));
+        snprintf(wk->have[slot].abs, sizeof(wk->have[slot].abs), "%s", abs);
+    } else if ((size_t)slot + 1 < wk->nhave) {
+        RtxBrowseDuHave keep = wk->have[slot];
+        memmove(&wk->have[slot], &wk->have[slot + 1],
+                (wk->nhave - (size_t)slot - 1) * sizeof(wk->have[0]));
+        wk->have[wk->nhave - 1] = keep;
+        slot = (int)wk->nhave - 1;
+    }
+    wk->have[slot].size = size;
+    wk->have[slot].denied = denied ? 1 : 0;
+}
+
+static int rtx_browse_du_have_get(const RtxBrowseWalk *wk, const char *abs,
+                                 uint64_t *size, int *denied) {
+    int slot = rtx_browse_du_have_i(wk, abs);
+    if (slot < 0) return 0;
+    if (size) *size = wk->have[slot].size;
+    if (denied) *denied = wk->have[slot].denied;
+    return 1;
+}
+
+static int rtx_browse_du_ent_abs(const RtxBrowse *br, const RtxBrowseEnt *e,
+                                char *dst, size_t n) {
+    if (!br || !e || !dst || n == 0 || !e->is_dir || e->sep) return 0;
+    if (strcmp(e->name, "..") == 0) return 0;
+    return rtx_browse_join(dst, n, br->dir, e->name);
+}
+
+static void rtx_browse_du_stamp(RtxBrowseEnt *e, uint64_t size, int denied) {
+    if (!e) return;
+    e->sized = 1;
+    e->has_stat = 1;
+    e->size = size;
+    e->size_done = 1;
+    e->size_denied = denied ? 1 : 0;
+}
+
+static void rtx_browse_du_reapply(RtxBrowse *br) {
+    RtxBrowseWalk *wk = rtx_br_wk(br);
+    size_t i;
+    if (!br || !wk || !br->ents) return;
+    for (i = 0; i < br->len; i++) {
+        char abs[RTX_BROWSE_DIR];
+        uint64_t size;
+        int denied;
+        if (!rtx_browse_du_ent_abs(br, &br->ents[i], abs, sizeof(abs)))
+            continue;
+        if (!rtx_browse_du_have_get(wk, abs, &size, &denied)) continue;
+        rtx_browse_du_stamp(&br->ents[i], size, denied);
+    }
+}
+
+static int rtx_browse_du_done(const RtxBrowseWalk *wk) {
+    return !wk || (wk->du_sp == 0 && !wk->du_dp);
 }
 
 static void rtx_browse_du_live_reset(RtxBrowseWalk *wk) {
@@ -418,20 +497,48 @@ static void rtx_browse_du_live_reset(RtxBrowseWalk *wk) {
         closedir(wk->du_dp);
         wk->du_dp = NULL;
     }
-    wk->du_jobs = NULL;
-    wk->du_jlen = 0;
-    wk->du_jcap = 0;
-    wk->du_jhead = 0;
+    wk->du_sp = 0;
     wk->du_name[0] = 0;
-    wk->du_abs[0] = 0;
     wk->du_last[0] = 0;
     wk->du_skip[0] = 0;
+}
+
+static void rtx_browse_du_park_skip(RtxBrowseWalk *wk) {
+    if (!wk || !wk->du_dp || wk->du_sp == 0) return;
+    if (wk->du_skip[0])
+        snprintf(wk->du_stk[wk->du_sp - 1].skip,
+                 sizeof(wk->du_stk[wk->du_sp - 1].skip), "%s", wk->du_skip);
+    else if (wk->du_last[0])
+        snprintf(wk->du_stk[wk->du_sp - 1].skip,
+                 sizeof(wk->du_stk[wk->du_sp - 1].skip), "%s", wk->du_last);
+}
+
+static int rtx_browse_du_dive(RtxBrowseWalk *wk, const char *full) {
+    RtxBrowseDuFrame *cur;
+    int depth;
+    if (!wk || !full || !full[0] || wk->du_sp == 0) return 0;
+    cur = &wk->du_stk[wk->du_sp - 1];
+    depth = cur->depth;
+    if (depth + 1 >= RTX_BROWSE_WALK || wk->du_sp >= (size_t)RTX_BROWSE_WALK)
+        return 0;
+    rtx_browse_du_park_skip(wk);
+    if (wk->du_dp) {
+        closedir(wk->du_dp);
+        wk->du_dp = NULL;
+    }
+    memset(&wk->du_stk[wk->du_sp], 0, sizeof(wk->du_stk[wk->du_sp]));
+    snprintf(wk->du_stk[wk->du_sp].abs, sizeof(wk->du_stk[wk->du_sp].abs),
+             "%s", full);
+    wk->du_stk[wk->du_sp].depth = depth + 1;
+    wk->du_sp++;
+    wk->du_last[0] = 0;
+    wk->du_skip[0] = 0;
+    return 1;
 }
 
 static void rtx_browse_du_park(RtxBrowse *br) {
     RtxBrowseWalk *wk = rtx_br_wk(br);
     RtxBrowseEnt *e;
-    size_t left;
     int slot;
     if (!br || !wk || !wk->du_name[0]) return;
     e = rtx_browse_du_ent(br);
@@ -448,32 +555,25 @@ static void rtx_browse_du_park(RtxBrowse *br) {
         snprintf(wk->hold[slot].name, sizeof(wk->hold[slot].name), "%s",
                  wk->du_name);
     }
+    if (wk->du_sp && wk->du_stk[0].abs[0])
+        snprintf(wk->hold[slot].abs, sizeof(wk->hold[slot].abs), "%s",
+                 wk->du_stk[0].abs);
+    else if (e)
+        rtx_browse_du_ent_abs(br, e, wk->hold[slot].abs,
+                              sizeof(wk->hold[slot].abs));
+    rtx_browse_du_park_skip(wk);
     wk->hold[slot].size = e ? e->size : 0;
     wk->hold[slot].denied = e && e->size_denied ? 1 : 0;
-    wk->hold[slot].done = !br->sizing && e && e->sized ? 1 : 0;
-    if (wk->du_jhead >= wk->du_jlen && !wk->du_dp) wk->hold[slot].done = 1;
+    wk->hold[slot].done = (e && e->size_done) || rtx_browse_du_done(wk);
+    if (wk->hold[slot].done && wk->hold[slot].abs[0])
+        rtx_browse_du_have_put(wk, wk->hold[slot].abs, wk->hold[slot].size,
+                              wk->hold[slot].denied);
     if (wk->hold[slot].done) {
-        wk->hold[slot].jlen = 0;
-        wk->hold[slot].jhead = 0;
-        wk->hold[slot].skip[0] = 0;
+        wk->hold[slot].sp = 0;
     } else {
-        left = wk->du_jlen > wk->du_jhead ? wk->du_jlen - wk->du_jhead : 0;
-        wk->hold[slot].jobs = NULL;
-        wk->hold[slot].jcap = 0;
-        wk->hold[slot].jlen = 0;
-        wk->hold[slot].jhead = 0;
-        if (left) {
-            wk->hold[slot].jobs = (RtxBrowseJob *)cc_arena_alloc(
-                &wk->arena, left * sizeof(RtxBrowseJob), 8);
-            if (wk->hold[slot].jobs) {
-                memcpy(wk->hold[slot].jobs, wk->du_jobs + wk->du_jhead,
-                       left * sizeof(RtxBrowseJob));
-                wk->hold[slot].jlen = left;
-                wk->hold[slot].jcap = left;
-            }
-        }
-        snprintf(wk->hold[slot].skip, sizeof(wk->hold[slot].skip), "%s",
-                 wk->du_dp ? wk->du_last : "");
+        memcpy(wk->hold[slot].stk, wk->du_stk,
+               wk->du_sp * sizeof(wk->du_stk[0]));
+        wk->hold[slot].sp = wk->du_sp;
     }
     if (e) {
         e->size_done = wk->hold[slot].done;
@@ -487,10 +587,18 @@ static int rtx_browse_du_resume(RtxBrowse *br, const char *name) {
     RtxBrowseWalk *wk = rtx_br_wk(br);
     RtxBrowseEnt *e;
     int slot;
-    char full[RTX_BROWSE_DIR];
+    char abs[RTX_BROWSE_DIR];
+    uint64_t have_sz;
+    int have_den;
     if (!br || !wk || !name) return 0;
-    slot = rtx_browse_du_hold_i(wk, name);
     e = rtx_browse_named_ent(br, name);
+    if (e && rtx_browse_du_ent_abs(br, e, abs, sizeof(abs)) &&
+        rtx_browse_du_have_get(wk, abs, &have_sz, &have_den)) {
+        rtx_browse_du_stamp(e, have_sz, have_den);
+        br->sizing = 0;
+        return 1;
+    }
+    slot = rtx_browse_du_hold_i(wk, name);
     if (slot < 0 || !e) return 0;
     e->sized = 1;
     e->has_stat = 1;
@@ -501,15 +609,12 @@ static int rtx_browse_du_resume(RtxBrowse *br, const char *name) {
         br->sizing = 0;
         return 1;
     }
-    if (!rtx_browse_join(full, sizeof(full), br->dir, name)) return 0;
     snprintf(wk->du_name, sizeof(wk->du_name), "%s", name);
-    snprintf(wk->du_abs, sizeof(wk->du_abs), "%s", full);
-    wk->du_jobs = wk->hold[slot].jobs;
-    wk->du_jlen = wk->hold[slot].jlen;
-    wk->du_jcap = wk->hold[slot].jcap;
-    wk->du_jhead = wk->hold[slot].jhead;
-    snprintf(wk->du_skip, sizeof(wk->du_skip), "%s", wk->hold[slot].skip);
+    memcpy(wk->du_stk, wk->hold[slot].stk,
+           wk->hold[slot].sp * sizeof(wk->du_stk[0]));
+    wk->du_sp = wk->hold[slot].sp;
     wk->du_last[0] = 0;
+    wk->du_skip[0] = 0;
     br->sizing = 1;
     return 1;
 }
@@ -520,26 +625,17 @@ static void rtx_browse_du_start(RtxBrowse *br, RtxBrowseEnt *ent) {
     if (!br || !wk || !ent) return;
     if (!rtx_browse_join(full, sizeof(full), br->dir, ent->name)) return;
     snprintf(wk->du_name, sizeof(wk->du_name), "%s", ent->name);
-    snprintf(wk->du_abs, sizeof(wk->du_abs), "%s", full);
+    memset(wk->du_stk, 0, sizeof(wk->du_stk[0]));
+    snprintf(wk->du_stk[0].abs, sizeof(wk->du_stk[0].abs), "%s", full);
+    wk->du_sp = 1;
     wk->du_last[0] = 0;
     wk->du_skip[0] = 0;
-    wk->du_jobs = NULL;
-    wk->du_jlen = 0;
-    wk->du_jcap = 0;
-    wk->du_jhead = 0;
     ent->size = 0;
     ent->sized = 1;
     ent->size_done = 0;
     ent->size_denied = 0;
     ent->has_stat = 1;
     br->sizing = 1;
-    if (rtx_browse_du_job_push(br, full, 0) < 0) {
-        br->sizing = 0;
-        ent->sized = 0;
-        ent->size_denied = 0;
-        ent->size_done = 0;
-        rtx_browse_du_live_reset(wk);
-    }
 }
 
 static void rtx_browse_du_retarget(RtxBrowse *br) {
@@ -551,68 +647,92 @@ static void rtx_browse_du_retarget(RtxBrowse *br) {
     }
     ent = &br->ents[br->cur];
     wk = rtx_br_wk(br);
-    if (wk && wk->du_name[0] && strcmp(wk->du_name, ent->name) == 0 &&
-        (br->sizing || (ent->is_dir && ent->sized)))
+    if (ent->is_dir && ent->size_done) {
+        rtx_browse_du_park(br);
+        return;
+    }
+    {
+        char abs[RTX_BROWSE_DIR];
+        uint64_t size;
+        int denied;
+        if (wk && rtx_browse_du_ent_abs(br, ent, abs, sizeof(abs)) &&
+            rtx_browse_du_have_get(wk, abs, &size, &denied)) {
+            rtx_browse_du_stamp(ent, size, denied);
+            rtx_browse_du_park(br);
+            return;
+        }
+    }
+    if (wk && br->sizing && wk->du_name[0] &&
+        strcmp(wk->du_name, ent->name) == 0)
         return;
     rtx_browse_du_park(br);
     if (!ent->is_dir || strcmp(ent->name, "..") == 0) return;
-    if (rtx_browse_du_resume(br, ent->name)) return;
+    if (rtx_browse_du_resume(br, ent->name)) {
+        if (br->sizing && wk) wk->du_defer = 1;
+        return;
+    }
     rtx_browse_du_start(br, ent);
+    if (br->sizing && wk) wk->du_defer = 1;
 }
 
 static size_t rtx_browse_pump_du(RtxBrowse *br) {
     RtxBrowseWalk *wk;
     RtxBrowseEnt *e;
-    int got = 0;
+    int work = 0;
+    long t0;
     if (!br || !br->sizing) return 0;
     wk = rtx_br_wk(br);
+    t0 = rtx_browse_now_ms();
     e = rtx_browse_du_ent(br);
     if (!wk || !e) {
         br->sizing = 0;
         rtx_browse_du_live_reset(wk);
         return 0;
     }
-    if (!wk->du_dp) {
-        if (wk->du_jhead >= wk->du_jlen) {
-            br->sizing = 0;
-            rtx_browse_du_park(br);
-            return 0;
-        }
-        wk->du_dp = opendir(wk->du_jobs[wk->du_jhead].abs);
-        if (!wk->du_dp) {
-            if ((errno == EACCES || errno == EPERM) &&
-                wk->du_jobs[wk->du_jhead].depth == 0) {
-                e->size_denied = 1;
-                e->size_done = 1;
-                br->sizing = 0;
-                rtx_browse_du_park(br);
-                return 0;
-            }
-            wk->du_jhead++;
-            wk->du_skip[0] = 0;
-            wk->du_last[0] = 0;
-            if (wk->du_jhead >= wk->du_jlen) {
-                br->sizing = 0;
-                rtx_browse_du_park(br);
-            }
-            return 0;
-        }
-    }
     for (;;) {
         struct dirent *de;
         const char *name;
         char full[RTX_BROWSE_DIR];
         struct stat st;
-        int depth;
-        if (got >= RTX_BROWSE_BATCH) break;
+        RtxBrowseDuFrame *cur;
+        int hint_dir, hint_lnk;
+        if (work >= RTX_BROWSE_DU) break;
+        if (work > 0 && rtx_browse_now_ms() - t0 >= (long)RTX_BROWSE_DU_MS)
+            break;
+        if (!wk->du_dp) {
+            if (wk->du_sp == 0) {
+                br->sizing = 0;
+                rtx_browse_du_park(br);
+                return (size_t)work;
+            }
+            cur = &wk->du_stk[wk->du_sp - 1];
+            wk->du_dp = opendir(cur->abs);
+            work++;
+            if (!wk->du_dp) {
+                if ((errno == EACCES || errno == EPERM) && cur->depth == 0) {
+                    e->size_denied = 1;
+                    e->size_done = 1;
+                    br->sizing = 0;
+                    rtx_browse_du_park(br);
+                    return (size_t)work;
+                }
+                wk->du_sp--;
+                wk->du_last[0] = 0;
+                wk->du_skip[0] = 0;
+                continue;
+            }
+            snprintf(wk->du_skip, sizeof(wk->du_skip), "%s", cur->skip);
+            wk->du_last[0] = 0;
+            if (work >= RTX_BROWSE_DU) break;
+        }
         de = readdir(wk->du_dp);
         if (!de) {
             closedir(wk->du_dp);
             wk->du_dp = NULL;
-            wk->du_jhead++;
-            wk->du_skip[0] = 0;
+            if (wk->du_sp) wk->du_sp--;
             wk->du_last[0] = 0;
-            break;
+            wk->du_skip[0] = 0;
+            continue;
         }
         name = de->d_name;
         if (!name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
@@ -622,25 +742,34 @@ static size_t rtx_browse_pump_du(RtxBrowse *br) {
             wk->du_skip[0] = 0;
             continue;
         }
-        if (!rtx_browse_join(full, sizeof(full),
-                             wk->du_jobs[wk->du_jhead].abs, name))
-            continue;
-        if (lstat(full, &st) != 0 || S_ISLNK(st.st_mode)) continue;
-        depth = wk->du_jobs[wk->du_jhead].depth;
         snprintf(wk->du_last, sizeof(wk->du_last), "%s", name);
+        hint_dir = 0;
+        hint_lnk = 0;
+#ifdef DT_DIR
+        hint_dir = (de->d_type == DT_DIR);
+        hint_lnk = (de->d_type == DT_LNK);
+#endif
+        if (hint_lnk) continue;
+        if (!rtx_browse_join(full, sizeof(full),
+                             wk->du_stk[wk->du_sp - 1].abs, name))
+            continue;
+        if (hint_dir) {
+            rtx_browse_du_dive(wk, full);
+            continue;
+        }
+        work++;
+        if (lstat(full, &st) != 0 || S_ISLNK(st.st_mode)) continue;
         if (S_ISDIR(st.st_mode)) {
-            if (depth < RTX_BROWSE_WALK)
-                rtx_browse_du_job_push(br, full, depth + 1);
+            rtx_browse_du_dive(wk, full);
             continue;
         }
         e->size += (uint64_t)st.st_size;
-        got++;
     }
-    if (!wk->du_dp && wk->du_jhead >= wk->du_jlen) {
+    if (rtx_browse_du_done(wk)) {
         br->sizing = 0;
         rtx_browse_du_park(br);
     }
-    return (size_t)got;
+    return (size_t)work;
 }
 
 static size_t rtx_browse_sep_i(const RtxBrowse *br) {
@@ -667,6 +796,7 @@ static void rtx_browse_sort_keep(RtxBrowse *br) {
     RtxBrowseWalk *wk = rtx_br_wk(br);
     if (!br || br->len <= 1) {
         rtx_browse_keep_cur(br, br && br->wk ? rtx_br_wk(br)->keep : NULL);
+        rtx_browse_du_reapply(br);
         return;
     }
     sep = rtx_browse_sep_last(br);
@@ -675,6 +805,7 @@ static void rtx_browse_sort_keep(RtxBrowse *br) {
             qsort(br->ents + sep + 1, br->len - sep - 1, sizeof(RtxBrowseEnt),
                   rtx_browse_cmp);
         rtx_browse_keep_cur(br, br->wk ? rtx_br_wk(br)->keep : NULL);
+        rtx_browse_du_reapply(br);
         return;
     }
     from = rtx_browse_is_root(br->dir) ? 0 : 1;
@@ -682,6 +813,7 @@ static void rtx_browse_sort_keep(RtxBrowse *br) {
         qsort(br->ents + from, br->len - from, sizeof(RtxBrowseEnt),
               rtx_browse_cmp);
     rtx_browse_keep_cur(br, br->wk ? rtx_br_wk(br)->keep : NULL);
+    rtx_browse_du_reapply(br);
 }
 
 static int rtx_browse_plant_flat_row(RtxBrowse *br) {
@@ -728,10 +860,19 @@ static int rtx_browse_plant_dotdot(RtxBrowse *br) {
 
 void !>(CCError) rtx_browse_kick(RtxBrowse *br) {
     char keep[RTX_BROWSE_NAME];
+    RtxBrowseDuHave keep_have[RTX_BROWSE_DU_HAVE];
+    size_t n_have = 0;
+    RtxBrowseWalk *old;
     if (!br || !br->dir[0]) return cc_err(CC_ERR_INVALID_ARG, "browse dir");
     keep[0] = 0;
     if (br->ents && br->cur < br->len)
         snprintf(keep, sizeof(keep), "%s", br->ents[br->cur].name);
+    rtx_browse_du_park(br);
+    old = rtx_br_wk(br);
+    if (old) {
+        n_have = old->nhave;
+        if (n_have) memcpy(keep_have, old->have, n_have * sizeof(keep_have[0]));
+    }
     rtx_browse_walk_stop(br);
     if (br->store.base) br->store.reset();
     else {
@@ -758,6 +899,12 @@ void !>(CCError) rtx_browse_kick(RtxBrowse *br) {
         return cc_err(CC_ERR_OUT_OF_MEMORY, "browse");
     if (rtx_browse_job_push(br, br->dir, "", 0) < 0)
         return cc_err(CC_ERR_OUT_OF_MEMORY, "browse job");
+    old = rtx_br_wk(br);
+    if (old) {
+        old->nhave = n_have;
+        if (n_have) memcpy(old->have, keep_have, n_have * sizeof(old->have[0]));
+    }
+    rtx_browse_du_reapply(br);
     return cc_ok();
 }
 
@@ -991,8 +1138,16 @@ size_t !>(CCError) rtx_browse_pump(RtxBrowse *br) {
             return cc_err(e);
         };
         else n = rtx_browse_pump_shallow(br) !>(e) { return cc_err(e); };
+        return cc_ok(rtx_browse_end_step(br, n));
     }
     rtx_browse_du_retarget(br);
+    {
+        RtxBrowseWalk *wk = rtx_br_wk(br);
+        if (wk && wk->du_defer) {
+            wk->du_defer = 0;
+            return cc_ok(rtx_browse_end_step(br, n));
+        }
+    }
     if (br->sizing) n += rtx_browse_pump_du(br);
     return cc_ok(rtx_browse_end_step(br, n));
 }
@@ -1000,8 +1155,11 @@ size_t !>(CCError) rtx_browse_pump(RtxBrowse *br) {
 void !>(CCError) rtx_browse_finish(RtxBrowse *br) {
     int n = 0;
     if (!br) return cc_err(CC_ERR_INVALID_ARG, "browse");
-    while ((br->scanning || br->sizing) && n++ < 100000)
+    while ((br->scanning || br->sizing) && n++ < 100000) {
+        RtxBrowseWalk *wk = rtx_br_wk(br);
+        if (wk) wk->du_defer = 0;
         rtx_browse_pump(br) !>(e) { return cc_err(e); };
+    }
     return cc_ok();
 }
 
@@ -1336,9 +1494,9 @@ int rtx_host_peer_path(const char *exe, int other, char *dst, size_t n) {
 }
 
 const char *rtx_host_peer_name(int other) {
-    int ray = rtx_host_is_ray(rtx_host_exe[0] ? rtx_host_exe : "cctext");
-    if (other) return ray ? "cctext" : "cctext-ray";
-    return ray ? "cctext-ray" : "cctext";
+    int gui = rtx_host_is_ray(rtx_host_exe[0] ? rtx_host_exe : "cctext");
+    if (other) return gui ? "cctext" : "cctext-ray";
+    return gui ? "cctext-ray" : "cctext";
 }
 
 void rtx_host_set_exe(const char *argv0) {

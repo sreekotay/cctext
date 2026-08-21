@@ -4,7 +4,7 @@
 #   ./testdata/gen_large.sh [lines] [outfile]      # default 100000 lines
 #   ./testdata/gen_large.sh --bytes 8G [outfile]    # ~8 GiB mixed text (slow)
 #   ./testdata/gen_large.sh --bytes 2G --json       # ~2 GiB JSON array (slow)
-#   ./testdata/gen_large.sh --bytes 3M --csv        # ~3 MiB CSV (one record / line)
+#   ./testdata/gen_large.sh --bytes 3M --csv        # ~3 MiB CSV (quoted NL stays one record)
 #   ./testdata/gen_large.sh --bytes 256M out.txt
 set -euo pipefail
 
@@ -94,10 +94,10 @@ dir="$(dirname "$out")"
 mkdir -p "$dir"
 
 if [[ "$bytes_target" -gt 0 && "$kind" == csv ]]; then
-    # One record per line (grid view: row axis is the line prefix).
-    # Widths vary on purpose: short id/qty, medium sku/city, note is
-    # usually tiny and sometimes a long quoted field with commas so a
-    # screen-local col_w vector actually changes as you scroll.
+    # Records end on an unquoted newline. Widths vary on purpose: short
+    # id/qty, medium sku/city, note is usually tiny and sometimes a long
+    # quoted field (comma, wrap, or embedded NL) so a screen-local col_w
+    # vector actually changes as you scroll.
     awk -v want="$bytes_target" '
     BEGIN {
         hdr = "id,sku,name,qty,price,note,city\n"
@@ -110,6 +110,8 @@ if [[ "$bytes_target" -gt 0 && "$kind" == csv ]]; then
             name = (b % 41 == 0) ? "" : sprintf("item_%d", b)
             if (b % 53 == 0)
                 note = "\"says \"\"hi\"\", really\""
+            else if (b % 29 == 0)
+                note = sprintf("\"line 1 of %d\n  indented line 2\nshort.\"", b)
             else if (b % 17 == 0)
                 note = "\"A wrapping note that stays one record but is wide enough that an eighty-column pane must clip this column or steal from city, row " b ".\""
             else if (b % 7 == 0)

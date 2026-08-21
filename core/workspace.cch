@@ -15,6 +15,7 @@ typedef struct {
     RtxLayout layout;
     size_t top;            /* line camera origin */
     size_t top_wrap;       /* visual rows skipped on that line */
+    size_t left_col;       /* unwrapped window x; wrap/hex stay 0 */
     size_t top_byte;       /* first byte row start when view == HEX (16-aligned) */
     int seek_valid;        /* byte camera until line_of(seek_off) hands off */
     size_t seek_off;       /* first visible byte while seek_valid */
@@ -22,6 +23,7 @@ typedef struct {
     size_t drag_vis;       /* scrollbar map frozen at press; 0 if not dragging */
     size_t drag_len;
     int drag_grab;         /* thumb grab offset in track cells/pixels */
+    int drag_horiz;        /* 1: drag_vis/len/grab are the left_col rail */
     int pin_view;          /* 1 after wheel/bar: do not reveal to the caret */
     int unlock;            /* 1: viewport does not follow caret (find/jump still land) */
     int hex_nib;           /* 0 high / 1 low; hex pane type only */
@@ -55,7 +57,7 @@ typedef struct {
     int truncated;
     int denied;            /* 1: listing dir itself was EACCES/EPERM */
     int scanning;          /* 1 while listing pump has work — same epoch as find */
-    int sizing;            /* 1: greedy du of the current folder */
+    int sizing;            /* 1: pumped du of the current folder */
     int flat;              /* 1: typed fragment, flattening this tree */
     char dir[RTX_BROWSE_DIR];
     char glob[RTX_BROWSE_GLOB];
@@ -76,12 +78,13 @@ typedef struct {
 typedef struct {
     int live;
     RtxLayout layout;
-    size_t top, top_wrap, top_byte;
+    size_t top, top_wrap, left_col, top_byte;
     int seek_valid;
     size_t seek_off;
     long seek_rel;
     size_t drag_vis, drag_len;
     int drag_grab;
+    int drag_horiz;
     int pin_view, unlock;
     int hex_nib;
     double scroll, layout_width;
@@ -137,6 +140,7 @@ static void rtx_buf_swap_cam(RtxBuf *b, RtxPaneSnap *s) {
     L = b->layout; b->layout = s->layout; s->layout = L;
     z = b->top; b->top = s->top; s->top = z;
     z = b->top_wrap; b->top_wrap = s->top_wrap; s->top_wrap = z;
+    z = b->left_col; b->left_col = s->left_col; s->left_col = z;
     z = b->top_byte; b->top_byte = s->top_byte; s->top_byte = z;
     i = b->seek_valid; b->seek_valid = s->seek_valid; s->seek_valid = i;
     z = b->seek_off; b->seek_off = s->seek_off; s->seek_off = z;
@@ -148,6 +152,7 @@ static void rtx_buf_swap_cam(RtxBuf *b, RtxPaneSnap *s) {
     z = b->drag_vis; b->drag_vis = s->drag_vis; s->drag_vis = z;
     z = b->drag_len; b->drag_len = s->drag_len; s->drag_len = z;
     i = b->drag_grab; b->drag_grab = s->drag_grab; s->drag_grab = i;
+    i = b->drag_horiz; b->drag_horiz = s->drag_horiz; s->drag_horiz = i;
     i = b->pin_view; b->pin_view = s->pin_view; s->pin_view = i;
     i = b->unlock; b->unlock = s->unlock; s->unlock = i;
     i = b->hex_nib; b->hex_nib = s->hex_nib; s->hex_nib = i;
@@ -324,11 +329,26 @@ static void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
     return cc_ok();
 }
 
+static void rtx_buf_grid_bind(RtxBuf *b) {
+    char sample[RTX_GRID_PROBE];
+    size_t got = 0;
+    if (!b || !rtx_layout_is_grid(&b->layout) || b->layout.grid_delim) return;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            got = 0;
+        }
+        got = b->doc.read_at(0, sample, sizeof(sample)) !>;
+    }
+    b->layout.grid_delim = rtx_grid_pick_delim(b->doc.path.ptr, sample, got);
+}
+
 static void RtxWs_set_view(RtxWs *w, int view) {
     size_t i;
     if (!w) return;
     for (i = 0; i < w->len; i++) {
         rtx_layout_set_view(&w->bufs[i].layout, view);
+        rtx_buf_grid_bind(&w->bufs[i]);
     }
     if (w->side.live) rtx_layout_set_view(&w->side.layout, view);
 }
@@ -338,6 +358,7 @@ static void RtxWs_set_views(RtxWs *w, const int *views, int n) {
     if (!w || !views || n < 1) return;
     for (i = 0; i < n && i < (int)w->len; i++) {
         rtx_layout_set_view(&w->bufs[i].layout, views[i]);
+        rtx_buf_grid_bind(&w->bufs[i]);
     }
 }
 
@@ -355,6 +376,7 @@ static void RtxWs_toggle_split(RtxWs *w) {
             w->side.live = 1;
             w->side.top = b->top;
             w->side.top_wrap = b->top_wrap;
+            w->side.left_col = b->left_col;
             w->side.top_byte = b->top_byte;
             w->side.unlock = b->unlock;
             w->side.layout.view = b->layout.view;
@@ -733,6 +755,7 @@ static void rtx_buf_origin_from_row(RtxBuf *b, size_t origin) {
     first = origin;
     while (first > 0 && b->layout.rows[first - 1].line == b->top) first--;
     b->top_wrap = origin - first;
+    if (rtx_layout_is_grid(&b->layout)) b->top_wrap = 0;
 }
 
 /* First visible byte in the current view. Does not scan. */
@@ -802,7 +825,17 @@ static void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
         return cc_ok();
     }
     cl = b->line_of(off) !>(e) { return cc_err(e); };
-    if (!b->layout.wrap) {
+    if (rtx_layout_is_grid(&b->layout)) {
+        size_t floor = rtx_doc_line_floor_local(&b->doc, off) !>(e) {
+            return cc_err(e);
+        };
+        size_t rec = rtx_layout_grid_cam_lo(&b->doc, floor, NULL) !>(e) {
+            return cc_err(rtx_index_from_cc(e));
+        };
+        if (b->doc.index_covers(rec))
+            cl = b->line_of(rec) !>(e) { return cc_err(e); };
+    }
+    if (!rtx_layout_soft_wrap(&b->layout)) {
         b->top_wrap = 0;
         if (cl < b->top) b->top = cl;
         if (cl >= b->top + (size_t)vis) b->top = cl - (size_t)vis + 1;
@@ -826,7 +859,9 @@ static void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
             return cc_ok();
         }
     }
-    ri = b->layout.row_of(off);
+    ri = rtx_layout_is_grid(&b->layout)
+             ? rtx_layout_grid_row_of(&b->layout, &b->doc, off)
+             : b->layout.row_of(off);
     if (ri < b->top_wrap) {
         rtx_buf_origin_from_row(b, ri);
         return cc_ok();
@@ -888,6 +923,8 @@ static void !>(RtxIndexErr) RtxBuf_cycle_view(RtxBuf *b, int vis) {
     keep = b->view_off();
     was_hex = rtx_layout_is_hex(&b->layout);
     rtx_layout_cycle_view(&b->layout);
+    rtx_buf_grid_bind(b);
+    b->left_col = 0;
     if (was_hex && !rtx_layout_is_hex(&b->layout) &&
         b->doc.sel_anchor == b->doc.caret) {
         b->doc.caret = b->doc.cluster_align(b->doc.caret) !>;
@@ -898,6 +935,7 @@ static void !>(RtxIndexErr) RtxBuf_cycle_view(RtxBuf *b, int vis) {
     b->seek_valid = 0;
     b->drag_vis = 0;
     b->drag_len = 0;
+    b->drag_horiz = 0;
     b->clear_pref();
     rtx_buf_hex_nib_reset(b);
     if (b->unlock) return b->reveal_off(keep, vis);
@@ -921,6 +959,29 @@ static void !>(RtxIndexErr) rtx_buf_fold_skip_cam(RtxBuf *b, int dir) {
         else
             rtx_buf_seek_set(b, snap);
         b->top_wrap = 0;
+    }
+    return cc_ok();
+}
+
+/* Grid camera is whole records. A wrap is not a scroll stop. */
+static void !>(CCError) rtx_buf_grid_scroll(RtxBuf *b, const RtxMeasure *m,
+                                           double width, int dir) {
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    (void)m;
+    (void)width;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "grid scroll");
+    b->top_wrap = 0;
+    if (dir < 0) {
+        if (b->top > 0) b->top = rtx_layout_grid_prev_line(&b->doc, b->top) !>;
+        return cc_ok();
+    }
+    if (dir > 0) {
+        size_t nxt = rtx_layout_grid_next_line(&b->doc, b->top) !>;
+        if (b->top == 0 && nxt != b->top)
+            nxt = rtx_layout_grid_next_line(&b->doc, nxt) !>;
+        b->top = nxt;
     }
     return cc_ok();
 }
@@ -968,6 +1029,11 @@ static void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double
         return cc_ok();
     }
     nlines = b->line_count();
+    if (rtx_layout_is_grid(&b->layout)) {
+        rtx_buf_grid_scroll(b, m, width, dir) !>;
+        rtx_buf_fold_skip_cam(b, dir) !>;
+        return cc_ok();
+    }
     if (!b->layout.wrap) {
         b->top_wrap = 0;
         if (dir < 0 && b->top > 0) b->top--;
@@ -1003,6 +1069,123 @@ static void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double
     return cc_ok();
 }
 
+static int rtx_buf_uses_left(const RtxBuf *b) {
+    return b && !rtx_layout_is_hex(&b->layout) && !b->layout.wrap;
+}
+
+static size_t rtx_buf_row_max_w(const RtxBuf *b) {
+    size_t i, mx = 0;
+    if (!b) return 0;
+    for (i = 0; i < b->layout.len; i++) {
+        size_t w = (size_t)b->layout.rows[i].width;
+        if (w > mx) mx = w;
+    }
+    return mx;
+}
+
+static void rtx_buf_clamp_left(RtxBuf *b, double width) {
+    size_t vis, mx;
+    if (!b || width < 1.0) return;
+    vis = (size_t)width;
+    mx = rtx_buf_row_max_w(b);
+    if (mx <= vis) {
+        if (mx) b->left_col = 0;
+        return;
+    }
+    if (b->left_col > mx - vis) b->left_col = mx - vis;
+}
+
+/* Pan left_col. Default (and grid) text; wrap/hex no-op. */
+static void !>(CCError) RtxBuf_scroll_x(RtxBuf *b, double width, int dir) {
+    size_t step;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "scroll x");
+    if (!rtx_buf_uses_left(b)) return cc_ok();
+    b->pin_view = 1;
+    if (width < 4.0) width = 4.0;
+    step = (size_t)(width / 4.0);
+    if (step < 1) step = 1;
+    if (dir < 0) {
+        if (b->left_col > step) b->left_col -= step;
+        else b->left_col = 0;
+    } else if (dir > 0) {
+        b->left_col += step;
+    }
+    rtx_buf_clamp_left(b, width);
+    return cc_ok();
+}
+
+/* Widest vis row in the current fill, or enough to keep left_col on the rail. */
+static size_t rtx_buf_content_w(const RtxBuf *b) {
+    size_t mx = rtx_buf_row_max_w(b);
+    if (b && b->left_col + 1 > mx) mx = b->left_col + 1;
+    return mx;
+}
+
+static int RtxBuf_scroll_x_needed(const RtxBuf *b, double width) {
+    size_t vis, cw;
+    if (!rtx_buf_uses_left(b) || width < 1.0) return 0;
+    if (b->left_col > 0 || (b->drag_horiz && b->drag_len)) return 1;
+    vis = (size_t)width;
+    cw = rtx_buf_content_w(b);
+    return cw > vis;
+}
+
+static RtxScrollRail RtxBuf_scroll_x_rail(const RtxBuf *b, double width) {
+    RtxScrollRail r = {0};
+    size_t vis, len;
+    if (!b || width < 1.0) return r;
+    vis = (size_t)width;
+    if (vis < 1) vis = 1;
+    len = rtx_buf_content_w(b);
+    if (len < vis) len = vis;
+    if (b->left_col + vis > len) len = b->left_col + vis;
+    r.pos = b->left_col;
+    r.vis = vis;
+    r.len = len;
+    r.ready = 1;
+    return r;
+}
+
+static void !>(CCError) RtxBuf_scroll_x_to(RtxBuf *b, double width, size_t pos) {
+    RtxScrollRail r;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "scroll x");
+    if (!rtx_buf_uses_left(b)) return cc_ok();
+    b->pin_view = 1;
+    r = RtxBuf_scroll_x_rail(b, width);
+    if (r.vis >= r.len) {
+        b->left_col = 0;
+        return cc_ok();
+    }
+    if (pos > r.len - r.vis) pos = r.len - r.vis;
+    b->left_col = pos;
+    return cc_ok();
+}
+
+/* Keep the caret's x in [left_col, left_col+width). Units match layout width. */
+static void rtx_buf_reveal_x(RtxBuf *b, RtxMeasure *m, double width) {
+    double x;
+    if (!b) return;
+    if (!rtx_buf_uses_left(b)) {
+        b->left_col = 0;
+        return;
+    }
+    if (width < 1.0) width = 1.0;
+    if (!m || b->layout.len == 0) return;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            return;
+        }
+        x = b->layout.x_of(&b->doc, m, b->doc.caret) !>;
+    }
+    if (x < (double)b->left_col) {
+        b->left_col = (size_t)x;
+    } else if (x >= (double)b->left_col + width) {
+        double n = x - width + 1.0;
+        b->left_col = n > 0 ? (size_t)n : 0;
+    }
+}
+
 /* Fill / clamp the visible window for text or hex. Shared by both frontends. */
 static void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int vis) {
     size_t nlines;
@@ -1031,18 +1214,26 @@ static void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double widt
         }
         (void)m;
         (void)width;
+        b->left_col = 0;
         return cc_ok();
     }
     if (b->seek_valid) {
         size_t want = (size_t)vis + 8 + b->top_wrap;
         if (b->layout_width != width || b->layout.len == 0 ||
             b->layout.len < (size_t)vis ||
-            (b->layout.len && b->layout.rows[0].byte_start != b->seek_off)) {
+            (b->layout.len && b->layout.rows[0].byte_start != b->seek_off &&
+             !(rtx_layout_is_grid(&b->layout) &&
+               b->seek_off >= b->layout.rows[0].byte_start &&
+               b->seek_off <= b->layout.rows[b->layout.len - 1].byte_start +
+                                  b->layout.rows[b->layout.len - 1].byte_len))) {
             b->layout.fill_off(&b->doc, m, width, b->seek_off, want) !>;
             b->layout_width = width;
         }
         rtx_buf_seek_label(b) !>;
-        if (b->seek_valid) return cc_ok();
+        if (b->seek_valid) {
+            if (!b->unlock && !b->pin_view) rtx_buf_reveal_x(b, m, width);
+            return cc_ok();
+        }
     }
     nlines = b->line_count();
     if (b->top >= nlines && nlines) b->top = nlines - 1;
@@ -1051,11 +1242,14 @@ static void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double widt
     need = want < avail ? want : avail;
     if (b->layout_width != width || b->layout.from_line != b->top ||
         b->layout.len == 0 || b->layout.nlines < need ||
-        (b->layout.wrap && b->layout.len < want + b->top_wrap)) {
+        (rtx_layout_soft_wrap(&b->layout) &&
+         b->layout.len < want + b->top_wrap)) {
         size_t min_rows = want + b->top_wrap;
         b->layout.fill(&b->doc, m, width, b->top, min_rows) !>;
         b->layout_width = width;
     }
+    if (!b->unlock && !b->pin_view) rtx_buf_reveal_x(b, m, width);
+    else if (!rtx_buf_uses_left(b)) b->left_col = 0;
     return cc_ok();
 }
 
@@ -1183,6 +1377,11 @@ static int RtxWs_browse_busy(const RtxWs *w) {
                  (w->nav[1].on && RtxWs_nav_need_pump(&w->nav[1])));
 }
 
+static int RtxWs_browse_scanning(const RtxWs *w) {
+    return w && ((w->nav[0].on && w->nav[0].scanning) ||
+                 (w->nav[1].on && w->nav[1].scanning));
+}
+
 static RtxBrowse *RtxWs_browse_at(RtxWs *w, int pane) {
     if (!w || pane < 0 || pane >= 2) return NULL;
     return &w->nav[pane];
@@ -1205,6 +1404,7 @@ static void rtx_ws_same_split_seed(RtxWs *w) {
     w->side.live = 1;
     w->side.top = b->top;
     w->side.top_wrap = b->top_wrap;
+    w->side.left_col = b->left_col;
     w->side.top_byte = b->top_byte;
     w->side.unlock = b->unlock;
     w->side.layout.view = b->layout.view;

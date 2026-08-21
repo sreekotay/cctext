@@ -46,6 +46,14 @@ Two cameras, two window writes — do not mix them.
 | seek | `seek_off` | `fill_off` |
 | line | `top` | `fill` |
 
+Unwrapped text also keeps `left_col` (window x, same units as the
+layout width). End, a caret past the pane, wheel left/right, Shift-
+wheel, a tilt wheel, wheel on the bottom bar, or a drag past the pane
+edge moves it. Cursor/VS Code drop Shift+wheel `deltaX`; the TTY
+recovers it from the session while focused.
+Wrap and hex stay at 0. Grid is the same offset, not a second camera.
+The bottom bar appears only when a vis row is wider than the pane.
+
 `line_of(seek_off)` hands off to the line camera (`top` / `fill`).
 `index_covers` alone does not — that wrote `line_guess` into `top`.
 Unlabeled stays a seek.
@@ -175,7 +183,18 @@ Save is a **safe rename**, not inode preservation: sibling `path.tmp.XXXXXX`, st
 Offsets, caret, selection, and the piece tree are bytes. Text views walk
 **clusters** for motion, wrap, hit-test, backspace, and measure (a UTF-8 scalar
 plus following combining marks / variation selectors). Hex is a paint of that same editor, not a second one: caret, selection,
-and unlock stay on the camera / document. A split is two editors (same
+and unlock stay on the camera / document. Grid is the same: one record
+per newline whose window-lex face is not STRING (the grammar's begin/end,
+via lookback — not a CSV quote walker). No lex: every NL is a record.
+Line 0 is a sticky header (always `read_at(0)`, not `line_start` from a
+gap). Widths are header ∪ this fill (max line in a cell). Each column
+caps at `RTX_GRID_MAX_COL`, not the pane; extra fields use `left_col`.
+A cell wraps on its width and on embedded newlines. A delim inside a
+string is not a field. The line prefix is still newlines. A mid-field
+camera walks back to the previous unheld NL (lookback / scratch cap);
+a miss is leftover, not a record index. Wheel/scroll steps whole records
+(not vis wraps). Each wrap row keeps its physical line in the gutter.
+`l` cycles default / wrap / hex / grid. A split is two editors (same
 file or another path); focus is which pane. Hex motion already steps one
 byte (and resets to the high nibble). On a hex pane, `type` accepts only
 `0-9a-fA-F` and overwrites that nibble. The dump is display (UTF-8 lead,

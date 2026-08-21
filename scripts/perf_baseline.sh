@@ -98,9 +98,16 @@ human_bytes() {
 echo "perf_baseline: building perf_matrix_smoke ($BUILD_FLAVOR)" >&2
 "$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc perf_matrix_smoke
 echo "perf_baseline: building cctext ($BUILD_FLAVOR)" >&2
-"$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc cctext || {
-    echo "perf_baseline: cctext build failed (binary size will omit it)" >&2
-}
+if [[ "$(uname -s)" == Darwin ]]; then
+    "$CCC" "${CCC_FLAGS[@]}" --ld-flags "-framework ApplicationServices" \
+        build --build-file build.cc cctext || {
+        echo "perf_baseline: cctext build failed (binary size will omit it)" >&2
+    }
+else
+    "$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc cctext || {
+        echo "perf_baseline: cctext build failed (binary size will omit it)" >&2
+    }
+fi
 
 # Prefer a giant fixture for warmup so the small text file is not the cold victim.
 warm_path="$LARGE"

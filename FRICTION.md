@@ -10,9 +10,9 @@ call-local; pass a named arena last to keep a product).
 Methods are `Type_name` declarations, not hook fields. see Concurrent-C 
 `docs/typehooks-typeviews.md`
 
-`frontend/gui.ccs` and `frontend/cctext.ccs` sit on the 8192 AST-node cap
+`frontend/gui.ccs` and `frontend/cctext.ccs` sit on the 32768 AST-node cap
 (one TU with the core). Mark/fold bodies live in `core/nav.ccs` (linked TU,
-same cut as hex / browse); `nav.cch` is only decls plus thin wrappers.
+same cut as hex / browse / grid); `nav.cch` is only decls plus thin wrappers.
 Find refine (`rtx_find_refine`) is `core/find.ccs` so prefix-extend does not
 sit on the cctext include TU.
 The scope intern table is `core/scope.ccs` — paint and lex must share IDs
@@ -20,7 +20,8 @@ The scope intern table is `core/scope.ccs` — paint and lex must share IDs
 Brace-pair paint (`rtx_nav_pair_ends`) is declared in `nav_pair.cch`, not
 `nav.cch`. TUI pane + chrome paint is `frontend/cctext_draw.ccs` (same cut as
 `gui_draw`); keys/mouse are `frontend/cctext_input.ccs`; the host loop stays
-in `cctext.ccs`. Find/browse chapter bodies live in the sibling `.ccs` (CCC
+in `cctext.ccs`. Darwin session-wheel (Cursor drops Shift+wheel `deltaX`) is
+`frontend/cctext_osx.ccs`. Find/browse chapter bodies live in the sibling `.ccs` (CCC
 will not keep impl-grade statics in a header included from two TUs).
 GUI paint is `frontend/gui_draw.ccs`; keys/mouse are `frontend/gui_input.ccs`;
 the host loop stays in `frontend/gui.ccs` (same cut as hex / browse). Do not
@@ -28,7 +29,7 @@ add `@typehooks` fields on the GUI TUs. Chrome (menus / fonts / help) is
 `frontend/gui_chrome.ccs`; `objc_msgSend` (file picker / live resize) is
 `frontend/gui_osx.ccs`.
 Browse listing (`rtx_browse_kick` / pump / `>` walk) is a linked TU
-(`core/browse.ccs`), same cut as hex. Browse spawn (self / sibling frontend)
+(`core/browse.ccs`), same cut as hex / grid. Grid geometry is `core/grid.ccs`. Browse spawn (self / sibling frontend)
 lives there too. Browse `scanning` is the find `done` bit inverted — same
 kick / step / yield (DESIGN.md Scan). Do not add a shared `RtxScan` type.
 `#define` before `#include "….cch"` does not survive into the generated C

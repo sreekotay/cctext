@@ -1,0 +1,439 @@
+#!ccc ccs
+/*
+ * Columnar view geometry (linked TU; see grid.cch).
+ */
+#include <ccc/std/prelude.cch>
+#include <string.h>
+#include "utf8.cch"
+#include "grid.cch"
+
+static size_t rtx_grid_trim_cr(const char *s, size_t n) {
+    if (s && n > 0 && s[n - 1] == '\r') return n - 1;
+    return n;
+}
+
+static int rtx_grid_is_break(char c) {
+    return c == ' ' || c == '\t';
+}
+
+static int rtx_grid_byte_held(const unsigned char *hold, size_t n, size_t i) {
+    return hold && i < n && hold[i];
+}
+
+size_t rtx_grid_split(const char *s, size_t n, char delim, RtxGridField *out,
+                      size_t cap, const unsigned char *hold) {
+    size_t i = 0;
+    size_t nf = 0;
+    if (!s || !out || cap == 0) return 0;
+    n = rtx_grid_trim_cr(s, n);
+    if (delim == 0) delim = ',';
+    while (i <= n) {
+        size_t start = i;
+        while (i < n &&
+               !((s[i] == delim || s[i] == '\n') &&
+                 !rtx_grid_byte_held(hold, n, i)))
+            i++;
+        if (nf < cap) {
+            out[nf].lo = start;
+            out[nf].hi = i;
+            nf++;
+        } else {
+            out[cap - 1].hi = n;
+            return cap;
+        }
+        if (i >= n) break;
+        if (s[i] == delim) {
+            i++;
+            if (i >= n) {
+                if (nf < cap) {
+                    out[nf].lo = n;
+                    out[nf].hi = n;
+                    nf++;
+                }
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    if (nf == 0 && n == 0) {
+        out[0].lo = 0;
+        out[0].hi = 0;
+        return 1;
+    }
+    return nf;
+}
+
+/* Delim pick only. Record/field breaks use the window-lex string face. */
+static void rtx_grid_probe_count(const char *s, size_t n, size_t *comma,
+                                 size_t *tab, size_t *pipe) {
+    size_t i = 0;
+    int in_q = 0;
+    *comma = 0;
+    *tab = 0;
+    *pipe = 0;
+    if (!s) return;
+    n = rtx_grid_trim_cr(s, n);
+    while (i < n) {
+        char c = s[i];
+        if (c == '"') {
+            if (in_q && i + 1 < n && s[i + 1] == '"') {
+                i += 2;
+                continue;
+            }
+            in_q = !in_q;
+            i++;
+            continue;
+        }
+        if (!in_q) {
+            if (c == ',') (*comma)++;
+            else if (c == '\t') (*tab)++;
+            else if (c == '|') (*pipe)++;
+        }
+        i++;
+    }
+}
+
+char rtx_grid_probe(const char *s, size_t n) {
+    size_t comma, tab, pipe, best;
+    char d;
+    rtx_grid_probe_count(s, n, &comma, &tab, &pipe);
+    best = comma;
+    d = ',';
+    if (tab > best) {
+        best = tab;
+        d = '\t';
+    }
+    if (pipe > best) {
+        best = pipe;
+        d = '|';
+    }
+    if (best == 0) return 0;
+    return d;
+}
+
+char rtx_grid_delim_hint(const char *path) {
+    const char *dot;
+    if (!path || !path[0]) return 0;
+    dot = strrchr(path, '.');
+    if (!dot || !dot[1]) return 0;
+    if (strcmp(dot, ".tsv") == 0) return '\t';
+    if (strcmp(dot, ".psv") == 0 || strcmp(dot, ".pipe") == 0) return '|';
+    if (strcmp(dot, ".csv") == 0) return ',';
+    return 0;
+}
+
+char rtx_grid_pick_delim(const char *path, const char *sample, size_t n) {
+    char probed = rtx_grid_probe(sample, n);
+    char hint = rtx_grid_delim_hint(path);
+    if (probed) return probed;
+    if (hint) return hint;
+    return ',';
+}
+
+int rtx_grid_cols(const char *s, size_t n) {
+    if (!s || n == 0) return 0;
+    return rtx_utf8_cols(cc_slice_from_buffer((char *)s, n));
+}
+
+void rtx_grid_geom_init(RtxGridGeom *g, char delim) {
+    if (!g) return;
+    memset(g, 0, sizeof(*g));
+    g->delim = delim ? delim : ',';
+}
+
+static int rtx_grid_field_cols(const char *s, size_t n) {
+    size_t i = 0;
+    size_t line = 0;
+    int max = 0;
+    if (!s) return 0;
+    while (i <= n) {
+        if (i == n || s[i] == '\n') {
+            size_t hi = i;
+            int w;
+            if (hi > line && s[hi - 1] == '\r') hi--;
+            w = rtx_grid_cols(s + line, hi - line);
+            if (w > max) max = w;
+            if (i == n) break;
+            i++;
+            line = i;
+            continue;
+        }
+        i++;
+    }
+    return max;
+}
+
+void rtx_grid_geom_add(RtxGridGeom *g, const char *s, size_t n) {
+    RtxGridField f[RTX_GRID_FIELDS];
+    size_t nf, i;
+    if (!g || !s) return;
+    nf = rtx_grid_split(s, n, g->delim, f, RTX_GRID_FIELDS, g->span_hold);
+    if (nf > g->ncols) g->ncols = nf;
+    for (i = 0; i < nf; i++) {
+        int w = rtx_grid_field_cols(s + f[i].lo, f[i].hi - f[i].lo);
+        if (w > g->col_w[i]) g->col_w[i] = w;
+    }
+}
+
+int rtx_grid_geom_width(const RtxGridGeom *g) {
+    size_t i;
+    int w = 0;
+    if (!g || g->ncols == 0) return 0;
+    for (i = 0; i < g->ncols; i++) {
+        if (i) w += RTX_GRID_GAP;
+        w += g->col_w[i];
+    }
+    return w;
+}
+
+void rtx_grid_geom_fit(RtxGridGeom *g, int pane) {
+    size_t i;
+    int min_w = RTX_GRID_MIN_COL;
+    int cap;
+    if (!g || g->ncols == 0) return;
+    if (pane < min_w) pane = min_w;
+    cap = pane < RTX_GRID_MAX_COL ? pane : RTX_GRID_MAX_COL;
+    for (i = 0; i < g->ncols; i++) {
+        if (g->col_w[i] < min_w) g->col_w[i] = min_w;
+        if (g->col_w[i] > cap) g->col_w[i] = cap;
+    }
+}
+
+size_t rtx_grid_record_end(const char *s, size_t n, const unsigned char *hold) {
+    size_t i;
+    if (!s) return 0;
+    for (i = 0; i < n; i++) {
+        if (s[i] == '\n' && !rtx_grid_byte_held(hold, n, i)) return i;
+    }
+    return n;
+}
+
+size_t rtx_grid_first_line(const char *s, size_t n) {
+    return rtx_grid_record_end(s, n, NULL);
+}
+
+void rtx_grid_bind_span(RtxGridGeom *g, size_t base, size_t n) {
+    if (!g) return;
+    g->span_hold = NULL;
+    if (!g->hold || n == 0 || base < g->hold_from) return;
+    if (base - g->hold_from + n > g->hold_n) return;
+    g->span_hold = g->hold + (base - g->hold_from);
+}
+
+size_t rtx_grid_wrap_field(const char *s, size_t n, int width, RtxGridField *out,
+                           size_t cap) {
+    size_t i = 0;
+    size_t nf = 0;
+    char[:] bytes;
+    if (!s || !out || cap == 0) return 0;
+    if (width < 1) width = 1;
+    bytes = cc_slice_from_buffer((char *)s, n);
+    if (n == 0) {
+        out[0].lo = 0;
+        out[0].hi = 0;
+        return 1;
+    }
+    while (i < n && nf < cap) {
+        size_t row_start = i;
+        int cols = 0;
+        size_t last_br = i;
+        int last_br_cols = 0;
+        while (i < n) {
+            RtxUtf8Cl cl;
+            size_t step;
+            int pc;
+            if (s[i] == '\n' || s[i] == '\r') break;
+            cl = rtx_utf8_cluster(bytes, i);
+            step = cl.n ? cl.n : 1;
+            pc = cl.cols > 0 ? cl.cols : 1;
+            if (cols > 0 && cols + pc > width) {
+                if (last_br > row_start) {
+                    i = last_br;
+                    cols = last_br_cols;
+                }
+                break;
+            }
+            cols += pc;
+            i += step;
+            if (step == 1 && rtx_grid_is_break(s[i - 1])) {
+                last_br = i;
+                last_br_cols = cols;
+            }
+        }
+        if (i == row_start && i < n && s[i] != '\n' && s[i] != '\r') {
+            RtxUtf8Cl cl = rtx_utf8_cluster(bytes, i);
+            i += cl.n ? cl.n : 1;
+        }
+        if (nf + 1 == cap && i < n) i = n;
+        out[nf].lo = row_start;
+        out[nf].hi = i;
+        nf++;
+        if (i < n && (s[i] == '\n' || s[i] == '\r'))
+            i = (s[i] == '\r' && i + 1 < n && s[i + 1] == '\n') ? i + 2 : i + 1;
+    }
+    return nf ? nf : 1;
+}
+
+static size_t rtx_grid_fields(const char *s, size_t n, const RtxGridGeom *g,
+                              RtxGridField *f) {
+    if (!g) return 0;
+    return rtx_grid_split(s, n, g->delim, f, RTX_GRID_FIELDS, g->span_hold);
+}
+
+int rtx_grid_record_height(const char *s, size_t n, const RtxGridGeom *g) {
+    RtxGridField f[RTX_GRID_FIELDS];
+    size_t nf, i;
+    int h = 1;
+    if (!g || g->ncols == 0) return 1;
+    nf = rtx_grid_fields(s, n, g, f);
+    for (i = 0; i < nf && i < g->ncols; i++) {
+        RtxGridField wr[RTX_GRID_WRAP_MAX];
+        size_t nh;
+        int w = g->col_w[i];
+        if (w <= 0) continue;
+        nh = rtx_grid_wrap_field(s + f[i].lo, f[i].hi - f[i].lo, w, wr,
+                                 RTX_GRID_WRAP_MAX);
+        if ((int)nh > h) h = (int)nh;
+    }
+    return h < 1 ? 1 : h;
+}
+
+int rtx_grid_cell_wrap(const char *s, size_t n, const RtxGridGeom *g, size_t col,
+                       int wr, RtxGridField *out) {
+    RtxGridField f[RTX_GRID_FIELDS];
+    RtxGridField lines[RTX_GRID_WRAP_MAX];
+    size_t nf, nh;
+    if (!out) return 0;
+    out->lo = 0;
+    out->hi = 0;
+    if (!g || !s || col >= g->ncols || wr < 0) return 0;
+    nf = rtx_grid_fields(s, n, g, f);
+    if (col >= nf) return 0;
+    nh = rtx_grid_wrap_field(s + f[col].lo, f[col].hi - f[col].lo, g->col_w[col],
+                             lines, RTX_GRID_WRAP_MAX);
+    if ((size_t)wr >= nh) return 0;
+    out->lo = f[col].lo + lines[wr].lo;
+    out->hi = f[col].lo + lines[wr].hi;
+    return 1;
+}
+
+/* Physical line of this wrap (record start + NLs before the wrap). */
+size_t rtx_grid_wrap_line(size_t rec_line, const char *s, size_t n,
+                          const RtxGridGeom *g, int wr) {
+    RtxGridField cell;
+    size_t c, k, lo = 0, nls = 0;
+    int found = 0;
+    if (!s || !g || wr <= 0) return rec_line;
+    for (c = 0; c < g->ncols; c++) {
+        if (rtx_grid_cell_wrap(s, n, g, c, wr, &cell) && cell.hi > cell.lo) {
+            if (!found || cell.lo < lo) {
+                lo = cell.lo;
+                found = 1;
+            }
+        }
+    }
+    if (!found) return rec_line;
+    for (k = 0; k < lo && k < n; k++)
+        if (s[k] == '\n') nls++;
+    return rec_line + nls;
+}
+
+int rtx_grid_wrap_at(const char *s, size_t n, const RtxGridGeom *g, size_t off) {
+    RtxGridField f[RTX_GRID_FIELDS];
+    size_t nf, c;
+    if (!g || !s) return 0;
+    n = rtx_grid_trim_cr(s, n);
+    if (off > n) off = n;
+    nf = rtx_grid_fields(s, n, g, f);
+    for (c = 0; c < nf && c < g->ncols; c++) {
+        if (off >= f[c].lo && off <= f[c].hi) {
+            RtxGridField lines[RTX_GRID_WRAP_MAX];
+            size_t nh, k;
+            size_t local = off - f[c].lo;
+            nh = rtx_grid_wrap_field(s + f[c].lo, f[c].hi - f[c].lo, g->col_w[c],
+                                     lines, RTX_GRID_WRAP_MAX);
+            for (k = 0; k < nh; k++) {
+                if (local < lines[k].hi || k + 1 == nh) return (int)k;
+            }
+            return 0;
+        }
+    }
+    return rtx_grid_record_height(s, n, g) - 1;
+}
+
+double rtx_grid_x_of(const char *s, size_t n, const RtxGridGeom *g, size_t off) {
+    RtxGridField f[RTX_GRID_FIELDS];
+    size_t nf, c;
+    double x = 0;
+    if (!g || !s) return 0;
+    n = rtx_grid_trim_cr(s, n);
+    if (off > n) off = n;
+    nf = rtx_grid_fields(s, n, g, f);
+    for (c = 0; c < g->ncols; c++) {
+        int w = g->col_w[c];
+        if (w <= 0) break;
+        if (c < nf && off >= f[c].lo && off <= f[c].hi) {
+            RtxGridField cell;
+            size_t local = off - f[c].lo;
+            int wr = rtx_grid_wrap_at(s, n, g, off);
+            if (rtx_grid_cell_wrap(s, n, g, c, wr, &cell) && local >= cell.lo - f[c].lo) {
+                size_t rel = (cell.lo > f[c].lo) ? (cell.lo - f[c].lo) : 0;
+                if (local > rel)
+                    x += (double)rtx_grid_cols(s + cell.lo, local - rel);
+            }
+            return x;
+        }
+        x += (double)w + (double)RTX_GRID_GAP;
+    }
+    return x;
+}
+
+size_t rtx_grid_hit(const char *s, size_t n, const RtxGridGeom *g, int wr,
+                    double x) {
+    RtxGridField f[RTX_GRID_FIELDS];
+    size_t nf, c;
+    double cx = 0;
+    if (!g || !s) return 0;
+    n = rtx_grid_trim_cr(s, n);
+    if (wr < 0) wr = 0;
+    nf = rtx_grid_fields(s, n, g, f);
+    if (x < 0) x = 0;
+    for (c = 0; c < g->ncols; c++) {
+        int w = g->col_w[c];
+        double next;
+        if (w <= 0) break;
+        next = cx + (double)w;
+        if (x < next + (double)RTX_GRID_GAP || c + 1 == g->ncols) {
+            RtxGridField cell;
+            if (c >= nf) return n;
+            if (!rtx_grid_cell_wrap(s, n, g, c, wr, &cell)) {
+                return f[c].hi;
+            }
+            {
+                size_t k = cell.lo;
+                double lx = x - cx;
+                char[:] bytes = cc_slice_from_buffer((char *)s, n);
+                double acc = 0;
+                if (lx <= 0) return cell.lo;
+                while (k < cell.hi) {
+                    RtxUtf8Cl cl = rtx_utf8_cluster(bytes, k);
+                    size_t step = cl.n ? cl.n : 1;
+                    int pc = cl.cols > 0 ? cl.cols : 1;
+                    if (acc + (double)pc / 2.0 >= lx) return k;
+                    acc += (double)pc;
+                    k += step;
+                }
+                return cell.hi;
+            }
+        }
+        cx = next + (double)RTX_GRID_GAP;
+    }
+    return n;
+}
+
+const char *rtx_grid_delim_name(char delim) {
+    if (delim == '\t') return "tab";
+    if (delim == '|') return "pipe";
+    return "csv";
+}

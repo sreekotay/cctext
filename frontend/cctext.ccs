@@ -2,7 +2,7 @@
 /*
  * cctext — POSIX console frontend. Same document/layout as cctext-ray.
  *
- *   cctext [--version] [--wrap|--hex|--view=default|wrap|hex] [file ...]
+ *   cctext [--version] [--wrap|--hex|--grid|--view=default|wrap|hex|grid] [file ...]
  *
  *   Esc help menu   g / Ctrl-G jump   f / Ctrl-F find   o / Ctrl-O browse
  *   browse ^O this app   browse e the other app
@@ -45,6 +45,7 @@ char g_status[160];
 static volatile sig_atomic_t g_winch;
 static int g_busy_frame;
 static long g_isle_paint_at;
+static size_t g_browse_paint_cur = (size_t)-1;
 /* Status-row spinner while piece-tree scan/save runs (blocking). */
 static void cctext_busy(void *ctx, const char *label, int pct) {
     struct winsize ws;
@@ -83,7 +84,8 @@ static char g_outbuf[65536];
 
 static void cctext_restore(void) {
     if (g_raw) tcsetattr(STDIN_FILENO, TCSANOW, &g_old);
-    fputs("\x1b[?2026l\x1b[?7h\x1b[?1002l\x1b[?1000l\x1b[?1006l"
+    cctext_osx_stop();
+    fputs("\x1b[?2026l\x1b[?7h\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?1004l"
           "\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l", stdout);
     fflush(stdout);
     g_raw = 0;
@@ -125,8 +127,11 @@ static int cctext_raw(void) {
         sigemptyset(&sa.sa_mask);
         sigaction(SIGWINCH, &sa, NULL);
     }
-    fputs("\x1b[?1049h\x1b[?25l\x1b[1 q\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h",
+    fputs("\x1b[?1049h\x1b[?25l\x1b[1 q\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+          "\x1b[?1004h",
           stdout);
+    fflush(stdout);
+    cctext_osx_start();
     atexit(cctext_restore);
     return 1;
 }
@@ -171,6 +176,22 @@ int cctext_pending(void) {
         return -1;
     }
     return c;
+}
+
+/* Focus/mouse CSI often arrives as ESC, then `[`. A bare pending()
+ * would treat that as Help and close the boot browser. */
+static int cctext_pending_wait(void) {
+    int c;
+    fd_set rfds;
+    struct timeval tv;
+    c = cctext_pending();
+    if (c >= 0) return c;
+    FD_ZERO(&rfds);
+    FD_SET(STDIN_FILENO, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 40000;
+    if (select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
+    return cctext_pending();
 }
 
 static int cctext_isle_yield(void) {
@@ -225,17 +246,21 @@ static int cctext_parse_mouse(void) {
     g_shift = (btn & 4) ? 1 : 0;
     g_alt = (btn & 8) ? 1 : 0;
     {
-        int code = btn & ~(4 | 8 | 16);
+        /* 4/8/16 = shift/alt/ctrl; 32 = motion. Wheel is 64..67. */
+        int code = btn & ~(4 | 8 | 16 | 32);
+        int motion = (btn & 32) ? 1 : 0;
         if (code == 64) return KEY_WHEEL_UP;
         if (code == 65) return KEY_WHEEL_DOWN;
-        if (code == 32 || code == 0) {
+        if (code == 66) return KEY_WHEEL_LEFT;
+        if (code == 67) return KEY_WHEEL_RIGHT;
+        if (code == 0) {
             if (!press) {
                 g_mouse_drag = 0;
                 g_drag_edge = 0;
                 return KEY_NONE;
             }
             g_mouse_drag = 1;
-            return (code == 32) ? KEY_MOUSE_DRAG : KEY_MOUSE;
+            return motion ? KEY_MOUSE_DRAG : KEY_MOUSE;
         }
     }
     return KEY_NONE;
@@ -254,6 +279,14 @@ static int cctext_with_mods(int key, int mods) {
 }
 
 static int cctext_csi_letter(int d, int n, int mods) {
+    if (d == 'I') {
+        cctext_osx_focus(1);
+        return KEY_NONE;
+    }
+    if (d == 'O') {
+        cctext_osx_focus(0);
+        return KEY_NONE;
+    }
     if (d == 'A') return cctext_with_mods(KEY_UP, mods);
     if (d == 'B') return cctext_with_mods(KEY_DOWN, mods);
     if (d == 'C') return cctext_with_mods(KEY_RIGHT, mods);
@@ -272,7 +305,8 @@ static int cctext_parse_csi(int first) {
     int b = first;
     if (b < 0) b = getchar();
     if (b == '<') return cctext_parse_mouse();
-    if (b == 'A' || b == 'B' || b == 'C' || b == 'D' || b == 'H' || b == 'F') {
+    if (b == 'A' || b == 'B' || b == 'C' || b == 'D' || b == 'H' || b == 'F' ||
+        b == 'I' || b == 'O') {
         return cctext_csi_letter(b, 0, 0);
     }
     if (b >= '0' && b <= '9') {
@@ -294,38 +328,58 @@ static int cctext_parse_csi(int first) {
     return KEY_NONE;
 }
 
+/* 1 stdin, 2 session scroll tap, 0 timeout, -1 error. */
+static int cctext_wait_in(int wait_us) {
+    fd_set rfds;
+    struct timeval tv;
+    int n;
+    int sfd = cctext_osx_scroll_fd();
+    int maxfd = STDIN_FILENO;
+    FD_ZERO(&rfds);
+    FD_SET(STDIN_FILENO, &rfds);
+    if (sfd >= 0) {
+        FD_SET(sfd, &rfds);
+        if (sfd > maxfd) maxfd = sfd;
+    }
+    tv.tv_sec = 0;
+    tv.tv_usec = wait_us < 0 ? 400000 : wait_us;
+    n = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+    if (n < 0) return -1;
+    if (n == 0) return 0;
+    if (FD_ISSET(STDIN_FILENO, &rfds)) return 1;
+    if (sfd >= 0 && FD_ISSET(sfd, &rfds)) return 2;
+    return 0;
+}
+
+static int cctext_osx_wheel(void) {
+    int d = cctext_osx_scroll_dir();
+    g_shift = 0;
+    g_alt = 0;
+    if (d < 0) return KEY_WHEEL_LEFT;
+    if (d > 0) return KEY_WHEEL_RIGHT;
+    return KEY_NONE;
+}
+
 static int cctext_read(int *ch_out, int wait_us) {
     int c;
     if (g_winch) return KEY_NONE;
     /* Terminals clamp the pointer to row 1..rows. While a drag sits on
      * the first or last text row, poll so we keep scrolling without a wiggle. */
     if (g_mouse_drag && g_drag_edge) {
-        fd_set rfds;
-        struct timeval tv;
-        int n;
-        FD_ZERO(&rfds);
-        FD_SET(STDIN_FILENO, &rfds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 32000;
-        n = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+        int n = cctext_wait_in(32000);
         if (n == 0) return KEY_MOUSE_DRAG;
         if (n < 0) return KEY_NONE;
+        if (n == 2) return cctext_osx_wheel();
     } else {
         /* Wake on SIGWINCH. Do not select if stdio already holds a CSI byte. */
         int peek = cctext_pending();
         if (peek >= 0) {
             ungetc(peek, stdin);
         } else {
-            fd_set rfds;
-            struct timeval tv;
-            int n;
-            FD_ZERO(&rfds);
-            FD_SET(STDIN_FILENO, &rfds);
-            tv.tv_sec = 0;
-            tv.tv_usec = wait_us < 0 ? 400000 : wait_us;
-            n = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+            int n = cctext_wait_in(wait_us);
             if (n < 0) return (errno == EINTR) ? KEY_NONE : KEY_QUIT;
             if (n == 0) return KEY_NONE;
+            if (n == 2) return cctext_osx_wheel();
         }
     }
     if (g_winch) return KEY_NONE;
@@ -359,7 +413,7 @@ static int cctext_read(int *ch_out, int wait_us) {
     if (c == 127 || c == 8) return KEY_BACKSPACE;
     if (c == '\r' || c == '\n') return KEY_ENTER;
     if (c == 0x1b) {
-        int a = cctext_pending();
+        int a = cctext_pending_wait();
         if (a < 0) return KEY_HELP;
         if (a == 0x1b) {
             ungetc(a, stdin);
@@ -378,10 +432,14 @@ static int cctext_read(int *ch_out, int wait_us) {
         if (a == '[') return cctext_parse_csi(-1);
         return cctext_cmd_letter(a);
     }
-    /* Leftover SGR mouse after a botched ESC: `[<32;71;32M` or `<32;…M`. */
+    /* Leftover CSI after a botched ESC: mouse or 1004 focus. */
     if (c == '[') {
         int n = cctext_pending();
         if (n == '<') return cctext_parse_mouse();
+        if (n == 'I' || n == 'O') {
+            cctext_osx_focus(n == 'I');
+            return KEY_NONE;
+        }
         if (n >= 0) ungetc(n, stdin);
     }
     if (c == '<') {
@@ -445,7 +503,10 @@ int main(int argc, char **argv) {
     }
     if (cli.nfiles == 0) {
         w.open_files(0, NULL) !>;
-        if (w.len) rtx_layout_set_view(&w.bufs[0].layout, cli.view);
+        if (w.len) {
+            rtx_layout_set_view(&w.bufs[0].layout, cli.view);
+            rtx_buf_grid_bind(&w.bufs[0]);
+        }
     } else {
         w.open_files(cli.nfiles, filebuf) !>;
         w.set_views(cli.file_view, cli.nfiles);
@@ -514,16 +575,24 @@ int main(int argc, char **argv) {
             int isle_on = act && rtx_line_isle_pumping(&act->doc.tree);
             int want_on = act && rtx_line_want_pumping(&act->doc.tree);
             int prefix_on = act && rtx_line_prefix_pumping(&act->doc.tree);
+            int scan_on = RtxWs_browse_scanning(&w);
+            int size_only = RtxWs_browse_busy(&w) && !scan_on;
+            int bmove = w.nav[w.focus].on &&
+                        w.nav[w.focus].cur != g_browse_paint_cur;
             int stale = 0;
             long now = rtx_ui_now_ms();
             if (act && act->seek_valid && act->layout.len &&
                 act->layout.rows[0].byte_start != act->seek_off)
                 stale = 1;
             if (!act || !act->layout.len) stale = 1;
+            if (w.nav[w.focus].on) stale = 0;
             /* During a pump the window text does not change — only the
-             * status %. A full wrap redraw here is what made 8G feel slow. */
-            if ((!isle_on && !want_on && !prefix_on) || stale ||
-                g_isle_paint_at == 0) {
+             * status %. A full wrap redraw here is what made 8G feel slow.
+             * Folder size is the same: paint on move, then every 50 ms. */
+            if ((!isle_on && !want_on && !prefix_on && !size_only) || stale ||
+                g_isle_paint_at == 0 || bmove ||
+                (size_only &&
+                 now - g_isle_paint_at >= (long)RTX_LINE_ISLE_PAINT_MS)) {
                 for (p = 0; p < w.npanes; p++) {
                     RtxBuf *b = &w.bufs[w.pane[p]];
                     double pw = (double)cctext_pane_cols(&w, cols, p);
@@ -539,6 +608,7 @@ int main(int argc, char **argv) {
                 }
                 cctext_draw(&w, &ui, rows, cols);
                 g_isle_paint_at = now;
+                if (w.nav[w.focus].on) g_browse_paint_cur = w.nav[w.focus].cur;
             }
             if (want_on)
                 cctext_draw_jump_status(&ui, &act->doc, rows);
@@ -548,8 +618,9 @@ int main(int argc, char **argv) {
         skip_reveal = 0;
         kind = cctext_read(&ch,
                            (rtx_ui_work_pumping(&ui, act ? &act->doc : NULL)
-                            || RtxWs_browse_busy(&w) || ui.stats)
-                               ? 0 : 400000);
+                            || RtxWs_browse_scanning(&w) || ui.stats)
+                               ? 0
+                               : (RtxWs_browse_busy(&w) ? 16000 : 400000));
         if (kind != KEY_NONE) rtx_ui_blink_show(&ui);
         act = w.active();
         if (!act) break;

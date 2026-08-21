@@ -1,0 +1,193 @@
+#!ccc ccs
+/*
+ * Darwin TTY: modifier key state + a listen-only session scroll tap.
+ * Cursor / VS Code (xterm.js) drop Shift+wheel and tilt (deltaX only).
+ * iTerm already sends SGR 66/67. Stubs on other hosts.
+ */
+#include <ccc/std/prelude.cch>
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#if defined(__APPLE__)
+#include <ApplicationServices/ApplicationServices.h>
+#include <pthread.h>
+#include <signal.h>
+
+static int g_pipe[2] = {-1, -1};
+static CFMachPortRef g_tap;
+static CFRunLoopRef volatile g_rl;
+static pthread_t g_th;
+static volatile sig_atomic_t g_focus = 1;
+static volatile sig_atomic_t g_run;
+static double g_acc;
+
+static int cctext_osx_is_ide(void) {
+    const char *p = getenv("TERM_PROGRAM");
+    return p && strcmp(p, "vscode") == 0;
+}
+
+static int cctext_osx_vk(unsigned short vk) {
+    return CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, vk)
+               ? 1
+               : 0;
+}
+
+int cctext_osx_shift_down(void) {
+    return cctext_osx_vk(0x38) || cctext_osx_vk(0x3C);
+}
+
+int cctext_osx_alt_down(void) {
+    return cctext_osx_vk(0x3A) || cctext_osx_vk(0x3D);
+}
+
+void cctext_osx_focus(int on) {
+    g_focus = on ? 1 : 0;
+}
+
+int cctext_osx_scroll_fd(void) {
+    return g_pipe[0];
+}
+
+int cctext_osx_scroll_dir(void) {
+    unsigned char b;
+    int dir = 0;
+    if (g_pipe[0] < 0) return 0;
+    while (read(g_pipe[0], &b, 1) == 1) {
+        if (b == 1) dir--;
+        else if (b == 2) dir++;
+    }
+    if (dir < 0) return -1;
+    if (dir > 0) return 1;
+    return 0;
+}
+
+static void cctext_osx_emit(int right) {
+    unsigned char b = right ? 2 : 1;
+    if (g_pipe[1] < 0) return;
+    if (write(g_pipe[1], &b, 1) < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+        return;
+}
+
+static CGEventRef cctext_osx_on_scroll(CGEventTapProxy proxy, CGEventType type,
+                                       CGEventRef event, void *ref) {
+    int64_t ax1, ax2;
+    (void)proxy;
+    (void)ref;
+    if (type == kCGEventTapDisabledByTimeout ||
+        type == kCGEventTapDisabledByUserInput) {
+        if (g_tap) CGEventTapEnable(g_tap, true);
+        return event;
+    }
+    if (!g_focus || type != kCGEventScrollWheel) return event;
+    ax2 = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2);
+    ax1 = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
+    if (llabs(ax2) > llabs(ax1)) {
+        /* Vertical leftover still reaches xterm.js; HID Shift remaps it. */
+        if (ax1 != 0 && cctext_osx_shift_down()) return event;
+        cctext_osx_emit(ax2 < 0);
+        g_acc = 0;
+        return event;
+    }
+    if (ax1 == 0 && ax2 == 0) {
+        double px = CGEventGetDoubleValueField(
+            event, kCGScrollWheelEventPointDeltaAxis2);
+        double py = CGEventGetDoubleValueField(
+            event, kCGScrollWheelEventPointDeltaAxis1);
+        if (fabs(px) <= fabs(py)) return event;
+        g_acc += px;
+        while (g_acc >= 80.0) {
+            cctext_osx_emit(0);
+            g_acc -= 80.0;
+        }
+        while (g_acc <= -80.0) {
+            cctext_osx_emit(1);
+            g_acc += 80.0;
+        }
+    }
+    return event;
+}
+
+static void *cctext_osx_loop(void *arg) {
+    CFRunLoopSourceRef src;
+    (void)arg;
+    src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, g_tap, 0);
+    if (!src) return NULL;
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopCommonModes);
+    g_rl = CFRunLoopGetCurrent();
+    CGEventTapEnable(g_tap, true);
+    CFRunLoopRun();
+    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), src, kCFRunLoopCommonModes);
+    CFRelease(src);
+    g_rl = NULL;
+    return NULL;
+}
+
+void cctext_osx_start(void) {
+    CGEventMask mask;
+    int flags;
+    if (g_tap || !cctext_osx_is_ide()) return;
+    if (pipe(g_pipe) != 0) {
+        g_pipe[0] = g_pipe[1] = -1;
+        return;
+    }
+    flags = fcntl(g_pipe[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(g_pipe[0], F_SETFL, flags | O_NONBLOCK);
+    flags = fcntl(g_pipe[1], F_GETFL, 0);
+    if (flags >= 0) fcntl(g_pipe[1], F_SETFL, flags | O_NONBLOCK);
+    mask = CGEventMaskBit(kCGEventScrollWheel);
+    g_tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                             kCGEventTapOptionListenOnly, mask,
+                             cctext_osx_on_scroll, NULL);
+    if (!g_tap) {
+        close(g_pipe[0]);
+        close(g_pipe[1]);
+        g_pipe[0] = g_pipe[1] = -1;
+        return;
+    }
+    g_run = 1;
+    g_focus = 1;
+    g_acc = 0;
+    g_rl = NULL;
+    if (pthread_create(&g_th, NULL, cctext_osx_loop, NULL) != 0) {
+        CFRelease(g_tap);
+        g_tap = NULL;
+        close(g_pipe[0]);
+        close(g_pipe[1]);
+        g_pipe[0] = g_pipe[1] = -1;
+        g_run = 0;
+    }
+}
+
+void cctext_osx_stop(void) {
+    int i;
+    for (i = 0; i < 50 && g_run && !g_rl; i++) usleep(1000);
+    if (g_rl) CFRunLoopStop(g_rl);
+    if (g_run) {
+        pthread_join(g_th, NULL);
+        g_run = 0;
+    }
+    if (g_tap) {
+        CFRelease(g_tap);
+        g_tap = NULL;
+    }
+    g_rl = NULL;
+    if (g_pipe[0] >= 0) close(g_pipe[0]);
+    if (g_pipe[1] >= 0) close(g_pipe[1]);
+    g_pipe[0] = g_pipe[1] = -1;
+}
+
+#else
+
+int cctext_osx_shift_down(void) { return 0; }
+int cctext_osx_alt_down(void) { return 0; }
+void cctext_osx_focus(int on) { (void)on; }
+int cctext_osx_scroll_fd(void) { return -1; }
+int cctext_osx_scroll_dir(void) { return 0; }
+void cctext_osx_start(void) { }
+void cctext_osx_stop(void) { }
+
+#endif

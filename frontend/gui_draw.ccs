@@ -138,12 +138,30 @@ int gui_text_ph(int hh, int top, int find_on) {
     return ph > 0 ? ph : 0;
 }
 
+int gui_scroll_x_h(RtxBuf *b) {
+    double w;
+    if (!b) return 0;
+    w = b->layout_width > 0.0 ? b->layout_width : 1.0;
+    return b->scroll_x_needed(w) ? GUI_SCROLL_W : 0;
+}
+
 int gui_scroll_hit(int mx, int my, int x0, int y0, int pane_w, int ph,
                           RtxBuf *b, int vis_rows) {
     int sx;
+    int hx;
+    int vph;
     if (!b || !b->scroll_needed(vis_rows)) return 0;
+    hx = gui_scroll_x_h(b);
+    vph = ph > hx ? ph - hx : ph;
     sx = x0 + pane_w - GUI_SCROLL_W;
-    return ph > 0 && mx >= sx && mx < x0 + pane_w && my >= y0 && my < y0 + ph;
+    return vph > 0 && mx >= sx && mx < x0 + pane_w && my >= y0 && my < y0 + vph;
+}
+
+int gui_scroll_x_hit(int mx, int my, int x0, int y0, int pane_w, int ph,
+                     RtxBuf *b) {
+    int hx = gui_scroll_x_h(b);
+    if (hx < 1 || ph < 1) return 0;
+    return my >= y0 + ph - hx && my < y0 + ph && mx >= x0 && mx < x0 + pane_w;
 }
 
 float gui_gutter_px(GuiFonts *fonts, RtxBuf *b, int vis_rows) {
@@ -154,7 +172,25 @@ float gui_gutter_px(GuiFonts *fonts, RtxBuf *b, int vis_rows) {
 double gui_text_w(GuiFonts *fonts, RtxBuf *b, int pane_w, int vis_rows) {
     int rw = (b && b->scroll_needed(vis_rows)) ? GUI_SCROLL_W : 0;
     double w = (double)pane_w - (double)gui_gutter_px(fonts, b, vis_rows) - (double)rw;
-    return w < 8.0 ? 8.0 : w;
+    if (w < 8.0) w = 8.0;
+    /* Grid wrap/fit is in cluster columns (same as TUI). */
+    if (b && rtx_layout_is_grid(&b->layout) && fonts) {
+        Vector2 m0 = MeasureTextEx(fonts->mono, "0", 14, 0);
+        float cw = m0.x > 1.0f ? m0.x : 8.0f;
+        int cols = (int)(w / (double)cw);
+        if (cols < RTX_GRID_MIN_COL) cols = RTX_GRID_MIN_COL;
+        return (double)cols;
+    }
+    return w;
+}
+
+double gui_layout_hit_x(GuiFonts *fonts, RtxBuf *b, double px) {
+    Vector2 m0;
+    float cw;
+    if (!b || !rtx_layout_is_grid(&b->layout) || !fonts) return px;
+    m0 = MeasureTextEx(fonts->mono, "0", 14, 0);
+    cw = m0.x > 1.0f ? m0.x : 8.0f;
+    return px / (double)cw;
 }
 
 void gui_draw_stats(GuiFonts *fonts, RtxBuf *b, int ww, int hh) {
@@ -779,6 +815,228 @@ static void gui_draw_browse(RtxBrowse *br, const RtxUi *ui, GuiFonts *fonts, int
     }
 }
 
+static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focused,
+                              int x0, int y0, int pw, int ph) {
+    size_t i;
+    double acc = 0;
+    int has = b->doc.has_sel();
+    int vis_rows = ph > 0 ? (int)((float)ph / 18.0f) : 32;
+    float gpx = gui_gutter_px(fonts, b, vis_rows);
+    Vector2 m0;
+    float cw;
+    @errhandler(CCError e) {
+        (void)e;
+        return;
+    }
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return;
+    }
+    m0 = MeasureTextEx(fonts->mono, "0", 14, 0);
+    cw = m0.x > 1.0f ? m0.x : 8.0f;
+    if (b->layout.grid_hdr_on) {
+        RtxVisRow head;
+        double y = (double)y0;
+        int span_ok = 1;
+        cc_arena_stack(hscratch, RTX_FRAME_SCRATCH);
+        char[:] hbytes = cc_slice_empty();
+        head.byte_start = 0;
+        head.byte_len = b->layout.grid_hdr_end;
+        head.line = 0;
+        head.wrap_i = 0;
+        head.width = 0;
+        head.height = 18.0;
+        head.sec = RTX_SEC_CODE;
+        acc += head.height;
+        DrawRectangle(x0, y0, pw, (int)head.height, (Color){36, 36, 40, 255});
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                span_ok = 0;
+            }
+            hbytes = b->scratch_span(&hscratch, 0, head.byte_len) !>;
+        }
+        if (span_ok) {
+            size_t c;
+            double x = (double)x0 + (double)gpx - (double)b->left_col * (double)cw;
+            DrawTextEx(fonts->mono, "1",
+                       (Vector2){(float)x0 + (focused ? 4.0f : 0), (float)y},
+                       13, 0,
+                       focused ? (Color){200, 204, 216, 255}
+                               : (Color){100, 104, 116, 255});
+            for (c = 0; c < b->layout.grid.ncols; c++) {
+                RtxGridField cell;
+                int ccols = b->layout.grid.col_w[c];
+                int used_c = 0;
+                if (ccols <= 0) break;
+                rtx_grid_bind_span(&b->layout.grid, 0, hbytes.len);
+                if (!rtx_grid_cell_wrap(hbytes.ptr, hbytes.len, &b->layout.grid, c,
+                                        0, &cell)) {
+                    cell.lo = 0;
+                    cell.hi = 0;
+                }
+                {
+                    size_t k = cell.lo;
+                    while (k < cell.hi && used_c < ccols) {
+                        RtxUtf8Cl cl = rtx_utf8_cluster(hbytes, k);
+                        size_t step = cl.n ? cl.n : 1;
+                        size_t off = k;
+                        RtxStyle st = b->doc.style_at(off);
+                        char tmp[RTX_UTF8_LOOK + 1];
+                        int pn, pc;
+                        if (step > RTX_UTF8_LOOK) step = RTX_UTF8_LOOK;
+                        pn = rtx_utf8_term_put(cl.cp, hbytes.ptr + k, step, tmp,
+                                               RTX_UTF8_LOOK);
+                        pc = rtx_utf8_term_cols(cl.cp, cl.cols);
+                        if (pc < 1) pc = 1;
+                        if (used_c + pc > ccols) break;
+                        if (pn > 0) {
+                            tmp[pn] = 0;
+                            if (has && (b->doc.sel_covers(off) !>)) {
+                                DrawRectangle((int)x, (int)y,
+                                              (int)(cw * (float)pc) + 1,
+                                              (int)head.height,
+                                              (Color){40, 70, 120, 255});
+                            }
+                            if (rtx_ui_here(ui, focused, b->doc.caret == off)) {
+                                DrawRectangle((int)x, (int)y, 2, (int)head.height,
+                                              (Color){255, 200, 80, 255});
+                            }
+                            DrawTextEx(gui_font(fonts, st, head.sec), tmp,
+                                       (Vector2){(float)x, (float)y},
+                                       gui_size(fonts, st, head.sec), 0,
+                                       gui_hl_color(st.scope));
+                        }
+                        x += (double)cw * (double)pc;
+                        used_c += pc;
+                        k += step;
+                    }
+                }
+                while (used_c < ccols) {
+                    x += (double)cw;
+                    used_c++;
+                }
+                if (c + 1 < b->layout.grid.ncols) x += (double)cw;
+            }
+        }
+        (void)y;
+    }
+    for (i = b->top_wrap; i < b->layout.len; i++) {
+        RtxVisRow *row = &b->layout.rows[i];
+        double y = (double)y0 + acc;
+        acc += row->height;
+        if (y + row->height < (double)y0) continue;
+        if (y > (double)(y0 + ph)) break;
+        {
+            size_t c;
+            double x = (double)x0 + (double)gpx - (double)b->left_col * (double)cw;
+            int show_ln = 1;
+            int span_ok = 1;
+            cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+            char[:] gbytes = cc_slice_empty();
+            {
+                @errhandler(CCError e) {
+                    (void)e;
+                    span_ok = 0;
+                }
+                gbytes = b->scratch_span(&scratch, row->byte_start, row->byte_len) !>;
+            }
+            if (span_ok) {
+                size_t gl;
+                rtx_grid_bind_span(&b->layout.grid, row->byte_start, gbytes.len);
+                gl = rtx_grid_wrap_line(row->line, gbytes.ptr, gbytes.len,
+                                        &b->layout.grid, (int)row->wrap_i);
+                if (row->wrap_i > 0) {
+                    size_t pgl = rtx_grid_wrap_line(row->line, gbytes.ptr,
+                                                    gbytes.len, &b->layout.grid,
+                                                    (int)row->wrap_i - 1);
+                    show_ln = (gl != pgl);
+                }
+                if (show_ln) {
+                char ln[16];
+                size_t abs = 0, plus = 0;
+                int gap = rtx_gutter_gap(b, row->byte_start, gl, &abs, &plus);
+                if (gap) snprintf(ln, sizeof(ln), gap < 0 ? "-%zu" : "+%zu", plus);
+                else snprintf(ln, sizeof(ln), "%zu", abs);
+                DrawTextEx(fonts->mono, ln,
+                           (Vector2){(float)x0 + (focused ? 4.0f : 0), (float)y},
+                           13, 0,
+                           gap ? (Color){220, 70, 70, 255}
+                               : (focused ? (Color){168, 172, 184, 255}
+                                          : (Color){78, 82, 94, 255}));
+                }
+            }
+            char[:] bytes = cc_slice_empty();
+            {
+                @errhandler(CCError e) {
+                    (void)e;
+                    span_ok = 0;
+                }
+                bytes = b->scratch_span(&scratch, row->byte_start, row->byte_len) !>;
+            }
+            if (!span_ok) continue;
+            for (c = 0; c < b->layout.grid.ncols; c++) {
+                RtxGridField cell;
+                int ccols = b->layout.grid.col_w[c];
+                int used_c = 0;
+                if (ccols <= 0) break;
+                rtx_grid_bind_span(&b->layout.grid, row->byte_start, bytes.len);
+                if (!rtx_grid_cell_wrap(bytes.ptr, bytes.len, &b->layout.grid, c,
+                                        (int)row->wrap_i, &cell)) {
+                    cell.lo = 0;
+                    cell.hi = 0;
+                }
+                {
+                    size_t k = cell.lo;
+                    while (k < cell.hi && used_c < ccols) {
+                        RtxUtf8Cl cl = rtx_utf8_cluster(bytes, k);
+                        size_t step = cl.n ? cl.n : 1;
+                        size_t off = row->byte_start + k;
+                        RtxStyle st = b->doc.style_at(off);
+                        char tmp[RTX_UTF8_LOOK + 1];
+                        int pn, pc;
+                        if (step > RTX_UTF8_LOOK) step = RTX_UTF8_LOOK;
+                        pn = rtx_utf8_term_put(cl.cp, bytes.ptr + k, step, tmp,
+                                               RTX_UTF8_LOOK);
+                        pc = rtx_utf8_term_cols(cl.cp, cl.cols);
+                        if (pc < 1) pc = 1;
+                        if (used_c + pc > ccols) break;
+                        if (pn > 0) {
+                            tmp[pn] = 0;
+                            if (has && (b->doc.sel_covers(off) !>)) {
+                                DrawRectangle((int)x, (int)y, (int)(cw * (float)pc) + 1,
+                                              (int)row->height,
+                                              (Color){40, 70, 120, 255});
+                            }
+                            if (rtx_ui_here(ui, focused, b->doc.caret == off)) {
+                                DrawRectangle((int)x, (int)y, 2, (int)row->height,
+                                              (Color){255, 200, 80, 255});
+                            }
+                            DrawTextEx(gui_font(fonts, st, row->sec), tmp,
+                                       (Vector2){(float)x, (float)y},
+                                       gui_size(fonts, st, row->sec), 0,
+                                       gui_hl_color(st.scope));
+                        }
+                        x += (double)cw * (double)pc;
+                        used_c += pc;
+                        k += step;
+                    }
+                }
+                while (used_c < ccols) {
+                    if (rtx_ui_here(ui, focused,
+                                    b->doc.caret == row->byte_start + cell.hi)) {
+                        DrawRectangle((int)x, (int)y, 2, (int)row->height,
+                                      (Color){255, 200, 80, 255});
+                    }
+                    x += (double)cw;
+                    used_c++;
+                }
+                if (c + 1 < b->layout.grid.ncols) x += (double)cw;
+            }
+        }
+    }
+}
+
 static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focused,
                          int x0, int y0, int pw, int ph, int pad) {
     size_t i;
@@ -804,6 +1062,10 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
     }
     if (rtx_layout_is_hex(&b->layout)) {
         gui_draw_hex_buf(b, ui, fonts, focused, x0, y0, pw, ph);
+        return;
+    }
+    if (rtx_layout_is_grid(&b->layout)) {
+        gui_draw_grid_buf(b, ui, fonts, focused, x0, y0, pw, ph);
         return;
     }
     phave = rtx_nav_pair_ends(&b->doc.tree, b->doc.runs, b->doc.run_len,
@@ -877,19 +1139,34 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                 }
                 tmp[pn] = 0;
                 gw = gui_measure(fonts, tmp.to_slice_n((size_t)pn), st, row->sec);
-                pos.x = (float)x;
+                if (b->left_col && !b->layout.wrap) {
+                    if (x + gw <= (double)x0 + (double)gpx + (double)b->left_col) {
+                        x += gw;
+                        k += cl.n ? cl.n : 1;
+                        continue;
+                    }
+                    if (x < (double)x0 + (double)gpx + (double)b->left_col) {
+                        /* cluster straddles the left edge — skip it */
+                        x += gw;
+                        k += cl.n ? cl.n : 1;
+                        continue;
+                    }
+                    pos.x = (float)(x - (double)b->left_col);
+                } else {
+                    pos.x = (float)x;
+                }
                 pos.y = (float)y;
                 if (has && (b->doc.sel_covers(off) !>)) {
-                    DrawRectangle((int)x, (int)y, (int)gw + 1, (int)row->height,
+                    DrawRectangle((int)pos.x, (int)y, (int)gw + 1, (int)row->height,
                                   (Color){40, 70, 120, 255});
                 } else if (phave && (off == plo || off == phi)) {
-                    DrawRectangle((int)x, (int)y, (int)gw + 1, (int)row->height,
+                    DrawRectangle((int)pos.x, (int)y, (int)gw + 1, (int)row->height,
                                   gui_pair_color());
                 }
                 if (rtx_ui_here(ui, focused, b->doc.caret == off ||
                     (box_row && (rtx_box_col_at(&b->doc, line_off, b->doc.box_ccol) !>) ==
                      off - line_off))) {
-                    DrawRectangle((int)x, (int)y, 2, (int)row->height,
+                    DrawRectangle((int)pos.x, (int)y, 2, (int)row->height,
                                   (Color){255, 200, 80, 255});
                 }
                 DrawTextEx(gui_font(fonts, st, row->sec), tmp, pos,
@@ -901,7 +1178,9 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                 (box_row &&
                  line_off + (rtx_box_col_at(&b->doc, line_off, b->doc.box_ccol) !>) ==
                  row->byte_start + row->byte_len))) {
-                DrawRectangle((int)x, (int)y, 2, (int)row->height,
+                DrawRectangle((int)(x - (b->left_col && !b->layout.wrap
+                                             ? (double)b->left_col : 0)),
+                              (int)y, 2, (int)row->height,
                               (Color){255, 200, 80, 255});
             }
             }
@@ -925,29 +1204,69 @@ void gui_draw_busy_badge(void) {
         DrawText(g_busy_msg, (int)pos.x, (int)pos.y, 14, fg);
     }
 }
+static void gui_draw_scroll_x(RtxBuf *b, int focused, int x0, int y0, int pane_w,
+                              int ph, int vis_rows) {
+    RtxScrollRail rail;
+    int hx, track_w, tx, th, sx;
+    double width;
+    Color track, thumb;
+    if (!b || ph < 1) return;
+    hx = gui_scroll_x_h(b);
+    if (hx < 1 && !(b->drag_horiz && b->drag_len)) return;
+    if (hx < 1) hx = GUI_SCROLL_W;
+    width = b->layout_width > 0.0 ? b->layout_width : 1.0;
+    rail = b->scroll_x_rail(width);
+    if (focused && g_live.dragging && *g_live.dragging == GUI_DRAG_SCROLL_X &&
+        b->drag_len && b->drag_horiz) {
+        rail.vis = b->drag_vis ? b->drag_vis : rail.vis;
+        rail.len = b->drag_len;
+    }
+    sx = (b->scroll_needed(vis_rows) || (b->drag_len && !b->drag_horiz))
+             ? GUI_SCROLL_W : 0;
+    track_w = pane_w - sx;
+    if (track_w < 8) track_w = pane_w;
+    rtx_scroll_rail_thumb(&rail, track_w, GUI_SCROLL_MIN_TH, &tx, &th);
+    if (focused && g_live.dragging && *g_live.dragging == GUI_DRAG_SCROLL_X &&
+        g_live.scroll_grab) {
+        int lx = (int)GetMouseX() - x0 - *g_live.scroll_grab;
+        int usable = track_w - th;
+        if (lx < 0) lx = 0;
+        if (usable > 0 && lx > usable) lx = usable;
+        tx = lx;
+    }
+    track = (Color){32, 34, 40, 255};
+    thumb = focused ? (Color){90, 96, 112, 255} : (Color){70, 74, 86, 255};
+    DrawRectangle(x0, y0 + ph - hx, track_w, hx, track);
+    DrawRectangle(x0 + tx, y0 + ph - hx + 2, th, hx - 4, thumb);
+}
+
 static void gui_draw_scroll(RtxBuf *b, int focused, int x0, int y0, int pane_w,
                             int ph, int vis_rows) {
     RtxScrollRail rail;
     int ty, th;
     int sx;
+    int hx;
+    int vph;
     Color track, thumb;
     @errhandler(RtxIndexErr e) {
         (void)e;
         return; /* fault already set by line_* on err */
     }
     if (!b || ph < 1) return;
-    if (!b->scroll_needed(vis_rows) && !b->drag_len) return;
+    hx = gui_scroll_x_h(b);
+    vph = ph > hx ? ph - hx : ph;
+    if (b->scroll_needed(vis_rows) || (b->drag_len && !b->drag_horiz)) {
     rail = b->scroll_rail(vis_rows) !>;
     if (focused && g_live.dragging && *g_live.dragging == GUI_DRAG_SCROLL &&
-        b->drag_len) {
+        b->drag_len && !b->drag_horiz) {
         rail.vis = b->drag_vis ? b->drag_vis : rail.vis;
         rail.len = b->drag_len;
     }
-    rtx_scroll_rail_thumb(&rail, ph, GUI_SCROLL_MIN_TH, &ty, &th);
+    rtx_scroll_rail_thumb(&rail, vph, GUI_SCROLL_MIN_TH, &ty, &th);
     if (focused && g_live.dragging && *g_live.dragging == GUI_DRAG_SCROLL &&
         g_live.scroll_grab) {
         int ly = (int)GetMouseY() - y0 - *g_live.scroll_grab;
-        int usable = ph - th;
+        int usable = vph - th;
         if (ly < 0) ly = 0;
         if (usable > 0 && ly > usable) ly = usable;
         ty = ly;
@@ -956,26 +1275,28 @@ static void gui_draw_scroll(RtxBuf *b, int focused, int x0, int y0, int pane_w,
     if (rail.ready) {
         track = (Color){32, 34, 40, 255};
         thumb = focused ? (Color){90, 96, 112, 255} : (Color){70, 74, 86, 255};
-        DrawRectangle(sx, y0, GUI_SCROLL_W, ph, track);
+        DrawRectangle(sx, y0, GUI_SCROLL_W, vph, track);
         DrawRectangle(sx + 2, y0 + ty, GUI_SCROLL_W - 4, th, thumb);
     } else {
         track = (Color){28, 30, 36, 255};
         thumb = focused ? (Color){70, 78, 96, 255} : (Color){56, 60, 72, 255};
-        DrawRectangle(sx, y0, GUI_SCROLL_W, ph, track);
+        DrawRectangle(sx, y0, GUI_SCROLL_W, vph, track);
         DrawRectangle(sx + 3, y0 + ty, GUI_SCROLL_W - 6, th, thumb);
-        DrawRectangle(sx + 2, y0 + ph - 3, GUI_SCROLL_W - 4, 2,
+        DrawRectangle(sx + 2, y0 + vph - 3, GUI_SCROLL_W - 4, 2,
                       (Color){110, 90, 50, 255});
     }
     if (rtx_buf_scroll_rel(b)) {
-        int my = rtx_buf_scroll_rel_mark_y(b, &rail, ph, GUI_SCROLL_MIN_TH,
+        int my = rtx_buf_scroll_rel_mark_y(b, &rail, vph, GUI_SCROLL_MIN_TH,
                                           vis_rows);
         int mh = 3;
         Color mark = focused ? (Color){220, 70, 70, 255}
                              : (Color){180, 64, 64, 255};
-        if (my + mh > ph) my = ph - mh;
+        if (my + mh > vph) my = vph - mh;
         if (my < 0) my = 0;
         DrawRectangle(sx, y0 + my, GUI_SCROLL_W, mh, mark);
     }
+    }
+    gui_draw_scroll_x(b, focused, x0, y0, pane_w, ph, vis_rows);
 }
 
 /* Draw contents only. Caller owns BeginDrawing / EndDrawing or flush+swap. */
@@ -1007,9 +1328,14 @@ void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner,
                 gui_draw_browse(br, g_live.ui, g_live.fonts, p == g_live.w->focus,
                                 x0, top, pane_w, ph, vis_rows);
             } else {
-                gui_draw_buf(b, g_live.ui, g_live.fonts, p == g_live.w->focus,
-                             x0, top, pane_w, ph, pad);
-                gui_draw_scroll(b, p == g_live.w->focus, x0, top, pane_w, ph, vis_rows);
+                {
+                    int hx = gui_scroll_x_h(b);
+                    int tph = ph > hx ? ph - hx : ph;
+                    gui_draw_buf(b, g_live.ui, g_live.fonts, p == g_live.w->focus,
+                                 x0, top, pane_w, tph, pad);
+                    gui_draw_scroll(b, p == g_live.w->focus, x0, top, pane_w, ph,
+                                    vis_rows);
+                }
             }
             RtxWs_drop_pane(g_live.w, p, held);
         }
@@ -1046,6 +1372,15 @@ void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner,
             snprintf(bar, sizeof(bar), "%s%s  @%zX  hex %s%s  %s",
                      star, path, act->doc.caret,
                      act->hex_nib ? "lo" : "hi",
+                     act->unlock ? "  unlock" : "", status);
+        } else if (act && rtx_layout_is_grid(&act->layout)) {
+            char pos[48];
+            rtx_status_line_pos(act, pos, sizeof(pos)) !>;
+            snprintf(bar, sizeof(bar), "%s%s  %s  grid %s%s  %s",
+                     star, path, pos,
+                     rtx_grid_delim_name(act->layout.grid_delim
+                                             ? act->layout.grid_delim
+                                             : act->layout.grid.delim),
                      act->unlock ? "  unlock" : "", status);
         } else {
             char pos[48];

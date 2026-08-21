@@ -9,6 +9,10 @@ endif
 RAYLIB_PREFIX := $(shell brew --prefix raylib 2>/dev/null)
 RAYLIB_CFLAGS := -I$(RAYLIB_PREFIX)/include
 RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+CCTEXT_LDFLAGS := -framework ApplicationServices
+endif
 
 LARGE_BYTES ?= 3M
 LARGE := testdata/generated/large.txt
@@ -29,6 +33,7 @@ smoke test: $(LARGE)
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run edit_session_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run find_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run hex_view_smoke
+	$(CCC) $(CCC_FLAGS) build --build-file build.cc run grid_view_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run line_index_prop_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run tm_grammar_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run tm_lookback_probe
@@ -73,7 +78,7 @@ perf-record: $(LARGE)
 	./scripts/perf_baseline.sh record
 
 cctext:
-	$(CCC) $(CCC_FLAGS) build --build-file build.cc cctext
+	$(CCC) $(CCC_FLAGS) --ld-flags "$(CCTEXT_LDFLAGS)" build --build-file build.cc cctext
 
 # Binary + grammars/ → dist/cctext-<os>-<arch>.tar.gz (not committed).
 dist-cctext: cctext
