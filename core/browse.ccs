@@ -8,12 +8,19 @@
 #include <ccc/cc_turnstile.cch>
 #include <ctype.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <spawn.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <crt_externs.h>
+#endif
 #include "browse.cch"
 
 enum {
@@ -21,7 +28,8 @@ enum {
     RTX_BROWSE_WAVE = 8,
     RTX_BROWSE_BATCH = 64,
     RTX_BROWSE_LOCAL = 512,
-    RTX_BROWSE_CHILD = 256
+    RTX_BROWSE_CHILD = 256,
+    RTX_BROWSE_DU_HOLD = 8
 };
 
 typedef struct {
@@ -30,12 +38,30 @@ typedef struct {
     int depth;
 } RtxBrowseJob;
 
+typedef struct {
+    char name[RTX_BROWSE_NAME];
+    char skip[RTX_BROWSE_NAME];
+    uint64_t size;
+    RtxBrowseJob *jobs;
+    size_t jlen, jcap, jhead;
+    int done;
+} RtxBrowseDuHold;
+
 typedef struct RtxBrowseWalk {
     CCArena arena;
     RtxBrowseJob *jobs;
     size_t jlen, jcap, jhead;
     DIR *dp;
     char keep[RTX_BROWSE_NAME];
+    char du_name[RTX_BROWSE_NAME];
+    char du_abs[RTX_BROWSE_DIR];
+    RtxBrowseJob *du_jobs;
+    size_t du_jlen, du_jcap, du_jhead;
+    DIR *du_dp;
+    char du_last[RTX_BROWSE_NAME];
+    char du_skip[RTX_BROWSE_NAME];
+    RtxBrowseDuHold hold[RTX_BROWSE_DU_HOLD];
+    size_t nhold;
 } RtxBrowseWalk;
 
 static RtxBrowseWalk *rtx_br_wk(RtxBrowse *br) {
@@ -122,6 +148,16 @@ static const char *rtx_browse_rel_base(const char *name) {
 
 static int rtx_browse_deep(const RtxBrowse *br) {
     return br && ((br->glob_len && br->glob[0] == '>') || br->flat);
+}
+
+/* Typed fragment (not empty, not `.`, not `*.txt`) flattens on kick. */
+static int rtx_browse_auto_flat(const RtxBrowse *br) {
+    const char *filter;
+    if (!br || !br->glob_len) return 0;
+    if (br->glob[0] == '>') return 0;
+    filter = rtx_browse_filter(br);
+    if (!filter[0] || rtx_browse_glob_meta(filter)) return 0;
+    return 1;
 }
 
 static int rtx_browse_find_ci(const char *name, const char *pat, size_t *off) {
@@ -253,9 +289,11 @@ void rtx_browse_walk_stop(RtxBrowse *br) {
     RtxBrowseWalk *wk = rtx_br_wk(br);
     if (!wk) return;
     if (wk->dp) closedir(wk->dp);
+    if (wk->du_dp) closedir(wk->du_dp);
     if (wk->arena.base) wk->arena.destroy();
     free(wk);
     br->wk = NULL;
+    if (br) br->sizing = 0;
 }
 
 static int rtx_browse_grow(RtxBrowse *br, size_t need) {
@@ -316,6 +354,269 @@ static int rtx_browse_job_push(RtxBrowse *br, const char *abs, const char *rel,
     return 0;
 }
 
+static RtxBrowseEnt *rtx_browse_named_ent(RtxBrowse *br, const char *name) {
+    size_t i;
+    if (!br || !name || !name[0] || !br->ents) return NULL;
+    for (i = 0; i < br->len; i++) {
+        if (strcmp(br->ents[i].name, name) == 0) return &br->ents[i];
+    }
+    return NULL;
+}
+
+static RtxBrowseEnt *rtx_browse_du_ent(RtxBrowse *br) {
+    RtxBrowseWalk *wk = rtx_br_wk(br);
+    if (!wk) return NULL;
+    return rtx_browse_named_ent(br, wk->du_name);
+}
+
+static int rtx_browse_du_hold_i(RtxBrowseWalk *wk, const char *name) {
+    size_t i;
+    if (!wk || !name || !name[0]) return -1;
+    for (i = 0; i < wk->nhold; i++) {
+        if (strcmp(wk->hold[i].name, name) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static int rtx_browse_du_job_push(RtxBrowse *br, const char *abs, int depth) {
+    RtxBrowseWalk *wk;
+    RtxBrowseJob *n;
+    size_t c;
+    if (!br || !br->wk || !abs || !abs[0]) return -1;
+    wk = br->wk;
+    if (wk->du_jlen >= wk->du_jcap) {
+        c = wk->du_jcap ? wk->du_jcap * 2 : 8;
+        n = (RtxBrowseJob *)cc_arena_alloc(&wk->arena, c * sizeof(RtxBrowseJob), 8);
+        if (!n) return -1;
+        if (wk->du_jobs && wk->du_jcap)
+            memcpy(n, wk->du_jobs, wk->du_jcap * sizeof(RtxBrowseJob));
+        wk->du_jobs = n;
+        wk->du_jcap = c;
+    }
+    memset(&wk->du_jobs[wk->du_jlen], 0, sizeof(wk->du_jobs[wk->du_jlen]));
+    snprintf(wk->du_jobs[wk->du_jlen].abs, sizeof(wk->du_jobs[wk->du_jlen].abs),
+             "%s", abs);
+    wk->du_jobs[wk->du_jlen].depth = depth;
+    wk->du_jlen++;
+    return 0;
+}
+
+static void rtx_browse_du_live_reset(RtxBrowseWalk *wk) {
+    if (!wk) return;
+    if (wk->du_dp) {
+        closedir(wk->du_dp);
+        wk->du_dp = NULL;
+    }
+    wk->du_jobs = NULL;
+    wk->du_jlen = 0;
+    wk->du_jcap = 0;
+    wk->du_jhead = 0;
+    wk->du_name[0] = 0;
+    wk->du_abs[0] = 0;
+    wk->du_last[0] = 0;
+    wk->du_skip[0] = 0;
+}
+
+static void rtx_browse_du_park(RtxBrowse *br) {
+    RtxBrowseWalk *wk = rtx_br_wk(br);
+    RtxBrowseEnt *e;
+    size_t left;
+    int slot;
+    if (!br || !wk || !wk->du_name[0]) return;
+    e = rtx_browse_du_ent(br);
+    slot = rtx_browse_du_hold_i(wk, wk->du_name);
+    if (slot < 0) {
+        if (wk->nhold >= (size_t)RTX_BROWSE_DU_HOLD) {
+            memmove(&wk->hold[0], &wk->hold[1],
+                    (wk->nhold - 1) * sizeof(wk->hold[0]));
+            wk->nhold--;
+        }
+        slot = (int)wk->nhold;
+        wk->nhold++;
+        memset(&wk->hold[slot], 0, sizeof(wk->hold[slot]));
+        snprintf(wk->hold[slot].name, sizeof(wk->hold[slot].name), "%s",
+                 wk->du_name);
+    }
+    wk->hold[slot].size = e ? e->size : 0;
+    wk->hold[slot].done = !br->sizing && e && e->sized ? 1 : 0;
+    if (wk->du_jhead >= wk->du_jlen && !wk->du_dp) wk->hold[slot].done = 1;
+    if (wk->hold[slot].done) {
+        wk->hold[slot].jlen = 0;
+        wk->hold[slot].jhead = 0;
+        wk->hold[slot].skip[0] = 0;
+    } else {
+        left = wk->du_jlen > wk->du_jhead ? wk->du_jlen - wk->du_jhead : 0;
+        wk->hold[slot].jobs = NULL;
+        wk->hold[slot].jcap = 0;
+        wk->hold[slot].jlen = 0;
+        wk->hold[slot].jhead = 0;
+        if (left) {
+            wk->hold[slot].jobs = (RtxBrowseJob *)cc_arena_alloc(
+                &wk->arena, left * sizeof(RtxBrowseJob), 8);
+            if (wk->hold[slot].jobs) {
+                memcpy(wk->hold[slot].jobs, wk->du_jobs + wk->du_jhead,
+                       left * sizeof(RtxBrowseJob));
+                wk->hold[slot].jlen = left;
+                wk->hold[slot].jcap = left;
+            }
+        }
+        snprintf(wk->hold[slot].skip, sizeof(wk->hold[slot].skip), "%s",
+                 wk->du_dp ? wk->du_last : "");
+    }
+    if (e) e->size_done = wk->hold[slot].done;
+    br->sizing = 0;
+    rtx_browse_du_live_reset(wk);
+}
+
+static int rtx_browse_du_resume(RtxBrowse *br, const char *name) {
+    RtxBrowseWalk *wk = rtx_br_wk(br);
+    RtxBrowseEnt *e;
+    int slot;
+    char full[RTX_BROWSE_DIR];
+    if (!br || !wk || !name) return 0;
+    slot = rtx_browse_du_hold_i(wk, name);
+    e = rtx_browse_named_ent(br, name);
+    if (slot < 0 || !e) return 0;
+    e->sized = 1;
+    e->has_stat = 1;
+    e->size = wk->hold[slot].size;
+    e->size_done = wk->hold[slot].done;
+    if (wk->hold[slot].done) {
+        br->sizing = 0;
+        return 1;
+    }
+    if (!rtx_browse_join(full, sizeof(full), br->dir, name)) return 0;
+    snprintf(wk->du_name, sizeof(wk->du_name), "%s", name);
+    snprintf(wk->du_abs, sizeof(wk->du_abs), "%s", full);
+    wk->du_jobs = wk->hold[slot].jobs;
+    wk->du_jlen = wk->hold[slot].jlen;
+    wk->du_jcap = wk->hold[slot].jcap;
+    wk->du_jhead = wk->hold[slot].jhead;
+    snprintf(wk->du_skip, sizeof(wk->du_skip), "%s", wk->hold[slot].skip);
+    wk->du_last[0] = 0;
+    br->sizing = 1;
+    return 1;
+}
+
+static void rtx_browse_du_start(RtxBrowse *br, RtxBrowseEnt *ent) {
+    RtxBrowseWalk *wk = rtx_br_wk(br);
+    char full[RTX_BROWSE_DIR];
+    if (!br || !wk || !ent) return;
+    if (!rtx_browse_join(full, sizeof(full), br->dir, ent->name)) return;
+    snprintf(wk->du_name, sizeof(wk->du_name), "%s", ent->name);
+    snprintf(wk->du_abs, sizeof(wk->du_abs), "%s", full);
+    wk->du_last[0] = 0;
+    wk->du_skip[0] = 0;
+    wk->du_jobs = NULL;
+    wk->du_jlen = 0;
+    wk->du_jcap = 0;
+    wk->du_jhead = 0;
+    ent->size = 0;
+    ent->sized = 1;
+    ent->size_done = 0;
+    ent->has_stat = 1;
+    br->sizing = 1;
+    if (rtx_browse_du_job_push(br, full, 0) < 0) {
+        br->sizing = 0;
+        ent->sized = 0;
+        ent->size_done = 0;
+        rtx_browse_du_live_reset(wk);
+    }
+}
+
+static void rtx_browse_du_retarget(RtxBrowse *br) {
+    RtxBrowseWalk *wk;
+    RtxBrowseEnt *ent;
+    if (!br || !br->ents || br->len == 0 || br->cur >= br->len) {
+        rtx_browse_du_park(br);
+        return;
+    }
+    ent = &br->ents[br->cur];
+    wk = rtx_br_wk(br);
+    if (wk && wk->du_name[0] && strcmp(wk->du_name, ent->name) == 0 &&
+        (br->sizing || (ent->is_dir && ent->sized)))
+        return;
+    rtx_browse_du_park(br);
+    if (!ent->is_dir || strcmp(ent->name, "..") == 0) return;
+    if (rtx_browse_du_resume(br, ent->name)) return;
+    rtx_browse_du_start(br, ent);
+}
+
+static size_t rtx_browse_pump_du(RtxBrowse *br) {
+    RtxBrowseWalk *wk;
+    RtxBrowseEnt *e;
+    int got = 0;
+    if (!br || !br->sizing) return 0;
+    wk = rtx_br_wk(br);
+    e = rtx_browse_du_ent(br);
+    if (!wk || !e) {
+        br->sizing = 0;
+        rtx_browse_du_live_reset(wk);
+        return 0;
+    }
+    if (!wk->du_dp) {
+        if (wk->du_jhead >= wk->du_jlen) {
+            br->sizing = 0;
+            rtx_browse_du_park(br);
+            return 0;
+        }
+        wk->du_dp = opendir(wk->du_jobs[wk->du_jhead].abs);
+        if (!wk->du_dp) {
+            wk->du_jhead++;
+            wk->du_skip[0] = 0;
+            wk->du_last[0] = 0;
+            if (wk->du_jhead >= wk->du_jlen) {
+                br->sizing = 0;
+                rtx_browse_du_park(br);
+            }
+            return 0;
+        }
+    }
+    for (;;) {
+        struct dirent *de;
+        const char *name;
+        char full[RTX_BROWSE_DIR];
+        struct stat st;
+        int depth;
+        if (got >= RTX_BROWSE_BATCH) break;
+        de = readdir(wk->du_dp);
+        if (!de) {
+            closedir(wk->du_dp);
+            wk->du_dp = NULL;
+            wk->du_jhead++;
+            wk->du_skip[0] = 0;
+            wk->du_last[0] = 0;
+            break;
+        }
+        name = de->d_name;
+        if (!name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+            continue;
+        if (wk->du_skip[0]) {
+            if (strcmp(name, wk->du_skip) != 0) continue;
+            wk->du_skip[0] = 0;
+            continue;
+        }
+        if (!rtx_browse_join(full, sizeof(full),
+                             wk->du_jobs[wk->du_jhead].abs, name))
+            continue;
+        if (lstat(full, &st) != 0 || S_ISLNK(st.st_mode)) continue;
+        depth = wk->du_jobs[wk->du_jhead].depth;
+        snprintf(wk->du_last, sizeof(wk->du_last), "%s", name);
+        if (S_ISDIR(st.st_mode)) {
+            if (depth < RTX_BROWSE_WALK)
+                rtx_browse_du_job_push(br, full, depth + 1);
+            continue;
+        }
+        e->size += (uint64_t)st.st_size;
+        got++;
+    }
+    if (!wk->du_dp && wk->du_jhead >= wk->du_jlen) {
+        br->sizing = 0;
+        rtx_browse_du_park(br);
+    }
+    return (size_t)got;
+}
+
 static void rtx_browse_sort_keep(RtxBrowse *br) {
     size_t from;
     if (!br || br->len <= 1) {
@@ -329,28 +630,9 @@ static void rtx_browse_sort_keep(RtxBrowse *br) {
     rtx_browse_keep_cur(br, br->wk ? rtx_br_wk(br)->keep : NULL);
 }
 
-static int rtx_browse_local_empty(const RtxBrowse *br) {
-    if (!br || br->len == 0) return 1;
-    return br->len == 1 && strcmp(br->ents[0].name, "..") == 0;
-}
-
-/* Shallow finished with no hits: walk the tree. One extra chrome row. */
-static int rtx_browse_try_flat(RtxBrowse *br) {
-    const char *filter;
-    if (!br || br->flat) return 0;
-    if (br->glob_len && br->glob[0] == '>') return 0;
-    filter = rtx_browse_filter(br);
-    if (!filter[0] || !rtx_browse_local_empty(br)) return 0;
-    if (rtx_browse_job_push(br, br->dir, "", 0) < 0) return 0;
-    br->flat = 1;
-    br->scanning = 1;
-    return 1;
-}
-
 static void rtx_browse_shallow_done(RtxBrowse *br) {
     rtx_browse_sort_keep(br);
-    if (!rtx_browse_try_flat(br))
-        br->scanning = 0;
+    br->scanning = 0;
 }
 
 static int rtx_browse_plant_dotdot(RtxBrowse *br) {
@@ -392,7 +674,7 @@ void !>(CCError) rtx_browse_kick(RtxBrowse *br) {
     br->cap = 0;
     snprintf(rtx_br_wk(br)->keep, sizeof(rtx_br_wk(br)->keep), "%s", keep);
     br->scanning = 1;
-    br->flat = 0;
+    br->flat = rtx_browse_auto_flat(br);
     br->truncated = 0;
     if (rtx_browse_plant_dotdot(br) < 0)
         return cc_err(CC_ERR_OUT_OF_MEMORY, "browse");
@@ -614,17 +896,23 @@ static size_t !>(CCError) rtx_browse_pump_deep(RtxBrowse *br) {
 }
 
 size_t !>(CCError) rtx_browse_pump(RtxBrowse *br) {
+    size_t n = 0;
     if (!br) return cc_err(CC_ERR_INVALID_ARG, "browse");
-    if (!br->scanning)
-        return cc_ok(rtx_browse_end_step(br, 0));
-    if (rtx_browse_deep(br)) return rtx_browse_pump_deep(br);
-    return rtx_browse_pump_shallow(br);
+    if (br->scanning) {
+        if (rtx_browse_deep(br)) n = rtx_browse_pump_deep(br) !>(e) {
+            return cc_err(e);
+        };
+        else n = rtx_browse_pump_shallow(br) !>(e) { return cc_err(e); };
+    }
+    rtx_browse_du_retarget(br);
+    if (br->sizing) n += rtx_browse_pump_du(br);
+    return cc_ok(rtx_browse_end_step(br, n));
 }
 
 void !>(CCError) rtx_browse_finish(RtxBrowse *br) {
     int n = 0;
     if (!br) return cc_err(CC_ERR_INVALID_ARG, "browse");
-    while (br->scanning && n++ < 100000)
+    while ((br->scanning || br->sizing) && n++ < 100000)
         rtx_browse_pump(br) !>(e) { return cc_err(e); };
     return cc_ok();
 }
@@ -741,8 +1029,19 @@ RtxThemeColor rtx_browse_face(RtxBrowseFace face) {
     case RTX_BROWSE_FACE_HIT:
         z.r = 255; z.g = 220; z.b = 80; z.ansi = "\x1b[43;30m";
         break;
+    case RTX_BROWSE_FACE_EXT:
+        z.r = 120; z.g = 210; z.b = 130; z.ansi = "\x1b[32m";
+        break;
     }
     return z;
+}
+
+const char *rtx_browse_scan_msg(const RtxBrowse *br) {
+    if (!br) return "";
+    if (br->scanning) return "  scanning...";
+    if (br->sizing) return "  sizing...";
+    if (br->truncated) return "  capped";
+    return "";
 }
 
 void rtx_browse_fmt_size(char *dst, size_t n, const RtxBrowseEnt *e) {
@@ -750,7 +1049,7 @@ void rtx_browse_fmt_size(char *dst, size_t n, const RtxBrowseEnt *e) {
     double v;
     char u;
     if (!dst || n == 0) return;
-    if (!e || !e->has_stat || e->is_dir) {
+    if (!e || !e->has_stat || (e->is_dir && !e->sized)) {
         snprintf(dst, n, "%*s", RTX_BROWSE_SIZE_W, "");
         return;
     }
@@ -857,6 +1156,25 @@ void rtx_browse_move(RtxBrowse *br, int dir, int vis) {
         br->cur++;
     }
     rtx_browse_scroll(br, vis);
+    rtx_browse_du_retarget(br);
+}
+
+int rtx_browse_need_pump(const RtxBrowse *br) {
+    const RtxBrowseEnt *e;
+    if (!br || !br->on) return 0;
+    if (br->scanning || br->sizing) return 1;
+    if (!br->ents || br->len == 0 || br->cur >= br->len) return 0;
+    e = &br->ents[br->cur];
+    return e->is_dir && strcmp(e->name, "..") != 0 && !e->sized;
+}
+
+void rtx_browse_select(RtxBrowse *br, size_t idx, int vis) {
+    if (!br || br->len == 0) return;
+    if (idx >= br->len) idx = br->len - 1;
+    br->cur = idx;
+    br->glob_focus = 0;
+    rtx_browse_scroll(br, vis);
+    rtx_browse_du_retarget(br);
 }
 
 int rtx_browse_hit(const RtxBrowse *br, int row, int vis) {
@@ -868,4 +1186,318 @@ int rtx_browse_hit(const RtxBrowse *br, int row, int vis) {
     idx = br->top + list;
     if (idx >= br->len) return -1;
     return (int)idx;
+}
+
+static char rtx_host_exe[PATH_MAX];
+
+static const char *rtx_host_base(const char *exe) {
+    const char *slash;
+    if (!exe || !exe[0]) return "";
+    slash = strrchr(exe, '/');
+    return slash ? slash + 1 : exe;
+}
+
+int rtx_host_is_ray(const char *exe) {
+    const char *b = rtx_host_base(exe);
+    return strcmp(b, "cctext-ray") == 0 || strcmp(b, "cctext_ray") == 0;
+}
+
+int rtx_host_peer_path(const char *exe, int other, char *dst, size_t n) {
+    char dir[PATH_MAX];
+    const char *peer;
+    int wr;
+    if (!dst || n == 0) return 0;
+    dst[0] = 0;
+    if (!exe || !exe[0]) exe = "cctext";
+    if (!other) {
+        snprintf(dst, n, "%s", exe);
+        return dst[0] != 0;
+    }
+    rtx_browse_dirname(dir, sizeof(dir), exe);
+    peer = rtx_host_is_ray(exe) ? "cctext" : "cctext-ray";
+    if (!strchr(exe, '/')) wr = snprintf(dst, n, "%s", peer);
+    else if (strcmp(dir, "/") == 0) wr = snprintf(dst, n, "/%s", peer);
+    else wr = snprintf(dst, n, "%s/%s", dir, peer);
+    return wr > 0 && (size_t)wr < n;
+}
+
+const char *rtx_host_peer_name(int other) {
+    int ray = rtx_host_is_ray(rtx_host_exe[0] ? rtx_host_exe : "cctext");
+    if (other) return ray ? "cctext" : "cctext-ray";
+    return ray ? "cctext-ray" : "cctext";
+}
+
+void rtx_host_set_exe(const char *argv0) {
+    char raw[PATH_MAX];
+    rtx_host_exe[0] = 0;
+#ifdef __APPLE__
+    {
+        uint32_t n = (uint32_t)sizeof(raw);
+        if (_NSGetExecutablePath(raw, &n) == 0) {
+            if (realpath(raw, rtx_host_exe)) return;
+            snprintf(rtx_host_exe, sizeof(rtx_host_exe), "%s", raw);
+            return;
+        }
+    }
+#else
+    {
+        ssize_t n = readlink("/proc/self/exe", raw, sizeof(raw) - 1);
+        if (n > 0) {
+            raw[n] = 0;
+            snprintf(rtx_host_exe, sizeof(rtx_host_exe), "%s", raw);
+            return;
+        }
+    }
+#endif
+    if (argv0 && argv0[0] == '/') {
+        if (!realpath(argv0, rtx_host_exe))
+            snprintf(rtx_host_exe, sizeof(rtx_host_exe), "%s", argv0);
+    } else if (argv0 && argv0[0]) {
+        if (!rtx_browse_abs(rtx_host_exe, sizeof(rtx_host_exe), argv0))
+            snprintf(rtx_host_exe, sizeof(rtx_host_exe), "%s", argv0);
+    } else {
+        snprintf(rtx_host_exe, sizeof(rtx_host_exe), "cctext");
+    }
+}
+
+int rtx_browse_sel_path(const RtxBrowse *br, char *dst, size_t n, int *is_dir) {
+    const RtxBrowseEnt *ent;
+    if (is_dir) *is_dir = 0;
+    if (!br || !br->on || br->len == 0 || br->cur >= br->len || !dst || n == 0)
+        return 0;
+    ent = &br->ents[br->cur];
+    if (!rtx_browse_join(dst, n, br->dir, ent->name)) return 0;
+    if (is_dir) *is_dir = ent->is_dir;
+    return 1;
+}
+
+static int rtx_sh_single_quote(char *dst, size_t n, const char *s) {
+    size_t i = 0;
+    if (!dst || n < 3) return 0;
+    dst[i++] = '\'';
+    for (; s && *s; s++) {
+        if (*s == '\'') {
+            if (i + 5 >= n) return 0;
+            dst[i++] = '\'';
+            dst[i++] = '"';
+            dst[i++] = '\'';
+            dst[i++] = '"';
+            dst[i++] = '\'';
+        } else {
+            if (i + 1 >= n) return 0;
+            dst[i++] = *s;
+        }
+    }
+    if (i + 1 >= n) return 0;
+    dst[i++] = '\'';
+    dst[i] = 0;
+    return 1;
+}
+
+static int rtx_host_pick_exe(int other, char *dst, size_t n) {
+    char want[PATH_MAX];
+    const char *self = rtx_host_exe[0] ? rtx_host_exe : "cctext";
+    if (!rtx_host_peer_path(self, other, want, sizeof(want))) return 0;
+    if (access(want, X_OK) == 0) {
+        if (want[0] == '/') {
+            snprintf(dst, n, "%s", want);
+            return 1;
+        }
+        return rtx_browse_abs(dst, n, want);
+    }
+    snprintf(dst, n, "%s", want);
+    return dst[0] != 0;
+}
+
+static char **rtx_host_env(void) {
+#ifdef __APPLE__
+    return *_NSGetEnviron();
+#else
+    static char *empty[1];
+    empty[0] = 0;
+    return empty;
+#endif
+}
+
+static int rtx_host_spawn_direct(const char *exe, const char *path, int is_dir) {
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    pid_t pid;
+    char *argv[3];
+    int rc;
+    if (!exe || !exe[0]) return 0;
+    argv[0] = (char *)exe;
+    if (is_dir || !path || !path[0]) {
+        argv[1] = NULL;
+    } else {
+        argv[1] = (char *)path;
+        argv[2] = NULL;
+    }
+    posix_spawn_file_actions_init(&fa);
+    posix_spawnattr_init(&attr);
+#ifdef POSIX_SPAWN_SETSID
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+#endif
+    if (is_dir && path && path[0]) {
+#ifdef __APPLE__
+        posix_spawn_file_actions_addchdir(&fa, path);
+#elif defined(__linux__)
+        posix_spawn_file_actions_addchdir_np(&fa, path);
+#endif
+    }
+    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDWR, 0);
+    rc = posix_spawn(&pid, exe, &fa, &attr, argv, rtx_host_env());
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    return rc == 0;
+}
+
+#ifdef __APPLE__
+static int rtx_env_has(const char *key, const char *needle) {
+    const char *s = getenv(key);
+    return s && needle && strstr(s, needle) != NULL;
+}
+
+const char *rtx_host_tty_app(void) {
+    const char *p = getenv("TERM_PROGRAM");
+    const char *trace = getenv("CURSOR_TRACE_ID");
+    int cursor_env = (trace && trace[0]) ||
+        rtx_env_has("GIT_ASKPASS", "Cursor.app") ||
+        rtx_env_has("VSCODE_GIT_ASKPASS_NODE", "Cursor.app") ||
+        rtx_env_has("VSCODE_GIT_ASKPASS_MAIN", "Cursor.app");
+    int code_env =
+        rtx_env_has("GIT_ASKPASS", "Visual Studio Code") ||
+        rtx_env_has("VSCODE_GIT_ASKPASS_NODE", "Visual Studio Code");
+    if (p && strcmp(p, "iTerm.app") == 0) return "iTerm";
+    if (p && strcmp(p, "Apple_Terminal") == 0) return "Terminal";
+    if (p && strcmp(p, "vscode") == 0) return code_env ? "Code" : "Cursor";
+    if (cursor_env) return "Cursor";
+    if (code_env) return "Code";
+    return "Terminal";
+}
+
+static int rtx_host_as_escape(char *dst, size_t n, const char *s) {
+    size_t i;
+    size_t j;
+    if (!dst || n < 2) return 0;
+    j = 0;
+    for (i = 0; s && s[i]; i++) {
+        if (j + 2 >= n) return 0;
+        if (s[i] == '\\' || s[i] == '"') {
+            dst[j] = '\\';
+            j++;
+        }
+        dst[j] = s[i];
+        j++;
+    }
+    dst[j] = 0;
+    return 1;
+}
+
+static int rtx_host_osascript(const char *script) {
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    pid_t pid;
+    char *argv[4];
+    int rc;
+    if (!script || !script[0]) return 0;
+    argv[0] = (char *)"/usr/bin/osascript";
+    argv[1] = (char *)"-e";
+    argv[2] = (char *)script;
+    argv[3] = NULL;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawnattr_init(&attr);
+    rc = posix_spawn(&pid, argv[0], &fa, &attr, argv, rtx_host_env());
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    return rc == 0;
+}
+
+static int rtx_host_spawn_terminal(const char *esc) {
+    char script[PATH_MAX * 4 + 160];
+    int wr;
+    wr = snprintf(script, sizeof(script),
+                  "tell application \"Terminal\" to do script \"%s\"", esc);
+    if (wr <= 0 || (size_t)wr >= sizeof(script)) return 0;
+    return rtx_host_osascript(script);
+}
+
+static int rtx_host_spawn_iterm(const char *esc) {
+    char script[PATH_MAX * 4 + 200];
+    int wr;
+    wr = snprintf(script, sizeof(script),
+                  "tell application \"iTerm\" to create window with default "
+                  "profile command \"%s\"", esc);
+    if (wr <= 0 || (size_t)wr >= sizeof(script)) return 0;
+    return rtx_host_osascript(script);
+}
+
+static int rtx_host_spawn_ide(const char *app, const char *esc) {
+    char script[PATH_MAX * 4 + 700];
+    int wr;
+    if (!app || !app[0]) return 0;
+    wr = snprintf(script, sizeof(script),
+        "tell application \"System Events\"\n"
+        "tell process \"%s\"\n"
+        "set frontmost to true\n"
+        "try\n"
+        "click menu item \"New Terminal\" of menu \"Terminal\" of "
+        "menu item \"Terminal\" of menu \"View\" of menu bar 1\n"
+        "on error\n"
+        "keystroke \"`\" using {control down, shift down}\n"
+        "end try\n"
+        "delay 0.4\n"
+        "keystroke \"%s\"\n"
+        "keystroke return\n"
+        "end tell\n"
+        "end tell\n", app, esc);
+    if (wr <= 0 || (size_t)wr >= sizeof(script)) return 0;
+    return rtx_host_osascript(script);
+}
+
+static int rtx_host_spawn_tty(const char *exe, const char *path, int is_dir) {
+    char qexe[PATH_MAX * 2];
+    char qpath[PATH_MAX * 2];
+    char cmd[PATH_MAX * 4 + 80];
+    char esc[PATH_MAX * 4 + 80];
+    const char *app;
+    int wr;
+    if (!rtx_sh_single_quote(qexe, sizeof(qexe), exe)) return 0;
+    if (is_dir && path && path[0]) {
+        if (!rtx_sh_single_quote(qpath, sizeof(qpath), path)) return 0;
+        wr = snprintf(cmd, sizeof(cmd), "cd %s && exec %s", qpath, qexe);
+    } else if (path && path[0]) {
+        if (!rtx_sh_single_quote(qpath, sizeof(qpath), path)) return 0;
+        wr = snprintf(cmd, sizeof(cmd), "exec %s %s", qexe, qpath);
+    } else {
+        wr = snprintf(cmd, sizeof(cmd), "exec %s", qexe);
+    }
+    if (wr <= 0 || (size_t)wr >= sizeof(cmd)) return 0;
+    if (!rtx_host_as_escape(esc, sizeof(esc), cmd)) return 0;
+    app = rtx_host_tty_app();
+    if ((strcmp(app, "Cursor") == 0 || strcmp(app, "Code") == 0) &&
+        rtx_host_spawn_ide(app, esc))
+        return 1;
+    if (strcmp(app, "iTerm") == 0 && rtx_host_spawn_iterm(esc)) return 1;
+    return rtx_host_spawn_terminal(esc);
+}
+#else
+const char *rtx_host_tty_app(void) {
+    return "Terminal";
+}
+#endif
+
+int rtx_browse_spawn(const RtxBrowse *br, int other) {
+    char full[RTX_BROWSE_DIR];
+    char exe[PATH_MAX];
+    int is_dir = 0;
+    if (!rtx_browse_sel_path(br, full, sizeof(full), &is_dir)) return 0;
+    if (!rtx_host_pick_exe(other, exe, sizeof(exe))) return 0;
+    if (rtx_host_is_ray(exe))
+        return rtx_host_spawn_direct(exe, full, is_dir);
+#ifdef __APPLE__
+    return rtx_host_spawn_tty(exe, full, is_dir);
+#else
+    return rtx_host_spawn_direct(exe, full, is_dir);
+#endif
 }

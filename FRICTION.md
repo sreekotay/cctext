@@ -28,9 +28,10 @@ add `@typehooks` fields on the GUI TUs. Chrome (menus / fonts / help) is
 `frontend/gui_chrome.ccs`; `objc_msgSend` (file picker / live resize) is
 `frontend/gui_osx.ccs`.
 Browse listing (`rtx_browse_kick` / pump / `>` walk) is a linked TU
-(`core/browse.ccs`), same cut as hex. Browse `scanning` is the find `done`
-bit inverted — same kick / step / yield (DESIGN.md Scan). Do not add a
-shared `RtxScan` type. `#define` before `#include "….cch"` does not survive
-into the generated C include — listing-only helpers belong in `browse.ccs`.
+(`core/browse.ccs`), same cut as hex. Browse spawn (self / sibling frontend)
+lives there too. Browse `scanning` is the find `done` bit inverted — same
+kick / step / yield (DESIGN.md Scan). Do not add a shared `RtxScan` type.
+`#define` before `#include "….cch"` does not survive into the generated C
+include — listing-only helpers belong in `browse.ccs`.
 Workspace helpers (`RtxWs_browse_*`) live in `workspace.cch` so the listing
 TU does not lower the hook table. 

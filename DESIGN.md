@@ -64,7 +64,9 @@ not line numbers. `line_count` is soft until EOF. `line_start` may extend
 the prefix; do not call it from a gap camera.
 
 `g N%` is a byte snap plus island (backfill). `g L` is a prefix pump
-(`want_line`), same host gate as find — not a guess.
+(`want_line`), same host gate as find — not a guess. After open the
+prefix also walks toward EOF on that gate (`prefix_step`) so gutters
+and `L n/N` do not sit idle.
 
 Host frame: mutations, then one window write. TUI read blocks, so
 `pump → layout+paint → input`. GUI events are already polled, so
@@ -81,6 +83,7 @@ The next walk copies this table.
 |---|---|---|---|---|---|
 | find | `find_set` | `find_step` | `!done && !cancel` | `scan_off` | `RTX_FIND_SEQ` |
 | jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
+| prefix | open / `!lf_ready` | `prefix_step` | `prefix_pumping` | `line_scan_off` | — |
 | island | `isle_kick` | `isle_step` | `isle_pumping` | `isle_from` | — |
 | browse | `rtx_browse_kick` | `rtx_browse_pump` | `scanning` | job queue | `RTX_BROWSE_SEQ` |
 
