@@ -7,6 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#elif defined(__linux__)
+#include <malloc.h>
+#endif
 #include "../core/document.cch"
 #include "../core/layout.cch"
 #include "../core/workspace.cch"
@@ -21,6 +26,25 @@ static void expect(int cond, const char *msg) {
         fprintf(stderr, "FAIL: %s\n", msg);
         fails++;
     }
+}
+
+/* Live malloc in-use. Peak RSS does not drop on free, so it cannot see
+ * the find-step wave leak (@destroy skipped through @parallel). */
+static size_t heap_in_use(void) {
+#if defined(__APPLE__)
+    malloc_statistics_t s;
+    memset(&s, 0, sizeof(s));
+    malloc_zone_statistics(NULL, &s);
+    return (size_t)s.size_in_use;
+#elif defined(__linux__)
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ) && __GLIBC_PREREQ(2, 33)
+    return (size_t)mallinfo2().uordblks;
+#else
+    return (size_t)mallinfo().uordblks;
+#endif
+#else
+    return 0;
+#endif
 }
 
 int main(void) {
@@ -278,6 +302,49 @@ int main(void) {
                "paste restores one");
         rtx_ui_find_apply(&ui, d) !>;
         expect(d->find.len == 0, "xone has no hits");
+    }
+
+    /* Three waves. Each step mints ~4.2MiB; @destroy through @parallel
+     * used to leave all three (~12MiB) after the doc died. */
+    {
+        size_t waves = 3;
+        size_t n = waves * (size_t)RTX_FIND_WAVE * (size_t)RTX_FIND_BLOCK;
+        CCArena body = cc_arena_heap(n + 64) @destroy;
+        char[:] big;
+        size_t base;
+        size_t live;
+        size_t after;
+        size_t slack = megabytes(3);
+        big = body.alloc_slice_bytes(n);
+        expect(big.ptr != NULL && big.len >= n, "wave leak arena");
+        if (big.ptr && big.len >= n) {
+            memset(big.ptr, 'x', n);
+            base = heap_in_use();
+            expect(base > 0, "heap_in_use");
+            {
+                RtxDoc d = {0} @destroy;
+                size_t k;
+                d.from_buffer(big) !>;
+                d.find_set("zz") !>;
+                for (k = 0; k < waves; k++)
+                    d.find_step(RTX_FIND_BUDGET) !>;
+                expect(d.find.done, "three-wave scan done");
+                live = heap_in_use();
+                if (base) {
+                    expect(live < base + slack, "find wave freed each step");
+                    if (live >= base + slack)
+                        fprintf(stderr, "  live-base=%zu (limit %zu)\n",
+                                live - base, slack);
+                }
+            }
+            after = heap_in_use();
+            if (base) {
+                expect(after < base + slack, "find wave gone after destroy");
+                if (after >= base + slack)
+                    fprintf(stderr, "  after-base=%zu (limit %zu)\n",
+                            after - base, slack);
+            }
+        }
     }
 
     if (fails) {

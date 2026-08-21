@@ -89,9 +89,10 @@ The next walk copies this table.
 | browse | `rtx_browse_kick` | `rtx_browse_pump` | `scanning` | job queue | `RTX_BROWSE_SEQ` |
 
 Kick plants the first paint and returns. One closed interval per step;
-returning is the yield. The find wave is a heap arena the step frees
-before it returns — `@destroy` through `@parallel` does not. Query copy
-and hit offsets stay on `d.find.store` and die with the document. A
+returning is the yield. The find wave is a heap arena with `@destroy`;
+a Result return after `@parallel wait` runs that life (ccc 0.3.4-194).
+Query copy and hit offsets stay on `d.find.store` and die with the
+document. A
 longer prefix query filters hits and keeps `scan_off`; a cap resumes
 from the last accepted hit; a shorter or non-prefix query resets.
 `find_apply` enters once; `find_pump` may enter again up to
