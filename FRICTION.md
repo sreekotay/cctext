@@ -19,10 +19,11 @@ The scope intern table is `core/scope.ccs` — paint and lex must share IDs
 (GUI draw is a separate TU). Help strings are `core/ui_help.ccs`.
 Brace-pair paint (`rtx_nav_pair_ends`) is declared in `nav_pair.cch`, not
 `nav.cch`. TUI pane + chrome paint is `frontend/cctext_draw.ccs` (same cut as
-`gui_draw`); keys/mouse are `frontend/cctext_input.ccs`; the host loop stays
-in `cctext.ccs`. Darwin session-wheel (Cursor drops Shift+wheel `deltaX`) is
-`frontend/cctext_osx.ccs`. Find/browse chapter bodies live in the sibling `.ccs` (CCC
-will not keep impl-grade statics in a header included from two TUs).
+`gui_draw`); grid pane paint is `frontend/cctext_grid_draw.ccs` so stock `ccc`
+(8192 AST) can still lower `cctext_draw`. Keys/mouse are `frontend/cctext_input.ccs`;
+the host loop stays in `cctext.ccs`. Darwin session-wheel (Cursor drops Shift+wheel
+`deltaX`) is `frontend/cctext_osx.ccs`. Find/browse chapter bodies live in the sibling
+`.ccs` (CCC will not keep impl-grade statics in a header included from two TUs).
 GUI paint is `frontend/gui_draw.ccs`; keys/mouse are `frontend/gui_input.ccs`;
 the host loop stays in `frontend/gui.ccs` (same cut as hex / browse). Do not
 add `@typehooks` fields on the GUI TUs. Chrome (menus / fonts / help) is

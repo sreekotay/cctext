@@ -8,8 +8,8 @@
 //   core/page_store.ccs, core/hex.ccs, core/grid.ccs, core/browse.ccs, core/piece_tree.ccs,
 //   core/nav.ccs, core/scope.ccs, core/find.ccs
 //   frontend/gui_draw.ccs, frontend/gui_input.ccs, frontend/gui_chrome.ccs,
-//   frontend/gui_osx.ccs, frontend/cctext_draw.ccs, frontend/cctext_input.ccs,
-//   frontend/cctext_osx.ccs
+//   frontend/gui_osx.ccs, frontend/cctext_draw.ccs, frontend/cctext_grid_draw.ccs,
+//   frontend/cctext_input.ccs, frontend/cctext_osx.ccs
 // piece_tree_rb.cch / piece_tree_lines.cch stay chapters of the tree TU.
 
 CC_DEFAULT piece_tree_smoke
@@ -108,6 +108,9 @@ CC_TARGET_DEPS pair_page_probe rtx_piece_tree rtx_hex rtx_grid rtx_nav rtx_scope
 CC_TARGET rtx_cctext_draw obj frontend/cctext_draw.ccs
 CC_TARGET_INCLUDE rtx_cctext_draw .
 
+CC_TARGET rtx_cctext_grid_draw obj frontend/cctext_grid_draw.ccs
+CC_TARGET_INCLUDE rtx_cctext_grid_draw .
+
 CC_TARGET rtx_cctext_input obj frontend/cctext_input.ccs
 CC_TARGET_INCLUDE rtx_cctext_input .
 
@@ -116,7 +119,7 @@ CC_TARGET_INCLUDE rtx_cctext_osx .
 
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
-CC_TARGET_DEPS cctext rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_ui_help rtx_cctext_draw rtx_cctext_input rtx_cctext_osx
+CC_TARGET_DEPS cctext rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_ui_help rtx_cctext_draw rtx_cctext_grid_draw rtx_cctext_input rtx_cctext_osx
 
 CC_TARGET rtx_gui_osx obj frontend/gui_osx.ccs
 CC_TARGET_INCLUDE rtx_gui_osx .
