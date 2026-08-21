@@ -76,16 +76,22 @@ void cctext_draw_grid_pane(RtxBuf *b, const RtxUi *ui, int focused, int vis,
                 show_ln = 1;
             }
             int span_ok = 1;
-            cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
+            CCArena heap = {0};
             char[:] bytes = cc_slice_empty();
-            {
-                @errhandler(CCError e) {
-                    (void)e;
-                    span_ok = 0;
+            if (row->byte_len) {
+                heap = cc_arena_heap(row->byte_len + 64);
+                if (!heap.base) span_ok = 0;
+                else {
+                    @errhandler(CCError e) {
+                        (void)e;
+                        span_ok = 0;
+                    }
+                    bytes = b->scratch_span(row->byte_start, row->byte_len,
+                                            &heap) !>;
                 }
-                bytes = b->scratch_span(&scratch, row->byte_start, row->byte_len) !>;
             }
             if (!span_ok) {
+                if (heap.base) heap.destroy();
                 used = g;
                 cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
                 continue;
@@ -157,29 +163,122 @@ void cctext_draw_grid_pane(RtxBuf *b, const RtxUi *ui, int focused, int vis,
                     }
                 }
                 fputs("\x1b[0m", stdout);
-                while (used_c < cw) {
-                    if (virt >= b->left_col && col < (size_t)tcols) {
-                        int here = rtx_ui_here(ui, focused,
-                                               b->doc.caret == row->byte_start + cell.hi);
-                        if (here) fputs("\x1b[7m \x1b[0m", stdout);
-                        else fputc(' ', stdout);
-                        col++;
+                {
+                    size_t field_hi = rtx_grid_col_hi(bytes.ptr, bytes.len,
+                                                      &b->layout.grid, c,
+                                                      cell.hi);
+                    int last = (cell.hi == field_hi);
+                    int pad_here = 0;
+                    while (used_c < cw) {
+                        if (virt >= b->left_col && col < (size_t)tcols) {
+                            int here = last && !pad_here &&
+                                       rtx_ui_here(ui, focused,
+                                                   b->doc.caret ==
+                                                       row->byte_start + cell.hi);
+                            if (here) {
+                                fputs("\x1b[7m \x1b[0m", stdout);
+                                pad_here = 1;
+                            } else
+                                fputc(' ', stdout);
+                            col++;
+                        }
+                        virt++;
+                        used_c++;
                     }
-                    virt++;
-                    used_c++;
-                }
-                if (c + 1 < b->layout.grid.ncols) {
-                    if (virt >= b->left_col && col < (size_t)tcols) {
-                        fputs("\x1b[90m \x1b[0m", stdout);
-                        col++;
+                    if (c + 1 < b->layout.grid.ncols) {
+                        if (virt >= b->left_col && col < (size_t)tcols) {
+                            size_t gap = row->byte_start + field_hi;
+                            int here = last &&
+                                       rtx_ui_here(ui, focused,
+                                                   b->doc.caret == gap);
+                            int gsel = last && has &&
+                                       (b->doc.sel_covers(gap) !>);
+                            fputs("\x1b[0m", stdout);
+                            if (here) fputs("\x1b[7m \x1b[0m", stdout);
+                            else if (gsel) fputs("\x1b[44m \x1b[0m", stdout);
+                            else fputs("\x1b[90m \x1b[0m", stdout);
+                            col++;
+                        }
+                        virt++;
                     }
-                    virt++;
                 }
             }
             used = g + (int)col;
             if (is_hdr) fputs("\x1b[0m", stdout);
+            if (heap.base) heap.destroy();
             cctext_row_end(b, focused, vis, pcols, col0, pad_rest, used, (int)r);
         }
     }
+    }
+}
+
+int cctext_grid_caret_cell(RtxBuf *b, int vis, int pcols, int col0, int *row,
+                           int *col) {
+    size_t caret;
+    int g, tcols, hdr, body, slots;
+    size_t at;
+    if (!b || !row || !col || vis < 1) return 0;
+    caret = b->doc.caret;
+    g = rtx_gutter_cols_buf(b, vis);
+    tcols = cctext_text_cols(b, pcols, vis);
+    hdr = b->layout.grid_hdr_on;
+    body = cctext_body_vis(b, vis, pcols);
+    slots = body > hdr ? body - hdr : 0;
+    if (hdr && caret <= b->layout.grid_hdr_end) {
+        size_t hlen = b->layout.grid_hdr_end;
+        CCArena heap = {0};
+        char[:] hbytes = cc_slice_empty();
+        if (hlen) {
+            heap = cc_arena_heap(hlen + 64);
+            if (!heap.base) return 0;
+            {
+                @errhandler(CCError e) {
+                    (void)e;
+                    heap.destroy();
+                    return 0;
+                }
+                hbytes = b->scratch_span(0, hlen, &heap) !>;
+            }
+        }
+        rtx_grid_bind_span(&b->layout.grid, 0, hbytes.len);
+        at = (size_t)rtx_grid_x_of(hbytes.ptr, hbytes.len, &b->layout.grid, caret);
+        if (heap.base) heap.destroy();
+        if (at < b->left_col) return 0;
+        at -= b->left_col;
+        if (at > (size_t)tcols) return 0;
+        *row = 1;
+        *col = col0 + g + (int)at;
+        return 1;
+    }
+    {
+        size_t ri = rtx_layout_grid_row_of(&b->layout, &b->doc, caret);
+        RtxVisRow *vr;
+        CCArena heap = {0};
+        char[:] bytes = cc_slice_empty();
+        if (ri < b->top_wrap) return 0;
+        if (ri - b->top_wrap >= (size_t)slots) return 0;
+        vr = &b->layout.rows[ri];
+        if (vr->byte_len) {
+            heap = cc_arena_heap(vr->byte_len + 64);
+            if (!heap.base) return 0;
+            {
+                @errhandler(CCError e) {
+                    (void)e;
+                    heap.destroy();
+                    return 0;
+                }
+                bytes = b->scratch_span(vr->byte_start, vr->byte_len, &heap) !>;
+            }
+        }
+        rtx_grid_bind_span(&b->layout.grid, vr->byte_start, bytes.len);
+        at = (size_t)rtx_grid_x_of(bytes.ptr, bytes.len, &b->layout.grid,
+                                   caret - vr->byte_start);
+        if (heap.base) heap.destroy();
+        if (at < b->left_col) return 0;
+        at -= b->left_col;
+        if (at > (size_t)tcols) return 0;
+        *row = (int)(ri - b->top_wrap) + 1 + hdr;
+        *col = col0 + g + (int)at;
+        return 1;
     }
 }

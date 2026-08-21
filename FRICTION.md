@@ -25,13 +25,20 @@ the host loop stays in `cctext.ccs`. Darwin session-wheel (Cursor drops Shift+wh
 `deltaX`) is `frontend/cctext_osx.ccs`. Find/browse chapter bodies live in the sibling
 `.ccs` (CCC will not keep impl-grade statics in a header included from two TUs).
 GUI paint is `frontend/gui_draw.ccs`; keys/mouse are `frontend/gui_input.ccs`;
-the host loop stays in `frontend/gui.ccs` (same cut as hex / browse). Do not
-add `@typehooks` fields on the GUI TUs. Chrome (menus / fonts / help) is
-`frontend/gui_chrome.ccs`; `objc_msgSend` (file picker / live resize) is
+the host loop stays in `frontend/gui.ccs` (same cut as hex / browse). Platform
+window + Core Text is `frontend/gui_plat.m` (clang object linked into
+`cctext-gui`). Do not add `@typehooks` fields on the GUI TUs. Chrome (menus /
+fonts / help) is `frontend/gui_chrome.ccs`; `objc_msgSend` (file picker) is
 `frontend/gui_osx.ccs`.
+Safe journals (`rtx_safe_flush` / load / park) are a linked TU
+(`core/safe.ccs`), same cut as browse. The live workspace is the panes;
+parked files are paths + on-disk hist, not N piece trees.
 Browse listing (`rtx_browse_kick` / pump / `>` walk) is a linked TU
-(`core/browse.ccs`), same cut as hex / grid. Grid geometry is `core/grid.ccs`. Browse spawn (self / sibling frontend)
-lives there too. Browse `scanning` is the find `done` bit inverted — same
+(`core/browse.ccs`), same cut as hex / grid. Grid geometry is `core/grid.ccs` (`rtx_grid_col_hi` lives there so TUI
+and GUI paint cannot each invent field.hi). Browse spawn (self / sibling frontend)
+lives there too. Vis-row motion is `rtx_layout_soft_wrap`; do not gate
+Home/End on `L.wrap`. `scratch_span(from, n, a)` — arena last; the
+caller names WHERE. `RTX_FRAME_SCRATCH` is a stack budget, not a span cap. Browse `scanning` is the find `done` bit inverted — same
 kick / step / yield (DESIGN.md Scan). Do not add a shared `RtxScan` type.
 `#define` before `#include "….cch"` does not survive into the generated C
 include — listing-only helpers belong in `browse.ccs`.

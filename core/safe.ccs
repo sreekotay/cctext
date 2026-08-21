@@ -1,0 +1,690 @@
+#!ccc ccs
+/*
+ * Durable session journals. Hosts include safe.cch; this TU owns the format.
+ */
+#include <ccc/std/prelude.cch>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "document.cch"
+#include "safe.cch"
+
+enum {
+    RTX_SAFE_VER = 1,
+    RTX_SAFE_PATH = 4096
+};
+
+#define RTX_SAFE_FILE_MAGIC 0x53585452u /* RTXS */
+#define RTX_SAFE_WS_MAGIC 0x57585452u   /* RTXW */
+
+void rtx_safe_test_isol(void) {
+    setenv("RTX_SAFE_HOME", "testdata/generated/safe_test", 1);
+    {
+        char dir[RTX_SAFE_PATH];
+        if (rtx_safe_dir(dir, sizeof(dir))) {
+            char cmd[RTX_SAFE_PATH + 16];
+            snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
+            (void)system(cmd);
+        }
+    }
+    setenv("RTX_SAFE_HOME", "testdata/generated/safe_test", 1);
+    {
+        char dir[RTX_SAFE_PATH];
+        (void)rtx_safe_dir(dir, sizeof(dir));
+    }
+}
+
+void rtx_safe_cam_clear(RtxSafeCam *c) {
+    if (c) memset(c, 0, sizeof(*c));
+}
+
+static uint64_t rtx_safe_fnv(const char *s) {
+    uint64_t h = 1469598103934665603ull;
+    const unsigned char *p;
+    if (!s) return 0;
+    for (p = (const unsigned char *)s; *p; p++) {
+        h ^= (uint64_t)*p;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static int rtx_safe_mkdir_p(const char *dir) {
+    char buf[RTX_SAFE_PATH];
+    size_t i, n;
+    if (!dir || !dir[0]) return -1;
+    n = strlen(dir);
+    if (n >= sizeof(buf)) return -1;
+    memcpy(buf, dir, n + 1);
+    for (i = 1; i < n; i++) {
+        if (buf[i] != '/') continue;
+        buf[i] = 0;
+        if (mkdir(buf, 0700) != 0 && errno != EEXIST) return -1;
+        buf[i] = '/';
+    }
+    if (mkdir(buf, 0700) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+int rtx_safe_dir(char *dst, size_t n) {
+    const char *env;
+    const char *home;
+    if (!dst || n < 8) return 0;
+    env = getenv("RTX_SAFE_HOME");
+    if (env && env[0]) {
+        snprintf(dst, n, "%s", env);
+        return rtx_safe_mkdir_p(dst) == 0;
+    }
+    home = getenv("HOME");
+    if (!home || !home[0]) return 0;
+#ifdef __APPLE__
+    snprintf(dst, n, "%s/Library/Caches/cctext/safe", home);
+#else
+    {
+        const char *xdg = getenv("XDG_CACHE_HOME");
+        if (xdg && xdg[0]) snprintf(dst, n, "%s/cctext/safe", xdg);
+        else snprintf(dst, n, "%s/.cache/cctext/safe", home);
+    }
+#endif
+    return rtx_safe_mkdir_p(dst) == 0;
+}
+
+static int rtx_safe_realpath(const char *path, char *out, size_t n) {
+    char real[PATH_MAX];
+    if (!path || !path[0] || !out || n < 2) return 0;
+    if (realpath(path, real)) {
+        snprintf(out, n, "%s", real);
+        return 1;
+    }
+    snprintf(out, n, "%s", path);
+    return 1;
+}
+
+int rtx_safe_file_path(char *dst, size_t n, const char *doc_path) {
+    char root[RTX_SAFE_PATH];
+    char real[RTX_SAFE_PATH];
+    char leaf[32];
+    if (!dst || !doc_path || !doc_path[0]) return 0;
+    if (!rtx_safe_dir(root, sizeof(root))) return 0;
+    if (!rtx_safe_realpath(doc_path, real, sizeof(real))) return 0;
+    snprintf(leaf, sizeof(leaf), "%016llx", (unsigned long long)rtx_safe_fnv(real));
+    snprintf(dst, n, "%s/f", root);
+    if (rtx_safe_mkdir_p(dst) != 0) return 0;
+    snprintf(dst, n, "%s/f/%s", root, leaf);
+    return 1;
+}
+
+static int rtx_safe_ws_path(char *dst, size_t n) {
+    char root[RTX_SAFE_PATH];
+    if (!rtx_safe_dir(root, sizeof(root))) return 0;
+    snprintf(dst, n, "%s/ws", root);
+    return 1;
+}
+
+static int rtx_safe_write_all(int fd, const void *p, size_t n) {
+    const char *s = (const char *)p;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, s + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (w == 0) return -1;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+static int rtx_safe_read_all(int fd, void *p, size_t n) {
+    char *s = (char *)p;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, s + off, n - off);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) return -1;
+        off += (size_t)r;
+    }
+    return 0;
+}
+
+static int rtx_safe_put_u32(int fd, uint32_t v) {
+    unsigned char b[4];
+    b[0] = (unsigned char)(v);
+    b[1] = (unsigned char)(v >> 8);
+    b[2] = (unsigned char)(v >> 16);
+    b[3] = (unsigned char)(v >> 24);
+    return rtx_safe_write_all(fd, b, 4);
+}
+
+static int rtx_safe_put_u64(int fd, uint64_t v) {
+    unsigned char b[8];
+    int i;
+    for (i = 0; i < 8; i++) b[i] = (unsigned char)(v >> (8 * i));
+    return rtx_safe_write_all(fd, b, 8);
+}
+
+static int rtx_safe_put_i64(int fd, int64_t v) {
+    return rtx_safe_put_u64(fd, (uint64_t)v);
+}
+
+static int rtx_safe_put_i32(int fd, int32_t v) {
+    return rtx_safe_put_u32(fd, (uint32_t)v);
+}
+
+static int rtx_safe_get_u32(int fd, uint32_t *v) {
+    unsigned char b[4];
+    if (rtx_safe_read_all(fd, b, 4) != 0) return -1;
+    *v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
+         ((uint32_t)b[3] << 24);
+    return 0;
+}
+
+static int rtx_safe_get_u64(int fd, uint64_t *v) {
+    unsigned char b[8];
+    int i;
+    uint64_t x = 0;
+    if (rtx_safe_read_all(fd, b, 8) != 0) return -1;
+    for (i = 0; i < 8; i++) x |= ((uint64_t)b[i] << (8 * i));
+    *v = x;
+    return 0;
+}
+
+static int rtx_safe_get_i64(int fd, int64_t *v) {
+    uint64_t u;
+    if (rtx_safe_get_u64(fd, &u) != 0) return -1;
+    *v = (int64_t)u;
+    return 0;
+}
+
+static int rtx_safe_get_i32(int fd, int32_t *v) {
+    uint32_t u;
+    if (rtx_safe_get_u32(fd, &u) != 0) return -1;
+    *v = (int32_t)u;
+    return 0;
+}
+
+static int rtx_safe_rename_over(int fd, const char *tmp, const char *dst) {
+    char dirbuf[RTX_SAFE_PATH];
+    char *slash;
+    int dfd;
+    if (fsync(fd) != 0) return -1;
+    if (close(fd) != 0) return -1;
+    if (rename(tmp, dst) != 0) return -1;
+    snprintf(dirbuf, sizeof(dirbuf), "%s", dst);
+    slash = strrchr(dirbuf, '/');
+    if (slash && slash != dirbuf) {
+        *slash = 0;
+        dfd = open(dirbuf, O_RDONLY);
+    } else {
+        dfd = open(".", O_RDONLY);
+    }
+    if (dfd >= 0) {
+        (void)fsync(dfd);
+        close(dfd);
+    }
+    return 0;
+}
+
+static int rtx_safe_ident(const char *path, int64_t *mtime, uint64_t *sz,
+                          uint64_t *ino) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0) return 0;
+    *mtime = (int64_t)st.st_mtime;
+    *sz = (uint64_t)st.st_size;
+    *ino = (uint64_t)st.st_ino;
+    return 1;
+}
+
+static char[:] rtx_safe_hist_ins(const RtxHistRec *r) {
+    if (!r || !r->ins.ptr || r->ins_used == 0) return cc_slice_empty();
+    return r->ins.sub(0, r->ins_used);
+}
+
+static char[:] rtx_safe_hist_del(const RtxHistRec *r) {
+    if (!r || !r->del.ptr || r->del_used == 0) return cc_slice_empty();
+    return r->del.sub(0, r->del_used);
+}
+
+static int rtx_safe_put_rec(int fd, RtxDoc *d, const RtxHistRec *r) {
+    char[:] ins = rtx_safe_hist_ins(r);
+    char[:] del = rtx_safe_hist_del(r);
+    CCArena hold = {0};
+    char[:] flat = cc_slice_empty();
+    int rc = -1;
+    if (r->del_ref_n) {
+        if (!r->del_n) {
+            del = cc_slice_empty();
+        } else {
+            hold = cc_arena_heap(r->del_n + 64);
+            if (!hold.base) return -1;
+            flat = hold.alloc_slice_bytes(r->del_n);
+            if (!flat.ptr || flat.len < r->del_n) {
+                hold.destroy();
+                return -1;
+            }
+            {
+                @errhandler(CCError e) {
+                    (void)e;
+                    hold.destroy();
+                    return -1;
+                }
+                d->tree.read_refs(r->del_refs, r->del_ref_n, flat.ptr,
+                                  r->del_n) !>;
+            }
+            del = flat.sub(0, r->del_n);
+        }
+    }
+    if (rtx_safe_put_u64(fd, (uint64_t)r->off) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)r->del_n) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)ins.len) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)r->caret_before) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)r->sel_before) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)r->caret_after) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)r->sel_after) != 0) goto done;
+    if (rtx_safe_put_i32(fd, r->sel_box_before) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)r->box_acol_before) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)r->box_ccol_before) != 0) goto done;
+    if (rtx_safe_put_i32(fd, r->sel_box_after) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)r->box_acol_after) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)r->box_ccol_after) != 0) goto done;
+    if (del.len && rtx_safe_write_all(fd, del.ptr, del.len) != 0) goto done;
+    if (ins.len && rtx_safe_write_all(fd, ins.ptr, ins.len) != 0) goto done;
+    rc = 0;
+done:
+    if (hold.base) hold.destroy();
+    return rc;
+}
+
+void rtx_safe_flush(RtxDoc *d, const RtxSafeCam *cam) {
+    char path[RTX_SAFE_PATH];
+    char tmp[RTX_SAFE_PATH + 16];
+    char real[RTX_SAFE_PATH];
+    int64_t mtime = 0;
+    uint64_t sz = 0, ino = 0;
+    int fd;
+    size_t i;
+    RtxSafeCam z;
+    if (!d || !d->path.ptr || d->path.len == 0) return;
+    if (!rtx_safe_file_path(path, sizeof(path), d->path.ptr)) return;
+    if (!rtx_safe_realpath(d->path.ptr, real, sizeof(real))) return;
+    (void)rtx_safe_ident(d->path.ptr, &mtime, &sz, &ino);
+    if (!cam) {
+        rtx_safe_cam_clear(&z);
+        cam = &z;
+    }
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
+    fd = mkstemp(tmp);
+    if (fd < 0) return;
+    if (rtx_safe_put_u32(fd, RTX_SAFE_FILE_MAGIC) != 0) goto fail;
+    if (rtx_safe_put_u32(fd, RTX_SAFE_VER) != 0) goto fail;
+    {
+        uint32_t pn = (uint32_t)strlen(real);
+        if (rtx_safe_put_u32(fd, pn) != 0) goto fail;
+        if (pn && rtx_safe_write_all(fd, real, pn) != 0) goto fail;
+    }
+    if (rtx_safe_put_i64(fd, mtime) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, sz) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, ino) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)d->saved_head) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)d->hist.head) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)d->hist.len) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)d->caret) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)d->sel_anchor) != 0) goto fail;
+    if (rtx_safe_put_i32(fd, d->sel_box) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)d->box_acol) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)d->box_ccol) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)cam->top) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)cam->top_wrap) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)cam->left_col) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)cam->top_byte) != 0) goto fail;
+    if (rtx_safe_put_u64(fd, (uint64_t)cam->seek_off) != 0) goto fail;
+    if (rtx_safe_put_i64(fd, (int64_t)cam->seek_rel) != 0) goto fail;
+    if (rtx_safe_put_i32(fd, cam->seek_valid) != 0) goto fail;
+    if (rtx_safe_put_i32(fd, cam->view) != 0) goto fail;
+    if (rtx_safe_put_i32(fd, cam->hex_nib) != 0) goto fail;
+    if (rtx_safe_put_i32(fd, cam->unlock) != 0) goto fail;
+    if (rtx_safe_put_i32(fd, cam->pin_view) != 0) goto fail;
+    for (i = 0; i < d->hist.len; i++) {
+        if (rtx_safe_put_rec(fd, d, &d->hist.recs[i]) != 0) goto fail;
+    }
+    if (rtx_safe_rename_over(fd, tmp, path) != 0) {
+        unlink(tmp);
+        return;
+    }
+    return;
+fail:
+    close(fd);
+    unlink(tmp);
+}
+
+static void rtx_safe_clamp_doc(RtxDoc *d, RtxSafeCam *cam) {
+    size_t n = d->len();
+    if (d->caret > n) d->caret = n;
+    if (d->sel_anchor > n) d->sel_anchor = n;
+    if (cam) {
+        if (cam->seek_off > n) cam->seek_off = n;
+        if (cam->top_byte > n) cam->top_byte = n;
+    }
+}
+
+static int rtx_safe_load_rec(int fd, RtxDoc *d, RtxHistRec *r) {
+    uint64_t off, del_n, ins_n, cb, sb, ca, sa, bab, bcb, baa, bca;
+    int32_t sbb, sba;
+    memset(r, 0, sizeof(*r));
+    if (rtx_safe_get_u64(fd, &off) != 0) return -1;
+    if (rtx_safe_get_u64(fd, &del_n) != 0) return -1;
+    if (rtx_safe_get_u64(fd, &ins_n) != 0) return -1;
+    if (rtx_safe_get_u64(fd, &cb) != 0) return -1;
+    if (rtx_safe_get_u64(fd, &sb) != 0) return -1;
+    if (rtx_safe_get_u64(fd, &ca) != 0) return -1;
+    if (rtx_safe_get_u64(fd, &sa) != 0) return -1;
+    if (rtx_safe_get_i32(fd, &sbb) != 0) return -1;
+    if (rtx_safe_get_u64(fd, &bab) != 0) return -1;
+    if (rtx_safe_get_u64(fd, &bcb) != 0) return -1;
+    if (rtx_safe_get_i32(fd, &sba) != 0) return -1;
+    if (rtx_safe_get_u64(fd, &baa) != 0) return -1;
+    if (rtx_safe_get_u64(fd, &bca) != 0) return -1;
+    r->off = (size_t)off;
+    r->del_n = (size_t)del_n;
+    r->caret_before = (size_t)cb;
+    r->sel_before = (size_t)sb;
+    r->caret_after = (size_t)ca;
+    r->sel_after = (size_t)sa;
+    r->sel_box_before = sbb;
+    r->box_acol_before = (size_t)bab;
+    r->box_ccol_before = (size_t)bcb;
+    r->sel_box_after = sba;
+    r->box_acol_after = (size_t)baa;
+    r->box_ccol_after = (size_t)bca;
+    if (del_n) {
+        char[:] got;
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                return -1;
+            }
+            got = rtx_session_bytes(d, NULL, (size_t)del_n) !>;
+        }
+        if (rtx_safe_read_all(fd, got.ptr, (size_t)del_n) != 0) return -1;
+        r->del = got;
+        r->del_used = (size_t)del_n;
+        r->del_cap = (size_t)del_n;
+    }
+    if (ins_n) {
+        char[:] got;
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                return -1;
+            }
+            got = rtx_session_bytes(d, NULL, (size_t)ins_n) !>;
+        }
+        if (rtx_safe_read_all(fd, got.ptr, (size_t)ins_n) != 0) return -1;
+        r->ins = got;
+        r->ins_used = (size_t)ins_n;
+        r->ins_cap = (size_t)ins_n;
+    }
+    return 0;
+}
+
+void rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
+    char path[RTX_SAFE_PATH];
+    int fd;
+    uint32_t magic, ver, pn;
+    int64_t jmtime = 0, smtime = 0;
+    uint64_t jsz = 0, jino = 0, ssz = 0, sino = 0;
+    uint64_t saved, head, hlen, caret, sel, bac, bcc;
+    int32_t box;
+    uint64_t top, tw, lc, tb, so;
+    int64_t srel;
+    int32_t sv, view, nib, unlock, pin;
+    size_t i;
+    int ident_ok;
+    char jpath[RTX_SAFE_PATH];
+    if (!d || !d->path.ptr || d->path.len == 0) return;
+    if (!rtx_safe_file_path(path, sizeof(path), d->path.ptr)) return;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    if (rtx_safe_get_u32(fd, &magic) != 0 || magic != RTX_SAFE_FILE_MAGIC) goto done;
+    if (rtx_safe_get_u32(fd, &ver) != 0 || ver != RTX_SAFE_VER) goto done;
+    if (rtx_safe_get_u32(fd, &pn) != 0 || pn >= sizeof(jpath)) goto done;
+    if (pn && rtx_safe_read_all(fd, jpath, pn) != 0) goto done;
+    jpath[pn] = 0;
+    if (rtx_safe_get_i64(fd, &jmtime) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &jsz) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &jino) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &saved) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &head) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &hlen) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &caret) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &sel) != 0) goto done;
+    if (rtx_safe_get_i32(fd, &box) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &bac) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &bcc) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &top) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &tw) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &lc) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &tb) != 0) goto done;
+    if (rtx_safe_get_u64(fd, &so) != 0) goto done;
+    if (rtx_safe_get_i64(fd, &srel) != 0) goto done;
+    if (rtx_safe_get_i32(fd, &sv) != 0) goto done;
+    if (rtx_safe_get_i32(fd, &view) != 0) goto done;
+    if (rtx_safe_get_i32(fd, &nib) != 0) goto done;
+    if (rtx_safe_get_i32(fd, &unlock) != 0) goto done;
+    if (rtx_safe_get_i32(fd, &pin) != 0) goto done;
+    ident_ok = rtx_safe_ident(d->path.ptr, &smtime, &ssz, &sino) &&
+               smtime == jmtime && ssz == jsz && sino == jino;
+    if (cam) {
+        cam->top = (size_t)top;
+        cam->top_wrap = (size_t)tw;
+        cam->left_col = (size_t)lc;
+        cam->top_byte = (size_t)tb;
+        cam->seek_off = (size_t)so;
+        cam->seek_rel = (long)srel;
+        cam->seek_valid = sv;
+        cam->view = view;
+        cam->hex_nib = nib;
+        cam->unlock = unlock;
+        cam->pin_view = pin;
+    }
+    d->caret = (size_t)caret;
+    d->sel_anchor = (size_t)sel;
+    d->sel_box = box;
+    d->box_acol = (size_t)bac;
+    d->box_ccol = (size_t)bcc;
+    if (!ident_ok || saved > hlen || head > hlen) {
+        rtx_safe_clamp_doc(d, cam);
+        goto done;
+    }
+    if (hlen) {
+        RtxHistRec *recs;
+        recs = (RtxHistRec *)cc_arena_alloc(&d->session, hlen * sizeof(RtxHistRec),
+                                            8);
+        if (!recs) {
+            rtx_safe_clamp_doc(d, cam);
+            goto done;
+        }
+        memset(recs, 0, hlen * sizeof(RtxHistRec));
+        for (i = 0; i < (size_t)hlen; i++) {
+            if (rtx_safe_load_rec(fd, d, &recs[i]) != 0) {
+                rtx_hist_clear(&d->hist);
+                rtx_safe_clamp_doc(d, cam);
+                goto done;
+            }
+        }
+        d->hist.recs = recs;
+        d->hist.len = (size_t)hlen;
+        d->hist.cap = (size_t)hlen;
+        d->hist.head = (size_t)saved;
+        d->saved_head = (size_t)saved;
+        d->hist.coalesce = 0;
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                rtx_hist_clear(&d->hist);
+                rtx_safe_clamp_doc(d, cam);
+                goto done;
+            }
+            while (d->hist.head < (size_t)head) d->redo() !>;
+            while (d->hist.head > (size_t)head) d->undo() !>;
+        }
+        d->caret = (size_t)caret;
+        d->sel_anchor = (size_t)sel;
+        d->sel_box = box;
+        d->box_acol = (size_t)bac;
+        d->box_ccol = (size_t)bcc;
+    }
+    rtx_safe_clamp_doc(d, cam);
+done:
+    close(fd);
+}
+
+void rtx_safe_drop(const char *doc_path) {
+    char path[RTX_SAFE_PATH];
+    if (!rtx_safe_file_path(path, sizeof(path), doc_path)) return;
+    unlink(path);
+}
+
+int rtx_safe_peek_dirty(const char *doc_path) {
+    char path[RTX_SAFE_PATH];
+    int fd;
+    uint32_t magic, ver, pn;
+    int64_t mtime;
+    uint64_t sz, ino, saved, head, hlen;
+    if (!rtx_safe_file_path(path, sizeof(path), doc_path)) return 0;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    if (rtx_safe_get_u32(fd, &magic) != 0 || magic != RTX_SAFE_FILE_MAGIC) {
+        close(fd);
+        return 0;
+    }
+    if (rtx_safe_get_u32(fd, &ver) != 0 || ver != RTX_SAFE_VER) {
+        close(fd);
+        return 0;
+    }
+    if (rtx_safe_get_u32(fd, &pn) != 0) {
+        close(fd);
+        return 0;
+    }
+    if (pn && lseek(fd, (off_t)pn, SEEK_CUR) < 0) {
+        close(fd);
+        return 0;
+    }
+    if (rtx_safe_get_i64(fd, &mtime) != 0) {
+        close(fd);
+        return 0;
+    }
+    if (rtx_safe_get_u64(fd, &sz) != 0 || rtx_safe_get_u64(fd, &ino) != 0) {
+        close(fd);
+        return 0;
+    }
+    if (rtx_safe_get_u64(fd, &saved) != 0 || rtx_safe_get_u64(fd, &head) != 0 ||
+        rtx_safe_get_u64(fd, &hlen) != 0) {
+        close(fd);
+        return 0;
+    }
+    close(fd);
+    (void)mtime;
+    (void)sz;
+    (void)ino;
+    (void)hlen;
+    return saved != head;
+}
+
+void rtx_safe_ws_write(const RtxSafeWs *ws) {
+    char path[RTX_SAFE_PATH];
+    char tmp[RTX_SAFE_PATH + 16];
+    int fd;
+    size_t i;
+    if (!ws || !rtx_safe_ws_path(path, sizeof(path))) return;
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
+    fd = mkstemp(tmp);
+    if (fd < 0) return;
+    if (rtx_safe_put_u32(fd, RTX_SAFE_WS_MAGIC) != 0) goto fail;
+    if (rtx_safe_put_u32(fd, RTX_SAFE_VER) != 0) goto fail;
+    if (rtx_safe_put_i32(fd, ws->npanes) != 0) goto fail;
+    if (rtx_safe_put_i32(fd, ws->focus) != 0) goto fail;
+    if (rtx_safe_put_i32(fd, ws->pane0) != 0) goto fail;
+    if (rtx_safe_put_i32(fd, ws->pane1) != 0) goto fail;
+    if (rtx_safe_put_u32(fd, (uint32_t)ws->n) != 0) goto fail;
+    for (i = 0; i < ws->n; i++) {
+        uint32_t pn = (uint32_t)strlen(ws->ents[i].path);
+        if (rtx_safe_put_u32(fd, pn) != 0) goto fail;
+        if (pn && rtx_safe_write_all(fd, ws->ents[i].path, pn) != 0) goto fail;
+        if (rtx_safe_put_i32(fd, ws->ents[i].view) != 0) goto fail;
+        if (rtx_safe_put_i32(fd, ws->ents[i].dirty) != 0) goto fail;
+    }
+    if (rtx_safe_rename_over(fd, tmp, path) != 0) {
+        unlink(tmp);
+        return;
+    }
+    return;
+fail:
+    close(fd);
+    unlink(tmp);
+}
+
+int rtx_safe_ws_read(RtxSafeWs *ws, CCArena *a) {
+    char path[RTX_SAFE_PATH];
+    int fd;
+    uint32_t magic, ver, n;
+    int32_t np, fo, p0, p1;
+    size_t i;
+    if (!ws || !a) return 0;
+    memset(ws, 0, sizeof(*ws));
+    if (!rtx_safe_ws_path(path, sizeof(path))) return 0;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    if (rtx_safe_get_u32(fd, &magic) != 0 || magic != RTX_SAFE_WS_MAGIC) goto fail;
+    if (rtx_safe_get_u32(fd, &ver) != 0 || ver != RTX_SAFE_VER) goto fail;
+    if (rtx_safe_get_i32(fd, &np) != 0) goto fail;
+    if (rtx_safe_get_i32(fd, &fo) != 0) goto fail;
+    if (rtx_safe_get_i32(fd, &p0) != 0) goto fail;
+    if (rtx_safe_get_i32(fd, &p1) != 0) goto fail;
+    if (rtx_safe_get_u32(fd, &n) != 0) goto fail;
+    ws->npanes = np;
+    ws->focus = fo;
+    ws->pane0 = p0;
+    ws->pane1 = p1;
+    ws->n = n;
+    if (n) {
+        ws->ents = (RtxSafeWsEnt *)cc_arena_alloc(a, n * sizeof(RtxSafeWsEnt), 8);
+        if (!ws->ents) goto fail;
+        memset(ws->ents, 0, n * sizeof(RtxSafeWsEnt));
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t pn;
+        int32_t view, dirty;
+        if (rtx_safe_get_u32(fd, &pn) != 0) goto fail;
+        if (pn >= sizeof(ws->ents[i].path)) goto fail;
+        if (pn && rtx_safe_read_all(fd, ws->ents[i].path, pn) != 0) goto fail;
+        ws->ents[i].path[pn] = 0;
+        if (rtx_safe_get_i32(fd, &view) != 0) goto fail;
+        if (rtx_safe_get_i32(fd, &dirty) != 0) goto fail;
+        ws->ents[i].view = view;
+        ws->ents[i].dirty = dirty;
+    }
+    close(fd);
+    ws->ok = 1;
+    return 1;
+fail:
+    close(fd);
+    memset(ws, 0, sizeof(*ws));
+    return 0;
+}
+
+void rtx_safe_ws_drop(void) {
+    char path[RTX_SAFE_PATH];
+    if (!rtx_safe_ws_path(path, sizeof(path))) return;
+    unlink(path);
+}

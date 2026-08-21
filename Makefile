@@ -6,9 +6,6 @@ CCC_FLAGS := -g --out-dir out --bin-dir bin
 else
 CCC_FLAGS := --release --out-dir out --bin-dir bin
 endif
-RAYLIB_PREFIX := $(shell brew --prefix raylib 2>/dev/null)
-RAYLIB_CFLAGS := -I$(RAYLIB_PREFIX)/include
-RAYLIB_LIBS := -L$(RAYLIB_PREFIX)/lib -lraylib -lobjc -framework Foundation
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 CCTEXT_LDFLAGS := -framework ApplicationServices
@@ -17,7 +14,7 @@ endif
 LARGE_BYTES ?= 3M
 LARGE := testdata/generated/large.txt
 
-.PHONY: setup test smoke large giant giant-json giant-smoke perf perf-check perf-record dup-scale-8g dup-scale-64g cctext cctext-ray dist-cctext clean
+.PHONY: setup test smoke large giant giant-json giant-smoke perf perf-check perf-record dup-scale-8g dup-scale-64g cctext cctext-gui dist-cctext clean
 
 setup:
 	./setup.sh
@@ -34,6 +31,7 @@ smoke test: $(LARGE)
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run find_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run hex_view_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run grid_view_smoke
+	$(CCC) $(CCC_FLAGS) build --build-file build.cc run safe_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run line_index_prop_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run tm_grammar_smoke
 	$(CCC) $(CCC_FLAGS) build --build-file build.cc run tm_lookback_probe
@@ -84,11 +82,14 @@ cctext:
 dist-cctext: cctext
 	./scripts/dist_cctext.sh
 
-# ccc target is cctext_ray (identifier); the installed name is cctext-ray.
-cctext-ray:
-	$(CCC) $(CCC_FLAGS) --cc-flags "$(RAYLIB_CFLAGS)" --ld-flags "$(RAYLIB_LIBS)" \
-		build --build-file build.cc cctext_ray
-	mv -f bin/cctext_ray bin/cctext-ray
+# Cocoa + Core Text GUI (macOS).
+cctext-gui:
+	mkdir -p out bin
+	clang $(if $(DEBUG),-g,-O2) -fobjc-arc -Ifrontend -c frontend/gui_plat.m -o out/gui_plat.o
+	$(CCC) $(CCC_FLAGS) --cc-flags "-Ifrontend" \
+		--ld-flags "out/gui_plat.o -lobjc -framework Cocoa -framework CoreText -framework CoreGraphics -framework Foundation" \
+		build --build-file build.cc cctext_gui
+	mv -f bin/cctext_gui bin/cctext-gui
 
 clean:
 	rm -rf out bin dist testdata/generated

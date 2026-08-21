@@ -1,15 +1,16 @@
-// cctext core tests + console + Raylib GUI (cctext-ray).
+// cctext core tests + console + Cocoa GUI (cctext-gui).
 //
 //   ./make.shcc @smoke
 //   ./make.shcc @cctext
-//   ./make.shcc @cctext_ray
+//   ./make.shcc @cctext_gui
 //
 // Leaf modules are real linked TUs (not textual includes):
 //   core/page_store.ccs, core/hex.ccs, core/grid.ccs, core/browse.ccs, core/piece_tree.ccs,
 //   core/nav.ccs, core/scope.ccs, core/find.ccs
 //   frontend/gui_draw.ccs, frontend/gui_input.ccs, frontend/gui_chrome.ccs,
-//   frontend/gui_osx.ccs, frontend/cctext_draw.ccs, frontend/cctext_grid_draw.ccs,
-//   frontend/cctext_input.ccs, frontend/cctext_osx.ccs
+//   frontend/gui_osx.ccs, frontend/cctext_draw.ccs, frontend/cctext_input.ccs,
+//   frontend/cctext_osx.ccs
+//   Platform window + Core Text: frontend/gui_plat.m (clang .m, linked in)
 // piece_tree_rb.cch / piece_tree_lines.cch stay chapters of the tree TU.
 
 CC_DEFAULT piece_tree_smoke
@@ -26,6 +27,10 @@ CC_TARGET_INCLUDE rtx_grid .
 CC_TARGET rtx_browse obj core/browse.ccs
 CC_TARGET_INCLUDE rtx_browse .
 CC_TARGET_DEPS rtx_browse rtx_piece_tree rtx_hex rtx_grid
+
+CC_TARGET rtx_safe obj core/safe.ccs
+CC_TARGET_INCLUDE rtx_safe .
+CC_TARGET_DEPS rtx_safe rtx_piece_tree
 
 CC_TARGET rtx_nav obj core/nav.ccs
 CC_TARGET_INCLUDE rtx_nav .
@@ -51,19 +56,19 @@ CC_TARGET_DEPS piece_tree_smoke rtx_piece_tree
 
 CC_TARGET layout_measure_smoke exe tests/layout_measure_smoke.ccs
 CC_TARGET_INCLUDE layout_measure_smoke .
-CC_TARGET_DEPS layout_measure_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find
+CC_TARGET_DEPS layout_measure_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe
 
 CC_TARGET edit_session_smoke exe tests/edit_session_smoke.ccs
 CC_TARGET_INCLUDE edit_session_smoke .
-CC_TARGET_DEPS edit_session_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find
+CC_TARGET_DEPS edit_session_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe
 
 CC_TARGET find_smoke exe tests/find_smoke.ccs
 CC_TARGET_INCLUDE find_smoke .
-CC_TARGET_DEPS find_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find
+CC_TARGET_DEPS find_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe
 
 CC_TARGET large_file_smoke exe tests/large_file_smoke.ccs
 CC_TARGET_INCLUDE large_file_smoke .
-CC_TARGET_DEPS large_file_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find
+CC_TARGET_DEPS large_file_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe
 
 CC_TARGET dup_scale_smoke exe tests/dup_scale_smoke.ccs
 CC_TARGET_INCLUDE dup_scale_smoke .
@@ -83,7 +88,11 @@ CC_TARGET_DEPS insert_profile rtx_piece_tree rtx_nav rtx_scope rtx_find
 
 CC_TARGET hex_view_smoke exe tests/hex_view_smoke.ccs
 CC_TARGET_INCLUDE hex_view_smoke .
-CC_TARGET_DEPS hex_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find
+CC_TARGET_DEPS hex_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe
+
+CC_TARGET safe_smoke exe tests/safe_smoke.ccs
+CC_TARGET_INCLUDE safe_smoke .
+CC_TARGET_DEPS safe_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe
 
 CC_TARGET grid_view_smoke exe tests/grid_view_smoke.ccs
 CC_TARGET_INCLUDE grid_view_smoke .
@@ -119,7 +128,7 @@ CC_TARGET_INCLUDE rtx_cctext_osx .
 
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
-CC_TARGET_DEPS cctext rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_ui_help rtx_cctext_draw rtx_cctext_grid_draw rtx_cctext_input rtx_cctext_osx
+CC_TARGET_DEPS cctext rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_ui_help rtx_cctext_draw rtx_cctext_grid_draw rtx_cctext_input rtx_cctext_osx
 
 CC_TARGET rtx_gui_osx obj frontend/gui_osx.ccs
 CC_TARGET_INCLUDE rtx_gui_osx .
@@ -133,6 +142,6 @@ CC_TARGET_INCLUDE rtx_gui_draw .
 CC_TARGET rtx_gui_input obj frontend/gui_input.ccs
 CC_TARGET_INCLUDE rtx_gui_input .
 
-CC_TARGET cctext_ray exe frontend/gui.ccs
-CC_TARGET_INCLUDE cctext_ray .
-CC_TARGET_DEPS cctext_ray rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_ui_help rtx_gui_osx rtx_gui_chrome rtx_gui_draw rtx_gui_input
+CC_TARGET cctext_gui exe frontend/gui.ccs
+CC_TARGET_INCLUDE cctext_gui .
+CC_TARGET_DEPS cctext_gui rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_ui_help rtx_gui_osx rtx_gui_chrome rtx_gui_draw rtx_gui_input

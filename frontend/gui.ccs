@@ -1,6 +1,6 @@
 #!ccc ccs
 /*
- * cctext-ray host loop. Paint is gui_draw.ccs; keys/mouse are gui_input.ccs.
+ * cctext-gui host loop. Paint is gui_draw.ccs; keys/mouse are gui_input.ccs. Cocoa+CoreText.
  * Frame: input → pump → layout → paint (DESIGN.md Interactive). TUI is the
  * same cycle with input last because read blocks.
  */
@@ -8,8 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <raylib.h>
-#include <rlgl.h>
+#include "gui_plat.h"
 #include "../core/document.cch"
 #include "../core/layout.cch"
 #include "../core/workspace.cch"
@@ -62,7 +61,7 @@ static int gui_keys_down(void) {
     return 0;
 }
 
-static int gui_saw_input(int dragging, int menu_open) {
+static int gui_saw_input(int dragging) {
     Vector2 m = GetMousePosition();
     int moved = ((int)m.x != (int)g_mouse_was.x) || ((int)m.y != (int)g_mouse_was.y);
     g_mouse_was = m;
@@ -74,8 +73,7 @@ static int gui_saw_input(int dragging, int menu_open) {
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) ||
         IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) return 1;
     if (dragging) return 1;
-    if (moved && menu_open >= 0) return 1;
-    if (moved && m.y >= 0.0f && m.y < (float)GUI_MENU_H) return 1;
+    if (gui_menu_pending()) return 1;
     return gui_keys_down();
 }
 
@@ -162,21 +160,16 @@ static void gui_live_paint(void) {
     BeginDrawing();
     g_live.draw_open = 1;
     gui_draw_body(ww, hh, g_live.pad, g_live.top, pane_w, inner, vis_rows);
-    rlDrawRenderBatchActive();
-    SwapScreenBuffer();
     g_live.draw_open = 0;
     g_live.painting = 0;
 }
 
 static void gui_install_live_resize(void) {
-    void *window = GetWindowHandle();
-    if (!window) return;
-    gui_osx_install_resize(window, gui_live_paint,
-                           &g_live.resize_observer, &g_live.resize_center);
+    fb_set_live_resize(gui_live_paint);
 }
 
 static void gui_uninstall_live_resize(void) {
-    gui_osx_uninstall_resize(g_live.resize_observer, g_live.resize_center);
+    fb_set_live_resize(NULL);
     g_live.resize_observer = NULL;
     g_live.resize_center = NULL;
 }
@@ -192,16 +185,15 @@ int main(int argc, char **argv) {
     int ww = 960;
     int hh = 640;
     int pad = 16;
-    int top = GUI_MENU_H + 8;
+    int top = 8;
     int dragging = 0;
     int scroll_grab = 0;
     size_t quit_armed_at = (size_t)-1;
     int close_held = 0;
-    int menu_open = -1;
     char status[160];
     RtxUi ui;
 
-    prog = (argc > 0 && argv[0] && argv[0][0]) ? argv[0] : "cctext-ray";
+    prog = (argc > 0 && argv[0] && argv[0][0]) ? argv[0] : "cctext-gui";
     rtx_host_set_exe(prog);
     if (rtx_cli_parse(argc, argv, filebuf, 32, &cli) != 0) {
         rtx_cli_usage(stderr, prog);
@@ -230,7 +222,7 @@ int main(int argc, char **argv) {
     if (cli.nfiles == 0 || w.untitled()) w.browse_start() !>;
 
     SetTraceLogLevel(LOG_NONE);
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI);
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(ww, hh, "cctext");
     SetExitKey(0);
     SetTargetFPS(60);
@@ -238,13 +230,18 @@ int main(int argc, char **argv) {
 
     {
         Vector2 dpi = GetWindowScaleDPI();
-        float scale = dpi.y > 1.0f ? dpi.y : 1.0f;
+        (void)dpi;
+        /* CT sizes are in points; do not multiply by backing scale. */
         fonts.mono_sz = 16;
         fonts.prose_sz = 17;
-        fonts.mono = gui_load_font(gui_mono_font_paths(), (int)(fonts.mono_sz * scale + 0.5f),
+        fonts.mono = gui_load_font(gui_mono_font_paths(), (int)fonts.mono_sz,
                                    &fonts.owned_mono);
-        fonts.prose = gui_load_font(gui_prose_font_paths(), (int)(fonts.prose_sz * scale + 0.5f),
+        fonts.prose = gui_load_font(gui_prose_font_paths(), (int)fonts.prose_sz,
                                     &fonts.owned_prose);
+        fonts.mono_bold = gui_derive_font(fonts.mono, 1, 0);
+        fonts.prose_bold = gui_derive_font(fonts.prose, 1, 0);
+        fonts.owned_mono_bold = (fonts.mono_bold.ct != fonts.mono.ct);
+        fonts.owned_prose_bold = (fonts.prose_bold.ct != fonts.prose.ct);
     }
     w.busy_bind(gui_busy, NULL);
     gui_layout_menus();
@@ -257,7 +254,6 @@ int main(int argc, char **argv) {
     g_live.m = &m;
     g_live.fonts = &fonts;
     g_live.ui = &ui;
-    g_live.menu_open = &menu_open;
     g_live.status = status;
     g_live.pad = pad;
     g_live.top = top;
@@ -266,10 +262,10 @@ int main(int argc, char **argv) {
     g_live.ready = 1;
 
     for (;;) {
+        gui_input_begin_frame();
         /*
          * Host close is a one-shot offer into ask_quit. Cancel dismisses the
-         * prompt; Raylib latches shouldClose so chrome-X will not re-fire —
-         * further quit is menu / Ctrl-Q, or save-then-exit while still latched.
+         * prompt; further quit is menu / Ctrl-Q, or save-then-exit.
          */
         if (WindowShouldClose()) {
             if (!w.any_dirty()) break;
@@ -285,12 +281,12 @@ int main(int argc, char **argv) {
         int vis_rows;
         int saw;
         RtxBuf *act;
-        saw = gui_saw_input(dragging, menu_open);
+        saw = gui_saw_input(dragging);
         if (saw) gui_blink_show(&ui);
         gui_geom(&ww, &hh, &inner, &pane_w, &vis_rows, pad, top, ui.find);
         act = w.active();
         if (gui_handle_input(&w, act, &m, &fonts, &ui, status, sizeof(status),
-                             &quit_armed_at, &menu_open, &dragging, &scroll_grab,
+                             &quit_armed_at, &dragging, &scroll_grab,
                              pane_w, vis_rows, pad, top, inner, hh)) {
             break;
         }
@@ -323,6 +319,7 @@ int main(int argc, char **argv) {
             }
         }
         RtxWs_browse_pump(&w) !>;
+        w.safe_pump();
 
         if (saw || g_need_layout || (act && gui_view_stale(act))) {
             for (p = 0; p < w.npanes; p++) {
@@ -359,8 +356,10 @@ int main(int argc, char **argv) {
             if (RtxWs_browse_busy(&w)) g_browse_paint_at = rtx_ui_now_ms();
             g_dirty = 0;
         } else if (act && rtx_ui_work_pumping(&ui, &act->doc)) {
+            gui_input_consume();
             PollInputEvents();
         } else {
+            gui_input_consume();
             gui_idle_wait(&ui);
         }
     }
@@ -370,6 +369,8 @@ int main(int argc, char **argv) {
     gui_uninstall_live_resize();
     if (fonts.owned_mono) UnloadFont(fonts.mono);
     if (fonts.owned_prose) UnloadFont(fonts.prose);
+    if (fonts.owned_mono_bold) UnloadFont(fonts.mono_bold);
+    if (fonts.owned_prose_bold) UnloadFont(fonts.prose_bold);
     CloseWindow();
     if (rtx_ws_close_heavy(&w)) _exit(0);
     return 0;

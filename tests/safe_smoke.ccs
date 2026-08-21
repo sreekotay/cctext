@@ -1,0 +1,219 @@
+#!ccc ccs
+/*
+ * Safe journals: park/reload, identity toss, untitled, quit discard.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/script/stdio.cch>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/safe.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static void expect_text(RtxDoc *d, const char *want, const char *msg) {
+    char buf[4096];
+    size_t n, got;
+    if (!d) {
+        expect(0, msg);
+        return;
+    }
+    n = d->len();
+    if (n != strlen(want) || n >= sizeof(buf)) {
+        expect(0, msg);
+        return;
+    }
+    got = d->read_at(0, buf, n) !>;
+    expect(got == n && memcmp(buf, want, n) == 0, msg);
+}
+
+static void write_file(const char *path, const char *s) {
+    FILE *f = fopen(path, "w");
+    expect(f != NULL, "write_file open");
+    if (!f) return;
+    fputs(s, f);
+    fclose(f);
+}
+
+static void isol_reset(void) {
+    rtx_safe_test_isol();
+    {
+        char dir[512];
+        if (rtx_safe_dir(dir, sizeof(dir))) {
+            char cmd[640];
+            snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
+            (void)system(cmd);
+        }
+    }
+    rtx_safe_test_isol();
+}
+
+int main(void) {
+    @errhandler(CCError e) { cc_error_log(e); return 1; }
+    const char *a = "testdata/generated/safe_a.txt";
+    const char *b = "testdata/generated/safe_b.txt";
+    mkdir("testdata/generated", 0755);
+    isol_reset();
+    write_file(a, "hello\n");
+    write_file(b, "other\n");
+
+    /* Flush + destroy + open restores dirty + undo + caret. */
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        expect(!w.bufs[0].parked, "first open live");
+        {
+            RtxDoc *d = &w.bufs[0].doc;
+            d->caret = 0;
+            d->type("x") !>;
+            d->caret = 1;
+            w.bufs[0].top = 0;
+            w.safe_flush_all();
+            expect(d->dirty(), "dirty after type");
+            expect(d->can_undo(), "can undo");
+        }
+    }
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        {
+            RtxDoc *d = &w.bufs[0].doc;
+            expect_text(d, "xhello\n", "reload dirty text");
+            expect(d->dirty(), "reload dirty");
+            expect(d->can_undo(), "reload undo");
+            expect(d->caret == 1, "reload caret");
+            d->undo() !>;
+            expect_text(d, "hello\n", "undo after reload");
+            expect(d->can_redo(), "redo tail");
+        }
+    }
+
+    /* 1-pane browse-away parks the hidden file; come back restores. */
+    isol_reset();
+    write_file(a, "hello\n");
+    write_file(b, "other\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        {
+            RtxDoc *d = &w.bufs[0].doc;
+            d->type("z") !>;
+        }
+        w.add_path(b) !>;
+        w.npanes = 1;
+        w.pane[0] = 1;
+        w.pane[1] = 1;
+        w.sync_live() !>;
+        expect(w.bufs[0].parked, "a parked after browse");
+        expect(!w.bufs[1].parked, "b live");
+        expect(w.bufs[0].park_dirty, "parked dirty bit");
+        expect_text(&w.bufs[1].doc, "other\n", "b unchanged");
+        w.pane[0] = 0;
+        w.sync_live() !>;
+        expect(!w.bufs[0].parked, "a live again");
+        {
+            RtxDoc *d = &w.bufs[0].doc;
+            expect_text(d, "zhello\n", "park reload text");
+            expect(d->can_undo(), "park reload undo");
+        }
+    }
+
+    /* External edit tosses hist. */
+    isol_reset();
+    write_file(a, "hello\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        {
+            RtxDoc *d = &w.bufs[0].doc;
+            d->type("x") !>;
+        }
+        w.safe_flush_all();
+    }
+    write_file(a, "changed\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        {
+            RtxDoc *d = &w.bufs[0].doc;
+            expect_text(d, "changed\n", "identity miss uses disk");
+            expect(!d->can_undo(), "hist tossed");
+            expect(!d->dirty(), "not dirty after toss");
+        }
+    }
+
+    /* Untitled cannot park. */
+    isol_reset();
+    {
+        RtxWs w = {0} @destroy;
+        w.open_files(0, NULL) !>;
+        expect(w.untitled(), "untitled boot");
+        {
+            RtxDoc *d = &w.bufs[0].doc;
+            d->type("nope") !>;
+        }
+        w.sync_live() !>;
+        expect(!w.bufs[0].parked, "untitled stays live");
+        expect(w.bufs[0].doc.hist.head != w.bufs[0].doc.saved_head,
+               "untitled dirty");
+    }
+
+    /* Quit discard drops the journal. */
+    isol_reset();
+    write_file(a, "hello\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        {
+            RtxDoc *d = &w.bufs[0].doc;
+            d->type("x") !>;
+        }
+        w.safe_flush_all();
+        expect(rtx_safe_peek_dirty(a), "journal dirty");
+        w.safe_discard_dirty();
+        expect(!rtx_safe_peek_dirty(a), "journal dropped");
+    }
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        {
+            RtxDoc *d = &w.bufs[0].doc;
+            expect_text(d, "hello\n", "after discard disk text");
+            expect(!d->dirty(), "after discard clean");
+        }
+    }
+
+    if (fails) {
+        fprintf(stderr, "safe_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("safe_smoke ok\n");
+    return 0;
+}

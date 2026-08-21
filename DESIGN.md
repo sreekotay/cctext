@@ -1,6 +1,6 @@
 # Design
 
-One document core, two frontends (`cctext`, `cctext-ray`). Memory is owned or it is a view. Lifetime is a field, not a protocol. The document type is as wide as the domain — a face is reach at the call site, not a smaller struct. Epochs say what dies when; faces say what this call may do. A TU’s write is the function that accepts only legal values for that unit; that is what the header exports. Ownership is handled at the call site.
+One document core, two frontends (`cctext`, `cctext-gui`). Memory is owned or it is a view. Lifetime is a field, not a protocol. The document type is as wide as the domain — a face is reach at the call site, not a smaller struct. Epochs say what dies when; faces say what this call may do. A TU’s write is the function that accepts only legal values for that unit; that is what the header exports. Ownership is handled at the call site.
 
 ## Locality
 
@@ -30,6 +30,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs, clipboard) |
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
+| Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | identity mismatch tosses hist; quit-`q` drops dirty journals |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
 
 ## Interactive
@@ -135,7 +136,7 @@ Fallible APIs are Results (`T !>(CCError)`). Value returns are only pure queries
 
 One document read surface: `size_t !>(CCError) read_at(off, dest, n)`. Success returns `got = min(n, len - off)` (EOF clamp is success). A hole inside that range is an error. Callers that need every byte of `n` require `off + n <= len` (or check `got == n`).
 
-If an API returns owned bytes, the destination arena is the **last** parameter (receiver first, arena last). That arena *is* the product’s lifetime. Call-local `@scratch` / frame stack stays inside the callee and is not returned. Views (`span`) do not take an arena.
+If an API returns owned bytes, the destination arena is the **last** parameter (receiver first, arena last). That arena *is* the product’s lifetime — the caller names WHERE. `scratch_span(from, n, a)` copies onto `a` when the range is not one piece. Call-local `@scratch` / frame stack stays inside the callee and is not returned. Views (`span`) do not take an arena. `RTX_FRAME_SCRATCH` is a stack budget, not a span cap.
 
 A Result failure is **unchanged** or **`broken`**. `broken` means the tree may be inconsistent — set only after a mutating step that could not be rolled back. The latch is a kind (`RTX_ERR_UNRESTORABLE`), not a message. Pre-mutation faults leave the object intact and do not set `broken`.
 
@@ -148,7 +149,7 @@ A `char[:]` is `{ptr, len, id}`. Storing it does not take the bytes.
 - `from_path` — page store until `destroy()`. No document-wide `char[:]` over the file; bytes are `read_at` (or a named-arena copy). Open does not scan the body.
 - `from_buffer` — keeps the caller’s slice. Refuses non-empty untracked (`id == 0`).
 - `span` — empty means “not one piece” (or `n == 0`), or store-backed bytes with no stable view. That is a payload; callers use `scratch_span` / `read_at`.
-- `scratch_span` / `analysis_span` — view if contiguous, else a copy on the named arena. Empty is `n == 0` / past end; OOM and short `read_at` are errors.
+- `scratch_span(from, n, a)` / `analysis_span` — view if contiguous, else a copy on the named arena (`a` last). Empty is `n == 0` / past end; OOM and short `read_at` are errors. Do not size `a` to `RTX_FRAME_SCRATCH` and treat a longer range as leftover.
 
 ## Safety
 
@@ -176,7 +177,9 @@ A same-file split is two cameras on one document. After a mutation, reparse once
 
 The document write is `replace` (byte range in `[0, len]`). `insert` / `erase` on the doc call it. User changes are `replace` on the history stack. Dirty is `hist.head != saved_head`. Offsets, caret, and selection are bytes. Save streams pieces (`write_fd`). Deleted bytes stay in the original/add buffers; hist stores them inline only while they still coalesce (typing/backspace), and otherwise keeps piece descriptors so undo splices the range back.
 
-Save is a **safe rename**, not inode preservation: sibling `path.tmp.XXXXXX`, stream pieces, keep `0777` mode bits from `stat`, fsync the file, `rename` over the path, best-effort directory fsync. That replaces the inode. Hard-link identity is lost; a symlink at `path` is replaced rather than followed; owner, ACL, and xattr are not copied. That is the intended 0.1 policy (crash-safe replace). Do not write through the existing file. There is no mtime / inode check against an external change.
+Save is a **safe rename**, not inode preservation: sibling `path.tmp.XXXXXX`, stream pieces, keep `0777` mode bits from `stat`, fsync the file, `rename` over the path, best-effort directory fsync. That replaces the inode. Hard-link identity is lost; a symlink at `path` is replaced rather than followed; owner, ACL, and xattr are not copied. That is the intended 0.1 policy (crash-safe replace). Do not write through the existing file. Save does not refuse an external change; Safe journals do (mtime + size + inode) and toss hist on mismatch.
+
+Browse-away does not ask and does not write the user’s path. It flushes the journal (hist as bytes, camera, identity) and **evicts** the document epoch. Live set is the pane slots. Untitled cannot park. Quit still asks; `q` drops dirty journals. A later suspend quit is not this cut.
 
 ## Encoding
 
@@ -186,15 +189,20 @@ plus following combining marks / variation selectors). Hex is a paint of that sa
 and unlock stay on the camera / document. Grid is the same: one record
 per newline whose window-lex face is not STRING (the grammar's begin/end,
 via lookback — not a CSV quote walker). No lex: every NL is a record.
-Line 0 is a sticky header (always `read_at(0)`, not `line_start` from a
-gap). Widths are header ∪ this fill (max line in a cell). Each column
-caps at `RTX_GRID_MAX_COL`, not the pane; extra fields use `left_col`.
-A cell wraps on its width and on embedded newlines. A delim inside a
-string is not a field. The line prefix is still newlines. A mid-field
-camera walks back to the previous unheld NL (lookback / scratch cap);
-a miss is leftover, not a record index. Wheel/scroll steps whole records
-(not vis wraps). Each wrap row keeps its physical line in the gutter.
-`l` cycles default / wrap / hex / grid. A split is two editors (same
+`rtx_layout_grid_held` is that STRING test; a delim or NL is a gap only
+when it is not held. Line 0 is a sticky header (always `read_at(0)`, not
+`line_start` from a gap). Widths are header ∪ this fill (max line in a
+cell). Each column caps at `RTX_GRID_MAX_COL`, not the pane; extra fields
+use `left_col`. A cell wraps on its width and on embedded newlines. A
+delim inside a string is not a field. The line prefix is still newlines.
+Three lengths, not one: `RTX_FRAME_SCRATCH` is a stack copy, not a record;
+`RTX_MARKUP_LOOKBACK` is the mid-field `cam_lo` walk; `RTX_GRID_REC_CAP`
+is a record leftover. A miss is leftover, not a record index. Wheel/scroll
+steps whole records (not vis wraps). Each wrap row keeps its physical
+line in the gutter. Vis-row Home/End is `rtx_layout_soft_wrap` (wrap view
+or grid). `L.wrap` is only the wrap view — grid sets it to 0. Horizontal
+camera is `rtx_layout_uses_left` (default and grid). `l` cycles default /
+wrap / hex / grid. A split is two editors (same
 file or another path); focus is which pane. Hex motion already steps one
 byte (and resets to the high nibble). On a hex pane, `type` accepts only
 `0-9a-fA-F` and overwrites that nibble. The dump is display (UTF-8 lead,

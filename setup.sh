@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Check the Concurrent-C toolchain and optional Raylib. Does not vendor either.
+# Check the Concurrent-C toolchain. Does not vendor ccc.
 set -euo pipefail
 
 CCC="${CCC:-ccc}"
@@ -23,12 +23,6 @@ case "$ver" in
         exit 1
         ;;
 esac
-
-if test -f "$(brew --prefix raylib 2>/dev/null)/include/raylib.h"; then
-    echo "raylib: $(brew --prefix raylib)"
-else
-    echo "raylib: not found (needed for ./make.shcc @cctext_ray). brew install raylib"
-fi
 
 mkdir -p testdata/generated out bin
 if test ! -f testdata/generated/large.txt; then

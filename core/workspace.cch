@@ -5,8 +5,12 @@
 #ifndef RTX_WORKSPACE_H
 #define RTX_WORKSPACE_H
 
+#include <limits.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <time.h>
+#include "safe.cch"
 
 /* RtxDoc / RtxLayout / RtxDocLayout come from document.cch + layout.cch. */
 
@@ -30,6 +34,12 @@ typedef struct {
     double scroll;
     double layout_width;
     RtxPref pref;          /* goal column for visual up/down */
+    char[:] park_path;     /* workspace session; realpath key for Safe */
+    int parked;            /* 1: doc/layout evicted; journal on disk */
+    int park_dirty;        /* last known dirty while parked */
+    size_t safe_gen;       /* last flushed edit_gen */
+    size_t safe_saved;     /* last flushed saved_head */
+    long safe_due_ms;      /* 0 idle; else flush at this monotonic ms */
 } RtxBuf;
 
 #ifndef RTX_BROWSE_TYPES
@@ -125,9 +135,225 @@ static int RtxWs_ensure(RtxWs *w) {
 
 static void RtxBuf_destroy(RtxBuf *b) {
     if (!b) return;
+    if (!b->parked) {
+        b->layout.destroy();
+        b->doc.destroy();
+    }
+    memset(b, 0, sizeof(*b));
+}
+
+static void rtx_ws_cam_from_buf(const RtxBuf *b, RtxSafeCam *c) {
+    rtx_safe_cam_clear(c);
+    if (!b) return;
+    c->top = b->top;
+    c->top_wrap = b->top_wrap;
+    c->left_col = b->left_col;
+    c->top_byte = b->top_byte;
+    c->seek_off = b->seek_off;
+    c->seek_rel = b->seek_rel;
+    c->seek_valid = b->seek_valid;
+    c->view = b->layout.view;
+    c->hex_nib = b->hex_nib;
+    c->unlock = b->unlock;
+    c->pin_view = b->pin_view;
+}
+
+static void rtx_ws_cam_to_buf(RtxBuf *b, const RtxSafeCam *c) {
+    if (!b || !c) return;
+    b->top = c->top;
+    b->top_wrap = c->top_wrap;
+    b->left_col = c->left_col;
+    b->top_byte = c->top_byte;
+    b->seek_off = c->seek_off;
+    b->seek_rel = c->seek_rel;
+    b->seek_valid = c->seek_valid;
+    rtx_layout_set_view(&b->layout, c->view);
+    b->hex_nib = c->hex_nib;
+    b->unlock = c->unlock;
+    b->pin_view = c->pin_view;
+}
+
+static char[:] rtx_ws_session_str(RtxWs *w, const char *s) {
+    char[:] out;
+    size_t n;
+    if (!w || !s) return cc_slice_empty();
+    n = strlen(s);
+    out = w->session.alloc_slice_bytes(n + 1);
+    if (!out.ptr) return cc_slice_empty();
+    memcpy(out.ptr, s, n);
+    out.ptr[n] = 0;
+    return out.sub(0, n);
+}
+
+static void rtx_ws_bind_path(RtxWs *w, RtxBuf *b, const char *path) {
+    char real[PATH_MAX];
+    const char *p = path;
+    if (!w || !b || !path || !path[0]) return;
+    if (realpath(path, real)) p = real;
+    b->park_path = rtx_ws_session_str(w, p);
+}
+
+static const char *rtx_ws_buf_path(const RtxBuf *b) {
+    if (!b) return NULL;
+    if (b->park_path.ptr && b->park_path.len) return b->park_path.ptr;
+    if (!b->parked && b->doc.path.ptr && b->doc.path.len) return b->doc.path.ptr;
+    return NULL;
+}
+
+static int rtx_ws_buf_dirty(const RtxBuf *b) {
+    if (!b) return 0;
+    if (b->parked) return b->park_dirty;
+    return b->doc.dirty();
+}
+
+static long rtx_ws_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+}
+
+static void rtx_ws_flush_buf(RtxBuf *b) {
+    RtxSafeCam cam;
+    if (!b || b->parked) return;
+    if (!rtx_ws_buf_path(b)) return;
+    rtx_ws_cam_from_buf(b, &cam);
+    rtx_safe_flush(&b->doc, &cam);
+    b->safe_gen = b->doc.edit_gen;
+    b->safe_saved = b->doc.saved_head;
+    b->park_dirty = b->doc.dirty();
+    b->safe_due_ms = 0;
+}
+
+static void rtx_ws_park_buf(RtxBuf *b) {
+    if (!b || b->parked) return;
+    if (!rtx_ws_buf_path(b)) return;
+    rtx_ws_flush_buf(b);
+    b->park_dirty = b->doc.dirty();
     b->layout.destroy();
     b->doc.destroy();
-    memset(b, 0, sizeof(*b));
+    memset(&b->doc, 0, sizeof(b->doc));
+    memset(&b->layout, 0, sizeof(b->layout));
+    b->parked = 1;
+}
+
+static void !>(CCError) rtx_ws_unpark_buf(RtxWs *w, RtxBuf *b) {
+    RtxSafeCam cam;
+    const char *path;
+    if (!b || !b->parked) return cc_ok();
+    path = rtx_ws_buf_path(b);
+    if (!path) return cc_err(CC_ERR_INVALID_ARG, "parked untitled");
+    rtx_safe_cam_clear(&cam);
+    b->doc.from_path(path) !>(e) { return cc_err(e); };
+    if (w) b->doc.tree.busy_bind(w->busy_fn, w->busy_ctx);
+    rtx_safe_load(&b->doc, &cam);
+    rtx_ws_cam_to_buf(b, &cam);
+    b->parked = 0;
+    b->park_dirty = b->doc.dirty();
+    b->safe_gen = b->doc.edit_gen;
+    b->safe_saved = b->doc.saved_head;
+    return cc_ok();
+}
+
+static int rtx_ws_buf_visible(const RtxWs *w, int bi) {
+    if (!w || bi < 0) return 0;
+    if (w->pane[0] == bi) return 1;
+    if (w->npanes > 1 && w->pane[1] == bi) return 1;
+    return 0;
+}
+
+static void rtx_ws_write_ws(RtxWs *w) {
+    RtxSafeWs ws;
+    RtxSafeWsEnt ents[64];
+    size_t i, n = 0;
+    if (!w) return;
+    memset(&ws, 0, sizeof(ws));
+    for (i = 0; i < w->len && n < 64; i++) {
+        const char *p = rtx_ws_buf_path(&w->bufs[i]);
+        if (!p) continue;
+        snprintf(ents[n].path, sizeof(ents[n].path), "%s", p);
+        ents[n].view = w->bufs[i].layout.view;
+        ents[n].dirty = rtx_ws_buf_dirty(&w->bufs[i]);
+        n++;
+    }
+    ws.npanes = w->npanes;
+    ws.focus = w->focus;
+    ws.pane0 = w->pane[0];
+    ws.pane1 = w->pane[1];
+    ws.n = n;
+    ws.ents = ents;
+    rtx_safe_ws_write(&ws);
+}
+
+static void !>(CCError) RtxWs_sync_live(RtxWs *w) {
+    size_t i;
+    if (!w) return cc_ok();
+    for (i = 0; i < w->len; i++) {
+        if (rtx_ws_buf_visible(w, (int)i)) {
+            if (w->bufs[i].parked)
+                rtx_ws_unpark_buf(w, &w->bufs[i]) !>(e) { return cc_err(e); };
+        } else if (!w->bufs[i].parked && rtx_ws_buf_path(&w->bufs[i])) {
+            rtx_ws_park_buf(&w->bufs[i]);
+        }
+    }
+    rtx_ws_write_ws(w);
+    return cc_ok();
+}
+
+static void RtxWs_safe_flush_all(RtxWs *w) {
+    size_t i;
+    if (!w) return;
+    for (i = 0; i < w->len; i++) rtx_ws_flush_buf(&w->bufs[i]);
+    rtx_ws_write_ws(w);
+}
+
+static void RtxWs_safe_pump(RtxWs *w) {
+    size_t i;
+    long now;
+    if (!w) return;
+    now = rtx_ws_now_ms();
+    for (i = 0; i < w->len; i++) {
+        RtxBuf *b = &w->bufs[i];
+        if (b->parked || !rtx_ws_buf_path(b)) continue;
+        if (b->safe_gen == b->doc.edit_gen && b->safe_saved == b->doc.saved_head) {
+            b->safe_due_ms = 0;
+            continue;
+        }
+        if (!b->safe_due_ms) b->safe_due_ms = now + (long)RTX_SAFE_DEBOUNCE_MS;
+        if (now < b->safe_due_ms) continue;
+        rtx_ws_flush_buf(b);
+    }
+}
+
+static void !>(CCError) RtxWs_save_dirty(RtxWs *w) {
+    size_t i;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    for (i = 0; i < w->len; i++) {
+        RtxBuf *b = &w->bufs[i];
+        if (b->parked && b->park_dirty)
+            rtx_ws_unpark_buf(w, b) !>(e) { return cc_err(e); };
+        if (b->parked || !b->doc.dirty()) continue;
+        if (!b->doc.path.ptr || b->doc.path.len == 0)
+            return cc_err(CC_ERR_INVALID_ARG, "untitled");
+        b->doc.save() !>(e) { return cc_err(e); };
+        b->doc.break_coalesce();
+        rtx_ws_flush_buf(b);
+    }
+    rtx_ws_write_ws(w);
+    return cc_ok();
+}
+
+static void RtxWs_safe_discard_dirty(RtxWs *w) {
+    size_t i;
+    if (!w) return;
+    for (i = 0; i < w->len; i++) {
+        if (!rtx_ws_buf_dirty(&w->bufs[i])) continue;
+        {
+            const char *p = rtx_ws_buf_path(&w->bufs[i]);
+            if (p) rtx_safe_drop(p);
+        }
+        w->bufs[i].park_dirty = 0;
+    }
+    rtx_ws_write_ws(w);
 }
 
 static void rtx_buf_swap_cam(RtxBuf *b, RtxPaneSnap *s) {
@@ -225,6 +451,35 @@ static void !>(CCError) RtxWs_add_path(RtxWs *w, const char *path) {
     memset(b, 0, sizeof(*b));
     b->doc.from_path(path) !>(e) { return cc_err(e); };
     b->doc.tree.busy_bind(w->busy_fn, w->busy_ctx);
+    rtx_ws_bind_path(w, b, path);
+    {
+        RtxSafeCam cam;
+        rtx_safe_cam_clear(&cam);
+        rtx_safe_load(&b->doc, &cam);
+        rtx_ws_cam_to_buf(b, &cam);
+    }
+    b->safe_gen = b->doc.edit_gen;
+    b->safe_saved = b->doc.saved_head;
+    b->park_dirty = b->doc.dirty();
+    w->len++;
+    return cc_ok();
+}
+
+static void !>(CCError) RtxWs_add_parked(RtxWs *w, const char *path, int dirty,
+                                         int view) {
+    RtxBuf *b;
+    if (!w || !path || !path[0]) return cc_err(CC_ERR_INVALID_ARG, "parked path");
+    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+    rtx_arena_grow(&w->session, (void **)&w->bufs, &w->cap, w->len + 1,
+                   sizeof(RtxBuf)) !>(e) {
+        return cc_err(e);
+    };
+    b = &w->bufs[w->len];
+    memset(b, 0, sizeof(*b));
+    rtx_ws_bind_path(w, b, path);
+    rtx_layout_set_view(&b->layout, view);
+    b->parked = 1;
+    b->park_dirty = dirty;
     w->len++;
     return cc_ok();
 }
@@ -246,8 +501,9 @@ static void !>(CCError) RtxWs_add_empty(RtxWs *w) {
 }
 
 static int RtxWs_untitled(const RtxWs *w) {
-    return w && w->len == 1 &&
-           (!w->bufs[0].doc.path.ptr || w->bufs[0].doc.path.len == 0);
+    if (!w || w->len != 1) return 0;
+    if (rtx_ws_buf_path(&w->bufs[0])) return 0;
+    return 1;
 }
 
 /* TTY only. Scripts keep the not-found error. */
@@ -287,6 +543,7 @@ static void RtxWs_busy_bind(RtxWs *w, RtxBusyFn fn, void *ctx) {
     w->busy_fn = fn;
     w->busy_ctx = ctx;
     for (i = 0; i < w->len; i++) {
+        if (w->bufs[i].parked) continue;
         w->bufs[i].doc.tree.busy_bind(fn, ctx);
     }
 }
@@ -301,6 +558,39 @@ static void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
     w->pane[0] = 0;
     w->pane[1] = 0;
     if (npaths <= 0) {
+        CCArena hold = cc_arena_heap(kilobytes(8));
+        RtxSafeWs snap;
+        int restored = 0;
+        if (hold.base && rtx_safe_ws_read(&snap, &hold) && snap.n) {
+            size_t k;
+            for (k = 0; k < snap.n; k++) {
+                struct stat st;
+                if (!snap.ents[k].path[0] || stat(snap.ents[k].path, &st) != 0)
+                    continue;
+                w->add_parked(snap.ents[k].path, snap.ents[k].dirty,
+                              snap.ents[k].view) !>(e) {
+                    continue;
+                };
+            }
+            if (w->len) {
+                w->npanes = snap.npanes >= 2 && w->len >= 2 ? 2 : 1;
+                w->focus = snap.focus;
+                if (w->focus < 0 || w->focus >= w->npanes) w->focus = 0;
+                w->pane[0] = snap.pane0;
+                w->pane[1] = snap.pane1;
+                if (w->pane[0] < 0 || (size_t)w->pane[0] >= w->len) w->pane[0] = 0;
+                if (w->pane[1] < 0 || (size_t)w->pane[1] >= w->len)
+                    w->pane[1] = w->len >= 2 ? 1 : 0;
+                w->sync_live() !>(e) {
+                    w->destroy();
+                    hold.destroy();
+                    return cc_err(e);
+                };
+                restored = 1;
+            }
+        }
+        if (hold.base) hold.destroy();
+        if (restored) return cc_ok();
         w->add_empty() !>(e) {
             w->destroy();
             return cc_err(e);
@@ -326,13 +616,18 @@ static void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
         w->npanes = 2;
         w->pane[1] = 1;
     }
+    w->sync_live() !>(e) {
+        w->destroy();
+        return cc_err(e);
+    };
     return cc_ok();
 }
 
 static void rtx_buf_grid_bind(RtxBuf *b) {
     char sample[RTX_GRID_PROBE];
     size_t got = 0;
-    if (!b || !rtx_layout_is_grid(&b->layout) || b->layout.grid_delim) return;
+    if (!b || b->parked || !rtx_layout_is_grid(&b->layout) || b->layout.grid_delim)
+        return;
     {
         @errhandler(CCError e) {
             (void)e;
@@ -400,6 +695,10 @@ static void RtxWs_next_buf(RtxWs *w) {
         rtx_ws_side_drop(w);
     }
     w->pane[w->focus] = (w->pane[w->focus] + 1) % (int)w->len;
+    {
+        @errhandler(CCError e) { (void)e; }
+        w->sync_live() !>;
+    }
 }
 
 static void RtxWs_prev_buf(RtxWs *w) {
@@ -409,6 +708,10 @@ static void RtxWs_prev_buf(RtxWs *w) {
         rtx_ws_side_drop(w);
     }
     w->pane[w->focus] = (w->pane[w->focus] + (int)w->len - 1) % (int)w->len;
+    {
+        @errhandler(CCError e) { (void)e; }
+        w->sync_live() !>;
+    }
 }
 
 static void RtxWs_set_focus(RtxWs *w, int pane) {
@@ -645,6 +948,34 @@ static int rtx_buf_byte_units(const RtxBuf *b) {
     return b && rtx_layout_is_hex(&b->layout);
 }
 
+/* Delim / wrap NL are not painted. STRING face is a cell (held). */
+static int rtx_buf_grid_gap(RtxBuf *b, size_t off) {
+    char delim;
+    if (!b || !rtx_layout_is_grid(&b->layout)) return 0;
+    delim = b->layout.grid_delim ? b->layout.grid_delim : b->layout.grid.delim;
+    return rtx_layout_grid_gap_at(&b->doc, off, delim);
+}
+
+static void !>(CCError) rtx_buf_grid_skip_gap(RtxBuf *b, int dir) {
+    size_t n, guard = 0;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (!b || !rtx_layout_is_grid(&b->layout)) return cc_ok();
+    n = b->len();
+    while (guard++ < 8 && b->doc.caret < n && rtx_buf_grid_gap(b, b->doc.caret)) {
+        if (dir < 0) {
+            if (b->doc.caret == 0) break;
+            b->doc.caret = b->doc.cluster_prev(b->doc.caret) !>;
+        } else {
+            size_t next = b->doc.cluster_next(b->doc.caret) !>;
+            if (next <= b->doc.caret) break;
+            b->doc.caret = next;
+        }
+    }
+    return cc_ok();
+}
+
 /* Left/right. Hex is one byte; text is one cluster. */
 static void !>(CCError) RtxBuf_move_horiz(RtxBuf *b, int dir, int shift) {
     size_t n;
@@ -677,6 +1008,8 @@ static void !>(CCError) RtxBuf_move_horiz(RtxBuf *b, int dir, int shift) {
         if (!shift) b->doc.sel_anchor = b->doc.caret;
         b->doc.sel_box = 0;
     }
+    if (rtx_layout_is_grid(&b->layout))
+        rtx_buf_grid_skip_gap(b, dir) !>(e) { return cc_err(e); };
     if (!rtx_buf_byte_units(b)) {
         b->doc.caret = b->doc.fold_snap(b->doc.caret, dir);
         if (!shift) b->doc.sel_anchor = b->doc.caret;
@@ -1034,7 +1367,7 @@ static void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double
         rtx_buf_fold_skip_cam(b, dir) !>;
         return cc_ok();
     }
-    if (!b->layout.wrap) {
+    if (b->layout.view != RTX_VIEW_WRAP) {
         b->top_wrap = 0;
         if (dir < 0 && b->top > 0) b->top--;
         if (dir > 0 && b->top + 1 < nlines) b->top++;
@@ -1070,7 +1403,7 @@ static void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double
 }
 
 static int rtx_buf_uses_left(const RtxBuf *b) {
-    return b && !rtx_layout_is_hex(&b->layout) && !b->layout.wrap;
+    return b && rtx_layout_uses_left(&b->layout);
 }
 
 static size_t rtx_buf_row_max_w(const RtxBuf *b) {
@@ -1331,7 +1664,7 @@ static int RtxWs_any_dirty(const RtxWs *w) {
     size_t i;
     if (!w) return 0;
     for (i = 0; i < w->len; i++) {
-        if (w->bufs[i].doc.dirty()) return 1;
+        if (rtx_ws_buf_dirty(&w->bufs[i])) return 1;
     }
     return 0;
 }
@@ -1341,6 +1674,7 @@ static int rtx_ws_close_heavy(const RtxWs *w) {
     size_t i;
     if (!w) return 0;
     for (i = 0; i < w->len; i++) {
+        if (w->bufs[i].parked) continue;
         if (w->bufs[i].doc.tree.line_off_len >= ((size_t)1 << 20)) return 1;
     }
     return 0;
@@ -1415,8 +1749,11 @@ static int rtx_ws_find_path(const RtxWs *w, const char *path) {
     size_t i;
     if (!w || !path || !path[0]) return -1;
     for (i = 0; i < w->len; i++) {
-        char[:] p = w->bufs[i].doc.path;
-        if (p.ptr && strcmp(p.ptr, path) == 0) return (int)i;
+        const char *p = rtx_ws_buf_path(&w->bufs[i]);
+        char real[PATH_MAX];
+        if (!p) continue;
+        if (strcmp(p, path) == 0) return (int)i;
+        if (realpath(path, real) && strcmp(p, real) == 0) return (int)i;
     }
     return -1;
 }
@@ -1430,6 +1767,8 @@ static void !>(CCError) RtxWs_open_in_pane(RtxWs *w, const char *path) {
     found = rtx_ws_find_path(w, path);
     if (found >= 0) bufi = found;
     else if (RtxWs_untitled(w)) {
+        if (w->bufs[0].doc.dirty())
+            return cc_err(CC_ERR_INVALID_ARG, "untitled dirty");
         w->bufs[0].destroy();
         memset(&w->bufs[0], 0, sizeof(w->bufs[0]));
         w->len = 0;
@@ -1447,7 +1786,7 @@ static void !>(CCError) RtxWs_open_in_pane(RtxWs *w, const char *path) {
     w->pane[pane] = bufi;
     rtx_ws_same_split_seed(w);
     rtx_browse_drop(&w->nav[pane]);
-    return cc_ok();
+    return w->sync_live();
 }
 
 static void !>(CCError) RtxWs_browse_start(RtxWs *w) {

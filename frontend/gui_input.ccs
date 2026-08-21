@@ -1,11 +1,11 @@
 #!ccc ccs
 /*
- * cctext-ray input (linked TU; see gui.cch).
+ * cctext-gui input (linked TU; see fb.cch).
  */
 #include <ccc/std/prelude.cch>
 #include <stdio.h>
 #include <string.h>
-#include <raylib.h>
+#include "gui_plat.h"
 #include "../core/document.cch"
 #include "../core/layout.cch"
 #include "../core/workspace.cch"
@@ -39,6 +39,9 @@ static void gui_follow_caret(RtxBuf *b) {
 
 static RtxClickSeq g_clicks;
 
+static size_t !>(CCError) gui_grid_hit_xy(RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
+                                          double x, double y);
+
 /* 1 = path chosen, 0 = cancel, -1 = no system dialog (use in-app browse). */
 static int gui_pick_file(RtxBuf *act, char *out, size_t n) {
     char dir[RTX_BROWSE_DIR];
@@ -65,8 +68,9 @@ static void !>(CCError) gui_after_edit(RtxWs *w, RtxBuf *act, RtxMeasure *m, dou
 }
 
 static int gui_wheel_steps(float v) {
-    if (v > 0.0f) return v < 1.0f ? 1 : (int)v;
-    if (v < 0.0f) return v > -1.0f ? -1 : (int)v;
+    /* Platform already commits integer notches; keep sign. */
+    if (v > 0.0f) return (int)v;
+    if (v < 0.0f) return (int)v;
     return 0;
 }
 
@@ -90,11 +94,9 @@ void gui_wheel(RtxBuf *b, RtxMeasure *m, double width, int force_horiz) {
     }
     while (dy > 0) {
         b->scroll_vis(m, width, -1) !>(e) { (void)e; return; };
-        b->scroll_vis(m, width, -1) !>(e) { (void)e; return; };
         dy--;
     }
     while (dy < 0) {
-        b->scroll_vis(m, width, 1) !>(e) { (void)e; return; };
         b->scroll_vis(m, width, 1) !>(e) { (void)e; return; };
         dy++;
     }
@@ -156,7 +158,7 @@ static void gui_home_end(RtxBuf *b, int to_end, int shift, int physical) {
         b->clear_pref();
         return;
     }
-    if (!physical && b->layout.wrap && b->layout.len) {
+    if (!physical && rtx_layout_soft_wrap(&b->layout) && b->layout.len) {
         b->layout.move_row_edge(&b->doc, to_end, shift);
     } else {
         b->doc.move_line_edge(to_end, shift) !>;
@@ -172,15 +174,27 @@ static int gui_run_cmd(int cmd, RtxWs *w, RtxBuf *act, RtxMeasure *m,
                        double text_w, int vis_rows, RtxUi *ui,
                        char *status, size_t status_n, size_t *quit_armed_at);
 
+/* 1 = saved, 0 = error (status filled). Isolates save from ask_quit latch. */
+static int gui_try_save_dirty(RtxWs *w, char *status, size_t status_n) {
+    @errhandler(CCError e) {
+        snprintf(status, status_n, "%s", e.message ? e.message : "save failed");
+        return 0;
+    }
+    if (!w) return 0;
+    w->save_dirty() !>;
+    return 1;
+}
+
 /* Mouse + keys. 1 = quit. Not Result: main is already at the bind cap. */
 int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
                             RtxUi *ui, char *status, size_t status_n,
-                            size_t *quit_armed_at, int *menu_open, int *dragging,
+                            size_t *quit_armed_at, int *dragging,
                             int *scroll_grab, int pane_w, int vis_rows, int pad,
                             int top, int inner, int hh) {
     Vector2 mouse;
     int key;
     double text_w;
+    int mcmd;
     @errhandler(CCError e) {
         snprintf(status, status_n, "%s", e.message ? e.message : "error");
         return 0;
@@ -192,58 +206,50 @@ int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
     if (!w || !act || !m || !fonts || !ui || !scroll_grab) return 0;
     text_w = gui_text_w(fonts, act, pane_w, vis_rows);
     if (ui->ask_quit) {
-        int choice = 0;
-        if (IsKeyPressed(KEY_ESCAPE) || (IsKeyPressed(KEY_C) && !gui_ctrl())) {
-            choice = 3;
-        } else if (IsKeyPressed(KEY_S) || (gui_ctrl() && IsKeyPressed(KEY_S))) {
-            choice = 1;
-        } else if (IsKeyPressed(KEY_Q) || IsKeyPressed(KEY_N) ||
-                   IsKeyPressed(KEY_D) || (gui_ctrl() && IsKeyPressed(KEY_Q))) {
-            choice = 2;
+        size_t n = 0, si;
+        int choice;
+        for (si = 0; si < w->len; si++) {
+            if (w->bufs[si].parked) {
+                if (w->bufs[si].park_dirty) n++;
+            } else if (w->bufs[si].doc.dirty()) n++;
         }
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            Vector2 mp = GetMousePosition();
-            int hit = gui_quit_hit((int)mp.x, (int)mp.y, GetScreenWidth(), hh);
-            if (hit) choice = hit;
-        }
-        while (GetCharPressed() > 0) { }
-        if (choice == 3) {
+        choice = gui_alert_unsaved(n);
+        if (choice == 0) {
             ui->ask_quit = 0;
-            /* Dismiss this host-close offer; chrome-X stays latched. */
+            gui_clear_close();
             return 0;
         }
-        if (choice == 2) return 1;
-        if (choice == 1) {
-            size_t si;
-            for (si = 0; si < w->len; si++) {
-                RtxDoc *sd = &w->bufs[si].doc;
-                if (!sd->dirty()) continue;
-                if (!sd->path.ptr || sd->path.len == 0) {
-                    snprintf(status, status_n, "untitled — save as a path first");
-                    return 0;
-                }
-                sd->save() !>;
-                sd->break_coalesce();
-            }
+        if (choice == 2) {
+            ui->ask_quit = 0;
+            w->safe_discard_dirty();
             return 1;
         }
+        if (choice == 1) {
+            if (!gui_try_save_dirty(w, status, status_n)) {
+                /* Drop the host-close latch so chrome-X can offer again. */
+                gui_clear_close();
+                ui->ask_quit = 0;
+                return 0;
+            }
+            ui->ask_quit = 0;
+            return 1;
+        }
+        ui->ask_quit = 0;
         return 0;
     }
-    if (*menu_open >= 0) {
-        Vector2 hm = GetMousePosition();
-        gui_menu_hover_title((int)hm.x, (int)hm.y, menu_open);
+    mcmd = gui_menu_poll_cmd();
+    if (mcmd != CMD_NONE) {
+        if (gui_run_cmd(mcmd, w, act, m, text_w, vis_rows, ui, status,
+                        status_n, quit_armed_at)) {
+            return 1;
+        }
+        act = w->active();
+        if (!act) return 0;
+        text_w = gui_text_w(fonts, act, pane_w, vis_rows);
     }
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-        int mcmd = CMD_NONE;
-        int mhit;
         mouse = GetMousePosition();
-        mhit = gui_menu_click((int)mouse.x, (int)mouse.y, menu_open, &mcmd);
-        if (mhit == 2) {
-            if (gui_run_cmd(mcmd, w, act, m, text_w, vis_rows, ui, status,
-                            status_n, quit_armed_at)) {
-                return 1;
-            }
-        } else if (mhit == 0 && ui->find &&
+        if (ui->find &&
                    mouse.y >= (float)(hh - 26 - GUI_FIND_H) &&
                    mouse.y < (float)(hh - 26)) {
             int y0 = hh - 26 - GUI_FIND_H;
@@ -263,7 +269,7 @@ int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
                     gui_land(act, vis_rows);
                 }
             }
-        } else if (mhit == 0) {
+        } else {
             int ph;
             int x0;
             int pane = gui_pane_at(w, (int)mouse.x, pad, inner);
@@ -450,18 +456,20 @@ int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
             int x0 = gui_pane_x0(w, w->focus, pad, inner);
             double x = (double)mouse.x - (double)x0 - (double)gui_gutter_px(fonts, act, vis_rows);
             double y = (double)mouse.y - (double)top;
+            if (rtx_layout_is_grid(&act->layout))
+                x = gui_layout_hit_x(fonts, act, x);
             int ph = gui_text_ph(hh, top, ui->find);
             int hx = gui_scroll_x_h(act);
             int tph = ph > hx ? ph - hx : ph;
             size_t at;
             if (x < 0) {
-                if (!act->layout.wrap && !rtx_layout_is_hex(&act->layout)) {
+                if (rtx_layout_uses_left(&act->layout)) {
                     act->scroll_x(text_w, -1) !>;
                     act->ensure_view(m, text_w, vis_rows) !>;
                 }
                 x = 0;
             } else if (x >= text_w) {
-                if (!act->layout.wrap && !rtx_layout_is_hex(&act->layout)) {
+                if (rtx_layout_uses_left(&act->layout)) {
                     act->scroll_x(text_w, 1) !>;
                     act->ensure_view(m, text_w, vis_rows) !>;
                 }
@@ -615,7 +623,7 @@ int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
                   gui_ctrl() && IsKeyPressed(KEY_A) ? CMD_SEL_ALL : CMD_NONE;
         if (IsKeyPressed(KEY_ESCAPE)) {
             if (w->browse_close()) return 1;
-        } else if (gui_ctrl() && IsKeyPressed(KEY_O)) {
+        } else if (gui_ctrl() && (IsKeyPressed(KEY_O) || IsKeyPressed(KEY_B))) {
             int ok = rtx_browse_spawn(br, 0);
             snprintf(status, status_n, "%s %s",
                      ok ? "opened in" : "could not open in",
@@ -661,7 +669,6 @@ int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
         return 0;
     }
     if (IsKeyPressed(KEY_ESCAPE)) {
-        *menu_open = -1;
         ui->help = !ui->help;
         return 0;
     }
@@ -680,13 +687,13 @@ int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
             else if (IsKeyPressed(KEY_Q)) cmd = CMD_QUIT;
             else if (IsKeyPressed(KEY_G)) cmd = CMD_JUMP;
             else if (IsKeyPressed(KEY_F)) cmd = CMD_FIND;
-            else if (IsKeyPressed(KEY_O))
-                cmd = gui_shift() ? CMD_BROWSE : CMD_OPEN;
+            else if (IsKeyPressed(KEY_O) || IsKeyPressed(KEY_B))
+                cmd = CMD_BROWSE;
             else if (IsKeyPressed(KEY_A)) cmd = CMD_SEL_ALL;
             else if (IsKeyPressed(KEY_L)) cmd = CMD_VIEW;
             else if (IsKeyPressed(KEY_U)) cmd = CMD_FOLLOW;
             else if (IsKeyPressed(KEY_K)) cmd = CMD_NAV_NEXT;
-            else if (IsKeyPressed(KEY_B)) cmd = CMD_NAV_PREV;
+            else if (IsKeyPressed(KEY_P)) cmd = CMD_NAV_PREV;
             else if (IsKeyPressed(KEY_E)) cmd = CMD_NAV_INV;
             else if (IsKeyPressed(KEY_R)) cmd = CMD_NAV_INV_PREV;
             else if (IsKeyPressed(KEY_T)) cmd = CMD_FOLD;
@@ -702,10 +709,8 @@ int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
             cmd = CMD_JUMP;
         } else if (gui_ctrl() && IsKeyPressed(KEY_F)) {
             cmd = CMD_FIND;
-        } else if (gui_ctrl() && gui_shift() && IsKeyPressed(KEY_O)) {
+        } else if (gui_ctrl() && (IsKeyPressed(KEY_O) || IsKeyPressed(KEY_B))) {
             cmd = CMD_BROWSE;
-        } else if (gui_ctrl() && IsKeyPressed(KEY_O)) {
-            cmd = CMD_OPEN;
         } else if (gui_ctrl() && IsKeyPressed(KEY_S)) {
             cmd = CMD_SAVE;
         } else if (gui_ctrl() && IsKeyPressed(KEY_Z) && !gui_shift()) {
@@ -735,7 +740,7 @@ int gui_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, GuiFonts *fonts,
             cmd = CMD_FOLLOW;
         } else if (gui_ctrl() && IsKeyPressed(KEY_K)) {
             cmd = CMD_NAV_NEXT;
-        } else if (gui_ctrl() && IsKeyPressed(KEY_B)) {
+        } else if (gui_ctrl() && IsKeyPressed(KEY_P)) {
             cmd = CMD_NAV_PREV;
         } else if (gui_ctrl() && IsKeyPressed(KEY_E)) {
             cmd = CMD_NAV_INV;
@@ -891,21 +896,25 @@ static size_t !>(CCError) gui_grid_hit_xy(RtxBuf *act, RtxMeasure *m, GuiFonts *
     double hx;
     if (!act || !m || !fonts) return cc_err(CC_ERR_INVALID_ARG, "grid hit");
     hx = gui_layout_hit_x(fonts, act, x) +
-         (act->layout.wrap ? 0.0 : (double)act->left_col);
+         (rtx_layout_uses_left(&act->layout) ? (double)act->left_col : 0.0);
     if (rtx_layout_is_grid(&act->layout) && act->layout.grid_hdr_on) {
         if (y < 18.0) {
-            char hdr[RTX_FRAME_SCRATCH];
-            size_t hgot = 0;
             size_t hlen = act->layout.grid_hdr_end;
-            {
-                @errhandler(CCError e) {
+            size_t hit;
+            CCArena heap = {0};
+            char[:] hbytes = cc_slice_empty();
+            if (hlen) {
+                heap = cc_arena_heap(hlen + 64);
+                if (!heap.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "grid hit");
+                hbytes = act->doc.scratch_span(0, hlen, &heap) !>(e) {
+                    heap.destroy();
                     return cc_err(e);
-                }
-                hgot = act->doc.read_at(0, hdr, sizeof(hdr)) !>;
+                };
             }
-            if (hlen > hgot) hlen = hgot;
-            rtx_grid_bind_span(&act->layout.grid, 0, hlen);
-            return cc_ok(rtx_grid_hit(hdr, hlen, &act->layout.grid, 0, hx));
+            rtx_grid_bind_span(&act->layout.grid, 0, hbytes.len);
+            hit = rtx_grid_hit(hbytes.ptr, hbytes.len, &act->layout.grid, 0, hx);
+            if (heap.base) heap.destroy();
+            return cc_ok(hit);
         }
         y -= 18.0;
     }
@@ -986,6 +995,13 @@ static int gui_run_cmd(int cmd, RtxWs *w, RtxBuf *act, RtxMeasure *m,
         rtx_ui_cancel_jump(ui, &act->doc);
         rtx_ui_clear_find(ui);
         ui->help = 0;
+        if (w->browsing()) {
+            int ok = rtx_browse_spawn(RtxWs_browse(w), 0);
+            snprintf(status, status_n, "%s %s",
+                     ok ? "opened in" : "could not open in",
+                     rtx_host_peer_name(0));
+            return 0;
+        }
         w->browse_start() !>;
     } else if (cmd == CMD_HELP) {
         ui->help = !ui->help;

@@ -27,22 +27,32 @@ typedef enum {
 #define RTX_HL_FULL_MAX 262144
 #define RTX_MARKUP_SCAN_MAX 262144
 #define RTX_HL_WIN_MAX RTX_MARKUP_SCAN_MAX
+/* Mid-field grid cam_lo / TM lookback. Not RTX_FRAME_SCRATCH. */
 #define RTX_MARKUP_LOOKBACK 16384
 
 typedef struct {
     size_t from;
     size_t n;
+    int keep; /* 1 = lex this window without dropping the rest of a long CODE */
 } RtxHlWin;
 
 static RtxHlWin rtx_hl_win(size_t from, size_t n) {
     RtxHlWin w;
     w.from = from;
     w.n = n > (size_t)RTX_HL_WIN_MAX ? (size_t)RTX_HL_WIN_MAX : n;
+    w.keep = 0;
     return w;
 }
 
 static RtxHlWin rtx_hl_span(size_t from, size_t to) {
     return rtx_hl_win(from, to > from ? to - from : 0);
+}
+
+/* Grid header / held lookback: same lex, do not clip the paint window. */
+static RtxHlWin rtx_hl_keep(size_t from, size_t n) {
+    RtxHlWin w = rtx_hl_win(from, n);
+    w.keep = 1;
+    return w;
 }
 
 typedef enum {
@@ -453,10 +463,10 @@ static long rtx_doc_lf_delta_local(const RtxDoc *d, size_t from, size_t to) {
     return neg ? -(long)seen : (long)seen;
 }
 
-static inline char[:] !>(CCError) RtxDoc_scratch_span(const RtxDoc *d, CCArena *scratch,
-                                          size_t from, size_t n) {
+static inline char[:] !>(CCError) RtxDoc_scratch_span(const RtxDoc *d, size_t from,
+                                          size_t n, CCArena *a) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
-    return RtxPieceTree_scratch_span(&d->tree, scratch, from, n);
+    return RtxPieceTree_scratch_span(&d->tree, from, n, a);
 }
 
 static inline int RtxDoc_check(const RtxDoc *d) {
@@ -885,18 +895,11 @@ static void !>(CCError) rtx_doc_refresh_prose_runs(RtxDoc *d, size_t lo, size_t 
         return cc_err(e);
     };
     need = hi - lo;
-    if (need <= (size_t)RTX_FRAME_SCRATCH) {
-        cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
-        char[:] bytes = d->scratch_span(&scratch, lo, need) !>(e) {
-            return cc_err(e);
-        };
-        return rtx_doc_scan_markup_runs(d, bytes.ptr, lo, bytes.len);
-    }
     {
         CCArena frame = cc_arena_heap(need + 64);
         char[:] bytes;
         if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "prose runs");
-        bytes = d->scratch_span(&frame, lo, need) !>(e) {
+        bytes = d->scratch_span(lo, need, &frame) !>(e) {
             frame.destroy();
             return cc_err(e);
         };
@@ -1115,14 +1118,20 @@ static void !>(CCError) rtx_doc_window_markup(RtxDoc *d, size_t from, size_t to)
     neu[nneu].hl_done = 0;
     nneu++;
     if (to > from) {
-        cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
-        char[:] bytes = d->scratch_span(&scratch, from, to - from) !>(e) {
+        CCArena frame = cc_arena_heap((to - from) + 64);
+        char[:] bytes;
+        if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "markup span");
+        bytes = d->scratch_span(from, to - from, &frame) !>(e) {
+            frame.destroy();
             return cc_err(e);
         };
         int at_bol = (from == 0);
         if (from > 0) {
             char p = 0;
-            size_t pg = d->read_at(from - 1, &p, 1) !>(e) { return cc_err(e); };
+            size_t pg = d->read_at(from - 1, &p, 1) !>(e) {
+                frame.destroy();
+                return cc_err(e);
+            };
             at_bol = (pg == 1 && p == '\n');
         }
         for (i = 0; i < bytes.len; i++) {
@@ -1150,21 +1159,25 @@ static void !>(CCError) rtx_doc_window_markup(RtxDoc *d, size_t from, size_t to)
             size_t old_len = d->run_len;
             size_t old_cap = d->run_cap;
             rtx_doc_clip_runs(d, from, to, rtx_run_is_markup_only) !>(e) {
+                frame.destroy();
                 return cc_err(e);
             };
             rtx_doc_scan_markup_runs(d, bytes.ptr, from, bytes.len) !>(e) {
                 d->runs = old_runs;
                 d->run_len = old_len;
                 d->run_cap = old_cap;
+                frame.destroy();
                 return cc_err(e);
             };
             rtx_doc_merge_window_secs(d, sec_lo, to, neu, nneu) !>(e) {
                 d->runs = old_runs;
                 d->run_len = old_len;
                 d->run_cap = old_cap;
+                frame.destroy();
                 return cc_err(e);
             };
         }
+        frame.destroy();
     } else {
         rtx_doc_merge_window_secs(d, sec_lo, to, neu, nneu) !>(e) {
             d->run_len = saved;
