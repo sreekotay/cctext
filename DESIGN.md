@@ -69,6 +69,22 @@ the prefix; do not call it from a gap camera.
 prefix also walks toward EOF on that gate (`prefix_step`) so gutters
 and `L n/N` do not sit idle.
 
+`lf_ready` the field is a latch. `lf_ready()` / `index_covers` are
+false when the flag is stale (huge + `subtree_lf==0`). The flag
+means node newline weights match the body (one unedited original at
+EOF, or a small recount). It is not “the prefix reached a milestone.”
+A split tree at EOF stays progressive: `scan_line` is exact, weights
+are not. Setting the flag with `subtree_lf==0` made `line_count()==1`
+and snapped the camera to line 0.
+
+The prefix frontier is paid work. A covered edit patches it
+(`note_insert` / `note_erase`). Truncate at the caret only when the
+edit changes newlines (Enter may park the scan). A letter key that
+parked `line_scan_off` at the caret rescanned the tail.
+
+`line_count` is a scroll budget until weights are live. A window
+write must not take `to = len` because that total said “last page.”
+
 Host frame: mutations, then one window write. TUI read blocks, so
 `pump → layout+paint → input`. GUI events are already polled, so
 `input → pump → layout → paint`. Do not layout, then handle, then
