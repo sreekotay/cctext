@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Write a mixed prose/code (or JSON) fixture under testdata/generated/ (gitignored).
+# Write a mixed prose/code (or JSON / CSV) fixture under testdata/generated/ (gitignored).
 #
 #   ./testdata/gen_large.sh [lines] [outfile]      # default 100000 lines
 #   ./testdata/gen_large.sh --bytes 8G [outfile]    # ~8 GiB mixed text (slow)
 #   ./testdata/gen_large.sh --bytes 2G --json       # ~2 GiB JSON array (slow)
+#   ./testdata/gen_large.sh --bytes 3M --csv        # ~3 MiB CSV (one record / line)
 #   ./testdata/gen_large.sh --bytes 256M out.txt
 set -euo pipefail
 
@@ -45,6 +46,10 @@ while [[ $# -gt 0 ]]; do
             kind=json
             shift
             ;;
+        --csv)
+            kind=csv
+            shift
+            ;;
         --bytes)
             bytes_label="${2:?gen_large: --bytes needs a size}"
             bytes_target="$(parse_size "$bytes_label")"
@@ -69,11 +74,16 @@ if [[ "$bytes_target" -gt 0 ]]; then
         out="$1"
     elif [[ "$kind" == json ]]; then
         out="testdata/generated/large_${bytes_label}.json"
+    elif [[ "$kind" == csv ]]; then
+        out="testdata/generated/large_${bytes_label}.csv"
     else
         out="testdata/generated/large_${bytes_label}.txt"
     fi
 elif [[ "$kind" == json ]]; then
     echo "gen_large: --json needs --bytes (e.g. --bytes 2G --json)" >&2
+    exit 2
+elif [[ "$kind" == csv ]]; then
+    echo "gen_large: --csv needs --bytes (e.g. --bytes 3M --csv)" >&2
     exit 2
 else
     lines="${1:-100000}"
@@ -83,7 +93,40 @@ fi
 dir="$(dirname "$out")"
 mkdir -p "$dir"
 
-if [[ "$bytes_target" -gt 0 && "$kind" == json ]]; then
+if [[ "$bytes_target" -gt 0 && "$kind" == csv ]]; then
+    # One record per line (grid view: row axis is the line prefix).
+    # Widths vary on purpose: short id/qty, medium sku/city, note is
+    # usually tiny and sometimes a long quoted field with commas so a
+    # screen-local col_w vector actually changes as you scroll.
+    awk -v want="$bytes_target" '
+    BEGIN {
+        hdr = "id,sku,name,qty,price,note,city\n"
+        printf "%s", hdr
+        total = length(hdr)
+        b = 0
+        while (1) {
+            city = (b % 5 == 0) ? "Austin" : (b % 5 == 1) ? "Boston" : \
+                   (b % 5 == 2) ? "Kyoto" : (b % 5 == 3) ? "Lima" : "Oslo"
+            name = (b % 41 == 0) ? "" : sprintf("item_%d", b)
+            if (b % 53 == 0)
+                note = "\"says \"\"hi\"\", really\""
+            else if (b % 17 == 0)
+                note = "\"A wrapping note that stays one record but is wide enough that an eighty-column pane must clip this column or steal from city, row " b ".\""
+            else if (b % 7 == 0)
+                note = "\"has, comma\""
+            else
+                note = "ok"
+            rec = sprintf("%d,SKU-%06d,%s,%d,%.2f,%s,%s\n", \
+                b, b, name, (b % 20) + 1, (b % 100) + 0.25, note, city)
+            n = length(rec)
+            if (total + n > want) break
+            printf "%s", rec
+            total += n
+            b++
+        }
+    }
+    ' > "$out"
+elif [[ "$bytes_target" -gt 0 && "$kind" == json ]]; then
     # Valid JSON array of objects. Stop before the next record would
     # exceed the budget so the closing ] stays well-formed (may be a
     # few hundred bytes under --bytes).
