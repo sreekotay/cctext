@@ -6,9 +6,9 @@ CCText has one document core, two frontends — **cctext** (POSIX console) and *
 
 This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). **cctext** also ships as a prebuilt on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler). It does not live inside the compiler repository.
 
-![cctext TUI — README.md with the key-bindings overlay](docs/cctext-tui.png)
+![cctext TUI — 2 GiB JSON, syntax highlight, and a box selection](docs/cctext-tui.png)
 
-![cctext file browser — flatten with `>`, name, size, and mtime](docs/cctext-browse.png)
+![cctext file browser — glob, name, size, mtime, and grammar-colored suffixes](docs/cctext-browse.png)
 
 ## Getting started
 
