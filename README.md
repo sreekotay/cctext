@@ -6,7 +6,7 @@ CCText has one document core, two frontends — **cctext** (POSIX console) and *
 
 This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). **cctext** also ships as a prebuilt on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler). It does not live inside the compiler repository.
 
-![cctext TUI — 2 GiB JSON, syntax highlight, and a box selection](docs/cctext-tui.png)
+![cctext TUI — 2 GiB JSON, syntax highlight, and a selection at line 5.8 M of 26 M](docs/cctext-tui.png)
 
 ![cctext file browser — glob, name, size, mtime, and grammar-colored suffixes](docs/cctext-browse.png)
 
@@ -34,10 +34,11 @@ From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt
 - **File browser.** No filename opens it. `b` / `Ctrl-B` opens the built-in browser (glob, walk directories) into the focused view; `o` / `Ctrl-O` does the same. In the GUI, **File → Browse** is ⌘B (⌘O aliases it); **File → Open…** is the system dialog with no shortcut. In the browser, `Ctrl-O` / `Cmd-O` launches this frontend on the selection; `e` / `Ctrl-E` launches the other (`cctext` ↔ `cctext-gui`). A new **cctext** opens in the host terminal (Cursor when you launched from there; iTerm or Terminal.app otherwise). **cctext-gui** is a window, not a terminal. The current folder (not `..`) sizes itself with a pumped walk — the total counts up, pauses if you leave, and resumes when you return. Enter still opens in this instance. A missing path asks to create an empty file.
 - **Deep search.** Typing a fragment filters this directory first, then a `> Flattened search` row and nested matches append below (pumped, parallel). `>` skips the local listing and flattens immediately. A fragment is case-insensitive; `*.txt` is a real glob and stays a local listing so you can still walk directories.
 - **TextMate grammars.** Drop any `.tmLanguage.json` into `grammars/` (or `RTX_GRAMMARS`) — loaded live, no rebuild. Window lex, not a full-file pass. Shipped: C/CC, JSON, Markdown, CSS, CSV/TSV/pipe, HTML, YAML, shell, Python, JS/TS.
-- **Marks and folds.** `Ctrl-K/B` steps highlight marks already in the window (`Ctrl-E/R` for `invalid`). `Ctrl-T` folds a heading or a `{}`/`[]`/`()` pair whose other end is within a page of the caret (256KiB analysis page, plus one neighbor). The matching pair is painted while the caret sits in it. No scan, no AST.
+- **Marks and folds.** `Ctrl-K/P` steps highlight marks already in the window (`Ctrl-E/R` for `invalid`). `Ctrl-T` folds a heading or a `{}`/`[]`/`()` pair whose other end is within a page of the caret (256KiB analysis page, plus one neighbor). The matching pair is painted while the caret sits in it. No scan, no AST.
 - **TUI mouse.** SGR click, drag, and wheel; a byte-rail scrollbar jumps by file offset (not a soft line count). Hit-test is the same layout as the GUI.
 - **Byte jump.** `g 50%` snaps to the mid-file line with a local read (8 KiB). The gutter shows `+1`… / `-L` until the line index catches up; arrows and wheel stay on that camera — they do not `line_of` the prefix. Absolute `g L` pumps the prefix and shows `scanning... N%` on the jump field.
 - **High-performance scroll.** Only the visible window is measured and highlighted. Idle frames skip relayout.
+- **Safe journals.** Crash / recover state for named files (not a silent write of your path). See [Safe journals](#safe-journals).
 
 ## Why
 
@@ -50,6 +51,52 @@ From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt
 ## Status
 
 Piece tree, document, layout, C/CC highlight, save, undo/redo, selection, incremental relayout, and multifile splits. **cctext** and **cctext-gui** share that core.
+
+## Safe journals
+
+Two different writes. Save is the file. The session is a cache journal — crash / recover state, not a silent write of your path.
+
+| | Where | When |
+|---|---|---|
+| **Save** (`Ctrl/Cmd-S`) | Your file (temp + rename) | Only when you ask |
+| **Safe journal** | Cache dir (not your path) | Automatic for **named** buffers |
+
+Journals live under `~/Library/Caches/cctext/safe` on macOS, or `$XDG_CACHE_HOME/cctext/safe` elsewhere. `RTX_SAFE_HOME` overrides. A file journal is keyed by a hash of the real path. Writes use the same temp + rename as Save. Flush is best-effort: a journal fault does not fail the edit.
+
+**Untitled has no journal** and cannot park.
+
+### What is stored
+
+A **file journal** is the named buffer’s session:
+
+- Flattened undo/redo (inserts and deletes as bytes, including piece-ref deletes). Dirty is `hist.head != saved_head`.
+- Caret, stream selection, and box columns.
+- Camera: line or byte (`top` / `seek_off`), wrap row, `left_col`, hex nibble, view, unlock, pin.
+- Identity of the file on disk when the journal was written (mtime + size + inode).
+
+A **workspace snapshot** is the last session: open paths, dirty bits, view per file, and the split (pane count, focus, which buffers are showing). It is not the document bytes.
+
+Not stored: find, clipboard, folds, highlight runs, the line-index prefix.
+
+### When it writes
+
+Both frontends call `safe_pump` every frame:
+
+1. **~250 ms after an edit** — debounce when `edit_gen` / `saved_head` change on a live named buffer.
+2. **Browse away** — flush the journal, then **park** (evict the document from RAM). Live set is the pane slots. Returning unparks and reloads from path + journal. Browse does not ask and does not write your path.
+3. **Unsaved-quit prompt** — flush everything first so a crash mid-dialog is recoverable.
+4. **After a real Save** — journal refreshed to match clean hist.
+5. **Workspace snapshot** — updated on park sync, flush-all, save-dirty, and discard.
+
+### Restore
+
+Launch with **no files** and the last workspace comes back: parked paths stay on disk until a pane shows them, then they unpark. Launch with a path and that file’s journal is applied after `from_path`.
+
+On load, a journal whose identity no longer matches the file on disk **tosses hist** (camera may still apply). You see the file as it is; it is not dirty. A corrupt or version-mismatched journal is ignored the same way.
+
+Replay is undo/redo from the saved head to the journaled head, then caret/selection are put back. Offsets past EOF clamp.
+
+Quit with **Don't save** / `q` **drops** dirty journals so the next open is the file on disk. A later “suspend quit” is not this cut.
 
 ## Setup
 
