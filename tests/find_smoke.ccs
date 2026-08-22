@@ -1,6 +1,6 @@
 #!ccc ccs
 /*
- * Incremental find: all hits, one wave per step, invalidate on edit.
+ * Incremental find: dest-live scan, invalidate on edit. Tests wait via finish.
  */
 #include <ccc/std/prelude.cch>
 #include <ccc/script/stdio.cch>
@@ -55,7 +55,7 @@ int main(void) {
         RtxDoc d = {0} @destroy;
         d.from_buffer("alpha\nbeta\nalpha\ngamma alpha\n") !>;
         d.find_set("alpha") !>;
-        d.find_step(RTX_FIND_BUDGET) !>;
+        d.find_finish() !>;
         expect(d.find.done, "small scan done");
         expect(d.find.len == 3, "three alpha");
         expect(!d.find.truncated, "not capped");
@@ -74,7 +74,7 @@ int main(void) {
         RtxDoc d = {0} @destroy;
         d.from_buffer("aaa") !>;
         d.find_set("aa") !>;
-        d.find_step(RTX_FIND_BUDGET) !>;
+        d.find_finish() !>;
         expect(d.find.done && d.find.len == 2, "overlapping aa in aaa");
         expect(d.find.offs[0] == 0 && d.find.offs[1] == 1, "overlap offsets");
     }
@@ -85,7 +85,7 @@ int main(void) {
         d.find_set("") !>;
         expect(d.find.done && d.find.len == 0, "empty query");
         d.find_set("nope") !>;
-        d.find_step(RTX_FIND_BUDGET) !>;
+        d.find_finish() !>;
         expect(d.find.done && d.find.len == 0, "no matches");
     }
 
@@ -93,14 +93,14 @@ int main(void) {
         RtxDoc d = {0} @destroy;
         d.from_buffer("xx y xx y xx\n") !>;
         d.find_set("xx") !>;
-        d.find_step(RTX_FIND_BUDGET) !>;
+        d.find_finish() !>;
         expect(d.find.len == 3, "three xx");
         d.caret = 0;
         d.sel_anchor = 0;
         d.type("z") !>;
         expect(d.find.len == 0 && !d.find.done, "invalidate on type");
         expect(d.find.query.len == 2, "query kept");
-        d.find_step(RTX_FIND_BUDGET) !>;
+        d.find_finish() !>;
         expect(d.find.done && d.find.len == 3, "rescan after edit");
         expect(d.find.offs[0] == 1, "hits shifted");
     }
@@ -111,7 +111,7 @@ int main(void) {
         RtxFindHitView v;
         d.from_buffer("one match here\n") !>;
         d.find_set("match") !>;
-        d.find_step(RTX_FIND_BUDGET) !>;
+        d.find_finish() !>;
         expect(d.find.len == 1, "one match");
         d.find_hit_view(0, &scratch, 40, &v) !>;
         expect(v.line1 == 1, "context line");
@@ -119,66 +119,52 @@ int main(void) {
         expect(v.ctx.len >= 5, "context bytes");
     }
 
-    /* Default budget is the ordered parallel loop (one ticket per block). */
+    /* Hit in the second block. */
     {
         RtxDoc d = {0} @destroy;
         size_t n = (size_t)RTX_FIND_BLOCK + 64;
         CCArena body = cc_arena_heap(n + 64) @destroy;
         char[:] big;
         big = body.alloc_slice_bytes(n);
-        expect(big.ptr != NULL && big.len >= n, "parallel find arena");
+        expect(big.ptr != NULL && big.len >= n, "two-block find arena");
         if (big.ptr && big.len >= n) {
             memset(big.ptr, 'x', n);
             memcpy(big.ptr + (size_t)RTX_FIND_BLOCK + 8, "needle", 6);
             d.from_buffer(big) !>;
             d.find_set("needle") !>;
-            d.find_step(RTX_FIND_BUDGET) !>;
-            expect(d.find.done, "parallel scan done");
+            d.find_finish() !>;
+            expect(d.find.done, "two-block scan done");
             expect(d.find.len == 1, "one needle in second block");
             expect(d.find.offs[0] == (size_t)RTX_FIND_BLOCK + 8, "hit at block+8");
         }
     }
 
-    /* A wave commits; host cancel is a written bit, not a body poll. */
+    /* New query drops old hits. */
     {
         RtxDoc d = {0} @destroy;
-        size_t n = 4 * (size_t)RTX_FIND_WAVE * (size_t)RTX_FIND_BLOCK + 64;
+        size_t n = 8 * (size_t)RTX_FIND_BLOCK + 64;
         CCArena body = cc_arena_heap(n + 64) @destroy;
         char[:] big;
-        size_t got;
         big = body.alloc_slice_bytes(n);
-        expect(big.ptr != NULL && big.len >= n, "wave find arena");
+        expect(big.ptr != NULL && big.len >= n, "rescan find arena");
         if (big.ptr && big.len >= n) {
             memset(big.ptr, 'x', n);
-            memcpy(big.ptr + (size_t)RTX_FIND_WAVE * (size_t)RTX_FIND_BLOCK,
-                   "needle", 6);
+            memcpy(big.ptr + (size_t)RTX_FIND_BLOCK + 8, "needle", 6);
             d.from_buffer(big) !>;
             d.find_set("needle") !>;
-            got = d.find_step(RTX_FIND_BUDGET) !>;
-            expect(got > 0, "wave committed");
-            expect(!d.find.done && !d.find.idle, "more file remains");
-            expect(d.find.len == 0, "needle is past the first wave");
-            {
-                size_t kept = d.find.scan_off;
-                RtxUi ui = {0};
-                ui.find = 1;
-                d.find.cancel = 1;
-                rtx_ui_find_pump(&ui, &d) !>;
-                expect(d.find.cancel, "host wrote cancel");
-                expect(d.find.scan_off == kept, "pump did not enter");
-                d.find.cancel = 0;
-                d.find.idle = 0;
-                rtx_ui_find_pump(&ui, &d) !>;
-                expect(d.find.scan_off > kept || d.find.done,
-                       "pump enters");
-                expect(d.find.done ||
-                       d.find.scan_off >= kept +
-                           2 * (size_t)RTX_FIND_WAVE * (size_t)RTX_FIND_BLOCK,
-                       "pump may enter several waves");
+            rtx_find_pause(&d);
+            if (!d.find.done) {
+                char st[96];
+                rtx_ui_find_stats(&d, st, sizeof(st));
+                expect(strstr(st, "scanning...") != NULL, "find lists scanning");
+                expect(strchr(st, '%') != NULL, "find lists %");
+                expect(strchr(st, 'B') != NULL, "find lists bytes");
             }
             d.find_set("zzz") !>;
-            expect(!d.find.cancel && !d.find.idle, "new query clears cancel");
-            expect(d.find.scan_off == 0, "rescan from start");
+            expect(!d.find.cancel, "new query clears cancel");
+            expect(d.find.len == 0, "new query drops hits");
+            d.find_finish() !>;
+            expect(d.find.done && d.find.len == 0, "zzz has no hits");
         }
     }
 
@@ -188,7 +174,7 @@ int main(void) {
         size_t kept;
         d.from_buffer("alpha\nbeta\nalpha\ngamma alpha\n") !>;
         d.find_set("al") !>;
-        d.find_step(RTX_FIND_BUDGET) !>;
+        d.find_finish() !>;
         expect(d.find.done && d.find.len == 3, "three al");
         kept = d.find.scan_off;
         d.find_set("alp") !>;
@@ -198,8 +184,7 @@ int main(void) {
         expect(d.find.done && d.find.len == 0, "alpx filters to none");
         expect(d.find.scan_off == kept, "still no rewind");
         d.find_set("al") !>;
-        expect(d.find.scan_off == 0 && !d.find.done, "shorter query restarts");
-        d.find_step(RTX_FIND_BUDGET) !>;
+        d.find_finish() !>;
         expect(d.find.done && d.find.len == 3, "al after restart");
     }
 
@@ -216,7 +201,7 @@ int main(void) {
             memcpy(big.ptr + (size_t)RTX_FIND_MAX, "xab", 3);
             d.from_buffer(big) !>;
             d.find_set("a") !>;
-            d.find_step(RTX_FIND_BUDGET) !>;
+            d.find_finish() !>;
             expect(d.find.truncated && d.find.len == (size_t)RTX_FIND_MAX,
                    "cap before refine");
             expect(d.find.offs[d.find.len - 1] == (size_t)RTX_FIND_MAX - 1,
@@ -225,14 +210,13 @@ int main(void) {
             expect(!d.find.done && !d.find.truncated, "cap is live again");
             expect(d.find.scan_off == (size_t)RTX_FIND_MAX, "resume after last a");
             expect(d.find.len == 0, "no ab in the capped prefix");
-            d.find_step(RTX_FIND_BUDGET) !>;
+            d.find_finish() !>;
             expect(d.find.done && d.find.len == 1, "ab after the cap");
             expect(d.find.offs[0] == (size_t)RTX_FIND_MAX + 1, "ab at MAX+1");
         }
     }
 
-    /* Dense block: collect cap is MAX. Two blocks so use_par is on.
-     * Parallel and seq-construct must agree. */
+    /* Dense block: collect cap is MAX. */
     {
         size_t n = (size_t)RTX_FIND_BLOCK + 64;
         CCArena body = cc_arena_heap(n + 8) @destroy;
@@ -240,29 +224,16 @@ int main(void) {
         big = body.alloc_slice_bytes(n);
         expect(big.ptr != NULL && big.len >= n, "dense find arena");
         if (big.ptr && big.len >= n) {
-            RtxDoc par = {0} @destroy;
+            RtxDoc d = {0} @destroy;
             memset(big.ptr, 'a', n);
-            par.from_buffer(big) !>;
-            par.find_set("a") !>;
-            par.find_step(RTX_FIND_BUDGET) !>;
-            expect(par.find.done && par.find.truncated, "par capped");
-            expect(par.find.len == (size_t)RTX_FIND_MAX, "par MAX hits");
-            expect(par.find.offs[0] == 0, "par first");
-            expect(par.find.offs[par.find.len - 1] == (size_t)RTX_FIND_MAX - 1,
-                   "par last is prefix");
-            {
-                RtxDoc seq = {0} @destroy;
-                seq.from_buffer(big) !>;
-                seq.find_set("a") !>;
-                setenv("RTX_FIND_SEQ", "1", 1);
-                seq.find_step(RTX_FIND_BUDGET) !>;
-                unsetenv("RTX_FIND_SEQ");
-                expect(seq.find.len == par.find.len, "seq construct same len");
-                expect(seq.find.truncated, "seq construct capped");
-                expect(seq.find.offs[seq.find.len - 1] ==
-                           par.find.offs[par.find.len - 1],
-                       "seq construct last");
-            }
+            d.from_buffer(big) !>;
+            d.find_set("a") !>;
+            d.find_finish() !>;
+            expect(d.find.done && d.find.truncated, "capped");
+            expect(d.find.len == (size_t)RTX_FIND_MAX, "MAX hits");
+            expect(d.find.offs[0] == 0, "first");
+            expect(d.find.offs[d.find.len - 1] == (size_t)RTX_FIND_MAX - 1,
+                   "last is prefix");
         }
     }
 
@@ -275,13 +246,22 @@ int main(void) {
         w.open_files(0, NULL) !>;
         d = &w.bufs[0].doc;
         d->type("one two one\n") !>;
-        rtx_ui_start_find(&ui, d);
-        expect(rtx_ui_find_char(&ui, 'o'), "type o");
-        expect(rtx_ui_find_char(&ui, 'n'), "type n");
-        expect(rtx_ui_find_char(&ui, 'e'), "type e");
-        expect(ui.find_len == 3 && ui.find_caret == 3, "query one at end");
-        rtx_ui_find_apply(&ui, d) !>;
-        expect(d->find.len == 2, "two one hits");
+        {
+            size_t caret0 = d->caret;
+            rtx_ui_start_find(&ui, d);
+            expect(rtx_ui_find_char(&ui, 'o'), "type o");
+            expect(rtx_ui_find_char(&ui, 'n'), "type n");
+            expect(rtx_ui_find_char(&ui, 'e'), "type e");
+            expect(ui.find_len == 3 && ui.find_caret == 3, "query one at end");
+            rtx_ui_find_apply(&ui, d) !>;
+            d->find_finish() !>;
+            expect(d->find.len == 2, "two one hits");
+            expect(d->caret == caret0, "apply does not jump");
+            expect(!d->find.pinned, "apply is not a select");
+            d->find_next();
+            expect(d->find.pinned, "next selects");
+            expect(d->caret == d->find.offs[d->find.cur], "next lands");
+        }
         f = rtx_ui_find_field(&ui);
         rtx_field_select_all(f);
         expect(rtx_field_has_sel(f) && rtx_field_lo(f) == 0 &&
@@ -303,6 +283,7 @@ int main(void) {
         expect(ui.find_len == 4 && memcmp(ui.find_buf, "xone", 4) == 0,
                "paste restores one");
         rtx_ui_find_apply(&ui, d) !>;
+        d->find_finish() !>;
         expect(d->find.len == 0, "xone has no hits");
     }
 
@@ -310,7 +291,7 @@ int main(void) {
      * used to leave all three (~12MiB) after the doc died. */
     {
         size_t waves = 3;
-        size_t n = waves * (size_t)RTX_FIND_WAVE * (size_t)RTX_FIND_BLOCK;
+        size_t n = waves * (size_t)RTX_FIND_BLOCK;
         CCArena body = cc_arena_heap(n + 64) @destroy;
         char[:] big;
         size_t base;
@@ -325,11 +306,9 @@ int main(void) {
             expect(base > 0, "heap_in_use");
             {
                 RtxDoc d = {0} @destroy;
-                size_t k;
                 d.from_buffer(big) !>;
                 d.find_set("zz") !>;
-                for (k = 0; k < waves; k++)
-                    d.find_step(RTX_FIND_BUDGET) !>;
+                d.find_finish() !>;
                 expect(d.find.done, "three-wave scan done");
                 live = heap_in_use();
                 if (base) {

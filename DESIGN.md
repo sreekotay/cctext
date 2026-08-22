@@ -26,7 +26,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Session | `d.session` | close (path, undo) |
 | Analysis | `d.analysis` | `analysis.reset()` on reparse |
 | Find | `d.find.store` (query + offs) | new query resets; `RtxDoc.destroy()`; edit invalidates offsets |
-| Find wave | call-local heap in `find_step` | end of the step (~4 MiB; not the find store) |
+| Find wave | call-local heap in the listing arm | end of the block (~4 MiB; not the find store) |
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs, clipboard) |
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
@@ -64,7 +64,9 @@ Unlabeled stays a seek.
 | `reveal` (follow) | keep | scroll / `seek_set` |
 | `land` | snap that line to top | `seek_set` |
 
-Click, type, and `ensure_caret` follow. Jump `%` and find hits land.
+Click, type, and `ensure_caret` follow. Jump `%` lands. Find hits land
+only when the user selects one (click / next / prev). Apply and pump
+keep the camera. Wheel and the scroll rail stay live while find is open.
 `if (seek) land else reveal` is the bug: a seek is a camera, not
 “index incomplete”. After handoff, wrap follow owns `top_wrap` again.
 
@@ -107,26 +109,30 @@ The next walk copies this table.
 
 | | start | one wave | live | resume | deny |
 |---|---|---|---|---|---|
-| find | `find_set` | `find_step` | `!done && !cancel` | `scan_off` | `RTX_FIND_SEQ` |
+| find | `find_set` | dest-live scan arm | `!done && !cancel` | `scan_off` | — |
 | jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
 | prefix | open / `!lf_ready` | `prefix_step` | `prefix_pumping` | `line_scan_off` | — |
 | island | `isle_kick` | `isle_step` | `isle_pumping` | `isle_from` | — |
-| browse | `rtx_browse_kick` | `rtx_browse_pump` | `scanning` | job queue | `RTX_BROWSE_SEQ` |
+| browse | `rtx_browse_kick` | dest-live listing arm | `scanning` (pause on paint) | job queue | — |
 
-Kick plants the first paint and returns. One closed interval per step;
-returning is the yield. The find wave is a heap arena with `@destroy`;
-a Result return after `@parallel wait` runs that life (ccc 0.3.4-194).
+Kick plants the first paint and returns. Browse and find are dest-live:
+the frame pauses / resumes / cancel+wait. Line walks stay one closed
+interval per step; returning is the yield. The find wave is a
+heap arena with `@destroy` (ccc 0.3.4-194); one block per step inside
+the listing arm. Kick `@serial` is empty so the worker is the scan.
 Query copy and hit offsets stay on `d.find.store` and die with the
 document. A
 longer prefix query filters hits and keeps `scan_off`; a cap resumes
 from the last accepted hit; a shorter or non-prefix query resets.
-`find_apply` enters once; `find_pump` may enter again up to
-`RTX_FIND_PUMP` while `RTX_FIND_PUMP_MS` remains, then lands.
-The step returns staged hops; 0 is not progress. `cancel` is a written
-bit, not a stdin poll. Chrome that owns the walk shows `scanning...` /
-`capped`. Tests call `finish` (drain). Do not drain the first screen
-before first paint. Tests that need a covered `line_of` call
-`rtx_line_scan_to` (or a pump) first.
+`find_apply` plants via `find_set`. `find_pump` kicks if the handle is
+down (edit invalidate) and marks the nearest hit. No list row is
+current until the user selects one; the camera stays.
+Chrome that owns the walk shows `scanning...` / `capped`. Find lists
+`scan_off` as `N%` and `off/len` bytes. TUI skips wrap while find is
+scanning and overlays the find panel (same skip as jump). Tests call
+`finish` (wait). Do not drain the first screen before first paint.
+Tests that need a covered `line_of` call `rtx_line_scan_to` (or a
+pump) first.
 
 ## Surfaces
 

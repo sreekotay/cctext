@@ -25,6 +25,9 @@ Where things live:
 - Safe journals: `core/safe.ccs`.
 - Browse listing: `core/browse.ccs`. Grid geometry: `core/grid.ccs`
   (`rtx_grid_col_hi` lives there so TUI and GUI cannot each invent field.hi).
+  Listing is a dest-live `@parallel`: pause only around paint; kick
+  and drop cancel+wait; tests call `finish` (wait). `RtxWs_browse_*`
+  stay in `workspace.cch`.
 - TUI: draw `cctext_draw.ccs`, grid paint `cctext_grid_draw.ccs`,
   keys `cctext_input.ccs`, Darwin session-wheel `cctext_osx.ccs`,
   host loop `cctext.ccs`.
@@ -32,7 +35,10 @@ Where things live:
   Chrome `gui_chrome.ccs`. `objc_msgSend` (file picker) `gui_osx.ccs`.
   Platform window + Core Text is `frontend/gui_plat.m`.
 
-Browse `scanning` is the find `done` bit inverted — same kick / step / yield
-(DESIGN.md Scan). Do not add a shared `RtxScan` type. Vis-row motion is
-`rtx_layout_soft_wrap`; do not gate Home/End on `L.wrap`. The live workspace
-is the panes; parked files are paths + on-disk hist, not N piece trees.
+Browse `scanning` is the chrome bit (handle live, not yet done). Find
+is dest-live too: `find_set` plants, tests call `finish` (wait). Worker
+arms are expressions so they do not write a stack `noop`. Pointer
+names copy; other captures must outlive `.wait()`. Do not add a shared `RtxScan`
+type. Vis-row motion is `rtx_layout_soft_wrap`; do not gate Home/End on
+`L.wrap`. The live workspace is the panes; parked files are paths +
+on-disk hist, not N piece trees.

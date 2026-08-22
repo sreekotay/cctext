@@ -55,7 +55,8 @@ static int g_mouse_down, g_mouse_pressed, g_mouse_released;
 static float g_wheel_x, g_wheel_y;
 static float g_wheel_carry_x, g_wheel_carry_y;
 
-static char g_clip[256 * 1024];
+static char *g_clip;
+static size_t g_clip_cap;
 static NSWindow *g_window;
 static NSView *g_view;
 static id g_app_delegate;
@@ -832,18 +833,30 @@ float GetMouseWheelMove(void) { return g_wheel_y; }
 
 void SetClipboardText(const char *text) {
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    NSString *s;
     [pb clearContents];
-    if (text)
-        [pb setString:[NSString stringWithUTF8String:text] forType:NSPasteboardTypeString];
+    if (!text) return;
+    s = [[NSString alloc] initWithUTF8String:text];
+    if (!s)
+        s = [[NSString alloc] initWithBytes:text length:strlen(text)
+                                   encoding:NSISOLatin1StringEncoding];
+    if (s)
+        [pb setString:s forType:NSPasteboardTypeString];
 }
 
 const char *GetClipboardText(void) {
     NSString *s = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
-    if (!s) {
-        g_clip[0] = 0;
-        return g_clip;
+    const char *u = s.UTF8String;
+    size_t n = u ? strlen(u) : 0;
+    if (n + 1 > g_clip_cap) {
+        char *p = realloc(g_clip, n + 1);
+        if (!p) return "";
+        g_clip = p;
+        g_clip_cap = n + 1;
     }
-    snprintf(g_clip, sizeof(g_clip), "%s", s.UTF8String ? s.UTF8String : "");
+    if (!g_clip) return "";
+    if (u) memcpy(g_clip, u, n + 1);
+    else g_clip[0] = 0;
     return g_clip;
 }
 
