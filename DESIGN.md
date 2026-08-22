@@ -77,8 +77,8 @@ the prefix; do not call it from a gap camera.
 
 `g N%` is a byte snap plus island (backfill). `g L` is a prefix pump
 (`want_line`), same host gate as find — not a guess. After open the
-prefix also walks toward EOF on that gate (`prefix_step`) so gutters
-and `L n/N` do not sit idle.
+host does not walk toward EOF. Gutters stay `+N` / `-L` until the
+island meets the prefix.
 
 `lf_ready` the field is a latch. `lf_ready()` / `index_covers` are
 false when the flag is stale (huge + `subtree_lf==0`). The flag
@@ -111,7 +111,7 @@ The next walk copies this table.
 |---|---|---|---|---|---|
 | find | `find_set` | dest-live scan arm | `!done && !cancel` | `scan_off` | — |
 | jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
-| prefix | open / `!lf_ready` | `prefix_step` | `prefix_pumping` | `line_scan_off` | — |
+| prefix | — | — | — | `line_scan_off` | host does not pump |
 | island | `isle_kick` | `isle_step` | `isle_pumping` | `isle_from` | — |
 | browse | `rtx_browse_kick` | dest-live listing arm | `scanning` (pause on paint) | job queue | — |
 
@@ -128,8 +128,8 @@ from the last accepted hit; a shorter or non-prefix query resets.
 down (edit invalidate) and marks the nearest hit. No list row is
 current until the user selects one; the camera stays.
 Chrome that owns the walk shows `scanning...` / `capped`. Find lists
-`scan_off` as `N%` and `off/len` bytes. TUI skips wrap while find is
-scanning and overlays the find panel (same skip as jump). Tests call
+`scan_off` as `N%` and `off/len` bytes. TUI wraps only when the camera
+moved; help / find / jump paint as chrome on the last window. Tests call
 `finish` (wait). Do not drain the first screen before first paint.
 Tests that need a covered `line_of` call `rtx_line_scan_to` (or a
 pump) first.
