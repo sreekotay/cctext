@@ -12,6 +12,11 @@ bodies against **new** extracted headers.
 Symptom: `too many arguments` / wrong type, blamed on a `.cch` line that does
 not match current source. Example: `ui.cch` already called `d->find_step()`,
 cached `cctext_grid_draw` C still had `RtxDoc_find_step(d, RTX_FIND_BUDGET)`.
+Also: arena UFCS re-lower — source has `d->session.alloc_slice_bytes(n)` /
+`&d->session`, but stale cctext TUs still emit `(d->session)->a` which fails
+once `cc_arena_*` macros wrap with `CC__ARENA_HOST` (`CCArena` is not a
+pointer). Hit on `rtx_cctext_draw` / `_input` / `_grid_draw` after a ccc
+arena-handle bump.
 
 Fix: delete the stale `out/c/…/<tu>/*.c` (or that hash tree) and rebuild.
 Do not “fix” the `.cch` to match the cached call.
