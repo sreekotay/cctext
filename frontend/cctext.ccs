@@ -44,8 +44,6 @@ int g_nav;
 char g_status[160];
 static volatile sig_atomic_t g_winch;
 static int g_busy_frame;
-static long g_isle_paint_at;
-static size_t g_browse_paint_cur = (size_t)-1;
 /* Status-row spinner while piece-tree scan/save runs (blocking). */
 static void cctext_busy(void *ctx, const char *label, int pct) {
     struct winsize ws;
@@ -540,59 +538,115 @@ int main(int argc, char **argv) {
     w.busy_bind(cctext_busy, NULL);
     if (cli.nfiles == 0 || w.untitled()) w.browse_start() !>;
 
-    /* pump → layout+paint → input. Next turn sees the handle. */
-    for (;;) {
-        int vis;
-        int find_h;
-        int p;
-        RtxBuf *act;
-        cctext_winsize(&rows, &cols);
-        if (g_winch || rows != last_rows || cols != last_cols) {
-            int rp;
-            g_winch = 0;
-            last_rows = rows;
-            last_cols = cols;
-            fputs("\x1b[H\x1b[J", stdout);
-            for (rp = 0; rp < w.npanes; rp++) {
-                int held = w.hold_pane(rp);
-                w.bufs[w.pane[rp]].layout.len = 0;
-                w.drop_pane(rp, held);
+    /* input → pump → layout → paint. Dirty is a flag, not a timestamp.
+     * Read blocks; timeout 0 while dirty so the first frame and the
+     * frame after a key paint in the same turn. */
+    {
+        int dirty = 1;
+        int chrome = 0;
+        long tick_at = 0;
+        int isle_was = 0;
+        size_t browse_cur = (size_t)-1;
+        for (;;) {
+            int vis;
+            int find_h;
+            int p;
+            int wait_us;
+            int isle_on;
+            int scan_on;
+            int browse_tick;
+            int find_tick;
+            long now;
+            long tick_ms;
+            RtxBuf *act;
+
+            act = w.active();
+            wait_us = 400000;
+            if (rtx_ui_work_pumping(&ui, act ? &act->doc : NULL) || ui.stats)
+                wait_us = 0;
+            else if (RtxWs_browse_busy(&w))
+                wait_us = 16000;
+            else if (rtx_ui_find_scanning(&ui, act ? &act->doc : NULL))
+                wait_us = (int)RTX_LINE_ISLE_PAINT_MS * 1000;
+            if (dirty || chrome) wait_us = 0;
+
+            kind = cctext_read(&ch, wait_us);
+            if (kind != KEY_NONE) rtx_ui_blink_show(&ui);
+
+            cctext_winsize(&rows, &cols);
+            if (g_winch || rows != last_rows || cols != last_cols) {
+                int rp;
+                g_winch = 0;
+                last_rows = rows;
+                last_cols = cols;
+                fputs("\x1b[H\x1b[J", stdout);
+                dirty = 1;
+                for (rp = 0; rp < w.npanes; rp++) {
+                    int held = w.hold_pane(rp);
+                    w.bufs[w.pane[rp]].layout.len = 0;
+                    w.drop_pane(rp, held);
+                }
             }
-        }
-        find_h = rtx_ui_find_rows(&ui, rows);
-        vis = rows - 1 - find_h;
-        if (vis < 1) vis = 1;
-        act = w.active();
-        if (act) {
-            size_t caret0 = act->doc.caret;
-            rtx_ui_work_pump(&ui, act, vis, cctext_isle_yield) !>;
-            if (ui.find && act->doc.caret != caret0 && act->doc.find.pinned)
-                act->land(vis) !>;
-            else if (act->doc.caret != caret0 && !ui.find && !act->unlock)
-                cctext_follow_caret(act);
-        }
-        RtxWs_browse_pump(&w) !>;
-        w.safe_pump();
-        {
-            int scan_on = RtxWs_browse_scanning(&w);
-            int browse_tick = RtxWs_browse_busy(&w);
-            long browse_ms = scan_on ? (long)RTX_BROWSE_PAINT_MS
-                                     : (long)RTX_LINE_ISLE_PAINT_MS;
-            int bmove = w.nav[w.focus].on &&
-                        w.nav[w.focus].cur != g_browse_paint_cur;
-            int stale = 0;
-            long now = rtx_ui_now_ms();
-            if (act && act->seek_valid && act->layout.len &&
-                act->layout.rows[0].byte_start != act->seek_off)
-                stale = 1;
-            if (!act || !act->layout.len) stale = 1;
-            if (w.nav[w.focus].on) stale = 0;
-            /* Wrap only when the camera moved. Idle 400 ms used to
-             * re-wrap 8G every blink once the prefix pump no longer
-             * skipped the frame — that was the flicker. */
-            if (stale ||
-                g_isle_paint_at == 0 || bmove ||
-                (browse_tick && now - g_isle_paint_at >= browse_ms)) {
+            find_h = rtx_ui_find_rows(&ui, rows);
+            vis = rows - 1 - find_h;
+            if (vis < 1) vis = 1;
+
+            act = w.active();
+            if (!act) break;
+            if (!g_mouse_drag && act->drag_len) {
+                act->drag_vis = 0;
+                act->drag_len = 0;
+                act->drag_grab = 0;
+            }
+            if (!g_mouse_drag) g_field_drag = 0;
+            if (cctext_handle_input(&w, act, &m, &ui, kind, ch, vis, cols,
+                                    &skip_reveal))
+                break;
+            if (kind != KEY_NONE) dirty = 1;
+            act = w.active();
+            if (!act) break;
+
+            if (act) {
+                size_t caret0 = act->doc.caret;
+                rtx_ui_work_pump(&ui, act, vis, cctext_isle_yield) !>;
+                if (act->doc.caret != caret0) {
+                    if (ui.find && act->doc.find.pinned)
+                        act->land(vis) !>;
+                    else if (!ui.find && !act->unlock)
+                        cctext_follow_caret(act);
+                    dirty = 1;
+                }
+            }
+            RtxWs_browse_pump(&w) !>;
+            w.safe_pump();
+
+            isle_on = act && rtx_line_isle_pumping(&act->doc.tree);
+            if (isle_was && !isle_on) dirty = 1;
+            isle_was = isle_on;
+
+            now = rtx_ui_now_ms();
+            scan_on = RtxWs_browse_scanning(&w);
+            browse_tick = RtxWs_browse_busy(&w);
+            find_tick = rtx_ui_find_scanning(&ui, act ? &act->doc : NULL);
+            tick_ms = scan_on ? (long)RTX_BROWSE_PAINT_MS
+                              : (long)RTX_LINE_ISLE_PAINT_MS;
+            if (!w.nav[w.focus].on) {
+                if (!act || !act->layout.len) dirty = 1;
+                else if (act->seek_valid &&
+                         act->layout.rows[0].byte_start != act->seek_off)
+                    dirty = 1;
+            } else if (w.nav[w.focus].cur != browse_cur) {
+                dirty = 1;
+            }
+            if ((browse_tick || isle_on) &&
+                (tick_at == 0 || now - tick_at >= tick_ms))
+                dirty = 1;
+            else if ((find_tick || ui.stats) &&
+                     (tick_at == 0 || now - tick_at >= (long)RTX_LINE_ISLE_PAINT_MS))
+                chrome = 1;
+            if (rtx_ui_blink_step(&ui)) chrome = 1;
+
+            if (dirty) {
                 RtxWs_browse_pause(&w);
                 if (act) rtx_find_pause(&act->doc);
                 for (p = 0; p < w.npanes; p++) {
@@ -609,34 +663,19 @@ int main(int argc, char **argv) {
                     w.drop_pane(p, held);
                 }
                 cctext_draw(&w, &ui, rows, cols);
-                g_isle_paint_at = now;
-                if (w.nav[w.focus].on) g_browse_paint_cur = w.nav[w.focus].cur;
+                tick_at = now;
+                if (w.nav[w.focus].on) browse_cur = w.nav[w.focus].cur;
                 if (act) rtx_find_resume(&act->doc);
                 RtxWs_browse_resume(&w);
-            } else {
+                dirty = 0;
+                chrome = 0;
+                skip_reveal = 0;
+            } else if (chrome) {
                 cctext_draw_chrome(&w, &ui, rows, cols);
+                tick_at = now;
+                chrome = 0;
             }
         }
-        skip_reveal = 0;
-        kind = cctext_read(&ch,
-                           (rtx_ui_work_pumping(&ui, act ? &act->doc : NULL)
-                            || ui.stats)
-                               ? 0
-                               : (RtxWs_browse_busy(&w) ? 16000 : 400000));
-        if (kind != KEY_NONE) rtx_ui_blink_show(&ui);
-        act = w.active();
-        if (!act) break;
-        if (!g_mouse_drag && act->drag_len) {
-            act->drag_vis = 0;
-            act->drag_len = 0;
-            act->drag_grab = 0;
-        }
-        if (!g_mouse_drag) g_field_drag = 0;
-        if (cctext_handle_input(&w, act, &m, &ui, kind, ch, vis, cols, &skip_reveal))
-            break;
-        if (kind != KEY_NONE &&
-            (ui.help || ui.find || ui.jump || ui.ask_quit || ui.stats))
-            cctext_draw_chrome(&w, &ui, rows, cols);
     }
     w.busy_bind(NULL, NULL);
     cctext_restore();

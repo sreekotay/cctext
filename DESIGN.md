@@ -96,10 +96,11 @@ parked `line_scan_off` at the caret rescanned the tail.
 `line_count` is a scroll budget until weights are live. A window
 write must not take `to = len` because that total said “last page.”
 
-Host frame: mutations, then one window write. TUI read blocks, so
-`pump → layout+paint → input`. GUI events are already polled, so
-`input → pump → layout → paint`. Do not layout, then handle, then
-layout again — a command that forgets a dirty bit paints the old camera.
+Host frame: mutations, then one window write. Both hosts are
+`input → pump → layout → paint`. TUI read blocks; timeout 0 while
+dirty so the first paint and the frame after a key are not a 400 ms
+wait. Do not layout, then handle, then layout again — a command that
+forgets a dirty bit paints the old camera.
 
 ## Scan
 
