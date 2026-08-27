@@ -75,6 +75,8 @@ Vector2 GetWindowScaleDPI(void);
 void BeginDrawing(void);
 void EndDrawing(void);
 void ClearBackground(Color color);
+void BeginScissorMode(int x, int y, int w, int h);
+void EndScissorMode(void);
 void PollInputEvents(void);
 void WaitTime(double seconds);
 

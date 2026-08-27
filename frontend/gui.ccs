@@ -22,6 +22,8 @@ int g_need_layout = 1;
 static Vector2 g_mouse_was;
 static long g_isle_paint_at;
 static long g_browse_paint_at;
+static int g_browse_busy_was;
+static int g_isle_was;
 
 static int gui_isle_yield(void) {
     int k;
@@ -101,11 +103,30 @@ static void gui_geom(int *ww, int *hh, int *inner, int *pane_w, int *vis_rows,
                      int pad, int top, int find_on) {
     *ww = GetScreenWidth();
     *hh = GetScreenHeight();
-    *inner = *ww - 2 * pad;
+    /* Left pad only — V-rail sits on the window edge, not inside a right gutter. */
+    *inner = *ww - pad;
     if (*inner < 40) *inner = 40;
-    *pane_w = (g_live.w && g_live.w->npanes >= 2) ? (*inner / 2 - 8) : *inner;
-    *vis_rows = (*hh - top - 28 - (find_on ? GUI_FIND_H : 0)) / 20;
+    *pane_w = (g_live.w && g_live.w->npanes >= 2) ? (*inner / 2) : *inner;
+    *vis_rows = (*hh - top - 28 - (find_on ? GUI_FIND_H : 0)) / GUI_ROW_H;
     if (*vis_rows < 4) *vis_rows = 4;
+}
+
+/* Body slots above the H-rail. A sticky grid header is not a vis row —
+ * TUI subtracts it in paint; reveal / ensure_view must use the same count
+ * or the last body row is “visible” while clipped and up/down slip. */
+static int gui_body_vis(RtxBuf *b, int vis_rows, int ph) {
+    int hx, fit, inner, hdr;
+    if (!b) return vis_rows < 1 ? 1 : vis_rows;
+    if (vis_rows < 1) vis_rows = 1;
+    hx = gui_scroll_x_h(b);
+    hdr = 0;
+    if (rtx_layout_is_grid(&b->layout) && b->layout.grid_hdr_on)
+        hdr = GUI_ROW_H;
+    inner = ph > hx ? ph - hx : ph;
+    if (inner > hdr) inner -= hdr;
+    fit = inner / GUI_ROW_H;
+    if (fit < 1) fit = 1;
+    return fit < vis_rows ? fit : vis_rows;
 }
 
 static int gui_view_stale(const RtxBuf *b) {
@@ -154,6 +175,10 @@ static void gui_live_paint(void) {
     }
     gui_geom(&ww, &hh, &inner, &pane_w, &vis_rows, g_live.pad, g_live.top,
              g_live.ui && g_live.ui->find);
+    if (g_live.w && RtxWs_active(g_live.w))
+        vis_rows = gui_body_vis(RtxWs_active(g_live.w), vis_rows,
+                               gui_text_ph(hh, g_live.top,
+                                           g_live.ui && g_live.ui->find));
     gui_relayout(pane_w, vis_rows) !>;
     g_need_layout = 0;
     g_dirty = 1;
@@ -209,14 +234,10 @@ int main(int argc, char **argv) {
     }
     if (cli.nfiles == 0) {
         w.open_files(0, NULL) !>;
-        if (w.len) {
-            rtx_layout_set_view(&w.bufs[0].layout, cli.view);
-            rtx_buf_grid_bind(&w.bufs[0]);
-        }
     } else {
         w.open_files(cli.nfiles, filebuf) !>;
-        w.set_views(cli.file_view, cli.nfiles);
     }
+    rtx_cli_apply_views(&w, &cli);
     status[0] = 0;
     memset(&ui, 0, sizeof(ui));
     if (cli.nfiles == 0 || w.untitled()) w.browse_start() !>;
@@ -268,6 +289,7 @@ int main(int argc, char **argv) {
          * prompt; further quit is menu / Ctrl-Q, or save-then-exit.
          */
         if (WindowShouldClose()) {
+            w.safe_flush_all();
             if (!w.any_dirty()) break;
             if (!ui.ask_quit && !close_held) rtx_ui_offer_quit(&w, &ui);
             close_held = 1;
@@ -285,16 +307,20 @@ int main(int argc, char **argv) {
         if (saw) gui_blink_show(&ui);
         gui_geom(&ww, &hh, &inner, &pane_w, &vis_rows, pad, top, ui.find);
         act = w.active();
+        if (act)
+            vis_rows = gui_body_vis(act, vis_rows, gui_text_ph(hh, top, ui.find));
         if (gui_handle_input(&w, act, &m, &fonts, &ui, status, sizeof(status),
                              &quit_armed_at, &dragging, &scroll_grab,
                              pane_w, vis_rows, pad, top, inner, hh)) {
             break;
         }
+        /* Before EndDrawing: that call clears edges then pumps the next
+         * mouse-up. Consuming after paint ate the release and stuck drag. */
+        gui_input_consume();
         act = w.active();
         if (act) {
             size_t caret0 = act->doc.caret;
-            int isle_was = rtx_line_isle_pumping(&act->doc.tree);
-            long now;
+            int vis_fit;
             @errhandler(RtxIndexErr e) {
                 snprintf(status, sizeof(status), "%s",
                          e.message ? e.message : "scan");
@@ -305,19 +331,53 @@ int main(int argc, char **argv) {
                 else if (!ui.find && !act->unlock) act->pin_view = 0;
                 g_need_layout = 1;
             }
-            now = rtx_ui_now_ms();
-            if (isle_was && !rtx_line_isle_pumping(&act->doc.tree)) {
-                g_dirty = 1;
+            vis_fit = gui_body_vis(act, vis_rows, gui_text_ph(hh, top, ui.find));
+            if (vis_fit != vis_rows) {
+                vis_rows = vis_fit;
                 g_need_layout = 1;
-            } else if (rtx_ui_work_pumping(&ui, &act->doc) &&
-                       (g_isle_paint_at == 0 ||
-                        now - g_isle_paint_at >= (long)RTX_LINE_ISLE_PAINT_MS)) {
-                g_dirty = 1;
-                g_isle_paint_at = now;
             }
         }
         RtxWs_browse_pump(&w) !>;
         w.safe_pump();
+
+        {
+            int isle_on = act && rtx_line_isle_pumping(&act->doc.tree);
+            long now = rtx_ui_now_ms();
+            if (g_isle_was && !isle_on) {
+                g_dirty = 1;
+                g_need_layout = 1;
+            } else if (isle_on &&
+                       (g_isle_paint_at == 0 ||
+                        now - g_isle_paint_at >= (long)RTX_LINE_ISLE_PAINT_MS)) {
+                g_dirty = 1;
+                g_need_layout = 1;
+                g_isle_paint_at = now;
+            }
+            g_isle_was = isle_on;
+        }
+
+        if (saw) g_dirty = 1;
+        if (rtx_ui_blink_step(&ui)) g_dirty = 1;
+        {
+            int browse_tick = RtxWs_browse_busy(&w);
+            if (g_browse_busy_was && !browse_tick) g_dirty = 1;
+            g_browse_busy_was = browse_tick;
+        }
+        if (RtxWs_browse_busy(&w) ||
+            rtx_ui_find_scanning(&ui, act ? &act->doc : NULL)) {
+            long now = rtx_ui_now_ms();
+            long ms = RtxWs_browse_scanning(&w) ? (long)RTX_BROWSE_PAINT_MS
+                                                : (long)RTX_LINE_ISLE_PAINT_MS;
+            if (g_browse_paint_at == 0 || now - g_browse_paint_at >= ms)
+                g_dirty = 1;
+        }
+        if (g_busy_show && !(act && rtx_ui_work_pumping(&ui, &act->doc)))
+            g_dirty = 1;
+        if (ui.stats) g_dirty = 1;
+
+        /* Publish dest-live before ensure_view so reline sees isle_before. */
+        if ((g_dirty || g_need_layout) && act)
+            rtx_line_isle_pause(&act->doc.tree);
 
         if (saw || g_need_layout || (act && gui_view_stale(act))) {
             for (p = 0; p < w.npanes; p++) {
@@ -332,20 +392,6 @@ int main(int argc, char **argv) {
             g_need_layout = 0;
         }
 
-        if (saw) g_dirty = 1;
-        if (rtx_ui_blink_step(&ui)) g_dirty = 1;
-        if (RtxWs_browse_busy(&w) ||
-            rtx_ui_find_scanning(&ui, act ? &act->doc : NULL)) {
-            long now = rtx_ui_now_ms();
-            long ms = RtxWs_browse_scanning(&w) ? (long)RTX_BROWSE_PAINT_MS
-                                                : (long)RTX_LINE_ISLE_PAINT_MS;
-            if (g_browse_paint_at == 0 || now - g_browse_paint_at >= ms)
-                g_dirty = 1;
-        }
-        if (g_busy_show && !(act && rtx_ui_work_pumping(&ui, &act->doc)))
-            g_dirty = 1;
-        if (ui.stats) g_dirty = 1;
-
         if (g_dirty) {
             RtxWs_browse_pause(&w);
             if (act) rtx_find_pause(&act->doc);
@@ -355,16 +401,19 @@ int main(int argc, char **argv) {
             g_live.draw_open = 0;
             EndDrawing();
             if (RtxWs_browse_busy(&w) ||
-                rtx_ui_find_scanning(&ui, act ? &act->doc : NULL))
+                rtx_ui_find_scanning(&ui, act ? &act->doc : NULL) ||
+                (act && rtx_line_isle_pumping(&act->doc.tree)))
                 g_browse_paint_at = rtx_ui_now_ms();
             g_dirty = 0;
             if (act) rtx_find_resume(&act->doc);
             RtxWs_browse_resume(&w);
-        } else if (act && rtx_ui_work_pumping(&ui, &act->doc)) {
-            gui_input_consume();
+        }
+        if (act) rtx_line_isle_resume(&act->doc.tree);
+
+        if (act && (rtx_ui_work_pumping(&ui, &act->doc) ||
+                    rtx_line_isle_pumping(&act->doc.tree) || g_isle_was)) {
             PollInputEvents();
         } else {
-            gui_input_consume();
             gui_idle_wait(&ui);
         }
     }

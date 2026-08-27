@@ -19,7 +19,8 @@ listing TU does not lower `RtxWs` / `RtxBuf`.
 Where things live:
 - Mark/fold bodies: `core/nav.ccs`; `nav.cch` is decls plus thin wrappers.
 - Brace-pair paint: `nav_pair.cch` (linked callers), not `nav.cch`.
-- Find: `core/find.ccs`.
+- Find: `core/find.ccs`. Island dest-live lives in the piece-tree TU
+  (`isle_kick` plants; tests call `finish`).
 - Scope intern: `core/scope.ccs` (paint and lex share IDs).
 - Help strings: `core/ui_help.ccs`.
 - Safe journals: `core/safe.ccs`.
@@ -36,9 +37,9 @@ Where things live:
   Platform window + Core Text is `frontend/gui_plat.m`.
 
 Browse `scanning` is the chrome bit (handle live, not yet done). Find
-is dest-live too: `find_set` plants, tests call `finish` (wait). Worker
-arms are expressions so they do not write a stack `noop`. Pointer
-names copy; other captures must outlive `.wait()`. Do not add a shared `RtxScan`
-type. Vis-row motion is `rtx_layout_soft_wrap`; do not gate Home/End on
+and island are dest-live too: `find_set` / `isle_kick` plant, tests
+call `finish` (wait). Worker arms are expressions so they do not write
+a stack `noop`. Pointer names copy; other captures must outlive
+`.wait()`. Do not add a shared `RtxScan` type. Vis-row motion is `rtx_layout_soft_wrap`; do not gate Home/End on
 `L.wrap`. The live workspace is the panes; parked files are paths +
 on-disk hist, not N piece trees.

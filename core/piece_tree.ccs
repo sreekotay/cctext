@@ -16,6 +16,7 @@ static void rtx_line_index_note_insert(RtxPieceTree *t, size_t off, size_t ins_l
                                        size_t lf);
 static void rtx_line_index_note_erase(RtxPieceTree *t, size_t off, size_t n,
                                       size_t lf);
+static void !>(CCError) rtx_isle_listing_start(RtxPieceTree *t);
 
 size_t RtxPieceTree_len(const RtxPieceTree *t) {
     if (!t || !t->root) return 0;
@@ -545,6 +546,7 @@ char[:] !>(CCError) RtxPieceTree_scratch_span(const RtxPieceTree *t, size_t from
 
 void RtxPieceTree_destroy(RtxPieceTree *t) {
     if (!t) return;
+    rtx_isle_handle_stop(t);
     t->store.destroy();
     /* line_off lives on the piece-tree arena — do not free() it. */
     if (t->arena && t->arena->base) {
@@ -1159,6 +1161,148 @@ void !>(CCError) RtxPieceTree_write_fd(RtxPieceTree *t, int fd) {
 }
 
 #include "piece_tree_lines.cch"
+
+static void rtx_isle_publish(RtxPieceTree *t) {
+    size_t lfs = 0;
+    size_t bytes = 0;
+    int all_done = 1;
+    int i;
+    if (!t) return;
+    for (i = 0; i < RTX_ISLE_WORKERS; i++) {
+        RtxIsleShard *s = &t->isle_shard[i];
+        if (!s->done) all_done = 0;
+        lfs += s->lfs;
+        if (s->hi > s->at) bytes += s->hi - s->at;
+    }
+    if (all_done) {
+        t->isle_from = t->line_scan_off;
+        t->isle_before = lfs;
+        return;
+    }
+    t->isle_from = t->isle_anchor > bytes ? t->isle_anchor - bytes : t->line_scan_off;
+}
+
+static void rtx_isle_lanes_init(RtxPieceTree *t) {
+    size_t span_lo;
+    size_t span_hi;
+    size_t span;
+    int i;
+    span_lo = t->line_scan_off;
+    span_hi = t->isle_anchor;
+    if (span_hi < span_lo) span_hi = span_lo;
+    span = span_hi - span_lo;
+    t->isle_nshard = RTX_ISLE_WORKERS;
+    for (i = 0; i < RTX_ISLE_WORKERS; i++) {
+        RtxIsleShard *s = &t->isle_shard[i];
+        memset(s, 0, sizeof(*s));
+        s->lo = span_lo + span * (size_t)i / (size_t)RTX_ISLE_WORKERS;
+        s->hi = span_lo + span * (size_t)(i + 1) / (size_t)RTX_ISLE_WORKERS;
+        s->at = s->hi;
+        if (s->hi > s->lo) {
+            s->buf = (char *)malloc((size_t)RTX_ISLE_BLOCK);
+            if (!s->buf) s->done = 1;
+        } else {
+            s->done = 1;
+        }
+    }
+}
+
+static void !>(CCError) rtx_isle_wave(RtxPieceTree *t, int id) {
+    RtxIsleShard *s;
+    size_t want, at, got;
+    if (!t || id < 0 || id >= RTX_ISLE_WORKERS)
+        return cc_err(CC_ERR_INVALID_ARG, "isle wave");
+    s = &t->isle_shard[id];
+    if (s->done || s->at <= s->lo || !s->buf) {
+        s->done = 1;
+        return cc_ok();
+    }
+    if (t->isle_cancel) {
+        s->done = 1;
+        return cc_ok();
+    }
+    want = (size_t)RTX_ISLE_BLOCK;
+    if (want > s->at - s->lo) want = s->at - s->lo;
+    at = s->at - want;
+    got = RtxPieceTree_read_uncached(t, at, s->buf, want) !>(e) {
+        s->done = 1;
+        return cc_err(e);
+    };
+    if (!got) {
+        s->done = 1;
+        return cc_ok();
+    }
+    if (got < want) at = s->at - got;
+    s->lfs += rtx_count_lf(s->buf, got);
+    s->at = at;
+    if (s->at <= s->lo) {
+        s->at = s->lo;
+        s->done = 1;
+    }
+    return cc_ok();
+}
+
+static int rtx_isle_h_poll(CCParallel *h) {
+    if (!h) return 0;
+    while (h->paused && !h->cancelled) cc_yield();
+    return !h->cancelled;
+}
+
+static int rtx_isle_listing_arm(RtxPieceTree *t, int id) {
+    RtxIsleShard *s;
+    if (!t || !t->isle_h_live || id < 0 || id >= RTX_ISLE_WORKERS) return 0;
+    s = &t->isle_shard[id];
+    if (s->hi <= s->lo) {
+        s->done = 1;
+        return 0;
+    }
+    while (!s->done && t->isle_live && !t->isle_cancel
+           && rtx_isle_h_poll(&t->isle_h)) {
+        rtx_isle_wave(t, id) !>(e) { (void)e; break; };
+    }
+    return 1;
+}
+
+static void !>(CCError) rtx_isle_listing_start(RtxPieceTree *t) {
+    int noop = 0;
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "isle kick");
+    if (!t->isle_live || t->isle_cancel || t->lf_ready) return cc_ok();
+    if (t->isle_anchor <= t->line_scan_off) return cc_ok();
+    if (t->isle_h_live) return cc_ok();
+    rtx_isle_lanes_init(t);
+    t->isle_h_live = 1;
+    t->isle_h = @parallel {
+        @serial { noop = 0; }
+        rtx_isle_listing_arm(t, 0);
+        rtx_isle_listing_arm(t, 1);
+    } !>;
+    return cc_ok();
+}
+
+void !>(CCError) rtx_line_isle_finish(RtxPieceTree *t) {
+    if (!t) return cc_ok();
+    if (t->isle_live && !t->isle_h_live && rtx_line_isle_pumping(t)
+        && !t->isle_cancel)
+        rtx_isle_listing_start(t) !>(e) { return cc_err(e); };
+    if (t->isle_h_live) {
+        t->isle_h.wait() !>(e) { return cc_err(e); };
+        t->isle_h_live = 0;
+        rtx_isle_publish(t);
+        rtx_isle_shards_drop(t);
+    }
+    return cc_ok();
+}
+
+void rtx_line_isle_pause(RtxPieceTree *t) {
+    if (!t || !t->isle_h_live) return;
+    t->isle_h.pause() !>(e) { (void)e; };
+    rtx_isle_publish(t);
+}
+
+void rtx_line_isle_resume(RtxPieceTree *t) {
+    if (!t || !t->isle_h_live || !t->isle_h.paused) return;
+    t->isle_h.resume() !>(e) { (void)e; };
+}
 
 int RtxPieceTree_lf_ready(const RtxPieceTree *t) {
     return rtx_lf_weights_ok(t);

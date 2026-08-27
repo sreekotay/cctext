@@ -96,7 +96,7 @@ CC_TARGET_DEPS safe_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx
 
 CC_TARGET grid_view_smoke exe tests/grid_view_smoke.ccs
 CC_TARGET_INCLUDE grid_view_smoke .
-CC_TARGET_DEPS grid_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find
+CC_TARGET_DEPS grid_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe
 
 CC_TARGET line_index_prop_smoke exe tests/line_index_prop_smoke.ccs
 CC_TARGET_INCLUDE line_index_prop_smoke .

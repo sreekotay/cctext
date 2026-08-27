@@ -75,10 +75,13 @@ keep the camera. Wheel and the scroll rail stay live while find is open.
 not line numbers. `line_count` is soft until EOF. `line_start` may extend
 the prefix; do not call it from a gap camera.
 
-`g N%` is a byte snap plus island (backfill). `g L` is a prefix pump
-(`want_line`), same host gate as find — not a guess. After open the
-host does not walk toward EOF. Gutters stay `+N` / `-L` until the
-island meets the prefix.
+`g N%` is a byte snap plus island (backfill). Land on an uncovered
+camera plants the same dest-live walk. `g L` is a prefix pump
+(`want_line`) — not a guess. After open the host does not walk toward
+EOF. Gutters stay `+N` / `-L` until the island meets the prefix.
+Connected numbers are the camera (`isle_before` + `seek_rel`), not
+`line_guess` and not `line_of(caret)`. A seek wider than the local
+floor replants the island — the old count is the previous camera.
 
 `lf_ready` the field is a latch. `lf_ready()` / `index_covers` are
 false when the flag is stale (huge + `subtree_lf==0`). The flag
@@ -119,16 +122,20 @@ The next walk copies this table.
 | find | `find_set` | dest-live scan arms (`RTX_FIND_WORKERS`) | `!done && !cancel` | `scan_off` | — |
 | jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
 | prefix | — | — | — | `line_scan_off` | host does not pump |
-| island | `isle_kick` | `isle_step` | `isle_pumping` | `isle_from` | — |
+| island | `isle_kick` (land / gap view) | dest-live scan arms (`RTX_ISLE_WORKERS`) | `isle_pumping` | `isle_from` | — |
 | browse | `rtx_browse_kick` | dest-live listing arm | `scanning` (pause on paint) | job queue | — |
 
-Kick plants the first paint and returns. Browse and find are dest-live:
-the frame pauses / resumes / cancel+wait. Line walks stay one closed
-interval per step; returning is the yield. The find wave is a
-reused 2 MiB buffer per arm (not a heap per wave). The file is split
-across `RTX_FIND_WORKERS` dest-live arms (default 2) so each reader
-stays sequential. Each arm owns a private hit list; pause and finish
-memcpy in file order. Kick `@serial` is empty so the workers are the scan.
+Kick plants the first paint and returns. Browse, find, and island are
+dest-live: the frame pauses / resumes / cancel+wait. `g L` stays one
+closed interval per step; returning is the yield. The find and island
+waves reuse a 2 MiB buffer per arm (not a heap per wave). The file is
+split across dest-live arms (default 2) so each reader stays sequential.
+Find arms own a private hit list; pause and finish memcpy in file order.
+Island arms count LFs backward in `[line_scan_off, isle_anchor)`; pause
+and finish sum the counts. Gutters stay `+N` / `-L` until they meet the
+prefix. `isle_step` kicks if the handle is down — the host does not
+walk the island on the UI thread. Kick `@serial` is empty so the
+workers are the scan.
 Query copy and hit offsets stay on `d.find.store` and die with the
 document. A
 longer prefix query filters hits and keeps `scan_off`; a cap resumes

@@ -18,7 +18,9 @@ typedef enum {
     FB_RECT,
     FB_RECT_LINES,
     FB_LINE,
-    FB_TEXT
+    FB_TEXT,
+    FB_CLIP,
+    FB_CLIP_END
 } FbOpKind;
 
 typedef struct {
@@ -241,28 +243,36 @@ static void fb_clear_frame_input(void) {
     g_resized = 0;
 }
 
-/* Turn trackpad carry into discrete notches for this frame (cap burst). */
+/* Trackpad points → notches. /40 made tilt die and vertical crawl. */
+enum { FB_WHEEL_CAP = 8 };
+#define FB_WHEEL_PREC_X 10.0f
+#define FB_WHEEL_PREC_Y 16.0f
+
+/* Turn carry into discrete notches for this frame. Leftover stays. */
 static void fb_wheel_commit(void) {
     int sx = 0, sy = 0;
-    while (g_wheel_carry_x >= 1.0f && sx < 3) {
+    while (g_wheel_carry_x >= 1.0f && sx < FB_WHEEL_CAP) {
         sx++;
         g_wheel_carry_x -= 1.0f;
     }
-    while (g_wheel_carry_x <= -1.0f && sx > -3) {
+    while (g_wheel_carry_x <= -1.0f && sx > -FB_WHEEL_CAP) {
         sx--;
         g_wheel_carry_x += 1.0f;
     }
-    while (g_wheel_carry_y >= 1.0f && sy < 3) {
+    while (g_wheel_carry_y >= 1.0f && sy < FB_WHEEL_CAP) {
         sy++;
         g_wheel_carry_y -= 1.0f;
     }
-    while (g_wheel_carry_y <= -1.0f && sy > -3) {
+    while (g_wheel_carry_y <= -1.0f && sy > -FB_WHEEL_CAP) {
         sy--;
         g_wheel_carry_y += 1.0f;
     }
-    /* Cap: discard leftover notches from one huge flick. */
-    if (sx == 3 || sx == -3) g_wheel_carry_x = 0;
-    if (sy == 3 || sy == -3) g_wheel_carry_y = 0;
+    /* X is a smaller point threshold than Y (tilt). A vertical swipe then
+     * emits more X notches and the editor panned to the end of the row. */
+    if (sy != 0) {
+        sx = 0;
+        g_wheel_carry_x = 0;
+    }
     g_wheel_x = (float)sx;
     g_wheel_y = (float)sy;
 }
@@ -298,11 +308,19 @@ static void fb_handle_event(NSEvent *ev) {
             g_key_down[k] = 1;
             if (k == g_exit_key) g_should_close = 1;
         }
-        if (!(ev.modifierFlags & NSEventModifierFlagControl)) {
+        /* Arrows / Home / End / Delete arrive as NS*FunctionKey (U+F700+)
+         * in characters. Those must not enter the insert queue — left/right
+         * used to type them because the editor only drained chars after
+         * up/down. */
+        if (!(ev.modifierFlags & NSEventModifierFlagControl) &&
+            k != KEY_LEFT && k != KEY_RIGHT && k != KEY_UP && k != KEY_DOWN &&
+            k != KEY_HOME && k != KEY_END && k != KEY_TAB &&
+            k != KEY_ESCAPE && k != KEY_ENTER && k != KEY_BACKSPACE &&
+            k != KEY_DELETE) {
             NSString *chars = ev.characters;
             if (chars.length > 0) {
                 unichar u = [chars characterAtIndex:0];
-                if (u >= 32 && u != 127 && g_nchar < 64)
+                if (u >= 32 && u != 127 && u < 0xF700 && g_nchar < 64)
                     g_chars[g_nchar++] = (int)u;
             }
         }
@@ -340,10 +358,14 @@ static void fb_handle_event(NSEvent *ev) {
     case NSEventTypeScrollWheel: {
         CGFloat dx = ev.scrollingDeltaX;
         CGFloat dy = ev.scrollingDeltaY;
-        /* Trackpad deltas are in points and huge vs mouse notches / Raylib. */
+        if (dx == 0 && dy == 0) {
+            dx = ev.deltaX;
+            dy = ev.deltaY;
+        }
+        /* Precise = points. Mouse notches stay 1:1. */
         if (ev.hasPreciseScrollingDeltas) {
-            g_wheel_carry_x += (float)(dx / 40.0);
-            g_wheel_carry_y += (float)(dy / 40.0);
+            g_wheel_carry_x += (float)(dx / (double)FB_WHEEL_PREC_X);
+            g_wheel_carry_y += (float)(dy / (double)FB_WHEEL_PREC_Y);
         } else {
             g_wheel_carry_x += (float)dx;
             g_wheel_carry_y += (float)dy;
@@ -455,6 +477,13 @@ static void fb_replay(CGContextRef ctx) {
             if (font != base) CFRelease(font);
             break;
         }
+        case FB_CLIP:
+            CGContextSaveGState(ctx);
+            CGContextClipToRect(ctx, CGRectMake(o->x, o->y, o->w, o->h));
+            break;
+        case FB_CLIP_END:
+            CGContextRestoreGState(ctx);
+            break;
         }
     }
 }
@@ -616,6 +645,22 @@ void ClearBackground(Color color) {
     FbOp o = {0};
     o.kind = FB_CLEAR;
     o.c = color;
+    fb_op(o);
+}
+
+void BeginScissorMode(int x, int y, int w, int h) {
+    FbOp o = {0};
+    o.kind = FB_CLIP;
+    o.x = x;
+    o.y = y;
+    o.w = w;
+    o.h = h;
+    fb_op(o);
+}
+
+void EndScissorMode(void) {
+    FbOp o = {0};
+    o.kind = FB_CLIP_END;
     fb_op(o);
 }
 

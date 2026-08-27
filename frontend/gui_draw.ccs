@@ -110,7 +110,14 @@ int gui_pane_at(RtxWs *w, int x, int pad, int inner) {
 }
 
 int gui_pane_x0(RtxWs *w, int pane, int pad, int inner) {
-    return pad + (pane == 1 && w && w->npanes == 2 ? inner / 2 + 8 : 0);
+    return pad + (pane == 1 && w && w->npanes == 2 ? inner / 2 : 0);
+}
+
+static int gui_rail_w(RtxBuf *b, int vis_rows) {
+    if (!b) return 0;
+    if (b->scroll_needed(vis_rows) || (b->drag_len && !b->drag_horiz))
+        return GUI_SCROLL_W;
+    return 0;
 }
 
 int gui_text_ph(int hh, int top, int find_on) {
@@ -150,7 +157,7 @@ float gui_gutter_px(GuiFonts *fonts, RtxBuf *b, int vis_rows) {
 }
 
 double gui_text_w(GuiFonts *fonts, RtxBuf *b, int pane_w, int vis_rows) {
-    int rw = (b && b->scroll_needed(vis_rows)) ? GUI_SCROLL_W : 0;
+    int rw = gui_rail_w(b, vis_rows);
     double w = (double)pane_w - (double)gui_gutter_px(fonts, b, vis_rows) - (double)rw;
     if (w < 8.0) w = 8.0;
     /* Layout units: grid is cluster columns; wrap/default stay pixels. */
@@ -729,15 +736,65 @@ static void gui_draw_browse(RtxBrowse *br, const RtxUi *ui, GuiFonts *fonts, int
     }
 }
 
+/* Caret x is cluster columns (same as TUI cctext_grid_caret_cell). Per-glyph
+ * `caret == off` missed pad/gap and looked like the last column. */
+static void gui_grid_caret_geom(RtxBuf *b, int *on_hdr, size_t *col_x,
+                                size_t *row_i) {
+    size_t caret, base, rec_n, rel;
+    CCArena heap = {0};
+    char[:] bytes = cc_slice_empty();
+    *on_hdr = 0;
+    *col_x = 0;
+    *row_i = (size_t)-1;
+    if (!b) return;
+    caret = b->doc.caret;
+    if (b->layout.grid_hdr_on && b->layout.grid_hdr_end &&
+        caret < b->layout.grid_hdr_end) {
+        *on_hdr = 1;
+        base = 0;
+        rec_n = b->layout.grid_hdr_end;
+    } else if (!rtx_layout_grid_rec_in(&b->layout, caret, &base, &rec_n)) {
+        if (b->layout.len)
+            *row_i = rtx_layout_grid_row_of(&b->layout, &b->doc, caret);
+        return;
+    }
+    if (rec_n) {
+        heap = cc_arena_heap(rec_n + 64);
+        if (!heap.base) return;
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                heap.destroy();
+                return;
+            }
+            bytes = b->scratch_span(base, rec_n, &heap) !>;
+        }
+    }
+    rel = rtx_layout_grid_rel(caret, base, rec_n);
+    rtx_grid_bind_span(&b->layout.grid, base, bytes.len);
+    *col_x = (size_t)rtx_grid_x_of(bytes.ptr, bytes.len, &b->layout.grid, rel);
+    if (!*on_hdr && b->layout.len)
+        *row_i = rtx_layout_grid_row_of(&b->layout, &b->doc, caret);
+    if (heap.base) heap.destroy();
+}
+
+static void gui_grid_caret_bar(const RtxUi *ui, int focused, float x, float y,
+                              float h) {
+    if (!rtx_ui_here(ui, focused, 1)) return;
+    DrawRectangle((int)x, (int)y, 2, (int)h, (Color){255, 200, 80, 255});
+}
+
 static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focused,
                               int x0, int y0, int pw, int ph) {
     size_t i;
     double acc = 0;
     int has = b->doc.has_sel();
-    int vis_rows = ph > 0 ? (int)((float)ph / 18.0f) : 32;
+    int vis_rows = ph > 0 ? ph / GUI_ROW_H : 32;
     float gpx = gui_gutter_px(fonts, b, vis_rows);
     Vector2 m0;
     float cw;
+    int caret_hdr = 0;
+    size_t caret_x = 0, caret_ri = (size_t)-1;
     @errhandler(CCError e) {
         (void)e;
         return;
@@ -748,6 +805,7 @@ static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int f
     }
     m0 = MeasureTextEx(fonts->mono, "0", 14, 0);
     cw = m0.x > 1.0f ? m0.x : 8.0f;
+    gui_grid_caret_geom(b, &caret_hdr, &caret_x, &caret_ri);
     if (b->layout.grid_hdr_on) {
         RtxVisRow head;
         double y = (double)y0;
@@ -759,7 +817,7 @@ static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int f
         head.line = 0;
         head.wrap_i = 0;
         head.width = 0;
-        head.height = 18.0;
+        head.height = (double)GUI_ROW_H;
         head.sec = RTX_SEC_CODE;
         acc += head.height;
         DrawRectangle(x0, y0, pw, (int)head.height, (Color){36, 36, 40, 255});
@@ -816,10 +874,6 @@ static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int f
                                               (int)head.height,
                                               (Color){40, 70, 120, 255});
                             }
-                            if (rtx_ui_here(ui, focused, b->doc.caret == off)) {
-                                DrawRectangle((int)x, (int)y, 2, (int)head.height,
-                                              (Color){255, 200, 80, 255});
-                            }
                             /* Grid columns are mono cells — never Georgia. */
                             DrawTextEx(fonts->mono, tmp,
                                        (Vector2){(float)x, (float)y},
@@ -836,24 +890,13 @@ static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int f
                                                       &b->layout.grid, c,
                                                       cell.hi);
                     int last = (cell.hi == field_hi);
-                    int pad_here = 0;
                     while (used_c < ccols) {
-                        if (last && !pad_here &&
-                            rtx_ui_here(ui, focused,
-                                        b->doc.caret == cell.hi)) {
-                            DrawRectangle((int)x, (int)y, 2, (int)head.height,
-                                          (Color){255, 200, 80, 255});
-                            pad_here = 1;
-                        }
                         x += (double)cw;
                         used_c++;
                     }
                     if (c + 1 < b->layout.grid.ncols) {
                         size_t gap = field_hi;
-                        if (last && rtx_ui_here(ui, focused, b->doc.caret == gap)) {
-                            DrawRectangle((int)x, (int)y, 2, (int)head.height,
-                                          (Color){255, 200, 80, 255});
-                        } else if (last && has && (b->doc.sel_covers(gap) !>)) {
+                        if (last && has && (b->doc.sel_covers(gap) !>)) {
                             DrawRectangle((int)x, (int)y, (int)cw,
                                           (int)head.height,
                                           (Color){40, 70, 120, 255});
@@ -864,13 +907,18 @@ static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int f
             }
         }
         if (hheap.base) hheap.destroy();
+        if (caret_hdr && caret_x >= b->left_col)
+            gui_grid_caret_bar(ui, focused,
+                               (float)x0 + gpx +
+                                   (float)(caret_x - b->left_col) * cw,
+                               (float)y, (float)head.height);
         (void)y;
     }
     for (i = b->top_wrap; i < b->layout.len; i++) {
         RtxVisRow *row = &b->layout.rows[i];
         double y = (double)y0 + acc;
-        acc += row->height;
-        if (y + row->height < (double)y0) continue;
+        acc += (double)GUI_ROW_H;
+        if (y + (double)GUI_ROW_H < (double)y0) continue;
         if (y > (double)(y0 + ph)) break;
         {
             size_t c;
@@ -938,12 +986,8 @@ static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int f
                             tmp[pn] = 0;
                             if (has && (b->doc.sel_covers(off) !>)) {
                                 DrawRectangle((int)x, (int)y, (int)(cw * (float)pc) + 1,
-                                              (int)row->height,
+                                              GUI_ROW_H,
                                               (Color){40, 70, 120, 255});
-                            }
-                            if (rtx_ui_here(ui, focused, b->doc.caret == off)) {
-                                DrawRectangle((int)x, (int)y, 2, (int)row->height,
-                                              (Color){255, 200, 80, 255});
                             }
                             /* Grid columns are mono cells — never Georgia. */
                             DrawTextEx(fonts->mono, tmp,
@@ -961,35 +1005,27 @@ static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int f
                                                       &b->layout.grid, c,
                                                       cell.hi);
                     int last = (cell.hi == field_hi);
-                    int pad_here = 0;
                     while (used_c < ccols) {
-                        if (last && !pad_here &&
-                            rtx_ui_here(ui, focused,
-                                        b->doc.caret ==
-                                            row->byte_start + cell.hi)) {
-                            DrawRectangle((int)x, (int)y, 2, (int)row->height,
-                                          (Color){255, 200, 80, 255});
-                            pad_here = 1;
-                        }
                         x += (double)cw;
                         used_c++;
                     }
                     if (c + 1 < b->layout.grid.ncols) {
                         size_t gap = row->byte_start + field_hi;
-                        if (last && rtx_ui_here(ui, focused,
-                                                b->doc.caret == gap)) {
-                            DrawRectangle((int)x, (int)y, 2, (int)row->height,
-                                          (Color){255, 200, 80, 255});
-                        } else if (last && has &&
+                        if (last && has &&
                                    (b->doc.sel_covers(gap) !>)) {
                             DrawRectangle((int)x, (int)y, (int)cw,
-                                          (int)row->height,
+                                          GUI_ROW_H,
                                           (Color){40, 70, 120, 255});
                         }
                         x += (double)cw;
                     }
                 }
             }
+            if (!caret_hdr && i == caret_ri && caret_x >= b->left_col)
+                gui_grid_caret_bar(ui, focused,
+                                   (float)x0 + gpx +
+                                       (float)(caret_x - b->left_col) * cw,
+                                   (float)y, (float)GUI_ROW_H);
             if (heap.base) heap.destroy();
         }
     }
@@ -1175,7 +1211,7 @@ void gui_draw_busy_badge(void) {
 static void gui_draw_scroll_x(RtxBuf *b, int focused, int x0, int y0, int pane_w,
                               int ph, int vis_rows) {
     RtxScrollRail rail;
-    int hx, track_w, tx, th, sx;
+    int hx, track_w, tx, th;
     double width;
     Color track, thumb;
     if (!b || ph < 1) return;
@@ -1189,9 +1225,8 @@ static void gui_draw_scroll_x(RtxBuf *b, int focused, int x0, int y0, int pane_w
         rail.vis = b->drag_vis ? b->drag_vis : rail.vis;
         rail.len = b->drag_len;
     }
-    sx = (b->scroll_needed(vis_rows) || (b->drag_len && !b->drag_horiz))
-             ? GUI_SCROLL_W : 0;
-    track_w = pane_w - sx;
+    (void)vis_rows;
+    track_w = pane_w;
     if (track_w < 8) track_w = pane_w;
     rtx_scroll_rail_thumb(&rail, track_w, GUI_SCROLL_MIN_TH, &tx, &th);
     if (focused && g_live.dragging && *g_live.dragging == GUI_DRAG_SCROLL_X &&
@@ -1299,8 +1334,13 @@ void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner,
                 {
                     int hx = gui_scroll_x_h(b);
                     int tph = ph > hx ? ph - hx : ph;
+                    int rw = gui_rail_w(b, vis_rows);
+                    int tw = pane_w > rw ? pane_w - rw : pane_w;
+                    if (tw > 0 && tph > 0)
+                        BeginScissorMode(x0, top, tw, tph);
                     gui_draw_buf(b, g_live.ui, g_live.fonts, p == g_live.w->focus,
                                  x0, top, pane_w, tph, pad);
+                    if (tw > 0 && tph > 0) EndScissorMode();
                     gui_draw_scroll(b, p == g_live.w->focus, x0, top, pane_w, ph,
                                     vis_rows);
                 }

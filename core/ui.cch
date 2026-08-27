@@ -359,27 +359,35 @@ static void !>(RtxIndexErr) rtx_status_line_pos(const RtxBuf *b, char *dst, size
     plus = 1;
     abs = 0;
     if (b->layout.len) {
+        const RtxVisRow *use = NULL;
         for (i = 0; i < b->layout.len; i++) {
             const RtxVisRow *row = &b->layout.rows[i];
             if (d->caret >= row->byte_start &&
                 d->caret <= row->byte_start + row->byte_len) {
-                int gap = rtx_gutter_gap(b, row->byte_start, row->line, &abs, &plus);
-                if (gap) {
-                    snprintf(dst, dst_n, gap < 0 ? "-%zu" : "+%zu", plus);
-                    rtx_status_line_scan(d, dst, dst_n);
-                    return cc_ok();
-                }
-                cur = abs;
-                if (d->index_fault()) {
-                    snprintf(dst, dst_n, "L%zu!", cur);
-                } else if (d->lf_ready()) {
-                    snprintf(dst, dst_n, "L%zu/%zu", cur, d->line_count());
-                } else {
-                    snprintf(dst, dst_n, "L%zu", cur);
-                }
+                use = row;
+                break;
+            }
+        }
+        /* Seek is the camera. Caret at BOF must not print L1 on a mid-file
+         * window — that is the island label, not line_of(caret). */
+        if (!use && b->seek_valid) use = &b->layout.rows[0];
+        if (use) {
+            int gap = rtx_gutter_gap(b, use->byte_start, use->line, &abs, &plus);
+            if (gap) {
+                snprintf(dst, dst_n, gap < 0 ? "-%zu" : "+%zu", plus);
                 rtx_status_line_scan(d, dst, dst_n);
                 return cc_ok();
             }
+            cur = abs;
+            if (d->index_fault()) {
+                snprintf(dst, dst_n, "L%zu!", cur);
+            } else if (d->lf_ready()) {
+                snprintf(dst, dst_n, "L%zu/%zu", cur, d->line_count());
+            } else {
+                snprintf(dst, dst_n, "L%zu", cur);
+            }
+            rtx_status_line_scan(d, dst, dst_n);
+            return cc_ok();
         }
     }
     if (!d->index_covers(d->caret) && !rtx_line_isle_connected(&d->tree)) {
@@ -387,8 +395,10 @@ static void !>(RtxIndexErr) rtx_status_line_pos(const RtxBuf *b, char *dst, size
         rtx_status_line_scan(d, dst, dst_n);
         return cc_ok();
     }
-    if (d->index_covers(d->caret))
+    if (d->index_covers(d->caret) && !b->seek_valid)
         cur = d->line_of(d->caret) !>(e) { return cc_err(e); };
+    else if (rtx_line_isle_connected(&d->tree))
+        cur = rtx_isle_cam_line(b);
     else
         cur = d->tree.scan_line + d->tree.isle_before;
     cur = cur + 1;
@@ -432,17 +442,12 @@ static void !>(RtxIndexErr) RtxDoc_goto_line(RtxDoc *d, size_t line1) {
     return cc_ok();
 }
 
-/* Fat slice; `yield` aborts the slice so a key/mouse is not stuck behind I/O. */
+/* Dest-live island: kick if an edit dropped the handle. Do not step
+ * on the UI thread (same gate as find). */
 static void rtx_ui_line_isle_pump(RtxDoc *d, int (*yield)(void)) {
-    long t0;
+    (void)yield;
     if (!d || !rtx_line_isle_pumping(&d->tree)) return;
-    t0 = rtx_ui_now_ms();
-    for (;;) {
-        if (!rtx_line_isle_pumping(&d->tree)) break;
-        if (yield && yield()) break;
-        if (rtx_ui_now_ms() - t0 >= (long)RTX_LINE_ISLE_WORK_MS) break;
-        if (!rtx_line_isle_step(&d->tree, (size_t)RTX_LINE_ISLE_BUDGET)) break;
-    }
+    (void)rtx_line_isle_step(&d->tree, 0);
 }
 
 /* Jump: digits = 1-based line. Digits then '%' = that percent of the file
@@ -541,13 +546,12 @@ static void !>(RtxIndexErr) rtx_ui_jump_pump(RtxUi *ui, RtxBuf *b, int vis,
     return cc_ok();
 }
 
-/* Host-step walks that own the frame clock. Dest-live find does not —
- * treating it as pumping set TUI timeout 0 and paused the worker
- * around chrome every spin (one 256 KiB block per paint). */
+/* Host-step walks that own the frame clock. Dest-live find / island
+ * do not — treating them as pumping set TUI timeout 0 and paused the
+ * worker around chrome every spin. */
 static int rtx_ui_work_pumping(const RtxUi *ui, const RtxDoc *d) {
     if (!d) return 0;
-    if (ui && ui->jump && rtx_line_want_pumping(&d->tree)) return 1;
-    return rtx_line_isle_pumping(&d->tree);
+    return ui && ui->jump && rtx_line_want_pumping(&d->tree);
 }
 
 static void !>(RtxIndexErr) rtx_ui_work_pump(RtxUi *ui, RtxBuf *b, int vis,
@@ -568,8 +572,9 @@ static void !>(RtxIndexErr) rtx_ui_work_pump(RtxUi *ui, RtxBuf *b, int vis,
 static int rtx_ui_offer_quit(RtxWs *w, RtxUi *ui) {
     size_t i;
     if (!w || !ui) return 1;
-    if (!w->any_dirty()) return 1;
+    /* Camera (view / caret) is not an edit. Flush even when clean. */
     w->safe_flush_all();
+    if (!w->any_dirty()) return 1;
     for (i = 0; i < w->len; i++) {
         if (w->bufs[i].parked) continue;
         rtx_line_want_cancel(&w->bufs[i].doc.tree);
@@ -620,10 +625,12 @@ enum { RTX_CLI_MAX = 32 };
 
 typedef struct {
     int view;     /* sticky RTX_VIEW_* for the next file (and the default file) */
+    int view_set; /* 1 after --wrap/--hex/--grid/--view (journal view otherwise) */
     int help;
     int version;
     int nfiles;
     int file_view[RTX_CLI_MAX];
+    int file_view_set[RTX_CLI_MAX];
 } RtxCli;
 
 static int rtx_cli_view_of(const char *s) {
@@ -686,14 +693,17 @@ static int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
             }
             if (strcmp(a, "--wrap") == 0) {
                 cli->view = RTX_VIEW_WRAP;
+                cli->view_set = 1;
                 continue;
             }
             if (strcmp(a, "--hex") == 0) {
                 cli->view = RTX_VIEW_HEX;
+                cli->view_set = 1;
                 continue;
             }
             if (strcmp(a, "--grid") == 0) {
                 cli->view = RTX_VIEW_GRID;
+                cli->view_set = 1;
                 continue;
             }
             if (strncmp(a, "--view=", 7) == 0) {
@@ -703,6 +713,7 @@ static int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
                     return 1;
                 }
                 cli->view = v;
+                cli->view_set = 1;
                 continue;
             }
             if (strcmp(a, "--view") == 0) {
@@ -716,6 +727,7 @@ static int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
                     return 1;
                 }
                 cli->view = v;
+                cli->view_set = 1;
                 continue;
             }
             fprintf(stderr, "unknown option: %s\n", a);
@@ -726,9 +738,30 @@ static int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
             return 1;
         }
         cli->file_view[cli->nfiles] = cli->view;
+        cli->file_view_set[cli->nfiles] = cli->view_set;
         files[cli->nfiles++] = argv[i];
     }
     return 0;
+}
+
+/* CLI --view overrides the journal; otherwise keep the restored camera. */
+static void rtx_cli_apply_views(RtxWs *w, const RtxCli *cli) {
+    int i;
+    if (!w || !cli) return;
+    if (cli->nfiles == 0) {
+        if (cli->view_set && w->len) {
+            rtx_layout_set_view(&w->bufs[0].layout, cli->view);
+            rtx_buf_grid_bind(&w->bufs[0]);
+        } else {
+            for (i = 0; i < (int)w->len; i++) rtx_buf_grid_bind(&w->bufs[i]);
+        }
+        return;
+    }
+    for (i = 0; i < cli->nfiles && i < (int)w->len; i++) {
+        if (cli->file_view_set[i])
+            rtx_layout_set_view(&w->bufs[i].layout, cli->file_view[i]);
+        rtx_buf_grid_bind(&w->bufs[i]);
+    }
 }
 
 #endif /* RTX_UI_H */

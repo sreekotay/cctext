@@ -144,6 +144,8 @@ static void RtxBuf_destroy(RtxBuf *b) {
     memset(b, 0, sizeof(*b));
 }
 
+static void rtx_buf_grid_bind(RtxBuf *b);
+
 static void rtx_ws_cam_from_buf(const RtxBuf *b, RtxSafeCam *c) {
     rtx_safe_cam_clear(c);
     if (!b) return;
@@ -170,6 +172,7 @@ static void rtx_ws_cam_to_buf(RtxBuf *b, const RtxSafeCam *c) {
     b->seek_rel = c->seek_rel;
     b->seek_valid = c->seek_valid;
     rtx_layout_set_view(&b->layout, c->view);
+    rtx_buf_grid_bind(b);
     b->hex_nib = c->hex_nib;
     b->unlock = c->unlock;
     b->pin_view = c->pin_view;
@@ -227,14 +230,17 @@ static void rtx_ws_flush_buf(RtxBuf *b) {
 }
 
 static void rtx_ws_park_buf(RtxBuf *b) {
+    int view;
     if (!b || b->parked) return;
     if (!rtx_ws_buf_path(b)) return;
     rtx_ws_flush_buf(b);
     b->park_dirty = b->doc.dirty();
+    view = b->layout.view;
     b->layout.destroy();
     b->doc.destroy();
     memset(&b->doc, 0, sizeof(b->doc));
     memset(&b->layout, 0, sizeof(b->layout));
+    rtx_layout_set_view(&b->layout, view);
     b->parked = 1;
 }
 
@@ -846,17 +852,23 @@ static size_t !>(RtxIndexErr) rtx_buf_cur_col(const RtxBuf *b) {
 }
 
 /* Keep seek_rel in lockstep with seek_off. A jump wider than the local
- * floor window starts a new +1 origin (do not line_of the span). */
+ * floor window starts a new +1 origin and replants the island there —
+ * the old isle_before is the previous camera, not this one. */
 static void rtx_buf_seek_set(RtxBuf *b, size_t floor) {
     size_t a, z;
     if (!b) return;
     if (b->seek_valid) {
         a = b->seek_off < floor ? b->seek_off : floor;
         z = b->seek_off < floor ? floor : b->seek_off;
-        if (z - a > (size_t)RTX_LINE_FLOOR_MAX) b->seek_rel = 0;
-        else b->seek_rel += rtx_doc_lf_delta_local(&b->doc, b->seek_off, floor);
+        if (z - a > (size_t)RTX_LINE_FLOOR_MAX) {
+            b->seek_rel = 0;
+            rtx_line_isle_kick(&b->doc.tree, floor);
+        } else
+            b->seek_rel += rtx_doc_lf_delta_local(&b->doc, b->seek_off, floor);
     } else {
         b->seek_rel = 0;
+        if (!b->doc.index_covers(floor))
+            rtx_line_isle_kick(&b->doc.tree, floor);
     }
     b->seek_off = floor;
     b->seek_valid = 1;
@@ -1016,6 +1028,113 @@ static void !>(CCError) RtxBuf_move_horiz(RtxBuf *b, int dir, int shift) {
         b->doc.caret = b->doc.fold_snap(b->doc.caret, dir);
         if (!shift) b->doc.sel_anchor = b->doc.caret;
     }
+    b->doc.break_coalesce();
+    b->clear_pref();
+    rtx_buf_hex_nib_reset(b);
+    return cc_ok();
+}
+
+/* Tab / Shift-Tab: next / prev field. Wraps to the next/prev record. */
+static void !>(CCError) RtxBuf_move_grid_col(RtxBuf *b, int dir) {
+    RtxLayout *L;
+    size_t start, rec_n, dlen, rel, col, nf, last, want;
+    RtxGridField f[RTX_GRID_FIELDS];
+    char[:] line = cc_slice_empty();
+    CCArena frame = {0};
+    int owned = 0;
+    int hdr;
+    @errhandler(CCError e) {
+        if (owned) frame.destroy();
+        return cc_err(e);
+    }
+    if (!b || !rtx_layout_is_grid(&b->layout))
+        return cc_err(CC_ERR_INVALID_ARG, "grid col");
+    L = &b->layout;
+    dlen = b->len();
+    hdr = L->grid_hdr_on && L->grid_hdr_end;
+    if (!rtx_layout_grid_rec_in(L, b->doc.caret, &start, &rec_n)) {
+        start = rtx_layout_grid_cam_lo(&b->doc, b->doc.caret, NULL) !>;
+        rec_n = rtx_layout_grid_rec_len(&b->doc, start) !>;
+    }
+    if (rec_n) {
+        frame = cc_arena_heap(rec_n + 64);
+        if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "grid col");
+        owned = 1;
+        line = b->doc.scratch_span(start, rec_n, &frame) !>;
+    }
+    rtx_grid_bind_span(&L->grid, start, rec_n);
+    nf = rtx_grid_split(line.ptr, line.len, L->grid.delim ? L->grid.delim : ',',
+                        f, RTX_GRID_FIELDS, L->grid.span_hold);
+    last = nf;
+    if (L->grid.ncols && last > L->grid.ncols) last = L->grid.ncols;
+    if (!last) {
+        if (owned) frame.destroy();
+        return cc_ok();
+    }
+    rel = rtx_layout_grid_rel(b->doc.caret, start, rec_n);
+    if (b->doc.caret >= start + rec_n) rel = 0;
+    col = (size_t)rtx_grid_col_at(line.ptr, line.len, &L->grid, rel);
+    if (col >= last) col = last - 1;
+    if (dir > 0) {
+        if (col + 1 < last) {
+            want = start + f[col + 1].lo;
+        } else {
+            size_t next = rtx_layout_grid_after_rec(&b->doc, start, rec_n);
+            if (next >= dlen) want = b->doc.caret;
+            else want = next;
+        }
+    } else if (col > 0) {
+        want = start + f[col - 1].lo;
+    } else if (hdr && start > 0 &&
+               start == rtx_layout_grid_after_rec(&b->doc, 0, L->grid_hdr_end)) {
+        if (owned) {
+            frame.destroy();
+            owned = 0;
+            line = cc_slice_empty();
+        }
+        start = 0;
+        rec_n = L->grid_hdr_end;
+        if (rec_n) {
+            frame = cc_arena_heap(rec_n + 64);
+            if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "grid col");
+            owned = 1;
+            line = b->doc.scratch_span(start, rec_n, &frame) !>;
+        }
+        rtx_grid_bind_span(&L->grid, start, rec_n);
+        nf = rtx_grid_split(line.ptr, line.len,
+                            L->grid.delim ? L->grid.delim : ',', f,
+                            RTX_GRID_FIELDS, L->grid.span_hold);
+        last = nf;
+        if (L->grid.ncols && last > L->grid.ncols) last = L->grid.ncols;
+        want = last ? start + f[last - 1].lo : start;
+    } else if (start == 0) {
+        want = start + (nf ? f[0].lo : 0);
+    } else {
+        if (owned) {
+            frame.destroy();
+            owned = 0;
+            line = cc_slice_empty();
+        }
+        start = rtx_layout_grid_cam_lo(&b->doc, start - 1, NULL) !>;
+        rec_n = rtx_layout_grid_rec_len(&b->doc, start) !>;
+        if (rec_n) {
+            frame = cc_arena_heap(rec_n + 64);
+            if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "grid col");
+            owned = 1;
+            line = b->doc.scratch_span(start, rec_n, &frame) !>;
+        }
+        rtx_grid_bind_span(&L->grid, start, rec_n);
+        nf = rtx_grid_split(line.ptr, line.len,
+                            L->grid.delim ? L->grid.delim : ',', f,
+                            RTX_GRID_FIELDS, L->grid.span_hold);
+        last = nf;
+        if (L->grid.ncols && last > L->grid.ncols) last = L->grid.ncols;
+        want = last ? start + f[last - 1].lo : start;
+    }
+    if (owned) frame.destroy();
+    b->doc.caret = want;
+    b->doc.sel_anchor = want;
+    b->doc.sel_box = 0;
     b->doc.break_coalesce();
     b->clear_pref();
     rtx_buf_hex_nib_reset(b);
@@ -1301,6 +1420,7 @@ static void !>(RtxIndexErr) RtxBuf_land(RtxBuf *b, int vis) {
             return cc_err(e);
         };
         rtx_buf_seek_set(b, floor);
+        rtx_line_isle_kick(&b->doc.tree, floor);
     }
     b->top_wrap = 0;
     return cc_ok();
@@ -1324,6 +1444,25 @@ static void !>(RtxIndexErr) RtxBuf_cycle_view(RtxBuf *b, int vis) {
     rtx_layout_cycle_view(&b->layout);
     rtx_buf_grid_bind(b);
     b->left_col = 0;
+    if (rtx_layout_is_grid(&b->layout) && b->doc.caret > 0) {
+        char c = 0;
+        size_t got = 0;
+        size_t was = b->doc.caret;
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                got = 0;
+            }
+            got = b->doc.read_at(was, &c, 1) !>;
+        }
+        /* Record NL is a gap. cluster_prev put the caret in the last
+         * field and reveal_x panned left_col. Land on this record start. */
+        if (got == 1 && (c == '\n' || c == '\r')) {
+            size_t lo = rtx_layout_grid_cam_lo(&b->doc, was, NULL) !>;
+            b->doc.caret = lo;
+            if (b->doc.sel_anchor == was) b->doc.sel_anchor = lo;
+        }
+    }
     if (was_hex && !rtx_layout_is_hex(&b->layout) &&
         b->doc.sel_anchor == b->doc.caret) {
         b->doc.caret = b->doc.cluster_align(b->doc.caret) !>;
@@ -1337,6 +1476,7 @@ static void !>(RtxIndexErr) RtxBuf_cycle_view(RtxBuf *b, int vis) {
     b->drag_horiz = 0;
     b->clear_pref();
     rtx_buf_hex_nib_reset(b);
+    rtx_ws_flush_buf(b);
     if (b->unlock) return b->reveal_off(keep, vis);
     return b->reveal_off(b->doc.caret, vis);
 }
@@ -1378,6 +1518,9 @@ static void !>(CCError) rtx_buf_grid_scroll(RtxBuf *b, const RtxMeasure *m,
     }
     if (dir > 0) {
         size_t nxt = rtx_layout_grid_next_line(&b->doc, b->top) !>;
+        /* top==0 fill skips the header record, so the first body row is
+         * already on screen. One next_line lands on that same row as a
+         * camera start (visually a no-op). Step again. */
         if (b->top == 0 && nxt != b->top)
             nxt = rtx_layout_grid_next_line(&b->doc, nxt) !>;
         b->top = nxt;
@@ -1618,6 +1761,9 @@ static void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double widt
     }
     if (b->seek_valid) {
         size_t want = (size_t)vis + 8 + b->top_wrap;
+        if (!b->doc.index_covers(b->seek_off) &&
+            !rtx_line_isle_live(&b->doc.tree))
+            rtx_line_isle_kick(&b->doc.tree, b->seek_off);
         if (b->layout_width != width || b->layout.len == 0 ||
             b->layout.len < (size_t)vis ||
             (b->layout.len && b->layout.rows[0].byte_start != b->seek_off &&
@@ -1630,6 +1776,12 @@ static void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double widt
         }
         rtx_buf_seek_label(b) !>;
         if (b->seek_valid) {
+            if (rtx_line_isle_connected(&b->doc.tree) && b->layout.len) {
+                long n = (long)b->doc.tree.scan_line +
+                         (long)b->doc.tree.isle_before + b->seek_rel;
+                if (n < 0) n = 0;
+                rtx_layout_reline(&b->layout, (size_t)n);
+            }
             if (!b->unlock && !b->pin_view) rtx_buf_reveal_x(b, m, width);
             return cc_ok();
         }
