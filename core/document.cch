@@ -150,13 +150,29 @@ typedef struct {
 
 #ifndef RTX_FIND_BUDGET
 enum {
-    RTX_FIND_BUDGET = 262144,
+    RTX_FIND_BUDGET = 2 * 1024 * 1024,
     RTX_FIND_BLOCK = RTX_FIND_BUDGET,
     RTX_FIND_MAX = 32768,
-    RTX_FIND_COLLECT = RTX_FIND_MAX + 1,
+    RTX_FIND_COLLECT = 256,
     RTX_FIND_QMAX = 256
 };
 #endif
+
+#ifndef RTX_FIND_WORKERS
+#define RTX_FIND_WORKERS 2
+#endif
+
+typedef struct {
+    CCArena lane;          /* reused read buf + worker hits */
+    char *buf;
+    size_t lo;
+    size_t hi;
+    size_t at;
+    size_t *offs;
+    size_t len;
+    size_t cap;
+    unsigned done : 1;
+} RtxFindShard;
 
 typedef struct {
     CCArena store;         /* created on first find_set */
@@ -165,6 +181,8 @@ typedef struct {
     size_t len;
     size_t cap;
     size_t scan_off;
+    size_t scan_base;      /* [scan_base, len) split across shards */
+    size_t scan_bytes;     /* published bytes done (chrome %) */
     size_t cur;
     size_t origin;         /* caret at find_set; list highlight prefers >= origin */
     unsigned done : 1;
@@ -172,27 +190,44 @@ typedef struct {
     unsigned pinned : 1;   /* user selected a hit (click / next / prev) */
     unsigned cancel : 1;   /* written when a cancel key is consumed */
     int h_live;            /* 1: scan dest not yet waited */
+    int nshard;
+    RtxFindShard shard[RTX_FIND_WORKERS];
     CCParallel h;
 } RtxFind;
 
 /* Join lives here so destroy / invalidate do not need find.ccs.
  * No `!>` — that unwrap in this header hits missing result-spec types
  * (CCResult_int_RtxIndexErr) in TUs that only include document.cch. */
+static void rtx_find_shards_drop(RtxFind *f) {
+    int i;
+    if (!f) return;
+    for (i = 0; i < RTX_FIND_WORKERS; i++) {
+        CCArena lane = f->shard[i].lane;
+        if (f->shard[i].buf) free(f->shard[i].buf);
+        if (lane.base) cc_arena_destroy(&lane);
+        memset(&f->shard[i], 0, sizeof(f->shard[i]));
+    }
+    f->nshard = 0;
+}
+
 static void rtx_find_handle_stop(RtxFind *f) {
     int i;
-    if (!f || !f->h_live) return;
-    cc__parallel_cancel_tree(&f->h);
-    if (!cc_atomic_load(&f->h.joined)) {
-        if (f->h.n) (void)cc_nursery_wait(f->h.n);
-        for (i = 0; i < f->h.nt; i++) {
-            cc_parallel_join(f->h.tasks[i]);
-            free(f->h.envs[i]);
-            f->h.envs[i] = NULL;
+    if (!f) return;
+    if (f->h_live) {
+        cc__parallel_cancel_tree(&f->h);
+        if (!cc_atomic_load(&f->h.joined)) {
+            if (f->h.n) (void)cc_nursery_wait(f->h.n);
+            for (i = 0; i < f->h.nt; i++) {
+                cc_parallel_join(f->h.tasks[i]);
+                free(f->h.envs[i]);
+                f->h.envs[i] = NULL;
+            }
+            f->h.nt = 0;
+            cc_atomic_store(&f->h.joined, 1);
         }
-        f->h.nt = 0;
-        cc_atomic_store(&f->h.joined, 1);
+        f->h_live = 0;
     }
-    f->h_live = 0;
+    rtx_find_shards_drop(f);
 }
 
 typedef struct {
@@ -1316,6 +1351,8 @@ static void rtx_find_scan_wipe(RtxDoc *d) {
     if (!d) return;
     d->find.len = 0;
     d->find.scan_off = 0;
+    d->find.scan_base = 0;
+    d->find.scan_bytes = 0;
     d->find.cur = 0;
     d->find.origin = d->caret;
     d->find.pinned = 0;

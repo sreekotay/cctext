@@ -102,6 +102,12 @@ dirty so the first paint and the frame after a key are not a 400 ms
 wait. Do not layout, then handle, then layout again — a command that
 forgets a dirty bit paints the old camera.
 
+Shared UI (`ui.cch`, `ui_cmd.h`, buf motion on `RtxBuf`) owns modal
+state, command ids (`CMD_*` / `rtx_cmd_from_letter`), field edits, and
+hex/text Home-End / up-down. Each host maps its events and draws.
+Pixels, CSI, fonts, and OS clipboard stay in the frontend. Do not
+extract a host protocol — a letter map and a buf write are the cut.
+
 ## Scan
 
 Backfill is a pump. The host yields (`rtx_ui_work_pump`). Do not extract a
@@ -110,7 +116,7 @@ The next walk copies this table.
 
 | | start | one wave | live | resume | deny |
 |---|---|---|---|---|---|
-| find | `find_set` | dest-live scan arm | `!done && !cancel` | `scan_off` | — |
+| find | `find_set` | dest-live scan arms (`RTX_FIND_WORKERS`) | `!done && !cancel` | `scan_off` | — |
 | jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
 | prefix | — | — | — | `line_scan_off` | host does not pump |
 | island | `isle_kick` | `isle_step` | `isle_pumping` | `isle_from` | — |
@@ -119,8 +125,10 @@ The next walk copies this table.
 Kick plants the first paint and returns. Browse and find are dest-live:
 the frame pauses / resumes / cancel+wait. Line walks stay one closed
 interval per step; returning is the yield. The find wave is a
-heap arena with `@destroy` (ccc 0.3.4-194); one block per step inside
-the listing arm. Kick `@serial` is empty so the worker is the scan.
+reused 2 MiB buffer per arm (not a heap per wave). The file is split
+across `RTX_FIND_WORKERS` dest-live arms (default 2) so each reader
+stays sequential. Each arm owns a private hit list; pause and finish
+memcpy in file order. Kick `@serial` is empty so the workers are the scan.
 Query copy and hit offsets stay on `d.find.store` and die with the
 document. A
 longer prefix query filters hits and keeps `scan_off`; a cap resumes

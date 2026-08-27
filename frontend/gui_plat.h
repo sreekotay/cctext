@@ -55,34 +55,8 @@ enum {
     TEXTURE_FILTER_BILINEAR = 1
 };
 
-/* Menu / command ids (native NSMenu tags). */
-enum {
-    CMD_NONE = 0,
-    CMD_SAVE,
-    CMD_UNDO,
-    CMD_REDO,
-    CMD_CUT,
-    CMD_COPY,
-    CMD_PASTE,
-    CMD_PANE,
-    CMD_NEXT,
-    CMD_SPLIT,
-    CMD_QUIT,
-    CMD_JUMP,
-    CMD_FIND,
-    CMD_OPEN,
-    CMD_BROWSE,
-    CMD_HELP,
-    CMD_SEL_ALL,
-    CMD_VIEW,
-    CMD_FOLLOW,
-    CMD_NAV_NEXT,
-    CMD_NAV_PREV,
-    CMD_NAV_INV,
-    CMD_NAV_INV_PREV,
-    CMD_FOLD,
-    CMD_STATS
-};
+/* Menu / command ids (native NSMenu tags). Same values as core/ui_cmd.h. */
+#include "../core/ui_cmd.h"
 
 void SetTraceLogLevel(int level);
 void SetConfigFlags(unsigned int flags);

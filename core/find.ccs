@@ -102,7 +102,7 @@ int RtxDoc_find_same_query(const RtxDoc *d, char[:] q) {
     return memcmp(d->find.query.ptr, q.ptr, q.len) == 0;
 }
 
-static void !>(CCError) rtx_find_wave(RtxDoc *d);
+static void !>(CCError) rtx_find_wave(RtxDoc *d, int id);
 static void !>(CCError) rtx_find_listing_start(RtxDoc *d);
 
 void !>(CCError) RtxDoc_find_set(RtxDoc *d, char[:] q) {
@@ -147,17 +147,12 @@ void !>(CCError) RtxDoc_find_set(RtxDoc *d, char[:] q) {
     return rtx_find_listing_start(d);
 }
 
-static void !>(CCError) rtx_find_push(RtxDoc *d, size_t off) {
-    if (d->find.len >= RTX_FIND_MAX) {
-        d->find.truncated = 1;
-        d->find.done = 1;
-        return cc_ok();
-    }
-    rtx_arena_grow(&d->find.store, (void **)&d->find.offs, &d->find.cap,
-                   d->find.len + 1, sizeof(size_t)) !>(e) {
-        return cc_err(e);
-    };
-    d->find.offs[d->find.len++] = off;
+static void !>(CCError) rtx_find_shard_reserve(RtxFindShard *s, size_t need) {
+    if (!s) return cc_err(CC_ERR_INVALID_ARG, "find shard");
+    if (need > (size_t)RTX_FIND_MAX) need = (size_t)RTX_FIND_MAX;
+    if (need <= s->cap) return cc_ok();
+    rtx_arena_grow(&s->lane, (void **)&s->offs, &s->cap, need, sizeof(size_t))
+        !>(e) { return cc_err(e); };
     return cc_ok();
 }
 
@@ -167,34 +162,57 @@ static size_t rtx_find_window_adv(size_t got, size_t qn, int last) {
     return got > overlap ? got - overlap : got;
 }
 
-static size_t rtx_find_collect(const char *buf, size_t got, size_t qn,
-                               const char *q, size_t adv,
-                               size_t *hits, size_t maxh) {
-    size_t i;
+static void !>(CCError) rtx_find_publish(RtxDoc *d) {
+    int i;
+    size_t o;
+    size_t bytes;
+    size_t front;
+    int all_done;
     size_t n;
-    size_t lim;
-    if (!buf || !q || got < qn || maxh == 0 || adv == 0) return 0;
-    lim = got - qn + 1;
-    if (adv < lim) lim = adv;
-    n = 0;
-    i = 0;
-    while (i < lim && n < maxh) {
-        const char *p = (const char *)memmem(buf + i, got - i, q, qn);
-        size_t at;
-        if (!p) break;
-        at = (size_t)(p - buf);
-        if (at >= lim) break;
-        hits[n++] = at;
-        i = at + 1;
+    size_t raw;
+    size_t need;
+    if (!d) return cc_ok();
+    n = d->len();
+    raw = 0;
+    bytes = 0;
+    front = n;
+    all_done = 1;
+    for (i = 0; i < d->find.nshard; i++) {
+        RtxFindShard *s = &d->find.shard[i];
+        raw += s->len;
+        if (s->at >= s->lo) bytes += s->at - s->lo;
+        if (!s->done && s->hi > s->lo) {
+            all_done = 0;
+            if (s->at < front) front = s->at;
+        }
     }
-    return n;
-}
-
-static void !>(CCError) rtx_find_commit(RtxDoc *d, size_t base,
-                                        const size_t *rel, size_t n) {
-    size_t k;
-    for (k = 0; k < n && !d->find.truncated; k++) {
-        rtx_find_push(d, base + rel[k]) !>(e) { return cc_err(e); };
+    need = raw;
+    if (need > (size_t)RTX_FIND_MAX) need = (size_t)RTX_FIND_MAX;
+    if (need) {
+        rtx_arena_grow(&d->find.store, (void **)&d->find.offs, &d->find.cap,
+                       need, sizeof(size_t)) !>(e) { return cc_err(e); };
+    }
+    o = 0;
+    for (i = 0; i < d->find.nshard && o < need; i++) {
+        RtxFindShard *s = &d->find.shard[i];
+        size_t take = s->len;
+        if (take > need - o) take = need - o;
+        if (take && s->offs)
+            memcpy(d->find.offs + o, s->offs, take * sizeof(size_t));
+        o += take;
+    }
+    d->find.len = o;
+    if (o >= (size_t)RTX_FIND_MAX && (raw > (size_t)RTX_FIND_MAX || !all_done))
+        d->find.truncated = 1;
+    d->find.scan_bytes = d->find.scan_base + bytes;
+    if (d->find.scan_bytes > n) d->find.scan_bytes = n;
+    if (d->find.truncated || all_done) {
+        d->find.done = 1;
+        d->find.scan_off = n;
+        if (d->find.truncated && d->find.len)
+            d->find.scan_off = d->find.offs[d->find.len - 1] + 1;
+    } else {
+        d->find.scan_off = front;
     }
     return cc_ok();
 }
@@ -214,59 +232,74 @@ void !>(CCError) RtxDoc_find_finish(RtxDoc *d) {
     if (d->find.h_live) {
         d->find.h.wait() !>(e) { return cc_err(e); };
         d->find.h_live = 0;
+        rtx_find_publish(d) !>(e) { return cc_err(e); };
+        rtx_find_shards_drop(&d->find);
     }
     return cc_ok();
 }
 
-static void !>(CCError) rtx_find_wave(RtxDoc *d) {
-    size_t qn, n, start, commit, want, got, adv, nloc;
+static void !>(CCError) rtx_find_wave(RtxDoc *d, int id) {
+    RtxFindShard *s;
+    size_t qn, n, start, commit, want, got, adv;
     char q[RTX_FIND_QMAX];
-    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (!d || id < 0 || id >= RTX_FIND_WORKERS)
+        return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    s = &d->find.shard[id];
     qn = d->find.query.len;
     n = d->len();
-    if (qn == 0 || qn > n) {
-        d->find.done = 1;
+    if (qn == 0 || s->hi <= s->lo || s->at >= s->hi ||
+        s->len >= (size_t)RTX_FIND_MAX) {
+        s->done = 1;
         return cc_ok();
     }
     memcpy(q, d->find.query.ptr, qn);
-    if (d->find.cancel) {
-        d->find.done = 1;
+    if (d->find.cancel || d->find.truncated) {
+        s->done = 1;
         return cc_ok();
     }
-    start = d->find.scan_off;
+    start = s->at;
     if (start + qn > n) {
-        d->find.scan_off = n;
-        d->find.done = 1;
+        s->at = s->hi;
+        s->done = 1;
         return cc_ok();
     }
     commit = (size_t)RTX_FIND_BLOCK;
+    if (commit > s->hi - start) commit = s->hi - start;
     if (commit > n - start) commit = n - start;
     want = commit;
     if (qn > 1 && want > 0) want += qn - 1;
     if (want > n - start) want = n - start;
     if (want < qn) want = 0;
-    nloc = 0;
-    if (want) {
-        size_t ticket = (size_t)RTX_FIND_BLOCK + (size_t)RTX_FIND_QMAX
-            + (size_t)RTX_FIND_COLLECT * sizeof(size_t);
-        CCArena wave = cc_arena_heap(ticket + kilobytes(16)) @destroy;
-        char *buf = wave.allocT((size_t)RTX_FIND_BLOCK + (size_t)RTX_FIND_QMAX);
-        size_t *hits = wave.allocT((size_t)RTX_FIND_COLLECT);
-        if (!buf || !hits) return cc_err(CC_ERR_OUT_OF_MEMORY, "find wave");
+    if (want && s->buf) {
+        size_t room = (size_t)RTX_FIND_MAX - s->len;
+        char *buf = s->buf;
+        size_t i;
         got = d->tree.read_uncached(start, buf, want) !>(e) { return cc_err(e); };
         adv = rtx_find_window_adv(got, qn, start + got >= n);
         if (adv > commit) adv = commit;
-        nloc = rtx_find_collect(buf, got, qn, q, adv, hits,
-                               (size_t)RTX_FIND_COLLECT);
-        rtx_find_commit(d, start, hits, nloc) !>(e) { return cc_err(e); };
+        if (got >= qn && adv && room) {
+            size_t lim = got - qn + 1;
+            if (adv < lim) lim = adv;
+            i = 0;
+            while (i < lim && s->len < (size_t)RTX_FIND_MAX) {
+                const char *p = (const char *)memmem(buf + i, got - i, q, qn);
+                size_t at;
+                size_t off;
+                if (!p) break;
+                at = (size_t)(p - buf);
+                if (at >= lim) break;
+                off = start + at;
+                if (off >= s->hi) break;
+                rtx_find_shard_reserve(s, s->len + 1) !>(e) { return cc_err(e); };
+                s->offs[s->len++] = off;
+                i = at + 1;
+            }
+        }
     }
     start += commit;
-    if (start > n) start = n;
-    d->find.scan_off = start;
-    if (d->find.scan_off + qn > n || d->find.truncated) {
-        if (d->find.scan_off + qn > n) d->find.scan_off = n;
-        d->find.done = 1;
-    }
+    if (start > s->hi) start = s->hi;
+    s->at = start;
+    if (s->at >= s->hi) s->done = 1;
     return cc_ok();
 }
 
@@ -276,23 +309,60 @@ static int rtx_find_h_poll(CCParallel *h) {
     return !h->cancelled;
 }
 
-static int rtx_find_listing_arm(RtxDoc *d) {
-    if (!d || !d->find.h_live) return 0;
-    while (!d->find.done && d->find.query.len && !d->find.truncated
+static int rtx_find_listing_arm(RtxDoc *d, int id) {
+    RtxFindShard *s;
+    if (!d || !d->find.h_live || id < 0 || id >= RTX_FIND_WORKERS) return 0;
+    s = &d->find.shard[id];
+    if (s->hi <= s->lo) {
+        s->done = 1;
+        return 0;
+    }
+    while (!s->done && !d->find.done && d->find.query.len && !d->find.truncated
            && !d->find.cancel && rtx_find_h_poll(&d->find.h)) {
-        rtx_find_wave(d) !>(e) { (void)e; break; };
+        rtx_find_wave(d, id) !>(e) { (void)e; break; };
     }
     return 1;
+}
+
+static void rtx_find_lanes_init(RtxDoc *d) {
+    size_t n;
+    size_t span_lo;
+    size_t span;
+    int i;
+    n = d->len();
+    span_lo = d->find.scan_off;
+    if (span_lo > n) span_lo = n;
+    span = n - span_lo;
+    d->find.scan_base = span_lo;
+    d->find.scan_bytes = span_lo;
+    d->find.nshard = RTX_FIND_WORKERS;
+    for (i = 0; i < RTX_FIND_WORKERS; i++) {
+        RtxFindShard *s = &d->find.shard[i];
+        memset(s, 0, sizeof(*s));
+        s->lo = span_lo + span * (size_t)i / (size_t)RTX_FIND_WORKERS;
+        s->hi = span_lo + span * (size_t)(i + 1) / (size_t)RTX_FIND_WORKERS;
+        s->at = s->lo;
+        if (s->hi > s->lo) {
+            s->lane = cc_arena_heap(kilobytes(16));
+            s->buf = (char *)malloc((size_t)RTX_FIND_BLOCK +
+                                    (size_t)RTX_FIND_QMAX);
+            if (!s->buf) s->done = 1;
+        } else {
+            s->done = 1;
+        }
+    }
 }
 
 static void !>(CCError) rtx_find_listing_start(RtxDoc *d) {
     int noop = 0;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "find kick");
     if (d->find.done || !d->find.query.len) return cc_ok();
+    rtx_find_lanes_init(d);
     d->find.h_live = 1;
     d->find.h = @parallel {
         @serial { noop = 0; }
-        rtx_find_listing_arm(d);
+        rtx_find_listing_arm(d, 0);
+        rtx_find_listing_arm(d, 1);
     } !>;
     return cc_ok();
 }
@@ -300,6 +370,7 @@ static void !>(CCError) rtx_find_listing_start(RtxDoc *d) {
 void rtx_find_pause(RtxDoc *d) {
     if (!d || !d->find.h_live || d->find.done) return;
     d->find.h.pause() !>(e) { (void)e; };
+    rtx_find_publish(d) !>(e) { (void)e; };
 }
 
 void rtx_find_resume(RtxDoc *d) {
