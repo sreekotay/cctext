@@ -1,0 +1,1986 @@
+#!ccc ccs
+/*
+ * Workspace (linked TU; see workspace.cch). Hosts include the face for
+ * types / UFCS; this file owns the RtxBuf / RtxWs bodies.
+ */
+#include <ccc/std/prelude.cch>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include "document.cch"
+#include "layout.cch"
+#include "workspace.cch"
+
+int RtxWs_ensure(RtxWs *w) {
+    if (!w) return 0;
+    if (w->session.base) return 1;
+    w->session = cc_arena_heap(kilobytes(8));
+    return w->session.base != NULL;
+}
+
+void RtxBuf_destroy(RtxBuf *b) {
+    if (!b) return;
+    if (!b->parked) {
+        b->layout.destroy();
+        b->doc.destroy();
+    }
+    memset(b, 0, sizeof(*b));
+}
+
+static void rtx_ws_cam_from_buf(const RtxBuf *b, RtxSafeCam *c) {
+    rtx_safe_cam_clear(c);
+    if (!b) return;
+    c->top = b->top;
+    c->top_wrap = b->top_wrap;
+    c->left_col = b->left_col;
+    c->top_byte = b->top_byte;
+    c->seek_off = b->seek_off;
+    c->seek_rel = b->seek_rel;
+    c->seek_valid = b->seek_valid;
+    c->view = b->layout.view;
+    c->hex_nib = b->hex_nib;
+    c->unlock = b->unlock;
+    c->pin_view = b->pin_view;
+}
+
+static void rtx_ws_cam_to_buf(RtxBuf *b, const RtxSafeCam *c) {
+    if (!b || !c) return;
+    b->top = c->top;
+    b->top_wrap = c->top_wrap;
+    b->left_col = c->left_col;
+    b->top_byte = c->top_byte;
+    b->seek_off = c->seek_off;
+    b->seek_rel = c->seek_rel;
+    b->seek_valid = c->seek_valid;
+    rtx_layout_set_view(&b->layout, c->view);
+    rtx_buf_grid_bind(b);
+    b->hex_nib = c->hex_nib;
+    b->unlock = c->unlock;
+    b->pin_view = c->pin_view;
+}
+
+static char[:] rtx_ws_session_str(RtxWs *w, const char *s) {
+    char[:] out;
+    size_t n;
+    if (!w || !s) return cc_slice_empty();
+    n = strlen(s);
+    out = w->session.alloc_slice_bytes(n + 1);
+    if (!out.ptr) return cc_slice_empty();
+    memcpy(out.ptr, s, n);
+    out.ptr[n] = 0;
+    return out.sub(0, n);
+}
+
+static void rtx_ws_bind_path(RtxWs *w, RtxBuf *b, const char *path) {
+    char real[PATH_MAX];
+    const char *p = path;
+    if (!w || !b || !path || !path[0]) return;
+    if (realpath(path, real)) p = real;
+    b->park_path = rtx_ws_session_str(w, p);
+}
+
+static const char *rtx_ws_buf_path(const RtxBuf *b) {
+    if (!b) return NULL;
+    if (b->park_path.ptr && b->park_path.len) return b->park_path.ptr;
+    if (!b->parked && b->doc.path.ptr && b->doc.path.len) return b->doc.path.ptr;
+    return NULL;
+}
+
+static int rtx_ws_buf_dirty(const RtxBuf *b) {
+    if (!b) return 0;
+    if (b->parked) return b->park_dirty;
+    return b->doc.dirty();
+}
+
+static long rtx_ws_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+}
+
+static void rtx_ws_flush_buf(RtxBuf *b) {
+    RtxSafeCam cam;
+    if (!b || b->parked) return;
+    if (!rtx_ws_buf_path(b)) return;
+    rtx_ws_cam_from_buf(b, &cam);
+    rtx_safe_flush(&b->doc, &cam);
+    b->safe_gen = b->doc.edit_gen;
+    b->safe_saved = b->doc.saved_head;
+    b->park_dirty = b->doc.dirty();
+    b->safe_due_ms = 0;
+}
+
+static void rtx_ws_park_buf(RtxBuf *b) {
+    int view;
+    if (!b || b->parked) return;
+    if (!rtx_ws_buf_path(b)) return;
+    rtx_ws_flush_buf(b);
+    b->park_dirty = b->doc.dirty();
+    view = b->layout.view;
+    b->layout.destroy();
+    b->doc.destroy();
+    memset(&b->doc, 0, sizeof(b->doc));
+    memset(&b->layout, 0, sizeof(b->layout));
+    rtx_layout_set_view(&b->layout, view);
+    b->parked = 1;
+}
+
+static void !>(CCError) rtx_ws_unpark_buf(RtxWs *w, RtxBuf *b) {
+    RtxSafeCam cam;
+    const char *path;
+    if (!b || !b->parked) return cc_ok();
+    path = rtx_ws_buf_path(b);
+    if (!path) return cc_err(CC_ERR_INVALID_ARG, "parked untitled");
+    rtx_safe_cam_clear(&cam);
+    b->doc.from_path(path) !>(e) { return cc_err(e); };
+    if (w) b->doc.tree.busy_bind(w->busy_fn, w->busy_ctx);
+    rtx_safe_load(&b->doc, &cam);
+    rtx_ws_cam_to_buf(b, &cam);
+    b->parked = 0;
+    b->park_dirty = b->doc.dirty();
+    b->safe_gen = b->doc.edit_gen;
+    b->safe_saved = b->doc.saved_head;
+    return cc_ok();
+}
+
+static int rtx_ws_buf_visible(const RtxWs *w, int bi) {
+    if (!w || bi < 0) return 0;
+    if (w->pane[0] == bi) return 1;
+    if (w->npanes > 1 && w->pane[1] == bi) return 1;
+    return 0;
+}
+
+static void rtx_ws_write_ws(RtxWs *w) {
+    RtxSafeWs ws;
+    RtxSafeWsEnt ents[64];
+    size_t i, n = 0;
+    if (!w) return;
+    memset(&ws, 0, sizeof(ws));
+    for (i = 0; i < w->len && n < 64; i++) {
+        const char *p = rtx_ws_buf_path(&w->bufs[i]);
+        if (!p) continue;
+        snprintf(ents[n].path, sizeof(ents[n].path), "%s", p);
+        ents[n].view = w->bufs[i].layout.view;
+        ents[n].dirty = rtx_ws_buf_dirty(&w->bufs[i]);
+        n++;
+    }
+    ws.npanes = w->npanes;
+    ws.focus = w->focus;
+    ws.pane0 = w->pane[0];
+    ws.pane1 = w->pane[1];
+    ws.n = n;
+    ws.ents = ents;
+    rtx_safe_ws_write(&ws);
+}
+
+void !>(CCError) RtxWs_sync_live(RtxWs *w) {
+    size_t i;
+    if (!w) return cc_ok();
+    for (i = 0; i < w->len; i++) {
+        if (rtx_ws_buf_visible(w, (int)i)) {
+            if (w->bufs[i].parked)
+                rtx_ws_unpark_buf(w, &w->bufs[i]) !>(e) { return cc_err(e); };
+        } else if (!w->bufs[i].parked && rtx_ws_buf_path(&w->bufs[i])) {
+            rtx_ws_park_buf(&w->bufs[i]);
+        }
+    }
+    rtx_ws_write_ws(w);
+    return cc_ok();
+}
+
+void RtxWs_safe_flush_all(RtxWs *w) {
+    size_t i;
+    if (!w) return;
+    for (i = 0; i < w->len; i++) rtx_ws_flush_buf(&w->bufs[i]);
+    rtx_ws_write_ws(w);
+}
+
+void RtxWs_safe_pump(RtxWs *w) {
+    size_t i;
+    long now;
+    if (!w) return;
+    now = rtx_ws_now_ms();
+    for (i = 0; i < w->len; i++) {
+        RtxBuf *b = &w->bufs[i];
+        if (b->parked || !rtx_ws_buf_path(b)) continue;
+        if (b->safe_gen == b->doc.edit_gen && b->safe_saved == b->doc.saved_head) {
+            b->safe_due_ms = 0;
+            continue;
+        }
+        if (!b->safe_due_ms) b->safe_due_ms = now + (long)RTX_SAFE_DEBOUNCE_MS;
+        if (now < b->safe_due_ms) continue;
+        rtx_ws_flush_buf(b);
+    }
+}
+
+void !>(CCError) RtxWs_save_dirty(RtxWs *w) {
+    size_t i;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    for (i = 0; i < w->len; i++) {
+        RtxBuf *b = &w->bufs[i];
+        if (b->parked && b->park_dirty)
+            rtx_ws_unpark_buf(w, b) !>(e) { return cc_err(e); };
+        if (b->parked || !b->doc.dirty()) continue;
+        if (!b->doc.path.ptr || b->doc.path.len == 0)
+            return cc_err(CC_ERR_INVALID_ARG, "untitled");
+        b->doc.save() !>(e) { return cc_err(e); };
+        b->doc.break_coalesce();
+        rtx_ws_flush_buf(b);
+    }
+    rtx_ws_write_ws(w);
+    return cc_ok();
+}
+
+void RtxWs_safe_discard_dirty(RtxWs *w) {
+    size_t i;
+    if (!w) return;
+    for (i = 0; i < w->len; i++) {
+        if (!rtx_ws_buf_dirty(&w->bufs[i])) continue;
+        {
+            const char *p = rtx_ws_buf_path(&w->bufs[i]);
+            if (p) rtx_safe_drop(p);
+        }
+        w->bufs[i].park_dirty = 0;
+    }
+    rtx_ws_write_ws(w);
+}
+
+static void rtx_buf_swap_cam(RtxBuf *b, RtxPaneSnap *s) {
+    RtxLayout L;
+    size_t z;
+    int i;
+    double d;
+    RtxPref pr;
+    if (!b || !s) return;
+    L = b->layout; b->layout = s->layout; s->layout = L;
+    z = b->top; b->top = s->top; s->top = z;
+    z = b->top_wrap; b->top_wrap = s->top_wrap; s->top_wrap = z;
+    z = b->left_col; b->left_col = s->left_col; s->left_col = z;
+    z = b->top_byte; b->top_byte = s->top_byte; s->top_byte = z;
+    i = b->seek_valid; b->seek_valid = s->seek_valid; s->seek_valid = i;
+    z = b->seek_off; b->seek_off = s->seek_off; s->seek_off = z;
+    {
+        long rel = b->seek_rel;
+        b->seek_rel = s->seek_rel;
+        s->seek_rel = rel;
+    }
+    z = b->drag_vis; b->drag_vis = s->drag_vis; s->drag_vis = z;
+    z = b->drag_len; b->drag_len = s->drag_len; s->drag_len = z;
+    i = b->drag_grab; b->drag_grab = s->drag_grab; s->drag_grab = i;
+    i = b->drag_horiz; b->drag_horiz = s->drag_horiz; s->drag_horiz = i;
+    i = b->pin_view; b->pin_view = s->pin_view; s->pin_view = i;
+    i = b->unlock; b->unlock = s->unlock; s->unlock = i;
+    i = b->hex_nib; b->hex_nib = s->hex_nib; s->hex_nib = i;
+    d = b->scroll; b->scroll = s->scroll; s->scroll = d;
+    d = b->layout_width; b->layout_width = s->layout_width; s->layout_width = d;
+    pr = b->pref; b->pref = s->pref; s->pref = pr;
+}
+
+int RtxWs_same_split(const RtxWs *w) {
+    return w && w->npanes == 2 && w->pane[0] == w->pane[1] && w->side.live;
+}
+
+int RtxWs_hold_pane(RtxWs *w, int p) {
+    if (!RtxWs_same_split(w) || p == w->focus) return 0;
+    rtx_buf_swap_cam(&w->bufs[w->pane[p]], &w->side);
+    return 1;
+}
+
+void RtxWs_drop_pane(RtxWs *w, int p, int held) {
+    if (held) rtx_buf_swap_cam(&w->bufs[w->pane[p]], &w->side);
+}
+
+static void rtx_ws_side_drop(RtxWs *w) {
+    if (!w || !w->side.live) return;
+    w->side.layout.destroy();
+    memset(&w->side, 0, sizeof(w->side));
+}
+
+void RtxWs_destroy(RtxWs *w) {
+    size_t i;
+    if (!w) return;
+    rtx_ws_side_drop(w);
+    rtx_browse_drop(&w->nav[0]);
+    rtx_browse_drop(&w->nav[1]);
+    for (i = 0; i < w->len; i++) {
+        w->bufs[i].destroy();
+    }
+    if (w->session.base) w->session.destroy();
+    memset(w, 0, sizeof(*w));
+}
+
+RtxBuf *RtxWs_active(RtxWs *w) {
+    int bi;
+    if (!w || w->len == 0) return NULL;
+    bi = w->pane[w->focus];
+    if (bi < 0 || (size_t)bi >= w->len) return &w->bufs[0];
+    return &w->bufs[bi];
+}
+
+RtxDoc *RtxWs_doc(RtxWs *w) {
+    RtxBuf *b = RtxWs_active(w);
+    return b ? &b->doc : NULL;
+}
+
+RtxLayout *RtxWs_layout(RtxWs *w) {
+    RtxBuf *b = RtxWs_active(w);
+    return b ? &b->layout : NULL;
+}
+
+void !>(CCError) RtxWs_add_path(RtxWs *w, const char *path) {
+    RtxBuf *b;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+    rtx_arena_grow(&w->session, (void **)&w->bufs, &w->cap, w->len + 1,
+                   sizeof(RtxBuf)) !>(e) {
+        return cc_err(e);
+    };
+    b = &w->bufs[w->len];
+    memset(b, 0, sizeof(*b));
+    b->doc.from_path(path) !>(e) { return cc_err(e); };
+    b->doc.tree.busy_bind(w->busy_fn, w->busy_ctx);
+    rtx_ws_bind_path(w, b, path);
+    {
+        RtxSafeCam cam;
+        rtx_safe_cam_clear(&cam);
+        rtx_safe_load(&b->doc, &cam);
+        rtx_ws_cam_to_buf(b, &cam);
+    }
+    b->safe_gen = b->doc.edit_gen;
+    b->safe_saved = b->doc.saved_head;
+    b->park_dirty = b->doc.dirty();
+    w->len++;
+    return cc_ok();
+}
+
+void !>(CCError) RtxWs_add_parked(RtxWs *w, const char *path, int dirty,
+                                         int view) {
+    RtxBuf *b;
+    if (!w || !path || !path[0]) return cc_err(CC_ERR_INVALID_ARG, "parked path");
+    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+    rtx_arena_grow(&w->session, (void **)&w->bufs, &w->cap, w->len + 1,
+                   sizeof(RtxBuf)) !>(e) {
+        return cc_err(e);
+    };
+    b = &w->bufs[w->len];
+    memset(b, 0, sizeof(*b));
+    rtx_ws_bind_path(w, b, path);
+    rtx_layout_set_view(&b->layout, view);
+    b->parked = 1;
+    b->park_dirty = dirty;
+    w->len++;
+    return cc_ok();
+}
+
+void !>(CCError) RtxWs_add_empty(RtxWs *w) {
+    RtxBuf *b;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+    rtx_arena_grow(&w->session, (void **)&w->bufs, &w->cap, w->len + 1,
+                   sizeof(RtxBuf)) !>(e) {
+        return cc_err(e);
+    };
+    b = &w->bufs[w->len];
+    memset(b, 0, sizeof(*b));
+    b->doc.empty() !>(e) { return cc_err(e); };
+    b->doc.tree.busy_bind(w->busy_fn, w->busy_ctx);
+    w->len++;
+    return cc_ok();
+}
+
+int RtxWs_untitled(const RtxWs *w) {
+    if (!w || w->len != 1) return 0;
+    if (rtx_ws_buf_path(&w->bufs[0])) return 0;
+    return 1;
+}
+
+static int rtx_ws_ask_create(const char *path) {
+    char line[8];
+    if (!path || !path[0]) return 0;
+    if (!isatty(STDIN_FILENO) || !isatty(STDERR_FILENO)) return 0;
+    fprintf(stderr, "cctext: '%s' not found. Create? [y/n] ", path);
+    fflush(stderr);
+    if (!fgets(line, sizeof(line), stdin)) return 0;
+    return line[0] == 'y' || line[0] == 'Y';
+}
+
+static int rtx_ws_touch_empty(const char *path) {
+    int fd;
+    if (!path || !path[0]) return 0;
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
+
+static void !>(CCError) rtx_ws_add_path_or_create(RtxWs *w, const char *path) {
+    w->add_path(path) !>(e) {
+        if (e.kind != CC_ERR_NOT_FOUND) return cc_err(e);
+        if (!rtx_ws_ask_create(path)) return cc_err(e);
+        if (!rtx_ws_touch_empty(path))
+            return cc_err(CC_ERR_IO, "create file");
+        return w->add_path(path);
+    };
+    return cc_ok();
+}
+
+void RtxWs_busy_bind(RtxWs *w, RtxBusyFn fn, void *ctx) {
+    size_t i;
+    if (!w) return;
+    w->busy_fn = fn;
+    w->busy_ctx = ctx;
+    for (i = 0; i < w->len; i++) {
+        if (w->bufs[i].parked) continue;
+        w->bufs[i].doc.tree.busy_bind(fn, ctx);
+    }
+}
+
+void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
+    int i;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    if (w->session.base || w->len) return cc_err(CC_ERR_INVALID_ARG, "ws already live");
+    memset(w, 0, sizeof(*w));
+    w->npanes = 1;
+    w->focus = 0;
+    w->pane[0] = 0;
+    w->pane[1] = 0;
+    if (npaths <= 0) {
+        CCArena hold = cc_arena_heap(kilobytes(8));
+        RtxSafeWs snap;
+        int restored = 0;
+        if (hold.base && rtx_safe_ws_read(&snap, &hold) && snap.n) {
+            size_t k;
+            for (k = 0; k < snap.n; k++) {
+                struct stat st;
+                if (!snap.ents[k].path[0] || stat(snap.ents[k].path, &st) != 0)
+                    continue;
+                w->add_parked(snap.ents[k].path, snap.ents[k].dirty,
+                              snap.ents[k].view) !>(e) {
+                    continue;
+                };
+            }
+            if (w->len) {
+                w->npanes = snap.npanes >= 2 && w->len >= 2 ? 2 : 1;
+                w->focus = snap.focus;
+                if (w->focus < 0 || w->focus >= w->npanes) w->focus = 0;
+                w->pane[0] = snap.pane0;
+                w->pane[1] = snap.pane1;
+                if (w->pane[0] < 0 || (size_t)w->pane[0] >= w->len) w->pane[0] = 0;
+                if (w->pane[1] < 0 || (size_t)w->pane[1] >= w->len)
+                    w->pane[1] = w->len >= 2 ? 1 : 0;
+                w->sync_live() !>(e) {
+                    w->destroy();
+                    hold.destroy();
+                    return cc_err(e);
+                };
+                restored = 1;
+            }
+        }
+        if (hold.base) hold.destroy();
+        if (restored) return cc_ok();
+        w->add_empty() !>(e) {
+            w->destroy();
+            return cc_err(e);
+        };
+        return cc_ok();
+    }
+    for (i = 0; i < npaths; i++) {
+        rtx_ws_add_path_or_create(w, paths[i]) !>(e) {
+            if (e.kind == CC_ERR_NOT_FOUND &&
+                isatty(STDIN_FILENO) && isatty(STDERR_FILENO))
+                continue;
+            w->destroy();
+            return cc_err(e);
+        };
+    }
+    if (w->len == 0) {
+        w->add_empty() !>(e) {
+            w->destroy();
+            return cc_err(e);
+        };
+    }
+    if (w->len >= 2) {
+        w->npanes = 2;
+        w->pane[1] = 1;
+    }
+    w->sync_live() !>(e) {
+        w->destroy();
+        return cc_err(e);
+    };
+    return cc_ok();
+}
+
+void rtx_buf_grid_bind(RtxBuf *b) {
+    char sample[RTX_GRID_PROBE];
+    size_t got = 0;
+    if (!b || b->parked || !rtx_layout_is_grid(&b->layout) || b->layout.grid_delim)
+        return;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            got = 0;
+        }
+        got = b->doc.read_at(0, sample, sizeof(sample)) !>;
+    }
+    b->layout.grid_delim = rtx_grid_pick_delim(b->doc.path.ptr, sample, got);
+}
+
+void RtxWs_set_view(RtxWs *w, int view) {
+    size_t i;
+    if (!w) return;
+    for (i = 0; i < w->len; i++) {
+        rtx_layout_set_view(&w->bufs[i].layout, view);
+        rtx_buf_grid_bind(&w->bufs[i]);
+    }
+    if (w->side.live) rtx_layout_set_view(&w->side.layout, view);
+}
+
+void RtxWs_set_views(RtxWs *w, const int *views, int n) {
+    int i;
+    if (!w || !views || n < 1) return;
+    for (i = 0; i < n && i < (int)w->len; i++) {
+        rtx_layout_set_view(&w->bufs[i].layout, views[i]);
+        rtx_buf_grid_bind(&w->bufs[i]);
+    }
+}
+
+void RtxWs_toggle_split(RtxWs *w) {
+    RtxBuf *b;
+    if (!w || w->len == 0) return;
+    if (w->npanes == 1) {
+        w->npanes = 2;
+        if (w->len >= 2) w->pane[1] = (w->pane[0] + 1) % (int)w->len;
+        else w->pane[1] = w->pane[0];
+        w->focus = 1;
+        if (w->pane[0] == w->pane[1]) {
+            b = &w->bufs[w->pane[0]];
+            memset(&w->side, 0, sizeof(w->side));
+            w->side.live = 1;
+            w->side.top = b->top;
+            w->side.top_wrap = b->top_wrap;
+            w->side.left_col = b->left_col;
+            w->side.top_byte = b->top_byte;
+            w->side.unlock = b->unlock;
+            w->side.layout.view = b->layout.view;
+            w->side.layout.wrap = b->layout.wrap;
+        }
+    } else {
+        if (w->side.live) {
+            b = &w->bufs[w->pane[0]];
+            if (w->focus == 1) rtx_buf_swap_cam(b, &w->side);
+            rtx_ws_side_drop(w);
+        }
+        w->npanes = 1;
+        w->focus = 0;
+    }
+}
+
+void RtxWs_next_buf(RtxWs *w) {
+    if (!w || w->len == 0) return;
+    if (RtxWs_same_split(w)) {
+        rtx_buf_swap_cam(&w->bufs[w->pane[0]], &w->side);
+        rtx_ws_side_drop(w);
+    }
+    w->pane[w->focus] = (w->pane[w->focus] + 1) % (int)w->len;
+    {
+        @errhandler(CCError e) { (void)e; }
+        w->sync_live() !>;
+    }
+}
+
+void RtxWs_prev_buf(RtxWs *w) {
+    if (!w || w->len == 0) return;
+    if (RtxWs_same_split(w)) {
+        rtx_buf_swap_cam(&w->bufs[w->pane[0]], &w->side);
+        rtx_ws_side_drop(w);
+    }
+    w->pane[w->focus] = (w->pane[w->focus] + (int)w->len - 1) % (int)w->len;
+    {
+        @errhandler(CCError e) { (void)e; }
+        w->sync_live() !>;
+    }
+}
+
+void RtxWs_set_focus(RtxWs *w, int pane) {
+    if (!w || pane < 0 || pane >= w->npanes || pane == w->focus) return;
+    if (RtxWs_same_split(w))
+        rtx_buf_swap_cam(&w->bufs[w->pane[0]], &w->side);
+    w->focus = pane;
+}
+
+void RtxWs_focus_other(RtxWs *w) {
+    if (!w || w->npanes < 2) return;
+    RtxWs_set_focus(w, 1 - w->focus);
+}
+
+void !>(CCError) RtxWs_set_clip(RtxWs *w, char[:] src) {
+    char[:] copy;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    if (!src.ptr || src.len == 0) {
+        w->clip = cc_slice_empty();
+        return cc_ok();
+    }
+    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+    copy = w->session.alloc_slice_bytes(src.len);
+    if (!copy.ptr) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+    memcpy(copy.ptr, src.ptr, src.len);
+    w->clip = copy;
+    return cc_ok();
+}
+
+static char[:] !>(CCError) rtx_ws_read_range(RtxWs *w, RtxDoc *d, size_t lo, size_t n) {
+    char[:] copy;
+    size_t got;
+    if (!w || !d) return cc_err(CC_ERR_INVALID_ARG, "read range");
+    if (n == 0) return cc_ok(cc_slice_empty());
+    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+    copy = w->session.alloc_slice_bytes(n);
+    if (!copy.ptr) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+    got = d->read_at(lo, copy.ptr, n) !>(e) { return cc_err(e); };
+    if (got != n) return cc_err(CC_ERR_INTERNAL, "clipboard read");
+    return cc_ok(copy);
+}
+
+int !>(CCError) RtxWs_copy(RtxWs *w) {
+    RtxDoc *d = w->doc();
+    size_t lo, hi;
+    if (!d || !d->has_sel()) return cc_ok(0);
+    if (d->sel_box) {
+        CCArena a = {0} @destroy;
+        char[:] bytes;
+        a = cc_arena_heap(kilobytes(8));
+        if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+        bytes = rtx_doc_box_text(d, &a) !>(e) { return cc_err(e); };
+        w->set_clip(bytes) !>(e) { return cc_err(e); };
+        return cc_ok(1);
+    }
+    lo = d->sel_lo();
+    hi = d->sel_hi();
+    {
+        char[:] bytes = rtx_ws_read_range(w, d, lo, hi - lo) !>(e) {
+            return cc_err(e);
+        };
+        w->clip = bytes;
+    }
+    return cc_ok(1);
+}
+
+void !>(CCError) RtxWs_cut(RtxWs *w) {
+    RtxDoc *d = w->doc();
+    size_t lo, hi;
+    char[:] copy = cc_slice_empty();
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "no buffer");
+    if (!d->has_sel()) return cc_ok();
+    if (d->sel_box) {
+        CCArena a = {0} @destroy;
+        char[:] bytes;
+        a = cc_arena_heap(kilobytes(8));
+        if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+        bytes = rtx_doc_box_text(d, &a) !>(e) { return cc_err(e); };
+        if (bytes.len) {
+            if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
+            copy = w->session.alloc_slice_bytes(bytes.len);
+            if (!copy.ptr) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+            memcpy(copy.ptr, bytes.ptr, bytes.len);
+        }
+        rtx_doc_box_apply(d, cc_slice_empty()) !>(e) { return cc_err(e); };
+        d->sel_box = 0;
+        d->sel_anchor = d->caret;
+        w->clip = copy;
+        return cc_ok();
+    }
+    lo = d->sel_lo();
+    hi = d->sel_hi();
+    copy = rtx_ws_read_range(w, d, lo, hi - lo) !>(e) { return cc_err(e); };
+    d->replace(lo, hi - lo, cc_slice_empty()) !>(e) { return cc_err(e); };
+    w->clip = copy;
+    return cc_ok();
+}
+
+void !>(CCError) RtxWs_paste(RtxWs *w) {
+    RtxDoc *d = w->doc();
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "no buffer");
+    if (!w->clip.ptr || w->clip.len == 0) return cc_ok();
+    return d->type(w->clip);
+}
+
+static void rtx_buf_hex_nib_reset(RtxBuf *b) {
+    if (b) b->hex_nib = 0;
+}
+
+void RtxBuf_clear_pref(RtxBuf *b) {
+    if (!b) return;
+    b->pref.ok = 0;
+    b->pref.eol = 0;
+    b->pref.x = 0;
+    b->pref.col = 0;
+}
+
+void RtxBuf_stick_eol(RtxBuf *b) {
+    if (!b) return;
+    b->pref.ok = 1;
+    b->pref.eol = 1;
+}
+
+static size_t !>(RtxIndexErr) rtx_buf_cur_col(const RtxBuf *b) {
+    size_t start;
+    if (!b) return cc_ok((size_t)0);
+    start = rtx_doc_line_floor(&b->doc, b->doc.caret) !>(e) { return cc_err(e); };
+    return cc_ok(b->doc.caret - start);
+}
+
+void rtx_buf_seek_set(RtxBuf *b, size_t floor) {
+    size_t a, z;
+    if (!b) return;
+    if (b->seek_valid) {
+        a = b->seek_off < floor ? b->seek_off : floor;
+        z = b->seek_off < floor ? floor : b->seek_off;
+        if (z - a > (size_t)RTX_LINE_FLOOR_MAX) {
+            b->seek_rel = 0;
+            rtx_line_isle_kick(&b->doc.tree, floor);
+        } else
+            b->seek_rel += rtx_doc_lf_delta_local(&b->doc, b->seek_off, floor);
+    } else {
+        b->seek_rel = 0;
+        if (!b->doc.index_covers(floor))
+            rtx_line_isle_kick(&b->doc.tree, floor);
+    }
+    b->seek_off = floor;
+    b->seek_valid = 1;
+}
+
+static void !>(RtxIndexErr) rtx_buf_seek_label(RtxBuf *b) {
+    size_t ln;
+    if (!b || !b->seek_valid || !b->layout.len) return cc_ok();
+    if (!b->doc.index_covers(b->seek_off)) return cc_ok();
+    ln = b->doc.line_of(b->seek_off) !>(e) { return cc_err(e); };
+    rtx_layout_reline(&b->layout, ln);
+    b->top = ln;
+    b->seek_valid = 0;
+    return cc_ok();
+}
+
+void !>(RtxIndexErr) RtxBuf_box_begin(RtxBuf *b) {
+    if (!b || b->doc.sel_box) return cc_ok();
+    b->doc.sel_box = 1;
+    if (b->pref.eol) b->doc.box_acol = (size_t)-1;
+    else if (b->pref.ok) b->doc.box_acol = b->pref.col;
+    else b->doc.box_acol = rtx_buf_cur_col(b) !>(e) { return cc_err(e); };
+    b->doc.box_ccol = b->doc.box_acol;
+    return cc_ok();
+}
+
+void !>(RtxIndexErr) RtxBuf_box_sync(RtxBuf *b) {
+    if (!b || !b->doc.sel_box) return cc_ok();
+    if (b->pref.eol) b->doc.box_ccol = (size_t)-1;
+    else if (b->pref.ok) b->doc.box_ccol = b->pref.col;
+    else b->doc.box_ccol = rtx_buf_cur_col(b) !>(e) { return cc_err(e); };
+    return cc_ok();
+}
+
+void !>(RtxIndexErr) RtxBuf_box_move_col(RtxBuf *b, int dir) {
+    size_t start, nlen, col, end;
+    @errhandler(RtxIndexErr e) {
+        return cc_err(e);
+    }
+    @errhandler(CCError e) {
+        return cc_err(rtx_index_from_cc(e));
+    }
+    if (!b) return cc_ok();
+    if (rtx_layout_is_hex(&b->layout)) {
+        size_t n = b->len();
+        size_t at = b->doc.caret;
+        b->box_begin() !>;
+        if (dir < 0) {
+            if (at > 0) at--;
+        } else if (at < n) {
+            at++;
+        }
+        b->doc.box_ccol = at;
+        b->pref.col = at;
+        b->pref.ok = 1;
+        b->pref.eol = 0;
+        b->doc.caret = b->doc.fold_snap(at, dir);
+        rtx_buf_hex_nib_reset(b);
+        return cc_ok();
+    }
+    b->box_begin() !>;
+    start = rtx_doc_line_floor(&b->doc, b->doc.caret) !>;
+    end = rtx_doc_line_end_caret(&b->doc, start) !>;
+    nlen = end - start;
+    col = b->doc.box_ccol;
+    if (col == (size_t)-1) col = nlen;
+    {
+        size_t at = start + (col < nlen ? col : nlen);
+        size_t next;
+        if (dir < 0) {
+            if (at <= start) return cc_ok();
+            next = b->doc.cluster_prev(at) !>;
+            if (next < start) next = start;
+        } else {
+            next = b->doc.cluster_next(at) !>;
+            if (next > end) next = end;
+        }
+        col = next - start;
+    }
+    b->doc.box_ccol = col;
+    b->pref.col = col;
+    b->pref.ok = 1;
+    b->pref.eol = 0;
+    b->doc.caret = b->doc.fold_snap(start + (col < nlen ? col : nlen), dir);
+    return cc_ok();
+}
+
+static int rtx_buf_byte_units(const RtxBuf *b) {
+    return b && rtx_layout_is_hex(&b->layout);
+}
+
+static int rtx_buf_grid_gap(RtxBuf *b, size_t off) {
+    char delim;
+    if (!b || !rtx_layout_is_grid(&b->layout)) return 0;
+    delim = b->layout.grid_delim ? b->layout.grid_delim : b->layout.grid.delim;
+    return rtx_layout_grid_gap_at(&b->doc, off, delim);
+}
+
+static void !>(CCError) rtx_buf_grid_skip_gap(RtxBuf *b, int dir) {
+    size_t n, guard = 0;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (!b || !rtx_layout_is_grid(&b->layout)) return cc_ok();
+    n = b->len();
+    while (guard++ < 8 && b->doc.caret < n && rtx_buf_grid_gap(b, b->doc.caret)) {
+        if (dir < 0) {
+            if (b->doc.caret == 0) break;
+            b->doc.caret = b->doc.cluster_prev(b->doc.caret) !>;
+        } else {
+            size_t next = b->doc.cluster_next(b->doc.caret) !>;
+            if (next <= b->doc.caret) break;
+            b->doc.caret = next;
+        }
+    }
+    return cc_ok();
+}
+
+void !>(CCError) RtxBuf_move_horiz(RtxBuf *b, int dir, int shift) {
+    size_t n;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "move horiz");
+    if (!shift && b->doc.has_sel()) {
+        b->doc.caret = dir < 0 ? b->doc.sel_lo() : b->doc.sel_hi();
+        b->doc.clear_sel();
+        b->doc.break_coalesce();
+        b->clear_pref();
+        rtx_buf_hex_nib_reset(b);
+        return cc_ok();
+    }
+    n = b->len();
+    if (dir < 0) {
+        if (b->doc.caret > 0) {
+            if (!shift) b->doc.sel_anchor = b->doc.caret;
+            if (rtx_buf_byte_units(b)) b->doc.caret--;
+            else b->doc.caret = b->doc.cluster_prev(b->doc.caret) !>(e) {
+                return cc_err(e);
+            };
+            if (!shift) b->doc.sel_anchor = b->doc.caret;
+            b->doc.sel_box = 0;
+        }
+    } else if (b->doc.caret < n) {
+        if (!shift) b->doc.sel_anchor = b->doc.caret;
+        if (rtx_buf_byte_units(b)) b->doc.caret++;
+        else b->doc.caret = b->doc.cluster_next(b->doc.caret) !>(e) {
+            return cc_err(e);
+        };
+        if (!shift) b->doc.sel_anchor = b->doc.caret;
+        b->doc.sel_box = 0;
+    }
+    if (rtx_layout_is_grid(&b->layout))
+        rtx_buf_grid_skip_gap(b, dir) !>(e) { return cc_err(e); };
+    if (!rtx_buf_byte_units(b)) {
+        b->doc.caret = b->doc.fold_snap(b->doc.caret, dir);
+        if (!shift) b->doc.sel_anchor = b->doc.caret;
+    }
+    b->doc.break_coalesce();
+    b->clear_pref();
+    rtx_buf_hex_nib_reset(b);
+    return cc_ok();
+}
+
+void !>(CCError) RtxBuf_move_grid_col(RtxBuf *b, int dir) {
+    RtxLayout *L;
+    size_t start, rec_n, dlen, rel, col, nf, last, want;
+    RtxGridField f[RTX_GRID_FIELDS];
+    char[:] line = cc_slice_empty();
+    CCArena frame = {0};
+    int owned = 0;
+    int hdr;
+    @errhandler(CCError e) {
+        if (owned) frame.destroy();
+        return cc_err(e);
+    }
+    if (!b || !rtx_layout_is_grid(&b->layout))
+        return cc_err(CC_ERR_INVALID_ARG, "grid col");
+    L = &b->layout;
+    dlen = b->len();
+    hdr = L->grid_hdr_on && L->grid_hdr_end;
+    if (!rtx_layout_grid_rec_in(L, b->doc.caret, &start, &rec_n)) {
+        start = rtx_layout_grid_cam_lo(&b->doc, b->doc.caret, NULL) !>;
+        rec_n = rtx_layout_grid_rec_len(&b->doc, start) !>;
+    }
+    if (rec_n) {
+        frame = cc_arena_heap(rec_n + 64);
+        if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "grid col");
+        owned = 1;
+        line = b->doc.scratch_span(start, rec_n, &frame) !>;
+    }
+    rtx_grid_bind_span(&L->grid, start, rec_n);
+    nf = rtx_grid_split(line.ptr, line.len, L->grid.delim ? L->grid.delim : ',',
+                        f, RTX_GRID_FIELDS, L->grid.span_hold);
+    last = nf;
+    if (L->grid.ncols && last > L->grid.ncols) last = L->grid.ncols;
+    if (!last) {
+        if (owned) frame.destroy();
+        return cc_ok();
+    }
+    rel = rtx_layout_grid_rel(b->doc.caret, start, rec_n);
+    if (b->doc.caret >= start + rec_n) rel = 0;
+    col = (size_t)rtx_grid_col_at(line.ptr, line.len, &L->grid, rel);
+    if (col >= last) col = last - 1;
+    if (dir > 0) {
+        if (col + 1 < last) {
+            want = start + f[col + 1].lo;
+        } else {
+            size_t next = rtx_layout_grid_after_rec(&b->doc, start, rec_n);
+            if (next >= dlen) want = b->doc.caret;
+            else want = next;
+        }
+    } else if (col > 0) {
+        want = start + f[col - 1].lo;
+    } else if (hdr && start > 0 &&
+               start == rtx_layout_grid_after_rec(&b->doc, 0, L->grid_hdr_end)) {
+        if (owned) {
+            frame.destroy();
+            owned = 0;
+            line = cc_slice_empty();
+        }
+        start = 0;
+        rec_n = L->grid_hdr_end;
+        if (rec_n) {
+            frame = cc_arena_heap(rec_n + 64);
+            if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "grid col");
+            owned = 1;
+            line = b->doc.scratch_span(start, rec_n, &frame) !>;
+        }
+        rtx_grid_bind_span(&L->grid, start, rec_n);
+        nf = rtx_grid_split(line.ptr, line.len,
+                            L->grid.delim ? L->grid.delim : ',', f,
+                            RTX_GRID_FIELDS, L->grid.span_hold);
+        last = nf;
+        if (L->grid.ncols && last > L->grid.ncols) last = L->grid.ncols;
+        want = last ? start + f[last - 1].lo : start;
+    } else if (start == 0) {
+        want = start + (nf ? f[0].lo : 0);
+    } else {
+        if (owned) {
+            frame.destroy();
+            owned = 0;
+            line = cc_slice_empty();
+        }
+        start = rtx_layout_grid_cam_lo(&b->doc, start - 1, NULL) !>;
+        rec_n = rtx_layout_grid_rec_len(&b->doc, start) !>;
+        if (rec_n) {
+            frame = cc_arena_heap(rec_n + 64);
+            if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "grid col");
+            owned = 1;
+            line = b->doc.scratch_span(start, rec_n, &frame) !>;
+        }
+        rtx_grid_bind_span(&L->grid, start, rec_n);
+        nf = rtx_grid_split(line.ptr, line.len,
+                            L->grid.delim ? L->grid.delim : ',', f,
+                            RTX_GRID_FIELDS, L->grid.span_hold);
+        last = nf;
+        if (L->grid.ncols && last > L->grid.ncols) last = L->grid.ncols;
+        want = last ? start + f[last - 1].lo : start;
+    }
+    if (owned) frame.destroy();
+    b->doc.caret = want;
+    b->doc.sel_anchor = want;
+    b->doc.sel_box = 0;
+    b->doc.break_coalesce();
+    b->clear_pref();
+    rtx_buf_hex_nib_reset(b);
+    return cc_ok();
+}
+
+void !>(CCError) RtxBuf_move_vert(RtxBuf *b, const RtxMeasure *m,
+                                        double width, int dir, int shift) {
+    size_t n, at;
+    if (!b || !m) return cc_err(CC_ERR_INVALID_ARG, "move vert");
+    if (rtx_layout_is_hex(&b->layout)) {
+        n = b->len();
+        at = b->doc.caret;
+        if (dir < 0) {
+            if (at >= (size_t)RTX_HEX_COLS) at -= (size_t)RTX_HEX_COLS;
+            else at = 0;
+        } else if (n) {
+            at += (size_t)RTX_HEX_COLS;
+            if (at >= n) at = n - 1;
+        }
+        if (!shift) b->doc.sel_anchor = at;
+        b->doc.caret = at;
+        rtx_buf_hex_nib_reset(b);
+        b->doc.sel_box = 0;
+        b->doc.break_coalesce();
+        b->clear_pref();
+        return cc_ok();
+    }
+    return b->layout.move_vert(&b->doc, m, width, dir, shift, &b->pref);
+}
+
+void !>(CCError) RtxBuf_move_edge(RtxBuf *b, int to_end, int shift,
+                                        int physical) {
+    size_t n, row, at;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr e) {
+        return cc_err(CC_ERR_IO, e.message ? e.message : "line index");
+    }
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "move edge");
+    if (rtx_layout_is_hex(&b->layout)) {
+        n = b->len();
+        row = n ? b->doc.caret / (size_t)RTX_HEX_COLS : 0;
+        if (!to_end) at = row * (size_t)RTX_HEX_COLS;
+        else {
+            at = row * (size_t)RTX_HEX_COLS + (size_t)RTX_HEX_COLS - 1;
+            if (n == 0) at = 0;
+            else if (at >= n) at = n - 1;
+        }
+        if (!shift) b->doc.sel_anchor = at;
+        b->doc.caret = at;
+        rtx_buf_hex_nib_reset(b);
+        b->doc.sel_box = 0;
+        b->doc.break_coalesce();
+        b->clear_pref();
+        return cc_ok();
+    }
+    if (!physical && rtx_layout_soft_wrap(&b->layout) && b->layout.len) {
+        b->layout.move_row_edge(&b->doc, to_end, shift);
+    } else {
+        b->doc.move_line_edge(to_end, shift) !>;
+    }
+    if (to_end) b->stick_eol();
+    else b->clear_pref();
+    return cc_ok();
+}
+
+void !>(CCError) RtxBuf_type_cp(RtxBuf *b, uint32_t cp) {
+    int dig;
+    size_t at, n, got;
+    unsigned char cur = 0;
+    char one[1];
+    int existed;
+    int hi;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "type");
+    if (!rtx_layout_is_hex(&b->layout)) return b->doc.type_cp(cp);
+    dig = rtx_hex_digit(cp);
+    if (dig < 0) return cc_ok();
+    if (b->doc.has_sel()) {
+        at = b->doc.sel_lo();
+        b->doc.caret = at;
+        b->doc.clear_sel();
+        b->hex_nib = 0;
+    } else {
+        at = b->doc.caret;
+    }
+    n = b->len();
+    if (at > n) at = n;
+    existed = at < n;
+    if (existed) {
+        got = b->doc.read_at(at, (char *)&cur, 1) !>;
+        if (got != 1) cur = 0;
+    }
+    hi = !b->hex_nib;
+    if (hi) cur = (unsigned char)((dig << 4) | (cur & 0x0F));
+    else cur = (unsigned char)((cur & 0xF0) | dig);
+    one[0] = (char)cur;
+    b->doc.replace(at, existed ? 1 : 0, one.to_slice_n(1)) !>;
+    if (hi) {
+        b->doc.caret = at;
+        b->doc.sel_anchor = at;
+        b->hex_nib = 1;
+    } else {
+        b->hex_nib = 0;
+    }
+    return cc_ok();
+}
+
+void !>(CCError) RtxBuf_backspace(RtxBuf *b) {
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "backspace");
+    rtx_buf_hex_nib_reset(b);
+    if (rtx_buf_byte_units(b) && !b->doc.has_sel() && b->doc.caret > 0) {
+        return b->doc.replace(b->doc.caret - 1, 1, cc_slice_empty());
+    }
+    return b->doc.backspace();
+}
+
+void !>(CCError) RtxBuf_delete_forward(RtxBuf *b) {
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "delete");
+    rtx_buf_hex_nib_reset(b);
+    if (rtx_buf_byte_units(b) && !b->doc.has_sel() && b->doc.caret < b->len()) {
+        return b->doc.replace(b->doc.caret, 1, cc_slice_empty());
+    }
+    return b->doc.delete_forward();
+}
+
+static void rtx_buf_origin_from_row(RtxBuf *b, size_t origin) {
+    size_t first;
+    if (!b || b->layout.len == 0) return;
+    if (origin >= b->layout.len) origin = b->layout.len - 1;
+    b->top = b->layout.rows[origin].line;
+    first = origin;
+    while (first > 0 && b->layout.rows[first - 1].line == b->top) first--;
+    b->top_wrap = origin - first;
+    if (rtx_layout_is_grid(&b->layout)) b->top_wrap = 0;
+}
+
+size_t RtxBuf_view_off(const RtxBuf *b) {
+    size_t i;
+    if (!b) return 0;
+    if (rtx_layout_is_hex(&b->layout)) return b->top_byte;
+    if (b->seek_valid) return b->seek_off;
+    if (b->layout.len) {
+        i = b->top_wrap < b->layout.len ? b->top_wrap : 0;
+        return b->layout.rows[i].byte_start;
+    }
+    return 0;
+}
+
+void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
+    size_t cl;
+    size_t ri;
+    size_t n;
+    size_t row;
+    size_t top_row;
+    if (!b) return cc_ok();
+    if (vis < 1) vis = 1;
+    n = b->len();
+    if (off > n) off = n;
+    if (rtx_layout_is_hex(&b->layout)) {
+        b->top_byte = rtx_hex_align(b->top_byte);
+        if (b->top_byte > n) b->top_byte = rtx_hex_align(n);
+        row = off / (size_t)RTX_HEX_COLS;
+        top_row = b->top_byte / (size_t)RTX_HEX_COLS;
+        if (row < top_row) b->top_byte = row * (size_t)RTX_HEX_COLS;
+        else if (row >= top_row + (size_t)vis) {
+            b->top_byte = (row + 1 - (size_t)vis) * (size_t)RTX_HEX_COLS;
+        }
+        b->seek_valid = 0;
+        return cc_ok();
+    }
+    /* Follow: a live seek stays a seek. Stay if `off` is already on a
+     * visible row. Snap-to-top is land (jump % / find hits). */
+    if (b->seek_valid) {
+        size_t floor = rtx_doc_line_floor_local(&b->doc, off) !>(e) {
+            return cc_err(e);
+        };
+        if (b->layout.len && b->layout.rows[0].byte_start == b->seek_off) {
+            size_t i0 = b->top_wrap < b->layout.len ? b->top_wrap : 0;
+            size_t i1 = i0 + (size_t)vis;
+            size_t a, z;
+            if (i1 > b->layout.len) i1 = b->layout.len;
+            if (i1 > i0) {
+                a = b->layout.rows[i0].byte_start;
+                z = b->layout.rows[i1 - 1].byte_start +
+                    b->layout.rows[i1 - 1].byte_len;
+                if (off >= a && off <= z) return cc_ok();
+            }
+        }
+        rtx_buf_seek_set(b, floor);
+        b->top_wrap = 0;
+        return cc_ok();
+    }
+    if (!b->doc.index_covers(off)) {
+        size_t floor = rtx_doc_line_floor_local(&b->doc, off) !>(e) {
+            return cc_err(e);
+        };
+        rtx_buf_seek_set(b, floor);
+        b->top_wrap = 0;
+        return cc_ok();
+    }
+    cl = b->line_of(off) !>(e) { return cc_err(e); };
+    if (rtx_layout_is_grid(&b->layout)) {
+        size_t floor = rtx_doc_line_floor_local(&b->doc, off) !>(e) {
+            return cc_err(e);
+        };
+        size_t rec = rtx_layout_grid_cam_lo(&b->doc, floor, NULL) !>(e) {
+            return cc_err(rtx_index_from_cc(e));
+        };
+        if (b->doc.index_covers(rec))
+            cl = b->line_of(rec) !>(e) { return cc_err(e); };
+    }
+    if (!rtx_layout_soft_wrap(&b->layout)) {
+        b->top_wrap = 0;
+        if (cl < b->top) b->top = cl;
+        if (cl >= b->top + (size_t)vis) b->top = cl - (size_t)vis + 1;
+        return cc_ok();
+    }
+    if (b->layout.len == 0) {
+        b->top = cl;
+        b->top_wrap = 0;
+        return cc_ok();
+    }
+    if (cl < b->top || off < b->layout.rows[0].byte_start) {
+        b->top = cl;
+        b->top_wrap = 0;
+        return cc_ok();
+    }
+    {
+        RtxVisRow *last = &b->layout.rows[b->layout.len - 1];
+        if (cl > last->line && off >= last->byte_start + last->byte_len) {
+            b->top = cl;
+            b->top_wrap = 0;
+            return cc_ok();
+        }
+    }
+    ri = rtx_layout_is_grid(&b->layout)
+             ? rtx_layout_grid_row_of(&b->layout, &b->doc, off)
+             : b->layout.row_of(off);
+    if (ri < b->top_wrap) {
+        rtx_buf_origin_from_row(b, ri);
+        return cc_ok();
+    }
+    if (ri < b->top_wrap + (size_t)vis) return cc_ok();
+    rtx_buf_origin_from_row(b, ri + 1 - (size_t)vis);
+    return cc_ok();
+}
+
+void !>(RtxIndexErr) RtxBuf_land(RtxBuf *b, int vis) {
+    size_t n;
+    size_t off;
+    size_t row;
+    size_t top_row;
+    if (!b) return cc_ok();
+    if (vis < 1) vis = 1;
+    b->pin_view = 0;
+    n = b->len();
+    off = b->doc.caret;
+    if (off > n) off = n;
+    if (rtx_layout_is_hex(&b->layout)) {
+        b->top_byte = rtx_hex_align(b->top_byte);
+        if (b->top_byte > n) b->top_byte = rtx_hex_align(n);
+        row = off / (size_t)RTX_HEX_COLS;
+        top_row = b->top_byte / (size_t)RTX_HEX_COLS;
+        if (row < top_row) b->top_byte = row * (size_t)RTX_HEX_COLS;
+        else if (row >= top_row + (size_t)vis) {
+            b->top_byte = (row + 1 - (size_t)vis) * (size_t)RTX_HEX_COLS;
+        }
+        b->seek_valid = 0;
+        return cc_ok();
+    }
+    {
+        size_t floor = rtx_doc_line_floor_local(&b->doc, off) !>(e) {
+            return cc_err(e);
+        };
+        rtx_buf_seek_set(b, floor);
+        rtx_line_isle_kick(&b->doc.tree, floor);
+    }
+    b->top_wrap = 0;
+    return cc_ok();
+}
+
+void !>(RtxIndexErr) RtxBuf_reveal(RtxBuf *b, int vis) {
+    if (!b) return cc_ok();
+    return b->reveal_off(b->doc.caret, vis);
+}
+
+void !>(RtxIndexErr) RtxBuf_cycle_view(RtxBuf *b, int vis) {
+    size_t keep;
+    int was_hex;
+    @errhandler(CCError e) {
+        return cc_err(rtx_index_from_cc(e));
+    }
+    if (!b) return cc_ok();
+    keep = b->view_off();
+    was_hex = rtx_layout_is_hex(&b->layout);
+    rtx_layout_cycle_view(&b->layout);
+    rtx_buf_grid_bind(b);
+    b->left_col = 0;
+    if (rtx_layout_is_grid(&b->layout) && b->doc.caret > 0) {
+        char c = 0;
+        size_t got = 0;
+        size_t was = b->doc.caret;
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                got = 0;
+            }
+            got = b->doc.read_at(was, &c, 1) !>;
+        }
+        /* Record NL is a gap. cluster_prev put the caret in the last
+         * field and reveal_x panned left_col. Land on this record start. */
+        if (got == 1 && (c == '\n' || c == '\r')) {
+            size_t lo = rtx_layout_grid_cam_lo(&b->doc, was, NULL) !>;
+            b->doc.caret = lo;
+            if (b->doc.sel_anchor == was) b->doc.sel_anchor = lo;
+        }
+    }
+    if (was_hex && !rtx_layout_is_hex(&b->layout) &&
+        b->doc.sel_anchor == b->doc.caret) {
+        b->doc.caret = b->doc.cluster_align(b->doc.caret) !>;
+        b->doc.sel_anchor = b->doc.caret;
+    }
+    b->top_wrap = 0;
+    b->layout.len = 0;
+    b->seek_valid = 0;
+    b->drag_vis = 0;
+    b->drag_len = 0;
+    b->drag_horiz = 0;
+    b->clear_pref();
+    rtx_buf_hex_nib_reset(b);
+    rtx_ws_flush_buf(b);
+    if (b->unlock) return b->reveal_off(keep, vis);
+    return b->reveal_off(b->doc.caret, vis);
+}
+
+static void !>(RtxIndexErr) rtx_buf_fold_skip_cam(RtxBuf *b, int dir) {
+    size_t off;
+    size_t snap;
+    if (!b || !b->doc.fold_n) return cc_ok();
+    if (rtx_layout_is_hex(&b->layout)) return cc_ok();
+    if (b->seek_valid) {
+        rtx_buf_seek_set(b, b->doc.fold_snap(b->seek_off, dir));
+        return cc_ok();
+    }
+    off = b->doc.line_start(b->top) !>;
+    snap = b->doc.fold_snap(off, dir);
+    if (snap != off) {
+        if (b->doc.index_covers(snap))
+            b->top = b->doc.line_of(snap) !>;
+        else
+            rtx_buf_seek_set(b, snap);
+        b->top_wrap = 0;
+    }
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_buf_grid_scroll(RtxBuf *b, const RtxMeasure *m,
+                                           double width, int dir) {
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    (void)m;
+    (void)width;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "grid scroll");
+    b->top_wrap = 0;
+    if (dir < 0) {
+        if (b->top > 0) b->top = rtx_layout_grid_prev_line(&b->doc, b->top) !>;
+        return cc_ok();
+    }
+    if (dir > 0) {
+        size_t nxt = rtx_layout_grid_next_line(&b->doc, b->top) !>;
+        /* top==0 fill skips the header record, so the first body row is
+         * already on screen. One next_line lands on that same row as a
+         * camera start (visually a no-op). Step again. */
+        if (b->top == 0 && nxt != b->top)
+            nxt = rtx_layout_grid_next_line(&b->doc, nxt) !>;
+        b->top = nxt;
+    }
+    return cc_ok();
+}
+
+void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double width, int dir) {
+    size_t nlines;
+    size_t n;
+    size_t rows;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "scroll");
+    b->pin_view = 1;
+    if (rtx_layout_is_hex(&b->layout)) {
+        n = b->len();
+        rows = rtx_hex_row_count(n);
+        b->top_byte = rtx_hex_align(b->top_byte);
+        if (dir < 0) {
+            if (b->top_byte >= (size_t)RTX_HEX_COLS) b->top_byte -= (size_t)RTX_HEX_COLS;
+            else b->top_byte = 0;
+        } else if (dir > 0) {
+            size_t next = b->top_byte + (size_t)RTX_HEX_COLS;
+            size_t last_top = rows > 1 ? (rows - 1) * (size_t)RTX_HEX_COLS : 0;
+            if (next <= last_top) b->top_byte = next;
+        }
+        return cc_ok();
+    }
+    if (b->seek_valid) {
+        size_t nlen = b->len();
+        if (dir < 0) {
+            if (b->seek_off > 0) {
+                size_t floor = rtx_doc_line_floor(&b->doc, b->seek_off - 1) !>;
+                rtx_buf_seek_set(b, floor);
+            }
+        } else if (b->seek_off < nlen) {
+            size_t next;
+            int has = rtx_doc_next_line_start(&b->doc, b->seek_off, &next) !>;
+            if (has) rtx_buf_seek_set(b, next);
+        }
+        b->top_wrap = 0;
+        rtx_buf_fold_skip_cam(b, dir) !>;
+        return cc_ok();
+    }
+    nlines = b->line_count();
+    if (rtx_layout_is_grid(&b->layout)) {
+        rtx_buf_grid_scroll(b, m, width, dir) !>;
+        rtx_buf_fold_skip_cam(b, dir) !>;
+        return cc_ok();
+    }
+    if (b->layout.view != RTX_VIEW_WRAP) {
+        b->top_wrap = 0;
+        if (dir < 0 && b->top > 0) b->top--;
+        if (dir > 0 && b->top + 1 < nlines) b->top++;
+        rtx_buf_fold_skip_cam(b, dir) !>;
+        return cc_ok();
+    }
+    if (dir < 0) {
+        if (b->top_wrap > 0) b->top_wrap--;
+        else if (b->top > 0) {
+            RtxLayout tmp = {0} @destroy;
+            size_t wraps;
+            b->top--;
+            tmp.wrap = 1;
+            tmp.lines(&b->doc, m, width, b->top, 1) !>;
+            wraps = tmp.len ? tmp.len : 1;
+            b->top_wrap = wraps - 1;
+        }
+    } else {
+        size_t wraps = b->layout.rows_for_line(b->top);
+        if (wraps == 0) wraps = 1;
+        b->top_wrap++;
+        if (b->top_wrap >= wraps) {
+            if (b->top + 1 < nlines) {
+                b->top++;
+                b->top_wrap = 0;
+            } else {
+                b->top_wrap = wraps - 1;
+            }
+        }
+    }
+    rtx_buf_fold_skip_cam(b, dir) !>;
+    return cc_ok();
+}
+
+static int rtx_buf_uses_left(const RtxBuf *b) {
+    return b && rtx_layout_uses_left(&b->layout);
+}
+
+static size_t rtx_buf_row_max_w(const RtxBuf *b) {
+    size_t i, mx = 0;
+    if (!b) return 0;
+    for (i = 0; i < b->layout.len; i++) {
+        size_t w = (size_t)b->layout.rows[i].width;
+        if (w > mx) mx = w;
+    }
+    return mx;
+}
+
+static void rtx_buf_clamp_left(RtxBuf *b, double width) {
+    size_t vis, mx;
+    if (!b || width < 1.0) return;
+    vis = (size_t)width;
+    mx = rtx_buf_row_max_w(b);
+    if (mx <= vis) {
+        if (mx) b->left_col = 0;
+        return;
+    }
+    if (b->left_col > mx - vis) b->left_col = mx - vis;
+}
+
+void !>(CCError) RtxBuf_scroll_x(RtxBuf *b, double width, int dir) {
+    size_t step;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "scroll x");
+    if (!rtx_buf_uses_left(b)) return cc_ok();
+    b->pin_view = 1;
+    if (width < 4.0) width = 4.0;
+    step = (size_t)(width / 4.0);
+    if (step < 1) step = 1;
+    if (dir < 0) {
+        if (b->left_col > step) b->left_col -= step;
+        else b->left_col = 0;
+    } else if (dir > 0) {
+        b->left_col += step;
+    }
+    rtx_buf_clamp_left(b, width);
+    return cc_ok();
+}
+
+static size_t rtx_buf_content_w(const RtxBuf *b) {
+    size_t mx = rtx_buf_row_max_w(b);
+    if (b && b->left_col + 1 > mx) mx = b->left_col + 1;
+    return mx;
+}
+
+int RtxBuf_scroll_x_needed(const RtxBuf *b, double width) {
+    size_t vis, cw;
+    if (!rtx_buf_uses_left(b) || width < 1.0) return 0;
+    if (b->left_col > 0 || (b->drag_horiz && b->drag_len)) return 1;
+    vis = (size_t)width;
+    cw = rtx_buf_content_w(b);
+    return cw > vis;
+}
+
+RtxScrollRail RtxBuf_scroll_x_rail(const RtxBuf *b, double width) {
+    RtxScrollRail r = {0};
+    size_t vis, len;
+    if (!b || width < 1.0) return r;
+    vis = (size_t)width;
+    if (vis < 1) vis = 1;
+    len = rtx_buf_content_w(b);
+    if (len < vis) len = vis;
+    if (b->left_col + vis > len) len = b->left_col + vis;
+    r.pos = b->left_col;
+    r.vis = vis;
+    r.len = len;
+    r.ready = 1;
+    return r;
+}
+
+void !>(CCError) RtxBuf_scroll_x_to(RtxBuf *b, double width, size_t pos) {
+    RtxScrollRail r;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "scroll x");
+    if (!rtx_buf_uses_left(b)) return cc_ok();
+    b->pin_view = 1;
+    r = RtxBuf_scroll_x_rail(b, width);
+    if (r.vis >= r.len) {
+        b->left_col = 0;
+        return cc_ok();
+    }
+    if (pos > r.len - r.vis) pos = r.len - r.vis;
+    b->left_col = pos;
+    return cc_ok();
+}
+
+static void rtx_buf_reveal_x(RtxBuf *b, RtxMeasure *m, double width) {
+    double x;
+    if (!b) return;
+    if (!rtx_buf_uses_left(b)) {
+        b->left_col = 0;
+        return;
+    }
+    if (width < 1.0) width = 1.0;
+    if (!m || b->layout.len == 0) return;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            return;
+        }
+        x = b->layout.x_of(&b->doc, m, b->doc.caret) !>;
+    }
+    if (x < (double)b->left_col) {
+        b->left_col = (size_t)x;
+    } else if (x >= (double)b->left_col + width) {
+        double n = x - width + 1.0;
+        b->left_col = n > 0 ? (size_t)n : 0;
+    }
+}
+
+void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int vis) {
+    size_t nlines;
+    size_t want;
+    size_t avail;
+    size_t need;
+    size_t n;
+    size_t rows;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
+    if (vis < 1) vis = 1;
+    if (rtx_layout_is_hex(&b->layout)) {
+        n = b->len();
+        rows = rtx_hex_row_count(n);
+        b->top_byte = rtx_hex_align(b->top_byte);
+        if (rows > 0) {
+            size_t last_top = (rows - 1) * (size_t)RTX_HEX_COLS;
+            if (b->top_byte > last_top) b->top_byte = last_top;
+        } else {
+            b->top_byte = 0;
+        }
+        (void)m;
+        (void)width;
+        b->left_col = 0;
+        return cc_ok();
+    }
+    if (b->seek_valid) {
+        size_t want = (size_t)vis + 8 + b->top_wrap;
+        if (!b->doc.index_covers(b->seek_off) &&
+            !rtx_line_isle_live(&b->doc.tree))
+            rtx_line_isle_kick(&b->doc.tree, b->seek_off);
+        if (b->layout_width != width || b->layout.len == 0 ||
+            b->layout.len < (size_t)vis ||
+            (b->layout.len && b->layout.rows[0].byte_start != b->seek_off &&
+             !(rtx_layout_is_grid(&b->layout) &&
+               b->seek_off >= b->layout.rows[0].byte_start &&
+               b->seek_off <= b->layout.rows[b->layout.len - 1].byte_start +
+                                  b->layout.rows[b->layout.len - 1].byte_len))) {
+            b->layout.fill_off(&b->doc, m, width, b->seek_off, want) !>;
+            b->layout_width = width;
+        }
+        rtx_buf_seek_label(b) !>;
+        if (b->seek_valid) {
+            if (rtx_line_isle_connected(&b->doc.tree) && b->layout.len) {
+                long n = (long)b->doc.tree.scan_line +
+                         (long)b->doc.tree.isle_before + b->seek_rel;
+                if (n < 0) n = 0;
+                rtx_layout_reline(&b->layout, (size_t)n);
+            }
+            if (!b->unlock && !b->pin_view) rtx_buf_reveal_x(b, m, width);
+            return cc_ok();
+        }
+    }
+    nlines = b->line_count();
+    if (b->top >= nlines && nlines) b->top = nlines - 1;
+    want = (size_t)vis + 8;
+    avail = (b->top < nlines) ? (nlines - b->top) : 0;
+    need = want < avail ? want : avail;
+    if (b->layout_width != width || b->layout.from_line != b->top ||
+        b->layout.len == 0 || b->layout.nlines < need ||
+        (rtx_layout_soft_wrap(&b->layout) &&
+         b->layout.len < want + b->top_wrap)) {
+        size_t min_rows = want + b->top_wrap;
+        b->layout.fill(&b->doc, m, width, b->top, min_rows) !>;
+        b->layout_width = width;
+    }
+    if (!b->unlock && !b->pin_view) rtx_buf_reveal_x(b, m, width);
+    else if (!rtx_buf_uses_left(b)) b->left_col = 0;
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_buf_refresh_view(RtxBuf *b, RtxMeasure *m, double width, int vis,
+                                            int edited) {
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
+    if (edited) {
+        b->clear_pref();
+        b->pin_view = 0;
+    }
+    /* Unlabeled seek stays a seek. line_of in ensure_view is the handoff. */
+    if (!rtx_layout_is_hex(&b->layout)) {
+        b->layout.len = 0;
+        b->layout_width = 0;
+    }
+    return RtxBuf_ensure_view(b, m, width, vis);
+}
+
+void !>(CCError) RtxBuf_after_edit(RtxBuf *b, RtxMeasure *m, double width, int vis) {
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
+    b->doc.reparse_edit(b->doc.last_off, b->doc.last_markup) !>;
+    return rtx_buf_refresh_view(b, m, width, vis, 1);
+}
+
+void !>(CCError) RtxWs_after_edit(RtxWs *w, int bufi, RtxMeasure *m,
+                                        double width0, double width1, int vis) {
+    int p;
+    int parsed = 0;
+    if (!w || !m || bufi < 0 || (size_t)bufi >= w->len)
+        return cc_err(CC_ERR_INVALID_ARG, "ws after edit");
+    for (p = 0; p < w->npanes; p++) {
+        int held;
+        double width;
+        RtxBuf *b;
+        if (w->pane[p] != bufi) continue;
+        held = RtxWs_hold_pane(w, p);
+        b = &w->bufs[bufi];
+        if (!parsed) {
+            b->doc.reparse_edit(b->doc.last_off, b->doc.last_markup) !>(e) {
+                RtxWs_drop_pane(w, p, held);
+                return cc_err(e);
+            };
+            parsed = 1;
+        }
+        width = (p == 0 || w->npanes < 2) ? width0 : width1;
+        rtx_buf_refresh_view(b, m, width, vis, p == w->focus) !>(e) {
+            RtxWs_drop_pane(w, p, held);
+            return cc_err(e);
+        };
+        RtxWs_drop_pane(w, p, held);
+    }
+    return cc_ok();
+}
+
+void RtxWs_invalidate_buf_views(RtxWs *w, int bufi) {
+    int p;
+    if (!w || bufi < 0 || (size_t)bufi >= w->len) return;
+    for (p = 0; p < w->npanes; p++) {
+        RtxBuf *b;
+        int held;
+        if (w->pane[p] != bufi) continue;
+        held = RtxWs_hold_pane(w, p);
+        b = &w->bufs[bufi];
+        b->layout.len = 0;
+        b->layout_width = 0;
+        RtxWs_drop_pane(w, p, held);
+    }
+}
+
+int RtxWs_any_dirty(const RtxWs *w) {
+    size_t i;
+    if (!w) return 0;
+    for (i = 0; i < w->len; i++) {
+        if (rtx_ws_buf_dirty(&w->bufs[i])) return 1;
+    }
+    return 0;
+}
+
+int rtx_ws_close_heavy(const RtxWs *w) {
+    size_t i;
+    if (!w) return 0;
+    for (i = 0; i < w->len; i++) {
+        if (w->bufs[i].parked) continue;
+        if (w->bufs[i].doc.tree.line_off_len >= ((size_t)1 << 20)) return 1;
+    }
+    return 0;
+}
+
+int RtxWs_nav_need_pump(const RtxBrowse *br) {
+    const RtxBrowseEnt *e;
+    if (!br || !br->on) return 0;
+    if (br->scanning || br->sizing) return 1;
+    if (!br->ents || br->len == 0 || br->cur >= br->len) return 0;
+    e = &br->ents[br->cur];
+    return e->is_dir && strcmp(e->name, "..") != 0 && !e->sized;
+}
+
+void !>(CCError) RtxWs_browse_pump(RtxWs *w) {
+    int p;
+    if (!w) return cc_ok();
+    for (p = 0; p < 2; p++) {
+        if (w->nav[p].on && RtxWs_nav_need_pump(&w->nav[p]))
+            rtx_browse_pump(&w->nav[p]) !>(e) { return cc_err(e); };
+    }
+    return cc_ok();
+}
+
+void RtxWs_browse_pause(RtxWs *w) {
+    int p;
+    if (!w) return;
+    for (p = 0; p < 2; p++) {
+        if (w->nav[p].on)
+            rtx_browse_pause(&w->nav[p]);
+    }
+}
+
+void RtxWs_browse_resume(RtxWs *w) {
+    int p;
+    if (!w) return;
+    for (p = 0; p < 2; p++) {
+        if (w->nav[p].on)
+            rtx_browse_resume(&w->nav[p]);
+    }
+}
+
+int RtxWs_browse_busy(const RtxWs *w) {
+    return w && ((w->nav[0].on && RtxWs_nav_need_pump(&w->nav[0])) ||
+                 (w->nav[1].on && RtxWs_nav_need_pump(&w->nav[1])));
+}
+
+int RtxWs_browse_scanning(const RtxWs *w) {
+    return w && ((w->nav[0].on && w->nav[0].scanning) ||
+                 (w->nav[1].on && w->nav[1].scanning));
+}
+
+RtxBrowse *RtxWs_browse_at(RtxWs *w, int pane) {
+    if (!w || pane < 0 || pane >= 2) return NULL;
+    return &w->nav[pane];
+}
+
+RtxBrowse *RtxWs_browse(RtxWs *w) {
+    if (!w) return NULL;
+    return &w->nav[w->focus];
+}
+
+int RtxWs_browsing(const RtxWs *w) {
+    return w && w->nav[w->focus].on;
+}
+
+static void rtx_ws_same_split_seed(RtxWs *w) {
+    RtxBuf *b;
+    if (!w || w->npanes != 2 || w->pane[0] != w->pane[1] || w->side.live) return;
+    b = &w->bufs[w->pane[0]];
+    memset(&w->side, 0, sizeof(w->side));
+    w->side.live = 1;
+    w->side.top = b->top;
+    w->side.top_wrap = b->top_wrap;
+    w->side.left_col = b->left_col;
+    w->side.top_byte = b->top_byte;
+    w->side.unlock = b->unlock;
+    w->side.layout.view = b->layout.view;
+    w->side.layout.wrap = b->layout.wrap;
+}
+
+static int rtx_ws_find_path(const RtxWs *w, const char *path) {
+    size_t i;
+    if (!w || !path || !path[0]) return -1;
+    for (i = 0; i < w->len; i++) {
+        const char *p = rtx_ws_buf_path(&w->bufs[i]);
+        char real[PATH_MAX];
+        if (!p) continue;
+        if (strcmp(p, path) == 0) return (int)i;
+        if (realpath(path, real) && strcmp(p, real) == 0) return (int)i;
+    }
+    return -1;
+}
+
+void !>(CCError) RtxWs_open_in_pane(RtxWs *w, const char *path) {
+    int pane, bufi, found;
+    if (!w || !path || !path[0]) return cc_err(CC_ERR_INVALID_ARG, "open path");
+    pane = w->focus;
+    found = rtx_ws_find_path(w, path);
+    if (found >= 0) bufi = found;
+    else if (RtxWs_untitled(w)) {
+        if (w->bufs[0].doc.dirty())
+            return cc_err(CC_ERR_INVALID_ARG, "untitled dirty");
+        w->bufs[0].destroy();
+        memset(&w->bufs[0], 0, sizeof(w->bufs[0]));
+        w->len = 0;
+        w->add_path(path) !>(e) { return cc_err(e); };
+        bufi = 0;
+    } else {
+        w->add_path(path) !>(e) { return cc_err(e); };
+        bufi = (int)w->len - 1;
+    }
+    if (RtxWs_same_split(w) && w->pane[pane] != bufi) {
+        if (w->focus == pane)
+            rtx_buf_swap_cam(&w->bufs[w->pane[0]], &w->side);
+        rtx_ws_side_drop(w);
+    }
+    w->pane[pane] = bufi;
+    rtx_ws_same_split_seed(w);
+    rtx_browse_drop(&w->nav[pane]);
+    return w->sync_live();
+}
+
+void !>(CCError) RtxWs_browse_start(RtxWs *w) {
+    RtxBrowse *br;
+    RtxBuf *b;
+    char want[RTX_BROWSE_NAME];
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    br = &w->nav[w->focus];
+    b = RtxWs_active(w);
+    want[0] = 0;
+    rtx_browse_drop(br);
+    br->on = 1;
+    br->boot = RtxWs_untitled(w);
+    if (b && b->doc.path.ptr && b->doc.path.len) {
+        char rel[RTX_BROWSE_DIR];
+        rtx_browse_dirname(rel, sizeof(rel), b->doc.path.ptr);
+        rtx_browse_basename(want, sizeof(want), b->doc.path.ptr);
+        if (!rtx_browse_abs(br->dir, sizeof(br->dir), rel))
+            snprintf(br->dir, sizeof(br->dir), "%s", rel);
+    }
+    if (!br->dir[0] || strcmp(br->dir, ".") == 0) {
+        if (!rtx_browse_abs(br->dir, sizeof(br->dir), "."))
+            snprintf(br->dir, sizeof(br->dir), ".");
+    }
+    rtx_browse_kick(br) !>(e) { return cc_err(e); };
+    if (want[0]) rtx_browse_keep_set(br, want);
+    return cc_ok();
+}
+
+int RtxWs_browse_close(RtxWs *w) {
+    int quit = 0;
+    if (!w) return 0;
+    quit = w->nav[w->focus].boot && RtxWs_untitled(w);
+    rtx_browse_drop(&w->nav[w->focus]);
+    return quit;
+}
+
+void !>(CCError) RtxWs_browse_enter(RtxWs *w) {
+    RtxBrowse *br;
+    RtxBrowseEnt *ent;
+    char full[RTX_BROWSE_DIR];
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    br = &w->nav[w->focus];
+    if (!br->on || br->len == 0 || br->cur >= br->len) return cc_ok();
+    ent = &br->ents[br->cur];
+    if (ent->sep) return cc_ok();
+    if (!rtx_browse_join(full, sizeof(full), br->dir, ent->name))
+        return cc_err(CC_ERR_INVALID_ARG, "browse path");
+    if (ent->is_dir) {
+        if (!rtx_browse_abs(br->dir, sizeof(br->dir), full))
+            snprintf(br->dir, sizeof(br->dir), "%s", full);
+        br->glob[0] = 0;
+        br->glob_len = 0;
+        br->glob_caret = 0;
+        br->glob_sel = 0;
+        return rtx_browse_kick(br);
+    }
+    return RtxWs_open_in_pane(w, full);
+}
+
+void !>(CCError) RtxWs_browse_parent(RtxWs *w) {
+    RtxBrowse *br;
+    char next[RTX_BROWSE_DIR];
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    br = &w->nav[w->focus];
+    if (!br->on) return cc_ok();
+    if (!rtx_browse_join(next, sizeof(next), br->dir, "..")) return cc_ok();
+    snprintf(br->dir, sizeof(br->dir), "%s", next);
+    return rtx_browse_kick(br);
+}
+
+void !>(CCError) RtxWs_browse_glob_set(RtxWs *w, const char *glob) {
+    RtxBrowse *br;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    br = &w->nav[w->focus];
+    if (!br->on) return cc_ok();
+    if (!glob) glob = "";
+    snprintf(br->glob, sizeof(br->glob), "%s", glob);
+    br->glob_len = strlen(br->glob);
+    br->glob_caret = br->glob_len;
+    br->glob_sel = br->glob_len;
+    return rtx_browse_kick(br);
+}
+
+RtxField rtx_browse_field(RtxBrowse *br) {
+    RtxField f = {0};
+    if (!br) return f;
+    f.buf = br->glob;
+    f.len = &br->glob_len;
+    f.cap = sizeof(br->glob);
+    f.caret = &br->glob_caret;
+    f.sel = &br->glob_sel;
+    return f;
+}
+
+void !>(CCError) RtxWs_browse_type(RtxWs *w, int ch) {
+    RtxBrowse *br;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    br = &w->nav[w->focus];
+    if (!br->on) return cc_ok();
+    if (rtx_field_type_cp(rtx_browse_field(br), (uint32_t)ch))
+        return rtx_browse_kick(br);
+    return cc_ok();
+}
+
+void !>(CCError) RtxWs_browse_backspace(RtxWs *w) {
+    RtxBrowse *br;
+    RtxField f;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    br = &w->nav[w->focus];
+    if (!br->on) return cc_ok();
+    f = rtx_browse_field(br);
+    if (br->glob_len == 0 && !rtx_field_has_sel(f))
+        return cc_ok();
+    rtx_field_backspace(f);
+    return rtx_browse_kick(br);
+}
+
