@@ -38,7 +38,8 @@ included only by `piece_tree.ccs`. Brace-pair paint is `nav_pair.cch`
 
 Where things live:
 - Mark/fold bodies: `core/nav.ccs`; `nav.cch` is the `rtx_nav_*` face.
-- Find: `core/find.ccs` (`find_set` plants; tests call `find_finish`).
+- Find: `core/find.ccs` (dest-live wrapper; wait-for tickets; tests call
+  `find_finish`).
 - Island dest-live: `core/piece_tree.ccs` (arms / `rtx_line_isle_finish`).
   `isle_kick` in `piece_tree_lines.cch` plants `listing_start`. Tests that
   wait call `finish`.

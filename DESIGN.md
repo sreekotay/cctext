@@ -119,7 +119,7 @@ The next walk copies this table.
 
 | | start | one wave | live | resume | deny |
 |---|---|---|---|---|---|
-| find | `find_set` | dest-live scan arms (`RTX_FIND_WORKERS`) | `!done && !cancel` | `scan_off` | — |
+| find | `find_set` | dest-live wrapper; wait-for 2 MiB blocks | `!done && !cancel` | `scan_off` | — |
 | jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
 | prefix | — | — | — | `line_scan_off` | host does not pump |
 | island | `isle_kick` (land / gap view) | dest-live scan arms (`RTX_ISLE_WORKERS`) | `isle_pumping` | `isle_from` | — |
@@ -127,15 +127,15 @@ The next walk copies this table.
 
 Kick plants the first paint and returns. Browse, find, and island are
 dest-live: the frame pauses / resumes / cancel+wait. `g L` stays one
-closed interval per step; returning is the yield. The find and island
-waves reuse a 2 MiB buffer per arm (not a heap per wave). The file is
-split across dest-live arms (default 2) so each reader stays sequential.
-Find arms own a private hit list; pause and finish memcpy in file order.
-Island arms count LFs backward in `[line_scan_off, isle_anchor)`; pause
-and finish sum the counts. Gutters stay `+N` / `-L` until they meet the
-prefix. `isle_step` kicks if the handle is down — the host does not
-walk the island on the UI thread. Kick `@serial` is empty so the
-workers are the scan.
+closed interval per step; returning is the yield. Find is the sequential
+2 MiB block loop with `@parallel wait` / `cache` / `@stage`: tickets
+share a 2 MiB window (`cache`); the write stage appends hits in file
+order. The wrapper stays dest-live so the frame does not `.wait()`.
+Island still splits `[line_scan_off, isle_anchor)` across dest-live arms
+(`RTX_ISLE_WORKERS`); pause and finish sum the counts. Gutters stay
+`+N` / `-L` until they meet the prefix. `isle_step` kicks if the handle
+is down — the host does not walk the island on the UI thread. Kick
+`@serial` is empty so the workers are the scan.
 Query copy and hit offsets stay on `d.find.store` and die with the
 document. A
 longer prefix query filters hits and keeps `scan_off`; a cap resumes
