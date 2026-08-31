@@ -250,13 +250,15 @@ static int rtx_safe_ident(const char *path, int64_t *mtime, uint64_t *sz,
 }
 
 static char[:] rtx_safe_hist_ins(const RtxHistRec *r) {
-    if (!r || !r->ins.ptr || r->ins_used == 0) return cc_slice_empty();
-    return r->ins.sub(0, r->ins_used);
+    char[:] sl;
+    if (!r) return cc_slice_empty();
+    sl = r->ins.view();
+    if (!sl.ptr || sl.len == 0) return cc_slice_empty();
+    return sl;
 }
 
 static char[:] rtx_safe_hist_del(const RtxHistRec *r) {
-    if (!r || !r->del.ptr || r->del_used == 0) return cc_slice_empty();
-    return r->del.sub(0, r->del_used);
+    return rtx_hist_del_view(r);
 }
 
 static int rtx_safe_put_rec(int fd, RtxDoc *d, const RtxHistRec *r) {
@@ -265,31 +267,36 @@ static int rtx_safe_put_rec(int fd, RtxDoc *d, const RtxHistRec *r) {
     CCArena hold = {0};
     char[:] flat = cc_slice_empty();
     int rc = -1;
-    if (r->del_ref_n) {
-        if (!r->del_n) {
-            del = cc_slice_empty();
-        } else {
-            hold = cc_arena_heap(r->del_n + 64);
-            if (!hold.base) return -1;
-            flat = hold.alloc_slice_bytes(r->del_n);
-            if (!flat.ptr || flat.len < r->del_n) {
-                hold.destroy();
-                return -1;
-            }
-            {
-                @errhandler(CCError e) {
-                    (void)e;
+    size_t del_n = rtx_hist_del_n(r);
+    {
+        if (rtx_hist_del_is_pieces(r)) {
+            RtxHistRefs refs = rtx_hist_del_pieces(r);
+            if (!refs.nbytes) {
+                del = cc_slice_empty();
+            } else {
+                hold = cc_arena_heap(refs.nbytes + 64);
+                if (!hold.base) return -1;
+                flat = hold.alloc_slice_bytes(refs.nbytes);
+                if (!flat.ptr || flat.len < refs.nbytes) {
                     hold.destroy();
                     return -1;
                 }
-                d->tree.read_refs(r->del_refs, r->del_ref_n, flat.ptr,
-                                  r->del_n) !>;
+                {
+                    @errhandler(CCError e) {
+                        (void)e;
+                        hold.destroy();
+                        return -1;
+                    }
+                    d->tree.read_refs(refs.refs,
+                                      refs.n, flat.ptr,
+                                      refs.nbytes) !>;
+                }
+                del = flat.sub(0, refs.nbytes);
             }
-            del = flat.sub(0, r->del_n);
         }
     }
     if (rtx_safe_put_u64(fd, (uint64_t)r->off) != 0) goto done;
-    if (rtx_safe_put_u64(fd, (uint64_t)r->del_n) != 0) goto done;
+    if (rtx_safe_put_u64(fd, (uint64_t)del_n) != 0) goto done;
     if (rtx_safe_put_u64(fd, (uint64_t)ins.len) != 0) goto done;
     if (rtx_safe_put_u64(fd, (uint64_t)r->caret_before) != 0) goto done;
     if (rtx_safe_put_u64(fd, (uint64_t)r->sel_before) != 0) goto done;
@@ -384,7 +391,7 @@ static void rtx_safe_clamp_doc(RtxDoc *d, RtxSafeCam *cam) {
 static int rtx_safe_load_rec(int fd, RtxDoc *d, RtxHistRec *r) {
     uint64_t off, del_n, ins_n, cb, sb, ca, sa, bab, bcb, baa, bca;
     int32_t sbb, sba;
-    *r = (RtxHistRec){0};
+    *r = rtx_hist_rec_empty();
     if (rtx_safe_get_u64(fd, &off) != 0) return -1;
     if (rtx_safe_get_u64(fd, &del_n) != 0) return -1;
     if (rtx_safe_get_u64(fd, &ins_n) != 0) return -1;
@@ -399,7 +406,6 @@ static int rtx_safe_load_rec(int fd, RtxDoc *d, RtxHistRec *r) {
     if (rtx_safe_get_u64(fd, &baa) != 0) return -1;
     if (rtx_safe_get_u64(fd, &bca) != 0) return -1;
     r->off = (size_t)off;
-    r->del_n = (size_t)del_n;
     r->caret_before = (size_t)cb;
     r->sel_before = (size_t)sb;
     r->caret_after = (size_t)ca;
@@ -420,9 +426,9 @@ static int rtx_safe_load_rec(int fd, RtxDoc *d, RtxHistRec *r) {
             got = rtx_session_bytes(d, NULL, (size_t)del_n) !>;
         }
         if (rtx_safe_read_all(fd, got.ptr, (size_t)del_n) != 0) return -1;
-        r->del = got;
-        r->del_used = (size_t)del_n;
-        r->del_cap = (size_t)del_n;
+        r->del = (RtxHistDel){
+            .text = { .bytes = got, .cap = (size_t)del_n }
+        };
     }
     if (ins_n) {
         char[:] got;
@@ -434,9 +440,7 @@ static int rtx_safe_load_rec(int fd, RtxDoc *d, RtxHistRec *r) {
             got = rtx_session_bytes(d, NULL, (size_t)ins_n) !>;
         }
         if (rtx_safe_read_all(fd, got.ptr, (size_t)ins_n) != 0) return -1;
-        r->ins = got;
-        r->ins_used = (size_t)ins_n;
-        r->ins_cap = (size_t)ins_n;
+        r->ins.rebind(got, (size_t)ins_n);
     }
     return 0;
 }
@@ -519,7 +523,7 @@ void rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
             goto done;
         }
         for (i = 0; i < (size_t)hlen; i++) {
-            recs[i] = (RtxHistRec){0};
+            recs[i] = rtx_hist_rec_empty();
             if (rtx_safe_load_rec(fd, d, &recs[i]) != 0) {
                 rtx_hist_clear(&d->hist);
                 rtx_safe_clamp_doc(d, cam);
