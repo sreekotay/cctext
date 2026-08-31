@@ -25,7 +25,6 @@
 
 #include <ccc/std/prelude.cch>
 #include <stdlib.h>
-#include <string.h>
 
 #include "page_store.cch"
 
@@ -57,8 +56,8 @@ static inline RtxIndexErr rtx_index_from_cc(CCError e) {
  * Same ballpark as RTX_HL_FULL_MAX / RTX_MARKUP_SCAN_MAX — a 2MiB first
  * keystroke must not finish a full-file index. */
 #define RTX_LINE_SOFT_MIN (256 * 1024)
-#ifndef RTX_ISLE_WORKERS
-#define RTX_ISLE_WORKERS 2
+#ifndef RTX_ISLE_CAP
+#define RTX_ISLE_CAP 4
 #endif
 #ifndef RTX_ISLE_BLOCK
 #define RTX_ISLE_BLOCK (2 * 1024 * 1024)
@@ -72,16 +71,6 @@ static inline int rtx_err_is_unrestorable(CCError e) {
 
 typedef struct RtxNode RtxNode;
 typedef struct RtxPieceTree RtxPieceTree;
-
-/* Dest-live island shard: LF count in [lo, hi), walking backward from hi. */
-typedef struct {
-    char *buf;
-    size_t lo;
-    size_t hi;
-    size_t at;
-    size_t lfs;
-    unsigned done : 1;
-} RtxIsleShard;
 
 /* Optional UI pulse while a long scan/save runs on this tree.
  * Frontends bind via w.busy_bind; headless smokes leave it NULL. */
@@ -127,9 +116,10 @@ struct RtxPieceTree {
     /* Progressive newline scan (valid when !lf_ready). */
     size_t line_scan_off;  /* next byte to read */
     size_t scan_line;      /* newlines seen so far */
-    /* One mid-file island. land / % jump plants dest-live readers that
-     * count LFs backward to the prefix. Not a second line_off — gutter
-     * uses +N / -L until they meet. */
+    /* One mid-file island. land / % jump plants a dest-live wait-for
+     * that counts LFs backward to the prefix. Write stage publishes
+     * isle_from / isle_before. Not a second line_off — gutter uses
+     * +N / -L until they meet. */
     size_t isle_anchor;
     size_t isle_from;
     size_t isle_to;
@@ -138,8 +128,6 @@ struct RtxPieceTree {
     unsigned isle_live : 1;
     unsigned isle_cancel : 1;
     int isle_h_live;
-    int isle_nshard;
-    RtxIsleShard isle_shard[RTX_ISLE_WORKERS];
     CCParallel isle_h;
     size_t want_line;      /* 1-based g L; 0 = none. Prefix pump, not isle. */
     /* UI progress drawer (session binding; survives destroy/reopen). */
@@ -187,7 +175,7 @@ size_t !>(CCError) RtxPieceTree_read_uncached(const RtxPieceTree *t, size_t offs
 char[:] RtxPieceTree_span(const RtxPieceTree *t, size_t from, size_t n);
 /* View if one piece, else a copy on `a`. Arena last (DESIGN). */
 char[:] !>(CCError) RtxPieceTree_scratch_span(const RtxPieceTree *t, size_t from,
-                                              size_t n, CCArena *a);
+                                              size_t n, CCArena a);
 size_t RtxPieceTree_line_count(const RtxPieceTree *t);
 size_t RtxPieceTree_line_known(const RtxPieceTree *t);
 size_t RtxPieceTree_line_guess(const RtxPieceTree *t, size_t off);
@@ -224,39 +212,7 @@ static inline int rtx_line_isle_connected(const RtxPieceTree *t) {
     return rtx_line_isle_live(t) && t->isle_from <= t->line_scan_off;
 }
 
-/* Join lives here so destroy / insert drop do not need a wait !> unwrap. */
-static void rtx_isle_shards_drop(RtxPieceTree *t) {
-    int i;
-    if (!t) return;
-    for (i = 0; i < RTX_ISLE_WORKERS; i++) {
-        if (t->isle_shard[i].buf) free(t->isle_shard[i].buf);
-        memset(&t->isle_shard[i], 0, sizeof(t->isle_shard[i]));
-    }
-    t->isle_nshard = 0;
-}
-
-static void rtx_isle_handle_stop(RtxPieceTree *t) {
-    int i;
-    if (!t) return;
-    if (t->isle_h_live) {
-        cc__parallel_cancel_tree(&t->isle_h);
-        if (!cc_atomic_load(&t->isle_h.joined)) {
-            {
-                CCNursery nur = cc_nursery_handle(t->isle_h.n);
-                if (cc_nursery_is_live(nur)) (void)cc_nursery_wait(nur);
-            }
-            for (i = 0; i < t->isle_h.nt; i++) {
-                cc_parallel_join(t->isle_h.tasks[i]);
-                free(t->isle_h.envs[i]);
-                t->isle_h.envs[i] = NULL;
-            }
-            t->isle_h.nt = 0;
-            cc_atomic_store(&t->isle_h.joined, 1);
-        }
-        t->isle_h_live = 0;
-    }
-    rtx_isle_shards_drop(t);
-}
+void rtx_isle_handle_stop(RtxPieceTree *t);
 
 /* `done * 100` as int32 wraps past ~21M (a 248M-line g L sits on 0%). */
 static inline int rtx_pct(size_t done, size_t total) {
@@ -326,7 +282,7 @@ typedef struct {
 
 void !>(CCError) RtxPieceTree_replace(RtxPieceTree *t, size_t off, size_t n, char[:] ins);
 void !>(CCError) RtxPieceTree_capture_range(const RtxPieceTree *t, size_t off, size_t n,
-                                            CCArena *a, RtxPieceRef **out, size_t *nout);
+                                            CCArena a, RtxPieceRef **out, size_t *nout);
 void !>(CCError) RtxPieceTree_splice_refs(RtxPieceTree *t, size_t off,
                                           const RtxPieceRef *refs, size_t nrefs);
 size_t !>(CCError) RtxPieceTree_append_copy(RtxPieceTree *t, size_t from, size_t n);

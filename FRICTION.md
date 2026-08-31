@@ -40,7 +40,7 @@ Where things live:
 - Mark/fold bodies: `core/nav.ccs`; `nav.cch` is the `rtx_nav_*` face.
 - Find: `core/find.ccs` (dest-live wrapper; wait-for tickets; tests call
   `find_finish`).
-- Island dest-live: `core/piece_tree.ccs` (arms / `rtx_line_isle_finish`).
+- Island dest-live: `core/piece_tree.ccs` (wait-for / `rtx_line_isle_finish`).
   `isle_kick` in `piece_tree_lines.cch` plants `listing_start`. Tests that
   wait call `finish`.
 - Page store: `core/page_store.ccs`.
@@ -53,7 +53,7 @@ Where things live:
 - Document: `core/document.ccs` (edit / highlight / tm bodies).
 - Browse listing: `core/browse.ccs`. Grid geometry: `core/grid.ccs`
   (`rtx_grid_col_hi` so TUI and GUI do not each invent field.hi).
-  Listing is dest-live: pause only around paint; kick and drop cancel+wait;
+  Listing is dest-live + wait-for dir jobs; write stage appends ents;
   tests call `finish`.
 - TUI: draw `cctext_draw.ccs`, grid paint `cctext_grid_draw.ccs`,
   keys `cctext_input.ccs`, Darwin session-wheel `cctext_osx.ccs`,
@@ -62,9 +62,9 @@ Where things live:
   Chrome `gui_chrome.ccs` / `gui_chrome.cch`. `objc_msgSend` (file picker)
   `gui_osx.ccs`. Platform window + Core Text is `frontend/gui_plat.m`.
 
-Browse `scanning` is the chrome bit (handle live, not yet done). Find
-and island plant with `find_set` / `isle_kick`; tests that wait call
-`finish`. Do not add a shared `RtxScan` type. Vis-row motion is
+Browse `scanning` is the chrome bit (handle live, not yet done). Find,
+island, and browse plant with `find_set` / `isle_kick` / `rtx_browse_kick`;
+tests that wait call `finish`. Do not add a shared `RtxScan` type. Vis-row motion is
 `rtx_layout_soft_wrap`; do not gate Home/End on `L.wrap`. The live
 workspace is the panes; parked files are paths + on-disk hist, not N
 piece trees.

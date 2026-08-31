@@ -117,25 +117,29 @@ Backfill is a pump. The host yields (`rtx_ui_work_pump`). Do not extract a
 shared type — bits stay local (`find.done`, `browse.scanning`, GUI AST).
 The next walk copies this table.
 
+Active is the dest (`h` / `h_live`). Results appear only at an explicit
+site: `@stage`, `recv`, or return from the wave. Progress is a monotonic
+cursor published at that same site. The frame does not read a field the
+worker is still storing into.
+
 | | start | one wave | live | resume | deny |
 |---|---|---|---|---|---|
-| find | `find_set` | dest-live wrapper; wait-for 2 MiB blocks | `!done && !cancel` | `scan_off` | — |
+| find | `find_set` | dest-live wrapper; wait-for 2 MiB blocks | `h_live` | `scan_off` | — |
 | jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
 | prefix | — | — | — | `line_scan_off` | host does not pump |
-| island | `isle_kick` (land / gap view) | dest-live scan arms (`RTX_ISLE_WORKERS`) | `isle_pumping` | `isle_from` | — |
-| browse | `rtx_browse_kick` | dest-live listing arm | `scanning` (pause on paint) | job queue | — |
+| island | `isle_kick` (land / gap view) | dest-live wrapper; wait-for 2 MiB blocks | `h_live` | `isle_from` | — |
+| browse | `rtx_browse_kick` | dest-live wrapper; wait-for dir jobs | `h_live` | `jhead` | — |
 
 Kick plants the first paint and returns. Browse, find, and island are
 dest-live: the frame pauses / resumes / cancel+wait. `g L` stays one
-closed interval per step; returning is the yield. Find is the sequential
-2 MiB block loop with `@parallel wait` / `cache` / `@stage`: tickets
-share a 2 MiB window (`cache`); the write stage appends hits in file
-order. The wrapper stays dest-live so the frame does not `.wait()`.
-Island still splits `[line_scan_off, isle_anchor)` across dest-live arms
-(`RTX_ISLE_WORKERS`); pause and finish sum the counts. Gutters stay
-`+N` / `-L` until they meet the prefix. `isle_step` kicks if the handle
-is down — the host does not walk the island on the UI thread. Kick
-`@serial` is empty so the workers are the scan.
+closed interval per step; returning is the yield. Find and island are
+the sequential 2 MiB block loop with `@parallel wait` / `@stage`.
+Browse is the same loop over directory jobs: collect is ticket-local,
+the write stage appends ents / child jobs and walks `jhead`.
+The wrapper stays dest-live so the frame does not `.wait()`.
+Gutters stay `+N` / `-L` until they meet the prefix. `isle_step` kicks
+if the handle is down — the host does not walk the island on the UI
+thread. Kick `@serial` is empty so the workers are the scan.
 Query copy and hit offsets stay on `d.find.store` and die with the
 document. A
 longer prefix query filters hits and keeps `scan_off`; a cap resumes
