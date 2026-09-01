@@ -235,7 +235,7 @@ ceil_ms() {
 write_baseline() {
     local o s j i n
     [[ -n "$open_ms" && -n "$screen_ms" && -n "$jump100k_ms" && -n "$insert_ms" ]] || {
-        echo "perf_baseline: need 8G RESULT lines to record pins (make giant)" >&2
+        echo "perf_baseline: need 8G RESULT lines to record pins (./make.shcc @giant)" >&2
         exit 1
     }
     o="$(ceil_ms "$open_ms" "$HEADROOM" "$FLOOR_MS")"
@@ -289,7 +289,7 @@ compare() {
         exit 1
     fi
     if [[ -z "$open_ms" ]]; then
-        echo "perf_baseline: no 8G measurements to compare (make giant)" >&2
+        echo "perf_baseline: no 8G measurements to compare (./make.shcc @giant)" >&2
         exit 1
     fi
     load_baseline

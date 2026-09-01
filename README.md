@@ -4,7 +4,7 @@ A text editor in [Concurrent-C](https://github.com/sreekotay/concurrent-c) — a
 
 CCText has one document core, two frontends — **cctext** (POSIX console) and **cctext-gui** (Cocoa + Core Text).
 
-This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). **cctext** also ships as a prebuilt on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler). It does not live inside the compiler repository.
+This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). Prebuilts ship on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler): **cctext** on Linux and macOS, **cctext-gui** on macOS in the same tarball. It does not live inside the compiler repository.
 
 ![cctext TUI — 2 GiB JSON, syntax highlight, and a selection at line 5.8 M of 26 M](docs/cctext-tui.png)
 
@@ -19,6 +19,7 @@ tar -xzf cctext-macos-arm64.tar.gz
 ./cctext-macos-arm64/cctext --version
 ./cctext-macos-arm64/cctext            # file browser
 ./cctext-macos-arm64/cctext file.txt   # missing path asks to create
+./cctext-macos-arm64/cctext-gui file.txt
 ```
 
 From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`. `-v` / `--version` prints `cctext 0.1`.
@@ -100,19 +101,21 @@ Quit with **Don't save** / `q` **drops** dirty journals so the next open is the 
 
 ## Setup
 
+Recipes live in `make.shcc` (`ccc --as=shcc`). There is no Makefile.
+
 ```bash
 ./setup.sh                  # checks ccc; macOS GUI needs AppKit (no extra deps)
 ./make.shcc @               # list tasks
-./make.shcc @smoke          # piece-tree + layout + edit-session + find + large-file
-./make.shcc @large          # testdata/generated/large.txt (~3 MiB; LARGE_BYTES= or @large)
-make giant                  # testdata/generated/large_8G.txt (~8 GiB; slow)
-make giant-json             # testdata/generated/large_2G.json (~2 GiB JSON array; slow)
-make giant-smoke            # open that file via page store (mid-line + tiny insert)
-make perf                   # ops×sizes + binary/RSS table → testdata/perf/results/…
-make perf-record            # that table + refresh testdata/perf/baseline.env pins
-make perf-check             # fail if 8G open/scroll/jump/insert regress
+./make.shcc @smoke          # tree, layout, edit, find, hex, grid, line-index, tm, large, dup-scale
+./make.shcc @large          # testdata/generated/large.txt (~3 MiB; LARGE_BYTES=)
+./make.shcc @giant          # testdata/generated/large_8G.txt (~8 GiB; slow)
+./make.shcc @giant_json     # testdata/generated/large_2G.json (~2 GiB JSON array; slow)
+./make.shcc @giant_smoke    # open that file via page store (mid-line + tiny insert)
+./make.shcc @perf           # ops×sizes + binary/RSS table → testdata/perf/results/…
+./make.shcc @perf_record    # that table + refresh testdata/perf/baseline.env pins
+./make.shcc @perf_check     # fail if 8G open/scroll/jump/insert regress
 ./make.shcc @cctext         # console editor (`--release`; DEBUG=1 keeps asserts)
-make dist-cctext            # dist/cctext-<os>-<arch>.tar.gz (binary + grammars/)
+./make.shcc @dist_cctext    # dist/cctext-<os>-<arch>.tar.gz (binary + grammars/)
 ./make.shcc @cctext_gui     # Cocoa GUI (macOS)
 ./bin/cctext testdata/mixed.txt testdata/small.txt
 ./bin/cctext --wrap testdata/wrap.txt --hex testdata/mixed.txt --grid testdata/grid_rfc.csv
@@ -126,28 +129,29 @@ Install `ccc` with Homebrew (`brew tap sreekotay/concurrent-c` / `brew install -
 
 ## Releases
 
-Prebuilt **cctext** only — not cctext-gui. Each GitHub Release attaches:
+Each GitHub Release attaches:
 
 | Artifact | Host |
 |---|---|
-| `cctext-linux-x64.tar.gz` | Ubuntu / glibc x86_64 |
-| `cctext-macos-arm64.tar.gz` | Apple Silicon |
+| `cctext-linux-x64.tar.gz` | Ubuntu / glibc x86_64 (**cctext**) |
+| `cctext-macos-arm64.tar.gz` | Apple Silicon (**cctext** and **cctext-gui**) |
 
-Unpack and run in place. Grammars load from `./grammars` next to the binary.
+Unpack and run in place. Grammars load from `./grammars` next to the binary. On macOS the two frontends sit in the same folder so browse `e` / Ctrl-E can launch the other.
 
 ```bash
 tar -xzf cctext-macos-arm64.tar.gz
 ./cctext-macos-arm64/cctext file.txt
 ./cctext-macos-arm64/cctext --wrap file.txt
+./cctext-macos-arm64/cctext-gui file.txt
 ```
 
 Local tarball (same layout, current machine):
 
 ```bash
-make dist-cctext            # → dist/cctext-<os>-<arch>.tar.gz
+./make.shcc @dist_cctext    # → dist/cctext-<os>-<arch>.tar.gz
 ```
 
-Cut a public drop: tag `cctext-v*` and push. CI installs `ccc` from [concurrent-c](https://github.com/sreekotay/concurrent-c), builds `--release`, and attaches both tarballs. `workflow_dispatch` on `.github/workflows/release-cctext.yml` builds artifacts without publishing (optional `ccc_ref` pins the compiler).
+Cut a public drop: tag `cctext-v*` and push. CI installs `ccc` from [concurrent-c](https://github.com/sreekotay/concurrent-c), builds `--release`, and attaches the Linux tarball plus the macOS tarball (TUI and GUI). `workflow_dispatch` on `.github/workflows/release-cctext.yml` builds artifacts without publishing (optional `ccc_ref` pins the compiler).
 
 ```bash
 git tag cctext-v0.1.0
@@ -157,6 +161,8 @@ git push origin cctext-v0.1.0
 ## Layout
 
 ```
+make.shcc     tasks (smoke, cctext, perf, …)
+build.cc      linked TUs
 core/         document — no AppKit in core, no termios
 frontend/     Cocoa GUI and TTY
 tests/        headless smokes

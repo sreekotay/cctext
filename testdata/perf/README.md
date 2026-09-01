@@ -1,8 +1,8 @@
 # Perf pins and dated results
 
-- `baseline.env` — regression ceilings for the 8 GiB fixture (`make perf-record`).
+- `baseline.env` — regression ceilings for the 8 GiB fixture (`./make.shcc @perf_record`).
 - `results/baseline_results_YYYY_MM_DD.txt` — human table from
-  `make perf` / `scripts/perf_baseline.sh`: binary sizes, peak RSS per fixture,
+  `./make.shcc @perf` (or `scripts/perf_baseline.sh`): binary sizes, peak RSS per fixture,
   then ops × sizes (ms).
 
 Fixtures (same ops, same byte distance):

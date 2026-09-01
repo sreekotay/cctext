@@ -3,6 +3,7 @@
 //   ./make.shcc @smoke
 //   ./make.shcc @cctext
 //   ./make.shcc @cctext_gui
+//   ./make.shcc @                 # list tasks
 //
 // Leaf modules are real linked TUs (not textual includes):
 //   core/page_store.ccs, core/hex.ccs, core/grid.ccs, core/browse.ccs, core/piece_tree.ccs,

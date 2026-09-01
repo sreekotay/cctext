@@ -2,7 +2,8 @@
 
 Concurrent-C recipes: `docs/cheatsheet.md` (Includes, UFCS, Keep).
 DESIGN.md is product shape. This file is the include map: what cc
-requires, then where cctext puts things.
+requires, then where cctext puts things. Recipes are `./make.shcc @`
+(`ccc --as=shcc`). There is no Makefile.
 
 ## Concurrent-C
 
