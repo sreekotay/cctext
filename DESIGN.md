@@ -33,6 +33,12 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | identity mismatch tosses hist; quit-`q` drops dirty journals |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
 
+Analysis `secs` / `runs` / `tm_ckpt` and layout `rows` are Vecs on that
+epoch arena. Hist restore text / ins are session `vec_from` wraps.
+Do not Vec `ws.bufs`, `find.offs`, `browse.ents`, or `hist.recs` — those
+stay raw and grow with `cc_arena_realloc` in their TU (Vec grow would
+destroy live docs, publish dest-live, or drop session wraps).
+
 ## Interactive
 
 The UI thread does not wait on the line index. Open, paint, hit, select,

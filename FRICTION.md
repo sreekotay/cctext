@@ -13,11 +13,21 @@ put them in `foo.ccs` (or a face that file includes). Other TUs
 Dest-live: pointer names copy the pointer; other locals are by reference
 and must outlive `.wait()`. Do not assign a worker arm to a stack `int`.
 `@serial { noop = 0; }` on the caller; the arm is an expression.
+`@parallel wait` index loops use `for`, not `@for`.
 
 ## cctext
 
 A `.cch` is the type plus the `RtxFoo_*` face (and the few `rtx_*`
 other TUs call). Helpers stay in the owner `.ccs`.
+
+Owned growable arrays are Vecs on their epoch arena (`vec_new` on plant;
+unbind the handle before `reset` / `destroy`). `.len` is the extent
+(read-only): grow with `push` / `reserve`, shrink with `truncate` /
+`clear`. Hist text / ins are session `vec_from` wraps — assign a new
+`from`, do not store `.len`. Leave raw + `cc_arena_realloc` where a Vec
+grow would destroy live docs (`ws.bufs`), publish dest-live (`find.offs`,
+`browse.ents`), or bump a session array of wraps (`hist.recs`). Field
+UFCS on a Vec member peels as the owner type — bind `Vec *` then call.
 
 `scratch_span(from, n, a)` — arena last; the caller names WHERE.
 `RTX_FRAME_SCRATCH` is a stack budget, not a span cap.

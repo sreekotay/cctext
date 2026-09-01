@@ -25,8 +25,8 @@ From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt
 
 ## Features
 
-- **Fast on huge files.** An 8 GiB open is 0.006 ms; first-screen scroll is 0.039 ms; `g 50%` is 0.005 ms. The body stays on disk (page store + progressive line index). Numbers, including syntax highlight: [Perf](#perf).
-- **Small.** Release `cctext` is 466 KiB. Open RSS is ~1.5 MiB on 3 MiB and on 8 GiB.
+- **Fast on huge files.** An 8 GiB open is 0.005 ms; first-screen scroll is 0.039 ms; `g 50%` is 0.005 ms. The body stays on disk (page store + progressive line index). Numbers, including syntax highlight: [Perf](#perf).
+- **Small.** Release `cctext` is 471 KiB. Open RSS is ~1.5 MiB on 3 MiB and on 8 GiB.
 - **UTF-8.** Caret, wrap, hit-test, and backspace walk clusters (scalar + combining marks / variation selectors). Full UAX #29 graphemes (ZWJ emoji, flags) are pending. Hex stays a byte camera.
 - **TUI and GUI.** Same document core: **cctext** (POSIX console) and **cctext-gui** (Cocoa + Core Text).
 - **Hex / grid.** `Ctrl-L` cycles default → wrap → hex (offset | hex | UTF-8 dump) → grid (CSV/TSV/pipe columns).
@@ -167,25 +167,25 @@ See [CCTEXT_PLAN.md](CCTEXT_PLAN.md). MIT — [LICENSE](LICENSE).
 
 ## Perf
 
-Release, best of 5, each op from a fresh `from_path`. Times include syntax highlighting. `jump_1m` / `wrap_1m` / `insert_mid` / `newline_mid` are **1 MiB into every file** so the sizes are comparable. `jump_50pct` is `g` + `50%` (`line_floor` + island; no prefix scan). 2026-08-28 on Srees-MacBook-Air. Full table: [testdata/perf/results/baseline_results_2026_08_28.txt](testdata/perf/results/baseline_results_2026_08_28.txt). Prior run: [2026-08-26](testdata/perf/results/baseline_results_2026_08_26.txt). How to re-run: [testdata/perf/README.md](testdata/perf/README.md).
+Release, best of 5, each op from a fresh `from_path`. Times include syntax highlighting. `jump_1m` / `wrap_1m` / `insert_mid` / `newline_mid` are **1 MiB into every file** so the sizes are comparable. `jump_50pct` is `g` + `50%` (`line_floor` + island; no prefix scan). 2026-09-01 on Srees-MacBook-Air. Full table: [testdata/perf/results/baseline_results_2026_09_01.txt](testdata/perf/results/baseline_results_2026_09_01.txt). Prior run: [2026-08-28](testdata/perf/results/baseline_results_2026_08_28.txt). How to re-run: [testdata/perf/README.md](testdata/perf/README.md).
 
-All tests are with syntax hilighting fully active.
+All tests are with syntax highlighting fully active.
 
-`perf_matrix_smoke` 233.0 KiB · `cctext` 465.7 KiB
+`perf_matrix_smoke` 270.1 KiB · `cctext` 470.6 KiB
 
 | | 3M text | 8G text | 2G JSON |
 |---|---:|---:|---:|
 | rss_open | 1.5 MiB | 1.5 MiB | 3.5 MiB |
-| rss_peak | 3.1 MiB | 6.1 MiB | 6.3 MiB |
-| open | 0.006 ms | 0.006 ms | 0.007 ms |
-| scroll_40 | 0.040 ms | 0.039 ms | 0.050 ms |
-| wrap_40 | 0.077 ms | 0.084 ms | 0.316 ms |
-| jump_1m | 0.453 ms | 0.448 ms | 0.408 ms |
+| rss_peak | 3.1 MiB | 3.1 MiB | 5.1 MiB |
+| open | 0.005 ms | 0.005 ms | 0.005 ms |
+| scroll_40 | 0.040 ms | 0.039 ms | 0.047 ms |
+| wrap_40 | 0.072 ms | 0.077 ms | 0.292 ms |
+| jump_1m | 0.464 ms | 0.455 ms | 0.395 ms |
 | jump_50pct | 0.004 ms | 0.005 ms | 0.004 ms |
-| wrap_1m | 0.872 ms | 0.772 ms | 0.879 ms |
-| insert_bof | 0.083 ms | 0.076 ms | 0.072 ms |
-| insert_eof | 0.077 ms | 0.082 ms | 0.074 ms |
-| insert_mid | 0.096 ms | 0.079 ms | 0.073 ms |
-| newline_mid | 0.098 ms | 0.087 ms | 0.065 ms |
+| wrap_1m | 0.732 ms | 0.728 ms | 0.823 ms |
+| insert_bof | 0.067 ms | 0.072 ms | 0.075 ms |
+| insert_eof | 0.086 ms | 0.077 ms | 0.095 ms |
+| insert_mid | 0.084 ms | 0.087 ms | 0.083 ms |
+| newline_mid | 0.106 ms | 0.072 ms | 0.066 ms |
 
 JSON `rss_open` includes grammar load on the first `.json` path. `wrap_40` there is the TextMate window lex; `wrap_1m` is the visible window at 1 MiB. `rss_peak` is the 1 MiB `jump_1m` / mid-insert, not a half-file index.
