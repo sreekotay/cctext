@@ -31,6 +31,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Workspace | `w.session` | close (bufs, clipboard) |
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
 | Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | identity mismatch tosses hist; quit-`q` drops dirty journals |
+| TM | process `rtx_tm_store` (langs + rules + interned pattern strings) | first grammar load; process |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
 
 Analysis `secs` / `runs` / `tm_ckpt` and layout `rows` are Vecs on that
@@ -123,18 +124,18 @@ Backfill is a pump. The host yields (`rtx_ui_work_pump`). Do not extract a
 shared type — bits stay local (`find.done`, `browse.scanning`, GUI AST).
 The next walk copies this table.
 
-Active is the dest (`h` / `h_live`). Results appear only at an explicit
+Active is the dest (`h.live()`). Results appear only at an explicit
 site: `@stage`, `recv`, or return from the wave. Progress is a monotonic
 cursor published at that same site. The frame does not read a field the
 worker is still storing into.
 
 | | start | one wave | live | resume | deny |
 |---|---|---|---|---|---|
-| find | `find_set` | dest-live wrapper; wait-for 2 MiB blocks | `h_live` | `scan_off` | — |
+| find | `find_set` | dest-live wrapper; wait-for 2 MiB blocks | `h.live()` | `scan_off` | — |
 | jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
 | prefix | — | — | — | `line_scan_off` | host does not pump |
-| island | `isle_kick` (land / gap view) | dest-live wrapper; wait-for 2 MiB blocks | `h_live` | `isle_from` | — |
-| browse | `rtx_browse_kick` | dest-live wrapper; wait-for dir jobs | `h_live` | `jhead` | — |
+| island | `isle_kick` (land / gap view) | dest-live wrapper; wait-for 2 MiB blocks | `isle_h.live()` | `isle_from` | — |
+| browse | `rtx_browse_kick` | dest-live wrapper; wait-for dir jobs | `h.live()` | `jhead` | — |
 
 Kick plants the first paint and returns. Browse, find, and island are
 dest-live: the frame pauses / resumes / cancel+wait. `g L` stays one

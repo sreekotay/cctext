@@ -22,6 +22,6 @@ not UFCS `h.wait() !>`.
 
 ## Field UFCS on a Vec member
 
-`d->runs.truncate(n)` peels as `RtxDoc`. Bind `Vec::[T] *runs = &d->runs`
-then `runs->truncate(n)`. Same in the owner TU for `r->ins.as_slice()` —
-use `CCVec_char_as_slice` there; a local `buf.as_slice()` is fine.
+`d->runs.truncate(n)` / `L->rows.clear()` — method is on the Vec field,
+including `@typehooks` owners (`RtxDoc`, `RtxLayout`). No `Vec::[T] *`
+peel bind.
