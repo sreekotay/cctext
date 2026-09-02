@@ -22,7 +22,7 @@ tar -xzf cctext-macos-arm64.tar.gz
 ./cctext-macos-arm64/cctext-gui file.txt
 ```
 
-From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`. `-v` / `--version` prints `cctext 0.1`.
+From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`. `-h` / `--help` lists options; `-v` / `--version` prints `cctext 0.1`; `--no-blink` keeps a solid caret; `--backup` saves in place (keeps a symlink) and writes `path~` first; `--stats-json` prints the Esc/= engine stats as JSON on exit.
 
 ## Features
 
@@ -117,8 +117,9 @@ Recipes live in `make.shcc` (`ccc --as=shcc`). There is no Makefile.
 ./make.shcc @cctext         # console editor (`--release`; DEBUG=1 keeps asserts)
 ./make.shcc @dist_cctext    # dist/cctext-<os>-<arch>.tar.gz (binary + grammars/)
 ./make.shcc @cctext_gui     # Cocoa GUI (macOS)
+./bin/cctext --help
 ./bin/cctext testdata/mixed.txt testdata/small.txt
-./bin/cctext --wrap testdata/wrap.txt --hex testdata/mixed.txt --grid testdata/grid_rfc.csv
+./bin/cctext --no-blink --backup --wrap testdata/wrap.txt --hex testdata/mixed.txt --grid testdata/grid_rfc.csv
 ./bin/cctext-gui --view=hex testdata/generated/large.txt
 # ./bin/cctext-gui testdata/generated/large_8G.txt
 ```

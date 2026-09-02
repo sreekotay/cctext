@@ -3390,6 +3390,97 @@ void !>(CCError) RtxDoc_redo(RtxDoc *d) {
     return cc_ok();
 }
 
+static int rtx_save_backup;
+
+void rtx_doc_set_save_backup(int on) {
+    rtx_save_backup = on ? 1 : 0;
+}
+
+int rtx_doc_save_backup(void) {
+    return rtx_save_backup;
+}
+
+static void rtx_save_fsync_dir(const char *path, size_t n) {
+    char dirbuf[4096];
+    char *slash;
+    int dfd;
+    if (!path || n + 1 >= sizeof(dirbuf)) return;
+    {
+        char[:] dst = cc_slice_from_buffer(dirbuf, n + 1);
+        char[:] src = cc_slice_from_buffer((void *)path, n + 1);
+        dst.copy(src) !>(e) { (void)e; return; };
+    }
+    slash = strrchr(dirbuf, '/');
+    if (slash && slash != dirbuf) {
+        *slash = 0;
+        dfd = open(dirbuf, O_RDONLY);
+    } else {
+        dfd = open(".", O_RDONLY);
+    }
+    if (dfd >= 0) {
+        (void)fsync(dfd);
+        close(dfd);
+    }
+}
+
+/* Copy src → dst (follows symlinks). Used for path~ before in-place save. */
+static void !>(CCError) rtx_save_copy_path(const char *src, const char *dst,
+                                          mode_t mode, int have_mode) {
+    char buf[64 * 1024];
+    int in = -1;
+    int out = -1;
+    ssize_t nr;
+    if (!src || !dst) return cc_err(CC_ERR_INVALID_ARG, "copy path");
+    in = open(src, O_RDONLY);
+    if (in < 0) return cc_err(CC_ERR_IO, "backup open");
+    out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, have_mode ? mode : 0666);
+    if (out < 0) {
+        close(in);
+        return cc_err(CC_ERR_IO, "backup create");
+    }
+    if (have_mode && fchmod(out, mode) != 0) {
+        close(in);
+        close(out);
+        unlink(dst);
+        return cc_err(CC_ERR_IO, "backup fchmod");
+    }
+    for (;;) {
+        nr = read(in, buf, sizeof(buf));
+        if (nr < 0) {
+            close(in);
+            close(out);
+            unlink(dst);
+            return cc_err(CC_ERR_IO, "backup read");
+        }
+        if (nr == 0) break;
+        {
+            ssize_t off = 0;
+            while (off < nr) {
+                ssize_t w = write(out, buf + off, (size_t)(nr - off));
+                if (w <= 0) {
+                    close(in);
+                    close(out);
+                    unlink(dst);
+                    return cc_err(CC_ERR_IO, "backup write");
+                }
+                off += w;
+            }
+        }
+    }
+    if (fsync(out) != 0) {
+        close(in);
+        close(out);
+        unlink(dst);
+        return cc_err(CC_ERR_IO, "backup fsync");
+    }
+    close(in);
+    if (close(out) != 0) {
+        unlink(dst);
+        return cc_err(CC_ERR_IO, "backup close");
+    }
+    return cc_ok();
+}
+
 void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
     char tmp[4096];
     char[:] new_path = cc_slice_empty();
@@ -3411,6 +3502,35 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
             have_mode = 1;
         }
     }
+    if (rtx_save_backup) {
+        char bak[4096];
+        if (n + 2 >= sizeof(bak)) return cc_err(CC_ERR_INVALID_ARG, "path too long");
+        snprintf(bak, sizeof(bak), "%s~", path);
+        if (access(path, F_OK) == 0) {
+            rtx_save_copy_path(path, bak, mode, have_mode) !>(e) {
+                return cc_err(e);
+            };
+        }
+        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, have_mode ? mode : 0666);
+        if (fd < 0) return cc_err(CC_ERR_IO, "save open");
+        if (have_mode && fchmod(fd, mode) != 0) {
+            close(fd);
+            return cc_err(CC_ERR_IO, "save fchmod");
+        }
+        d->tree.write_fd(fd) !>(e) {
+            close(fd);
+            return cc_err(e);
+        };
+        if (fsync(fd) != 0) {
+            close(fd);
+            return cc_err(CC_ERR_IO, "save fsync");
+        }
+        if (close(fd) != 0) return cc_err(CC_ERR_IO, "save close");
+        rtx_save_fsync_dir(path, n);
+        if (new_path.ptr) d->path = new_path;
+        d->saved_head = d->hist.head;
+        return cc_ok();
+    }
     snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
     fd = mkstemp(tmp);
     if (fd < 0) return cc_err(CC_ERR_IO, "save open");
@@ -3430,29 +3550,7 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
     if (close(fd) != 0) return cc_err(CC_ERR_IO, "save close");
     if (rename(tmp, path) != 0) return cc_err(CC_ERR_IO, "save rename");
     /* Best-effort directory fsync so the rename itself is durable. */
-    {
-        char dirbuf[4096];
-        char *slash;
-        int dfd;
-        if (n + 1 < sizeof(dirbuf)) {
-            {
-                char[:] dst = cc_slice_from_buffer(dirbuf, n + 1);
-                char[:] src = cc_slice_from_buffer((void *)path, n + 1);
-                dst.copy(src) !>;
-            }
-            slash = strrchr(dirbuf, '/');
-            if (slash && slash != dirbuf) {
-                *slash = 0;
-                dfd = open(dirbuf, O_RDONLY);
-            } else {
-                dfd = open(".", O_RDONLY);
-            }
-            if (dfd >= 0) {
-                (void)fsync(dfd);
-                close(dfd);
-            }
-        }
-    }
+    rtx_save_fsync_dir(path, n);
     if (new_path.ptr) d->path = new_path;
     d->saved_head = d->hist.head;
     return cc_ok();

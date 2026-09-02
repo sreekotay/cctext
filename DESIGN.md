@@ -210,7 +210,14 @@ A same-file split is two cameras on one document. After a mutation, reparse once
 
 The document write is `replace` (byte range in `[0, len]`). `insert` / `erase` on the doc call it. User changes are `replace` on the history stack. Dirty is `hist.head != saved_head`. Offsets, caret, and selection are bytes. Save streams pieces (`write_fd`). Deleted bytes stay in the original/add buffers; hist stores them inline only while they still coalesce (typing/backspace), and otherwise keeps piece descriptors so undo splices the range back.
 
-Save is a **safe rename**, not inode preservation: sibling `path.tmp.XXXXXX`, stream pieces, keep `0777` mode bits from `stat`, fsync the file, `rename` over the path, best-effort directory fsync. That replaces the inode. Hard-link identity is lost; a symlink at `path` is replaced rather than followed; owner, ACL, and xattr are not copied. That is the intended 0.1 policy (crash-safe replace). Do not write through the existing file. Save does not refuse an external change; Safe journals do (mtime + size + inode) and toss hist on mismatch.
+Save defaults to a **safe rename** (sibling `path.tmp.XXXXXX`, mode bits,
+fsync, `rename`, best-effort dir fsync). That replaces the inode: hard-link
+identity is lost, and a symlink at `path` is replaced rather than followed.
+Owner, ACL, and xattr are not copied. `--backup` is the other policy: copy
+the existing bytes to `path~`, then truncate+write through `path` (follows
+the symlink / keeps the inode). Crash mid-write can leave a truncated
+target; `path~` is the recovery. Save does not refuse an external change;
+Safe journals do (mtime + size + inode) and toss hist on mismatch.
 
 Browse-away does not ask and does not write the user’s path. It flushes the journal (hist as bytes, camera, identity) and **evicts** the document epoch. Live set is the pane slots. Untitled cannot park. Quit still asks; `q` drops dirty journals. A later suspend quit is not this cut.
 
