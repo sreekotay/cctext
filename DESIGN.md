@@ -219,6 +219,12 @@ the symlink / keeps the inode). Crash mid-write can leave a truncated
 target; `path~` is the recovery. Save does not refuse an external change;
 Safe journals do (mtime + size + inode) and toss hist on mismatch.
 
+`--batch` is a headless command host (no TTY): `-c` lines or a stdin script.
+Verbs are semantic (`goto @N` / `N%` / `LN`, `await index|island`, `print`,
+`read`, `insert`, `save`, `stats-json`, `quit`) — not keystrokes. Progressive
+work must be awaited; `goto` does not kick an island. Safe journals are off
+unless `--safe`.
+
 Browse-away does not ask and does not write the user’s path. It flushes the journal (hist as bytes, camera, identity) and **evicts** the document epoch. Live set is the pane slots. Untitled cannot park. Quit still asks; `q` drops dirty journals. A later suspend quit is not this cut.
 
 ## Encoding

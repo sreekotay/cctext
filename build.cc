@@ -34,6 +34,10 @@ CC_TARGET rtx_safe obj core/safe.ccs
 CC_TARGET_INCLUDE rtx_safe .
 CC_TARGET_DEPS rtx_safe rtx_piece_tree rtx_document
 
+CC_TARGET rtx_batch obj core/batch.ccs
+CC_TARGET_INCLUDE rtx_batch .
+CC_TARGET_DEPS rtx_batch rtx_document rtx_workspace rtx_piece_tree rtx_nav rtx_find
+
 CC_TARGET rtx_document obj core/document.ccs
 CC_TARGET_INCLUDE rtx_document .
 CC_TARGET_DEPS rtx_document rtx_piece_tree rtx_nav rtx_scope
@@ -70,19 +74,19 @@ CC_TARGET_DEPS piece_tree_smoke rtx_piece_tree
 
 CC_TARGET layout_measure_smoke exe tests/layout_measure_smoke.ccs
 CC_TARGET_INCLUDE layout_measure_smoke .
-CC_TARGET_DEPS layout_measure_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace
+CC_TARGET_DEPS layout_measure_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
 
 CC_TARGET edit_session_smoke exe tests/edit_session_smoke.ccs
 CC_TARGET_INCLUDE edit_session_smoke .
-CC_TARGET_DEPS edit_session_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace
+CC_TARGET_DEPS edit_session_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
 
 CC_TARGET find_smoke exe tests/find_smoke.ccs
 CC_TARGET_INCLUDE find_smoke .
-CC_TARGET_DEPS find_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace
+CC_TARGET_DEPS find_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
 
 CC_TARGET large_file_smoke exe tests/large_file_smoke.ccs
 CC_TARGET_INCLUDE large_file_smoke .
-CC_TARGET_DEPS large_file_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace
+CC_TARGET_DEPS large_file_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
 
 CC_TARGET dup_scale_smoke exe tests/dup_scale_smoke.ccs
 CC_TARGET_INCLUDE dup_scale_smoke .
@@ -102,15 +106,19 @@ CC_TARGET_DEPS insert_profile rtx_piece_tree rtx_nav rtx_scope rtx_find rtx_docu
 
 CC_TARGET hex_view_smoke exe tests/hex_view_smoke.ccs
 CC_TARGET_INCLUDE hex_view_smoke .
-CC_TARGET_DEPS hex_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace
+CC_TARGET_DEPS hex_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
 
 CC_TARGET safe_smoke exe tests/safe_smoke.ccs
 CC_TARGET_INCLUDE safe_smoke .
-CC_TARGET_DEPS safe_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace
+CC_TARGET_DEPS safe_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
 
 CC_TARGET grid_view_smoke exe tests/grid_view_smoke.ccs
 CC_TARGET_INCLUDE grid_view_smoke .
-CC_TARGET_DEPS grid_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace
+CC_TARGET_DEPS grid_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
+
+CC_TARGET batch_smoke exe tests/batch_smoke.ccs
+CC_TARGET_INCLUDE batch_smoke .
+CC_TARGET_DEPS batch_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
 
 CC_TARGET line_index_prop_smoke exe tests/line_index_prop_smoke.ccs
 CC_TARGET_INCLUDE line_index_prop_smoke .
@@ -142,7 +150,7 @@ CC_TARGET_INCLUDE rtx_cctext_osx .
 
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
-CC_TARGET_DEPS cctext rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_ui_help rtx_cctext_draw rtx_cctext_grid_draw rtx_cctext_input rtx_cctext_osx
+CC_TARGET_DEPS cctext rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui_help rtx_cctext_draw rtx_cctext_grid_draw rtx_cctext_input rtx_cctext_osx
 
 CC_TARGET rtx_gui_osx obj frontend/gui_osx.ccs
 CC_TARGET_INCLUDE rtx_gui_osx .
@@ -158,4 +166,4 @@ CC_TARGET_INCLUDE rtx_gui_input .
 
 CC_TARGET cctext_gui exe frontend/gui.ccs
 CC_TARGET_INCLUDE cctext_gui .
-CC_TARGET_DEPS cctext_gui rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_ui_help rtx_gui_osx rtx_gui_chrome rtx_gui_draw rtx_gui_input
+CC_TARGET_DEPS cctext_gui rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui_help rtx_gui_osx rtx_gui_chrome rtx_gui_draw rtx_gui_input

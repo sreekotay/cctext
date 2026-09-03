@@ -22,7 +22,7 @@ tar -xzf cctext-macos-arm64.tar.gz
 ./cctext-macos-arm64/cctext-gui file.txt
 ```
 
-From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`. `-h` / `--help` lists options; `-v` / `--version` prints `cctext 0.1`; `--no-blink` keeps a solid caret; `--backup` saves in place (keeps a symlink) and writes `path~` first; `--stats-json` prints the Esc/= engine stats as JSON on exit.
+From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`. `-h` / `--help` lists options; `-v` / `--version` prints `cctext 0.1`; `--no-blink` keeps a solid caret; `--backup` saves in place (keeps a symlink) and writes `path~` first; `--stats-json` prints the Esc/= engine stats as JSON on exit; `--batch` runs `-c` commands or a stdin script with no TTY (Safe journals off unless `--safe`).
 
 ## Features
 
@@ -118,6 +118,8 @@ Recipes live in `make.shcc` (`ccc --as=shcc`). There is no Makefile.
 ./make.shcc @dist_cctext    # dist/cctext-<os>-<arch>.tar.gz (binary + grammars/)
 ./make.shcc @cctext_gui     # Cocoa GUI (macOS)
 ./bin/cctext --help
+./bin/cctext --batch testdata/small.txt -c 'goto 50%' -c 'print 2' -c 'stats-json'
+./bin/cctext --batch testdata/small.txt < testdata/batch/smoke.ops
 ./bin/cctext testdata/mixed.txt testdata/small.txt
 ./bin/cctext --no-blink --backup --wrap testdata/wrap.txt --hex testdata/mixed.txt --grid testdata/grid_rfc.csv
 ./bin/cctext-gui --view=hex testdata/generated/large.txt
