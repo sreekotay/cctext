@@ -2,11 +2,12 @@
 # Build the low-end image and run @smoke under single-core / tight RAM limits.
 #
 #   ./docker/run-smoke.sh
-#   CPUS=1 MEMORY=1536m RTX_TARGETS=256 ./docker/run-smoke.sh
+#   CPUS=1 CPUSET=0 MEMORY=1536m RTX_TARGETS=256 ./docker/run-smoke.sh
 #
 # Env:
 #   IMAGE=cctext-lowend   docker tag
-#   CPUS=1                docker --cpus
+#   CPUSET=0              docker --cpuset-cpus (one real core; --cpus is quota)
+#   CPUS=1                docker --cpus (CFS quota; not enough alone)
 #   MEMORY=2g             docker --memory (dup_scale @smoke needs ~1 GiB doc + headroom)
 #   CCC_REF=              pin concurrent-c git ref at build time
 #   SKIP_BUILD=1          reuse existing image
@@ -14,6 +15,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE="${IMAGE:-cctext-lowend}"
+CPUSET="${CPUSET:-0}"
 CPUS="${CPUS:-1}"
 MEMORY="${MEMORY:-2g}"
 CCC_REF="${CCC_REF:-}"
@@ -33,10 +35,11 @@ fi
 echo "docker: smoke @ ${CPUS} CPU, ${MEMORY} RAM → $LOG" >&2
 {
     echo "# cctext low-end docker smoke"
-    echo "# date=$(date -u +%Y-%m-%dT%H:%M:%SZ)  cpus=$CPUS  memory=$MEMORY"
+    echo "# date=$(date -u +%Y-%m-%dT%H:%M:%SZ)  cpuset=$CPUSET  cpus=$CPUS  memory=$MEMORY"
     echo "# image=$IMAGE"
     echo
     docker run --rm \
+        --cpuset-cpus="$CPUSET" \
         --cpus="$CPUS" \
         --memory="$MEMORY" \
         --memory-swap="$MEMORY" \
