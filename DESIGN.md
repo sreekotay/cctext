@@ -26,13 +26,18 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Session | `d.session` | close (path, undo) |
 | Analysis | `d.analysis` | `analysis.reset()` on reparse |
 | Find | `d.find.store` (query + offs) | new query resets; `RtxDoc.destroy()`; edit invalidates offsets |
-| Find wave | call-local heap in the listing arm | end of the block (~4 MiB; not the find store) |
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs, clipboard) |
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
 | Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | `RTXS` hist + `RTXC` state sidecar; `RTXW` workspace; unknown ver ignored; identity mismatch tosses hist; quit-`q` drops dirty journals |
 | TM | process `rtx_tm_store` (langs + rules + interned pattern strings) | first grammar load; process |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
+
+Document’s page store is that epoch’s bytes (fds + LRU), not a peer
+epoch. Find / Layout / Workspace / Browse / Safe / TM / Frame are
+caches and stores — not kinds of camera. Find’s listing arm may use a
+call-local heap (~4 MiB) that dies with the block; that is not the find
+store.
 
 Analysis `secs` / `runs` / `tm_ckpt` and layout `rows` are Vecs on that
 epoch arena. Hist restore text / ins are session `vec_from` wraps.
@@ -42,29 +47,31 @@ destroy live docs, publish dest-live, or drop session wraps).
 
 ## Interactive
 
+One pane is one **camera**: **seeking** (`seek_off` / `fill_off`) or
+**lined** (`top` / `fill`). Do not mix those window writes. A same-file
+split is two cameras on one document (multiview), not a third mode.
+
 The UI thread does not wait on the line index. Open, paint, hit, select,
-arrow, wheel, `%` jump, and a gap edit are bytes: `line_floor` / `line_next`
-(local 8KiB), `fill_off`, window lex. Gutter is `+N` / `-L` until the
-island meets the prefix.
+arrow, wheel, `%` jump, and a gap edit are bytes: `line_floor` /
+`line_next` (local 8KiB), `fill_off`, and the **window** highlight face.
+Gutter is `+N` / `-L` until the island meets the prefix (**cover**).
 
-Two cameras, two window writes — do not mix them.
-
-| camera | origin | fill |
+| mode | origin | fill |
 |---|---|---|
-| seek | `seek_off` | `fill_off` |
-| line | `top` | `fill` |
+| seeking | `seek_off` | `fill_off` |
+| lined | `top` | `fill` |
 
 Unwrapped text also keeps `left_col` (window x, same units as the
 layout width). End, a caret past the pane, wheel left/right, Shift-
 wheel, a tilt wheel, wheel on the bottom bar, or a drag past the pane
 edge moves it. Cursor/VS Code drop Shift+wheel `deltaX`; the TTY
 recovers it from the session while focused.
-Wrap and hex stay at 0. Grid is the same offset, not a second camera.
+Wrap and hex stay at 0. Grid is the same offset, not a second mode.
 The bottom bar appears only when a vis row is wider than the pane.
 
-`line_of(seek_off)` hands off to the line camera (`top` / `fill`).
+`line_of(seek_off)` hands off to lined (`top` / `fill`).
 `index_covers` alone does not — that wrote `line_guess` into `top`.
-Unlabeled stays a seek.
+Unlabeled stays seeking.
 
 | window | caret already visible | else |
 |---|---|---|
@@ -72,31 +79,38 @@ Unlabeled stays a seek.
 | `land` | snap that line to top | `seek_set` |
 
 Click, type, and `ensure_caret` follow. Jump `%` lands. Find hits land
-only when the user selects one (click / next / prev). Apply and pump
+only when the user selects one (click / next / prev). Apply and **pump**
 keep the camera. Wheel and the scroll rail stay live while find is open.
-`if (seek) land else reveal` is the bug: a seek is a camera, not
+`if (seek) land else reveal` is the bug: seeking is a camera mode, not
 “index incomplete”. After handoff, wrap follow owns `top_wrap` again.
 
 `line_of` is a covered lookup. Uncovered is an error — it does not scan.
 `RtxDocLayout` does not grant it. Box select is two floors and columns,
 not line numbers. `line_count` is soft until EOF. `line_start` may extend
-the prefix; do not call it from a gap camera.
+the prefix; do not call it while seeking without cover.
+
+**Cover** — the prefix grows from 0 (`line_scan_off` is the paid cursor;
+the host does not pump it). An island grows from a land and meets the
+prefix. `index_covers` is the test.
+
+**Gutter key** — a live origin (`mark_off` / `mark_line`) plus `seek_rel`,
+and up to 32 fraction pins. Once keyed, local scroll paints absolute
+`L` without waiting for cover. Do not kick an island just to paint
+numbers when a pin can re-key. (`pin_view` on the buf is a follow-lock
+after wheel/bar — not a gutter pin.)
 
 `g N%` is a byte snap plus island (backfill). Land on an uncovered
 camera plants the same dest-live walk. `g L` is a prefix pump
 (`want_line`) — not a guess. After open the host does not walk toward
-EOF. The gutter is a **live origin** (`mark_off` / `mark_line`) plus
-`seek_rel`. Once keyed, local scroll keeps painting absolute `L`. A
-far seek (>8 KiB) drops the origin and goes back to red `+N` / `-L`
-unless a planted 1/32 pin is next to the landing — then that pin
+EOF. A far seek (>8 KiB) drops the origin and goes back to red `+N` /
+`-L` unless a planted 1/32 pin is next to the landing — then that pin
 re-keys the origin. Slot `i` is byte `i * len / 32` (vacant =
 `(size_t)-1`). Prefix cover or a connected island plants a pin and
 keys the origin (island does not have to sit on a slot). An edit
 wipes pins at or after the byte and clears the origin (BOF slot 0
-stays). Do not kick an island just to paint numbers when a pin can
-re-key. Highlight / markup still `ensure_hl` the paint window plus
-`RTX_MARKUP_LOOKBACK` (and one neighbor page for pairs). That is
-windowed lex, not a walk to BOF.
+stays). Highlight / markup still `ensure_hl` the **window** (vis rows)
+plus `RTX_MARKUP_LOOKBACK` (and one neighbor page for pairs) — not a
+walk to BOF. Fold is stored only if both ends are in that grain.
 
 `lf_ready` the field is a latch. `lf_ready()` / `index_covers` are
 false when the flag is stale (huge + `subtree_lf==0`). The flag
@@ -106,7 +120,7 @@ A split tree at EOF stays progressive: `scan_line` is exact, weights
 are not. Setting the flag with `subtree_lf==0` made `line_count()==1`
 and snapped the camera to line 0.
 
-The prefix frontier is paid work. A covered edit patches it
+The prefix cursor is paid work. A covered edit patches it
 (`note_insert` / `note_erase`). Truncate at the caret only when the
 edit changes newlines (Enter may park the scan). A letter key that
 parked `line_scan_off` at the caret rescanned the tail.
@@ -115,10 +129,10 @@ parked `line_scan_off` at the caret rescanned the tail.
 write must not take `to = len` because that total said “last page.”
 
 Host frame: mutations, then one window write. Both hosts are
-`input → pump → layout → paint`. TUI read blocks; timeout 0 while
-dirty so the first paint and the frame after a key are not a 400 ms
-wait. Do not layout, then handle, then layout again — a command that
-forgets a dirty bit paints the old camera.
+`input → pump → layout → paint` — **pump** is the host verb. TUI read
+blocks; timeout 0 while dirty so the first paint and the frame after a
+key are not a 400 ms wait. Do not layout, then handle, then layout
+again — a command that forgets a dirty bit paints the old camera.
 
 Shared UI (`ui.cch`, `ui_cmd.h`, buf motion on `RtxBuf`) owns modal
 state, command ids (`CMD_*` / `rtx_cmd_from_letter`), field edits, and
@@ -133,11 +147,11 @@ shared type — bits stay local (`find.done`, `browse.scanning`, GUI AST).
 The next walk copies this table.
 
 Active is the dest (`h.live()`). Results appear only at an explicit
-site: `@stage`, `recv`, or return from the wave. Progress is a monotonic
-cursor published at that same site. The frame does not read a field the
-worker is still storing into.
+site: `@stage`, `recv`, or return from the dest-live arm. Progress is a
+monotonic cursor published at that same site. The frame does not read a
+field the worker is still storing into.
 
-| | start | one wave | live | resume | deny |
+| | start | one step | live | resume | deny |
 |---|---|---|---|---|---|
 | find | `find_set` | dest-live wrapper; wait-for 2 MiB blocks | `h.live()` | `scan_off` | — |
 | jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
@@ -145,36 +159,33 @@ worker is still storing into.
 | island | `isle_kick` (land / gap view) | dest-live wrapper; wait-for 2 MiB blocks | `isle_h.live()` | `isle_from` | — |
 | browse | `rtx_browse_kick` | dest-live wrapper; wait-for dir jobs | `h.live()` | `jhead` | — |
 
-Kick plants the first paint and returns. A dest-live wave has no
+Kick plants the first paint and returns. A dest-live kick has no
 "not yet started" window — the arm may finish inline before the next
 statement. Everything the finish path reads (browse keep, jump dest,
 find query) is set before the kick, not after. `RTX_PARALLEL_INLINE=1`
 (`./make.shcc @smoke_inline`) runs the browse and find wrappers on the
 caller so that schedule is the default in CI. Island stays dest-live:
-the gap camera is a live prefix, not a drained result.
-Browse, find, and island are dest-live: the frame pauses / resumes /
-cancel+wait. `g L` stays one
-closed interval per step; returning is the yield. Find and island are
-the sequential 2 MiB block loop with `@parallel wait` / `@stage`.
-Browse is the same loop over directory jobs: collect is ticket-local,
-the write stage appends ents / child jobs and walks `jhead`.
-The wrapper stays dest-live so the frame does not `.wait()`.
-Gutters stay `+N` / `-L` until they meet the prefix. `isle_step` kicks
-if the handle is down — the host does not walk the island on the UI
-thread. Kick `@serial` is empty so the workers are the scan.
-Query copy and hit offsets stay on `d.find.store` and die with the
-document. A
-longer prefix query filters hits and keeps `scan_off`; a cap resumes
-from the last accepted hit; a shorter or non-prefix query resets.
-`find_apply` plants via `find_set`. `find_pump` kicks if the handle is
-down (edit invalidate) and marks the nearest hit. No list row is
-current until the user selects one; the camera stays.
-Chrome that owns the walk shows `scanning...` / `capped`. Find lists
-`scan_off` as `N%` and `off/len` bytes. TUI wraps only when the camera
-moved; help / find / jump paint as chrome on the last window. Tests call
-`finish` (wait). Do not drain the first screen before first paint.
-Tests that need a covered `line_of` call `rtx_line_scan_to` (or a
-pump) first.
+seeking without cover is a live prefix, not a drained result.
+Browse, find, and island are dest-live so the frame pauses / resumes /
+cancel+wait and does not `.wait()`. `g L` stays one closed interval per
+step; returning is the yield. Find and island are the sequential 2 MiB
+block loop with `@parallel wait` / `@stage`. Browse is the same loop
+over directory jobs: collect is ticket-local, the write stage appends
+ents / child jobs and walks `jhead`. Gutters stay `+N` / `-L` until
+they meet the prefix. `isle_step` kicks if the handle is down — the
+host does not walk the island on the UI thread. Kick `@serial` is empty
+so the workers are the scan. Query copy and hit offsets stay on
+`d.find.store` and die with the document. A longer prefix query filters
+hits and keeps `scan_off`; a cap resumes from the last accepted hit; a
+shorter or non-prefix query resets. `find_apply` plants via `find_set`.
+`find_pump` kicks if the handle is down (edit invalidate) and marks the
+nearest hit. No list row is current until the user selects one; the
+camera stays. Chrome that owns the walk shows `scanning...` / `capped`.
+Find lists `scan_off` as `N%` and `off/len` bytes. TUI wraps only when
+the camera moved; help / find / jump paint as chrome on the last
+window. Tests call `finish` (wait). Do not drain the first screen
+before first paint. Tests that need a covered `line_of` call
+`rtx_line_scan_to` (or a pump) first.
 
 ## Surfaces
 
