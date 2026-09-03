@@ -30,7 +30,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs, clipboard) |
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
-| Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | magic+ver (`RTXS` / `RTXW`); unknown ver ignored; identity mismatch tosses hist; quit-`q` drops dirty journals |
+| Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | `RTXS` hist + `RTXC` state sidecar; `RTXW` workspace; unknown ver ignored; identity mismatch tosses hist; quit-`q` drops dirty journals |
 | TM | process `rtx_tm_store` (langs + rules + interned pattern strings) | first grammar load; process |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
 
@@ -221,11 +221,16 @@ The document write is `replace` (byte range in `[0, len]`). `insert` / `erase` o
 Save defaults to a **safe rename** (sibling `path.tmp.XXXXXX`, mode bits,
 fsync, `rename`, best-effort dir fsync). That replaces the inode: hard-link
 identity is lost, and a symlink at `path` is replaced rather than followed.
-Owner, ACL, and xattr are not copied. `--backup` is the other policy: copy
-the existing bytes to `path~`, then truncate+write through `path` (follows
-the symlink / keeps the inode). Crash mid-write can leave a truncated
-target; `path~` is the recovery. Save does not refuse an external change;
-Safe journals do (mtime + size + inode) and toss hist on mismatch.
+Owner, ACL, and xattr are not copied. `--backup` is the other policy: write
+through `path` (follows the symlink / keeps the inode). When the dest is the
+opened original and its size still matches, only the dirty span is copied
+and overwritten — unchanged prefix (and a same-length original suffix) stay
+on disk. `path~` is then `RTXB` (magic / ver / old_len / lo) plus the old
+bytes that were about to be overwritten. A pure append writes no `path~`.
+If the dest is another path or the size drifted, fall back to a full copy
+then truncate+write. Crash mid-write can leave a mixed target; `path~` is
+the recovery. Save does not refuse an external change; Safe journals do
+(mtime + size + inode) and toss hist on mismatch.
 
 `--batch` is a headless command host (no TTY): `-c` lines or a stdin script.
 Verbs are semantic (`goto @N` / `N%` / `LN`, `await index|island`, `print`,

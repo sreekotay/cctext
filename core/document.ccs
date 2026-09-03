@@ -5,6 +5,7 @@
  * highlight, and tm.
  */
 #include <ccc/std/prelude.cch>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -230,8 +231,8 @@ long rtx_doc_lf_delta_local(const RtxDoc *d, size_t from, size_t to) {
 
 int RtxDoc_init_epochs(RtxDoc *d) {
     if (!d) return 0;
-    d->session = cc_arena_heap(kilobytes(16));
-    d->analysis = cc_arena_heap(kilobytes(16));
+    d->session = cc_arena_malloc(kilobytes(16));
+    d->analysis = cc_arena_malloc(kilobytes(16));
     return d->session.base != NULL && d->analysis.base != NULL;
 }
 
@@ -263,14 +264,10 @@ static char[:] !>(CCError) rtx_session_str(RtxDoc *d, const char *s) {
 }
 
 static void rtx_doc_unbind_analysis(RtxDoc *d) {
-    Vec::[RtxSection] secs = {0};
-    Vec::[RtxRun] runs = {0};
-    Vec::[RtxTmCkpt] ckpt = {0};
     if (!d) return;
-    /* Store zeros first so a drop-assign cannot release after reset. */
-    d->secs = secs;
-    d->runs = runs;
-    d->tm_ckpt = ckpt;
+    d->secs.destroy();
+    d->runs.destroy();
+    d->tm_ckpt.destroy();
 }
 
 void RtxDoc_analysis_reset(RtxDoc *d) {
@@ -384,28 +381,13 @@ void RtxDoc_destroy(RtxDoc *d) {
     if (d->analysis.base) d->analysis.destroy();
     /* Always run — overflow slabs can outlive `.base` after a reset. */
     rtx_find_handle_stop(&d->find);
+    if (d->find.store.base) d->find.store.reset();
     d->find.store.destroy();
     *d = (RtxDoc){0};
 }
 
 static int rtx_doc_is_live(const RtxDoc *d) {
     return d && (RtxPieceTree_is_live(&d->tree) || d->session.base || d->analysis.base);
-}
-
-static char[:] !>(CCError) rtx_doc_analysis_span(RtxDoc *d, size_t from, size_t n) {
-    char[:] view;
-    char[:] copy;
-    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
-    if (n == 0) return cc_ok(cc_slice_empty());
-    view = RtxPieceTree_span(&d->tree, from, n);
-    if (view.ptr) return cc_ok(view);
-    copy = d->analysis.alloc_slice_bytes(n);
-    if (!copy.ptr || copy.len < n) return cc_err(CC_ERR_OUT_OF_MEMORY, "analysis span");
-    {
-        size_t got = d->read_at(from, copy.ptr, n) !>(e) { return cc_err(e); };
-        if (got != n) return cc_err(CC_ERR_INTERNAL, "analysis span read");
-    }
-    return cc_ok(copy);
 }
 
 void !>(CCError) RtxDoc_empty(RtxDoc *d) {
@@ -898,14 +880,15 @@ static void !>(CCError) rtx_doc_resolve_markup_win(RtxDoc *d, RtxMarkupWin *w) {
         w->kind = hk;
         w->anchor = hoff;
     } else {
+        size_t prev_back = w->back;
         w->back = next;
         if (next == 0) {
             w->known = 1;
             w->kind = rtx_doc_path_kind(d);
             w->anchor = 0;
-        } else if (rtx_doc_path_kind(d) == RTX_SEC_CODE) {
-            /* Grammar on the path already proved CODE. Waiting for BOF
-             * would take ~len/LOOKBACK frames on a mid-file jump. */
+        } else if (rtx_doc_path_kind(d) == RTX_SEC_CODE && prev_back == w->from) {
+            /* Grammar on the path already proved CODE. Only on the first
+             * budget at the window origin — later draws keep walking back. */
             w->known = 1;
             w->kind = RTX_SEC_CODE;
             w->anchor = w->from;
@@ -991,6 +974,7 @@ static void !>(CCError) rtx_doc_window_markup(RtxDoc *d, size_t from, size_t to)
     }
     win = rtx_doc_markup_win(d, from, to);
     if (!win) return cc_err(CC_ERR_INTERNAL, "markup window");
+    /* Known+ready: cached. !known+ready: later draw — one more lookback step. */
     if (win->known && win->ready) return cc_ok();
     rtx_doc_resolve_markup_win(d, win) !>(e) { return cc_err(e); };
     kind = win->known ? win->kind : RTX_SEC_UNKNOWN;
@@ -1060,7 +1044,7 @@ static void !>(CCError) rtx_doc_window_markup(RtxDoc *d, size_t from, size_t to)
             return cc_err(e);
         };
     }
-    win->ready = win->known;
+    win->ready = 1;
     return cc_ok();
 }
 
@@ -1076,11 +1060,19 @@ static void !>(CCError) rtx_doc_scan_markup(RtxDoc *d) {
         return cc_ok();
     }
     {
-        char[:] bytes = rtx_doc_analysis_span(d, 0, n) !>(e) { return cc_err(e); };
+        CCArena frame = cc_arena_heap(n + 64);
+        char[:] bytes;
+        if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "markup scan");
+        bytes = d->scratch_span(0, n, frame) !>(e) {
+            frame.destroy();
+            return cc_err(e);
+        };
         rtx_doc_scan_buf(d, bytes.ptr, bytes.len) !>(e) {
+            frame.destroy();
             d->analysis_reset();
             return cc_err(e);
         };
+        frame.destroy();
     }
     return cc_ok();
 }
@@ -2796,13 +2788,19 @@ static void !>(CCError) rtx_doc_highlight(RtxDoc *d) {
         if (hi > n) hi = n;
         if (lo >= hi) continue;
         {
-            char[:] bytes = rtx_doc_analysis_span(d, lo, hi - lo) !>(e) {
+            CCArena frame = cc_arena_heap((hi - lo) + 64);
+            char[:] bytes;
+            if (!frame.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "highlight span");
+            bytes = d->scratch_span(lo, hi - lo, frame) !>(e) {
+                frame.destroy();
                 return cc_err(e);
             };
             rtx_hl_range(d, bytes.ptr, lo, bytes.len, lo, NULL,
                          RTX_TM_CATCHUP) !>(e) {
+                frame.destroy();
                 return cc_err(e);
             };
+            frame.destroy();
         }
     }
     for (s = 0; s < d->secs.len; s++) {
@@ -3440,7 +3438,28 @@ static void rtx_save_fsync_dir(const char *path, size_t n) {
     }
 }
 
-/* Copy src → dst (follows symlinks). Used for path~ before in-place save. */
+#define RTX_BAK_MAGIC 0x42585452u /* 'RTXB' LE */
+#define RTX_BAK_VER 1u
+
+static void rtx_bak_u32le(unsigned char *p, uint32_t v) {
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+
+static void rtx_bak_u64le(unsigned char *p, uint64_t v) {
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+    p[4] = (unsigned char)(v >> 32);
+    p[5] = (unsigned char)(v >> 40);
+    p[6] = (unsigned char)(v >> 48);
+    p[7] = (unsigned char)(v >> 56);
+}
+
+/* Copy src → dst (follows symlinks). Fallback when the dest is not the opened file. */
 static void !>(CCError) rtx_save_copy_path(const char *src, const char *dst,
                                           mode_t mode, int have_mode) {
     char buf[64 * 1024];
@@ -3498,6 +3517,96 @@ static void !>(CCError) rtx_save_copy_path(const char *src, const char *dst,
     return cc_ok();
 }
 
+/* path~ = RTXB header + old bytes [lo, bak_to). Empty span: drop path~. */
+static void !>(CCError) rtx_save_copy_span(const char *src, const char *dst,
+                                          size_t lo, size_t bak_to, size_t old_len,
+                                          mode_t mode, int have_mode) {
+    char buf[64 * 1024];
+    unsigned char hdr[24];
+    int in = -1;
+    int out = -1;
+    size_t left;
+    if (!src || !dst) return cc_err(CC_ERR_INVALID_ARG, "copy span");
+    if (lo > bak_to || bak_to > old_len) return cc_err(CC_ERR_INVALID_ARG, "span");
+    if (lo == bak_to) {
+        unlink(dst);
+        return cc_ok();
+    }
+    in = open(src, O_RDONLY);
+    if (in < 0) return cc_err(CC_ERR_IO, "backup open");
+    out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, have_mode ? mode : 0666);
+    if (out < 0) {
+        close(in);
+        return cc_err(CC_ERR_IO, "backup create");
+    }
+    if (have_mode && fchmod(out, mode) != 0) {
+        close(in);
+        close(out);
+        unlink(dst);
+        return cc_err(CC_ERR_IO, "backup fchmod");
+    }
+    rtx_bak_u32le(hdr, RTX_BAK_MAGIC);
+    rtx_bak_u32le(hdr + 4, RTX_BAK_VER);
+    rtx_bak_u64le(hdr + 8, (uint64_t)old_len);
+    rtx_bak_u64le(hdr + 16, (uint64_t)lo);
+    {
+        ssize_t off = 0;
+        while (off < (ssize_t)sizeof(hdr)) {
+            ssize_t w = write(out, hdr + off, sizeof(hdr) - (size_t)off);
+            if (w <= 0) {
+                close(in);
+                close(out);
+                unlink(dst);
+                return cc_err(CC_ERR_IO, "backup write");
+            }
+            off += w;
+        }
+    }
+    if (lo && lseek(in, (off_t)lo, SEEK_SET) < 0) {
+        close(in);
+        close(out);
+        unlink(dst);
+        return cc_err(CC_ERR_IO, "backup lseek");
+    }
+    left = bak_to - lo;
+    while (left) {
+        size_t take = left > sizeof(buf) ? sizeof(buf) : left;
+        ssize_t nr = read(in, buf, take);
+        if (nr <= 0) {
+            close(in);
+            close(out);
+            unlink(dst);
+            return cc_err(CC_ERR_IO, "backup read");
+        }
+        {
+            ssize_t off = 0;
+            while (off < nr) {
+                ssize_t w = write(out, buf + off, (size_t)(nr - off));
+                if (w <= 0) {
+                    close(in);
+                    close(out);
+                    unlink(dst);
+                    return cc_err(CC_ERR_IO, "backup write");
+                }
+                off += w;
+            }
+        }
+        left -= (size_t)nr;
+    }
+    if (fsync(out) != 0) {
+        close(in);
+        close(out);
+        unlink(dst);
+        return cc_err(CC_ERR_IO, "backup fsync");
+    }
+    close(in);
+    if (close(out) != 0) {
+        unlink(dst);
+        return cc_err(CC_ERR_IO, "backup close");
+    }
+    return cc_ok();
+}
+
 void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
     char tmp[4096];
     char[:] new_path = cc_slice_empty();
@@ -3505,6 +3614,8 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
     size_t n;
     mode_t mode = 0666;
     int have_mode = 0;
+    int have_st = 0;
+    struct stat st;
     if (!d || !path || !path[0]) return cc_err(CC_ERR_INVALID_ARG, "save path");
     if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     n = strlen(path);
@@ -3512,32 +3623,66 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, const char *path) {
     if (!d->path.ptr || !d->path.eq_cstr(path)) {
         new_path = rtx_session_str(d, path) !>(e) { return cc_err(e); };
     }
-    {
-        struct stat st;
-        if (stat(path, &st) == 0) {
-            mode = st.st_mode & 0777;
-            have_mode = 1;
-        }
+    if (stat(path, &st) == 0) {
+        mode = st.st_mode & 0777;
+        have_mode = 1;
+        have_st = 1;
     }
     if (rtx_save_backup) {
         char bak[4096];
+        size_t lo = 0, hi = 0, oldn, newn, bak_to;
+        int same = 0;
         if (n + 2 >= sizeof(bak)) return cc_err(CC_ERR_INVALID_ARG, "path too long");
         snprintf(bak, sizeof(bak), "%s~", path);
+        oldn = d->tree.save_span(&lo, &hi);
+        newn = d->tree.len();
+        if (d->path.ptr && d->path.eq_cstr(path) && d->tree.store.orig_open &&
+            have_st && (size_t)st.st_size == oldn && lo <= oldn)
+            same = 1;
+        bak_to = (newn == oldn && hi <= oldn) ? hi : oldn;
         if (access(path, F_OK) == 0) {
-            rtx_save_copy_path(path, bak, mode, have_mode) !>(e) {
+            if (same)
+                rtx_save_copy_span(path, bak, lo, bak_to, oldn, mode, have_mode) !>(e) {
+                    return cc_err(e);
+                };
+            else
+                rtx_save_copy_path(path, bak, mode, have_mode) !>(e) {
+                    return cc_err(e);
+                };
+        }
+        if (same) {
+            fd = open(path, O_WRONLY | O_CREAT, have_mode ? mode : 0666);
+            if (fd < 0) return cc_err(CC_ERR_IO, "save open");
+            if (have_mode && fchmod(fd, mode) != 0) {
+                close(fd);
+                return cc_err(CC_ERR_IO, "save fchmod");
+            }
+            if (lo && lseek(fd, (off_t)lo, SEEK_SET) < 0) {
+                close(fd);
+                return cc_err(CC_ERR_IO, "save lseek");
+            }
+            d->tree.write_fd_from(fd, lo, hi) !>(e) {
+                close(fd);
+                return cc_err(e);
+            };
+            if (newn != (size_t)st.st_size) {
+                if (ftruncate(fd, (off_t)newn) != 0) {
+                    close(fd);
+                    return cc_err(CC_ERR_IO, "save ftruncate");
+                }
+            }
+        } else {
+            fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, have_mode ? mode : 0666);
+            if (fd < 0) return cc_err(CC_ERR_IO, "save open");
+            if (have_mode && fchmod(fd, mode) != 0) {
+                close(fd);
+                return cc_err(CC_ERR_IO, "save fchmod");
+            }
+            d->tree.write_fd(fd) !>(e) {
+                close(fd);
                 return cc_err(e);
             };
         }
-        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, have_mode ? mode : 0666);
-        if (fd < 0) return cc_err(CC_ERR_IO, "save open");
-        if (have_mode && fchmod(fd, mode) != 0) {
-            close(fd);
-            return cc_err(CC_ERR_IO, "save fchmod");
-        }
-        d->tree.write_fd(fd) !>(e) {
-            close(fd);
-            return cc_err(e);
-        };
         if (fsync(fd) != 0) {
             close(fd);
             return cc_err(CC_ERR_IO, "save fsync");

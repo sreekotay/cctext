@@ -5,6 +5,7 @@
 #include <ccc/std/prelude.cch>
 #include <ccc/stdio.cch>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -68,6 +69,78 @@ static int try_type(RtxDoc *d, char[:] s, CCError *out) {
         return 1;
     }
     d->type(s) !>;
+    return 0;
+}
+
+static uint32_t test_u32le(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint64_t test_u64le(const unsigned char *p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
+           ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
+static void write_cstr_path(const char *path, const char *s) {
+    FILE *f = fopen(path, "w");
+    expect(f != NULL, "write_cstr_path");
+    if (f) {
+        fputs(s, f);
+        fclose(f);
+    }
+}
+
+static size_t read_path_bytes(const char *path, unsigned char *buf, size_t cap) {
+    FILE *f = fopen(path, "rb");
+    size_t n;
+    if (!f) return (size_t)-1;
+    n = fread(buf, 1, cap, f);
+    fclose(f);
+    return n;
+}
+
+static void expect_rtxb(const unsigned char *got, size_t n, uint64_t old_len,
+                        uint64_t lo, const char *payload, const char *msg) {
+    size_t pn = strlen(payload);
+    expect(n == 24 + pn, msg);
+    if (n < 24) return;
+    expect(test_u32le(got) == 0x42585452u && test_u32le(got + 4) == 1, msg);
+    expect(test_u64le(got + 8) == old_len && test_u64le(got + 16) == lo, msg);
+    expect(n >= 24 + pn &&
+               ({ char[:] __s = cc_slice_from_buffer((char *)got + 24, pn);
+                  __s.eq_cstr(payload); }),
+           msg);
+}
+
+static int restore_rtxb(const char *path, const unsigned char *bak, size_t n) {
+    uint64_t old_len, lo;
+    size_t payload, off = 0;
+    int fd;
+    if (n < 24) return -1;
+    old_len = test_u64le(bak + 8);
+    lo = test_u64le(bak + 16);
+    payload = n - 24;
+    fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    if (lo && lseek(fd, (off_t)lo, SEEK_SET) < 0) {
+        close(fd);
+        return -1;
+    }
+    while (off < payload) {
+        ssize_t w = write(fd, bak + 24 + off, payload - off);
+        if (w <= 0) {
+            close(fd);
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    if (ftruncate(fd, (off_t)old_len) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
     return 0;
 }
 
@@ -209,16 +282,354 @@ int main(void) {
         if (f) fclose(f);
         expect(n == 7 && ({ char[:] __s = cc_slice_from_buffer(got, 7); __s.eq_cstr("old-new"); }),
                "target updated in place");
-        f = fopen(bak, "r");
-        expect(f != NULL, "path~ backup written");
-        n = f ? fread(got, 1, sizeof(got), f) : 0;
-        if (f) fclose(f);
-        expect(n == 3 && ({ char[:] __s = cc_slice_from_buffer(got, 3); __s.eq_cstr("old"); }),
-               "backup holds prior bytes");
+        expect(access(bak, F_OK) != 0, "append writes no path~");
         rtx_doc_set_save_backup(prev);
         unlink(link);
         unlink(bak);
         unlink(real);
+    }
+
+    {
+        /* Same-length mid replace: path~ is RTXB + the overwritten old bytes. */
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_backup_span.txt";
+        const char *bak = "testdata/generated/save_backup_span.txt~";
+        FILE *f;
+        unsigned char got[64];
+        size_t n;
+        int prev = rtx_doc_save_backup();
+        uint32_t magic, ver;
+        uint64_t old_len, lo;
+        if (system("mkdir -p testdata/generated") != 0) expect(0, "mkdir");
+        unlink(path);
+        unlink(bak);
+        f = fopen(path, "w");
+        expect(f != NULL, "span dest create");
+        if (f) {
+            fputs("hello world", f);
+            fclose(f);
+        }
+        rtx_doc_set_save_backup(1);
+        d.from_path(path) !>;
+        d.replace(6, 5, "there") !>;
+        d.save() !>;
+        f = fopen(path, "r");
+        expect(f != NULL, "span dest after save");
+        n = f ? fread(got, 1, sizeof(got), f) : 0;
+        if (f) fclose(f);
+        expect(n == 11 && ({ char[:] __s = cc_slice_from_buffer((char *)got, 11); __s.eq_cstr("hello there"); }),
+               "span dest mid replace");
+        f = fopen(bak, "r");
+        expect(f != NULL, "span path~ written");
+        n = f ? fread(got, 1, sizeof(got), f) : 0;
+        if (f) fclose(f);
+        expect(n == 24 + 5, "span path~ is header + dirty old bytes");
+        magic = (uint32_t)got[0] | ((uint32_t)got[1] << 8) |
+                ((uint32_t)got[2] << 16) | ((uint32_t)got[3] << 24);
+        ver = (uint32_t)got[4] | ((uint32_t)got[5] << 8) |
+              ((uint32_t)got[6] << 16) | ((uint32_t)got[7] << 24);
+        old_len = (uint64_t)got[8] | ((uint64_t)got[9] << 8) |
+                  ((uint64_t)got[10] << 16) | ((uint64_t)got[11] << 24) |
+                  ((uint64_t)got[12] << 32) | ((uint64_t)got[13] << 40) |
+                  ((uint64_t)got[14] << 48) | ((uint64_t)got[15] << 56);
+        lo = (uint64_t)got[16] | ((uint64_t)got[17] << 8) |
+             ((uint64_t)got[18] << 16) | ((uint64_t)got[19] << 24) |
+             ((uint64_t)got[20] << 32) | ((uint64_t)got[21] << 40) |
+             ((uint64_t)got[22] << 48) | ((uint64_t)got[23] << 56);
+        expect(magic == 0x42585452u && ver == 1, "span RTXB header");
+        expect(old_len == 11 && lo == 6, "span header offsets");
+        expect(({ char[:] __s = cc_slice_from_buffer((char *)got + 24, 5); __s.eq_cstr("world"); }),
+               "span payload is overwritten old bytes");
+        rtx_doc_set_save_backup(prev);
+        unlink(path);
+        unlink(bak);
+    }
+
+    {
+        /* Shrink: write the new tail and ftruncate; path~ keeps the old suffix. */
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_backup_shrink.txt";
+        const char *bak = "testdata/generated/save_backup_shrink.txt~";
+        FILE *f;
+        unsigned char got[64];
+        size_t n;
+        int prev = rtx_doc_save_backup();
+        uint32_t magic;
+        uint64_t old_len, lo;
+        if (system("mkdir -p testdata/generated") != 0) expect(0, "mkdir");
+        unlink(path);
+        unlink(bak);
+        f = fopen(path, "w");
+        expect(f != NULL, "shrink dest create");
+        if (f) {
+            fputs("hello world", f);
+            fclose(f);
+        }
+        rtx_doc_set_save_backup(1);
+        d.from_path(path) !>;
+        d.replace(5, 6, cc_slice_empty()) !>;
+        d.save() !>;
+        f = fopen(path, "r");
+        expect(f != NULL, "shrink dest after save");
+        n = f ? fread(got, 1, sizeof(got), f) : 0;
+        if (f) fclose(f);
+        expect(n == 5 && ({ char[:] __s = cc_slice_from_buffer((char *)got, 5); __s.eq_cstr("hello"); }),
+               "shrink dest truncated");
+        f = fopen(bak, "r");
+        expect(f != NULL, "shrink path~ written");
+        n = f ? fread(got, 1, sizeof(got), f) : 0;
+        if (f) fclose(f);
+        expect(n == 24 + 6, "shrink path~ is header + old suffix");
+        magic = (uint32_t)got[0] | ((uint32_t)got[1] << 8) |
+                ((uint32_t)got[2] << 16) | ((uint32_t)got[3] << 24);
+        old_len = (uint64_t)got[8] | ((uint64_t)got[9] << 8) |
+                  ((uint64_t)got[10] << 16) | ((uint64_t)got[11] << 24) |
+                  ((uint64_t)got[12] << 32) | ((uint64_t)got[13] << 40) |
+                  ((uint64_t)got[14] << 48) | ((uint64_t)got[15] << 56);
+        lo = (uint64_t)got[16] | ((uint64_t)got[17] << 8) |
+             ((uint64_t)got[18] << 16) | ((uint64_t)got[19] << 24) |
+             ((uint64_t)got[20] << 32) | ((uint64_t)got[21] << 40) |
+             ((uint64_t)got[22] << 48) | ((uint64_t)got[23] << 56);
+        expect(magic == 0x42585452u && old_len == 11 && lo == 5, "shrink RTXB");
+        expect(({ char[:] __s = cc_slice_from_buffer((char *)got + 24, 6); __s.eq_cstr(" world"); }),
+               "shrink payload is old suffix");
+        rtx_doc_set_save_backup(prev);
+        unlink(path);
+        unlink(bak);
+    }
+
+    {
+        /* Mid insert: dest grows; path~ is the old suffix only. */
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_backup_insert.txt";
+        const char *bak = "testdata/generated/save_backup_insert.txt~";
+        unsigned char got[64];
+        size_t n;
+        int prev = rtx_doc_save_backup();
+        if (system("mkdir -p testdata/generated") != 0) expect(0, "mkdir");
+        unlink(path);
+        unlink(bak);
+        write_cstr_path(path, "hello world");
+        rtx_doc_set_save_backup(1);
+        d.from_path(path) !>;
+        d.replace(5, 0, "XX") !>;
+        d.save() !>;
+        n = read_path_bytes(path, got, sizeof(got));
+        expect(n == 13 &&
+                   ({ char[:] __s = cc_slice_from_buffer((char *)got, 13);
+                      __s.eq_cstr("helloXX world"); }),
+               "insert dest");
+        n = read_path_bytes(bak, got, sizeof(got));
+        expect_rtxb(got, n, 11, 5, " world", "insert path~");
+        rtx_doc_set_save_backup(prev);
+        unlink(path);
+        unlink(bak);
+    }
+
+    {
+        /* BOF same-length: only the first dirty byte is in path~. */
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_backup_bof.txt";
+        const char *bak = "testdata/generated/save_backup_bof.txt~";
+        unsigned char got[64];
+        size_t n;
+        int prev = rtx_doc_save_backup();
+        unlink(path);
+        unlink(bak);
+        write_cstr_path(path, "hello world");
+        rtx_doc_set_save_backup(1);
+        d.from_path(path) !>;
+        d.replace(0, 1, "H") !>;
+        d.save() !>;
+        n = read_path_bytes(path, got, sizeof(got));
+        expect(n == 11 &&
+                   ({ char[:] __s = cc_slice_from_buffer((char *)got, 11);
+                      __s.eq_cstr("Hello world"); }),
+               "bof dest");
+        n = read_path_bytes(bak, got, sizeof(got));
+        expect_rtxb(got, n, 11, 0, "h", "bof path~");
+        rtx_doc_set_save_backup(prev);
+        unlink(path);
+        unlink(bak);
+    }
+
+    {
+        /* Restore: write RTXB payload at lo and ftruncate to old_len. */
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_backup_restore.txt";
+        const char *bak = "testdata/generated/save_backup_restore.txt~";
+        unsigned char got[64];
+        size_t n;
+        int prev = rtx_doc_save_backup();
+        unlink(path);
+        unlink(bak);
+        write_cstr_path(path, "hello world");
+        rtx_doc_set_save_backup(1);
+        d.from_path(path) !>;
+        d.replace(5, 6, cc_slice_empty()) !>;
+        d.save() !>;
+        n = read_path_bytes(path, got, sizeof(got));
+        expect(n == 5 &&
+                   ({ char[:] __s = cc_slice_from_buffer((char *)got, 5);
+                      __s.eq_cstr("hello"); }),
+               "restore pre");
+        n = read_path_bytes(bak, got, sizeof(got));
+        expect(n != (size_t)-1 && restore_rtxb(path, got, n) == 0, "restore apply");
+        n = read_path_bytes(path, got, sizeof(got));
+        expect(n == 11 &&
+                   ({ char[:] __s = cc_slice_from_buffer((char *)got, 11);
+                      __s.eq_cstr("hello world"); }),
+               "restore dest");
+        rtx_doc_set_save_backup(prev);
+        unlink(path);
+        unlink(bak);
+    }
+
+    {
+        /* Large same-length mid replace: path~ stays header + 4 bytes. */
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_backup_large.txt";
+        const char *bak = "testdata/generated/save_backup_large.txt~";
+        FILE *f;
+        unsigned char got[32];
+        size_t i, n;
+        int prev = rtx_doc_save_backup();
+        struct stat st;
+        unlink(path);
+        unlink(bak);
+        f = fopen(path, "w");
+        expect(f != NULL, "large dest create");
+        if (f) {
+            for (i = 0; i < 65536; i++) fputc('A', f);
+            fputs("MARK", f);
+            for (i = 0; i < 65536; i++) fputc('B', f);
+            fclose(f);
+        }
+        rtx_doc_set_save_backup(1);
+        d.from_path(path) !>;
+        d.replace(65536, 4, "mark") !>;
+        d.save() !>;
+        expect(stat(path, &st) == 0 && st.st_size == 65536 + 4 + 65536, "large dest size");
+        expect(stat(bak, &st) == 0 && st.st_size == 24 + 4, "large path~ is span only");
+        f = fopen(path, "rb");
+        expect(f != NULL, "large dest reopen");
+        if (f) {
+            expect(fseek(f, 0, SEEK_SET) == 0 && fgetc(f) == 'A', "large prefix");
+            expect(fseek(f, 65536, SEEK_SET) == 0 && fread(got, 1, 4, f) == 4 &&
+                       ({ char[:] __s = cc_slice_from_buffer((char *)got, 4);
+                          __s.eq_cstr("mark"); }),
+                   "large mid");
+            expect(fseek(f, 65536 + 4 + 65535, SEEK_SET) == 0 && fgetc(f) == 'B',
+                   "large suffix");
+            fclose(f);
+        }
+        n = read_path_bytes(bak, got, sizeof(got));
+        expect_rtxb(got, n, 65536 + 4 + 65536, 65536, "MARK", "large path~");
+        rtx_doc_set_save_backup(prev);
+        unlink(path);
+        unlink(bak);
+    }
+
+    {
+        /* save_as another existing path: full raw copy of that dest, not RTXB. */
+        RtxDoc d = {0} @destroy;
+        const char *src = "testdata/generated/save_backup_src.txt";
+        const char *dst = "testdata/generated/save_backup_other.txt";
+        const char *bak = "testdata/generated/save_backup_other.txt~";
+        unsigned char got[64];
+        size_t n;
+        int prev = rtx_doc_save_backup();
+        unlink(src);
+        unlink(dst);
+        unlink(bak);
+        write_cstr_path(src, "opened");
+        write_cstr_path(dst, "DESTDATA");
+        rtx_doc_set_save_backup(1);
+        d.from_path(src) !>;
+        d.caret = d.len();
+        d.sel_anchor = d.caret;
+        d.type("!") !>;
+        d.save_as(dst) !>;
+        n = read_path_bytes(dst, got, sizeof(got));
+        expect(n == 7 &&
+                   ({ char[:] __s = cc_slice_from_buffer((char *)got, 7);
+                      __s.eq_cstr("opened!"); }),
+               "other dest");
+        n = read_path_bytes(bak, got, sizeof(got));
+        expect(n == 8 &&
+                   ({ char[:] __s = cc_slice_from_buffer((char *)got, 8);
+                      __s.eq_cstr("DESTDATA"); }),
+               "other path~ is raw dest copy");
+        rtx_doc_set_save_backup(prev);
+        unlink(src);
+        unlink(dst);
+        unlink(bak);
+    }
+
+    {
+        /* Dest size drifted: fall back to a full raw copy of the on-disk file. */
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_backup_drift.txt";
+        const char *bak = "testdata/generated/save_backup_drift.txt~";
+        unsigned char got[64];
+        size_t n;
+        int prev = rtx_doc_save_backup();
+        FILE *ext;
+        unlink(path);
+        unlink(bak);
+        write_cstr_path(path, "hello");
+        rtx_doc_set_save_backup(1);
+        d.from_path(path) !>;
+        ext = fopen(path, "a");
+        expect(ext != NULL, "drift append");
+        if (ext) {
+            fputs("XXXX", ext);
+            fclose(ext);
+        }
+        d.replace(0, 1, "H") !>;
+        d.save() !>;
+        n = read_path_bytes(path, got, sizeof(got));
+        expect(n == 5 &&
+                   ({ char[:] __s = cc_slice_from_buffer((char *)got, 5);
+                      __s.eq_cstr("Hello"); }),
+               "drift dest is editor bytes");
+        n = read_path_bytes(bak, got, sizeof(got));
+        expect(n == 9 &&
+                   ({ char[:] __s = cc_slice_from_buffer((char *)got, 9);
+                      __s.eq_cstr("helloXXXX"); }),
+               "drift path~ is raw drifted copy");
+        rtx_doc_set_save_backup(prev);
+        unlink(path);
+        unlink(bak);
+    }
+
+    {
+        /* Buffer-backed doc: dest is not the opened original, so path~ is raw. */
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_backup_buf.txt";
+        const char *bak = "testdata/generated/save_backup_buf.txt~";
+        unsigned char got[64];
+        size_t n;
+        int prev = rtx_doc_save_backup();
+        unlink(path);
+        unlink(bak);
+        write_cstr_path(path, "zzz");
+        rtx_doc_set_save_backup(1);
+        d.from_buffer("abc") !>;
+        d.save_as(path) !>;
+        n = read_path_bytes(path, got, sizeof(got));
+        expect(n == 3 &&
+                   ({ char[:] __s = cc_slice_from_buffer((char *)got, 3);
+                      __s.eq_cstr("abc"); }),
+               "buf dest");
+        n = read_path_bytes(bak, got, sizeof(got));
+        expect(n == 3 &&
+                   ({ char[:] __s = cc_slice_from_buffer((char *)got, 3);
+                      __s.eq_cstr("zzz"); }),
+               "buf path~ is raw dest copy");
+        rtx_doc_set_save_backup(prev);
+        unlink(path);
+        unlink(bak);
     }
 
     {
@@ -418,7 +829,7 @@ int main(void) {
         browse_wait(br) !>;
         expect(br->len && strcmp(br->ents[br->cur].name, "small.txt") == 0,
                "browse preselects the open file");
-        {
+        if (geteuid() != 0) {
             char abs[RTX_BROWSE_DIR];
             const char *rel = "testdata/generated/browse_denied";
             (void)system("mkdir -p testdata/generated/browse_denied");

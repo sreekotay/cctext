@@ -1111,27 +1111,6 @@ static void !>(CCError) rtx_write_all(int fd, const char *p, size_t n) {
     return cc_ok();
 }
 
-static void !>(CCError) rtx_write_node(RtxPieceTree *t, const RtxNode *n, int fd,
-                                         size_t *written, size_t total) {
-    char buf[RTX_PAGE_SIZE];
-    size_t off;
-    if (!n) return cc_ok();
-    rtx_write_node(t, n->left, fd, written, total) !>(e) { return cc_err(e); };
-    off = 0;
-    while (off < n->piece.len) {
-        size_t take = n->piece.len - off;
-        if (take > sizeof(buf)) take = sizeof(buf);
-        rtx_piece_read(t, &n->piece, off, buf, take) !>(e) { return cc_err(e); };
-        rtx_write_all(fd, buf, take) !>(e) { return cc_err(e); };
-        off += take;
-        if (written) {
-            *written += take;
-            rtx_busy_pulse(t, "saving", *written, total);
-        }
-    }
-    return rtx_write_node(t, n->right, fd, written, total);
-}
-
 void !>(CCError) RtxPieceTree_read_refs(const RtxPieceTree *t, const RtxPieceRef *refs,
                                         size_t nrefs, char *dst, size_t n) {
     size_t i;
@@ -1155,12 +1134,95 @@ void !>(CCError) RtxPieceTree_read_refs(const RtxPieceTree *t, const RtxPieceRef
 
 /* Stream pieces to fd. Does not load the document into one buffer. */
 void !>(CCError) RtxPieceTree_write_fd(RtxPieceTree *t, int fd) {
+    return RtxPieceTree_write_fd_from(t, fd, 0, 0);
+}
+
+static void rtx_save_span_walk(const RtxNode *n, size_t *tree_off, size_t *lo,
+                               int *prefix, size_t *suf0, int *insuf) {
+    int aligned;
+    if (!n) return;
+    rtx_save_span_walk(n->left, tree_off, lo, prefix, suf0, insuf);
+    aligned = (n->piece.buf == RTX_BUF_ORIGINAL && n->piece.start == *tree_off);
+    if (*prefix) {
+        if (aligned) *lo = *tree_off + n->piece.len;
+        else {
+            *prefix = 0;
+            *insuf = 0;
+        }
+    } else if (aligned) {
+        if (!*insuf) {
+            *suf0 = *tree_off;
+            *insuf = 1;
+        }
+    } else {
+        *insuf = 0;
+    }
+    *tree_off += n->piece.len;
+    rtx_save_span_walk(n->right, tree_off, lo, prefix, suf0, insuf);
+}
+
+size_t RtxPieceTree_save_span(const RtxPieceTree *t, size_t *lo, size_t *hi) {
+    size_t oldn, newn, tree_off = 0, prefix = 0, suf0 = 0;
+    int in_pref = 1, in_suf = 0;
+    oldn = t ? rtx_original_len(t) : 0;
+    newn = t ? RtxPieceTree_len(t) : 0;
+    if (t && t->root)
+        rtx_save_span_walk(t->root, &tree_off, &prefix, &in_pref, &suf0, &in_suf);
+    if (lo) *lo = prefix > newn ? newn : prefix;
+    if (hi) {
+        if (newn == oldn && in_suf && suf0 >= prefix) *hi = suf0;
+        else *hi = newn;
+    }
+    return oldn;
+}
+
+static void !>(CCError) rtx_write_node_from(RtxPieceTree *t, const RtxNode *n,
+                                           int fd, size_t *cur, size_t from,
+                                           size_t to, size_t *written,
+                                           size_t total) {
+    size_t piece_lo, piece_hi, a, z, off;
+    char buf[RTX_PAGE_SIZE];
+    if (!n) return cc_ok();
+    rtx_write_node_from(t, n->left, fd, cur, from, to, written, total) !>(e) {
+        return cc_err(e);
+    };
+    piece_lo = *cur;
+    piece_hi = *cur + n->piece.len;
+    a = piece_lo < from ? from : piece_lo;
+    z = piece_hi < to ? piece_hi : to;
+    if (a < z) {
+        off = a - piece_lo;
+        while (a < z) {
+            size_t take = z - a;
+            if (take > sizeof(buf)) take = sizeof(buf);
+            rtx_piece_read(t, &n->piece, off, buf, take) !>(e) {
+                return cc_err(e);
+            };
+            rtx_write_all(fd, buf, take) !>(e) { return cc_err(e); };
+            off += take;
+            a += take;
+            if (written) {
+                *written += take;
+                rtx_busy_pulse(t, "saving", *written, total);
+            }
+        }
+    }
+    *cur = piece_hi;
+    return rtx_write_node_from(t, n->right, fd, cur, from, to, written, total);
+}
+
+void !>(CCError) RtxPieceTree_write_fd_from(RtxPieceTree *t, int fd, size_t from,
+                                            size_t to) {
     size_t written = 0;
     size_t total;
+    size_t cur = 0;
     if (!t || fd < 0) return cc_err(CC_ERR_INVALID_ARG, "write_fd");
     if (!t->root) return cc_ok();
     total = RtxPieceTree_len(t);
-    rtx_write_node(t, t->root, fd, &written, total) !>(e) {
+    if (to == 0 || to > total) to = total;
+    if (from >= to) return cc_ok();
+    total = to - from;
+    rtx_write_node_from(t, t->root, fd, &cur, from, to, &written, total) !>(e) {
         rtx_busy_end(t);
         return cc_err(e);
     };
@@ -1172,7 +1234,7 @@ void !>(CCError) RtxPieceTree_write_fd(RtxPieceTree *t, int fd) {
 
 void rtx_isle_handle_stop(RtxPieceTree *t) {
     if (!t) return;
-    t->isle_cancel = 1;
+    rtx_isle_store_cancel(t, 1);
     if (!t->isle_h.live()) return;
     if (t->isle_h.paused())
         t->isle_h.resume() !>(e) { (void)e; };
@@ -1183,7 +1245,7 @@ static size_t rtx_isle_read_block(RtxPieceTree *t, size_t start, char *buf,
                                  size_t want) {
     @errhandler(CCError e) {
         (void)e;
-        if (t) t->isle_cancel = 1;
+        if (t) rtx_isle_store_cancel(t, 1);
         return 0;
     }
     if (!t || !buf || !want) return 0;
@@ -1211,9 +1273,8 @@ static int rtx_isle_run(RtxPieceTree *t) {
     span_hi = t->isle_anchor;
     if (span_hi < span_lo) span_hi = span_lo;
     remain = span_hi - span_lo;
-    t->isle_from = span_hi;
-    t->isle_before = 0;
-    if (remain == 0 || !t->isle_live || t->isle_cancel) return 1;
+    /* isle_from / isle_before planted on kick; publish only in @stage below. */
+    if (remain == 0 || !rtx_isle_load_live(t) || rtx_isle_load_cancel(t)) return 1;
     n_sz = (remain + (size_t)RTX_ISLE_BLOCK - 1) / (size_t)RTX_ISLE_BLOCK;
     if (n_sz > (size_t)INT_MAX) return 0;
     n = (int)n_sz;
@@ -1233,21 +1294,21 @@ static int rtx_isle_run(RtxPieceTree *t) {
             want = hi > lo ? hi - lo : 0;
             lfs = 0;
             buf = NULL;
-            if (want && !t->isle_cancel && t->isle_live) {
+            if (want && !rtx_isle_load_cancel(t) && rtx_isle_load_live(t)) {
                 buf = (char *)malloc((size_t)RTX_ISLE_BLOCK);
                 if (buf) {
                     got = rtx_isle_read_block(t, lo, buf, want);
                     if (got < want && got) lo = hi - got;
                     lfs = rtx_count_lf(buf, got);
                 } else {
-                    t->isle_cancel = 1;
+                    rtx_isle_store_cancel(t, 1);
                 }
             }
 
             @stage (ts, 0, i) {
-                while (t->isle_h.paused && !t->isle_cancel)
+                while (t->isle_h.paused && !rtx_isle_load_cancel(t))
                     cc_yield();
-                if (!t->isle_cancel && t->isle_live) {
+                if (!rtx_isle_load_cancel(t) && rtx_isle_load_live(t)) {
                     acc += lfs;
                     t->isle_before = acc;
                     t->isle_from = lo;
@@ -1257,19 +1318,19 @@ static int rtx_isle_run(RtxPieceTree *t) {
             }
 
             if (buf) free(buf);
-            if (t->isle_cancel || !t->isle_live
+            if (rtx_isle_load_cancel(t) || !rtx_isle_load_live(t)
                 || t->isle_from <= t->line_scan_off)
                 break;
         } !>.wait()!>;
 
     (void)fin;
-    return t->isle_cancel ? 0 : 1;
+    return rtx_isle_load_cancel(t) ? 0 : 1;
 }
 
 static void !>(CCError) rtx_isle_listing_start(RtxPieceTree *t) {
     int noop = 0;
     if (!t) return cc_err(CC_ERR_INVALID_ARG, "isle kick");
-    if (!t->isle_live || t->isle_cancel || t->lf_ready) return cc_ok();
+    if (!rtx_isle_load_live(t) || rtx_isle_load_cancel(t) || t->lf_ready) return cc_ok();
     if (t->isle_anchor <= t->line_scan_off) return cc_ok();
     if (t->isle_h.live()) return cc_ok();
     t->isle_h = @parallel {
@@ -1281,8 +1342,8 @@ static void !>(CCError) rtx_isle_listing_start(RtxPieceTree *t) {
 
 void !>(CCError) rtx_line_isle_finish(RtxPieceTree *t) {
     if (!t) return cc_ok();
-    if (t->isle_live && !t->isle_h.live() && rtx_line_isle_pumping(t)
-        && !t->isle_cancel)
+    if (rtx_isle_load_live(t) && !t->isle_h.live() && rtx_line_isle_pumping(t)
+        && !rtx_isle_load_cancel(t))
         rtx_isle_listing_start(t) !>(e) { return cc_err(e); };
     if (t->isle_h.live()) {
         if (t->isle_h.paused())

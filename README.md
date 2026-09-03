@@ -22,7 +22,7 @@ tar -xzf cctext-macos-arm64.tar.gz
 ./cctext-macos-arm64/cctext-gui file.txt
 ```
 
-From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`. `-h` / `--help` lists options; `-v` / `--version` prints `cctext 0.1`; `--no-blink` keeps a solid caret; `--backup` saves in place (keeps a symlink) and writes `path~` first; `--stats-json` prints the Esc/= engine stats as JSON on exit; `--batch` runs `-c` commands or a stdin script with no TTY (Safe journals off unless `--safe`).
+From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`. `-h` / `--help` lists options; `-v` / `--version` prints `cctext 0.1`; `--no-blink` keeps a solid caret; `--backup` saves in place (keeps a symlink) and writes a dirty-span `path~` first; `--stats-json` prints the Esc/= engine stats as JSON on exit; `--batch` runs `-c` commands or a stdin script with no TTY (Safe journals off unless `--safe`).
 
 ## Features
 
@@ -84,7 +84,7 @@ Not stored: find, clipboard, folds, highlight runs, the full line-index prefix.
 
 Both frontends call `safe_pump` every frame:
 
-1. **~250 ms after the last session change** — last-change debounce when hist (`edit_gen` / `saved_head`) **or** caret / selection / camera (seek, view, wrap, hex, `left_col`) / line-mark change on a live named buffer. A jump or a drag with no type still writes once you pause. Dragging does not rewrite the full hist every 250 ms.
+1. **~250 ms after the last session change** — last-change debounce. Hist (`edit_gen` / `saved_head`) writes the `RTXS` leaf (undo recs). Caret / selection / camera / pins write only the `RTXC` sidecar (`<hash>.s`). A jump or a drag with no type still writes state once you pause. Scrolling does not rewrite hist.
 2. **Browse away** — flush the journal, then **park** (evict the document from RAM). Live set is the pane slots. Returning unparks and reloads from path + journal. Browse does not ask and does not write your path.
 3. **Unsaved-quit prompt** — flush everything first so a crash mid-dialog is recoverable.
 4. **After a real Save** — journal refreshed to match clean hist.
@@ -96,7 +96,7 @@ Both frontends call `safe_pump` every frame:
 
 Launch with **no files** and the last workspace comes back: parked paths stay on disk until a pane shows them, then they unpark. Launch with a path and that file’s journal is applied after `from_path`.
 
-On load, a journal whose identity no longer matches the file on disk **tosses hist** (camera may still apply). You see the file as it is; it is not dirty — there are no recovered edits. A corrupt journal, or one whose version is below `RTX_SAFE_FILE_VER_MIN` or newer than this build (`RTX_SAFE_FILE_VER`), is ignored the same way. File journals are `RTXS` + a little-endian version (now 5: 1/16 pins + origin byte). Workspace snapshots are `RTXW` + an exact version match.
+On load, a journal whose identity no longer matches the file on disk **tosses hist** (camera may still apply). You see the file as it is; it is not dirty — there are no recovered edits. A corrupt journal, or one whose version is below `RTX_SAFE_FILE_VER_MIN` or newer than this build (`RTX_SAFE_FILE_VER`), is ignored the same way. File journals are `RTXS` + a little-endian version (now 5: 1/16 pins + origin byte). Camera / caret live in a sibling `RTXC` sidecar so a pause after scroll does not rewrite hist. Workspace snapshots are `RTXW` + an exact version match.
 
 Quit with **Don't save** / `q` **drops** dirty journals so the next open is the file on disk. The TUI does not flush again after that drop. A later “suspend quit” is not this cut.
 
