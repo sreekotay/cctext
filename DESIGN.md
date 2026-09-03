@@ -225,8 +225,12 @@ Owner, ACL, and xattr are not copied. `--backup` is the other policy: write
 through `path` (follows the symlink / keeps the inode). When the dest is the
 opened original and its size still matches, only the dirty span is copied
 and overwritten — unchanged prefix (and a same-length original suffix) stay
-on disk. `path~` is then `RTXB` (magic / ver / old_len / lo) plus the old
-bytes that were about to be overwritten. A pure append writes no `path~`.
+on disk. A length-changing write that still streams original pieces pins
+those file bytes before the first `pwrite` (the dest inode is the page
+store’s original). A tail above `RTX_SAVE_PIN_MAX` writes a full temp and
+copies onto the path. `path~` is then `RTXB` (magic / ver / old_len / lo)
+plus the old bytes that were about to be overwritten. A pure append writes
+no `path~`.
 If the dest is another path or the size drifted, fall back to a full copy
 then truncate+write. Crash mid-write can leave a mixed target; `path~` is
 the recovery. Save does not refuse an external change; Safe journals do

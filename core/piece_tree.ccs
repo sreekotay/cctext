@@ -1176,14 +1176,69 @@ size_t RtxPieceTree_save_span(const RtxPieceTree *t, size_t *lo, size_t *hi) {
     return oldn;
 }
 
+static void !>(CCError) rtx_piece_read_snap(const RtxPieceTree *t, const RtxPiece *p,
+                                           size_t local, char *dest, size_t n,
+                                           const char *snap, size_t snap_lo,
+                                           size_t snap_n) {
+    size_t fo;
+    if (!snap || !snap_n || !p || p->buf != RTX_BUF_ORIGINAL)
+        return rtx_piece_read(t, p, local, dest, n);
+    fo = p->start + local;
+    if (fo < snap_lo || fo - snap_lo > snap_n || n > snap_n - (fo - snap_lo))
+        return cc_err(CC_ERR_INTERNAL, "save snap");
+    {
+        char[:] dst = cc_slice_from_buffer(dest, n);
+        char[:] src = cc_slice_from_buffer((char *)snap + (fo - snap_lo), n);
+        dst.copy(src) !>;
+    }
+    return cc_ok();
+}
+
+static void rtx_save_orig_walk(const RtxNode *n, size_t *cur, size_t from,
+                               size_t to, size_t *flo, size_t *fhi, int *any) {
+    size_t piece_lo, piece_hi, a, z;
+    if (!n) return;
+    rtx_save_orig_walk(n->left, cur, from, to, flo, fhi, any);
+    piece_lo = *cur;
+    piece_hi = *cur + n->piece.len;
+    a = piece_lo < from ? from : piece_lo;
+    z = piece_hi < to ? piece_hi : to;
+    if (a < z && n->piece.buf == RTX_BUF_ORIGINAL) {
+        size_t fo = n->piece.start + (a - piece_lo);
+        size_t fz = fo + (z - a);
+        if (!*any || fo < *flo) *flo = fo;
+        if (!*any || fz > *fhi) *fhi = fz;
+        *any = 1;
+    }
+    *cur = piece_hi;
+    rtx_save_orig_walk(n->right, cur, from, to, flo, fhi, any);
+}
+
+size_t RtxPieceTree_save_orig_span(const RtxPieceTree *t, size_t from, size_t to,
+                                   size_t *file_lo, size_t *file_hi) {
+    size_t cur = 0, flo = 0, fhi = 0, total;
+    int any = 0;
+    if (!t || !t->root) return 0;
+    total = RtxPieceTree_len(t);
+    if (to == 0 || to > total) to = total;
+    if (from >= to) return 0;
+    rtx_save_orig_walk(t->root, &cur, from, to, &flo, &fhi, &any);
+    if (!any) return 0;
+    if (file_lo) *file_lo = flo;
+    if (file_hi) *file_hi = fhi;
+    return fhi > flo ? fhi - flo : 0;
+}
+
 static void !>(CCError) rtx_write_node_from(RtxPieceTree *t, const RtxNode *n,
                                            int fd, size_t *cur, size_t from,
                                            size_t to, size_t *written,
-                                           size_t total) {
+                                           size_t total, const char *snap,
+                                           size_t snap_lo, size_t snap_n) {
     size_t piece_lo, piece_hi, a, z, off;
     char buf[RTX_PAGE_SIZE];
     if (!n) return cc_ok();
-    rtx_write_node_from(t, n->left, fd, cur, from, to, written, total) !>(e) {
+    rtx_write_node_from(t, n->left, fd, cur, from, to, written, total, snap,
+                        snap_lo, snap_n) !>(e) {
         return cc_err(e);
     };
     piece_lo = *cur;
@@ -1195,7 +1250,8 @@ static void !>(CCError) rtx_write_node_from(RtxPieceTree *t, const RtxNode *n,
         while (a < z) {
             size_t take = z - a;
             if (take > sizeof(buf)) take = sizeof(buf);
-            rtx_piece_read(t, &n->piece, off, buf, take) !>(e) {
+            rtx_piece_read_snap(t, &n->piece, off, buf, take, snap, snap_lo,
+                                snap_n) !>(e) {
                 return cc_err(e);
             };
             rtx_write_all(fd, buf, take) !>(e) { return cc_err(e); };
@@ -1208,11 +1264,14 @@ static void !>(CCError) rtx_write_node_from(RtxPieceTree *t, const RtxNode *n,
         }
     }
     *cur = piece_hi;
-    return rtx_write_node_from(t, n->right, fd, cur, from, to, written, total);
+    return rtx_write_node_from(t, n->right, fd, cur, from, to, written, total,
+                               snap, snap_lo, snap_n);
 }
 
-void !>(CCError) RtxPieceTree_write_fd_from(RtxPieceTree *t, int fd, size_t from,
-                                            size_t to) {
+void !>(CCError) RtxPieceTree_write_fd_from_snap(RtxPieceTree *t, int fd,
+                                                 size_t from, size_t to,
+                                                 const char *snap, size_t snap_lo,
+                                                 size_t snap_n) {
     size_t written = 0;
     size_t total;
     size_t cur = 0;
@@ -1222,12 +1281,18 @@ void !>(CCError) RtxPieceTree_write_fd_from(RtxPieceTree *t, int fd, size_t from
     if (to == 0 || to > total) to = total;
     if (from >= to) return cc_ok();
     total = to - from;
-    rtx_write_node_from(t, t->root, fd, &cur, from, to, &written, total) !>(e) {
+    rtx_write_node_from(t, t->root, fd, &cur, from, to, &written, total, snap,
+                        snap_lo, snap_n) !>(e) {
         rtx_busy_end(t);
         return cc_err(e);
     };
     rtx_busy_end(t);
     return cc_ok();
+}
+
+void !>(CCError) RtxPieceTree_write_fd_from(RtxPieceTree *t, int fd, size_t from,
+                                            size_t to) {
+    return RtxPieceTree_write_fd_from_snap(t, fd, from, to, NULL, 0, 0);
 }
 
 #include "piece_tree_lines.cch"
