@@ -948,6 +948,28 @@ int gui_alert_unsaved(size_t nfiles) {
     }
 }
 
+int gui_alert_changed(const char *path) {
+    NSAlert *alert;
+    NSModalResponse rc;
+    @autoreleasepool {
+        alert = [[NSAlert alloc] init];
+        alert.alertStyle = NSAlertStyleWarning;
+        alert.messageText = @"File changed on disk";
+        if (path && path[0])
+            alert.informativeText =
+                [NSString stringWithFormat:
+                    @"%s was modified by another program. Overwrite it?",
+                    path];
+        else
+            alert.informativeText =
+                @"This file was modified by another program. Overwrite it?";
+        [alert addButtonWithTitle:@"Overwrite"];
+        [alert addButtonWithTitle:@"Cancel"];
+        rc = [alert runModal];
+        return rc == NSAlertFirstButtonReturn ? 1 : 0;
+    }
+}
+
 int gui_save_panel(const char *dir, char *out, size_t n) {
     NSSavePanel *panel;
     NSModalResponse rc;

@@ -72,6 +72,10 @@ CC_TARGET piece_tree_smoke exe tests/piece_tree_smoke.ccs
 CC_TARGET_INCLUDE piece_tree_smoke .
 CC_TARGET_DEPS piece_tree_smoke rtx_piece_tree
 
+CC_TARGET utf8_cluster_smoke exe tests/utf8_cluster_smoke.ccs
+CC_TARGET_INCLUDE utf8_cluster_smoke .
+CC_TARGET_DEPS utf8_cluster_smoke rtx_piece_tree rtx_nav rtx_scope rtx_document
+
 CC_TARGET layout_measure_smoke exe tests/layout_measure_smoke.ccs
 CC_TARGET_INCLUDE layout_measure_smoke .
 CC_TARGET_DEPS layout_measure_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch

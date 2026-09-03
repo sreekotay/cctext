@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include "../core/document.cch"
 #include "../core/layout.cch"
@@ -70,6 +71,23 @@ static int try_type(RtxDoc *d, char[:] s, CCError *out) {
     }
     d->type(s) !>;
     return 0;
+}
+
+static int try_save(RtxDoc *d, CCError *out) {
+    @errhandler(CCError e) {
+        if (out) *out = e;
+        return 1;
+    }
+    d->save() !>;
+    return 0;
+}
+
+static void bump_mtime(const char *path) {
+    struct timeval tv[2];
+    tv[0].tv_sec = 1;
+    tv[0].tv_usec = 0;
+    tv[1] = tv[0];
+    expect(utimes(path, tv) == 0, "utimes bump");
 }
 
 static uint32_t test_u32le(const unsigned char *p) {
@@ -694,7 +712,7 @@ int main(void) {
     }
 
     {
-        /* Dest size drifted: fall back to a full raw copy of the on-disk file. */
+        /* Dest size drifted: refuse, then overwrite is a full raw copy. */
         RtxDoc d = {0} @destroy;
         const char *path = "testdata/generated/save_backup_drift.txt";
         const char *bak = "testdata/generated/save_backup_drift.txt~";
@@ -702,6 +720,8 @@ int main(void) {
         size_t n;
         int prev = rtx_doc_save_backup();
         FILE *ext;
+        CCError e = {0};
+        int saw;
         unlink(path);
         unlink(bak);
         write_cstr_path(path, "hello");
@@ -714,6 +734,11 @@ int main(void) {
             fclose(ext);
         }
         d.replace(0, 1, "H") !>;
+        expect(d.disk_changed(), "size drift is a conflict");
+        saw = try_save(&d, &e);
+        expect(saw && e.message && strstr(e.message, "changed"),
+               "drift save refuses");
+        d.save_overwrite();
         d.save() !>;
         n = read_path_bytes(path, got, sizeof(got));
         expect(n == 5 &&
@@ -1743,6 +1768,96 @@ int main(void) {
     }
 
     {
+        /* External change: save refuses; overwrite writes our buffer. */
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_conflict.txt";
+        CCError e = {0};
+        int saw;
+        FILE *f;
+        char got[32];
+        size_t n;
+        RtxUi ui = {0};
+        if (system("mkdir -p testdata/generated") != 0) expect(0, "mkdir");
+        unlink(path);
+        write_cstr_path(path, "hello");
+        d.from_path(path) !>;
+        expect(!d.disk_changed(), "open matches disk");
+        d.caret = d.len();
+        d.sel_anchor = d.caret;
+        d.type("!") !>;
+        write_cstr_path(path, "hello-ext");
+        bump_mtime(path);
+        expect(d.disk_changed(), "external write is a conflict");
+        saw = try_save(&d, &e);
+        expect(saw && e.message && strstr(e.message, "changed"),
+               "save refuses a drifted path");
+        expect_text(&d, "hello!", "buffer stays ours after refuse");
+        f = fopen(path, "r");
+        n = f ? fread(got, 1, sizeof(got), f) : 0;
+        if (f) fclose(f);
+        expect(n == 9 && ({ char[:] __s = cc_slice_from_buffer(got, 9);
+                            __s.eq_cstr("hello-ext"); }),
+               "disk stays the external bytes");
+        rtx_ui_offer_conflict(&ui);
+        expect(ui.ask_conflict, "conflict prompt open");
+        expect(rtx_ui_conflict_letter('s') == 1, "s overwrites");
+        expect(rtx_ui_conflict_letter('c') == 0, "c cancels");
+        ui.ask_conflict = 0;
+        d.save_overwrite();
+        d.save() !>;
+        expect(!d.dirty() && !d.disk_changed(), "overwrite restamps");
+        f = fopen(path, "r");
+        n = f ? fread(got, 1, sizeof(got), f) : 0;
+        if (f) fclose(f);
+        expect(n == 6 && ({ char[:] __s = cc_slice_from_buffer(got, 6);
+                            __s.eq_cstr("hello!"); }),
+               "overwrite writes our buffer");
+        unlink(path);
+        d.type("x") !>;
+        expect(!d.disk_changed(), "deleted dest is not a conflict");
+        d.save() !>;
+        expect(!d.dirty(), "save recreates a missing path");
+        unlink(path);
+    }
+
+    {
+        /* --backup + same-size external edit: overwrite is a full write. */
+        RtxDoc d = {0} @destroy;
+        const char *path = "testdata/generated/save_conflict_backup.txt";
+        int prev = rtx_doc_save_backup();
+        CCError e = {0};
+        int saw;
+        FILE *f;
+        char got[32];
+        size_t n;
+        if (system("mkdir -p testdata/generated") != 0) expect(0, "mkdir");
+        unlink(path);
+        write_cstr_path(path, "hello world");
+        rtx_doc_set_save_backup(1);
+        d.from_path(path) !>;
+        d.caret = 0;
+        d.sel_anchor = 5;
+        d.type("HELLO") !>;
+        write_cstr_path(path, "hello WORLD");
+        bump_mtime(path);
+        expect(d.disk_changed(), "same-size external is a conflict");
+        saw = try_save(&d, &e);
+        expect(saw && e.message && strstr(e.message, "changed"),
+               "backup save refuses a drifted path");
+        d.save_overwrite();
+        d.save() !>;
+        f = fopen(path, "r");
+        n = f ? fread(got, 1, sizeof(got), f) : 0;
+        if (f) fclose(f);
+        expect(n == 11 && ({ char[:] __s = cc_slice_from_buffer(got, 11);
+                             __s.eq_cstr("HELLO world"); }),
+               "overwrite does not splice the drifted tail");
+        rtx_doc_set_save_backup(prev);
+        unlink(path);
+        unlink("testdata/generated/save_conflict_backup.txt~");
+    }
+
+    {
         RtxDoc d = {0} @destroy;
         size_t used;
         int saw;
@@ -1991,6 +2106,58 @@ int main(void) {
         d.sel_anchor = 0;
         d.delete_forward() !>;
         expect(d.len() == 0, "delete_forward combining cluster");
+    }
+    {
+        RtxDoc d = {0} @destroy;
+        char zwj[11];
+        zwj[0] = (char)0xF0; zwj[1] = (char)0x9F; zwj[2] = (char)0x91;
+        zwj[3] = (char)0xA9;
+        zwj[4] = (char)0xE2; zwj[5] = (char)0x80; zwj[6] = (char)0x8D;
+        zwj[7] = (char)0xF0; zwj[8] = (char)0x9F; zwj[9] = (char)0x92;
+        zwj[10] = (char)0xBB;
+        d.from_buffer("") !>;
+        d.replace(0, 0, zwj.to_slice_n(11)) !>;
+        d.caret = 11;
+        d.sel_anchor = 11;
+        d.backspace() !>;
+        expect(d.len() == 0, "backspace deletes ZWJ emoji cluster");
+    }
+    {
+        RtxDoc d = {0} @destroy;
+        char zwj[11];
+        zwj[0] = (char)0xF0; zwj[1] = (char)0x9F; zwj[2] = (char)0x91;
+        zwj[3] = (char)0xA9;
+        zwj[4] = (char)0xE2; zwj[5] = (char)0x80; zwj[6] = (char)0x8D;
+        zwj[7] = (char)0xF0; zwj[8] = (char)0x9F; zwj[9] = (char)0x92;
+        zwj[10] = (char)0xBB;
+        d.from_buffer("") !>;
+        d.replace(0, 0, zwj.to_slice_n(11)) !>;
+        d.caret = 0;
+        d.sel_anchor = 0;
+        d.delete_forward() !>;
+        expect(d.len() == 0, "delete_forward ZWJ emoji cluster");
+    }
+    {
+        RtxDoc d = {0} @destroy;
+        char flag[8];
+        flag[0] = (char)0xF0; flag[1] = (char)0x9F; flag[2] = (char)0x87;
+        flag[3] = (char)0xBA;
+        flag[4] = (char)0xF0; flag[5] = (char)0x9F; flag[6] = (char)0x87;
+        flag[7] = (char)0xB8;
+        d.from_buffer("") !>;
+        d.replace(0, 0, flag.to_slice_n(8)) !>;
+        {
+            size_t _v = d.cluster_next(0) !>;
+            expect(_v == 8, "doc cluster_next flag");
+        }
+        {
+            size_t _v = d.cluster_align(4) !>;
+            expect(_v == 0, "doc cluster_align mid-flag");
+        }
+        d.caret = 8;
+        d.sel_anchor = 8;
+        d.backspace() !>;
+        expect(d.len() == 0, "backspace deletes RI flag cluster");
     }
 
     {

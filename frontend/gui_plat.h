@@ -132,6 +132,9 @@ void gui_clear_close(void); /* cancel WindowShouldClose latch */
  */
 int gui_alert_unsaved(size_t nfiles);
 
+/* File-changed-on-disk NSAlert. Returns 1=Overwrite, 0=Cancel. */
+int gui_alert_changed(const char *path);
+
 /* NSSavePanel; 1=path chosen, 0=cancel, -1=unavailable. */
 int gui_save_panel(const char *dir, char *out, size_t n);
 

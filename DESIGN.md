@@ -88,8 +88,8 @@ camera plants the same dest-live walk. `g L` is a prefix pump
 EOF. The gutter is a **live origin** (`mark_off` / `mark_line`) plus
 `seek_rel`. Once keyed, local scroll keeps painting absolute `L`. A
 far seek (>8 KiB) drops the origin and goes back to red `+N` / `-L`
-unless a planted 1/16 pin is next to the landing — then that pin
-re-keys the origin. Slot `i` is byte `i * len / 16` (vacant =
+unless a planted 1/32 pin is next to the landing — then that pin
+re-keys the origin. Slot `i` is byte `i * len / 32` (vacant =
 `(size_t)-1`). Prefix cover or a connected island plants a pin and
 keys the origin (island does not have to sit on a slot). An edit
 wipes pins at or after the byte and clears the origin (BOF slot 0
@@ -240,8 +240,12 @@ plus the old bytes that were about to be overwritten. A pure append writes
 no `path~`.
 If the dest is another path or the size drifted, fall back to a full copy
 then truncate+write. Crash mid-write can leave a mixed target; `path~` is
-the recovery. Save does not refuse an external change; Safe journals do
-(mtime + size + inode) and toss hist on mismatch.
+the recovery. Save stamps mtime + size + inode at open and after a
+successful write. A later save of that same path refuses if the identity
+drifted (`file changed on disk`) unless the user overwrites — then the
+write is whole-file, not a `--backup` dirty span. A missing dest is not
+a conflict (recreate). `--batch` save fails with that error; it does not
+overwrite. Safe journals use the same triple and toss hist on mismatch.
 
 `--batch` is a headless command host (no TTY): `-c` lines or a stdin script.
 Verbs are semantic (`goto @N` / `N%` / `LN`, `await index|island`, `print`,
@@ -254,8 +258,9 @@ Browse-away does not ask and does not write the user’s path. It flushes the jo
 ## Encoding
 
 Offsets, caret, selection, and the piece tree are bytes. Text views walk
-**clusters** for motion, wrap, hit-test, backspace, and measure (a UTF-8 scalar
-plus following combining marks / variation selectors). Hex is a paint of that same editor, not a second one: caret, selection,
+**extended grapheme clusters** (UAX #29 GB3–GB13: combining marks, ZWJ emoji,
+regional-indicator flags, Hangul, Indic conjuncts) for motion, wrap, hit-test,
+backspace, and measure. Hex is a paint of that same editor, not a second one: caret, selection,
 and unlock stay on the camera / document. Grid is the same: one record
 per newline whose window-lex face is not STRING (the grammar's begin/end,
 via lookback — not a CSV quote walker). No lex: every NL is a record.
@@ -278,5 +283,7 @@ byte (and resets to the high nibble). On a hex pane, `type` accepts only
 `0-9a-fA-F` and overwrites that nibble. The dump is display (UTF-8 lead,
 continuation ·, else .), not a caret of its own. Leaving hex with a
 collapsed caret snaps it to a cluster start. `read_at` stays bytes.
-Invalid bytes are one-byte clusters (U+FFFD, width 1). Full UAX #29 graphemes
-(ZWJ emoji, flags) are later.
+Invalid bytes are one-byte clusters (U+FFFD, width 1). Cluster width is the
+cluster, not only the first scalar: ZWJ emoji, RI flags, and VS16 emoji
+presentation are 2 columns; extend/ZWJ glue adds none; otherwise the first
+scalar’s East-Asian / `rtx_utf8_cp_width` policy (then `cols >= 1`).
