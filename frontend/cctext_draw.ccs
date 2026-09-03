@@ -800,18 +800,425 @@ static void cctext_browse_ent(int row, int col0, int pcols, int pad_rest,
     if (!pad_rest) fputs("\x1b[K", stdout);
 }
 
-static void cctext_draw_browse(RtxBrowse *br, const RtxUi *ui, int focused, int vis,
-                               int pcols, int col0, int pad_rest) {
+static double cctext_prev_measure(void *ctx, char[:] bytes, RtxStyle style,
+                                 RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return (double)rtx_utf8_cols(bytes);
+}
+
+static double cctext_prev_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+static void cctext_draw_browse_prev_hex(RtxBrowsePrev *pv, int row0, int col0,
+                                        int cols, int vis, int pad_rest) {
+    size_t r;
+    size_t n;
+    static const char *hexd = "0123456789ABCDEF";
+    size_t htop;
+    if (!pv || !pv->live) return;
+    n = pv->doc.len();
+    htop = pv->cam.top_byte;
+    if (!htop && pv->cam.seek_valid) htop = pv->cam.seek_off;
+    htop = rtx_hex_align(htop);
+    for (r = 0; r < (size_t)vis; r++) {
+        size_t off = rtx_hex_row_off(htop, r);
+        unsigned char win[RTX_HEX_DUMP_WIN];
+        unsigned char *row;
+        RtxHexDumpCell dump[RTX_HEX_COLS];
+        size_t take = (size_t)RTX_HEX_COLS;
+        size_t look = 0, tail = 0, got = 0, k;
+        int used = 0;
+        fprintf(stdout, "\x1b[%d;%dH", row0 + (int)r, col0);
+        if (off >= n && !(n == 0 && r == 0)) {
+            fputs("\x1b[90m~\x1b[0m", stdout);
+            used = 1;
+            cctext_browse_pad(cols - used, 0);
+            fputs("\x1b[0m", stdout);
+            if (!pad_rest) fputs("\x1b[K", stdout);
+            continue;
+        }
+        if (take > n - off) take = n - off;
+        look = rtx_hex_dump_look(off);
+        tail = rtx_hex_dump_tail(off, take, n);
+        {
+            size_t wn = 0;
+            size_t want = look + take + tail;
+            if (want) {
+                @errhandler(CCError e) {
+                    (void)e;
+                    wn = 0;
+                }
+                wn = pv->doc.read_at(off - look, (char *)win, want) !>;
+            }
+            if (wn > look) {
+                got = wn - look;
+                if (got > take) got = take;
+            }
+            rtx_hex_dump_row(win, wn, look, got, dump);
+        }
+        row = win + look;
+        if (used + RTX_HEX_OFF_W <= cols) {
+            fprintf(stdout, "\x1b[34m%0*zX \x1b[0m", RTX_HEX_OFF_W - 1, off);
+            used += RTX_HEX_OFF_W;
+        }
+        for (k = 0; k < (size_t)RTX_HEX_COLS && used + 3 <= cols; k++) {
+            size_t at = off + k;
+            int here = k < got && pv->doc.caret == at;
+            int sel = k < got && rtx_browse_prev_sel(&pv->doc, at);
+            if (sel || here) fputs(here ? "\x1b[7m" : "\x1b[44m", stdout);
+            if (k < got) {
+                fputc(hexd[(row[k] >> 4) & 0xF], stdout);
+                fputc(hexd[row[k] & 0xF], stdout);
+            } else {
+                fputs("  ", stdout);
+            }
+            if (sel || here) fputs("\x1b[0m", stdout);
+            fputc(' ', stdout);
+            used += 3;
+        }
+        if (used + RTX_HEX_GAP <= cols) {
+            int g;
+            for (g = 0; g < RTX_HEX_GAP; g++) fputc(' ', stdout);
+            used += RTX_HEX_GAP;
+        }
+        for (k = 0; k < (size_t)RTX_HEX_COLS && used < cols; k++) {
+            if (k >= got || dump[k].kind == RTX_HEX_DUMP_EMPTY) {
+                fputc(' ', stdout);
+            } else {
+                if (dump[k].kind == RTX_HEX_DUMP_CONT) fputs("\x1b[90m", stdout);
+                fwrite(dump[k].utf8, 1, (size_t)(dump[k].n > 0 ? dump[k].n : 1),
+                       stdout);
+                if (dump[k].kind == RTX_HEX_DUMP_CONT) fputs("\x1b[0m", stdout);
+            }
+            used++;
+        }
+        cctext_browse_pad(cols - used, 0);
+        fputs("\x1b[0m", stdout);
+        if (!pad_rest) fputs("\x1b[K", stdout);
+    }
+}
+
+static void cctext_draw_browse_prev_text(RtxBrowsePrev *pv, int row0, int col0,
+                                         int cols, int vis, int pad_rest) {
+    size_t r;
+    size_t skip;
+    if (!pv || !pv->live) return;
+    skip = pv->cam.top_wrap;
+    for (r = 0; r < (size_t)vis; r++) {
+        size_t ri = r + skip;
+        int used = 0;
+        fprintf(stdout, "\x1b[%d;%dH", row0 + (int)r, col0);
+        if (ri >= pv->layout.rows.len) {
+            fputs("\x1b[90m~\x1b[0m", stdout);
+            used = 1;
+            cctext_browse_pad(cols - used, 0);
+            fputs("\x1b[0m", stdout);
+            if (!pad_rest) fputs("\x1b[K", stdout);
+            continue;
+        }
+        {
+            RtxVisRow *row = &pv->layout.rows.data[ri];
+            size_t k = 0;
+            size_t col = 0;
+            size_t virt = 0;
+            int span_ok = 1;
+            int last_sel = -1, last_here = -1, last_bold = -1;
+            CCArena scratch = {0};
+            char[:] bytes = cc_slice_empty();
+            RtxScope last_scope = (RtxScope)-1;
+            if (row->byte_len) {
+                scratch = cc_arena_heap(row->byte_len + 64);
+                if (!scratch.base) span_ok = 0;
+            }
+            {
+                @errhandler(CCError e) {
+                    (void)e;
+                    span_ok = 0;
+                }
+                bytes = pv->doc.scratch_span(row->byte_start, row->byte_len,
+                                             scratch) !>;
+            }
+            if (!span_ok) {
+                if (scratch.base) scratch.destroy();
+                cctext_browse_pad(cols, 0);
+                fputs("\x1b[0m", stdout);
+                if (!pad_rest) fputs("\x1b[K", stdout);
+                continue;
+            }
+            while (k < bytes.len && col < (size_t)cols) {
+                RtxUtf8Cl cl = rtx_utf8_cluster(bytes, k);
+                size_t step = cl.n ? cl.n : 1;
+                size_t off = row->byte_start + k;
+                RtxStyle st = pv->doc.style_at(off);
+                int here = pv->doc.caret == off;
+                int sel = rtx_browse_prev_sel(&pv->doc, off);
+                char put[RTX_UTF8_LOOK];
+                int pn = rtx_utf8_term_put(cl.cp, bytes.ptr + k, step, put,
+                                           sizeof(put));
+                int pc = rtx_utf8_term_cols(cl.cp, cl.cols);
+                if (pc < 1) pc = 0;
+                if ((size_t)pc > 0 && virt < pv->cam.left_col) {
+                    virt += (size_t)pc;
+                    k += step;
+                    continue;
+                }
+                if ((size_t)pc > 0 && col + (size_t)pc > (size_t)cols) break;
+                if (st.scope != last_scope || (int)st.bold != last_bold ||
+                    sel != last_sel || here != last_here) {
+                    fputs("\x1b[0m", stdout);
+                    cctext_style(st, sel, here);
+                    last_scope = st.scope;
+                    last_bold = (int)st.bold;
+                    last_sel = sel;
+                    last_here = here;
+                }
+                if (pn > 0) fwrite(put, 1, (size_t)pn, stdout);
+                col += (size_t)pc;
+                virt += (size_t)pc;
+                k += step;
+            }
+            used = (int)col;
+            if (scratch.base) scratch.destroy();
+        }
+        fputs("\x1b[0m", stdout);
+        cctext_browse_pad(cols - used, 0);
+        fputs("\x1b[0m", stdout);
+        if (!pad_rest) fputs("\x1b[K", stdout);
+    }
+}
+
+static void cctext_draw_browse_prev_rail(RtxBrowsePrev *pv, int focused,
+                                        int vis, int row, int screen_row,
+                                        int col) {
+    RtxScrollRail rail;
+    int ty, th;
+    char ch;
+    const char *fg;
+    int on_thumb, on_mark, mark;
+    if (!pv || !pv->live || vis < 1 || col < 1 || row < 0 || row >= vis)
+        return;
+    rail = rtx_browse_prev_rail(pv, vis);
+    rtx_scroll_rail_thumb(&rail, vis, 1, &ty, &th);
+    mark = rtx_scroll_rail_mark_y(&rail, vis, pv->doc.caret);
+    on_thumb = (row >= ty && row < ty + th);
+    on_mark = row == mark;
+    if (on_thumb) {
+        ch = '#';
+        if (on_mark)
+            fg = focused ? "\x1b[7;33m" : "\x1b[7;90m";
+        else
+            fg = rail.ready ? (focused ? "\x1b[7;37m" : "\x1b[7;90m")
+                            : (focused ? "\x1b[7;33m" : "\x1b[7;90m");
+    } else if (on_mark) {
+        ch = '+';
+        fg = focused ? "\x1b[33m" : "\x1b[90m";
+    } else if (!rail.ready && row == vis - 1) {
+        ch = '+';
+        fg = "\x1b[33m";
+    } else {
+        ch = '|';
+        fg = "\x1b[90m";
+    }
+    fprintf(stdout, "\x1b[%d;%dH%s%c\x1b[0m", screen_row, col, fg, ch);
+}
+
+static void cctext_draw_browse_prev_grid(RtxBrowsePrev *pv, int row0, int col0,
+                                        int cols, int vis, int pad_rest) {
+    size_t r;
+    int hdr;
+    if (!pv || !pv->live || cols < 1 || vis < 1) return;
+    hdr = pv->layout.grid_hdr_on;
+    for (r = 0; r < (size_t)vis; r++) {
+        int is_hdr = hdr && r == 0;
+        size_t idx = is_hdr ? 0 : r - (size_t)hdr + pv->cam.top_wrap;
+        int used = 0;
+        fprintf(stdout, "\x1b[%d;%dH", row0 + (int)r, col0);
+        if (!is_hdr && idx >= pv->layout.rows.len) {
+            fputs("\x1b[90m~\x1b[0m", stdout);
+            used = 1;
+            cctext_browse_pad(cols - used, 0);
+            fputs("\x1b[0m", stdout);
+            if (!pad_rest) fputs("\x1b[K", stdout);
+            continue;
+        }
+        {
+            RtxVisRow head;
+            RtxVisRow *row;
+            size_t c, col = 0, virt = 0;
+            int span_ok = 1;
+            CCArena heap = {0};
+            char[:] bytes = cc_slice_empty();
+            if (is_hdr) {
+                head.byte_start = 0;
+                head.byte_len = pv->layout.grid_hdr_end;
+                head.line = 0;
+                head.wrap_i = 0;
+                head.width = 0;
+                head.height = 1;
+                head.sec = RTX_SEC_CODE;
+                row = &head;
+                fputs("\x1b[48;5;236m", stdout);
+            } else {
+                row = &pv->layout.rows.data[idx];
+            }
+            if (row->byte_len) {
+                heap = cc_arena_heap(row->byte_len + 64);
+                if (!heap.base) span_ok = 0;
+                else {
+                    @errhandler(CCError e) {
+                        (void)e;
+                        span_ok = 0;
+                    }
+                    bytes = pv->doc.scratch_span(row->byte_start, row->byte_len,
+                                                 heap) !>;
+                }
+            }
+            if (!span_ok) {
+                if (heap.base) heap.destroy();
+                cctext_browse_pad(cols, 0);
+                fputs("\x1b[0m", stdout);
+                if (!pad_rest) fputs("\x1b[K", stdout);
+                continue;
+            }
+            for (c = 0; c < pv->layout.grid.ncols && col < (size_t)cols; c++) {
+                RtxGridField cell;
+                int cw = pv->layout.grid.col_w[c];
+                int used_c = 0;
+                if (cw <= 0) break;
+                rtx_grid_bind_span(&pv->layout.grid, row->byte_start, bytes.len);
+                if (!rtx_grid_cell_wrap(bytes.ptr, bytes.len, &pv->layout.grid, c,
+                                        (int)row->wrap_i, &cell)) {
+                    cell.lo = 0;
+                    cell.hi = 0;
+                }
+                {
+                    size_t k = cell.lo;
+                    while (k < cell.hi && used_c < cw) {
+                        RtxUtf8Cl cl = rtx_utf8_cluster(bytes, k);
+                        size_t step = cl.n ? cl.n : 1;
+                        size_t off = row->byte_start + k;
+                        RtxStyle st = pv->doc.style_at(off);
+                        char put[RTX_UTF8_LOOK];
+                        int pn = rtx_utf8_term_put(cl.cp, bytes.ptr + k, step,
+                                                   put, sizeof(put));
+                        int pc = rtx_utf8_term_cols(cl.cp, cl.cols);
+                        int here = pv->doc.caret == off;
+                        int sel = rtx_browse_prev_sel(&pv->doc, off);
+                        if (pc < 1) pc = 1;
+                        if (used_c + pc > cw) break;
+                        if (virt >= pv->cam.left_col && col < (size_t)cols) {
+                            fputs("\x1b[0m", stdout);
+                            if (is_hdr) fputs("\x1b[48;5;236m", stdout);
+                            cctext_style(st, sel, here);
+                            if (pn > 0) fwrite(put, 1, (size_t)pn, stdout);
+                            col += (size_t)pc;
+                        }
+                        virt += (size_t)pc;
+                        used_c += pc;
+                        k += step;
+                    }
+                }
+                fputs("\x1b[0m", stdout);
+                if (is_hdr) fputs("\x1b[48;5;236m", stdout);
+                while (used_c < cw) {
+                    if (virt >= pv->cam.left_col && col < (size_t)cols) {
+                        fputc(' ', stdout);
+                        col++;
+                    }
+                    virt++;
+                    used_c++;
+                }
+                if (c + 1 < pv->layout.grid.ncols) {
+                    if (virt >= pv->cam.left_col && col < (size_t)cols) {
+                        fputs("\x1b[90m \x1b[0m", stdout);
+                        if (is_hdr) fputs("\x1b[48;5;236m", stdout);
+                        col++;
+                    }
+                    virt++;
+                }
+            }
+            used = (int)col;
+            if (heap.base) heap.destroy();
+        }
+        fputs("\x1b[0m", stdout);
+        cctext_browse_pad(cols - used, 0);
+        fputs("\x1b[0m", stdout);
+        if (!pad_rest) fputs("\x1b[K", stdout);
+    }
+}
+
+static void cctext_draw_browse_prev(RtxWs *w, int pane, int row0, int col0,
+                                    int cols, int vis, int pad_rest,
+                                    int focused) {
+    RtxBrowsePrev *pv;
+    RtxMeasure m;
+    const char *msg = NULL;
+    RtxBrowseFace face = RTX_BROWSE_FACE_FILE;
+    int rw = cols > 1 ? 1 : 0;
+    int text_c = cols - rw;
+    if (!w || cols < 1 || vis < 1) return;
+    if (text_c < 1) text_c = 1;
+    m.measure = cctext_prev_measure;
+    m.line_height = cctext_prev_lh;
+    m.ctx = NULL;
+    w->browse_prev_sync(pane, &m, (double)text_c, vis) !>(e) { (void)e; };
+    pv = &w->prev[pane];
+    if (pv->kind == RTX_BROWSE_PREV_DIR) {
+        msg = " directory";
+        face = RTX_BROWSE_FACE_DIR;
+    } else if (pv->kind == RTX_BROWSE_PREV_FAIL) {
+        msg = " cannot open";
+        face = RTX_BROWSE_FACE_DENY;
+    } else if (pv->kind == RTX_BROWSE_PREV_EMPTY) {
+        msg = "";
+    } else if (pv->live) {
+        int r;
+        if (rtx_layout_is_hex(&pv->layout))
+            cctext_draw_browse_prev_hex(pv, row0, col0, text_c, vis, pad_rest);
+        else if (rtx_layout_is_grid(&pv->layout))
+            cctext_draw_browse_prev_grid(pv, row0, col0, text_c, vis, pad_rest);
+        else
+            cctext_draw_browse_prev_text(pv, row0, col0, text_c, vis, pad_rest);
+        if (rw) {
+            for (r = 0; r < vis; r++)
+                cctext_draw_browse_prev_rail(pv, focused, vis, r, row0 + r,
+                                             col0 + cols - 1);
+        }
+        return;
+    }
+    {
+        int r;
+        for (r = 0; r < vis; r++) {
+            cctext_browse_row(row0 + r, col0, cols, pad_rest, 0,
+                              r == 0 ? msg : "", face);
+        }
+    }
+}
+
+static void cctext_draw_browse(RtxWs *w, int pane, const RtxUi *ui, int focused,
+                               int vis, int pcols, int col0, int pad_rest) {
+    RtxBrowse *br;
     char line[512];
     int r;
     size_t list, i;
+    int list_w;
+    int prev_w;
+    if (!w) return;
+    br = &w->nav[pane];
     if (!br) return;
     rtx_browse_scroll(br, vis);
+    list_w = rtx_browse_list_cols(pcols);
+    prev_w = pcols - list_w;
     snprintf(line, sizeof(line), " %s", br->dir);
     cctext_browse_row(1, col0, pcols, pad_rest, 0, line, RTX_BROWSE_FACE_PATH);
     {
         int used = 0;
-        int i;
         fprintf(stdout, "\x1b[%d;%dH", 2, col0);
         cctext_browse_face(0, RTX_BROWSE_FACE_GLOB);
         fputs(" glob: ", stdout);
@@ -824,17 +1231,32 @@ static void cctext_draw_browse(RtxBrowse *br, const RtxUi *ui, int focused, int 
     }
     {
         int head = rtx_browse_head(br);
+        int list_pad = prev_w > 0 ? 1 : pad_rest;
         list = (vis > head) ? (size_t)(vis - head) : 0;
         for (i = 0; i < list; i++) {
             size_t idx = br->top + i;
             r = head + 1 + (int)i;
             if (idx >= br->len) {
-                cctext_browse_row(r, col0, pcols, pad_rest, 0, "",
+                cctext_browse_row(r, col0, list_w, list_pad, 0, "",
                                   RTX_BROWSE_FACE_FILE);
                 continue;
             }
-            cctext_browse_ent(r, col0, pcols, pad_rest,
+            cctext_browse_ent(r, col0, list_w, list_pad,
                               focused && idx == br->cur, br, &br->ents[idx]);
+        }
+        if (prev_w > 0) {
+            int gap = prev_w > 1 ? 1 : 0;
+            int pc = prev_w - gap;
+            int pr0 = head + 1;
+            int pvis = vis > head ? vis - head : 0;
+            size_t j;
+            for (j = 0; j < list && gap; j++) {
+                fprintf(stdout, "\x1b[%d;%dH\x1b[90m│\x1b[0m",
+                        head + 1 + (int)j, col0 + list_w);
+            }
+            if (pc > 0 && pvis > 0)
+                cctext_draw_browse_prev(w, pane, pr0, col0 + list_w + gap, pc,
+                                        pvis, pad_rest, focused);
         }
     }
 }
@@ -1198,7 +1620,7 @@ void cctext_draw(RtxWs *w, RtxUi *ui, int rows, int cols) {
             RtxBrowse *br = &w->nav[p];
             int held = w->hold_pane(p);
             if (br && br->on)
-                cctext_draw_browse(br, ui, p == w->focus, vis, pcols, col0, pad_left);
+                cctext_draw_browse(w, p, ui, p == w->focus, vis, pcols, col0, pad_left);
             else
                 cctext_draw_pane(b, ui, p == w->focus, vis, pcols, col0, pad_left,
                                  g_status, sizeof(g_status), g_mouse_row);

@@ -32,7 +32,7 @@ From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt
 - **TUI and GUI.** Same document core: **cctext** (POSIX console) and **cctext-gui** (Cocoa + Core Text).
 - **Hex / grid.** `Ctrl-L` cycles default → wrap → hex (offset | hex | UTF-8 dump) → grid (CSV/TSV/pipe columns).
 - **Multiview.** Several files, splits, two cameras on one document. Unlock (`Ctrl-U`) lets a pane scroll off the caret.
-- **File browser.** No filename opens it. `b` / `Ctrl-B` opens the built-in browser (glob, walk directories) into the focused view; `o` / `Ctrl-O` does the same. In the GUI, **File → Browse** is ⌘B (⌘O aliases it); **File → Open…** is the system dialog with no shortcut. In the browser, `Ctrl-O` / `Cmd-O` launches this frontend on the selection; `e` / `Ctrl-E` launches the other (`cctext` ↔ `cctext-gui`). A new **cctext** opens in the host terminal (Cursor when you launched from there; iTerm or Terminal.app otherwise). **cctext-gui** is a window, not a terminal. The current folder (not `..`) sizes itself with a pumped walk — the total counts up, pauses if you leave, and resumes when you return. Enter still opens in this instance. A missing path asks to create an empty file.
+- **File browser.** No filename opens it. `b` / `Ctrl-B` opens the built-in browser (glob, walk directories) into the focused view; `o` / `Ctrl-O` does the same. In the GUI, **File → Browse** is ⌘B (⌘O aliases it); **File → Open…** is the system dialog with no shortcut. The listing sits on the left; a read-only preview of the selection fills the right when the pane is wide enough. The preview shows the same byte-rail scrollbar as the editor; click the preview (or the rail) to open the file. The preview loads that file’s Safe journal (recovered edits, caret, selection, camera, view) and does not write one. Ctrl-L still cycles the preview without flushing. `Ctrl-L` cycles the preview through default / wrap / hex / grid (same as the editor). In the browser, `Ctrl-O` / `Cmd-O` launches this frontend on the selection; `e` / `Ctrl-E` launches the other (`cctext` ↔ `cctext-gui`). A new **cctext** opens in the host terminal (Cursor when you launched from there; iTerm or Terminal.app otherwise). **cctext-gui** is a window, not a terminal. The current folder (not `..`) sizes itself with a pumped walk — the total counts up, pauses if you leave, and resumes when you return. Enter still opens in this instance. A missing path asks to create an empty file.
 - **Deep search.** Typing a fragment filters this directory first, then a `> Flattened search` row and nested matches append below. `>` skips the local listing and flattens immediately. A fragment is case-insensitive; `*.txt` is a real glob and stays a local listing so you can still walk directories.
 - **TextMate grammars.** Drop any `.tmLanguage.json` into `grammars/` (or `RTX_GRAMMARS`) — loaded live, no rebuild. Window lex, not a full-file pass. Shipped: C/CC, JSON, Markdown, CSS, CSV/TSV/pipe, HTML, YAML, shell, Python, JS/TS.
 - **Marks and folds.** `Ctrl-K/P` steps highlight marks already in the window (`Ctrl-E/R` for `invalid`). `Ctrl-T` folds a heading or a `{}`/`[]`/`()` pair whose other end is within a page of the caret (256KiB analysis page, plus one neighbor). The matching pair is painted while the caret sits in it. No scan, no AST.
@@ -73,17 +73,18 @@ A **file journal** is the named buffer’s session:
 - Flattened undo/redo (inserts and deletes as bytes, including piece-ref deletes). Dirty is `hist.head != saved_head`.
 - Caret, stream selection, and box columns.
 - Camera: line or byte (`top` / `seek_off`), wrap row, `left_col`, hex nibble, view, unlock, pin.
+- A live gutter origin (`mark_line` + `seek_rel`) plus up to 16 line→byte pins at 1/16 file fractions (vacant until known). Pins re-key the origin on land / reopen; they are not a paint-time gate. An edit drops the origin and every pin at or after that byte.
 - Identity of the file on disk when the journal was written (mtime + size + inode).
 
 A **workspace snapshot** is the last session: open paths, dirty bits, view per file, and the split (pane count, focus, which buffers are showing). It is not the document bytes.
 
-Not stored: find, clipboard, folds, highlight runs, the line-index prefix.
+Not stored: find, clipboard, folds, highlight runs, the full line-index prefix.
 
 ### When it writes
 
 Both frontends call `safe_pump` every frame:
 
-1. **~250 ms after an edit** — debounce when `edit_gen` / `saved_head` change on a live named buffer.
+1. **~250 ms after the last session change** — last-change debounce when hist (`edit_gen` / `saved_head`) **or** caret / selection / camera (seek, view, wrap, hex, `left_col`) / line-mark change on a live named buffer. A jump or a drag with no type still writes once you pause. Dragging does not rewrite the full hist every 250 ms.
 2. **Browse away** — flush the journal, then **park** (evict the document from RAM). Live set is the pane slots. Returning unparks and reloads from path + journal. Browse does not ask and does not write your path.
 3. **Unsaved-quit prompt** — flush everything first so a crash mid-dialog is recoverable.
 4. **After a real Save** — journal refreshed to match clean hist.
@@ -95,9 +96,9 @@ Both frontends call `safe_pump` every frame:
 
 Launch with **no files** and the last workspace comes back: parked paths stay on disk until a pane shows them, then they unpark. Launch with a path and that file’s journal is applied after `from_path`.
 
-On load, a journal whose identity no longer matches the file on disk **tosses hist** (camera may still apply). You see the file as it is; it is not dirty — there are no recovered edits. A corrupt or version-mismatched journal is ignored the same way.
+On load, a journal whose identity no longer matches the file on disk **tosses hist** (camera may still apply). You see the file as it is; it is not dirty — there are no recovered edits. A corrupt journal, or one whose version is below `RTX_SAFE_FILE_VER_MIN` or newer than this build (`RTX_SAFE_FILE_VER`), is ignored the same way. File journals are `RTXS` + a little-endian version (now 5: 1/16 pins + origin byte). Workspace snapshots are `RTXW` + an exact version match.
 
-Quit with **Don't save** / `q` **drops** dirty journals so the next open is the file on disk. A later “suspend quit” is not this cut.
+Quit with **Don't save** / `q` **drops** dirty journals so the next open is the file on disk. The TUI does not flush again after that drop. A later “suspend quit” is not this cut.
 
 ## Setup
 

@@ -13,10 +13,6 @@ Browse, find, and island plants: `@serial { noop = … }` on the caller;
 worker is an expression (`rtx_find_run` / `rtx_isle_run` /
 `rtx_*_listing_arm`), not `noop = …`.
 
-Dest-live `@parallel wait` index loops use `for`, not `@for`.
-
-`!>` inside `document.cch` (early, before the TU’s result specs) failed
-clang: `unknown type name 'CCResult_int_RtxIndexErr'` in `__cc_uw_is_err`.
 Destroy / invalidate join with `cc__parallel_cancel_tree` + `cc_parallel_join`,
 not UFCS `h.wait() !>`.
 

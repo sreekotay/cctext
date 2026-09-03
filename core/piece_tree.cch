@@ -56,6 +56,18 @@ static inline RtxIndexErr rtx_index_from_cc(CCError e) {
  * Same ballpark as RTX_HL_FULL_MAX / RTX_MARKUP_SCAN_MAX — a 2MiB first
  * keystroke must not finish a full-file index. */
 #define RTX_LINE_SOFT_MIN (256 * 1024)
+/* Known (byte → 0-based line) samples. Safe journals at most this many.
+ * Slots are i/16 of the file; vacant line is RTX_LINE_PIN_EMPTY. */
+#define RTX_LINE_MARK_MAX 16
+#define RTX_LINE_PIN_EMPTY ((size_t)-1)
+#ifndef RTX_LINE_PIN_NEAR
+#define RTX_LINE_PIN_NEAR 8192 /* same window as RTX_LINE_FLOOR_MAX */
+#endif
+
+typedef struct {
+    size_t off;
+    size_t line; /* 0-based at off; RTX_LINE_PIN_EMPTY if vacant */
+} RtxLineMark;
 #ifndef RTX_ISLE_CAP
 #define RTX_ISLE_CAP 4
 #endif
@@ -116,10 +128,18 @@ struct RtxPieceTree {
     /* Progressive newline scan (valid when !lf_ready). */
     size_t line_scan_off;  /* next byte to read */
     size_t scan_line;      /* newlines seen so far */
+    /* 16 file-fraction pins (i/16 of len). line == RTX_LINE_PIN_EMPTY
+     * until we know that slot. An edit wipes pins at/after the byte.
+     * Pins re-key the live origin; they are not a paint-time gate. */
+    RtxLineMark pins[RTX_LINE_MARK_MAX];
+    /* Live gutter origin. seek_rel is LFs from mark_off. */
+    size_t mark_off;
+    size_t mark_line;
+    unsigned mark_valid : 1;
     /* One mid-file island. land / % jump plants a dest-live wait-for
      * that counts LFs backward to the prefix. Write stage publishes
      * isle_from / isle_before. Not a second line_off — gutter uses
-     * +N / -L until they meet. */
+     * +N / -L until they meet, or a planted mark. */
     size_t isle_anchor;
     size_t isle_from;
     size_t isle_to;
@@ -235,6 +255,135 @@ static inline size_t rtx_line_known_now(const RtxPieceTree *t) {
     if (!t) return 1;
     return t->scan_line + 1;
 }
+
+static inline size_t rtx_line_pin_slot(size_t off, size_t len) {
+    size_t s;
+    if (len == 0) return 0;
+    s = (size_t)(((unsigned long long)off * (unsigned long long)RTX_LINE_MARK_MAX) /
+                 (unsigned long long)len);
+    if (s >= RTX_LINE_MARK_MAX) s = RTX_LINE_MARK_MAX - 1;
+    return s;
+}
+
+static inline size_t rtx_line_pin_target(size_t slot, size_t len) {
+    if (slot >= RTX_LINE_MARK_MAX) slot = RTX_LINE_MARK_MAX - 1;
+    if (len == 0) return 0;
+    return (size_t)(((unsigned long long)slot * (unsigned long long)len) /
+                    (unsigned long long)RTX_LINE_MARK_MAX);
+}
+
+static inline void rtx_line_pins_reset(RtxPieceTree *t) {
+    size_t i;
+    if (!t) return;
+    for (i = 0; i < RTX_LINE_MARK_MAX; i++) {
+        t->pins[i].off = 0;
+        t->pins[i].line = RTX_LINE_PIN_EMPTY;
+    }
+    t->pins[0].off = 0;
+    t->pins[0].line = 0;
+    t->mark_off = 0;
+    t->mark_line = 0;
+    t->mark_valid = 0;
+}
+
+static inline void rtx_line_origin_clear(RtxPieceTree *t) {
+    if (!t) return;
+    t->mark_off = 0;
+    t->mark_line = 0;
+    t->mark_valid = 0;
+}
+
+/* Slot table only. No-op when `off` is not within RTX_LINE_PIN_NEAR of i/16. */
+static inline void rtx_line_pin_learn(RtxPieceTree *t, size_t off, size_t line) {
+    size_t len, slot, tgt, dist;
+    if (!t) return;
+    len = RtxPieceTree_len(t);
+    slot = rtx_line_pin_slot(off, len);
+    tgt = rtx_line_pin_target(slot, len);
+    dist = off > tgt ? off - tgt : tgt - off;
+    if (dist > (size_t)RTX_LINE_PIN_NEAR) return;
+    t->pins[slot].off = off;
+    t->pins[slot].line = line;
+}
+
+/* Key the live origin. Also plants a 1/16 slot when `off` sits on one. */
+static inline void rtx_line_origin_key(RtxPieceTree *t, size_t off, size_t line) {
+    if (!t) return;
+    t->mark_off = off;
+    t->mark_line = line;
+    t->mark_valid = 1;
+    rtx_line_pin_learn(t, off, line);
+}
+
+static inline void rtx_line_pins_wipe_from(RtxPieceTree *t, size_t from) {
+    size_t i;
+    if (!t) return;
+    for (i = 0; i < RTX_LINE_MARK_MAX; i++) {
+        if (t->pins[i].line == RTX_LINE_PIN_EMPTY) continue;
+        if (t->pins[i].off >= from) {
+            t->pins[i].off = 0;
+            t->pins[i].line = RTX_LINE_PIN_EMPTY;
+        }
+    }
+    t->pins[0].off = 0;
+    t->pins[0].line = 0;
+    /* Origin is not a pin. Any edit can stale seek_rel; drop the key. */
+    rtx_line_origin_clear(t);
+}
+
+static inline int rtx_line_pin_near(const RtxPieceTree *t, size_t off,
+                                   RtxLineMark *out) {
+    size_t i, best_d = (size_t)-1;
+    int found = 0;
+    RtxLineMark best = {0};
+    if (!t) return 0;
+    for (i = 0; i < RTX_LINE_MARK_MAX; i++) {
+        size_t a, z, d;
+        if (t->pins[i].line == RTX_LINE_PIN_EMPTY) continue;
+        a = t->pins[i].off < off ? t->pins[i].off : off;
+        z = t->pins[i].off < off ? off : t->pins[i].off;
+        d = z - a;
+        if (d > (size_t)RTX_LINE_PIN_NEAR) continue;
+        if (!found || d < best_d) {
+            best = t->pins[i];
+            best_d = d;
+            found = 1;
+        }
+    }
+    if (found && out) *out = best;
+    return found;
+}
+
+static inline int rtx_line_pin_ok(const RtxPieceTree *t, size_t off) {
+    return rtx_line_pin_near(t, off, NULL);
+}
+
+static inline int rtx_line_origin_from_pin(RtxPieceTree *t, size_t off) {
+    RtxLineMark pin;
+    if (!rtx_line_pin_near(t, off, &pin)) return 0;
+    rtx_line_origin_key(t, pin.off, pin.line);
+    return 1;
+}
+
+static inline int rtx_line_mark_ok(const RtxPieceTree *t) {
+    return t && t->mark_valid;
+}
+
+static inline void rtx_line_mark_clear(RtxPieceTree *t) {
+    rtx_line_origin_clear(t);
+}
+
+static inline void rtx_line_mark_plant(RtxPieceTree *t, size_t line) {
+    if (!t) return;
+    t->mark_off = 0;
+    t->mark_line = line;
+    t->mark_valid = 1;
+}
+
+/* Planted 1/16 pins (vacant slots omitted). */
+size_t rtx_line_marks_collect(const RtxPieceTree *t, RtxLineMark *out, size_t cap);
+void rtx_line_pins_from_prefix(RtxPieceTree *t);
+void rtx_line_pin_from_isle(RtxPieceTree *t);
 
 static inline int rtx_line_want_reached(const RtxPieceTree *t) {
     size_t n;

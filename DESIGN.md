@@ -30,7 +30,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs, clipboard) |
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
-| Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | identity mismatch tosses hist; quit-`q` drops dirty journals |
+| Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | magic+ver (`RTXS` / `RTXW`); unknown ver ignored; identity mismatch tosses hist; quit-`q` drops dirty journals |
 | TM | process `rtx_tm_store` (langs + rules + interned pattern strings) | first grammar load; process |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
 
@@ -85,10 +85,18 @@ the prefix; do not call it from a gap camera.
 `g N%` is a byte snap plus island (backfill). Land on an uncovered
 camera plants the same dest-live walk. `g L` is a prefix pump
 (`want_line`) — not a guess. After open the host does not walk toward
-EOF. Gutters stay `+N` / `-L` until the island meets the prefix.
-Connected numbers are the camera (`isle_before` + `seek_rel`), not
-`line_guess` and not `line_of(caret)`. A seek wider than the local
-floor replants the island — the old count is the previous camera.
+EOF. The gutter is a **live origin** (`mark_off` / `mark_line`) plus
+`seek_rel`. Once keyed, local scroll keeps painting absolute `L`. A
+far seek (>8 KiB) drops the origin and goes back to red `+N` / `-L`
+unless a planted 1/16 pin is next to the landing — then that pin
+re-keys the origin. Slot `i` is byte `i * len / 16` (vacant =
+`(size_t)-1`). Prefix cover or a connected island plants a pin and
+keys the origin (island does not have to sit on a slot). An edit
+wipes pins at or after the byte and clears the origin (BOF slot 0
+stays). Do not kick an island just to paint numbers when a pin can
+re-key. Highlight / markup still `ensure_hl` the paint window plus
+`RTX_MARKUP_LOOKBACK` (and one neighbor page for pairs). That is
+windowed lex, not a walk to BOF.
 
 `lf_ready` the field is a latch. `lf_ready()` / `index_covers` are
 false when the flag is stale (huge + `subtree_lf==0`). The flag

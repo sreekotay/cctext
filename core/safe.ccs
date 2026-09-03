@@ -15,13 +15,7 @@
 #include "document.cch"
 #include "safe.cch"
 
-enum {
-    RTX_SAFE_VER = 1,
-    RTX_SAFE_PATH = 4096
-};
-
-#define RTX_SAFE_FILE_MAGIC 0x53585452u /* RTXS */
-#define RTX_SAFE_WS_MAGIC 0x57585452u   /* RTXW */
+enum { RTX_SAFE_PATH = 4096 };
 
 static int rtx_safe_on = 1;
 
@@ -327,6 +321,90 @@ done:
     return rc;
 }
 
+static int rtx_safe_origin_line(RtxDoc *d, const RtxSafeCam *cam, size_t *oline) {
+    long n;
+    if (!d || !oline) return 0;
+    if (rtx_line_mark_ok(&d->tree)) {
+        *oline = d->tree.mark_line;
+        return 1;
+    }
+    if (cam && cam->mark_valid) {
+        *oline = cam->mark_line;
+        return 1;
+    }
+    if (rtx_line_isle_connected(&d->tree)) {
+        n = (long)d->tree.scan_line + (long)d->tree.isle_before;
+        if (n < 0) n = 0;
+        *oline = (size_t)n;
+        return 1;
+    }
+    if (cam && cam->seek_valid && d->index_covers(cam->seek_off)) {
+        size_t ln;
+        @errhandler(RtxIndexErr e) {
+            (void)e;
+            return 0;
+        }
+        ln = d->line_of(cam->seek_off) !>;
+        n = (long)ln - cam->seek_rel;
+        if (n < 0) n = 0;
+        *oline = (size_t)n;
+        return 1;
+    }
+    if (cam && !cam->seek_valid &&
+        (d->lf_ready() || d->index_covers(d->caret))) {
+        *oline = cam->top;
+        return 1;
+    }
+    return 0;
+}
+
+static void rtx_safe_marks_add(RtxLineMark *a, size_t *n, size_t cap, size_t off,
+                              size_t line) {
+    size_t i;
+    if (!a || !n || !cap) return;
+    for (i = 0; i < *n; i++) {
+        if (a[i].off == off) {
+            a[i].line = line;
+            return;
+        }
+        if (a[i].off > off) break;
+    }
+    if (*n >= cap) return;
+    if (i < *n) {
+        size_t k;
+        for (k = *n; k > i; k--) a[k] = a[k - 1];
+    }
+    a[i].off = off;
+    a[i].line = line;
+    (*n)++;
+}
+
+static size_t rtx_safe_collect_marks(RtxDoc *d, const RtxSafeCam *cam,
+                                    RtxLineMark *out) {
+    size_t n, oline;
+    if (!d || !out) return 0;
+    n = rtx_line_marks_collect(&d->tree, out, RTX_LINE_MARK_MAX);
+    if (rtx_safe_origin_line(d, cam, &oline) && cam) {
+        size_t at_off = cam->seek_valid ? cam->seek_off : d->caret;
+        long at = (long)oline + (cam->seek_valid ? cam->seek_rel : 0);
+        if (at < 0) at = 0;
+        if (n >= RTX_LINE_MARK_MAX) n = RTX_LINE_MARK_MAX - 1;
+        rtx_safe_marks_add(out, &n, RTX_LINE_MARK_MAX, at_off, (size_t)at);
+    }
+    return n;
+}
+
+static void rtx_safe_plant_marks(RtxDoc *d, const RtxSafeCam *cam,
+                                const RtxLineMark *marks, size_t n) {
+    size_t i;
+    (void)cam;
+    if (!d || !marks || !n) return;
+    for (i = 0; i < n; i++) {
+        if (marks[i].line == RTX_LINE_PIN_EMPTY) continue;
+        rtx_line_pin_learn(&d->tree, marks[i].off, marks[i].line);
+    }
+}
+
 void rtx_safe_flush(RtxDoc *d, const RtxSafeCam *cam) {
     char path[RTX_SAFE_PATH];
     char tmp[RTX_SAFE_PATH + 16];
@@ -348,7 +426,7 @@ void rtx_safe_flush(RtxDoc *d, const RtxSafeCam *cam) {
     fd = mkstemp(tmp);
     if (fd < 0) return;
     if (rtx_safe_put_u32(fd, RTX_SAFE_FILE_MAGIC) != 0) goto fail;
-    if (rtx_safe_put_u32(fd, RTX_SAFE_VER) != 0) goto fail;
+    if (rtx_safe_put_u32(fd, RTX_SAFE_FILE_VER) != 0) goto fail;
     {
         uint32_t pn = (uint32_t)strlen(real);
         if (rtx_safe_put_u32(fd, pn) != 0) goto fail;
@@ -376,6 +454,27 @@ void rtx_safe_flush(RtxDoc *d, const RtxSafeCam *cam) {
     if (rtx_safe_put_i32(fd, cam->hex_nib) != 0) goto fail;
     if (rtx_safe_put_i32(fd, cam->unlock) != 0) goto fail;
     if (rtx_safe_put_i32(fd, cam->pin_view) != 0) goto fail;
+    {
+        size_t oline = 0;
+        size_t ooff = 0;
+        int has = rtx_safe_origin_line(d, cam, &oline);
+        if (rtx_line_mark_ok(&d->tree)) ooff = d->tree.mark_off;
+        else if (cam) ooff = cam->mark_off;
+        if (rtx_safe_put_i32(fd, has) != 0) goto fail;
+        if (rtx_safe_put_u64(fd, (uint64_t)oline) != 0) goto fail;
+        if (rtx_safe_put_u64(fd, (uint64_t)ooff) != 0) goto fail;
+    }
+    {
+        RtxLineMark marks[RTX_LINE_MARK_MAX];
+        size_t nm = rtx_safe_collect_marks(d, cam, marks);
+        uint32_t nmark = (uint32_t)nm;
+        size_t k;
+        if (rtx_safe_put_u32(fd, nmark) != 0) goto fail;
+        for (k = 0; k < nm; k++) {
+            if (rtx_safe_put_u64(fd, (uint64_t)marks[k].off) != 0) goto fail;
+            if (rtx_safe_put_u64(fd, (uint64_t)marks[k].line) != 0) goto fail;
+        }
+    }
     for (i = 0; i < d->hist.len; i++) {
         if (rtx_safe_put_rec(fd, d, &d->hist.recs[i]) != 0) goto fail;
     }
@@ -467,6 +566,11 @@ void rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
     uint64_t top, tw, lc, tb, so;
     int64_t srel;
     int32_t sv, view, nib, unlock, pin;
+    uint32_t nmark = 0;
+    int32_t has_origin = 0;
+    uint64_t origin_line = 0;
+    uint64_t origin_off = 0;
+    RtxLineMark marks[RTX_LINE_MARK_MAX];
     size_t i;
     int ident_ok;
     char jpath[RTX_SAFE_PATH];
@@ -475,7 +579,9 @@ void rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
     fd = open(path, O_RDONLY);
     if (fd < 0) return;
     if (rtx_safe_get_u32(fd, &magic) != 0 || magic != RTX_SAFE_FILE_MAGIC) goto done;
-    if (rtx_safe_get_u32(fd, &ver) != 0 || ver != RTX_SAFE_VER) goto done;
+    if (rtx_safe_get_u32(fd, &ver) != 0 || ver < RTX_SAFE_FILE_VER_MIN ||
+        ver > RTX_SAFE_FILE_VER)
+        goto done;
     if (rtx_safe_get_u32(fd, &pn) != 0 || pn >= sizeof(jpath)) goto done;
     if (pn && rtx_safe_read_all(fd, jpath, pn) != 0) goto done;
     jpath[pn] = 0;
@@ -501,6 +607,22 @@ void rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
     if (rtx_safe_get_i32(fd, &nib) != 0) goto done;
     if (rtx_safe_get_i32(fd, &unlock) != 0) goto done;
     if (rtx_safe_get_i32(fd, &pin) != 0) goto done;
+    if (ver >= 3) {
+        if (rtx_safe_get_i32(fd, &has_origin) != 0) goto done;
+        if (rtx_safe_get_u64(fd, &origin_line) != 0) goto done;
+        if (ver >= 5 && rtx_safe_get_u64(fd, &origin_off) != 0) goto done;
+    }
+    if (ver >= 2) {
+        if (rtx_safe_get_u32(fd, &nmark) != 0 || nmark > RTX_LINE_MARK_MAX)
+            goto done;
+        for (i = 0; i < (size_t)nmark; i++) {
+            uint64_t mo, ml;
+            if (rtx_safe_get_u64(fd, &mo) != 0) goto done;
+            if (rtx_safe_get_u64(fd, &ml) != 0) goto done;
+            marks[i].off = (size_t)mo;
+            marks[i].line = (size_t)ml;
+        }
+    }
     ident_ok = rtx_safe_ident(d->path.ptr, &smtime, &ssz, &sino) &&
                smtime == jmtime && ssz == jsz && sino == jino;
     if (cam) {
@@ -515,6 +637,9 @@ void rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
         cam->hex_nib = nib;
         cam->unlock = unlock;
         cam->pin_view = pin;
+        cam->mark_valid = has_origin;
+        cam->mark_line = (size_t)origin_line;
+        cam->mark_off = (size_t)origin_off;
     }
     d->caret = (size_t)caret;
     d->sel_anchor = (size_t)sel;
@@ -564,6 +689,29 @@ void rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
         d->box_ccol = (size_t)bcc;
     }
     rtx_safe_clamp_doc(d, cam);
+    /* v2/v3 marks were prefix-stride samples, not 1/16 pins. */
+    if (ver >= 4 && nmark)
+        rtx_safe_plant_marks(d, cam, marks, (size_t)nmark);
+    if (ver >= 4 && has_origin && cam) {
+        size_t at;
+        long line;
+        if (ver >= 5 && cam->mark_valid) {
+            at = cam->mark_off;
+            line = (long)origin_line;
+        } else if (cam->seek_valid) {
+            at = cam->seek_off;
+            line = (long)origin_line + cam->seek_rel;
+            cam->seek_rel = 0;
+        } else {
+            at = d->caret;
+            line = (long)origin_line;
+        }
+        if (line < 0) line = 0;
+        rtx_line_origin_key(&d->tree, at, (size_t)line);
+    } else if (ver >= 4 && cam) {
+        size_t at = cam->seek_valid ? cam->seek_off : d->caret;
+        (void)rtx_line_origin_from_pin(&d->tree, at);
+    }
 done:
     close(fd);
 }
@@ -587,7 +735,8 @@ int rtx_safe_peek_dirty(const char *doc_path) {
         close(fd);
         return 0;
     }
-    if (rtx_safe_get_u32(fd, &ver) != 0 || ver != RTX_SAFE_VER) {
+    if (rtx_safe_get_u32(fd, &ver) != 0 || ver < RTX_SAFE_FILE_VER_MIN ||
+        ver > RTX_SAFE_FILE_VER) {
         close(fd);
         return 0;
     }
@@ -630,7 +779,7 @@ void rtx_safe_ws_write(const RtxSafeWs *ws) {
     fd = mkstemp(tmp);
     if (fd < 0) return;
     if (rtx_safe_put_u32(fd, RTX_SAFE_WS_MAGIC) != 0) goto fail;
-    if (rtx_safe_put_u32(fd, RTX_SAFE_VER) != 0) goto fail;
+    if (rtx_safe_put_u32(fd, RTX_SAFE_WS_VER) != 0) goto fail;
     if (rtx_safe_put_i32(fd, ws->npanes) != 0) goto fail;
     if (rtx_safe_put_i32(fd, ws->focus) != 0) goto fail;
     if (rtx_safe_put_i32(fd, ws->pane0) != 0) goto fail;
@@ -665,7 +814,7 @@ int rtx_safe_ws_read(RtxSafeWs *ws, CCArena a) {
     fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
     if (rtx_safe_get_u32(fd, &magic) != 0 || magic != RTX_SAFE_WS_MAGIC) goto fail;
-    if (rtx_safe_get_u32(fd, &ver) != 0 || ver != RTX_SAFE_VER) goto fail;
+    if (rtx_safe_get_u32(fd, &ver) != 0 || ver != RTX_SAFE_WS_VER) goto fail;
     if (rtx_safe_get_i32(fd, &np) != 0) goto fail;
     if (rtx_safe_get_i32(fd, &fo) != 0) goto fail;
     if (rtx_safe_get_i32(fd, &p0) != 0) goto fail;

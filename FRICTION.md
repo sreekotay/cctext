@@ -19,8 +19,6 @@ if a write-stage honor is parked.
 read-only). Copy `.len` into a local first. `v->data[v->len - 1]` as
 an index is fine.
 
-`!>` inside `document.cch` (early, before the TU’s result specs) failed
-clang: `unknown type name 'CCResult_int_RtxIndexErr'` in `__cc_uw_is_err`.
 Destroy / invalidate join with `cc__parallel_cancel_tree` +
 `cc_parallel_join`, not UFCS `h.wait() !>`.
 
