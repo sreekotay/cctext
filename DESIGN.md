@@ -264,7 +264,7 @@ Verbs are semantic (`goto @N` / `N%` / `LN`, `await index|island`, `print`,
 work must be awaited; `goto` does not kick an island. Safe journals are off
 unless `--safe`.
 
-Browse-away does not ask and does not write the user’s path. It flushes the journal (hist as bytes, camera, identity) and **evicts** the document epoch only when that hist write landed or the buffer is clean. A dirty journal miss keeps the epoch live. Live set is the pane slots. Untitled cannot park. Quit still asks; `q` drops dirty journals. A later suspend quit is not this cut.
+Browse-away does not ask and does not write the user’s path. It flushes the journal (hist as bytes, camera, identity) and **evicts** the document epoch only when that hist write landed or the buffer is clean. A dirty journal miss keeps the epoch live and is a visible fault. An idle flush miss must not mark hist current — otherwise a later park would evict on a stale “already flushed” note. Live set is the pane slots. Untitled cannot park. Quit still asks; `q` drops dirty journals. A later suspend quit is not this cut.
 
 ## Encoding
 

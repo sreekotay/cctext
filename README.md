@@ -93,8 +93,8 @@ Not stored: find, clipboard, folds, highlight runs, the full line-index prefix.
 
 Both frontends call `safe_pump` every frame:
 
-1. **~250 ms after the last session change** — last-change debounce. Hist (`edit_gen` / `saved_head`) writes the `RTXS` leaf (undo recs). Caret / selection / camera / pins write only the `RTXC` sidecar (`<hash>.s`). A jump or a drag with no type still writes state once you pause. Scrolling does not rewrite hist.
-2. **Browse away** — flush the journal, then **park** (evict the document from RAM) only if that hist write landed or the buffer is clean. A dirty flush miss keeps the document live. Live set is the pane slots. Returning unparks and reloads from path + journal. Browse does not ask and does not write your path. The [listing preview](#browse-preview) is that same load and does not flush.
+1. **~250 ms after the last session change** — last-change debounce. Hist (`edit_gen` / `saved_head`) writes the `RTXS` leaf (undo recs). Caret / selection / camera / pins write only the `RTXC` sidecar (`<hash>.s`). A jump or a drag with no type still writes state once you pause. Scrolling does not rewrite hist. A failed hist write does not mark the journal current (idle retry stays armed) and does not allow a later park to evict.
+2. **Browse away** — flush the journal, then **park** (evict the document from RAM) only if that hist write landed or the buffer is clean. A dirty flush miss keeps the document live and shows the fault. Live set is the pane slots. Returning unparks and reloads from path + journal. Browse does not ask and does not write your path. The [listing preview](#browse-preview) is that same load and does not flush.
 3. **Unsaved-quit prompt** — flush everything first so a crash mid-dialog is recoverable.
 4. **After a real Save** — journal refreshed to match clean hist.
 5. **Workspace snapshot** — updated on park sync, flush-all, save-dirty, and discard.
