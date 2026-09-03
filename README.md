@@ -108,6 +108,7 @@ Recipes live in `make.shcc` (`ccc --as=shcc`). There is no Makefile.
 ./setup.sh                  # checks ccc; macOS GUI needs AppKit (no extra deps)
 ./make.shcc @               # list tasks
 ./make.shcc @smoke          # tree, layout, edit, find, hex, grid, line-index, tm, large, dup-scale
+./make.shcc @smoke_inline   # same list; dest-live kicks run on the caller (one-core schedule)
 ./make.shcc @large          # testdata/generated/large.txt (~3 MiB; LARGE_BYTES=)
 ./make.shcc @giant          # testdata/generated/large_8G.txt (~8 GiB; slow)
 ./make.shcc @giant_json     # testdata/generated/large_2G.json (~2 GiB JSON array; slow)

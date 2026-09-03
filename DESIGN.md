@@ -145,8 +145,15 @@ worker is still storing into.
 | island | `isle_kick` (land / gap view) | dest-live wrapper; wait-for 2 MiB blocks | `isle_h.live()` | `isle_from` | — |
 | browse | `rtx_browse_kick` | dest-live wrapper; wait-for dir jobs | `h.live()` | `jhead` | — |
 
-Kick plants the first paint and returns. Browse, find, and island are
-dest-live: the frame pauses / resumes / cancel+wait. `g L` stays one
+Kick plants the first paint and returns. A dest-live wave has no
+"not yet started" window — the arm may finish inline before the next
+statement. Everything the finish path reads (browse keep, jump dest,
+find query) is set before the kick, not after. `RTX_PARALLEL_INLINE=1`
+(`./make.shcc @smoke_inline`) runs the browse and find wrappers on the
+caller so that schedule is the default in CI. Island stays dest-live:
+the gap camera is a live prefix, not a drained result.
+Browse, find, and island are dest-live: the frame pauses / resumes /
+cancel+wait. `g L` stays one
 closed interval per step; returning is the yield. Find and island are
 the sequential 2 MiB block loop with `@parallel wait` / `@stage`.
 Browse is the same loop over directory jobs: collect is ticket-local,

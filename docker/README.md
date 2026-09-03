@@ -10,7 +10,9 @@ Defaults: **cpuset 0** (one real core) plus **1 CPU** CFS quota, **2 GiB RAM**
 (enough for `@smoke` including `dup_scale_smoke` at the 1000 MiB checkpoint).
 `--cpus=1` alone is quota on a multi-core host and still schedules the
 listing wave in parallel; `--cpuset-cpus` is the pin that matches a
-one-core box.
+one-core box. Native `@smoke_inline` (`RTX_PARALLEL_INLINE=1`) runs the
+browse and find dest-live wrappers on the caller so that finish-during-kick
+schedule is the default without a cpuset.
 
 Tighter box (smaller dup-scale target):
 
