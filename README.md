@@ -39,7 +39,7 @@ From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt
 - **TUI mouse.** SGR click, drag, and wheel; a byte-rail scrollbar jumps by file offset (not a soft line count). Hit-test is the same layout as the GUI.
 - **Byte jump.** `g 50%` snaps to the mid-file line with a local read (8 KiB). The gutter shows `+1`… / `-L` until the line index catches up; arrows and wheel stay on that camera — they do not `line_of` the prefix. Absolute `g L` pumps the prefix and shows `scanning... N%` on the jump field.
 - **High-performance scroll.** Only the visible window is measured and highlighted. Idle frames skip relayout.
-- **Safe journals.** Crash / recover state for named files (not a silent write of your path). See [Safe journals](#safe-journals).
+- **Safe journals.** Crash / recover state for named files. Reopen can show **recovered edits** (session hist replayed onto the file on disk) — not a silent write of your path. See [Safe journals](#safe-journals).
 
 ## Why
 
@@ -62,7 +62,7 @@ Two different writes. Save is the file. The session is a cache journal — crash
 | **Save** (`Ctrl/Cmd-S`) | Your file (temp + rename) | Only when you ask |
 | **Safe journal** | Cache dir (not your path) | Automatic for **named** buffers |
 
-Journals live under `~/Library/Caches/cctext/safe` on macOS, or `$XDG_CACHE_HOME/cctext/safe` elsewhere. `RTX_SAFE_HOME` overrides. A file journal is keyed by a hash of the real path. Writes use the same temp + rename as Save. Flush is best-effort: a journal fault does not fail the edit.
+Journals live under `~/Library/Caches/cctext/safe` on macOS, or `$XDG_CACHE_HOME/cctext/safe` elsewhere. `RTX_SAFE_HOME` overrides. A file journal is keyed by a hash of the **real path** (not the basename). Writes use the same temp + rename as Save. Flush is best-effort: a journal fault does not fail the edit. The leaf is that hash — **not a silent write of your path**.
 
 **Untitled has no journal** and cannot park.
 
@@ -89,13 +89,13 @@ Both frontends call `safe_pump` every frame:
 4. **After a real Save** — journal refreshed to match clean hist.
 5. **Workspace snapshot** — updated on park sync, flush-all, save-dirty, and discard.
 
-### Restore
+### Recovered edits
+
+**Recovered edits** means the journal replayed: undo/redo from the saved head to the journaled head, then caret/selection (offsets past EOF clamp). The buffer can look dirty. That is the last session, not a new Save. **Not a silent write of your path.**
 
 Launch with **no files** and the last workspace comes back: parked paths stay on disk until a pane shows them, then they unpark. Launch with a path and that file’s journal is applied after `from_path`.
 
-On load, a journal whose identity no longer matches the file on disk **tosses hist** (camera may still apply). You see the file as it is; it is not dirty. A corrupt or version-mismatched journal is ignored the same way.
-
-Replay is undo/redo from the saved head to the journaled head, then caret/selection are put back. Offsets past EOF clamp.
+On load, a journal whose identity no longer matches the file on disk **tosses hist** (camera may still apply). You see the file as it is; it is not dirty — there are no recovered edits. A corrupt or version-mismatched journal is ignored the same way.
 
 Quit with **Don't save** / `q` **drops** dirty journals so the next open is the file on disk. A later “suspend quit” is not this cut.
 
