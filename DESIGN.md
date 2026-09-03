@@ -253,7 +253,7 @@ Verbs are semantic (`goto @N` / `N%` / `LN`, `await index|island`, `print`,
 work must be awaited; `goto` does not kick an island. Safe journals are off
 unless `--safe`.
 
-Browse-away does not ask and does not write the user’s path. It flushes the journal (hist as bytes, camera, identity) and **evicts** the document epoch. Live set is the pane slots. Untitled cannot park. Quit still asks; `q` drops dirty journals. A later suspend quit is not this cut.
+Browse-away does not ask and does not write the user’s path. It flushes the journal (hist as bytes, camera, identity) and **evicts** the document epoch only when that hist write landed or the buffer is clean. A dirty journal miss keeps the epoch live. Live set is the pane slots. Untitled cannot park. Quit still asks; `q` drops dirty journals. A later suspend quit is not this cut.
 
 ## Encoding
 
@@ -267,8 +267,9 @@ via lookback — not a CSV quote walker). No lex: every NL is a record.
 `rtx_layout_grid_held` is that STRING test; a delim or NL is a gap only
 when it is not held. Line 0 is a sticky header (always `read_at(0)`, not
 `line_start` from a gap). Widths are header ∪ this fill (max line in a
-cell). Each column caps at `RTX_GRID_MAX_COL`, not the pane; extra fields
-use `left_col`. A cell wraps on its width and on embedded newlines. A
+cell). Column count follows the record. Each column caps at
+`RTX_GRID_MAX_COL`, not the pane; extra fields use `left_col`. A cell
+wraps on its width and on embedded newlines. A
 delim inside a string is not a field. The line prefix is still newlines.
 Three lengths, not one: `RTX_FRAME_SCRATCH` is a stack copy, not a record;
 `RTX_MARKUP_LOOKBACK` is the mid-field `cam_lo` walk; `RTX_GRID_REC_CAP`

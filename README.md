@@ -71,7 +71,7 @@ Two different writes. Save is the file. The session is a cache journal — crash
 | **Save** (`Ctrl/Cmd-S`) | Your file (temp + rename) | Only when you ask; refuses if that path changed on disk |
 | **Safe journal** | Cache dir (not your path) | Automatic for **named** buffers |
 
-Journals live under `~/Library/Caches/cctext/safe` on macOS, or `$XDG_CACHE_HOME/cctext/safe` elsewhere. `RTX_SAFE_HOME` overrides. A file journal is keyed by a hash of the **real path** (not the basename). Writes use the same temp + rename as Save. Flush is best-effort: a journal fault does not fail the edit. The leaf is that hash — **not a silent write of your path**.
+Journals live under `~/Library/Caches/cctext/safe` on macOS, or `$XDG_CACHE_HOME/cctext/safe` elsewhere. `RTX_SAFE_HOME` overrides. A file journal is keyed by a hash of the **real path** (not the basename). Writes use the same temp + rename as Save. An idle journal fault does not fail the edit. Park of a **dirty** buffer requires a successful hist journal — if that write fails, the document stays live (switching away must not drop the newest unsaved delta). The leaf is that hash — **not a silent write of your path**.
 
 **Untitled has no journal** and cannot park.
 
@@ -94,7 +94,7 @@ Not stored: find, clipboard, folds, highlight runs, the full line-index prefix.
 Both frontends call `safe_pump` every frame:
 
 1. **~250 ms after the last session change** — last-change debounce. Hist (`edit_gen` / `saved_head`) writes the `RTXS` leaf (undo recs). Caret / selection / camera / pins write only the `RTXC` sidecar (`<hash>.s`). A jump or a drag with no type still writes state once you pause. Scrolling does not rewrite hist.
-2. **Browse away** — flush the journal, then **park** (evict the document from RAM). Live set is the pane slots. Returning unparks and reloads from path + journal. Browse does not ask and does not write your path. The [listing preview](#browse-preview) is that same load and does not flush.
+2. **Browse away** — flush the journal, then **park** (evict the document from RAM) only if that hist write landed or the buffer is clean. A dirty flush miss keeps the document live. Live set is the pane slots. Returning unparks and reloads from path + journal. Browse does not ask and does not write your path. The [listing preview](#browse-preview) is that same load and does not flush.
 3. **Unsaved-quit prompt** — flush everything first so a crash mid-dialog is recoverable.
 4. **After a real Save** — journal refreshed to match clean hist.
 5. **Workspace snapshot** — updated on park sync, flush-all, save-dirty, and discard.
@@ -137,7 +137,7 @@ Recipes live in `make.shcc` (`ccc --as=shcc`). There is no Makefile.
 # ./bin/cctext-gui testdata/generated/large_8G.txt
 ```
 
-**cctext-gui** uses a native macOS menu bar. The GUI matches **cctext**: blinking caret, idle skip-layout, unlock scroll. **Esc** still opens the key-binding overlay in both frontends. **g** / **Ctrl-G** jumps to a line, or `N%` of the file by byte (`+1` / `-L` in the gutter until the index catches up). **b** / **Ctrl-B** opens browse ( **o** / **Ctrl-O** also); GUI **File → Open…** is the system dialog. From the browser, **Ctrl-O** / **Cmd-O** starts this app on the selection and **e** / **Ctrl-E** starts the other. **l** / **Ctrl-L** cycles default / wrap / hex / grid. Grid is a columnar paint of the same bytes (CSV/TSV/pipe): widths from this screen, cells wrap. **u** / **Ctrl-U** unlocks the pane from the caret; jump lands, and find lands when you select a hit. Wheel still scrolls while find is open. Line numbers are in the gutter. Ctrl/Cmd chords work while the overlay is closed. Unsaved quit asks Save / Don't save / Cancel. Save asks overwrite / cancel if the file changed on disk.
+**cctext-gui** uses a native macOS menu bar. The GUI matches **cctext**: blinking caret, idle skip-layout, unlock scroll. **Esc** still opens the key-binding overlay in both frontends. **g** / **Ctrl-G** jumps to a line, or `N%` of the file by byte (`+1` / `-L` in the gutter until the index catches up). **b** / **Ctrl-B** opens browse ( **o** / **Ctrl-O** also); GUI **File → Open…** is the system dialog. From the browser, **Ctrl-O** / **Cmd-O** starts this app on the selection and **e** / **Ctrl-E** starts the other. **l** / **Ctrl-L** cycles default / wrap / hex / grid. Grid is a columnar paint of the same bytes (CSV/TSV/pipe): widths from this screen, cells wrap, column count follows the record. **u** / **Ctrl-U** unlocks the pane from the caret; jump lands, and find lands when you select a hit. Wheel still scrolls while find is open. Line numbers are in the gutter. Ctrl/Cmd chords work while the overlay is closed. Unsaved quit asks Save / Don't save / Cancel. Save asks overwrite / cancel if the file changed on disk.
 
 Install `ccc` with Homebrew (`brew tap sreekotay/concurrent-c` / `brew install --HEAD …/ccc`) or from a concurrent-c checkout (`PREFIX=$HOME/.local ./cc-install.sh`). TextMate schema parse uses `<ccc/std/json.cch>` / `include JsonKeep` (closed `TmGrammar` stays in-tree). The GUI links Core Text via `frontend/gui_plat.m`.
 
