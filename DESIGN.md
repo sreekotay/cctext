@@ -14,7 +14,7 @@ d.from_path(path) !>;
 or a second local (`RtxDoc d2 = {0} @destroy`). Same for tree, layout, buf,
 workspace. A buf slot destroys layout, then doc. `memset` is neither.
 
-Hooks and faces live next to the type they name. A file cut is not an API — chapters of one TU stay chapters (`piece_tree_rb` / `piece_tree_lines` are not their own products). `workspace.cch` / `layout.cch` / `document.cch` are leaf TUs. `edit.cch` / `tm.cch` stay chapters of the document TU (FRICTION.md). The header exports the legal write (`replace`), not `insert` / `erase` because a rope usually does. Do not split `RtxDoc` into history/selection types because it is wide. A label on a shared record is an enum (closed dispatch, no `default:`); a value that is one of several payloads is a `@variant` — do not variant-shape every classifier. A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
+Hooks and faces live next to the type they name. A file cut is not an API — chapters of one TU stay chapters (`piece_tree_rb` / `piece_tree_lines` are not their own products). `workspace.cch` / `layout.cch` / `document.cch` / `ui.cch` are leaf TUs. `edit.cch` / `tm.cch` stay chapters of the document TU (FRICTION.md). The header exports the legal write (`replace`), not `insert` / `erase` because a rope usually does. Do not split `RtxDoc` into history/selection types because it is wide. A label on a shared record is an enum (closed dispatch, no `default:`); a value that is one of several payloads is a `@variant` — do not variant-shape every classifier. A Layout parameter cannot `insert` — that is local in the signature, not a comment. Frame copies take a scratch arena the function owns; analysis copies take `d.analysis`. Hist and path stay on `session` across reparse.
 
 There is no inflight counter and no drain-to-zero. A path that gives up says so at the position that caused it.
 
@@ -134,7 +134,7 @@ blocks; timeout 0 while dirty so the first paint and the frame after a
 key are not a 400 ms wait. Do not layout, then handle, then layout
 again — a command that forgets a dirty bit paints the old camera.
 
-Shared UI (`ui.cch`, `ui_cmd.h`, buf motion on `RtxBuf`) owns modal
+Shared UI (`ui.cch` / `ui.ccs`, `ui_cmd.h`, buf motion on `RtxBuf`) owns modal
 state, command ids (`CMD_*` / `rtx_cmd_from_letter`), field edits, and
 hex/text Home-End / up-down. Each host maps its events and draws.
 Pixels, CSI, fonts, and OS clipboard stay in the frontend. Do not

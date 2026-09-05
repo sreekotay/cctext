@@ -5,8 +5,11 @@ Current cc / cctext landmines. DESIGN.md is product shape. Recipes:
 
 ## Concurrent-C
 
-ccs features (`!>(e) {`, dest-live `@parallel`, bodies) need a `.ccs`.
-Other TUs `#include "foo.cch"` and link; they get decls.
+A face with non-`static` bodies has one owner `.ccs` (same stem, or a
+same-directory include). Other TUs `#include "foo.cch"` and link the
+owner; they get decls. Dest-live `@parallel` stays `.ccs`-only.
+Statement `!>(e) {` in extractable `static inline` rewrites in the
+lowered `.h` and does not force a splice.
 
 Dest-live: pointer names copy the pointer; other locals are by reference
 and must outlive `.wait()`. Do not assign a worker arm to a stack `int`
@@ -29,7 +32,7 @@ would destroy live docs, publish dest-live, or drop session wraps. Those
 stay raw + `cc_arena_realloc`. Hist text / ins are session `vec_from`
 wraps: assign a new `from`, do not store `.len`.
 
-`ui.cch` is still all-static: every host splices a private copy. Tree
-chapters (`piece_tree_rb.cch`, `piece_tree_lines.cch`,
-`piece_tree_priv.cch`) are not TUs — include them only from
-`piece_tree.ccs`.
+`ui.cch` is owned by `ui.ccs` (`rtx_ui`). `ui_types.cch` is decls;
+gutter / rail / blink bodies live in `workspace.ccs`. Tree chapters
+(`piece_tree_rb.cch`, `piece_tree_lines.cch`, `piece_tree_priv.cch`)
+are not TUs — include them only from `piece_tree.ccs`.

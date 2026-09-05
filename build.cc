@@ -7,8 +7,8 @@
 //
 // Leaf modules are real linked TUs (not textual includes):
 //   core/page_store.ccs, core/hex.ccs, core/grid.ccs, core/browse.ccs, core/piece_tree.ccs,
-//   core/nav.ccs, core/scope.ccs, core/find.ccs, core/safe.ccs, core/ui_help.ccs,
-//   core/workspace.ccs, core/layout.ccs, core/document.ccs
+//   core/nav.ccs, core/scope.ccs, core/find.ccs, core/safe.ccs, core/ui.ccs,
+//   core/ui_help.ccs, core/workspace.ccs, core/layout.ccs, core/document.ccs
 //   frontend/gui_draw.ccs, frontend/gui_input.ccs, frontend/gui_chrome.ccs,
 //   frontend/gui_osx.ccs, frontend/cctext_draw.ccs, frontend/cctext_grid_draw.ccs,
 //   frontend/cctext_input.ccs, frontend/cctext_osx.ccs
@@ -61,6 +61,10 @@ CC_TARGET_DEPS rtx_find rtx_piece_tree rtx_scope rtx_document
 CC_TARGET rtx_scope obj core/scope.ccs
 CC_TARGET_INCLUDE rtx_scope .
 
+CC_TARGET rtx_ui obj core/ui.ccs
+CC_TARGET_INCLUDE rtx_ui .
+CC_TARGET_DEPS rtx_ui rtx_piece_tree rtx_hex rtx_grid rtx_nav rtx_find rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui_help
+
 CC_TARGET rtx_ui_help obj core/ui_help.ccs
 CC_TARGET_INCLUDE rtx_ui_help .
 
@@ -78,19 +82,19 @@ CC_TARGET_DEPS utf8_cluster_smoke rtx_piece_tree rtx_nav rtx_scope rtx_document
 
 CC_TARGET layout_measure_smoke exe tests/layout_measure_smoke.ccs
 CC_TARGET_INCLUDE layout_measure_smoke .
-CC_TARGET_DEPS layout_measure_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
+CC_TARGET_DEPS layout_measure_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
 
 CC_TARGET edit_session_smoke exe tests/edit_session_smoke.ccs
 CC_TARGET_INCLUDE edit_session_smoke .
-CC_TARGET_DEPS edit_session_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
+CC_TARGET_DEPS edit_session_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
 
 CC_TARGET find_smoke exe tests/find_smoke.ccs
 CC_TARGET_INCLUDE find_smoke .
-CC_TARGET_DEPS find_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
+CC_TARGET_DEPS find_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
 
 CC_TARGET large_file_smoke exe tests/large_file_smoke.ccs
 CC_TARGET_INCLUDE large_file_smoke .
-CC_TARGET_DEPS large_file_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
+CC_TARGET_DEPS large_file_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
 
 CC_TARGET dup_scale_smoke exe tests/dup_scale_smoke.ccs
 CC_TARGET_INCLUDE dup_scale_smoke .
@@ -110,7 +114,7 @@ CC_TARGET_DEPS insert_profile rtx_piece_tree rtx_nav rtx_scope rtx_find rtx_docu
 
 CC_TARGET hex_view_smoke exe tests/hex_view_smoke.ccs
 CC_TARGET_INCLUDE hex_view_smoke .
-CC_TARGET_DEPS hex_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
+CC_TARGET_DEPS hex_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
 
 CC_TARGET safe_smoke exe tests/safe_smoke.ccs
 CC_TARGET_INCLUDE safe_smoke .
@@ -118,11 +122,11 @@ CC_TARGET_DEPS safe_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx
 
 CC_TARGET grid_view_smoke exe tests/grid_view_smoke.ccs
 CC_TARGET_INCLUDE grid_view_smoke .
-CC_TARGET_DEPS grid_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
+CC_TARGET_DEPS grid_view_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
 
 CC_TARGET batch_smoke exe tests/batch_smoke.ccs
 CC_TARGET_INCLUDE batch_smoke .
-CC_TARGET_DEPS batch_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch
+CC_TARGET_DEPS batch_smoke rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
 
 CC_TARGET line_index_prop_smoke exe tests/line_index_prop_smoke.ccs
 CC_TARGET_INCLUDE line_index_prop_smoke .
@@ -142,19 +146,22 @@ CC_TARGET_DEPS pair_page_probe rtx_piece_tree rtx_hex rtx_grid rtx_nav rtx_scope
 
 CC_TARGET rtx_cctext_draw obj frontend/cctext_draw.ccs
 CC_TARGET_INCLUDE rtx_cctext_draw .
+CC_TARGET_DEPS rtx_cctext_draw rtx_ui
 
 CC_TARGET rtx_cctext_grid_draw obj frontend/cctext_grid_draw.ccs
 CC_TARGET_INCLUDE rtx_cctext_grid_draw .
+CC_TARGET_DEPS rtx_cctext_grid_draw rtx_ui
 
 CC_TARGET rtx_cctext_input obj frontend/cctext_input.ccs
 CC_TARGET_INCLUDE rtx_cctext_input .
+CC_TARGET_DEPS rtx_cctext_input rtx_ui
 
 CC_TARGET rtx_cctext_osx obj frontend/cctext_osx.ccs
 CC_TARGET_INCLUDE rtx_cctext_osx .
 
 CC_TARGET cctext exe frontend/cctext.ccs
 CC_TARGET_INCLUDE cctext .
-CC_TARGET_DEPS cctext rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui_help rtx_cctext_draw rtx_cctext_grid_draw rtx_cctext_input rtx_cctext_osx
+CC_TARGET_DEPS cctext rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui rtx_ui_help rtx_cctext_draw rtx_cctext_grid_draw rtx_cctext_input rtx_cctext_osx
 
 CC_TARGET rtx_gui_osx obj frontend/gui_osx.ccs
 CC_TARGET_INCLUDE rtx_gui_osx .
@@ -164,10 +171,12 @@ CC_TARGET_INCLUDE rtx_gui_chrome .
 
 CC_TARGET rtx_gui_draw obj frontend/gui_draw.ccs
 CC_TARGET_INCLUDE rtx_gui_draw .
+CC_TARGET_DEPS rtx_gui_draw rtx_ui
 
 CC_TARGET rtx_gui_input obj frontend/gui_input.ccs
 CC_TARGET_INCLUDE rtx_gui_input .
+CC_TARGET_DEPS rtx_gui_input rtx_ui
 
 CC_TARGET cctext_gui exe frontend/gui.ccs
 CC_TARGET_INCLUDE cctext_gui .
-CC_TARGET_DEPS cctext_gui rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui_help rtx_gui_osx rtx_gui_chrome rtx_gui_draw rtx_gui_input
+CC_TARGET_DEPS cctext_gui rtx_piece_tree rtx_hex rtx_grid rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui rtx_ui_help rtx_gui_osx rtx_gui_chrome rtx_gui_draw rtx_gui_input
