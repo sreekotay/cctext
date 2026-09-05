@@ -141,9 +141,9 @@ What the lowering reads today vs. what the fixtures need is in
   `injections`, `scopeName` are skipped. `include: source.x` has nothing to
   resolve against and is dropped silently in `rtx_tm_flatten`.
 - Begin/end are literals; no shipped grammar uses regex spans.
-- Live bug pinned by `testdata/rich/code/nested.md:11`: a ``` inside a
-  Python docstring closes the fence early because the literal closer is not
-  line‑anchored.
+- Fixed: `testdata/rich/code/nested.md:11` (a ``` inside a Python docstring
+  closed the fence early). Literal spans take `"cctext": {"bol": true}` —
+  begin and end must sit at line start; the shipped fence rule declares it.
 
 Minimum, cheapest first: (1) line‑anchored fence closer + info‑string
 capture on `RTX_TM_LIT_SPAN`; (2) explicit `"""` / `'''` rules in the
@@ -223,7 +223,7 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 1 | `hint_a / hint_b` on runs | **done** (write‑only) |
 | 2 | Style bits from sidecar or default scope map, copied at plant; `markdown.tmLanguage.json` declares `kind: markup`; prose scanner gated to PROSE sub‑ranges | **done** |
 | 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; atom step and reveal‑on‑entry; `rich` toggle key; TUI + GUI paint | next |
-| 4 | Fence + injection: line‑anchored closer (fixes `nested.md:11`), `scopeName` / embed op, depth‑2 guest lex, injected planter | |
+| 4 | Fence + injection: line‑anchored closer (**done**, `cctext.bol`); info‑string capture; `scopeName` / embed op; depth‑2 guest lex; injected planter | |
 | 5 | MD table child | |
 | 6 | Apply / toolbar via one `replace`; toggle‑off by rule id | |
 | 7 | Blocks as folds — after the three blockers above | |

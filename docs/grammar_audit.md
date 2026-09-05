@@ -148,7 +148,10 @@ Needs codes:
 Ordered by how little of the walker/lowering has to change. Each item names
 the fixture that proves it and where it lands.
 
-1. **Line-anchored fence close + info string (Markdown fences).** Extend
+1. **Line-anchored fence close + info string (Markdown fences).** *(BOL half
+   landed 2026‑09‑05 as the `cctext.bol` sidecar key — strict line start,
+   no ≤3‑space allowance, no trailing‑whitespace check; info string not yet
+   recorded.)* Extend
    `RTX_TM_LIT_SPAN` with a "closer must be at line start (after ≤3 spaces)
    and followed by only whitespace" flag, and record the run of bytes after
    the opener up to EOL as the info string. This fixes `nested.md` line 11

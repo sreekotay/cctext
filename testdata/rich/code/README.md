@@ -104,7 +104,7 @@ table in `core/tm.cch`) does with the shipped `testdata/grammars/*.tmLanguage.js
 
 | Lines | Construct | Expected | Today |
 |---|---|---|---|
-| 7–14 | ```` ```python ```` fence with a docstring | fence 7:1–14:3, info string `python` → body 8–13 as `source.python`; the docstring 9–12 is a Python span inside (depth 2). Line 11's ``` ``` ``` is docstring text and must NOT close the fence: fence close must be line-anchored (`^\s*```\s*$`, needs (b)) | the literal ``` ``` ``` LIT_SPAN closes at the ``` ``` ``` on line 11; 14:1 re-opens a fence that runs to 18:3, so lines 14–18 (`## HTML fence…`) are raw and the html fence is inverted. First visible bug this fixture pins |
+| 7–14 | ```` ```python ```` fence with a docstring | fence 7:1–14:3, info string `python` → body 8–13 as `source.python`; the docstring 9–12 is a Python span inside (depth 2). Line 11's ``` ``` ``` is docstring text and must NOT close the fence: fence close must be line-anchored (`^\s*```\s*$`, needs (b)) | fence 7:1–14:3 (closer is line-anchored via `cctext.bol`, smoke in `tm_grammar_smoke`); body is raw, no `source.python` yet |
 | 18–23 | ```` ```html ```` fence with `<script>` | body 19–22 as `text.html.basic`; 19:1–22:9 is a script span with body as `source.js` (depth 3: md→html→js). Line 20's split `"</scr" + "ipt>"` must not close the script; line 21's template with `${s}` is a JS island | see above: fence phase is inverted from line 14 on |
 | 27–34 | ```` ```js ```` fence with a template literal | body 28–33 as JS; the template 28:13–33:1 is a JS span (depth 3 md→js→template). The escaped ``\` `` on 30 and 32 must close neither the template nor the fence; line 29 `# not a markdown heading` is template text | inverted phase; line 29 `#…` may be styled as a heading depending on the phase |
 | 38–43 | ```` ```sh ```` fence with `<<PY` heredoc | body 39–42 as `source.shell`; heredoc 39:11–42:3 with body 40–41 as `source.python`; the docstring on 41 is depth 4 (md→sh→py→docstring) | phase-dependent |
@@ -120,4 +120,4 @@ table in `core/tm.cch`) does with the shipped `testdata/grammars/*.tmLanguage.js
 - `embeds.sh`: heredocs are (b) with an end-regex backreference; `<<PY` adds (c)+(d); `<<<` must not match.
 - `embeds.yaml`: block scalars end by indentation (TextMate `while`), which none of (a–e) covers; embeds are by key-name injection, not by grammar.
 - `embeds.c`: `#if 0` (b) and macro continuation (b); everything else already works with literal spans.
-- `nested.md`: line 11 shows the literal-fence closer bug; blockquote fences need `while`; everything else is depth ≥ 2.
+- `nested.md`: line 11 pinned the literal-fence closer bug (fixed with `cctext.bol`); blockquote fences need `while`; everything else is depth ≥ 2.
