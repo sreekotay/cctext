@@ -4,6 +4,7 @@
  * / UFCS; this file owns the wrap / hit-test bodies.
  */
 #include <ccc/std/prelude.cch>
+#include <string.h>
 #include "utf8.cch"
 #include "document.cch"
 #include "layout.cch"
@@ -418,6 +419,71 @@ static void !>(CCError) rtx_layout_grid_walk(RtxLayout *L, RtxDocLayout d,
     return cc_ok();
 }
 
+static int rtx_layout_style_eq(RtxStyle a, RtxStyle b) {
+    return a.bold == b.bold && a.italic == b.italic && a.mono == b.mono &&
+           a.scope == b.scope;
+}
+
+/* Next `c` in [k, hi), or hi. */
+static size_t rtx_layout_next_byte(char[:] bytes, size_t k, size_t hi, char c) {
+    const char *p;
+    if (k >= hi) return hi;
+    p = (const char *)memchr(bytes.ptr + k, c, hi - k);
+    return p ? (size_t)(p - bytes.ptr) : hi;
+}
+
+/*
+ * Unwrapped row: width is the sum of per-style-run measures, height the
+ * max over those runs. `RtxDocLayout` grants `style_at`, not `runs`, so
+ * the walk cannot list runs. Width-bearing styles (bold / mono) come
+ * only from prose markup, whose runs lie strictly between two same-line
+ * `*` / '`' bytes; lex scopes do not size a glyph. So the style can
+ * change only at a delimiter byte or one past it: probe `style_at` at
+ * those candidates (O(K) probes for K delimiters, memchr between them).
+ * A line with no markup byte takes the single-measure path unprobed —
+ * a 3 MiB JSON line costs two memchr passes and one measure, as before.
+ */
+static double rtx_layout_row_measure(RtxDocLayout d, const RtxMeasure *m,
+                                     size_t from, char[:] bytes, size_t lo,
+                                     size_t hi, RtxSectionKind sec, double *h_out) {
+    RtxStyle z = {0};
+    RtxStyle cur;
+    size_t star, tick, seg, probed;
+    double w = 0, h;
+    star = rtx_layout_next_byte(bytes, lo, hi, '*');
+    tick = rtx_layout_next_byte(bytes, lo, hi, '`');
+    if (star >= hi && tick >= hi) {
+        *h_out = m->line_height(m->ctx, z, sec);
+        return m->measure(m->ctx, bytes.sub(lo, hi), z, sec);
+    }
+    cur = d->style_at(from + lo);
+    h = m->line_height(m->ctx, cur, sec);
+    seg = lo;
+    probed = lo;
+    while (star < hi || tick < hi) {
+        size_t q = star < tick ? star : tick;
+        size_t c;
+        for (c = q; c <= q + 1 && c < hi; c++) {
+            RtxStyle st;
+            double gh;
+            if (c <= probed) continue;
+            probed = c;
+            st = d->style_at(from + c);
+            if (rtx_layout_style_eq(st, cur)) continue;
+            w += m->measure(m->ctx, bytes.sub(seg, c), cur, sec);
+            seg = c;
+            cur = st;
+            gh = m->line_height(m->ctx, cur, sec);
+            if (gh > h) h = gh;
+        }
+        if (star == q) star = rtx_layout_next_byte(bytes, q + 1, hi, '*');
+        if (tick == q) tick = rtx_layout_next_byte(bytes, q + 1, hi, '`');
+    }
+    w += m->measure(m->ctx, bytes.sub(seg, hi), cur, sec);
+    *h_out = h;
+    return w;
+}
+
 static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                                              const RtxMeasure *m, size_t from,
                                              size_t n, double max_width, int wrap,
@@ -440,9 +506,9 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
             continue;
         }
         if (!wrap) {
-            char[:] line = bytes.sub(i, line_end);
-            double w = m->measure(m->ctx, line, z, sec);
-            double h = m->line_height(m->ctx, z, sec);
+            double h = 0;
+            double w = rtx_layout_row_measure(d, m, from, bytes, i, line_end,
+                                              sec, &h);
             if (!rtx_layout_push_row(L, m, from + i, line_end - i, phys,
                                      w, h, sec)) {
                 return cc_err(CC_ERR_OUT_OF_MEMORY, "layout row");
