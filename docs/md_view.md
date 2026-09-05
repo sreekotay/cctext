@@ -1,0 +1,256 @@
+# Markup lens: rich documents over bytes
+
+Markdown is the **first client**, not the product. The product is a lens
+that any grammar can drive: true styling from grammar metadata, hint bytes
+that a Rich pane paints at zero width, marks that move like clusters, a
+toolbar generated from `apply` tags, and — on the block side — nested
+child views (tables, fences, opaque renders) and folds.
+
+Source of truth stays **document bytes**. Nothing here is a second
+document, a Markdown→HTML store, or a WYSIWYG dual. Every feature is a
+run, a layout policy over runs, or a fold. Product shape that must still
+hold: DESIGN Interactive (seeking / lined camera, cover, gutter key, pump,
+window) and DESIGN Encoding (byte caret, window highlight, grid as a view
+over bytes, **marks are clusters with one more join rule**).
+
+## Status
+
+Landed (the "fix first" batch, 2026‑09‑05):
+
+| Piece | Where | State |
+|---|---|---|
+| Runs carry a **planter** (`RTX_RUN_PROSE` / `RTX_RUN_TM`); window re‑lex clips by planter, not bit shape | `RtxRun.planter`, `rtx_run_planted_*` in `core/document.ccs` | done — fixes the mixed‑run leak |
+| `RTX_SEC_MARKUP`: lexed like CODE, `style_at` keeps scope, GUI may pick a prose face | `rtx_sec_lexed`, `rtx_doc_path_kind` | done; **no shipped grammar opts in yet**, so zero behavior change |
+| Prose scanner: `**x**` bold, `*x*` italic, `` `x` `` mono | `rtx_doc_scan_markup_runs` | done |
+| Grammar sidecar: `"cctext": {"kind":"markup"}` (grammar), `bold` / `italic` / `mono` / `apply` (pattern) | `RtxTmRt.markup`, `RtxTmRule.sc_*` | parsed and stored; **not yet applied to run style at plant time** |
+| Hint byte counts on runs from literal begin/end | `RtxRun.hint_a` / `hint_b` (0 = unclosed) | written; nothing reads them |
+| Italic paints: TUI SGR 3, GUI italic / bold‑italic faces | `frontend/cctext.ccs`, `gui_draw.ccs` | done |
+| Unwrapped row width = sum of per‑run measures via `RtxDoc_style_next` | `rtx_layout_row_measure` | done; scope‑only edges coalesce |
+| Heading fold at window edge is a leftover, not a fold to the window end | `nav_region` | done |
+| Per‑pane `rich` bit reserved on `RtxLayout`; persisted in `RtxSafeCam` (RTXC v2, v1 reads) | `layout.cch`, `safe.cch` | reserved; nothing reads it |
+| Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; smokes not yet written |
+| TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
+
+Not landed: anything that reads `hint_*` or `rich`, any Rich‑mode paint or
+motion, `apply`, nested children, injection, opaque renders, blocks‑as‑folds.
+
+## Vocabulary
+
+- **Mark** — a grammar span: `hint_a` bytes, content, `hint_b` bytes
+  (`**bold**`, `` `code` ``, `- [ ]`, `[text](url)`). A `match` with no
+  content is a mark with `hint_b = 0`.
+- **Hint** — the delimiter bytes. Always in the file; Rich pane paints them
+  at zero width (unless revealed).
+- **Content** — ordinary clusters between the hints.
+- **Atom** — what motion crosses in one step. In Rich a pair of hints is
+  one atom in two places (DESIGN Encoding). Source has no hint atoms.
+- **Source / Rich** — `layout.rich` per pane. Source is today's paint.
+- **Planter** — who produced a run (prose scanner, TM lex, later:
+  injected lex). Clip and toggle‑off are by planter, never by bit shape.
+- **Section kind** — `PROSE` (no grammar; scanner), `CODE` (lexed; mono),
+  `MARKUP` (lexed; prose face). Kind decides lex and font; the run decides
+  style.
+- **Child** — a layout‑epoch measure / paint / hit over a byte span with a
+  local policy (table, fence, opaque). Not a node, not a second doc.
+
+## Zero cost when unused
+
+A plain file, a CSV in grid, a hex dump pay nothing:
+
+- Style bits live on `RtxTmRule` and are copied to the run at plant time
+  — one byte compare per plant, no lookup per glyph.
+- `L->has_marks` is set per fill when any run in the window has
+  `hint_a > 0` and `L->rich`. Every Rich path (skip, atom step, reveal) is
+  behind that gate; `rtx_utf8_cluster` is unchanged.
+- `style_next` on a document with no runs is one compare.
+- Grid and hex ignore `rich` entirely (hidden hints would make column
+  widths lie; keep grid the CSV lens).
+
+## Style from grammar
+
+Two sources, sidecar wins:
+
+1. **Sidecar** on the pattern: `"cctext": {"bold":true, "italic":true,
+   "mono":true, "apply":"bold"}` — already parsed.
+2. **Default scope→style map** beside the theme map in `core/scope.ccs`:
+   `markup.bold → bold`, `markup.italic → italic`, `markup.raw → mono`,
+   `markup.heading → bold`. Third‑party grammars dropped into
+   `testdata/grammars/` never carry a sidecar; this makes them useful.
+   Consulted at plant time only.
+
+Plant path: TM match → one run with scope **and** bits **and**
+`hint_a/hint_b`, planter `RTX_RUN_TM`. The prose scanner is the planter
+only for `PROSE` without a grammar (pre‑existing quirk: open‑time `scan_buf`
+and the >256K window scan still run it on every byte, so a CODE doc gets
+scanner runs at open; decide keep vs gate with wedge 2).
+
+Section/font: `MARKUP` gets the prose face; `st.mono` (inline code, fence
+body) gets mono inside it. `.md` matching a grammar that declares
+`kind: markup` is the switch; until the shipped `markdown.tmLanguage.json`
+declares it, `.md` stays CODE as today.
+
+## Hints, Source and Rich
+
+| | Source (`rich == 0`) | Rich (`rich == 1`) |
+|---|---|---|
+| Hint paint | plain bytes | zero width, **revealed** when caret or selection is inside the mark |
+| Hit‑test at a hint x | byte | resolves to content edge (hints are not a landing) — no ambiguity because an adjacent caret reveals them |
+| Motion across hints | per cluster | one step crosses the pair edge; interior positions are content clusters |
+| Backspace on a hint | deletes a byte | unwrap: removes both hints (one atom in two places) |
+| Selection reaching a hint | as bytes | reaches the pair; cut removes the pair |
+| Copy | bytes | bytes, hints included (truth is bytes) |
+| Find hit inside a hint | plain | selects the match and reveals the mark |
+| Line‑start hints (`# `, `- `, `> `) | plain | zero width; gutter / line numbers unaffected |
+| Wrap and `x_of` | as today | skip hint bytes at layout time (same place soft‑wrap already walks clusters) |
+
+"Reveal on entry" (Typora / Obsidian live preview) is what makes the rest
+cheap: the caret can never sit on an invisible byte, so no second
+coordinate system and no "skip vs stick" policy.
+
+Implementation site: an atom‑length beside `rtx_utf8_cluster` consumed by
+motion, selection, delete, wrap and hit — motion post‑steps the way
+`fold_snap` does. All gated on `has_marks`.
+
+## Apply and toolbar
+
+- Rules tagged `apply: <name>` are enumerated by the host for the caret's
+  section from the active grammar — no hard‑coded Bold for MD.
+- Apply = **one** `replace(lo, hi-lo, a + bytes + b)`: one hist record,
+  no new primitive. Cap the selection at `RTX_HL_WIN_MAX` and refuse
+  above (honest leftover) — the copy is the cost.
+- Toggle‑off finds the enclosing run by rule (planter + rule id on the run)
+  and removes its hints — same unwrap as backspace on a hint.
+- `- [ ]` ↔ `- [x]` is `apply: toggle` on a 5‑byte mark: one `replace`.
+- TUI: status‑row keys; GUI: toolbar. Both consume the same table as paint.
+
+## Code embeds and injection
+
+This is the same lens; MD fences are only the depth‑0 client. Docstrings
+with SQL, JS template literals, `<script>` / `<style>`, shell heredocs, YAML
+block scalars, `#if 0` all want *lex this span with that grammar*, and all
+sit **inside** a string span, so they need the state stack the lexer does
+not have (`RTX_TM_STACK 32` is declared; depth never exceeds 1).
+
+What the lowering reads today vs. what the fixtures need is in
+[docs/grammar_audit.md](grammar_audit.md), with per‑line expectations in
+[testdata/rich/code/README.md](../testdata/rich/code/README.md). Headline:
+
+- Walker keeps `name / match / begin / end / include / patterns / captures
+  / cctext`; `contentName`, `beginCaptures`, `endCaptures`, `while`,
+  `injections`, `scopeName` are skipped. `include: source.x` has nothing to
+  resolve against and is dropped silently in `rtx_tm_flatten`.
+- Begin/end are literals; no shipped grammar uses regex spans.
+- Live bug pinned by `testdata/rich/code/nested.md:11`: a ``` inside a
+  Python docstring closes the fence early because the literal closer is not
+  line‑anchored.
+
+Minimum, cheapest first: (1) line‑anchored fence closer + info‑string
+capture on `RTX_TM_LIT_SPAN`; (2) explicit `"""` / `'''` rules in the
+Python grammar; (3) read `scopeName`, `rtx_tm_rt_for_scope()`, an
+`RTX_TM_EMBED` op; (4) `contentName` + guest lex at depth 2 with the host
+closer tested first (grammar index per stack frame and in `RtxTmCkpt`);
+(5) regex begin/end with back‑referenced closers. `while` and `injections`
+stay out. Injected runs carry their own planter so window re‑lex of the host
+does not clip them.
+
+## Nested children (block side)
+
+A **child** is measure / paint / hit over `[lo, hi)` with a local policy.
+Locked shape (unchanged from the first cut):
+
+- **Layout‑epoch scratch**, destroyed with vis‑row reset — the honesty of
+  `RtxGridGeom.fields` ("last split, not a second column table").
+- **Paint‑time recursion**: parent keeps coarse `RtxVisRow`s (physical
+  lines or table records); paint / hit recurse. Flattening cell wrap lines
+  into tagged vis rows is rejected (row count and scroll math blow up).
+- Caret stays a byte offset; hit recurses; Tab may jump cell `lo` like
+  `RtxBuf_move_grid_col`.
+- Classification is **window + `RTX_MARKUP_LOOKBACK`** only. A fence opened
+  above the lookback or a table cut by the window edge is a leftover
+  painted as text, never a wrong nest. No progressive MD index; line cover
+  (`line_scan_off` / island) stays the only progressive index.
+
+| Child | Bytes | Needs | Not in v1 |
+|---|---|---|---|
+| Fence | `` ``` `` lines | grammar injection on the body span (see above); mono face; optional inner wrap | fence ⊃ table |
+| MD table | run of `\|` lines + optional `\|---\|` row (geom, not a record) | column geom = header ∪ this fill; per‑cell child with inline marks via `style_at`; sticky header as chrome; wheel steps records | widths beyond the fill; auto‑pad `\|`; CSV STRING hold; table ⊃ fence; recursive tables |
+| Opaque render (mermaid, math, dot, image) | fence body / `![]()` | one vis row of height H at fill time; content from a **Scan‑table row** (start / step / live / resume / deny) like find / island / browse; cached on layout epoch keyed (span hash, width); GUI only | TUI ASCII art (source or fixed box); blocking the frame; fetch on the layout thread |
+| Derived value (formula in a cell) | `=SUM(A1:A3)` literal | paint value in place of content, formula is the hint; layout‑epoch, read‑only, one record in window | editing the value; cross‑window refs; persisted values |
+
+Grid vs MD table: `l` cycles default → wrap → hex → grid and **grid stays
+the CSV / TSV / pipe lens**. MD tables appear under default / wrap on a
+MARKUP doc, never by binding `|` as a CSV delimiter. Reuse from grid: width
+= max over header ∪ fill, per‑cell wrap, `left_col` overflow, sticky header
+chrome, record‑step wheel, ephemeral field `lo/hi`.
+
+## Blocks are folds — deferred
+
+Notion‑style toggles, `<details>`, `<div>…</div>`, MD heading regions are
+not a block model; they are folds over begin/end runs (DESIGN Faces). Kept
+as direction, not a wedge, until:
+
+1. `RTX_FOLD_MAX 8` is either named as a product cap or becomes a Vec.
+2. Folds are **document state** (shared across panes) — accept, or move
+   fold state to the pane before a Source/Rich split relies on it.
+3. Tag pairs lex as spans (HTML tags are `match` today; needs regex
+   begin/end with a back‑referenced closer).
+
+Landed already: `nav_region` no longer folds to the window edge when the
+next heading is outside the window.
+
+## Host parity
+
+| | TUI | GUI |
+|---|---|---|
+| Hidden hints, atoms, apply | yes | yes |
+| Bold / italic | SGR 1 / 3 | Core Text faces (done) |
+| Prose vs mono face | no (one cell grid) | yes, by section kind + `st.mono` |
+| Table cells | aligned in columns | proportional, per‑cell child |
+| Opaque renders | source or fixed‑height box | rendered child |
+
+Say this out loud in the UI: Rich in a terminal is hidden hints, SGR, and
+aligned cells — never the GUI picture.
+
+## Wedge order
+
+Each wedge is zero‑cost when unused and ships behind `@smoke` +
+`@perf_check`.
+
+| # | Wedge | State |
+|---|---|---|
+| 0 | `RTX_SEC_MARKUP`; clip by planter | **done** |
+| 1 | `hint_a / hint_b` on runs | **done** (write‑only) |
+| 2 | Style bits: sidecar parsed (**done**); apply bits to run style at plant; default scope→style map; `markdown.tmLanguage.json` declares `kind: markup`; gate the prose scanner to PROSE‑without‑grammar at open too | next |
+| 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; atom step and reveal‑on‑entry; `rich` toggle key; TUI + GUI paint | |
+| 4 | Fence + injection: line‑anchored closer (fixes `nested.md:11`), `scopeName` / embed op, depth‑2 guest lex, injected planter | |
+| 5 | MD table child | |
+| 6 | Apply / toolbar via one `replace`; toggle‑off by rule id | |
+| 7 | Blocks as folds — after the three blockers above | |
+
+Smokes come from the fixtures: each README row under `testdata/rich/*` is
+an assertion (`style_at`, `hint_a/b`, `section_at`, fold region, child
+geometry) once its wedge lands.
+
+## Locks
+
+| Topic | Lock |
+|---|---|
+| Scope | Rich docs via grammar; MD first client |
+| Section kind | `MARKUP` exists; lex / scope / font decided separately |
+| Styling | Bits on `RtxTmRule` (sidecar, else default scope map) copied to the run; clip and toggle by planter |
+| Hints | Literal begin/end byte counts on the run; layout‑time skip gated on `has_marks`; per‑pane `rich` bit, never OR'd into `view` |
+| Atoms | Marks are clusters with one more join rule (DESIGN Encoding); reveal on entry; byte caret |
+| Nesting | Span depth 1 is a stated leftover for MD fences; lifting the stack is the code‑embed wedge, not optional |
+| Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX` |
+| Children | Layout‑epoch scratch; paint‑time recursion; window + lookback classify; leftover, never wrong |
+| Renders | Opaque vis row of height H; Scan‑table job; epoch cache; GUI only |
+| Derived values | Layout‑epoch, read‑only, one record in window |
+| Grid / hex | Untouched by `rich` |
+| Blocks | Folds are document state; blocks‑as‑folds deferred |
+
+## Non‑goals
+
+Dual document or HTML store; Notion blocks as identity; collaborative OT;
+fully hidden source with no Source mode; a new grammar format (additive
+`cctext` keys on TM only); rendering arbitrary HTML as a browser widget;
+whole‑file MD outline index; TUI diagram rendering.

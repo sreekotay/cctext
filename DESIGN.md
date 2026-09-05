@@ -226,9 +226,11 @@ Commit only after the new value exists: hist after `tree.replace` (reserve coale
 
 - `as: tree` on `RtxDoc`, `as: doc` on `RtxBuf` — miss on the outer retries on the embed.
 - `RtxDocHighlight` — `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`. It cannot `len` / `line_*` / `insert` / `type` / `save`.
-- `RtxDocLayout` — measure may `len`, `line_count`, `line_start`, `line_guess`, `index_covers`, `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`, `fold_covers`. It cannot `line_of` / `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
+- `RtxDocLayout` — measure may `len`, `line_count`, `line_start`, `line_guess`, `index_covers`, `read_at`, `scratch_span`, `style_at`, `style_next`, `section_at`, `ensure_hl(RtxHlWin)`, `fold_covers`. It cannot `line_of` / `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
 
-Mark motion and fold walk the runs `ensure_hl` already produced. They do not lex ahead, pump, or keep a file-shaped table. Heading pairs use those runs; brace pairs (`{}` `[]` `()`) match on the caret’s 256KiB analysis page plus at most one neighbor page each side (same grain as `RTX_HL_WIN_MAX`, not the 64KiB store). Paint does not `ensure_hl` that span — skip uses whatever runs the layout window already has. A fold is stored only when both ends are in that window. Layout skips interiors; caret and scroll jump to the fold edge; hex ignores folds.
+Mark motion and fold walk the runs `ensure_hl` already produced. They do not lex ahead, pump, or keep a file-shaped table. Heading pairs use those runs; brace pairs (`{}` `[]` `()`) match on the caret’s 256KiB analysis page plus at most one neighbor page each side (same grain as `RTX_HL_WIN_MAX`, not the 64KiB store). Paint does not `ensure_hl` that span — skip uses whatever runs the layout window already has. A fold is stored only when both ends are in that window. Layout skips interiors; caret and scroll jump to the fold edge; hex ignores folds. Folds are document state (`RtxDoc.folds`, cap `RTX_FOLD_MAX`), shared by every pane on the doc — per-pane folds are a known non-feature.
+
+Grid, hex, and the markup lens (Rich hints, nested children, injected lex) are paint policies over the same bytes and the same runs — see [docs/md_view.md](docs/md_view.md).
 
 Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for `write_fd` / page-store internals.
 
@@ -301,3 +303,19 @@ Invalid bytes are one-byte clusters (U+FFFD, width 1). Cluster width is the
 cluster, not only the first scalar: ZWJ emoji, RI flags, and VS16 emoji
 presentation are 2 columns; extend/ZWJ glue adds none; otherwise the first
 scalar’s East-Asian / `rtx_utf8_cp_width` policy (then `cols >= 1`).
+
+**Marks are clusters with one more join rule.** A markup span (`**bold**`,
+`` `code` ``, `- [ ]`, `[text](url)`) is hint bytes around content. In a
+Rich pane the hints are atoms exactly the way a ZWJ sequence is: never an
+interior caret position, one step to cross, painted at zero width. The
+extra rule is that a pair’s two hints are **one atom in two places** —
+what removes one removes both (backspace on a hint is unwrap), what
+selects one selects both (a cut that reaches a hint reaches the pair).
+Content between the hints is ordinary clusters, so interior positions are
+legal; that is the only way a mark differs from a glyph. There is no
+“extend the selection” policy and no broken-markup case — those are the
+join rule. Implement it where clusters already are: an atom-length beside
+`rtx_utf8_cluster`, consumed by motion, selection, delete, wrap, and hit;
+gated on a per-fill `has_marks` so a plain file never pays. Source mode
+(`layout.rich == 0`) has no hint atoms — hints are plain bytes. See
+[docs/md_view.md](docs/md_view.md).
