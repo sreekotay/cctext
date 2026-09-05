@@ -69,9 +69,136 @@ static int join2(char *dst, size_t cap, const char *a, const char *b) {
     return n > 0 && (size_t)n < cap;
 }
 
-int main(void) {
+static int write_file(const char *path, const char *text) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) return 0;
+    fputs(text, fp);
+    fclose(fp);
+    return 1;
+}
+
+#define MK_GRAMMAR_DIR "testdata/generated/markup_grammars"
+#define MK_DOC "testdata/generated/markup_doc.mk"
+
+/* File scope on purpose: ccc silently truncates a concatenated string
+ * literal past 511 source bytes when it initializes a *local* declaration
+ * (see CLAUDE.md). File-scope initializers lower intact. */
+static const char *const mk_grammar =
+    "{\n"
+    "  \"name\": \"Mk\",\n"
+    "  \"scopeName\": \"text.mk\",\n"
+    "  \"fileTypes\": [\"mk\"],\n"
+    "  \"cctext\": { \"kind\": \"markup\", \"future\": [1, {\"x\": null}] },\n"
+    "  \"patterns\": [\n"
+    "    { \"include\": \"#head\" },\n"
+    "    { \"include\": \"#em\" }\n"
+    "  ],\n"
+    "  \"repository\": {\n"
+    "    \"head\": {\n"
+    "      \"name\": \"markup.heading.mk\",\n"
+    "      \"match\": \"#{1,6}\\\\s.*\",\n"
+    "      \"cctext\": { \"bold\": true, \"apply\": \"heading\", \"mono\": false }\n"
+    "    },\n"
+    "    \"em\": {\n"
+    "      \"name\": \"markup.italic.mk\",\n"
+    "      \"begin\": \"*\",\n"
+    "      \"end\": \"*\",\n"
+    "      \"cctext\": { \"italic\": true }\n"
+    "    }\n"
+    "  }\n"
+    "}\n";
+
+/* Child process: the grammar registry loads once per process, so a grammar
+ * that declares `"cctext": { "kind": "markup" }` is exercised with
+ * RTX_GRAMMARS pointing at a temp dir (see markup_parent). */
+static int markup_child(void) {
+    @errhandler(CCError e) { cc_error_log(e); return 1; }
+    const RtxTmRt *rt = rtx_tm_for_path("x.mk");
+    size_t k;
+    int saw_bold_apply = 0, saw_italic = 0;
+    expect(rt != NULL, "markup: temp grammar loaded via RTX_GRAMMARS");
+    expect(rtx_tm_nlangs == 1, "markup: only the temp grammar");
+    if (!rt) return fails ? 1 : 0;
+    expect(rt->markup == 1, "markup: grammar-level cctext.kind = markup");
+    expect(rtx_tm_for_path("x.md") == NULL, "markup: md not loaded in temp dir");
+    for (k = 0; k < rt->rules.len; k++) {
+        const RtxTmRule *r = &rt->rules.data[k];
+        if (r->sc_bold && r->sc_apply && strcmp(r->sc_apply, "heading") == 0 &&
+            !r->sc_italic && !r->sc_mono) {
+            saw_bold_apply = 1;
+        }
+        if (r->sc_italic && !r->sc_bold && r->sc_apply == NULL) saw_italic = 1;
+    }
+    expect(saw_bold_apply, "markup: rule carries cctext.bold + apply");
+    expect(saw_italic, "markup: rule carries cctext.italic, apply NULL");
+    {
+        RtxDoc d = {0} @destroy;
+        size_t i;
+        int all_tm = 1, saw_head = 0;
+        d.from_path(MK_DOC) !>;
+        expect(d.secs.len >= 1 && d.section_at(0) == RTX_SEC_MARKUP,
+               "markup: root section is MARKUP");
+        expect(d.runs.len > 0, "markup: TM runs present");
+        for (i = 0; i < d.runs.len; i++) {
+            const char *s = rtx_scope_name(d.runs.data[i].style.scope);
+            /* Scope runs are TM-planted; open-time `*` bits are PROSE-planted. */
+            if (d.runs.data[i].style.scope != RTX_SCOPE_NONE &&
+                d.runs.data[i].planter != RTX_RUN_TM)
+                all_tm = 0;
+            if (d.runs.data[i].style.scope == RTX_SCOPE_NONE &&
+                d.runs.data[i].planter != RTX_RUN_PROSE)
+                all_tm = 0;
+            if (s && strstr(s, "heading")) saw_head = 1;
+        }
+        expect(all_tm, "markup: scope runs planted by TM");
+        expect(saw_head, "markup: heading lexed");
+        expect(d.style_at(0).scope != RTX_SCOPE_NONE, "markup: style_at keeps scope");
+        {
+            const char *s = rtx_scope_name(d.style_at(0).scope);
+            expect(s && strstr(s, "heading"), "markup: style_at(0) is heading");
+        }
+        /* A letter re-lexes the MARKUP section like CODE: heading survives. */
+        d.caret = d.len();
+        d.sel_anchor = d.caret;
+        d.type("z") !>;
+        d.reparse_edit(d.last_off, d.last_markup) !>;
+        expect(d.section_at(0) == RTX_SEC_MARKUP, "markup: stays MARKUP after type");
+        saw_head = 0;
+        for (i = 0; i < d.runs.len; i++) {
+            const char *s = rtx_scope_name(d.runs.data[i].style.scope);
+            if (s && strstr(s, "heading")) saw_head = 1;
+        }
+        expect(saw_head, "markup: heading survives a letter");
+    }
+    return fails ? 1 : 0;
+}
+
+static void markup_parent(const char *exe) {
+    char cmd[1200];
+    int n;
+    if (system("mkdir -p " MK_GRAMMAR_DIR) != 0) expect(0, "mkdir markup grammars");
+    expect(strstr(mk_grammar, "\"italic\": true }") != NULL &&
+               mk_grammar[strlen(mk_grammar) - 2] == '}',
+           "markup grammar literal intact");
+    expect(write_file(MK_GRAMMAR_DIR "/mk.tmLanguage.json", mk_grammar),
+           "write markup grammar");
+    expect(write_file(MK_DOC, "# Title\nsome *it* text\n"), "write markup doc");
+    n = snprintf(cmd, sizeof cmd, "RTX_GRAMMARS='%s' '%s' --markup-child",
+                 MK_GRAMMAR_DIR, exe);
+    expect(n > 0 && (size_t)n < sizeof cmd, "markup child cmd");
+    expect(system(cmd) == 0, "markup child process passed");
+    remove(MK_DOC);
+    remove(MK_GRAMMAR_DIR "/mk.tmLanguage.json");
+}
+
+int main(int argc, char **argv) {
     @errhandler(CCError e) { cc_error_log(e); return 1; }
     char path[512];
+    if (argc > 1 && strcmp(argv[1], "--markup-child") == 0) {
+        int rc = markup_child();
+        if (fails) fprintf(stderr, "%d markup child failure(s)\n", fails);
+        return rc;
+    }
     FILE *fp;
     char *buf = NULL;
     long sz = 0;
@@ -287,7 +414,8 @@ int main(void) {
             char buf[160];
             size_t n, k, bold_off, mono_off;
             const char *p;
-            int code_hl = 0, prose_hl = 0, saw_bold = 0, saw_mono = 0;
+            int code_hl = 0, prose_hl = 0, saw_ital = 0, saw_mono = 0;
+            int planter_ok = 1;
             n = d.read_at(0, buf, sizeof(buf) - 1) !>;
             buf[n] = 0;
             p = strstr(buf, "int x = ");
@@ -320,19 +448,94 @@ int main(void) {
                 if (num && r.start <= prose_off && prose_off < r.start + r.len) {
                     prose_hl = 1;
                 }
-                if (r.style.bold && r.start <= bold_off &&
+                /* Single `*` is italic in prose; `**` is bold. */
+                if (r.style.italic && r.start <= bold_off &&
                     bold_off < r.start + r.len) {
-                    saw_bold = 1;
+                    saw_ital = 1;
                 }
+                if (r.style.bold) planter_ok = 0;
                 if (r.style.mono && r.start <= mono_off &&
                     mono_off < r.start + r.len) {
                     saw_mono = 1;
                 }
+                /* Planter tag: scope runs come from the lexer, bit runs from
+                 * the prose scanner. */
+                if (r.style.scope != RTX_SCOPE_NONE && r.planter != RTX_RUN_TM) {
+                    planter_ok = 0;
+                }
+                if ((r.style.italic || r.style.mono) && r.planter != RTX_RUN_PROSE) {
+                    planter_ok = 0;
+                }
+                if (r.style.scope == RTX_SCOPE_NONE && (r.hint_a || r.hint_b)) {
+                    planter_ok = 0;
+                }
             }
             expect(code_hl, "code 16 is numeric");
             expect(!prose_hl, "prose 17 is not numeric");
-            expect(saw_bold && saw_mono, "prose *bold* and `mono`");
+            expect(saw_ital && saw_mono, "prose *italic* and `mono`");
+            expect(planter_ok, "runs tagged by planter, no bold for single *");
         }
+    }
+
+    /* Prose scanner: `**` bold, `*` italic, `` ` `` mono; all RTX_RUN_PROSE. */
+    {
+        RtxDoc d = {0} @destroy;
+        size_t k;
+        int nb = 0, ni = 0, nm = 0, prose_ok = 1;
+        /* offsets: **bb** 0-5, *ii* 7-10, `mm` 12-15; then unclosed spans */
+        d.from_buffer("**bb** *ii* `mm` *a\n*b `q\n") !>;
+        expect(d.section_at(0) == RTX_SEC_PROSE, "buffer root is prose");
+        for (k = 0; k < d.runs.len; k++) {
+            RtxRun r = d.runs.data[k];
+            if (r.planter != RTX_RUN_PROSE || r.style.scope != RTX_SCOPE_NONE)
+                prose_ok = 0;
+            if (r.style.bold) {
+                nb++;
+                if (!(r.start == 2 && r.len == 2)) prose_ok = 0;
+            }
+            if (r.style.italic) {
+                ni++;
+                if (!(r.start == 8 && r.len == 2)) prose_ok = 0;
+            }
+            if (r.style.mono) {
+                nm++;
+                if (!(r.start == 13 && r.len == 2)) prose_ok = 0;
+            }
+        }
+        expect(nb == 1 && ni == 1 && nm == 1, "one bold, one italic, one mono");
+        expect(prose_ok, "prose runs at **bb** *ii* `mm`; unclosed spans skipped");
+        expect(d.style_at(2).bold && !d.style_at(2).italic, "style_at bold");
+        expect(d.style_at(8).italic && !d.style_at(8).bold, "style_at italic");
+        expect(d.style_at(13).mono, "style_at mono");
+    }
+
+    /* Clip by planter: a TM-planted run that also carries a style bit is
+     * still dropped by the section re-lex (bit shape used to exempt it). */
+    {
+        RtxDoc d = {0} @destroy;
+        RtxScope inv = RTX_SCOPE_NONE;
+        RtxStyle st = {0};
+        size_t k, at;
+        int saw_bold = 0;
+        d.from_buffer("=== code ===\nint x;\n") !>;
+        expect(rtx_scope_put(&inv, "invalid.illegal"), "intern invalid (clip)");
+        at = strlen("=== code ===\n");
+        st.scope = inv;
+        st.bold = 1;
+        expect(rtx_doc_add_run(&d, at, 3, st, RTX_RUN_TM), "plant scope+bold TM run");
+        for (k = 0; k < d.runs.len; k++) {
+            if (d.runs.data[k].style.bold) saw_bold = 1;
+        }
+        expect(saw_bold, "planted run present before re-lex");
+        d.caret = d.len();
+        d.sel_anchor = d.caret;
+        d.type("y") !>;
+        d.reparse_edit(d.last_off, d.last_markup) !>;
+        saw_bold = 0;
+        for (k = 0; k < d.runs.len; k++) {
+            if (d.runs.data[k].style.bold) saw_bold = 1;
+        }
+        expect(!saw_bold, "TM re-lex clips a TM run that carries a bit");
     }
 
     {
@@ -604,6 +807,54 @@ int main(void) {
         expect(saw_h, "README heading survives paste");
     }
 
+    /* Span hints: a closed ``` fence records both literal lengths; an
+     * unclosed one (window end) records hint_b = 0. Non-span runs are 0/0. */
+    {
+        const char *fpath = "testdata/generated/fence.md";
+        RtxDoc d = {0} @destroy;
+        size_t k;
+        int closed_ok = 0, others_ok = 1;
+        if (system("mkdir -p testdata/generated") != 0) expect(0, "mkdir fence");
+        expect(write_file(fpath, "# H\n```\nint x;\n```\ntail `c` *i*\n"),
+               "write fence.md");
+        d.from_path(fpath) !>;
+        expect(d.section_at(0) == RTX_SEC_CODE, "md fence doc is CODE");
+        for (k = 0; k < d.runs.len; k++) {
+            RtxRun r = d.runs.data[k];
+            const char *s = rtx_scope_name(r.style.scope);
+            if (r.style.scope != RTX_SCOPE_NONE && r.planter != RTX_RUN_TM)
+                others_ok = 0;
+            if (r.style.scope == RTX_SCOPE_NONE && (r.hint_a || r.hint_b))
+                others_ok = 0;
+            if (s && strstr(s, "raw.block")) {
+                if (r.start == 4 && r.hint_a == 3 && r.hint_b == 3) closed_ok = 1;
+            } else if (s && strstr(s, "heading")) {
+                if (r.hint_a || r.hint_b) others_ok = 0;
+            } else if (s && strstr(s, "raw.inline")) {
+                if (!(r.hint_a == 1 && r.hint_b == 1)) others_ok = 0;
+            }
+        }
+        expect(closed_ok, "closed fence hint_a == 3 && hint_b == 3");
+        expect(others_ok, "regex runs 0/0, inline code 1/1, scope runs TM planted");
+        d.destroy();
+        expect(write_file(fpath, "# H\n```\nint x;\nno closer\n"), "write open fence");
+        d.from_path(fpath) !>;
+        closed_ok = 0;
+        for (k = 0; k < d.runs.len; k++) {
+            RtxRun r = d.runs.data[k];
+            const char *s = rtx_scope_name(r.style.scope);
+            if (s && strstr(s, "raw.block") && r.start == 4 &&
+                r.start + r.len == d.len() && r.hint_a == 3 && r.hint_b == 0) {
+                closed_ok = 1;
+            }
+        }
+        expect(closed_ok, "unclosed fence hint_a == 3 && hint_b == 0");
+        remove(fpath);
+    }
+
+    /* RTX_SEC_MARKUP + grammar sidecar, in a child with RTX_GRAMMARS. */
+    markup_parent(argv[0]);
+
     {
         RtxDoc d = {0} @destroy;
         size_t first;
@@ -629,7 +880,7 @@ int main(void) {
         expect(rtx_scope_put(&inv, "invalid.illegal"), "intern invalid");
         at = d.len() ? d.len() - 1 : 0;
         st.scope = inv;
-        expect(rtx_doc_add_run(&d, at, 1, st), "plant invalid run");
+        expect(rtx_doc_add_run(&d, at, 1, st, RTX_RUN_TM), "plant invalid run");
         d.caret = 0;
         d.sel_anchor = 0;
         expect(d.scope_step(1, 1), "step to invalid");
