@@ -2450,6 +2450,147 @@ int main(void) {
         unlink(path);
     }
 
+    /* Rich pane join rule (DESIGN Encoding, docs/md_view.md): a pair's hints
+     * are one atom in two places. Motion never rests inside a hint;
+     * backspace / delete on a hint unwraps the pair; a selection reaching
+     * one hint removes both; cut and typing over such a selection do the
+     * same. Source pane: plain bytes. */
+    {
+        RtxWs w = {0} @destroy;
+        RtxBuf *act;
+        RtxDoc *d;
+        char *paths[1];
+        char path[] = "/tmp/rtx_rich_join_XXXXXX";
+        char mdpath[64];
+        int fd = mkstemp(path);
+        const char *text = "# T\n\nThis has **bold** and *italic* words in one line.\n";
+        char got[256];
+        size_t n, ob, oi, ls, hint_before;
+        expect(fd >= 0, "join: tmp file");
+        if (fd >= 0) {
+            (void)!write(fd, text, strlen(text));
+            close(fd);
+        }
+        snprintf(mdpath, sizeof mdpath, "%s.md", path);
+        rename(path, mdpath); /* grammar is chosen by extension */
+        paths[0] = mdpath;
+        w.open_files(1, paths) !>;
+        act = w.active();
+        d = &act->doc;
+        expect(act && d->section_at(0) == RTX_SEC_MARKUP, "join: .md is MARKUP");
+        expect(d->has_marks(), "join: hinted runs present");
+        ls = 5;                              /* "This has ..." */
+        ob = ls + 9;                         /* `**bold**` */
+        oi = ls + 22;                        /* `*italic*` */
+        n = d->len();
+        act->layout.rich = 1;
+        /* Motion: right from just before `**` crosses the opener in one step. */
+        d->caret = ob;
+        d->sel_anchor = ob;
+        act->move_horiz(1, 0) !>;
+        expect(d->caret == ob + 2, "join: → from before ** lands on content");
+        act->move_horiz(-1, 0) !>;
+        expect(d->caret == ob, "join: ← back over ** lands before it");
+        d->caret = ob + 6; /* content end, before the closer */
+        d->sel_anchor = d->caret;
+        act->move_horiz(1, 0) !>;
+        expect(d->caret == ob + 8, "join: → over closer ** is one step");
+        /* A caret placed inside a hint (jump / hit) is snapped on the next move. */
+        d->caret = ob + 1;
+        d->sel_anchor = d->caret;
+        act->move_horiz(1, 0) !>;
+        expect(d->caret == ob + 2 || d->caret == ob + 3,
+               "join: interior hint caret steps out, never rests at ob+1");
+        /* Backspace just after the closer: unwrap, both hints gone, content stays. */
+        d->caret = ob + 8;
+        d->sel_anchor = d->caret;
+        hint_before = d->len();
+        act->backspace() !>;
+        expect(d->len() == hint_before - 4, "join: backspace on closer removes 4 hint bytes");
+        d->read_at(ls, got, 30) !>;
+        expect(strncmp(got, "This has bold and *italic*", 26) == 0, "join: **bold** → bold");
+        expect(d->caret == ob + 4, "join: caret after unwrapped content");
+        /* Undo is one record. */
+        d->undo() !>;
+        d->reparse_edit(d->last_off, d->last_markup) !>; /* after_edit would */
+        expect(d->len() == n, "join: one undo restores the pair");
+        d->read_at(ob, got, 8) !>;
+        expect(strncmp(got, "**bold**", 8) == 0, "join: pair back after undo");
+        /* Delete forward at the opener: same unwrap. */
+        d->caret = ob;
+        d->sel_anchor = ob;
+        act->delete_forward() !>;
+        expect(d->len() == n - 4, "join: delete on opener removes both hints");
+        d->undo() !>;
+        d->reparse_edit(d->last_off, d->last_markup) !>; /* after_edit would */
+        expect(d->len() == n, "join: undo delete-unwrap");
+        /* Selection covering `**bo` (one hint, part of the content): the
+         * closer goes too. Result: `ld and` — no dangling `**`. */
+        d->sel_anchor = ob;
+        d->caret = ob + 4;
+        act->backspace() !>;
+        d->read_at(ls, got, 24) !>;
+        expect(strncmp(got, "This has ld and *italic*", 24) == 0, "join: sel over one hint cuts the pair");
+        expect(d->caret == ob, "join: caret at the deletion start");
+        d->undo() !>;
+        d->reparse_edit(d->last_off, d->last_markup) !>; /* after_edit would */
+        expect(d->len() == n, "join: undo sel-join");
+        /* Selection from bold content into italic content: bold closer and
+         * italic opener are inside, so bold opener and italic closer go. */
+        d->sel_anchor = ob + 4; /* `ld** and *it` */
+        d->caret = oi + 3;
+        act->backspace() !>;
+        d->read_at(ls, got, 20) !>;
+        expect(strncmp(got, "This has boalic word", 20) == 0, "join: sel across two pairs removes both partners");
+        d->undo() !>;
+        d->reparse_edit(d->last_off, d->last_markup) !>; /* after_edit would */
+        expect(d->len() == n, "join: undo two-pair join");
+        /* Typing over a selection that reaches a hint: the pair goes, text lands. */
+        d->sel_anchor = ob;
+        d->caret = ob + 4;
+        act->type_cp((uint32_t)'X') !>;
+        d->read_at(ls, got, 20) !>;
+        expect(strncmp(got, "This has Xld and *it", 20) == 0, "join: type over sel joins the pair");
+        expect(d->caret == ob + 1, "join: caret after the typed byte");
+        d->undo() !>;
+        d->reparse_edit(d->last_off, d->last_markup) !>; /* after_edit would */
+        expect(d->len() == n, "join: undo type-join");
+        /* Cut: the clipboard is the bytes as selected; the doc loses the pair. */
+        d->sel_anchor = ob;
+        d->caret = ob + 4;
+        w.cut() !>;
+        expect(w.clip.len == 4 && strncmp(w.clip.ptr, "**bo", 4) == 0, "join: cut copies selected bytes");
+        d->read_at(ls, got, 16) !>;
+        expect(strncmp(got, "This has ld and ", 16) == 0, "join: cut removes the pair");
+        d->undo() !>;
+        d->reparse_edit(d->last_off, d->last_markup) !>; /* after_edit would */
+        expect(d->len() == n, "join: undo cut-join");
+        /* Content deletion inside a mark is ordinary: `d` from `bold`. */
+        d->caret = ob + 4;
+        d->sel_anchor = d->caret;
+        act->backspace() !>;
+        expect(d->len() == n - 1, "join: backspace in content deletes one byte");
+        d->read_at(ob, got, 7) !>;
+        expect(strncmp(got, "**bld**", 7) == 0, "join: hints untouched by content edit");
+        d->undo() !>;
+        d->reparse_edit(d->last_off, d->last_markup) !>; /* after_edit would */
+        /* Source pane: backspace on the closer is one byte, as always. */
+        act->layout.rich = 0;
+        d->caret = ob + 8;
+        d->sel_anchor = d->caret;
+        act->backspace() !>;
+        expect(d->len() == n - 1, "source: backspace on a hint is one byte");
+        d->read_at(ob, got, 7) !>;
+        expect(strncmp(got, "**bold*", 7) == 0, "source: one star gone");
+        d->undo() !>;
+        d->reparse_edit(d->last_off, d->last_markup) !>; /* after_edit would */
+        d->caret = ob;
+        d->sel_anchor = ob;
+        act->move_horiz(1, 0) !>;
+        expect(d->caret == ob + 1, "source: → steps one byte into **");
+        remove(mdpath);
+    }
+
     if (fails) {
         fprintf(stderr, "%d failure(s)\n", fails);
         return 1;

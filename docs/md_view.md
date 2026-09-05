@@ -31,13 +31,14 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Per‑pane `rich` bit on `RtxLayout`; persisted in `RtxSafeCam` (RTXC v2, v1 reads); `d` / `Ctrl-D` / Cmd-D toggles (`RtxBuf_toggle_rich`); status shows `rich` | `layout.cch`, `safe.cch`, `ui_cmd.h` `CMD_RICH` | done |
 | Rich layout: `has_marks` per fill; `rtx_layout_hidden_to` skips hidden hint bytes in row measure, wrap walk, `x_of`, hit, and all four text paint loops (TUI active / preview, GUI active / preview); grid and hex ignore `rich` | `core/layout.ccs`, `cctext_draw.ccs`, `gui_draw.ccs` | done |
 | Reveal on entry: `rtx_layout_reveal` = union of `mark_at(caret)`, `mark_at(anchor)`; `ensure_view` refills when the span changes; `move_vert` scratch rows inherit it | `rtx_layout_reveal`, `RtxBuf_ensure_view` | done |
+| Join rule: `RtxDoc_replace_join` — a replace touching one hint removes both hints whole, one `replace` over the union span, one hist record (cap `RTX_HL_WIN_MAX`, else plain). Pane hooks on Rich only: `move_horiz` never rests inside a hint (`rtx_buf_hint_snap`); backspace / delete on a hint unwraps; selection delete, cut and type‑over go through the join. Copy is the bytes as selected. | `core/document.ccs`, `RtxBuf_backspace` / `delete_forward` / `type_cp`, `RtxWs_cut` | done |
 | Inline spans stay on one line: `"cctext": {"inline": true}` drops an unclosed span at EOL (opener is text, CommonMark unmatched delimiter); `"flank": true` rejects an opener before whitespace and a closer after it (`2 * 3` is plain). Bold / italic / code declare `inline`; bold / italic add `flank` | `RtxTmRule.inl` / `flank`, `rtx_tm_span_advance`, `markdown.tmLanguage.json` | done |
 | Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; smokes not yet written |
 | TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
 
-Not landed: Rich **motion** (atom step across a pair, backspace‑unwrap,
-selection reaching a hint), `apply`, nested children, injection, opaque
-renders, blocks‑as‑folds. Known Rich leftovers from the depth‑1 lexer: nested
+Not landed: `apply`, nested children, injection, opaque renders,
+blocks‑as‑folds. Rich hit‑test can still land between the two bytes of a
+*revealed* `**` (the next motion snaps out); hidden hints are never a landing. Known Rich leftovers from the depth‑1 lexer: nested
 marks (`***both***`, `**a *b* c**`) lex wrong until the stack lands (wedge 4);
 `\*` escapes and `_` marks have no rule yet, so they paint as source.
 
@@ -231,8 +232,8 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 0 | `RTX_SEC_MARKUP`; clip by planter | **done** |
 | 1 | `hint_a / hint_b` on runs | **done** (write‑only) |
 | 2 | Style bits from sidecar or default scope map, copied at plant; `markdown.tmLanguage.json` declares `kind: markup`; prose scanner gated to PROSE sub‑ranges | **done** |
-| 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; reveal‑on‑entry; `rich` toggle key; TUI + GUI paint — **done**. Atom step / unwrap / selection join rule | next |
-| 4 | Fence + injection: line‑anchored closer (**done**, `cctext.bol`); info‑string capture; `scopeName` / embed op; depth‑2 guest lex; injected planter | |
+| 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; reveal‑on‑entry; `rich` toggle key; TUI + GUI paint; atom step, unwrap, selection join rule | **done** |
+| 4 | Fence + injection: line‑anchored closer (**done**, `cctext.bol`); info‑string capture; `scopeName` / embed op; depth‑2 guest lex (also fixes nested inline marks); injected planter | next |
 | 5 | MD table child | |
 | 6 | Apply / toolbar via one `replace`; toggle‑off by rule id | |
 | 7 | Blocks as folds — after the three blockers above | |
