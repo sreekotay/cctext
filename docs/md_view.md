@@ -20,9 +20,10 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Piece | Where | State |
 |---|---|---|
 | Runs carry a **planter** (`RTX_RUN_PROSE` / `RTX_RUN_TM`); window re‑lex clips by planter, not bit shape | `RtxRun.planter`, `rtx_run_planted_*` in `core/document.ccs` | done — fixes the mixed‑run leak |
-| `RTX_SEC_MARKUP`: lexed like CODE, `style_at` keeps scope, GUI may pick a prose face | `rtx_sec_lexed`, `rtx_doc_path_kind` | done; **no shipped grammar opts in yet**, so zero behavior change |
-| Prose scanner: `**x**` bold, `*x*` italic, `` `x` `` mono | `rtx_doc_scan_markup_runs` | done |
-| Grammar sidecar: `"cctext": {"kind":"markup"}` (grammar), `bold` / `italic` / `mono` / `apply` (pattern) | `RtxTmRt.markup`, `RtxTmRule.sc_*` | parsed and stored; **not yet applied to run style at plant time** |
+| `RTX_SEC_MARKUP`: lexed like CODE, `style_at` keeps scope, GUI picks the prose face | `rtx_sec_lexed`, `rtx_doc_path_kind` | done; Markdown opts in |
+| Prose scanner: `**x**` bold, `*x*` italic, `` `x` `` mono; runs only on PROSE / unknown sub-ranges (open, window, edit) | `rtx_doc_scan_prose_runs` | done |
+| Grammar sidecar: `"cctext": {"kind":"markup"}` (grammar), `bold` / `italic` / `mono` / `apply` (pattern); default scope→bits map when absent; bits copied to every TM run at plant | `RtxTmRt.markup`, `RtxTmRule.sc_*` / `cap_bits`, `rtx_scope_default_bits` | done; `apply` stored only |
+| `markdown.tmLanguage.json` declares `kind: markup` — `.md` is MARKUP: TM scopes + bold / italic / mono bits, prose face in the GUI | `testdata/grammars/markdown.tmLanguage.json` | done |
 | Hint byte counts on runs from literal begin/end | `RtxRun.hint_a` / `hint_b` (0 = unclosed) | written; nothing reads them |
 | Italic paints: TUI SGR 3, GUI italic / bold‑italic faces | `frontend/cctext.ccs`, `gui_draw.ccs` | done |
 | Unwrapped row width = sum of per‑run measures via `RtxDoc_style_next` | `rtx_layout_row_measure` | done; scope‑only edges coalesce |
@@ -79,15 +80,15 @@ Two sources, sidecar wins:
    Consulted at plant time only.
 
 Plant path: TM match → one run with scope **and** bits **and**
-`hint_a/hint_b`, planter `RTX_RUN_TM`. The prose scanner is the planter
-only for `PROSE` without a grammar (pre‑existing quirk: open‑time `scan_buf`
-and the >256K window scan still run it on every byte, so a CODE doc gets
-scanner runs at open; decide keep vs gate with wedge 2).
+`hint_a/hint_b`, planter `RTX_RUN_TM`. Bits are resolved once per rule at
+bind (`rtx_tm_bind_bits`; capture scopes in `rtx_tm_intern_caps`), so a
+plant is three bit copies. The prose scanner is the planter only for
+`PROSE` (or still‑unknown) sub‑ranges — `rtx_doc_scan_prose_runs` walks the
+section list, so a grammared section never carries `RTX_RUN_PROSE` runs.
 
 Section/font: `MARKUP` gets the prose face; `st.mono` (inline code, fence
-body) gets mono inside it. `.md` matching a grammar that declares
-`kind: markup` is the switch; until the shipped `markdown.tmLanguage.json`
-declares it, `.md` stays CODE as today.
+body) gets mono inside it. The shipped `markdown.tmLanguage.json` declares
+`kind: markup`, so `.md` is MARKUP now.
 
 ## Hints, Source and Rich
 
@@ -220,8 +221,8 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 |---|---|---|
 | 0 | `RTX_SEC_MARKUP`; clip by planter | **done** |
 | 1 | `hint_a / hint_b` on runs | **done** (write‑only) |
-| 2 | Style bits: sidecar parsed (**done**); apply bits to run style at plant; default scope→style map; `markdown.tmLanguage.json` declares `kind: markup`; gate the prose scanner to PROSE‑without‑grammar at open too | next |
-| 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; atom step and reveal‑on‑entry; `rich` toggle key; TUI + GUI paint | |
+| 2 | Style bits from sidecar or default scope map, copied at plant; `markdown.tmLanguage.json` declares `kind: markup`; prose scanner gated to PROSE sub‑ranges | **done** |
+| 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; atom step and reveal‑on‑entry; `rich` toggle key; TUI + GUI paint | next |
 | 4 | Fence + injection: line‑anchored closer (fixes `nested.md:11`), `scopeName` / embed op, depth‑2 guest lex, injected planter | |
 | 5 | MD table child | |
 | 6 | Apply / toolbar via one `replace`; toggle‑off by rule id | |
