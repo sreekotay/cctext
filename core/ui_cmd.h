@@ -30,7 +30,8 @@ enum {
     CMD_NAV_INV,
     CMD_NAV_INV_PREV,
     CMD_FOLD,
-    CMD_STATS
+    CMD_STATS,
+    CMD_RICH  /* markup lens: Source / Rich per pane */
 };
 
 #endif /* RTX_UI_CMD_H */

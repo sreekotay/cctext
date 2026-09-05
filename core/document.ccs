@@ -1571,6 +1571,19 @@ static int rtx_tm_at_bol(const char *buf, size_t i, int bol0) {
     return i == 0 ? bol0 : buf[i - 1] == '\n';
 }
 
+static int rtx_tm_is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/* `cctext.flank`: an opener at i (alen bytes) must be followed by a
+ * non-space; a closer at i must be preceded by one. `2 * 3` opens nothing. */
+static int rtx_tm_flank_open(const char *buf, size_t i, size_t n, size_t alen) {
+    return i + alen < n && !rtx_tm_is_ws(buf[i + alen]);
+}
+static int rtx_tm_flank_close(const char *buf, size_t i) {
+    return i > 0 && !rtx_tm_is_ws(buf[i - 1]);
+}
+
 static int rtx_tm_try_rule(RtxDoc *d, const RtxTmRt *rt, const RtxTmRule *rule,
                            const char *buf, size_t base, size_t n, size_t emit_from,
                            size_t *i, size_t *sp, size_t *stk_rule, size_t *stk_off,
@@ -1594,6 +1607,7 @@ static int rtx_tm_try_rule(RtxDoc *d, const RtxTmRt *rt, const RtxTmRule *rule,
     case RTX_TM_LIT_SPAN:
         if (!allow_span || !rtx_tm_starts(buf, *i, n, rule->a, rule->alen)) return 0;
         if (rule->bol && !rtx_tm_at_bol(buf, *i, bol0)) return 0;
+        if (rule->flank && !rtx_tm_flank_open(buf, *i, n, rule->alen)) return 0;
         if (*sp >= RTX_TM_STACK) return -1;
         stk_rule[*sp] = (size_t)(rule - rt->rules.data);
         stk_off[*sp] = *i;
@@ -1695,6 +1709,17 @@ static int rtx_tm_span_advance(RtxDoc *d, const RtxTmRt *rt, RtxTmRule *fr,
     if (fr->blen == 1) {
         hit_bs = (const char *)memchr(buf + *i, '\\', n - *i);
     }
+    if (fr->inl) {
+        /* `cctext.inline`: a closer past the line end does not close. The
+         * opener was plain text (CommonMark's unmatched delimiter); drop the
+         * frame at the newline and let the outer loop lex on from there. */
+        const char *nl = (const char *)memchr(buf + *i, '\n', n - *i);
+        if (nl && (!hit_end || nl < hit_end) && (!hit_bs || nl < hit_bs)) {
+            *i = (size_t)(nl - buf);
+            (*sp)--;
+            return 1;
+        }
+    }
     if (!hit_end && !hit_bs) {
         *i = n;
         return 1;
@@ -1717,7 +1742,8 @@ static int rtx_tm_span_advance(RtxDoc *d, const RtxTmRt *rt, RtxTmRule *fr,
     }
     *i = (size_t)(hit_end - buf);
     if (rtx_tm_starts(buf, *i, n, fr->b, fr->blen) &&
-        (!fr->bol || rtx_tm_at_bol(buf, *i, bol0))) {
+        (!fr->bol || rtx_tm_at_bol(buf, *i, bol0)) &&
+        (!fr->flank || rtx_tm_flank_close(buf, *i))) {
         if (!rtx_tm_add_span(d, base + stk_off[*sp - 1], base + *i + fr->blen,
                              emit_from, fr->scope, rtx_tm_rule_bits(fr),
                              fr->alen, fr->blen)) {
@@ -1742,6 +1768,8 @@ typedef struct {
     size_t n_kids;
     unsigned char sc_has;
     unsigned char sc_bol;
+    unsigned char sc_inl;
+    unsigned char sc_flank;
     unsigned char sc_bold;
     unsigned char sc_italic;
     unsigned char sc_mono;
@@ -1894,6 +1922,8 @@ static int rtx_tm_pat_from_raw(const RtxTmPatRaw *raw, RtxTmPat *out) {
     out->n_kids = raw->n_kids;
     out->sc_has = raw->sc_has;
     out->sc_bol = raw->sc_bol;
+    out->sc_inl = raw->sc_inl;
+    out->sc_flank = raw->sc_flank;
     out->sc_bold = raw->sc_bold;
     out->sc_italic = raw->sc_italic;
     out->sc_mono = raw->sc_mono;
@@ -1909,7 +1939,8 @@ static void rtx_tm_pat_clear(RtxTmPatRaw *p) {
     p->kid0 = 0;
     p->n_kids = 0;
     for (i = 0; i < (size_t)RTX_TM_CAPS; i++) p->capn[i][0] = 0;
-    p->sc_has = p->sc_bol = p->sc_bold = p->sc_italic = p->sc_mono = 0;
+    p->sc_has = p->sc_bol = p->sc_inl = p->sc_flank = 0;
+    p->sc_bold = p->sc_italic = p->sc_mono = 0;
     p->sc_apply[0] = 0;
 }
 
@@ -1956,6 +1987,12 @@ static int rtx_jw_cctext_pat(RtxJw *j, RtxTmPatRaw *p) {
         } else if (strcmp(key, "bol") == 0) {
             if (!rtx_jw_bool(j, &b)) return 0;
             p->sc_bol = (unsigned char)b;
+        } else if (strcmp(key, "inline") == 0) {
+            if (!rtx_jw_bool(j, &b)) return 0;
+            p->sc_inl = (unsigned char)b;
+        } else if (strcmp(key, "flank") == 0) {
+            if (!rtx_jw_bool(j, &b)) return 0;
+            p->sc_flank = (unsigned char)b;
         } else if (strcmp(key, "apply") == 0) {
             if (!rtx_jw_string(j, p->sc_apply, sizeof p->sc_apply)) return 0;
         } else if (!rtx_jw_skip(j)) {
@@ -2125,6 +2162,8 @@ static void rtx_tm_bind_rule(RtxTmRule *rule, RtxTmPat *stable) {
     if (!rule || !stable) return;
     rtx_tm_bind_bits(rule, stable);
     rule->bol = stable->sc_bol;
+    rule->inl = stable->sc_inl;
+    rule->flank = stable->sc_flank;
     rule->sc_apply = stable->sc_apply && stable->sc_apply[0] ? stable->sc_apply : NULL;
     switch (rule->op) {
     case RTX_TM_SKIP:
@@ -2977,6 +3016,10 @@ static void !>(CCError) rtx_tm_lex(RtxDoc *d, const RtxTmRt *rt, const char *buf
             {
                 size_t k;
                 int inner_hit = 0;
+                if (fr->inl && fr->op == RTX_TM_LIT_SPAN && buf[i] == '\n') {
+                    sp--; /* `cctext.inline`: unclosed at EOL, opener was text */
+                    continue;
+                }
                 /* Inner rules get allow_span = 0: a span never opens inside a
                  * span, so sp stays at 1 (RTX_TM_STACK in tm.cch is headroom). */
                 for (k = 0; k < fr->innern; k++) {
@@ -2996,7 +3039,8 @@ static void !>(CCError) rtx_tm_lex(RtxDoc *d, const RtxTmRt *rt, const char *buf
                 }
                 if (fr->op == RTX_TM_LIT_SPAN &&
                     rtx_tm_starts(buf, i, n, fr->b, fr->blen) &&
-                    (!fr->bol || rtx_tm_at_bol(buf, i, bol0))) {
+                    (!fr->bol || rtx_tm_at_bol(buf, i, bol0)) &&
+                    (!fr->flank || rtx_tm_flank_close(buf, i))) {
                     if (!rtx_tm_add_span(d, base + stk_off[sp - 1],
                                          base + i + fr->blen, emit_from,
                                          fr->scope, rtx_tm_rule_bits(fr),

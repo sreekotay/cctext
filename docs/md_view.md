@@ -24,16 +24,22 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Prose scanner: `**x**` bold, `*x*` italic, `` `x` `` mono; runs only on PROSE / unknown sub-ranges (open, window, edit) | `rtx_doc_scan_prose_runs` | done |
 | Grammar sidecar: `"cctext": {"kind":"markup"}` (grammar), `bold` / `italic` / `mono` / `apply` (pattern); default scope→bits map when absent; bits copied to every TM run at plant | `RtxTmRt.markup`, `RtxTmRule.sc_*` / `cap_bits`, `rtx_scope_default_bits` | done; `apply` stored only |
 | `markdown.tmLanguage.json` declares `kind: markup` — `.md` is MARKUP: TM scopes + bold / italic / mono bits, prose face in the GUI | `testdata/grammars/markdown.tmLanguage.json` | done |
-| Hint byte counts on runs from literal begin/end | `RtxRun.hint_a` / `hint_b` (0 = unclosed) | written; nothing reads them |
+| Hint byte counts on runs from literal begin/end | `RtxRun.hint_a` / `hint_b` (0 = unclosed) | done; read by `RtxDoc_hint_at` / `mark_at` / `hint_next` / `has_marks` |
 | Italic paints: TUI SGR 3, GUI italic / bold‑italic faces | `frontend/cctext.ccs`, `gui_draw.ccs` | done |
 | Unwrapped row width = sum of per‑run measures via `RtxDoc_style_next` | `rtx_layout_row_measure` | done; scope‑only edges coalesce |
 | Heading fold at window edge is a leftover, not a fold to the window end | `nav_region` | done |
-| Per‑pane `rich` bit reserved on `RtxLayout`; persisted in `RtxSafeCam` (RTXC v2, v1 reads) | `layout.cch`, `safe.cch` | reserved; nothing reads it |
+| Per‑pane `rich` bit on `RtxLayout`; persisted in `RtxSafeCam` (RTXC v2, v1 reads); `d` / `Ctrl-D` / Cmd-D toggles (`RtxBuf_toggle_rich`); status shows `rich` | `layout.cch`, `safe.cch`, `ui_cmd.h` `CMD_RICH` | done |
+| Rich layout: `has_marks` per fill; `rtx_layout_hidden_to` skips hidden hint bytes in row measure, wrap walk, `x_of`, hit, and all four text paint loops (TUI active / preview, GUI active / preview); grid and hex ignore `rich` | `core/layout.ccs`, `cctext_draw.ccs`, `gui_draw.ccs` | done |
+| Reveal on entry: `rtx_layout_reveal` = union of `mark_at(caret)`, `mark_at(anchor)`; `ensure_view` refills when the span changes; `move_vert` scratch rows inherit it | `rtx_layout_reveal`, `RtxBuf_ensure_view` | done |
+| Inline spans stay on one line: `"cctext": {"inline": true}` drops an unclosed span at EOL (opener is text, CommonMark unmatched delimiter); `"flank": true` rejects an opener before whitespace and a closer after it (`2 * 3` is plain). Bold / italic / code declare `inline`; bold / italic add `flank` | `RtxTmRule.inl` / `flank`, `rtx_tm_span_advance`, `markdown.tmLanguage.json` | done |
 | Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; smokes not yet written |
 | TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
 
-Not landed: anything that reads `hint_*` or `rich`, any Rich‑mode paint or
-motion, `apply`, nested children, injection, opaque renders, blocks‑as‑folds.
+Not landed: Rich **motion** (atom step across a pair, backspace‑unwrap,
+selection reaching a hint), `apply`, nested children, injection, opaque
+renders, blocks‑as‑folds. Known Rich leftovers from the depth‑1 lexer: nested
+marks (`***both***`, `**a *b* c**`) lex wrong until the stack lands (wedge 4);
+`\*` escapes and `_` marks have no rule yet, so they paint as source.
 
 ## Vocabulary
 
@@ -144,6 +150,9 @@ What the lowering reads today vs. what the fixtures need is in
 - Fixed: `testdata/rich/code/nested.md:11` (a ``` inside a Python docstring
   closed the fence early). Literal spans take `"cctext": {"bol": true}` —
   begin and end must sit at line start; the shipped fence rule declares it.
+- Literal spans also take `"inline": true` (unclosed at EOL → opener is text)
+  and `"flank": true` (opener not before whitespace, closer not after). These
+  three keys are the whole span vocabulary; nesting is still the stack.
 
 Minimum, cheapest first: (1) line‑anchored fence closer + info‑string
 capture on `RTX_TM_LIT_SPAN`; (2) explicit `"""` / `'''` rules in the
@@ -222,7 +231,7 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 0 | `RTX_SEC_MARKUP`; clip by planter | **done** |
 | 1 | `hint_a / hint_b` on runs | **done** (write‑only) |
 | 2 | Style bits from sidecar or default scope map, copied at plant; `markdown.tmLanguage.json` declares `kind: markup`; prose scanner gated to PROSE sub‑ranges | **done** |
-| 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; atom step and reveal‑on‑entry; `rich` toggle key; TUI + GUI paint | next |
+| 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; reveal‑on‑entry; `rich` toggle key; TUI + GUI paint — **done**. Atom step / unwrap / selection join rule | next |
 | 4 | Fence + injection: line‑anchored closer (**done**, `cctext.bol`); info‑string capture; `scopeName` / embed op; depth‑2 guest lex; injected planter | |
 | 5 | MD table child | |
 | 6 | Apply / toolbar via one `replace`; toggle‑off by rule id | |

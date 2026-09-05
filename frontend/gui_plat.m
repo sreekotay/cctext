@@ -139,6 +139,7 @@ static void gui_menu_build(void) {
     viewItem.title = @"View";
     [mainMenu addItem:viewItem];
     gui_menu_add(viewMenu, @"Cycle View", @"l", (int)cmd, CMD_VIEW);
+    gui_menu_add(viewMenu, @"Rich / Source", @"d", (int)cmd, CMD_RICH);
     gui_menu_add(viewMenu, @"Follow Caret", @"u", (int)cmd, CMD_FOLLOW);
     gui_menu_add(viewMenu, @"Split", @"\\", (int)cmd, CMD_SPLIT);
     gui_menu_add(viewMenu, @"Next File", @"n", (int)cmd, CMD_NEXT);
