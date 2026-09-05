@@ -100,11 +100,13 @@ numbers when a pin can re-key. (`pin_view` on the buf is a follow-lock
 after wheel/bar — not a gutter pin.)
 
 `g N%` is a byte snap plus island (backfill). Land on an uncovered
-camera plants the same dest-live walk. `g L` is a prefix pump
-(`want_line`) — not a guess. After open the host does not walk toward
-EOF. A far seek (>8 KiB) drops the origin and goes back to red `+N` /
-`-L` unless a planted 1/32 pin is next to the landing — then that pin
-re-keys the origin. Slot `i` is byte `i * len / 32` (vacant =
+camera plants the same dest-live walk. The walk stops at the prefix
+or the last planted 1/32 pin ahead of it — after an EOF update has
+filled the slot table, that is at most one slice. `g L` is a prefix
+pump (`want_line`) — not a guess. After open the host does not walk
+toward EOF. A far seek (>8 KiB) drops the origin and goes back to
+red `+N` / `-L` unless a planted 1/32 pin is in that slice — then
+that pin re-keys the origin. Slot `i` is byte `i * len / 32` (vacant =
 `(size_t)-1`). Prefix cover or a connected island plants a pin and
 keys the origin (island does not have to sit on a slot). An edit
 wipes pins at or after the byte and clears the origin (BOF slot 0

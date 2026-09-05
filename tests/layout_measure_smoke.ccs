@@ -26,6 +26,27 @@ static void expect(int cond, const char *msg) {
     }
 }
 
+static size_t rtx_test_slot_tgt(size_t slot, size_t n) {
+    return (size_t)(((unsigned long long)slot * (unsigned long long)n) /
+                    (unsigned long long)RTX_LINE_MARK_MAX);
+}
+
+static void rtx_test_plant_all(RtxPieceTree *t, const RtxLineMark *saved) {
+    size_t i;
+    if (!t || !saved) return;
+    for (i = 0; i < RTX_LINE_MARK_MAX; i++)
+        t->pins[i] = saved[i];
+}
+
+static void rtx_test_vacate_from(RtxPieceTree *t, size_t from) {
+    size_t i;
+    if (!t) return;
+    for (i = from; i < RTX_LINE_MARK_MAX; i++) {
+        t->pins[i].off = 0;
+        t->pins[i].line = RTX_LINE_PIN_EMPTY;
+    }
+}
+
 static double meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
     double w = 0;
     (void)ctx;
@@ -624,6 +645,418 @@ int main(void) {
             expect(b.doc.line_guess(0) == ln0, "guess matches when ready");
         }
         expect(b.doc.index_covers(b.len()), "small buffer covers EOF");
+    }
+
+    {
+        /* Scrollbar drag must not keep respawning the dest-live island.
+         * Cancel the live worker on the first jump; kick one on release. */
+        RtxBuf b = {0} @destroy;
+        FILE *fp;
+        int i;
+        const char *path = "testdata/generated/scroll_drag.txt";
+        (void)system("mkdir -p testdata/generated");
+        fp = fopen(path, "w");
+        expect(fp != NULL, "scroll drag fopen");
+        if (fp) {
+            for (i = 0; i < 8000; i++)
+                fprintf(fp, "line %04d xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i);
+            fclose(fp);
+        }
+        b.doc.from_path(path) !>;
+        if (!b.doc.lf_ready()) {
+            size_t n = b.doc.len();
+            b.drag_len = n ? n : 1;
+            for (i = 1; i <= 8; i++) {
+                b.scroll_to_off(n * (size_t)i / 9) !>;
+                b.ensure_view(&m, 80.0, 8) !>;
+            }
+            expect(!rtx_line_isle_live(&b.doc.tree),
+                   "drag cancels the island and does not spawn another");
+            rtx_buf_drag_end(&b);
+            expect(!b.drag_len, "drag_end clears the rail grab");
+            if (!b.doc.lf_ready() && b.seek_valid &&
+                !b.doc.index_covers(b.seek_off) &&
+                !rtx_line_mark_ok(&b.doc.tree))
+                expect(rtx_line_isle_live(&b.doc.tree),
+                       "release kicks one island at the thumb");
+        }
+        (void)unlink(path);
+    }
+
+    {
+        /* A planted 1/32 pin is already a line. Long seeks keep that
+         * number; they must not flicker the gutter to +N. */
+        RtxBuf b = {0} @destroy;
+        FILE *fp;
+        int i;
+        size_t n, tgt, abs = 0, plus = 0;
+        int gap;
+        const char *path = "testdata/generated/pin_gutter.txt";
+        (void)system("mkdir -p testdata/generated");
+        fp = fopen(path, "w");
+        expect(fp != NULL, "pin gutter fopen");
+        if (fp) {
+            for (i = 0; i < 8000; i++)
+                fprintf(fp, "line %04d xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i);
+            fclose(fp);
+        }
+        b.doc.from_path(path) !>;
+        n = b.doc.len();
+        /* Slot 16 target. Seek past the 8 KiB pin window but stay in-slice
+         * so the gutter keeps 4001 instead of flickering to +N. */
+        tgt = (size_t)(((unsigned long long)16 * (unsigned long long)n) /
+                       (unsigned long long)32);
+        b.doc.tree.pins[16].off = tgt;
+        b.doc.tree.pins[16].line = 4000;
+        b.drag_len = n ? n : 1;
+        b.scroll_to_off(tgt + 9000 < n ? tgt + 9000 : tgt) !>;
+        b.ensure_view(&m, 80.0, 8) !>;
+        expect(rtx_line_mark_ok(&b.doc.tree), "slot pin keys the origin");
+        expect(b.layout.rows.len > 0, "pin gutter fill");
+        gap = rtx_gutter_gap(&b, b.layout.rows.data[0].byte_start,
+                             b.layout.rows.data[0].line, &abs, &plus);
+        expect(gap == 0 && abs > 0, "checkpoint gutter stays a line number");
+        rtx_buf_drag_end(&b);
+        (void)unlink(path);
+    }
+
+    {
+        /* EOF update plants all 32 slots. A later land with those
+         * markers walks back at most one 1/32 slice — not to BOF. */
+        const char *path = "testdata/generated/pin_slice.txt";
+        const char *row = "xxxxxxxxxxxxxxxxxxxx\n";
+        const size_t row_n = 21;
+        const int nlines = 20000;
+        FILE *fp;
+        int i;
+        size_t n, slice, at, planted;
+        RtxLineMark saved[RTX_LINE_MARK_MAX];
+        (void)system("mkdir -p testdata/generated");
+        fp = fopen(path, "w");
+        expect(fp != NULL, "pin_slice fopen");
+        if (fp) {
+            for (i = 0; i < nlines; i++) fputs(row, fp);
+            fclose(fp);
+        }
+        {
+            RtxBuf b = {0} @destroy;
+            b.doc.from_path(path) !>;
+            n = b.doc.len();
+            expect(n > (size_t)RTX_LINE_SOFT_MIN, "pin_slice above soft min");
+            expect(n == (size_t)nlines * row_n, "pin_slice size");
+            rtx_line_scan_to(&b.doc.tree, n) !>;
+            planted = rtx_line_marks_collect(&b.doc.tree, saved, RTX_LINE_MARK_MAX);
+            expect(planted == (size_t)RTX_LINE_MARK_MAX,
+                   "EOF update plants all 1/32 checkpoints");
+            for (i = 0; i < RTX_LINE_MARK_MAX; i++)
+                expect(b.doc.tree.pins[i].line != RTX_LINE_PIN_EMPTY,
+                       "every slot has a line after EOF");
+        }
+        {
+            /* First land, no mid pins: island meets the prefix. */
+            RtxBuf b = {0} @destroy;
+            size_t scan0, span;
+            b.doc.from_path(path) !>;
+            n = b.doc.len();
+            slice = n / (size_t)RTX_LINE_MARK_MAX;
+            at = (size_t)(((unsigned long long)20 * (unsigned long long)n) /
+                          (unsigned long long)RTX_LINE_MARK_MAX) + 9000;
+            scan0 = b.doc.tree.line_scan_off;
+            rtx_line_isle_kick(&b.doc.tree, at);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(rtx_line_isle_connected(&b.doc.tree),
+                   "no-pin land meets the prefix");
+            expect(b.doc.tree.isle_from <= scan0 + 1,
+                   "no-pin island walks back to the prefix");
+            span = b.doc.tree.isle_anchor - b.doc.tree.isle_from;
+            expect(span > n / 4, "no-pin span is most of the gap");
+        }
+        {
+            /* Same land after the EOF pins: stop at the previous slot. */
+            RtxBuf b = {0} @destroy;
+            size_t scan0, floor, span, abs = 0, plus = 0;
+            int gap;
+            b.doc.from_path(path) !>;
+            n = b.doc.len();
+            slice = n / (size_t)RTX_LINE_MARK_MAX;
+            for (i = 0; i < RTX_LINE_MARK_MAX; i++)
+                b.doc.tree.pins[i] = saved[i];
+            floor = saved[20].off;
+            at = floor + 9000;
+            expect(9000 > (size_t)RTX_LINE_PIN_NEAR, "past the 8 KiB window");
+            expect(9000 < slice, "still in slot 20");
+            scan0 = b.doc.tree.line_scan_off;
+            expect(scan0 < floor, "prefix has not reached the pin");
+            rtx_line_isle_kick(&b.doc.tree, at);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(rtx_line_isle_connected(&b.doc.tree),
+                   "pin land meets the checkpoint");
+            expect(b.doc.tree.isle_from > scan0,
+                   "pin island does not walk back to BOF");
+            expect(b.doc.tree.isle_floor == floor, "floor is slot 20");
+            span = b.doc.tree.isle_anchor - b.doc.tree.isle_from;
+            expect(span <= slice + 64, "scan is at most one 1/32 slice");
+            b.scroll_to_off(at) !>;
+            b.ensure_view(&m, 80.0, 8) !>;
+            expect(b.layout.rows.len > 0, "pin-slice fill");
+            gap = rtx_gutter_gap(&b, b.layout.rows.data[0].byte_start,
+                                 b.layout.rows.data[0].line, &abs, &plus);
+            expect(gap == 0 && abs > 0, "pin-slice gutter is a line number");
+            expect(b.doc.tree.line_scan_off == scan0,
+                   "bounded island does not advance the prefix");
+        }
+        (void)unlink(path);
+    }
+
+    {
+        /* Adversarial 1/32 floors: hole, future pin, BOF-only, slot
+         * edge, last slice, exact land, prefix past a pin, edit wipe,
+         * hop, gutter must not take BOF as a mid-file line. */
+        const char *path = "testdata/generated/pin_adv.txt";
+        const char *row = "xxxxxxxxxxxxxxxxxxxx\n";
+        const int nlines = 20000;
+        FILE *fp;
+        int i;
+        size_t n, slice;
+        RtxLineMark saved[RTX_LINE_MARK_MAX];
+        (void)system("mkdir -p testdata/generated");
+        fp = fopen(path, "w");
+        expect(fp != NULL, "pin_adv fopen");
+        if (fp) {
+            for (i = 0; i < nlines; i++) fputs(row, fp);
+            fclose(fp);
+        }
+        {
+            RtxBuf b = {0} @destroy;
+            b.doc.from_path(path) !>;
+            n = b.doc.len();
+            expect(n > (size_t)RTX_LINE_SOFT_MIN, "pin_adv above soft min");
+            rtx_line_scan_to(&b.doc.tree, n) !>;
+            expect(rtx_line_marks_collect(&b.doc.tree, saved, RTX_LINE_MARK_MAX) ==
+                       (size_t)RTX_LINE_MARK_MAX,
+                   "pin_adv EOF plants 32");
+        }
+        n = (size_t)nlines * 21;
+        slice = n / (size_t)RTX_LINE_MARK_MAX;
+
+        {
+            /* Vacant 17..19: land in the hole uses pin 16, not pin 20
+             * and not BOF. */
+            RtxBuf b = {0} @destroy;
+            size_t at, scan0, span;
+            b.doc.from_path(path) !>;
+            rtx_test_plant_all(&b.doc.tree, saved);
+            b.doc.tree.pins[17].line = RTX_LINE_PIN_EMPTY;
+            b.doc.tree.pins[18].line = RTX_LINE_PIN_EMPTY;
+            b.doc.tree.pins[19].line = RTX_LINE_PIN_EMPTY;
+            at = rtx_test_slot_tgt(18, n) + 9000;
+            scan0 = b.doc.tree.line_scan_off;
+            rtx_line_isle_kick(&b.doc.tree, at);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_floor == saved[16].off,
+                   "hole floor is the last planted pin behind");
+            expect(b.doc.tree.isle_from > scan0, "hole does not walk to BOF");
+            span = b.doc.tree.isle_anchor - b.doc.tree.isle_from;
+            expect(span > slice, "hole span crosses vacant slots");
+            expect(span <= 3 * slice + 64, "hole span stops at pin 16");
+        }
+
+        {
+            /* A pin ahead of the camera is not a floor. */
+            RtxBuf b = {0} @destroy;
+            size_t at, scan0, span;
+            b.doc.from_path(path) !>;
+            rtx_test_vacate_from(&b.doc.tree, 1);
+            b.doc.tree.pins[24] = saved[24];
+            at = rtx_test_slot_tgt(10, n) + 9000;
+            scan0 = b.doc.tree.line_scan_off;
+            rtx_line_isle_kick(&b.doc.tree, at);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_floor <= scan0 + 1,
+                   "future pin is not the floor");
+            expect(b.doc.tree.isle_from <= scan0 + 1,
+                   "future pin still walks to the prefix");
+            span = b.doc.tree.isle_anchor - b.doc.tree.isle_from;
+            expect(span > n / 8, "ahead-only pin does not bound the walk");
+        }
+
+        {
+            /* BOF pin must not paint mid-file as L1. */
+            RtxBuf b = {0} @destroy;
+            size_t abs = 0, plus = 0;
+            int gap;
+            b.doc.from_path(path) !>;
+            b.scroll_to_off(n / 2) !>;
+            b.ensure_view(&m, 80.0, 8) !>;
+            expect(b.layout.rows.len > 0, "bof-only mid fill");
+            gap = rtx_gutter_gap(&b, b.layout.rows.data[0].byte_start,
+                                 b.layout.rows.data[0].line, &abs, &plus);
+            expect(gap != 0, "bof-only mid gutter is +N / -L");
+            expect(!(gap == 0 && abs == 1), "bof-only mid is not line 1");
+        }
+
+        {
+            /* One byte before slot 21 vs on the 21 target. */
+            RtxBuf b = {0} @destroy;
+            size_t edge, scan0;
+            b.doc.from_path(path) !>;
+            rtx_test_plant_all(&b.doc.tree, saved);
+            edge = saved[21].off;
+            expect(edge > 0, "slot 21 target");
+            scan0 = b.doc.tree.line_scan_off;
+            rtx_line_isle_kick(&b.doc.tree, edge - 1);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_floor == saved[20].off,
+                   "byte before slot 21 uses pin 20");
+            rtx_line_isle_cancel(&b.doc.tree);
+            rtx_line_isle_kick(&b.doc.tree, edge);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_floor == saved[21].off,
+                   "on slot 21 uses pin 21");
+            expect(b.doc.tree.isle_from > scan0, "edge lands stay off the prefix");
+        }
+
+        {
+            /* Last slice / near EOF. */
+            RtxBuf b = {0} @destroy;
+            size_t at, span;
+            b.doc.from_path(path) !>;
+            rtx_test_plant_all(&b.doc.tree, saved);
+            at = saved[31].off + 9000;
+            if (at > n) at = n;
+            expect(at > saved[31].off, "EOF land is past pin 31");
+            rtx_line_isle_kick(&b.doc.tree, at);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_floor == saved[31].off, "EOF floor is pin 31");
+            span = b.doc.tree.isle_anchor - b.doc.tree.isle_from;
+            expect(span <= slice + 64, "EOF scan is one slice");
+        }
+
+        {
+            /* Land exactly on a pin: no backfill past it. */
+            RtxBuf b = {0} @destroy;
+            b.doc.from_path(path) !>;
+            rtx_test_plant_all(&b.doc.tree, saved);
+            rtx_line_isle_kick(&b.doc.tree, saved[20].off);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_floor == saved[20].off, "exact land floor");
+            expect(b.doc.tree.isle_from >= saved[20].off, "exact land does not pass the pin");
+            expect(b.doc.tree.isle_anchor - b.doc.tree.isle_from <= 64,
+                   "exact land span is empty");
+        }
+
+        {
+            /* Prefix already past pin 16: land in 24 uses 24, not 16. */
+            RtxBuf b = {0} @destroy;
+            size_t at, span;
+            b.doc.from_path(path) !>;
+            rtx_test_plant_all(&b.doc.tree, saved);
+            b.doc.tree.line_scan_off = saved[16].off;
+            at = saved[24].off + 9000;
+            rtx_line_isle_kick(&b.doc.tree, at);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_floor == saved[24].off,
+                   "prefix-past-16 floor is pin 24");
+            expect(b.doc.tree.isle_from >= saved[24].off, "does not rewind past pin 24");
+            span = b.doc.tree.isle_anchor - b.doc.tree.isle_from;
+            expect(span <= slice + 64, "prefix-past pin still one slice");
+        }
+
+        {
+            /* Edit wipes from slot 10; land in 20 floors at pin 9. */
+            RtxBuf b = {0} @destroy;
+            size_t at, span, scan0;
+            b.doc.from_path(path) !>;
+            rtx_test_plant_all(&b.doc.tree, saved);
+            b.doc.caret = saved[10].off;
+            b.doc.sel_anchor = b.doc.caret;
+            b.doc.type("\n") !>;
+            expect(b.doc.tree.pins[10].line == RTX_LINE_PIN_EMPTY,
+                   "adv edit vacates slot 10");
+            expect(b.doc.tree.pins[20].line == RTX_LINE_PIN_EMPTY,
+                   "adv edit vacates later slots");
+            expect(b.doc.tree.pins[9].line != RTX_LINE_PIN_EMPTY,
+                   "adv edit keeps pin 9");
+            at = saved[20].off + 9000;
+            scan0 = b.doc.tree.line_scan_off;
+            rtx_line_isle_kick(&b.doc.tree, at);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_floor == saved[9].off, "wiped land floors at pin 9");
+            expect(b.doc.tree.isle_from > scan0, "wiped land does not walk to BOF");
+            span = b.doc.tree.isle_anchor - b.doc.tree.isle_from;
+            expect(span > 2 * slice, "wiped land is more than one slice");
+            expect(span < n / 2, "wiped land still stops at pin 9");
+        }
+
+        {
+            /* Hop 8 → 24: each land is its own slice. */
+            RtxBuf b = {0} @destroy;
+            size_t span;
+            b.doc.from_path(path) !>;
+            rtx_test_plant_all(&b.doc.tree, saved);
+            rtx_line_isle_kick(&b.doc.tree, saved[8].off + 9000);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_floor == saved[8].off, "hop first floor is 8");
+            span = b.doc.tree.isle_anchor - b.doc.tree.isle_from;
+            expect(span <= slice + 64, "hop first is one slice");
+            rtx_line_isle_kick(&b.doc.tree, saved[24].off + 9000);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_floor == saved[24].off, "hop second floor is 24");
+            span = b.doc.tree.isle_anchor - b.doc.tree.isle_from;
+            expect(span <= slice + 64, "hop second is one slice");
+        }
+
+        {
+            /* Neighbor pins inside 8 KiB: release must not spawn a walk. */
+            RtxBuf b = {0} @destroy;
+            size_t at, abs = 0, plus = 0;
+            int gap;
+            b.doc.from_path(path) !>;
+            rtx_test_plant_all(&b.doc.tree, saved);
+            at = saved[20].off + 9000;
+            b.drag_len = n ? n : 1;
+            b.scroll_to_off(at) !>;
+            b.ensure_view(&m, 80.0, 8) !>;
+            expect(rtx_line_mark_ok(&b.doc.tree), "dense-pin drag keys the gutter");
+            rtx_buf_drag_end(&b);
+            expect(!rtx_line_isle_live(&b.doc.tree),
+                   "dense pins skip a release backfill");
+            gap = rtx_gutter_gap(&b, b.layout.rows.data[0].byte_start,
+                                 b.layout.rows.data[0].line, &abs, &plus);
+            expect(gap == 0 && abs > 1, "dense-pin gutter stays a line number");
+        }
+
+        {
+            /* Vacate the next slot so 8 KiB cannot steal a future pin.
+             * Release then walks back to pin 20 only. */
+            RtxBuf b = {0} @destroy;
+            size_t at, scan0, span, abs = 0, plus = 0;
+            int gap;
+            b.doc.from_path(path) !>;
+            rtx_test_plant_all(&b.doc.tree, saved);
+            b.doc.tree.pins[21].line = RTX_LINE_PIN_EMPTY;
+            at = saved[20].off + 9000;
+            scan0 = b.doc.tree.line_scan_off;
+            b.drag_len = n ? n : 1;
+            b.scroll_to_off(at) !>;
+            b.ensure_view(&m, 80.0, 8) !>;
+            expect(rtx_line_mark_ok(&b.doc.tree), "drag pin keys the gutter");
+            expect(!rtx_line_isle_live(&b.doc.tree), "drag does not keep an island");
+            rtx_buf_drag_end(&b);
+            rtx_line_isle_finish(&b.doc.tree) !>;
+            expect(b.doc.tree.isle_from > scan0, "release does not walk to BOF");
+            expect(b.doc.tree.isle_floor == saved[20].off, "release floor is pin 20");
+            if (b.doc.tree.isle_anchor >= b.doc.tree.isle_from) {
+                span = b.doc.tree.isle_anchor - b.doc.tree.isle_from;
+                expect(span <= slice + 64, "release scan is one slice");
+            }
+            b.ensure_view(&m, 80.0, 8) !>;
+            gap = rtx_gutter_gap(&b, b.layout.rows.data[0].byte_start,
+                                 b.layout.rows.data[0].line, &abs, &plus);
+            expect(gap == 0 && abs > 1, "release gutter stays a line number");
+        }
+
+        (void)unlink(path);
     }
 
     /* Jump / find land in the active view. Hex % keeps the byte. */

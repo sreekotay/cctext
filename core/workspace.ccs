@@ -898,12 +898,69 @@ static size_t !>(RtxIndexErr) rtx_buf_cur_col(const RtxBuf *b) {
     return cc_ok(b->doc.caret - start);
 }
 
+static int rtx_buf_adopt_pin(RtxBuf *b, size_t floor, const RtxLineMark *pin) {
+    size_t a, z;
+    if (!b || !pin) return 0;
+    rtx_line_origin_key(&b->doc.tree, pin->off, pin->line);
+    a = pin->off < floor ? pin->off : floor;
+    z = pin->off < floor ? floor : pin->off;
+    if (z - a <= (size_t)RTX_LINE_FLOOR_MAX)
+        b->seek_rel = rtx_doc_lf_delta_local(&b->doc, pin->off, floor);
+    else
+        b->seek_rel = 0;
+    return 1;
+}
+
 static int rtx_buf_key_from_pin(RtxBuf *b, size_t floor) {
     RtxLineMark pin;
     if (!b || !rtx_line_pin_near(&b->doc.tree, floor, &pin)) return 0;
-    rtx_line_origin_key(&b->doc.tree, pin.off, pin.line);
-    b->seek_rel = rtx_doc_lf_delta_local(&b->doc, pin.off, floor);
-    return 1;
+    return rtx_buf_adopt_pin(b, floor, &pin);
+}
+
+/* Checkpoint for this 1/32 slice (or one slice away). Not the BOF pin
+ * from mid-file — that would paint line 1 instead of +N. */
+static int rtx_buf_pin_for_floor(const RtxPieceTree *t, size_t len, size_t off,
+                                 RtxLineMark *out) {
+    size_t i, slot, max_d, best_d = (size_t)-1;
+    int found = 0;
+    RtxLineMark best = {0};
+    if (!t) return 0;
+    if (len == 0) {
+        if (t->pins[0].line == RTX_LINE_PIN_EMPTY) return 0;
+        if (out) *out = t->pins[0];
+        return 1;
+    }
+    slot = (size_t)(((unsigned long long)off * (unsigned long long)RTX_LINE_MARK_MAX) /
+                    (unsigned long long)len);
+    if (slot >= RTX_LINE_MARK_MAX) slot = RTX_LINE_MARK_MAX - 1;
+    if (t->pins[slot].line != RTX_LINE_PIN_EMPTY) {
+        if (out) *out = t->pins[slot];
+        return 1;
+    }
+    max_d = len / (size_t)RTX_LINE_MARK_MAX;
+    if (max_d < (size_t)RTX_LINE_PIN_NEAR) max_d = (size_t)RTX_LINE_PIN_NEAR;
+    for (i = 0; i < RTX_LINE_MARK_MAX; i++) {
+        size_t a, z, d;
+        if (t->pins[i].line == RTX_LINE_PIN_EMPTY) continue;
+        a = t->pins[i].off < off ? t->pins[i].off : off;
+        z = t->pins[i].off < off ? off : t->pins[i].off;
+        d = z - a;
+        if (d > max_d) continue;
+        if (!found || d < best_d) {
+            best = t->pins[i];
+            best_d = d;
+            found = 1;
+        }
+    }
+    if (found && out) *out = best;
+    return found;
+}
+
+static int rtx_buf_key_from_slot_pin(RtxBuf *b, size_t floor) {
+    RtxLineMark pin;
+    if (!b || !rtx_buf_pin_for_floor(&b->doc.tree, b->len(), floor, &pin))
+        return 0;
+    return rtx_buf_adopt_pin(b, floor, &pin);
 }
 
 void rtx_buf_seek_set(RtxBuf *b, size_t floor) {
@@ -914,9 +971,14 @@ void rtx_buf_seek_set(RtxBuf *b, size_t floor) {
         z = b->seek_off < floor ? floor : b->seek_off;
         if (z - a > (size_t)RTX_LINE_FLOOR_MAX) {
             b->seek_rel = 0;
-            if (!rtx_buf_key_from_pin(b, floor)) {
+            if (!rtx_buf_key_from_slot_pin(b, floor)) {
                 rtx_line_origin_clear(&b->doc.tree);
-                rtx_line_isle_kick(&b->doc.tree, floor);
+                /* Rail drag: drop the live island so only one exists, and
+                 * do not kick again until mouse-up. */
+                if (b->drag_len)
+                    rtx_line_isle_cancel(&b->doc.tree);
+                else
+                    rtx_line_isle_kick(&b->doc.tree, floor);
             }
         } else {
             b->seek_rel += rtx_doc_lf_delta_local(&b->doc, b->seek_off, floor);
@@ -924,13 +986,39 @@ void rtx_buf_seek_set(RtxBuf *b, size_t floor) {
         }
     } else {
         b->seek_rel = 0;
-        if (!rtx_buf_key_from_pin(b, floor) && !b->doc.index_covers(floor)) {
+        if (!rtx_buf_key_from_slot_pin(b, floor) &&
+            !b->doc.index_covers(floor)) {
             rtx_line_origin_clear(&b->doc.tree);
-            rtx_line_isle_kick(&b->doc.tree, floor);
+            if (b->drag_len)
+                rtx_line_isle_cancel(&b->doc.tree);
+            else
+                rtx_line_isle_kick(&b->doc.tree, floor);
         }
     }
     b->seek_off = floor;
     b->seek_valid = 1;
+}
+
+/* Mouse-up on a rail. One island at the final thumb, not one per drag pixel. */
+void rtx_buf_drag_end(RtxBuf *b) {
+    int was;
+    if (!b) return;
+    was = b->drag_len != 0;
+    b->drag_vis = 0;
+    b->drag_len = 0;
+    b->drag_grab = 0;
+    b->drag_horiz = 0;
+    if (!was || !b->seek_valid || b->doc.lf_ready()) return;
+    if (b->doc.index_covers(b->seek_off)) return;
+    if (rtx_line_mark_ok(&b->doc.tree)) {
+        size_t a = b->doc.tree.mark_off < b->seek_off ? b->doc.tree.mark_off
+                                                     : b->seek_off;
+        size_t z = b->doc.tree.mark_off < b->seek_off ? b->seek_off
+                                                     : b->doc.tree.mark_off;
+        /* Origin already local. A far pin still wants one ≤1/32 backfill. */
+        if (z - a <= (size_t)RTX_LINE_FLOOR_MAX) return;
+    }
+    rtx_line_isle_kick(&b->doc.tree, b->seek_off);
 }
 
 static void !>(RtxIndexErr) rtx_buf_seek_label(RtxBuf *b) {
@@ -1837,7 +1925,7 @@ void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int 
     }
     if (b->seek_valid) {
         size_t want = (size_t)vis + 8 + b->top_wrap;
-        if (!b->doc.index_covers(b->seek_off) &&
+        if (!b->drag_len && !b->doc.index_covers(b->seek_off) &&
             !rtx_line_isle_live(&b->doc.tree) &&
             !rtx_line_mark_ok(&b->doc.tree))
             rtx_line_isle_kick(&b->doc.tree, b->seek_off);
