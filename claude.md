@@ -26,6 +26,15 @@ literals in call arguments lower intact; >2047 bytes is a proper
 `token spelling exceeds 2047-byte AST text field` error. Put long
 literals at file scope (see `mk_grammar` in tests/tm_grammar_smoke.ccs).
 
+## `shadow_lower` stall (not reproduced)
+
+2026‑09‑05: a `tests/tm_grammar_smoke.ccs` build sat in `shadow_lower` for
+3+ min with no output while the IDE's `cc-lsp` was lowering the same file
+and another project's test suite was compiling. Killing both and rerunning
+the identical source passed in 3 s; a minimal repro of the new code (UFCS
+call under `!` / `&&` with `&lo, &hi` args) lowers fine. Treat a silent
+multi‑minute lower as contention first: check `pgrep -fl shadow_lower`.
+
 ## Field UFCS on a Vec member
 
 `d->runs.truncate(n)` / `L->rows.clear()` — method is on the Vec field,
