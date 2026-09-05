@@ -419,6 +419,33 @@ static void !>(CCError) rtx_layout_grid_walk(RtxLayout *L, RtxDocLayout d,
     return cc_ok();
 }
 
+size_t rtx_layout_hidden_to(const RtxLayout *L, RtxDocLayout d, size_t off) {
+    size_t lo, hi;
+    if (!L || !L->has_marks) return 0;
+    if (!d->hint_at(off, &lo, &hi)) return 0;
+    if (off >= L->reveal_lo && off < L->reveal_hi) return 0;
+    return hi;
+}
+
+int rtx_layout_reveal(RtxLayout *L, RtxDocLayout d, size_t caret, size_t anchor) {
+    size_t lo = 0, hi = 0, mlo, mhi;
+    if (!L) return 0;
+    if (L->rich && d->has_marks()) {
+        if (d->mark_at(caret, &mlo, &mhi)) {
+            lo = mlo;
+            hi = mhi;
+        }
+        if (anchor != caret && d->mark_at(anchor, &mlo, &mhi)) {
+            if (hi == lo || mlo < lo) lo = mlo;
+            if (mhi > hi) hi = mhi;
+        }
+    }
+    if (lo == L->reveal_lo && hi == L->reveal_hi) return 0;
+    L->reveal_lo = lo;
+    L->reveal_hi = hi;
+    return 1;
+}
+
 /* Width-bearing bits only. Scope colours a glyph; it does not size one, so
  * adjacent runs that differ only in scope measure as one segment. */
 static int rtx_layout_size_eq(RtxStyle a, RtxStyle b) {
@@ -432,18 +459,34 @@ static int rtx_layout_size_eq(RtxStyle a, RtxStyle b) {
  * edges where no width-bearing bit changes. A line with no run is one
  * style_next call and one measure — a 3 MiB JSON line pays as before.
  */
-static double rtx_layout_row_measure(RtxDocLayout d, const RtxMeasure *m,
-                                     size_t from, char[:] bytes, size_t lo,
-                                     size_t hi, RtxSectionKind sec, double *h_out) {
+static double rtx_layout_row_measure(const RtxLayout *L, RtxDocLayout d,
+                                     const RtxMeasure *m, size_t from,
+                                     char[:] bytes, size_t lo, size_t hi,
+                                     RtxSectionKind sec, double *h_out) {
     RtxStyle cur;
     size_t seg = lo, k = lo;
     double w = 0, h;
     cur = d->style_at(from + lo);
     h = m->line_height(m->ctx, cur, sec);
     while (k < hi) {
-        size_t nxt = d->style_next(from + k, from + hi) - from;
+        size_t nxt, to;
         RtxStyle st;
         double gh;
+        /* Rich: a hidden hint at k measures nothing; the segment resumes
+         * past it with that byte's style. */
+        to = rtx_layout_hidden_to(L, d, from + k);
+        if (to) {
+            if (seg < k) w += m->measure(m->ctx, bytes.sub(seg, k), cur, sec);
+            k = to > from + hi ? hi : to - from;
+            seg = k;
+            if (k < hi) cur = d->style_at(from + k);
+            continue;
+        }
+        nxt = d->style_next(from + k, from + hi) - from;
+        if (L->has_marks) {
+            size_t hn = d->hint_next(from + k, from + nxt) - from;
+            if (hn < nxt) nxt = hn;
+        }
         if (nxt >= hi) break;
         st = d->style_at(from + nxt);
         k = nxt;
@@ -454,7 +497,7 @@ static double rtx_layout_row_measure(RtxDocLayout d, const RtxMeasure *m,
         gh = m->line_height(m->ctx, cur, sec);
         if (gh > h) h = gh;
     }
-    w += m->measure(m->ctx, bytes.sub(seg, hi), cur, sec);
+    if (seg < hi) w += m->measure(m->ctx, bytes.sub(seg, hi), cur, sec);
     *h_out = h;
     return w;
 }
@@ -482,7 +525,7 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
         }
         if (!wrap) {
             double h = 0;
-            double w = rtx_layout_row_measure(d, m, from, bytes, i, line_end,
+            double w = rtx_layout_row_measure(L, d, m, from, bytes, i, line_end,
                                               sec, &h);
             if (!rtx_layout_push_row(L, m, from + i, line_end - i, phys,
                                      w, h, sec)) {
@@ -504,12 +547,22 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                 double last_br_w = 0;
                 double last_br_h = 0;
                 while (i < line_end) {
-                    RtxUtf8Cl cl = rtx_utf8_cluster(bytes, i);
-                    size_t step = cl.n ? cl.n : 1;
-                    RtxStyle st = d->style_at(from + i);
-                    char[:] one = bytes.sub(i, i + step);
-                    double gw = m->measure(m->ctx, one, st, sec);
-                    double gh = m->line_height(m->ctx, st, sec);
+                    RtxUtf8Cl cl;
+                    size_t step, to;
+                    RtxStyle st;
+                    char[:] one;
+                    double gw, gh;
+                    to = rtx_layout_hidden_to(L, d, from + i);
+                    if (to) { /* Rich: hidden hint, zero width, same row */
+                        i = to > from + line_end ? line_end : to - from;
+                        continue;
+                    }
+                    cl = rtx_utf8_cluster(bytes, i);
+                    step = cl.n ? cl.n : 1;
+                    st = d->style_at(from + i);
+                    one = bytes.sub(i, i + step);
+                    gw = m->measure(m->ctx, one, st, sec);
+                    gh = m->line_height(m->ctx, st, sec);
                     if (w > 0 && w + gw > max_width) {
                         if (last_br > row_start) {
                             i = last_br;
@@ -536,6 +589,8 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                     h = m->line_height(m->ctx, st, sec);
                     i += step;
                 }
+                /* A row of only hidden hints still has a line's height. */
+                if (h <= 0) h = m->line_height(m->ctx, z, sec);
                 if (!rtx_layout_push_row(L, m, from + row_start, i - row_start,
                                          phys, w, h, sec)) {
                     return cc_err(CC_ERR_OUT_OF_MEMORY, "layout row");
@@ -560,6 +615,9 @@ void !>(CCError) RtxLayout_range(RtxLayout *L, RtxDocLayout d, const RtxMeasure 
     }
     if (!L->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "layout store");
     wrap = L->wrap && max_width > 0;
+    /* Fill-epoch gate: every hidden-hint check is one compare when 0. */
+    L->has_marks = L->rich && L->view != RTX_VIEW_GRID && L->view != RTX_VIEW_HEX &&
+                   d->has_marks();
     {
         size_t dlen = d->len();
         if (from >= dlen) return cc_ok();
@@ -698,18 +756,28 @@ void !>(CCError) RtxLayout_fill_off(RtxLayout *L, RtxDocLayout d, const RtxMeasu
     return L->range(d, m, from, n, max_width);
 }
 
-static size_t !>(CCError) rtx_layout_hit_bytes(const RtxVisRow *r, RtxDocLayout d,
-                                              const RtxMeasure *m, double x,
-                                              char[:] bytes) {
+static size_t !>(CCError) rtx_layout_hit_bytes(const RtxLayout *L, const RtxVisRow *r,
+                                              RtxDocLayout d, const RtxMeasure *m,
+                                              double x, char[:] bytes) {
     size_t k = 0;
     size_t hit = r->byte_start + r->byte_len;
     double cx = 0;
     while (k < bytes.len) {
-        RtxUtf8Cl cl = rtx_utf8_cluster(bytes, k);
-        size_t step = cl.n ? cl.n : 1;
-        RtxStyle st = d->style_at(r->byte_start + k);
-        char[:] one = bytes.sub(k, k + step);
-        double gw = m->measure(m->ctx, one, st, r->sec);
+        RtxUtf8Cl cl;
+        size_t step, to;
+        RtxStyle st;
+        char[:] one;
+        double gw;
+        to = rtx_layout_hidden_to(L, d, r->byte_start + k);
+        if (to) { /* hidden hint: not a landing; x is unchanged */
+            k = to > r->byte_start + bytes.len ? bytes.len : to - r->byte_start;
+            continue;
+        }
+        cl = rtx_utf8_cluster(bytes, k);
+        step = cl.n ? cl.n : 1;
+        st = d->style_at(r->byte_start + k);
+        one = bytes.sub(k, k + step);
+        gw = m->measure(m->ctx, one, st, r->sec);
         if (cx + gw / 2.0 >= x) {
             hit = r->byte_start + k;
             break;
@@ -740,8 +808,9 @@ size_t !>(CCError) rtx_layout_grid_hit_row(const RtxLayout *L, const RtxVisRow *
     return cc_ok(hit);
 }
 
-static size_t !>(CCError) rtx_layout_hit_row(const RtxVisRow *r, RtxDocLayout d,
-                                            const RtxMeasure *m, double x) {
+static size_t !>(CCError) rtx_layout_hit_row(const RtxLayout *L, const RtxVisRow *r,
+                                            RtxDocLayout d, const RtxMeasure *m,
+                                            double x) {
     CCArena frame;
     char[:] bytes;
     size_t hit;
@@ -753,7 +822,7 @@ static size_t !>(CCError) rtx_layout_hit_row(const RtxVisRow *r, RtxDocLayout d,
         frame.destroy();
         return cc_err(e);
     };
-    hit = rtx_layout_hit_bytes(r, d, m, x, bytes) !>(e) {
+    hit = rtx_layout_hit_bytes(L, r, d, m, x, bytes) !>(e) {
         frame.destroy();
         return cc_err(e);
     };
@@ -761,14 +830,21 @@ static size_t !>(CCError) rtx_layout_hit_row(const RtxVisRow *r, RtxDocLayout d,
     return cc_ok(hit);
 }
 
-static double rtx_layout_x_of_bytes(const RtxVisRow *r, RtxDocLayout d,
-                                    const RtxMeasure *m, size_t off,
-                                    char[:] bytes) {
+static double rtx_layout_x_of_bytes(const RtxLayout *L, const RtxVisRow *r,
+                                    RtxDocLayout d, const RtxMeasure *m,
+                                    size_t off, char[:] bytes) {
     size_t k = 0;
     double x = 0;
     while (k < bytes.len && r->byte_start + k < off) {
-        RtxUtf8Cl cl = rtx_utf8_cluster(bytes, k);
-        size_t step = cl.n ? cl.n : 1;
+        RtxUtf8Cl cl;
+        size_t step, to;
+        to = rtx_layout_hidden_to(L, d, r->byte_start + k);
+        if (to) { /* hidden hint: zero width */
+            k = to > r->byte_start + bytes.len ? bytes.len : to - r->byte_start;
+            continue;
+        }
+        cl = rtx_utf8_cluster(bytes, k);
+        step = cl.n ? cl.n : 1;
         if (r->byte_start + k + step > off) break;
         {
             RtxStyle st = d->style_at(r->byte_start + k);
@@ -825,7 +901,7 @@ double !>(CCError) RtxLayout_x_of(const RtxLayout *L, RtxDocLayout d, const RtxM
             frame.destroy();
             return cc_err(e);
         };
-        x = rtx_layout_x_of_bytes(r, d, m, off, bytes);
+        x = rtx_layout_x_of_bytes(L, r, d, m, off, bytes);
         frame.destroy();
         return cc_ok(x);
     }
@@ -841,7 +917,7 @@ size_t !>(CCError) RtxLayout_hit(const RtxLayout *L, RtxDocLayout d, const RtxMe
         if (y < acc + r->height || i + 1 == L->rows.len) {
             if (L->view == RTX_VIEW_GRID)
                 return rtx_layout_grid_hit_row(L, r, d, x);
-            return rtx_layout_hit_row(r, d, m, x);
+            return rtx_layout_hit_row(L, r, d, m, x);
         }
         acc += r->height;
     }
@@ -997,6 +1073,10 @@ void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *
         return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
     }
     if (!L || !d || !m || !pref) return cc_err(CC_ERR_INVALID_ARG, "move vert");
+    /* Scratch rows measure like the pane: same Rich bit and reveal span. */
+    one.rich = L->rich;
+    one.reveal_lo = L->reveal_lo;
+    one.reveal_hi = L->reveal_hi;
     if (!shift) {
         d->sel_anchor = d->caret;
         d->sel_box = 0;
@@ -1193,7 +1273,7 @@ void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *
     if (pref->eol) {
         d->caret = one.rows.data[row].byte_start + one.rows.data[row].byte_len;
     } else {
-        size_t at = rtx_layout_hit_row(&one.rows.data[row], d, m, pref->x) !>;
+        size_t at = rtx_layout_hit_row(&one, &one.rows.data[row], d, m, pref->x) !>;
         d->caret = at;
     }
     d->caret = d->fold_snap(d->caret, dir);
