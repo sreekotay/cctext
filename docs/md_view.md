@@ -22,7 +22,7 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Runs carry a **planter** (`RTX_RUN_PROSE` / `RTX_RUN_TM`); window re‑lex clips by planter, not bit shape | `RtxRun.planter`, `rtx_run_planted_*` in `core/document.ccs` | done — fixes the mixed‑run leak |
 | `RTX_SEC_MARKUP`: lexed like CODE, `style_at` keeps scope, GUI picks the prose face | `rtx_sec_lexed`, `rtx_doc_path_kind` | done; Markdown opts in |
 | Prose scanner: `**x**` bold, `*x*` italic, `` `x` `` mono; runs only on PROSE / unknown sub-ranges (open, window, edit) | `rtx_doc_scan_prose_runs` | done |
-| Grammar sidecar: `"cctext": {"kind":"markup"}` (grammar), `bold` / `italic` / `mono` / `apply` (pattern); default scope→bits map when absent; bits copied to every TM run at plant | `RtxTmRt.markup`, `RtxTmRule.sc_*` / `cap_bits`, `rtx_scope_default_bits` | done; `apply` stored only |
+| Grammar sidecar: `"cctext": {"kind":"markup"}` (grammar), `bold` / `italic` / `mono` / `apply` (pattern); default scope→bits map when absent; bits copied to every TM run at plant | `RtxTmRt.markup`, `RtxTmRule.sc_*` / `cap_bits`, `rtx_scope_default_bits` | done; `apply` drives the toolbar |
 | `markdown.tmLanguage.json` declares `kind: markup` — `.md` is MARKUP: TM scopes + bold / italic / mono bits, prose face in the GUI | `testdata/grammars/markdown.tmLanguage.json` | done |
 | Hint byte counts on runs from literal begin/end | `RtxRun.hint_a` / `hint_b` (0 = unclosed) | done; read by `RtxDoc_hint_at` / `mark_at` / `hint_next` / `has_marks` |
 | Italic paints: TUI SGR 3, GUI italic / bold‑italic faces | `frontend/cctext.ccs`, `gui_draw.ccs` | done |
@@ -37,10 +37,10 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; table classify smoke written |
 | MD table child: classify + fill-epoch geom; Rich aligns cells, hides `|`; TUI paints `│` rails and the sep as a `├─┼─┤` rule; GUI is a clipped stroked grid (pixel col widths, no box-drawing); Source stays raw; `x_of` / hit through cells; motion skips the rule; `|` and cell pad are not a caret landing (`rtx_layout_md_snap`) | `rtx_md_table_*`, `RtxLayout.md_*`, TUI/GUI paint | done this cut; no wrap inside a record; no lookback; no invented top/bottom box |
 | TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
-| Mark arity (pair / prefix / path): headings and links share the lens, not the pair-join | [docs/mark_arity.md](mark_arity.md) | 6b path faces landed; heading prefix planted this cut (toolbar still 6) |
+| Mark arity (pair / prefix / path): headings and links share the lens, not the pair-join | [docs/mark_arity.md](mark_arity.md) | prefix plant + named apply table this cut |
 
-Not landed: `apply`, opaque renders, blocks‑as‑folds, table lookback /
-cell wrap, heredoc / lookaround regex spans. Rich hit‑test can still land
+Not landed: path wrap, `apply: toggle`, opaque renders, blocks‑as‑folds,
+table lookback / cell wrap, heredoc / lookaround regex spans. Rich hit‑test can still land
 between the two bytes of a *revealed* `**` (the next motion snaps out);
 hidden hints are never a landing. `\*` escapes and `_` marks have no rule
 yet, so they paint as source.
@@ -143,11 +143,23 @@ motion, selection, delete, wrap and hit — motion post‑steps the way
 - Toggle‑off finds the enclosing run by rule (planter + rule id on the run)
   and removes its hints. Pair: same unwrap as backspace on a hint. Prefix
   / path: apply, not `replace_join`.
-- First client (wedge 6): `apply: heading` — insert / change / strip
-  the prefix the grammar named. Path unwrap is 6b (`arity: path`); dest
-  hide and join refuse follow the sidecar, not a Markdown delimiter.
+- Prefix apply is grammar-driven: `apply` is the toolbar name, `insert`
+  is the unit (`#`, `>`, `- `), `max` is how many stack. Cycle the
+  prefix on this line, or insert the first prefix+insert rule. Hosts
+  do not hard-code heading / quote / list. Path unwrap is 6b.
+- Pair apply (bold / italic / code / autolink) uses the same name: wrap
+  is `a + bytes + b` from begin/end, or from `wrap` + `insert` bookends
+  (`"<>"` + `wrap: 1`). Toggle-off unwraps the covering mark. Path
+  wrap (dest face) is leftover; the table still lists `link` for unwrap.
+- Hosts enumerate unique `apply` names (`rtx_tm_apply_list`). Cmd-.
+  (Ctrl-.) opens the on-screen apply menu; `1–9` picks. Cmd-1..9
+  applies directly. Shift-Cmd-H stays prefix cycle.
+- `cctext.bol` is the content-line start: physical BOL, or only
+  whitespace since an open prefix opener (stack, not planted runs).
+  A quote line can therefore host a list / heading prefix. Fence that
+  spans quote lines still needs `while`.
 - `- [ ]` ↔ `- [x]` is `apply: toggle` on a 5‑byte mark: one `replace`.
-- TUI: status‑row keys; GUI: toolbar. Both consume the same table as paint.
+- TUI: Esc-. then `1–9`. GUI: Apply menu / Cmd-1..9. Same table.
 
 ## Code embeds and injection
 
@@ -241,7 +253,7 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; reveal‑on‑entry; `rich` toggle key; TUI + GUI paint; atom step, unwrap, selection join rule | **done** |
 | 4 | Fence + injection: `cctext.bol` + `cctext.info`; `scopeName` / `rtx_tm_rt_for_scope()` / `rtx_tm_rt_for_info()`; depth‑2 guest lex; `RTX_RUN_INJECT`; nested inline marks; HTML `<script>`/`<style>` `RE_SPAN` | **done** |
 | 5 | MD table child | **done this cut**: classify, fill-epoch geom, `│` rails + sep rule chrome, aligned Rich paint / hit; Source raw. Lookback and cell wrap later |
-| 6 | Apply / toolbar via one `replace`; toggle‑off by rule id; first client = heading prefix | prefix plant + Backspace demote/unwrap **done this cut**; toolbar / insert still 6 |
+| 6 | Apply / toolbar via one `replace`; toggle‑off by rule id; prefix apply from `insert`/`max` | prefix + pair named apply + grammar table **this cut**; toggle‑off by rule id leftover |
 | 6b | Path faces: two runs (label + dest); dest hide; `replace_join` refuses dest↔label; unwrap keeps the label | **done this cut** (wrap / toolbar still 6) |
 | 7 | Blocks as folds — after the three blockers above | |
 
@@ -259,8 +271,8 @@ geometry) once its wedge lands.
 | Hints | Literal begin/end byte counts on the run; layout‑time skip gated on `has_marks`; per‑pane `rich` bit, never OR'd into `view` |
 | Atoms | Pair join is DESIGN Encoding (one content, two hints). Prefix / path extend it ([mark_arity.md](mark_arity.md)); dest never in label `hint_b`; no face id on `RtxRun` |
 | Nesting | Stack is live (wedge 4). Join stays pair-only; path is two runs |
-| Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX`. Heading first; link unwrap is apply, not join |
-| Leftover marks | Setext, reference links, images-as-opaque, quote / list prefix — not 6b |
+| Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX`. Named apply from the grammar table; link unwrap is apply, not join |
+| Leftover marks | Setext, reference links, images-as-opaque, path wrap, `apply: toggle` |
 | Children | Layout‑epoch scratch; paint‑time recursion; window + lookback classify; leftover, never wrong |
 | Renders | Opaque vis row of height H; Scan‑table job; epoch cache; GUI only |
 | Derived values | Layout‑epoch, read‑only, one record in window |

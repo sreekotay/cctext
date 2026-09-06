@@ -15,7 +15,8 @@ This note locks arity. It does not implement.
 | **Prefix** | `hint_a` on the opener only; `hint_b = 0` | Does **not** invent a closer | Backspace on the opener is **apply** (demote / unwrap), one `replace` of those bytes |
 | **Path** | Two **faces**, two runs | Join **names a face** (the run). Never unions dest into label | Keep label, drop `[` `](dest)` — **apply**, not “caret was in the link” |
 
-Prefix clients: ATX heading, later quote / list marker. Path clients:
+Prefix clients: any `arity: prefix` + `insert` rule (MD: heading, quote,
+list). Path clients:
 inline link, later image. Autolink `<url>` stays a **pair** (dest ==
 label). Fold is a third axis (wedge 7). Reference links `[text][ref]`
 are leftover for v1.
@@ -24,8 +25,9 @@ are leftover for v1.
 
 | Construct | Today | Why it is the wrong shape |
 |---|---|---|
-| ATX heading | Prefix span `#{1,6}[ \\t]*` … `\\n`, `arity: prefix`; trailing `[ \\t]+#+$` is a second prefix | Landed this cut. Title is ordinary / inner-able. `hint_b = 0`. Setext leftover. |
-| Quote | `match` `>.*` → `RTX_TM_LIT_LINE` | Same: whole line, no `hint_a`, no inners. Prefix later; not this ship. |
+| ATX heading | Prefix span `#{1,6}[ \\t]*` … `\\n`, `arity: prefix`; trailing `[ \\t]+#+$` is a second prefix | Landed. Title is ordinary / inner-able. `hint_b = 0`. Setext leftover. |
+| Quote | Prefix span `[ \\t]{0,3}>([ \\t]*>)*[ \\t]*` … `\\n` | Landed. `bol` is virtual after an open prefix. List / heading are quote inners. Fence across quote lines leftover (`while`). |
+| List | Prefix spans `[-*+]` / `[0-9]{1,9}[.]` / `[0-9]{1,9}[)]` … `\\n` | Landed. Indent is not in the hint. `***` / `---` do not plant. Task boxes leftover. |
 | Inline link | `match` `\\[[^\\]]+\\]\\([^)]+\\)` (`link`) | One run, no hint split. `[^]]+` **cannot** nest `` `code` `` in the label (`[`file`](path)`). Dest sits in the same run as the label. |
 | Pair marks | `begin`/`end` + `rtx_tm_add_span` `hint_a`/`hint_b` | Honest. Do not break. |
 | `replace_join` | `core/document.ccs`: if a run’s `hint_a` or `hint_b` overlaps `[lo,hi)`, add **both** hints (`hint_b==0` → opener only) | Correct for pairs. Footgun if dest bytes are stored as the label’s `hint_b` (today’s DESIGN example `[text](url)`). Rich-only; Source is plain `replace`. |
@@ -60,7 +62,9 @@ Prefer `cctext` on the TM pattern. Copy onto `RtxTmRule` like `apply` /
 | `face` | `label` (default) / `dest` | Path dest only. Layout: if dest and the dest run is not in `reveal`, skip the **whole run** (hints **and** dest bytes). |
 | `lit` | `true` | Force `LIT_SPAN` when begin/end are regex metacharacters. |
 | `wrap` | `1`–`255` (or `true` = 1) | **Match** plants `hint_a = hint_b = N`. Spans use begin/end lengths. |
-| `apply` | `heading` / `link` / … | Toolbar name. Does **not** plant. |
+| `apply` | `heading` / `quote` / `list` / `link` / … | Toolbar / cycle name. Does **not** plant. |
+| `insert` | literal unit (`#`, `>`, `- `) or wrap bookends (`<>`) | Prefix apply / Backspace demote, or pair wrap with `wrap`. Not the begin regex. |
+| `max` | 1–255 (0 → 1) | How many `insert` units stack. |
 
 `hint_b==0` is **not** arity. An unclosed pair at the window end is still
 a pair (`hint_b=0` today). Prefix vs that leftover is the sidecar.
@@ -82,7 +86,7 @@ keep `markup.heading` (default bold).
 | Shape | `RE_SPAN` (or literal) **prefix span**: `begin` `#{1,6}[ \\t]*`, `cctext.bol`, close at EOL |
 | Hints | `hint_a` = matched opener (`#` + spaces). `hint_b = 0` even though the line ends — the newline is not a closer hint |
 | Inners | `#bold` `#italic` `#code` `#link` (fixture L29; `# Title` with `` `code` ``) |
-| Sidecar | `arity: prefix`, `apply: heading` |
+| Sidecar | `arity: prefix`, `apply: heading`, `insert: #`, `max: 6` |
 | Empty `#` | Opener may be `#` with no space (`headings.md` L33) |
 | Trailing ` ##` | **Second prefix** on the same line (`\\s+#+$`), `hint_a` only. Not a pair with the leading hashes (title type-over must not join them) |
 | Type-over | Title clusters; must not eat `# ` unless the selection actually covers the opener |
@@ -121,8 +125,9 @@ Titled dest `[text](url "title")`: title bytes are dest-face content
 | `[text] (` space | Not a link (L13) |
 
 Autolink `<https://…>`: **pair** via `match` + `wrap: 1` (`hint_a` /
-`hint_b` = 1). Dest == label. Today’s join is correct. Any grammar can
-do the same (`[[page]]` is `wrap: 2`).
+`hint_b` = 1) and `insert: "<>"` so apply wrap/unwrap is grammar-driven.
+Dest == label. Today’s join is correct. Any grammar can do the same
+(`[[page]]` is `wrap: 2` + `insert: "[[]]"`).
 
 ## Runs: two faces, not a face id
 
@@ -185,7 +190,7 @@ hit next).
 | # | Slice | State |
 |---|---|---|
 | 5 | MD table child | classify + cell split done; paint / hit next |
-| **6** | Apply / toolbar | Heading prefix planted + Backspace apply **this cut**. Toolbar / insert / quote / list markers later |
+| **6** | Apply / toolbar | Prefix + pair named apply from the grammar table **this cut**. Path wrap leftover |
 | **6b** | Path faces | Beside 6, after 5. Grammar rewrite + dest hide + join refuse + `apply: link` unwrap / wrap. Dest pair-shape rides apply; do not invent a join |
 | 7 | Blocks as folds | Unchanged. Setext / heading regions wait here (or a later prefix client), not 6b |
 
@@ -237,7 +242,7 @@ Parent lifts; do not rewrite those files here.
   with `hint_b=0` is prefix only when `arity: prefix`.
 - Hints / Source / Rich table: prefix row (backspace = apply); path row
   (reveal is per face; dest content hidden until entered).
-- Apply: heading is the first client; link unwrap / wrap is 6b.
+- Apply: named apply from the grammar table; path wrap leftover.
 - Encoding pointer: pair sentence stays; one line that prefix / path
   extend it — this file.
 - Wedge table: 6 first client heading; **6b** path faces; 5 and 7

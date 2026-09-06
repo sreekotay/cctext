@@ -31,7 +31,10 @@ enum {
     CMD_NAV_INV_PREV,
     CMD_FOLD,
     CMD_STATS,
-    CMD_RICH  /* markup lens: Source / Rich per pane */
+    CMD_RICH, /* markup lens: Source / Rich per pane */
+    CMD_APPLY,      /* cycle the grammar prefix apply on this line / off */
+    CMD_APPLY_NAMED, /* toolbar / help digit: name from the grammar table */
+    CMD_APPLY_MENU   /* toggle the on-screen apply palette */
 };
 
 #endif /* RTX_UI_CMD_H */

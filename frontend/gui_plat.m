@@ -64,6 +64,8 @@ static NSView *g_view;
 static id g_app_delegate;
 static int g_menu_cmd;
 static int g_menu_ready;
+static int g_apply_pick = -1;
+static NSMenu *g_apply_menu;
 static void (*g_live_resize)(void);
 
 @interface FbView : NSView
@@ -132,6 +134,17 @@ static void gui_menu_build(void) {
     gui_menu_add(editMenu, @"Copy", @"c", (int)cmd, CMD_COPY);
     gui_menu_add(editMenu, @"Paste", @"v", (int)cmd, CMD_PASTE);
     gui_menu_add(editMenu, @"Select All", @"a", (int)cmd, CMD_SEL_ALL);
+    {
+        NSMenuItem *applyItem = [[NSMenuItem alloc] initWithTitle:@"Apply"
+                                                          action:nil
+                                                   keyEquivalent:@""];
+        g_apply_menu = [[NSMenu alloc] initWithTitle:@"Apply"];
+        applyItem.submenu = g_apply_menu;
+        [editMenu addItem:applyItem];
+        gui_menu_add(g_apply_menu, @"Show Menu", @".", (int)cmd, CMD_APPLY_MENU);
+        gui_menu_add(g_apply_menu, @"Cycle Prefix", @"h", (int)cmdshift,
+                     CMD_APPLY);
+    }
 
     viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
     viewItem = [[NSMenuItem alloc] init];
@@ -212,6 +225,7 @@ static int map_keycode(unsigned short kc) {
     case 0x0E: return KEY_E;
     case 0x03: return KEY_F;
     case 0x05: return KEY_G;
+    case 0x04: return KEY_H;
     case 0x26: return KEY_J;
     case 0x28: return KEY_K;
     case 0x25: return KEY_L;
@@ -230,6 +244,18 @@ static int map_keycode(unsigned short kc) {
     case 0x06: return KEY_Z;
     case 0x18: return KEY_EQUAL;
     case 0x2A: return KEY_BACKSLASH;
+    case 0x32: return KEY_GRAVE;
+    case 0x2F: return KEY_PERIOD;
+    case 0x1D: return KEY_0;
+    case 0x12: return KEY_1;
+    case 0x13: return KEY_2;
+    case 0x14: return KEY_3;
+    case 0x15: return KEY_4;
+    case 0x17: return KEY_5;
+    case 0x16: return KEY_6;
+    case 0x1A: return KEY_7;
+    case 0x1C: return KEY_8;
+    case 0x19: return KEY_9;
     default: return -1;
     }
 }
@@ -293,13 +319,16 @@ static void fb_handle_event(NSEvent *ev) {
     case NSEventTypeKeyDown:
         k = map_keycode(ev.keyCode);
         /* Cmd+letter goes to NSMenu — except Cmd-O aliases Browse (no menu key).
-         * Super+arrows are Home/End / line motion in the editor. */
+         * Super+arrows are Home/End / line motion in the editor.
+         * Cmd-. / Cmd-1..9 are apply (menu + host fallback). */
         if (ev.modifierFlags & NSEventModifierFlagCommand) {
+            int apply_chord = (k == KEY_PERIOD) || (k >= KEY_1 && k <= KEY_9);
             if (k == KEY_O && !(ev.modifierFlags & NSEventModifierFlagShift)) {
                 g_menu_cmd = CMD_BROWSE;
                 break;
             }
-            if (k != KEY_LEFT && k != KEY_RIGHT && k != KEY_UP && k != KEY_DOWN &&
+            if (!apply_chord &&
+                k != KEY_LEFT && k != KEY_RIGHT && k != KEY_UP && k != KEY_DOWN &&
                 k != KEY_HOME && k != KEY_END)
                 break;
         }
@@ -314,6 +343,7 @@ static void fb_handle_event(NSEvent *ev) {
          * used to type them because the editor only drained chars after
          * up/down. */
         if (!(ev.modifierFlags & NSEventModifierFlagControl) &&
+            !(ev.modifierFlags & NSEventModifierFlagCommand) &&
             k != KEY_LEFT && k != KEY_RIGHT && k != KEY_UP && k != KEY_DOWN &&
             k != KEY_HOME && k != KEY_END && k != KEY_TAB &&
             k != KEY_ESCAPE && k != KEY_ENTER && k != KEY_BACKSPACE &&
@@ -516,8 +546,16 @@ static void fb_replay(CGContextRef ctx) {
 @implementation FbAppDelegate
 - (void)menuCommand:(id)sender {
     NSMenuItem *it = (NSMenuItem *)sender;
+    int tag;
     if (!it) return;
-    g_menu_cmd = (int)it.tag;
+    tag = (int)it.tag;
+    if (tag >= RTX_APPLY_TAG0 && tag < RTX_APPLY_TAG0 + 16) {
+        g_menu_cmd = CMD_APPLY_NAMED;
+        g_apply_pick = tag - RTX_APPLY_TAG0;
+    } else {
+        g_menu_cmd = tag;
+        g_apply_pick = -1;
+    }
 }
 - (BOOL)windowShouldClose:(NSWindow *)sender {
     (void)sender;
@@ -979,6 +1017,51 @@ int gui_menu_poll_cmd(void) {
 
 int gui_menu_pending(void) {
     return g_menu_cmd != CMD_NONE;
+}
+
+int gui_menu_apply_pick(void) {
+    return g_apply_pick;
+}
+
+void gui_menu_set_apply(const char **names, size_t n) {
+    static char last[16][64];
+    static size_t last_n = (size_t)-1;
+    NSEventModifierFlags cmd = NSEventModifierFlagCommand;
+    NSEventModifierFlags cmdshift = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    size_t i;
+    int same;
+    if (!g_menu_ready || !g_apply_menu) return;
+    if (n > 16) n = 16;
+    same = (n == last_n);
+    if (same) {
+        for (i = 0; i < n; i++) {
+            const char *s = names && names[i] ? names[i] : "";
+            if (strncmp(last[i], s, sizeof last[i] - 1) != 0) {
+                same = 0;
+                break;
+            }
+        }
+    }
+    if (same) return;
+    last_n = n;
+    for (i = 0; i < n; i++) {
+        const char *s = names && names[i] ? names[i] : "";
+        strncpy(last[i], s, sizeof last[i] - 1);
+        last[i][sizeof last[i] - 1] = 0;
+    }
+    [g_apply_menu removeAllItems];
+    gui_menu_add(g_apply_menu, @"Show Menu", @".", (int)cmd, CMD_APPLY_MENU);
+    gui_menu_add(g_apply_menu, @"Cycle Prefix", @"h", (int)cmdshift, CMD_APPLY);
+    if (n) [g_apply_menu addItem:[NSMenuItem separatorItem]];
+    for (i = 0; i < n; i++) {
+        const char *s = names && names[i] ? names[i] : "";
+        NSString *title = [NSString stringWithUTF8String:s];
+        NSString *ke = (i < 9)
+            ? [NSString stringWithFormat:@"%d", (int)i + 1] : @"";
+        if (!title) title = @"";
+        gui_menu_add(g_apply_menu, title, ke, i < 9 ? (int)cmd : 0,
+                     RTX_APPLY_TAG0 + (int)i);
+    }
 }
 
 void gui_clear_close(void) {

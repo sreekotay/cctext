@@ -3,7 +3,8 @@
  * Directory listing (linked TU; see browse.cch).
  * Hosts include the header for types/chrome; this file owns kick / pump.
  * Listing: dest-live wrapper; one WAVE of directory jobs per arm;
- * the host pump starts the next wave. Flatten skips vendor trees,
+ * dest-live stays live until wait, so the host pump joins a finished
+ * arm then starts the next wave. Flatten skips vendor trees,
  * caps the job queue, and splits huge folders. finish drains waves
  * then folder-size. Drop/kick cancel the tree and join.
  */
@@ -83,6 +84,7 @@ typedef struct RtxBrowseWalk {
     int du_defer;          /* 1: movement owns this turn; no du I/O */
     int deep_phase;        /* 1: local listing done, appending flatten */
     _Atomic unsigned char cancel; /* drop / kick asked the wave to leave */
+    _Atomic unsigned char done;   /* 1: dest-live arm returned; host may wait */
     CCParallel h;
 } RtxBrowseWalk;
 
@@ -92,6 +94,14 @@ static inline unsigned char rtx_browse_load_cancel(const RtxBrowseWalk *wk) {
 
 static inline void rtx_browse_store_cancel(RtxBrowseWalk *wk, unsigned char v) {
     if (wk) atomic_store_explicit(&wk->cancel, v, memory_order_release);
+}
+
+static inline unsigned char rtx_browse_load_done(const RtxBrowseWalk *wk) {
+    return wk ? atomic_load_explicit(&wk->done, memory_order_acquire) : 1;
+}
+
+static inline void rtx_browse_store_done(RtxBrowseWalk *wk, unsigned char v) {
+    if (wk) atomic_store_explicit(&wk->done, v, memory_order_release);
 }
 
 typedef struct {
@@ -1175,6 +1185,7 @@ static int rtx_browse_run(RtxBrowse *br) {
     RtxBrowseWalk *wk;
     @errhandler(CCError e) {
         (void)e;
+        if (br) rtx_browse_store_done(rtx_br_wk(br), 1);
         return 0;
     }
     if (!br) return 0;
@@ -1241,6 +1252,7 @@ static int rtx_browse_run(RtxBrowse *br) {
         br->scanning = 0;
         rtx_browse_sort_keep(br);
     }
+    rtx_browse_store_done(wk, 1);
     return rtx_browse_load_cancel(wk) ? 0 : 1;
 }
 
@@ -1249,6 +1261,7 @@ static void !>(CCError) rtx_browse_listing_start(RtxBrowse *br) {
     int noop = 0;
     if (!br || !wk) return cc_err(CC_ERR_INVALID_ARG, "browse kick");
     if (wk->h.live()) return cc_ok();
+    rtx_browse_store_done(wk, 0);
     if (rtx_parallel_inline()) {
         rtx_browse_run(br);
         return cc_ok();
@@ -1280,11 +1293,27 @@ static int rtx_browse_listing_pending(RtxBrowse *br) {
     return wk->jhead < wk->jlen;
 }
 
+/* Dest-live stays live() until wait, even after the wave body returns.
+ * Join only when done — wait of an in-flight wave is the old UI hang. */
+static void !>(CCError) rtx_browse_listing_join_done(RtxBrowse *br) {
+    RtxBrowseWalk *wk = rtx_br_wk(br);
+    if (!wk || !wk->h.live() || !rtx_browse_load_done(wk)) return cc_ok();
+    if (wk->h.paused())
+        wk->h.resume() !>(e) { return cc_err(e); };
+    wk->h.wait() !>(e) { return cc_err(e); };
+    return cc_ok();
+}
+
 size_t !>(CCError) rtx_browse_pump(RtxBrowse *br) {
     size_t n = 0;
     RtxBrowseWalk *wk;
     if (!br) return cc_err(CC_ERR_INVALID_ARG, "browse");
     rtx_browse_du_retarget(br);
+    rtx_browse_listing_join_done(br) !>(e) { return cc_err(e); };
+    wk = rtx_br_wk(br);
+    if (wk && wk->h.live() && !rtx_browse_load_done(wk))
+        cc_yield();
+    rtx_browse_listing_join_done(br) !>(e) { return cc_err(e); };
     wk = rtx_br_wk(br);
     if (wk && !wk->h.live() && rtx_browse_listing_pending(br))
         rtx_browse_listing_start(br) !>(e) { return cc_err(e); };
