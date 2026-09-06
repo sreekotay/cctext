@@ -13,35 +13,51 @@ before relying on a number. Function names are the stable anchors.
 
 ## 0. What the lowering accepts today
 
-The JSON walker (`rtx_jw_pattern_fields`, `core/document.ccs:1851`) reads, per
+The JSON walker (`rtx_jw_pattern_fields`) reads, per
 pattern, exactly: `name`, `match`, `begin`, `end`, `include`, `patterns`,
-`captures`, and the `cctext` sidecar. Every other key falls into
-`rtx_jw_skip` (`:1912`) and is discarded, so `contentName`, `beginCaptures`,
-`endCaptures`, `while`, `applyEndPatternLast`, `injections`, `injectionSelector`
-and `scopeName` never reach the table. At grammar level
-(`rtx_tm_load_json`, `:2089`) only `fileTypes` (`:2118`), `patterns`, and
-`repository` (`:2150`) are read; `scopeName` is skipped at `:2171`, so no
-grammar knows its own scope name and nothing can be looked up by one.
+`captures`, `beginCaptures` (same `capn[]` as `captures`), and the `cctext`
+sidecar. Every other key falls into
+`rtx_jw_skip` and is discarded, so `contentName`,
+`endCaptures`, `while`, `applyEndPatternLast`, `injections`, and
+`injectionSelector` never reach the table. **Update 2026‑09‑05 (wedge 4):**
+`scopeName` and display `name` are stored on `RtxTmRt`;
+`rtx_tm_rt_for_scope()` / `rtx_tm_rt_for_info()` resolve them at lex time
+(markdown loads before python alphabetically, so embed is not bound at
+flatten). `cctext.info` on a `LIT_SPAN` takes the opener line after begin
+as the info string. A span `include: source.x` is `embed_scope` on that
+rule. `allow_span = 1` for inners and guest top‑level rules, so `sp > 1`.
+Guest runs are `RTX_RUN_INJECT`. **Update 2026‑09‑05 (regex spans):**
+`begin`/`end` with a regex metachar (`\\`, class, group, `^$`, … — not a
+lone `*`, so `**` / `/*` stay `LIT_SPAN`) lower as `RTX_TM_RE_SPAN` and
+match through `rtx_re_match` / `rtx_re_match_caps`. A per-frame literal
+closer substitutes `\\1`–`\\7` from the begin captures at open
+(`stk_close` / `stk_closen`); not stored on `RtxTmCkpt`, so a window
+resume mid-heredoc is leftover. `while` and `injections` are still out.
+The engine still has no lookaround, no backrefs, no `\\G`, no `(?i:)`.
+At grammar level
+(`rtx_tm_load_json`, `:2089`) `fileTypes`, `patterns`, `repository`,
+`scopeName`, and `name` are read.
 
 `rtx_tm_lower_rule` (`:1327`) classifies a pattern into `RtxTmOp`
 (`core/tm.cch:28–36`):
 
 | Input | Op | Notes |
 |---|---|---|
-| `include` non-empty | `RTX_TM_SKIP` (`:1334`) | only `#repo` is resolved, by `rtx_tm_flatten` (`:2030`); any other `include` (`source.x`, `$self`, `$base`) hits `if (!found) continue;` (`:2043`) and is dropped silently |
-| `begin` + `end` non-empty | `RTX_TM_LIT_SPAN` (`:1340`) | both are byte literals compared with `rtx_tm_starts`; no regex, no anchors, no backreference |
+| `include` non-empty, no begin/end | `RTX_TM_SKIP` | `#repo` expands in flatten / `rtx_tm_add_inner_resolved`; a span's `include: source.x` is `embed_scope` (wedge 4) |
+| `begin` + `end` non-empty, no regex metachar | `RTX_TM_LIT_SPAN` | byte literals via `rtx_tm_starts`; `**` / `*` / ``` / `"""` / `<!--` stay here |
+| `begin` + `end` with a regex metachar (`\\` / class / group / `^$`; not a lone `*`) | `RTX_TM_RE_SPAN` | `rtx_re_match_caps` at open, `rtx_re_match` (or a substituted literal closer) at close; `a`/`alen` and `b`/`blen` are pattern lengths |
 | `match` = `X.*` with no metachar in `X` | `RTX_TM_LIT_LINE` | |
 | `match` ∈ {`\b[0-9]+\b`, `[0-9]+`, `\d+`, `\b\d+\b`} | `RTX_TM_DIGITS` | |
 | `match` = `\b(a\|b\|…)\b` | `RTX_TM_KEYWORDS` | |
 | `match` = `\\.` | `RTX_TM_ESC_DOT` | |
 | anything else | `RTX_TM_REGEX` | `tm_re.cch` engine; `captures` → `cap[1..7]` scopes |
 
-Span nesting: `rtx_tm_try_rule` (`:1449`) opens a `LIT_SPAN` only when
-`allow_span` is set (`:1469`), and `rtx_tm_lex` (`:2783`) passes `allow_span = 1`
-only from the top-level loop (`:2852`) and `0` for inner rules (`:2817`), so
-`sp` never exceeds 1 (`core/tm.cch:69–73` says so). A span's `patterns` are
-flattened into `rt->inners` by `rtx_tm_add_inner` (`:2007`); an inner that is
-itself a `begin`/`end` pair lowers to a `LIT_SPAN` rule that can never fire.
+Span nesting: `rtx_tm_try_rule` opens a `LIT_SPAN` when `allow_span` is
+set. **Wedge 4:** `allow_span = 1` for inners and for guest top‑level
+rules; `sp` exceeds 1. A span's `patterns` / `#include` attach via
+`rtx_tm_add_inner_resolved` (depth cap 4), so `#italic` inside `#bold`
+is a real inner `LIT_SPAN`. The current frame's closer is always tested
+before inners or guest rules.
 Inside a span whose inners are all `ESC_DOT` (or none), `rtx_tm_span_advance`
 (`:1555`) `memchr`s to the closer's first byte; with any other inner the
 generic loop at `:2811–2847` runs.
@@ -65,7 +81,7 @@ records what each would need to express its real-world embeds.
 | `c` | `source.c` | c h ccs cch cc shcc hpp cpp | `//` line comment, `/* */` span, `"` span with `\\.` escape inner, `'` span, digits, keywords, `#directive` regex (list lacks `if`/`elif`/`else`/`undef`/`error`) | LIT_LINE, LIT_SPAN×3, ESC_DOT (inner), DIGITS, KEYWORDS, REGEX | `#if 0` disabled branch (R), `#define … \` continuation (R), `asm("…")` body (R, E, depth 2), printf placeholders (REGEX inner: allowed but disables the memchr fast path) |
 | `css` | `source.css` | css | `//`, `/* */`, `"` span, `#hex` regex, unit-number regex, property keywords | LIT_LINE, LIT_SPAN×2, REGEX×2, KEYWORDS | `url(…)` / `'` strings (a), `@media` blocks (a), embedded in HTML via `<style>` (host side: R, E, CN) |
 | `csv` | `text.csv` | csv tsv psv pipe | `#` line comment, `"` span with `""` inner, number/column/field/sep regexes | LIT_LINE, LIT_SPAN, REGEX×5 | nothing embed-related; note the `""` inner is `RTX_TM_REGEX` not `ESC_DOT`, so `"` spans take the slow path |
-| `html` | `text.html.basic` | html htm | `<!-- -->` span, `"` span, one tag regex `</?[A-Za-z][^>]*>` | LIT_SPAN×2, REGEX | `<script>`→`source.js` (R, E, CN), `<style>`→`source.css` (R, E, CN), `style="…"`→CSS (R, E, CN), `<code class=language-x>` (R, E, CN, I), entities regex, `'` attribute strings (a) |
+| `html` | `text.html.basic` | html htm | `<!-- -->` span, `"` span, `<style>`/`<script>` RE_SPAN with `source.css`/`source.js` guest, tag regex `</?[A-Za-z][^>]*>` | LIT_SPAN×2, RE_SPAN×2, REGEX | self-closing `<script … />` (needs lookaround), `style="…"`→CSS (R, E, CN), `<code class=language-x>` (R, E, CN, I), entities regex, `'` attribute strings (a) |
 | `javascript` | `source.js` | js mjs ts | `//`, `/* */`, `"` span + `\\.` inner, `'` span, digits, keywords | LIT_LINE, LIT_SPAN×3, ESC_DOT, DIGITS, KEYWORDS | template literal `` ` `` (a for the outer span; `${…}` islands need depth 2 + host re-entry), tagged templates `sql`/`html`/`css`/`gql` (R, BC, CN, E), regex literal vs division (R with lookbehind), JSX/TSX (R, depth) |
 | `json` | `source.json` | json | key regex with `captures.1`, `"` span + `\\.` inner, number regex, `true/false/null` | REGEX(has_cap), LIT_SPAN, ESC_DOT, REGEX, KEYWORDS | nothing embed-related (JSON is only ever a *guest*: YAML `>` scalars, md fences) |
 | `markdown` | `text.markdown` | md markdown | ```` ``` ```` span, heading regex, `>` quote LIT_LINE, `**`/`*`/`` ` `` spans, link regex | LIT_SPAN×4, REGEX×2, LIT_LINE | fence info string → grammar (R, BC, CN, E), line-anchored fence close with backreference to the opener (R), blockquote continuation (W), list-item indentation (W), HTML blocks (E `text.html`), fence inside quote/list (depth 2) |
@@ -82,9 +98,9 @@ Observations that cut across grammars:
 - Comments are tried before strings in every grammar, so a `"` inside a
   comment or a `/*` inside a string is already handled correctly
   (`embeds.c` lines 20–22, `embeds.py` line 32).
-- No grammar carries a regex `begin`, so `rtx_tm_lower_rule` has never had to
-  choose between `LIT_SPAN` and a regex span; the `RTX_TM_REGEX` path is only
-  used for `match`.
+- HTML `<style>` / `<script>` are the first regex `begin`/`end` rules;
+  `rtx_tm_lower_rule` chooses `RE_SPAN` when a metachar other than a lone
+  `*` is present. `RTX_TM_REGEX` remains the leftover `match` path.
 
 ## 2. Fixture → TextMate construct → lowering needs
 
@@ -116,8 +132,8 @@ Needs codes:
 | `embeds.js` 12–13 JSX/TSX (in a comment here) | `meta.tag.tsx` `begin: (<)([A-Z]\w*)`, `end: (/>)\|(</\2>)`, attribute strings, `{…}` islands via `include: $self` | (b) with backreference, (e) |
 | `embeds.js` 15–16 backticks in strings | `"`/`'` spans | (a) — already works |
 | `embeds.js` 18–29 multi-line template with a fence | `string.template.js` span; the escaped ``\` `` is `constant.character.escape.js` `\\.` inner | (a) + ESC_DOT inner (the fence lookalikes are then automatically body) |
-| `embeds.html` 5–9 `<style>` | `begin: (<)(style)\b(?![^>]*/>)[^>]*(>)`, `end: (</)(style)(>)`, `beginCaptures`/`endCaptures`, `contentName: source.css`, `include: source.css` | (b), BC, (c), (d) |
-| `embeds.html` 10–14 `<script>` with split closer | same with `source.js`; the closer regex `(</)(script)\s*(>)` is only tried by the *host* while the JS string span is open, which is why the split string does not close it | (b), BC, (c), (d), (e) (JS string is depth 2) |
+| `embeds.html` 5–9 `<style>` | `begin: <style\\b[^>]*>`, `end: </style\\s*>`, `include: source.css` (no lookaround, so self-closing is leftover) | **landed** as `RE_SPAN` + lex-time embed; `contentName` / `beginCaptures` still skipped |
+| `embeds.html` 10–14 `<script>` with split closer | same with `source.js`; host closer is always tested first, so `"</scr" + "ipt>"` stays inside the JS string | **landed** (depth 2); (d) `contentName` still skipped |
 | `embeds.html` 16 `style="…"` | `meta.attribute.style.html`: `begin: (style)\s*(=)\s*(")`, `end: (")`, `contentName: meta.embedded.line.css`, `include: source.css` | (b), (c), (d) |
 | `embeds.html` 17 comment containing `<script>` | `comment.block.html` `<!--`/`-->` | (a) — already works |
 | `embeds.html` 18–21 `<pre><code class="language-python">` | no stock rule; a custom `begin: (<code\b[^>]*class="language-(\w+)"[^>]*>)`, `end: (</code>)`, `contentName` chosen from capture 2 | (b), BC (dynamic grammar from a capture), (c), (d) |
@@ -148,10 +164,10 @@ Needs codes:
 Ordered by how little of the walker/lowering has to change. Each item names
 the fixture that proves it and where it lands.
 
-1. **Line-anchored fence close + info string (Markdown fences).** *(BOL half
-   landed 2026‑09‑05 as the `cctext.bol` sidecar key — strict line start,
-   no ≤3‑space allowance, no trailing‑whitespace check; info string not yet
-   recorded.)* Extend
+1. **Line-anchored fence close + info string (Markdown fences).** **Landed
+   2026‑09‑05** (`cctext.bol` + `cctext.info`; guest resolved at lex via
+   `rtx_tm_rt_for_info`). Historical note, kept for the leftover ≤3‑space
+   / trailing‑whitespace gap: extend
    `RTX_TM_LIT_SPAN` with a "closer must be at line start (after ≤3 spaces)
    and followed by only whitespace" flag, and record the run of bytes after
    the opener up to EOL as the info string. This fixes `nested.md` line 11
@@ -162,13 +178,18 @@ the fixture that proves it and where it lands.
    and the closer test in the generic loop (`:2834–2846`). The info string is
    the hook for item 3; store it on the span's `RtxRun` (`core/document.cch:96–97`
    already carries `hint_a`/`hint_b`) or resolve it immediately.
-2. **Multi-byte string openers with escape (Python docstrings).** Add explicit
+2. **Multi-byte string openers with escape (Python docstrings).** **Landed
+   2026‑09‑05** (`#ddstring` / `#dsstring` before `"` / `'` in
+   `python.tmLanguage.json`). Add explicit
    `"""` / `'''` `LIT_SPAN` rules ahead of `"` / `'` in `python.tmLanguage.json`
    with a `\\.` inner. Pure grammar edit; the lowering already handles a 3-byte
    `begin`/`end` (`rtx_tm_starts`, `:1316`). Removes the `""`+`"…"`+`""` accident
    in `embeds.py` 1–4, 7–12, 16–20. Not a lowering change, but it is the
    prerequisite for injecting SQL at 7–12.
-3. **`include: source.x` → loaded grammar (the embed itself).** Read
+3. **`include: source.x` → loaded grammar (the embed itself).** **Landed
+   2026‑09‑05** (`RtxTmRt.scope` / `title`, `rtx_tm_rt_for_scope()`,
+   `embed_scope` on the span, info‑string resolve at lex — no
+   `RTX_TM_EMBED` op). Read
    `scopeName` in `rtx_tm_load_json` (new branch beside `fileTypes` at `:2118`;
    today it falls into `rtx_jw_skip` at `:2171`) and store it on `RtxTmRt`
    (`core/tm.cch:61–67`). Add `rtx_tm_rt_for_scope()` next to
@@ -180,7 +201,11 @@ the fixture that proves it and where it lands.
    `fileTypes`/`name`), so the fence rule needs a "resolve from info string"
    variant rather than a fixed scope. Covers `nested.md` fences and, with
    item 4, everything else.
-4. **`contentName` + guest lexing inside a span (depth 2).** Read
+4. **`contentName` + guest lexing inside a span (depth 2).** **Landed
+   2026‑09‑05** without `contentName`: guest from `cctext.info` /
+   `embed_scope`; `stk_lang` / `stk_embed` on the walk and in
+   `RtxTmCkpt`; closer first; `RTX_RUN_INJECT`. `contentName` itself is
+   still skipped. Read
    `contentName` in `rtx_jw_pattern_fields` (new branch beside `include` at
    `:1867`; add a field to `RtxTmPatRaw` `:1605–1618`, `RtxTmPat`
    `core/tm.cch:76–89`, `RtxTmRule` `:40–59`). In `rtx_tm_lex`, when the top
@@ -195,18 +220,18 @@ the fixture that proves it and where it lands.
    open: this is where `sp` first exceeds 1 (`core/tm.cch:69–73`). Covers
    Python docstrings + SQL (`embeds.py` 7–12), HTML `<script>`/`<style>` once
    item 5 gives them a regex begin, and all of `nested.md` depth-2 rows.
-5. **Regex `begin`/`end` (HTML script/style, JS templates, heredocs).** Let
-   `rtx_tm_lower_rule` (`:1340`) fall through to a new `RTX_TM_RE_SPAN` when
-   `begin` or `end` contains a regex metachar, matching with `rtx_re_match_caps`
-   (already used at `:1490–1516` for `RTX_TM_REGEX`). `end` must be
-   re-instantiated per opening with `\N` backreferences substituted from the
-   begin captures (heredoc `\3`, fence `\2`/`\3`, JSX `</\2>`): store the
-   substituted closer as a per-frame literal so `rtx_tm_span_advance` can keep
-   its memchr fast path. `beginCaptures` is the same walk as `captures`
-   (`:1888–1911`) written to a second array. This is the largest item; it
-   also needs `^`/`$` and lookahead in `tm_re.cch` if not already present.
-   Covers `embeds.html` 5–16, `embeds.js` 5–10, `embeds.sh` 5–28, `embeds.c`
-   4–8 and 25–28.
+5. **Regex `begin`/`end` (HTML script/style, JS templates, heredocs).**
+   **Landed 2026‑09‑05** for HTML `<script>` / `<style>`: `RTX_TM_RE_SPAN`
+   when `begin` or `end` has a regex metachar (not a lone `*`), matched
+   with `rtx_re_match_caps` / `rtx_re_match`. Substituted closer hook:
+   `\\1`–`\\7` from the begin caps become a per-frame literal
+   (`stk_close` / `stk_closen`); closer test uses `rtx_tm_starts`. Not on
+   `RtxTmCkpt` — mid-heredoc window resume is leftover. `beginCaptures`
+   writes the same `capn[]` as `captures` (no separate emit). Engine still
+   has no lookaround / backrefs / `\\G` / `(?i:)`. `span_advance` memchr
+   stays LIT_SPAN-only. Still leftover: self-closing `<script … />`,
+   `style="…"`, `<code class=language-x>`, JS templates, heredoc product
+   work (hook only), `embeds.c` `#if 0` / macro continuation.
 
 Not in the minimum set: `while` (YAML block scalars, Markdown blockquotes and
 list items — `embeds.yaml` 4–23, `nested.md` 47–67), `injections` /

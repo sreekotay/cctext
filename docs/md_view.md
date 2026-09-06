@@ -33,14 +33,15 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Reveal on entry: `rtx_layout_reveal` = union of `mark_at(caret)`, `mark_at(anchor)`; `ensure_view` refills when the span changes; `move_vert` scratch rows inherit it | `rtx_layout_reveal`, `RtxBuf_ensure_view` | done |
 | Join rule: `RtxDoc_replace_join` — a replace touching one hint removes both hints whole, one `replace` over the union span, one hist record (cap `RTX_HL_WIN_MAX`, else plain). Pane hooks on Rich only: `move_horiz` never rests inside a hint (`rtx_buf_hint_snap`); backspace / delete on a hint unwraps; selection delete, cut and type‑over go through the join. Copy is the bytes as selected. | `core/document.ccs`, `RtxBuf_backspace` / `delete_forward` / `type_cp`, `RtxWs_cut` | done |
 | Inline spans stay on one line: `"cctext": {"inline": true}` drops an unclosed span at EOL (opener is text, CommonMark unmatched delimiter); `"flank": true` rejects an opener before whitespace and a closer after it (`2 * 3` is plain). Bold / italic / code declare `inline`; bold / italic add `flank` | `RtxTmRule.inl` / `flank`, `rtx_tm_span_advance`, `markdown.tmLanguage.json` | done |
+| Fence + injection: `cctext.info` + `scopeName`; guest lex at depth 2; `RTX_RUN_INJECT`; nested `#italic` / `#bold` / `#code`; Python `"""` / `'''`; closer always first; `style_at` walk-back does not stop at a sibling | `RtxTmRule.info` / `embed_scope`, `rtx_tm_rt_for_scope`, `rtx_tm_lex`, `rtx_doc_run_first` | done; HTML `<script>`/`<style>` `RE_SPAN` landed |
 | Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; smokes not yet written |
 | TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
 
-Not landed: `apply`, nested children, injection, opaque renders,
-blocks‑as‑folds. Rich hit‑test can still land between the two bytes of a
-*revealed* `**` (the next motion snaps out); hidden hints are never a landing. Known Rich leftovers from the depth‑1 lexer: nested
-marks (`***both***`, `**a *b* c**`) lex wrong until the stack lands (wedge 4);
-`\*` escapes and `_` marks have no rule yet, so they paint as source.
+Not landed: `apply`, nested children, opaque renders, blocks‑as‑folds,
+heredoc / lookaround regex spans. Rich hit‑test can still land
+between the two bytes of a *revealed* `**` (the next motion snaps out);
+hidden hints are never a landing. `\*` escapes and `_` marks have no rule
+yet, so they paint as source.
 
 ## Vocabulary
 
@@ -53,8 +54,8 @@ marks (`***both***`, `**a *b* c**`) lex wrong until the stack lands (wedge 4);
 - **Atom** — what motion crosses in one step. In Rich a pair of hints is
   one atom in two places (DESIGN Encoding). Source has no hint atoms.
 - **Source / Rich** — `layout.rich` per pane. Source is today's paint.
-- **Planter** — who produced a run (prose scanner, TM lex, later:
-  injected lex). Clip and toggle‑off are by planter, never by bit shape.
+- **Planter** — who produced a run (prose scanner, host TM lex, guest
+  inject). Clip and toggle‑off are by planter, never by bit shape.
 - **Section kind** — `PROSE` (no grammar; scanner), `CODE` (lexed; mono),
   `MARKUP` (lexed; prose face). Kind decides lex and font; the run decides
   style.
@@ -135,34 +136,22 @@ motion, selection, delete, wrap and hit — motion post‑steps the way
 
 This is the same lens; MD fences are only the depth‑0 client. Docstrings
 with SQL, JS template literals, `<script>` / `<style>`, shell heredocs, YAML
-block scalars, `#if 0` all want *lex this span with that grammar*, and all
-sit **inside** a string span, so they need the state stack the lexer does
-not have (`RTX_TM_STACK 32` is declared; depth never exceeds 1).
+block scalars, `#if 0` all want *lex this span with that grammar*.
 
-What the lowering reads today vs. what the fixtures need is in
-[docs/grammar_audit.md](grammar_audit.md), with per‑line expectations in
-[testdata/rich/code/README.md](../testdata/rich/code/README.md). Headline:
+Landed with wedge 4 (2026‑09‑05): the begin/end stack is live (`sp > 1`).
+A fence with `"cctext": {"bol": true, "info": true}` records the info
+string, resolves it via `rtx_tm_rt_for_info()` (`python` →
+`source.python` through `scopeName` / title / `fileTypes`), and guest‑lexes
+the body. Guest runs are `RTX_RUN_INJECT` and clip with TM. The current
+closer is always tested first, so italic `*` cannot steal bold `**` and a
+BOL ``` wins over an unclosed guest span. Same‑grammar nest
+(`***both***`, `**a *b* c**`, `*outer **inner** outer*`) works because
+bold/italic list each other as inners and `cctext.flank` rejects a closer
+after whitespace. Python ships explicit `"""` / `'''` spans.
 
-- Walker keeps `name / match / begin / end / include / patterns / captures
-  / cctext`; `contentName`, `beginCaptures`, `endCaptures`, `while`,
-  `injections`, `scopeName` are skipped. `include: source.x` has nothing to
-  resolve against and is dropped silently in `rtx_tm_flatten`.
-- Begin/end are literals; no shipped grammar uses regex spans.
-- Fixed: `testdata/rich/code/nested.md:11` (a ``` inside a Python docstring
-  closed the fence early). Literal spans take `"cctext": {"bol": true}` —
-  begin and end must sit at line start; the shipped fence rule declares it.
-- Literal spans also take `"inline": true` (unclosed at EOL → opener is text)
-  and `"flank": true` (opener not before whitespace, closer not after). These
-  three keys are the whole span vocabulary; nesting is still the stack.
-
-Minimum, cheapest first: (1) line‑anchored fence closer + info‑string
-capture on `RTX_TM_LIT_SPAN`; (2) explicit `"""` / `'''` rules in the
-Python grammar; (3) read `scopeName`, `rtx_tm_rt_for_scope()`, an
-`RTX_TM_EMBED` op; (4) `contentName` + guest lex at depth 2 with the host
-closer tested first (grammar index per stack frame and in `RtxTmCkpt`);
-(5) regex begin/end with back‑referenced closers. `while` and `injections`
-stay out. Injected runs carry their own planter so window re‑lex of the host
-does not clip them.
+HTML `<script>` / `<style>` regex spans landed. Still out: lookaround,
+heredocs, JS templates, `while`, `injections`, host islands (`${}`, f‑strings).
+Detail in [docs/grammar_audit.md](grammar_audit.md).
 
 ## Nested children (block side)
 
@@ -233,7 +222,7 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 1 | `hint_a / hint_b` on runs | **done** (write‑only) |
 | 2 | Style bits from sidecar or default scope map, copied at plant; `markdown.tmLanguage.json` declares `kind: markup`; prose scanner gated to PROSE sub‑ranges | **done** |
 | 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; reveal‑on‑entry; `rich` toggle key; TUI + GUI paint; atom step, unwrap, selection join rule | **done** |
-| 4 | Fence + injection: line‑anchored closer (**done**, `cctext.bol`); info‑string capture; `scopeName` / embed op; depth‑2 guest lex (also fixes nested inline marks); injected planter | next |
+| 4 | Fence + injection: `cctext.bol` + `cctext.info`; `scopeName` / `rtx_tm_rt_for_scope()` / `rtx_tm_rt_for_info()`; depth‑2 guest lex; `RTX_RUN_INJECT`; nested inline marks; HTML `<script>`/`<style>` `RE_SPAN` | **done** |
 | 5 | MD table child | |
 | 6 | Apply / toolbar via one `replace`; toggle‑off by rule id | |
 | 7 | Blocks as folds — after the three blockers above | |

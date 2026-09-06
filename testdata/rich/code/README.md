@@ -54,8 +54,8 @@ table in `core/tm.cch`) does with the shipped `testdata/grammars/*.tmLanguage.js
 
 | Lines | Construct | Expected | Today |
 |---|---|---|---|
-| 5–9 | `<style>…</style>` | span 5:3–9:10, `contentName: source.css` over lines 6–8 (needs (b),(c),(d)). Line 7 `"<style>"` is a CSS string and must not re-open a style span; line 8's `<script>` is inside a CSS comment and must not open a script span | `<style>`/`</style>` match the `#tag` regex; the body is lexed as HTML: `"<style>"` becomes an HTML string, `/* … */` unstyled |
-| 10–14 | `<script>…</script>` | span 10:3–14:11, body 11–13 as `source.js`. Line 11's `"a string with </scr" + "ipt> …"` is two JS strings and must not close the span; the real closer is line 14 | tag regex on `<script>`/`</script>`; body lexed as HTML (`"` strings only) |
+| 5–9 | `<style>…</style>` | span 5:3–9:10, `contentName: source.css` over lines 6–8 (needs (b),(c),(d)). Line 7 `"<style>"` is a CSS string and must not re-open a style span; line 8's `<script>` is inside a CSS comment and must not open a script span | `RE_SPAN` + `source.css` guest; `"<style>"` is a CSS string; `/* … <script> … */` is a CSS comment (no script span). Self-closing leftover |
+| 10–14 | `<script>…</script>` | span 10:3–14:11, body 11–13 as `source.js`. Line 11's `"a string with </scr" + "ipt> …"` is two JS strings and must not close the span; the real closer is line 14 | `RE_SPAN` + `source.js` guest; host closer first so the split string does not close |
 | 16 | `style="background: #fff; padding: 1em"` | attribute value injected as `source.css` (VS Code: `meta.embedded.line.css`; needs (b),(c),(d)) | `"` string |
 | 17 | `<!-- <script>alert("in a comment")</script> -->` | one comment 17:3–17:49; the inner `<script>` never opens a span | `<!--` LIT_SPAN opens first (correct) |
 | 18–21 | `<pre><code class="language-python">…</code></pre>` | body from 18:38 to the end of line 20 as `source.python` (docstring on 19). No stock grammar does this; it is an injection keyed on the `class` attribute (needs (b),(c),(d)) | tags + `"language-python"` string; body plain |
@@ -104,8 +104,8 @@ table in `core/tm.cch`) does with the shipped `testdata/grammars/*.tmLanguage.js
 
 | Lines | Construct | Expected | Today |
 |---|---|---|---|
-| 7–14 | ```` ```python ```` fence with a docstring | fence 7:1–14:3, info string `python` → body 8–13 as `source.python`; the docstring 9–12 is a Python span inside (depth 2). Line 11's ``` ``` ``` is docstring text and must NOT close the fence: fence close must be line-anchored (`^\s*```\s*$`, needs (b)) | fence 7:1–14:3 (closer is line-anchored via `cctext.bol`, smoke in `tm_grammar_smoke`); body is raw, no `source.python` yet |
-| 18–23 | ```` ```html ```` fence with `<script>` | body 19–22 as `text.html.basic`; 19:1–22:9 is a script span with body as `source.js` (depth 3: md→html→js). Line 20's split `"</scr" + "ipt>"` must not close the script; line 21's template with `${s}` is a JS island | see above: fence phase is inverted from line 14 on |
+| 7–14 | ```` ```python ```` fence with a docstring | fence 7:1–14:3, info string `python` → body 8–13 as `source.python`; the docstring 9–12 is a Python span inside (depth 2). Line 11's ``` ``` ``` is docstring text and must NOT close the fence: fence close must be line-anchored (`^\s*```\s*$`, needs (b)) | fence 7:1–14:3 (`cctext.bol` + `cctext.info`); body is `source.python` (`RTX_RUN_INJECT`); docstring is a `"""` span; line 11's ``` stays body. HTML fence guest-lexes; JS/sh still need regex begin/end |
+| 18–23 | ```` ```html ```` fence with `<script>` | body 19–22 as `text.html.basic`; 19:1–22:9 is a script span with body as `source.js` (depth 3: md→html→js). Line 20's split `"</scr" + "ipt>"` must not close the script; line 21's template with `${s}` is a JS island | fence + HTML `RE_SPAN` + JS guest; split closer stays in the JS string. `${s}` island still leftover |
 | 27–34 | ```` ```js ```` fence with a template literal | body 28–33 as JS; the template 28:13–33:1 is a JS span (depth 3 md→js→template). The escaped ``\` `` on 30 and 32 must close neither the template nor the fence; line 29 `# not a markdown heading` is template text | inverted phase; line 29 `#…` may be styled as a heading depending on the phase |
 | 38–43 | ```` ```sh ```` fence with `<<PY` heredoc | body 39–42 as `source.shell`; heredoc 39:11–42:3 with body 40–41 as `source.python`; the docstring on 41 is depth 4 (md→sh→py→docstring) | phase-dependent |
 | 47–54 | fence inside a blockquote | quote span 47–54 (`markup.quote`, TextMate `while` continuation on `^>`); nested fence 49:3–52:5 with body 50–51 as `source.python` (needs `while`, (e)) | `>.*` LIT_LINE wins at line start: 47–54 are all quote lines, the fence is never seen |
@@ -114,10 +114,10 @@ table in `core/tm.cch`) does with the shipped `testdata/grammars/*.tmLanguage.js
 
 ## What the fixtures pin, in one sentence each
 
-- `embeds.py`: the 1-byte `"` span gets triple quotes right by accident; SQL/regex/f-string islands need (c)/(d)/(e).
+- `embeds.py`: explicit `"""` / `'''` spans (wedge 4); SQL/regex/f-string islands still need (c)/(d)/(e).
 - `embeds.js`: JS has no template rule at all; templates, tags, regex-vs-division all need (b) and template islands need (e).
-- `embeds.html`: `<script>`/`<style>`/`style=`/`<code class>` are the canonical (b)+(c)+(d) case; the split `</scr"+"ipt>` is the closer-inside-body trap.
+- `embeds.html`: `<script>`/`<style>` RE_SPAN + guest lex (wedge regex spans); `style=` / `<code class>` / self-closing still leftover; the split `</scr"+"ipt>` is the closer-inside-body trap (host closer first).
 - `embeds.sh`: heredocs are (b) with an end-regex backreference; `<<PY` adds (c)+(d); `<<<` must not match.
 - `embeds.yaml`: block scalars end by indentation (TextMate `while`), which none of (a–e) covers; embeds are by key-name injection, not by grammar.
 - `embeds.c`: `#if 0` (b) and macro continuation (b); everything else already works with literal spans.
-- `nested.md`: line 11 pinned the literal-fence closer bug (fixed with `cctext.bol`); blockquote fences need `while`; everything else is depth ≥ 2.
+- `nested.md`: line 11 pinned the literal-fence closer bug (`cctext.bol`); the python fence guest-lexes (`cctext.info`); the HTML fence guest-lexes `<script>` via `RE_SPAN`; blockquote fences need `while`; JS/sh still need regex begin/end.
