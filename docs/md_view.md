@@ -34,25 +34,35 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Join rule: `RtxDoc_replace_join` — a replace touching one hint removes both hints whole, one `replace` over the union span, one hist record (cap `RTX_HL_WIN_MAX`, else plain). Pane hooks on Rich only: `move_horiz` never rests inside a hint (`rtx_buf_hint_snap`); backspace / delete on a hint unwraps; selection delete, cut and type‑over go through the join. Copy is the bytes as selected. | `core/document.ccs`, `RtxBuf_backspace` / `delete_forward` / `type_cp`, `RtxWs_cut` | done |
 | Inline spans stay on one line: `"cctext": {"inline": true}` drops an unclosed span at EOL (opener is text, CommonMark unmatched delimiter); `"flank": true` rejects an opener before whitespace and a closer after it (`2 * 3` is plain). Bold / italic / code declare `inline`; bold / italic add `flank` | `RtxTmRule.inl` / `flank`, `rtx_tm_span_advance`, `markdown.tmLanguage.json` | done |
 | Fence + injection: `cctext.info` + `scopeName`; guest lex at depth 2; `RTX_RUN_INJECT`; nested `#italic` / `#bold` / `#code`; Python `"""` / `'''`; closer always first; `style_at` walk-back does not stop at a sibling | `RtxTmRule.info` / `embed_scope`, `rtx_tm_rt_for_scope`, `rtx_tm_lex`, `rtx_doc_run_first` | done; HTML `<script>`/`<style>` `RE_SPAN` landed |
-| Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; smokes not yet written |
+| Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; table classify smoke written |
+| MD table child: classify + fill-epoch geom; Rich aligns cells, hides `|`; TUI paints `│` rails and the sep as a `├─┼─┤` rule; GUI is a clipped stroked grid (pixel col widths, no box-drawing); Source stays raw; `x_of` / hit through cells; motion skips the rule; `|` and cell pad are not a caret landing (`rtx_layout_md_snap`) | `rtx_md_table_*`, `RtxLayout.md_*`, TUI/GUI paint | done this cut; no wrap inside a record; no lookback; no invented top/bottom box |
 | TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
+| Mark arity (pair / prefix / path): headings and links share the lens, not the pair-join | [docs/mark_arity.md](mark_arity.md) | 6b path faces landed; heading prefix planted this cut (toolbar still 6) |
 
-Not landed: `apply`, nested children, opaque renders, blocks‑as‑folds,
-heredoc / lookaround regex spans. Rich hit‑test can still land
+Not landed: `apply`, opaque renders, blocks‑as‑folds, table lookback /
+cell wrap, heredoc / lookaround regex spans. Rich hit‑test can still land
 between the two bytes of a *revealed* `**` (the next motion snaps out);
 hidden hints are never a landing. `\*` escapes and `_` marks have no rule
 yet, so they paint as source.
 
 ## Vocabulary
 
-- **Mark** — a grammar span: `hint_a` bytes, content, `hint_b` bytes
-  (`**bold**`, `` `code` ``, `- [ ]`, `[text](url)`). A `match` with no
-  content is a mark with `hint_b = 0`.
+- **Mark** — a grammar span with an **arity** ([mark_arity.md](mark_arity.md)).
+  A **pair** is `hint_a` + one content + `hint_b` (`**bold**`, `` `code` ``,
+  fence). A **prefix** is `hint_a` on the opener only (`# `, later `> ` /
+  `- `); `hint_b = 0` is not a closer. A **path** is two **faces** (label
+  and dest): `[text](url)` is not a pair. `hint_b = 0` on an unclosed pair
+  at the window end is still a pair — prefix is the sidecar, not that.
 - **Hint** — the delimiter bytes. Always in the file; Rich pane paints them
-  at zero width (unless revealed).
-- **Content** — ordinary clusters between the hints.
-- **Atom** — what motion crosses in one step. In Rich a pair of hints is
-  one atom in two places (DESIGN Encoding). Source has no hint atoms.
+  at zero width (unless revealed). Dest-face **content** is also hidden
+  until that face is entered.
+- **Content** — ordinary clusters of a face (pair interior, heading title,
+  link label). Dest is a second content face.
+- **Face** — path only: `label` (shown) or `dest` (hidden until entered).
+  Two runs, no face id on `RtxRun`.
+- **Atom** — what motion crosses in one step. In Rich a **pair**’s two
+  hints are one atom in two places (DESIGN Encoding). Prefix opener is
+  one-sided. Path join never crosses a face. Source has no hint atoms.
 - **Source / Rich** — `layout.rich` per pane. Source is today's paint.
 - **Planter** — who produced a run (prose scanner, host TM lex, guest
   inject). Clip and toggle‑off are by planter, never by bit shape.
@@ -105,8 +115,11 @@ body) gets mono inside it. The shipped `markdown.tmLanguage.json` declares
 | Hint paint | plain bytes | zero width, **revealed** when caret or selection is inside the mark |
 | Hit‑test at a hint x | byte | resolves to content edge (hints are not a landing) — no ambiguity because an adjacent caret reveals them |
 | Motion across hints | per cluster | one step crosses the pair edge; interior positions are content clusters |
-| Backspace on a hint | deletes a byte | unwrap: removes both hints (one atom in two places) |
-| Selection reaching a hint | as bytes | reaches the pair; cut removes the pair |
+| Backspace on a **pair** hint | deletes a byte | unwrap: removes both hints of that pair (one atom in two places) |
+| Backspace on a **prefix** (`# `) | deletes a byte | **apply** on the opener (demote / unwrap); title type-over does not eat `# ` |
+| Backspace on a **path** `[` / `](` | deletes a byte | **apply** unwrap: keep the label, drop `[` `](dest)`. Not pair-join |
+| Selection reaching a pair hint | as bytes | reaches that pair; cut removes the pair |
+| Selection of a path label | as bytes | **named face** — does not include dest bytes |
 | Copy | bytes | bytes, hints included (truth is bytes) |
 | Find hit inside a hint | plain | selects the match and reveals the mark |
 | Line‑start hints (`# `, `- `, `> `) | plain | zero width; gutter / line numbers unaffected |
@@ -128,7 +141,11 @@ motion, selection, delete, wrap and hit — motion post‑steps the way
   no new primitive. Cap the selection at `RTX_HL_WIN_MAX` and refuse
   above (honest leftover) — the copy is the cost.
 - Toggle‑off finds the enclosing run by rule (planter + rule id on the run)
-  and removes its hints — same unwrap as backspace on a hint.
+  and removes its hints. Pair: same unwrap as backspace on a hint. Prefix
+  / path: apply, not `replace_join`.
+- First client (wedge 6): `apply: heading` — insert / change / strip
+  the prefix the grammar named. Path unwrap is 6b (`arity: path`); dest
+  hide and join refuse follow the sidecar, not a Markdown delimiter.
 - `- [ ]` ↔ `- [x]` is `apply: toggle` on a 5‑byte mark: one `replace`.
 - TUI: status‑row keys; GUI: toolbar. Both consume the same table as paint.
 
@@ -223,8 +240,9 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 2 | Style bits from sidecar or default scope map, copied at plant; `markdown.tmLanguage.json` declares `kind: markup`; prose scanner gated to PROSE sub‑ranges | **done** |
 | 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; reveal‑on‑entry; `rich` toggle key; TUI + GUI paint; atom step, unwrap, selection join rule | **done** |
 | 4 | Fence + injection: `cctext.bol` + `cctext.info`; `scopeName` / `rtx_tm_rt_for_scope()` / `rtx_tm_rt_for_info()`; depth‑2 guest lex; `RTX_RUN_INJECT`; nested inline marks; HTML `<script>`/`<style>` `RE_SPAN` | **done** |
-| 5 | MD table child | |
-| 6 | Apply / toolbar via one `replace`; toggle‑off by rule id | |
+| 5 | MD table child | **done this cut**: classify, fill-epoch geom, `│` rails + sep rule chrome, aligned Rich paint / hit; Source raw. Lookback and cell wrap later |
+| 6 | Apply / toolbar via one `replace`; toggle‑off by rule id; first client = heading prefix | prefix plant + Backspace demote/unwrap **done this cut**; toolbar / insert still 6 |
+| 6b | Path faces: two runs (label + dest); dest hide; `replace_join` refuses dest↔label; unwrap keeps the label | **done this cut** (wrap / toolbar still 6) |
 | 7 | Blocks as folds — after the three blockers above | |
 
 Smokes come from the fixtures: each README row under `testdata/rich/*` is
@@ -239,9 +257,10 @@ geometry) once its wedge lands.
 | Section kind | `MARKUP` exists; lex / scope / font decided separately |
 | Styling | Bits on `RtxTmRule` (sidecar, else default scope map) copied to the run; clip and toggle by planter |
 | Hints | Literal begin/end byte counts on the run; layout‑time skip gated on `has_marks`; per‑pane `rich` bit, never OR'd into `view` |
-| Atoms | Marks are clusters with one more join rule (DESIGN Encoding); reveal on entry; byte caret |
-| Nesting | Span depth 1 is a stated leftover for MD fences; lifting the stack is the code‑embed wedge, not optional |
-| Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX` |
+| Atoms | Pair join is DESIGN Encoding (one content, two hints). Prefix / path extend it ([mark_arity.md](mark_arity.md)); dest never in label `hint_b`; no face id on `RtxRun` |
+| Nesting | Stack is live (wedge 4). Join stays pair-only; path is two runs |
+| Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX`. Heading first; link unwrap is apply, not join |
+| Leftover marks | Setext, reference links, images-as-opaque, quote / list prefix — not 6b |
 | Children | Layout‑epoch scratch; paint‑time recursion; window + lookback classify; leftover, never wrong |
 | Renders | Opaque vis row of height H; Scan‑table job; epoch cache; GUI only |
 | Derived values | Layout‑epoch, read‑only, one record in window |

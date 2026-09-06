@@ -804,6 +804,48 @@ void UnloadFont(Font font) {
     if (font.ct) CFRelease((CTFontRef)font.ct);
 }
 
+static int gui_ct_family_same(CTFontRef a, CTFontRef b) {
+    CFStringRef fa, fb;
+    int ok;
+    if (!a || !b) return 0;
+    fa = CTFontCopyFamilyName(a);
+    fb = CTFontCopyFamilyName(b);
+    ok = fa && fb &&
+         CFStringCompare(fa, fb, kCFCompareCaseInsensitive) == kCFCompareEqualTo;
+    if (fa) CFRelease(fa);
+    if (fb) CFRelease(fb);
+    return ok;
+}
+
+static int gui_ct_hidden_ps(CTFontRef src) {
+    CFStringRef ps;
+    int hidden;
+    if (!src) return 0;
+    ps = CTFontCopyPostScriptName(src);
+    hidden = ps && CFStringHasPrefix(ps, CFSTR("."));
+    if (ps) CFRelease(ps);
+    return hidden;
+}
+
+static CTFontRef gui_ct_from_path(const char *path, CGFloat size) {
+    CFStringRef p;
+    CFURLRef url;
+    CGDataProviderRef prov;
+    CGFontRef cgf;
+    CTFontRef ct = NULL;
+    if (!path || !path[0]) return NULL;
+    p = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
+    url = p ? CFURLCreateWithFileSystemPath(NULL, p, kCFURLPOSIXPathStyle, false) : NULL;
+    prov = url ? CGDataProviderCreateWithURL(url) : NULL;
+    cgf = prov ? CGFontCreateWithDataProvider(prov) : NULL;
+    if (cgf) ct = CTFontCreateWithGraphicsFont(cgf, size, NULL, NULL);
+    if (cgf) CFRelease(cgf);
+    if (prov) CGDataProviderRelease(prov);
+    if (url) CFRelease(url);
+    if (p) CFRelease(p);
+    return ct;
+}
+
 Font gui_derive_font(Font base, int bold, int italic) {
     CTFontRef src = (CTFontRef)base.ct;
     CTFontSymbolicTraits want = 0;
@@ -813,7 +855,22 @@ Font gui_derive_font(Font base, int bold, int italic) {
     if (bold) want |= kCTFontBoldTrait;
     if (italic) want |= kCTFontItalicTrait;
     if (!want) return base;
+    /* File-loaded SFNSMono has no BoldItalic. Trait copy looks up
+     * `.SFNSMono-BoldItalic`, logs, and substitutes Times. Stay on bold. */
+    if (bold && italic && gui_ct_hidden_ps(src)) return base;
     derived = CTFontCreateCopyWithSymbolicTraits(src, base.size, NULL, want, want);
+    if (derived && !gui_ct_family_same(src, derived)) {
+        CFRelease(derived);
+        derived = NULL;
+    }
+    if (!derived && italic && !bold) {
+        derived = gui_ct_from_path("/System/Library/Fonts/SFNSMonoItalic.ttf",
+                                   base.size);
+        if (derived && !gui_ct_family_same(src, derived)) {
+            CFRelease(derived);
+            derived = NULL;
+        }
+    }
     if (!derived && bold && !italic) {
         CFStringRef fam = CTFontCopyFamilyName(src);
         if (fam) {
@@ -821,6 +878,10 @@ Font gui_derive_font(Font base, int bold, int italic) {
             CFStringAppend(name, fam);
             CFStringAppend(name, CFSTR(" Bold"));
             derived = CTFontCreateWithName(name, base.size, NULL);
+            if (derived && !gui_ct_family_same(src, derived)) {
+                CFRelease(derived);
+                derived = NULL;
+            }
             CFRelease(name);
             CFRelease(fam);
         }

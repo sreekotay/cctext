@@ -159,7 +159,7 @@ field the worker is still storing into.
 | jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
 | prefix | — | — | — | `line_scan_off` | host does not pump |
 | island | `isle_kick` (land / gap view) | dest-live wrapper; wait-for 2 MiB blocks | `isle_h.live()` | `isle_from` | — |
-| browse | `rtx_browse_kick` | dest-live wrapper; wait-for dir jobs | `h.live()` | `jhead` | — |
+| browse | `rtx_browse_kick` | dest-live wrapper; one `RTX_BROWSE_WAVE` of dir jobs; pump starts the next | `h.live()` | `jhead` | — |
 
 Kick plants the first paint and returns. A dest-live kick has no
 "not yet started" window — the arm may finish inline before the next
@@ -230,7 +230,7 @@ Commit only after the new value exists: hist after `tree.replace` (reserve coale
 
 Mark motion and fold walk the runs `ensure_hl` already produced. They do not lex ahead, pump, or keep a file-shaped table. Heading pairs use those runs; brace pairs (`{}` `[]` `()`) match on the caret’s 256KiB analysis page plus at most one neighbor page each side (same grain as `RTX_HL_WIN_MAX`, not the 64KiB store). Paint does not `ensure_hl` that span — skip uses whatever runs the layout window already has. A fold is stored only when both ends are in that window. Layout skips interiors; caret and scroll jump to the fold edge; hex ignores folds. Folds are document state (`RtxDoc.folds`, cap `RTX_FOLD_MAX`), shared by every pane on the doc — per-pane folds are a known non-feature.
 
-Grid, hex, and the markup lens (Rich hints, nested children, injected lex) are paint policies over the same bytes and the same runs — see [docs/md_view.md](docs/md_view.md).
+Grid, hex, and the markup lens (Rich hints, nested children, injected lex) are paint policies over the same bytes and the same runs — see [docs/md_view.md](docs/md_view.md). Pair / prefix / path mark shapes: [docs/mark_arity.md](docs/mark_arity.md).
 
 Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for `write_fd` / page-store internals.
 
@@ -305,7 +305,7 @@ presentation are 2 columns; extend/ZWJ glue adds none; otherwise the first
 scalar’s East-Asian / `rtx_utf8_cp_width` policy (then `cols >= 1`).
 
 **Marks are clusters with one more join rule.** A markup span (`**bold**`,
-`` `code` ``, `- [ ]`, `[text](url)`) is hint bytes around content. In a
+`` `code` ``, a fence) is hint bytes around **one** content. In a
 Rich pane the hints are atoms exactly the way a ZWJ sequence is: never an
 interior caret position, one step to cross, painted at zero width. The
 extra rule is that a pair’s two hints are **one atom in two places** —
@@ -314,8 +314,11 @@ selects one selects both (a cut that reaches a hint reaches the pair).
 Content between the hints is ordinary clusters, so interior positions are
 legal; that is the only way a mark differs from a glyph. There is no
 “extend the selection” policy and no broken-markup case — those are the
-join rule. Implement it where clusters already are: an atom-length beside
-`rtx_utf8_cluster`, consumed by motion, selection, delete, wrap, and hit;
-gated on a per-fill `has_marks` so a plain file never pays. Source mode
-(`layout.rich == 0`) has no hint atoms — hints are plain bytes. See
+join rule. Prefix marks (`# `) and path marks (`[label](dest)`) **extend**
+that sentence — they do not use this join; see
+[docs/mark_arity.md](docs/mark_arity.md). Implement the pair rule where
+clusters already are: an atom-length beside `rtx_utf8_cluster`, consumed
+by motion, selection, delete, wrap, and hit; gated on a per-fill
+`has_marks` so a plain file never pays. Source mode (`layout.rich == 0`)
+has no hint atoms — hints are plain bytes. See
 [docs/md_view.md](docs/md_view.md).

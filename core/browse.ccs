@@ -2,10 +2,10 @@
 /*
  * Directory listing (linked TU; see browse.cch).
  * Hosts include the header for types/chrome; this file owns kick / pump.
- * Listing: dest-live wrapper; wait-for a WAVE of directory jobs; write
- * stage appends ents. Flatten skips vendor trees and caps the job
- * queue. finish waits the wrapper then drains folder-size. Drop/kick
- * cancel the tree and join.
+ * Listing: dest-live wrapper; one WAVE of directory jobs per arm;
+ * the host pump starts the next wave. Flatten skips vendor trees,
+ * caps the job queue, and splits huge folders. finish drains waves
+ * then folder-size. Drop/kick cancel the tree and join.
  */
 #include <ccc/std/prelude.cch>
 #include <ctype.h>
@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -39,6 +40,7 @@ typedef struct {
     char abs[RTX_BROWSE_DIR];
     char rel[RTX_BROWSE_NAME];
     int depth;
+    int skip;              /* raw readdir count already consumed */
 } RtxBrowseJob;
 
 typedef struct {
@@ -80,9 +82,17 @@ typedef struct RtxBrowseWalk {
     size_t nhave;
     int du_defer;          /* 1: movement owns this turn; no du I/O */
     int deep_phase;        /* 1: local listing done, appending flatten */
-    int cancel;            /* 1: drop / kick asked the wave to leave */
+    _Atomic unsigned char cancel; /* drop / kick asked the wave to leave */
     CCParallel h;
 } RtxBrowseWalk;
+
+static inline unsigned char rtx_browse_load_cancel(const RtxBrowseWalk *wk) {
+    return wk ? atomic_load_explicit(&wk->cancel, memory_order_acquire) : 1;
+}
+
+static inline void rtx_browse_store_cancel(RtxBrowseWalk *wk, unsigned char v) {
+    if (wk) atomic_store_explicit(&wk->cancel, v, memory_order_release);
+}
 
 typedef struct {
     RtxBrowseEnt *ents;
@@ -197,6 +207,7 @@ static int rtx_browse_skip_deep(const char *name) {
     static const char *const skip[] = {
         "node_modules", "target", "dist", "build", "out", "__pycache__",
         "vendor", ".venv", "venv", "Pods", ".build", ".gradle", ".cargo",
+        ".git", ".cc-build",
         NULL
     };
     const char *base;
@@ -344,7 +355,7 @@ void rtx_browse_keep_set(RtxBrowse *br, const char *name) {
 void rtx_browse_walk_stop(RtxBrowse *br) {
     RtxBrowseWalk *wk = rtx_br_wk(br);
     if (!wk) return;
-    wk->cancel = 1;
+    rtx_browse_store_cancel(wk, 1);
     if (wk->h.live()) {
         if (wk->h.paused())
             wk->h.resume() !>(e) { (void)e; };
@@ -395,12 +406,11 @@ static int rtx_browse_push(RtxBrowse *br, const RtxBrowseEnt *rec) {
     return 0;
 }
 
-static int rtx_browse_job_push(RtxBrowse *br, const char *abs, const char *rel,
-                              int depth) {
+static int rtx_browse_job_push(RtxBrowse *br, const RtxBrowseJob *job) {
     RtxBrowseWalk *wk;
     RtxBrowseJob *n;
     size_t c;
-    if (!br || !br->wk || !abs || !abs[0]) return -1;
+    if (!br || !br->wk || !job || !job->abs[0]) return -1;
     wk = br->wk;
     if (wk->jlen >= (size_t)RTX_BROWSE_JOB_MAX) {
         br->truncated = 1;
@@ -419,11 +429,7 @@ static int rtx_browse_job_push(RtxBrowse *br, const char *abs, const char *rel,
         wk->jobs = n;
         wk->jcap = c;
     }
-    wk->jobs[wk->jlen] = (RtxBrowseJob){0};
-    snprintf(wk->jobs[wk->jlen].abs, sizeof(wk->jobs[wk->jlen].abs), "%s", abs);
-    snprintf(wk->jobs[wk->jlen].rel, sizeof(wk->jobs[wk->jlen].rel), "%s",
-             rel ? rel : "");
-    wk->jobs[wk->jlen].depth = depth;
+    wk->jobs[wk->jlen] = *job;
     wk->jlen++;
     return 0;
 }
@@ -470,6 +476,23 @@ static int rtx_browse_scratch_kid(RtxBrowseScratch *s, const RtxBrowseJob *job,
     snprintf(s->kids[s->kn].abs, sizeof(s->kids[s->kn].abs), "%s", full);
     snprintf(s->kids[s->kn].rel, sizeof(s->kids[s->kn].rel), "%s", child);
     s->kids[s->kn].depth = job->depth + 1;
+    s->kids[s->kn].skip = 0;
+    s->kn++;
+    return 0;
+}
+
+static int rtx_browse_scratch_resume(RtxBrowseScratch *s, const RtxBrowseJob *job,
+                                    int skip) {
+    if (!s || !job) return -1;
+    if (s->kn >= s->kcap) {
+        size_t c = s->kcap ? s->kcap * 2 : 8;
+        RtxBrowseJob *p = (RtxBrowseJob *)realloc(s->kids, c * sizeof(*p));
+        if (!p) return -1;
+        s->kids = p;
+        s->kcap = c;
+    }
+    s->kids[s->kn] = *job;
+    s->kids[s->kn].skip = skip;
     s->kn++;
     return 0;
 }
@@ -514,6 +537,8 @@ static void rtx_browse_collect_deep(const RtxBrowse *br, const RtxBrowseJob *job
                                    RtxBrowseScratch *s) {
     DIR *dp;
     RtxBrowseWalk *wk;
+    int seen = 0;
+    int work = 0;
     if (!br || !job || !s) return;
     wk = rtx_br_wk((RtxBrowse *)br);
     dp = opendir(job->abs);
@@ -533,34 +558,37 @@ static void rtx_browse_collect_deep(const RtxBrowse *br, const RtxBrowseJob *job
         int wr;
         de = readdir(dp);
         if (!de) break;
+        seen++;
+        if (seen <= job->skip) continue;
+        work++;
         name = de->d_name;
         if (!name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
-            continue;
-        if (rtx_browse_hidden(br, name)) continue;
-        if (wk && wk->cancel) break;
+            goto budget;
+        if (rtx_browse_hidden(br, name)) goto budget;
+        if (rtx_browse_load_cancel(wk)) break;
 #ifdef DT_LNK
-        if (de->d_type == DT_LNK) continue;
+        if (de->d_type == DT_LNK) goto budget;
 #endif
         wr = (job->rel[0])
                  ? snprintf(child, sizeof(child), "%s/%s", job->rel, name)
                  : snprintf(child, sizeof(child), "%s", name);
-        if (wr <= 0 || (size_t)wr >= sizeof(child)) continue;
+        if (wr <= 0 || (size_t)wr >= sizeof(child)) goto budget;
 #ifdef DT_DIR
         if (de->d_type == DT_DIR) {
-            if (rtx_browse_skip_deep(name)) continue;
+            if (rtx_browse_skip_deep(name)) goto budget;
             if (rtx_browse_scratch_kid(s, job, name) < 0) break;
-            continue;
+            goto budget;
         }
 #endif
-        if (!rtx_browse_show_name(br, child, 0)) continue;
+        if (!rtx_browse_show_name(br, child, 0)) goto budget;
         if (br->flat && !rtx_browse_explicit_deep(br) && !strchr(child, '/'))
-            continue;
-        if (!rtx_browse_join(full, sizeof(full), job->abs, name)) continue;
-        if (lstat(full, &st) != 0 || S_ISLNK(st.st_mode)) continue;
+            goto budget;
+        if (!rtx_browse_join(full, sizeof(full), job->abs, name)) goto budget;
+        if (lstat(full, &st) != 0 || S_ISLNK(st.st_mode)) goto budget;
         if (S_ISDIR(st.st_mode)) {
-            if (rtx_browse_skip_deep(name)) continue;
+            if (rtx_browse_skip_deep(name)) goto budget;
             if (rtx_browse_scratch_kid(s, job, name) < 0) break;
-            continue;
+            goto budget;
         }
         rec = (RtxBrowseEnt){0};
         snprintf(rec.name, sizeof(rec.name), "%s", child);
@@ -569,6 +597,11 @@ static void rtx_browse_collect_deep(const RtxBrowse *br, const RtxBrowseJob *job
         rec.size = (uint64_t)st.st_size;
         rec.mtime = st.st_mtime;
         if (rtx_browse_scratch_ent(s, &rec) < 0) break;
+    budget:
+        if (work >= RTX_BROWSE_DIR_BUDGET) {
+            if (rtx_browse_scratch_resume(s, job, seen) < 0) break;
+            break;
+        }
     }
     closedir(dp);
 }
@@ -1037,36 +1070,15 @@ static int rtx_browse_plant_flat_row(RtxBrowse *br) {
 
 static void rtx_browse_begin_flat(RtxBrowse *br) {
     RtxBrowseWalk *wk = rtx_br_wk(br);
-    DIR *dp;
+    RtxBrowseJob job = {0};
     if (!br || !wk || wk->deep_phase) return;
     if (rtx_browse_plant_flat_row(br) < 0) return;
-    /* Enqueue every sibling dir first; then flip deep_phase so peers can pop. */
-    dp = opendir(br->dir);
-    if (dp) {
-        struct dirent *de;
-        char full[RTX_BROWSE_DIR];
-        while ((de = readdir(dp)) != NULL) {
-            const char *name = de->d_name;
-            int is_dir = 0;
-            if (!name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
-                continue;
-            if (rtx_browse_hidden(br, name)) continue;
-            if (rtx_browse_skip_deep(name)) continue;
-#ifdef DT_DIR
-            if (de->d_type == DT_DIR) is_dir = 1;
-            else if (de->d_type != DT_UNKNOWN && de->d_type != DT_LNK)
-                continue;
-#endif
-            if (!rtx_browse_join(full, sizeof(full), br->dir, name)) continue;
-            if (!is_dir) {
-                struct stat st;
-                if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-            }
-            if (rtx_browse_job_push(br, full, name, 1) < 0) break;
-        }
-        closedir(dp);
-    }
+    /* One deep job on this folder. Waves walk children; do not stat every
+     * sibling on this write-stage turn (a /code-sized listing froze kick). */
+    snprintf(job.abs, sizeof(job.abs), "%s", br->dir);
+    job.depth = 1;
     wk->deep_phase = 1;
+    if (rtx_browse_job_push(br, &job) < 0) return;
     if (wk->jhead < wk->jlen) br->scanning = 1;
 }
 
@@ -1139,8 +1151,12 @@ void !>(CCError) rtx_browse_kick(RtxBrowse *br) {
         rtx_br_wk(br)->deep_phase = 1;
     if (rtx_browse_plant_dotdot(br) < 0)
         return cc_err(CC_ERR_OUT_OF_MEMORY, "browse");
-    if (rtx_browse_job_push(br, br->dir, "", 0) < 0)
-        return cc_err(CC_ERR_OUT_OF_MEMORY, "browse job");
+    {
+        RtxBrowseJob job = {0};
+        snprintf(job.abs, sizeof(job.abs), "%s", br->dir);
+        if (rtx_browse_job_push(br, &job) < 0)
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "browse job");
+    }
     old = rtx_br_wk(br);
     if (old) {
         old->nhave = n_have;
@@ -1165,7 +1181,7 @@ static int rtx_browse_run(RtxBrowse *br) {
     wk = rtx_br_wk(br);
     if (!wk) return 0;
 
-    while (!wk->cancel && !br->truncated && wk->jhead < wk->jlen) {
+    if (!rtx_browse_load_cancel(wk) && !br->truncated && wk->jhead < wk->jlen) {
         size_t base = wk->jhead;
         size_t remain = wk->jlen - base;
         size_t n_sz;
@@ -1188,7 +1204,7 @@ static int rtx_browse_run(RtxBrowse *br) {
 
             job = wk->jobs[base + (size_t)i];
             shallow = (job.depth == 0 && !wk->deep_phase);
-            if (!wk->cancel && !br->truncated) {
+            if (!rtx_browse_load_cancel(wk) && !br->truncated) {
                 if (shallow)
                     rtx_browse_collect_shallow(br, &job, &slot);
                 else
@@ -1197,37 +1213,35 @@ static int rtx_browse_run(RtxBrowse *br) {
 
             @stage (ts, 0, i) {
                 size_t k;
-                while (wk->h.paused && !wk->cancel)
+                while (wk->h.paused && !rtx_browse_load_cancel(wk))
                     cc_yield();
-                if (!wk->cancel && !br->truncated) {
+                if (!rtx_browse_load_cancel(wk) && !br->truncated) {
                     if (slot.denied) br->denied = 1;
                     for (k = 0; k < slot.n && !br->truncated; k++) {
                         if (rtx_browse_push(br, &slot.ents[k]) < 0)
                             br->truncated = 1;
                     }
                     for (k = 0; k < slot.kn && !br->truncated; k++) {
-                        if (rtx_browse_job_push(br, slot.kids[k].abs,
-                                               slot.kids[k].rel,
-                                               slot.kids[k].depth) < 0)
+                        if (rtx_browse_job_push(br, &slot.kids[k]) < 0)
                             br->truncated = 1;
                     }
                     wk->jhead = base + (size_t)i + 1;
-                    if (shallow && !br->truncated && !wk->cancel)
+                    if (shallow && !br->truncated && !rtx_browse_load_cancel(wk))
                         rtx_browse_shallow_done(br);
                 }
             }
 
-            if (wk->cancel || br->truncated)
+            if (rtx_browse_load_cancel(wk) || br->truncated)
                 break;
         } !>.wait()!>;
         (void)fin;
-        if (wk->jhead == base)
-            break;
     }
 
-    br->scanning = 0;
-    rtx_browse_sort_keep(br);
-    return wk->cancel ? 0 : 1;
+    if (rtx_browse_load_cancel(wk) || br->truncated || wk->jhead >= wk->jlen) {
+        br->scanning = 0;
+        rtx_browse_sort_keep(br);
+    }
+    return rtx_browse_load_cancel(wk) ? 0 : 1;
 }
 
 static void !>(CCError) rtx_browse_listing_start(RtxBrowse *br) {
@@ -1259,16 +1273,25 @@ void rtx_browse_resume(RtxBrowse *br) {
     wk->h.resume() !>(e) { (void)e; };
 }
 
+static int rtx_browse_listing_pending(RtxBrowse *br) {
+    RtxBrowseWalk *wk = rtx_br_wk(br);
+    if (!br || !wk || !br->scanning) return 0;
+    if (rtx_browse_load_cancel(wk) || br->truncated) return 0;
+    return wk->jhead < wk->jlen;
+}
+
 size_t !>(CCError) rtx_browse_pump(RtxBrowse *br) {
     size_t n = 0;
+    RtxBrowseWalk *wk;
     if (!br) return cc_err(CC_ERR_INVALID_ARG, "browse");
     rtx_browse_du_retarget(br);
-    {
-        RtxBrowseWalk *wk = rtx_br_wk(br);
-        if (wk && wk->du_defer) {
-            wk->du_defer = 0;
-            return cc_ok(n);
-        }
+    wk = rtx_br_wk(br);
+    if (wk && !wk->h.live() && rtx_browse_listing_pending(br))
+        rtx_browse_listing_start(br) !>(e) { return cc_err(e); };
+    wk = rtx_br_wk(br);
+    if (wk && wk->du_defer) {
+        wk->du_defer = 0;
+        return cc_ok(n);
     }
     if (br->sizing) n += rtx_browse_pump_du(br);
     return cc_ok(n);
@@ -1277,12 +1300,21 @@ size_t !>(CCError) rtx_browse_pump(RtxBrowse *br) {
 void !>(CCError) rtx_browse_finish(RtxBrowse *br) {
     RtxBrowseWalk *wk;
     int n = 0;
+    int guard = 0;
     if (!br) return cc_err(CC_ERR_INVALID_ARG, "browse");
-    wk = rtx_br_wk(br);
-    if (wk && wk->h.live()) {
-        if (wk->h.paused())
-            wk->h.resume() !>(e) { return cc_err(e); };
-        wk->h.wait() !>(e) { return cc_err(e); };
+    while (guard++ < 1000000) {
+        wk = rtx_br_wk(br);
+        if (wk && wk->h.live()) {
+            if (wk->h.paused())
+                wk->h.resume() !>(e) { return cc_err(e); };
+            wk->h.wait() !>(e) { return cc_err(e); };
+            continue;
+        }
+        if (rtx_browse_listing_pending(br)) {
+            rtx_browse_listing_start(br) !>(e) { return cc_err(e); };
+            continue;
+        }
+        break;
     }
     br->scanning = 0;
     /* Listing is joined. Start du for the current row if needed — the
@@ -1777,6 +1809,31 @@ static int rtx_host_spawn_direct(const char *exe, const char *path, int is_dir) 
         posix_spawn_file_actions_addchdir_np(&fa, path);
 #endif
     }
+    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDWR, 0);
+    rc = posix_spawn(&pid, exe, &fa, &attr, argv, rtx_host_env());
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    return rc == 0;
+}
+
+int rtx_open_url(const char *url) {
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    pid_t pid;
+    char *argv[3];
+    int rc;
+    const char *exe;
+    if (!url || !url[0]) return 0;
+#ifdef __APPLE__
+    exe = "/usr/bin/open";
+#else
+    exe = "/usr/bin/xdg-open";
+#endif
+    argv[0] = (char *)exe;
+    argv[1] = (char *)url;
+    argv[2] = NULL;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawnattr_init(&attr);
     posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDWR, 0);
     rc = posix_spawn(&pid, exe, &fa, &attr, argv, rtx_host_env());
     posix_spawn_file_actions_destroy(&fa);

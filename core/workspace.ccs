@@ -1158,6 +1158,14 @@ static void rtx_buf_hint_snap(RtxBuf *b, int dir) {
     b->doc.caret = dir < 0 ? lo : hi;
 }
 
+/* Rich table: `|` and unpainted pad are not a caret landing. */
+static void rtx_buf_md_snap(RtxBuf *b, int dir) {
+    if (!b || !b->layout.rich) return;
+    if (rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout))
+        return;
+    b->doc.caret = rtx_layout_md_snap(&b->layout, &b->doc, b->doc.caret, dir);
+}
+
 void !>(CCError) RtxBuf_move_horiz(RtxBuf *b, int dir, int shift) {
     size_t n;
     if (!b) return cc_err(CC_ERR_INVALID_ARG, "move horiz");
@@ -1194,6 +1202,7 @@ void !>(CCError) RtxBuf_move_horiz(RtxBuf *b, int dir, int shift) {
     if (!rtx_buf_byte_units(b)) {
         b->doc.caret = b->doc.fold_snap(b->doc.caret, dir);
         rtx_buf_hint_snap(b, dir);
+        rtx_buf_md_snap(b, dir);
         if (!shift) b->doc.sel_anchor = b->doc.caret;
     }
     b->doc.break_coalesce();
@@ -1302,6 +1311,291 @@ void !>(CCError) RtxBuf_move_grid_col(RtxBuf *b, int dir) {
     return cc_ok();
 }
 
+static int rtx_buf_in_md_table(const RtxBuf *b) {
+    if (!b || !b->layout.rich) return 0;
+    if (rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout))
+        return 0;
+    return rtx_layout_md_index(&b->layout, b->doc.caret) >= 0;
+}
+
+/* One new body row. Header / sep Enter inserts the first body row. */
+static void !>(CCError) rtx_buf_md_insert_row(RtxBuf *b) {
+    int ti, role;
+    const RtxMdTable *t;
+    size_t insert_at, nlen, got, n, lead;
+    char row[1 + 3 * RTX_MD_TABLE_COLS + 2];
+    char ch;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "md row");
+    ti = rtx_layout_md_index(&b->layout, b->doc.caret);
+    if (ti < 0) return cc_ok();
+    t = &b->layout.md_tab[ti];
+    role = rtx_md_table_role(t, b->doc.caret);
+    if (role == RTX_MD_ROLE_HDR || role == RTX_MD_ROLE_SEP)
+        insert_at = t->body_lo;
+    else {
+        insert_at = b->doc.caret;
+        nlen = b->len();
+        if (insert_at < t->lo) insert_at = t->lo;
+        if (insert_at > t->hi) insert_at = t->hi;
+        while (insert_at < t->hi && insert_at < nlen) {
+            ch = 0;
+            got = b->doc.read_at(insert_at, &ch, 1) !>(e) { return cc_err(e); };
+            if (got != 1) break;
+            insert_at++;
+            if (ch == '\n') break;
+        }
+    }
+    lead = 0;
+    if (insert_at > 0) {
+        ch = 0;
+        got = b->doc.read_at(insert_at - 1, &ch, 1) !>(e) { return cc_err(e); };
+        if (got == 1 && ch != '\n') {
+            row[0] = '\n';
+            lead = 1;
+        }
+    }
+    n = rtx_md_empty_row(t->ncols, row + lead, sizeof(row) - lead);
+    if (!n) return cc_ok();
+    b->doc.replace(insert_at, 0, row.to_slice_n(lead + n)) !>(e) {
+        return cc_err(e);
+    };
+    b->doc.caret = insert_at + lead + 1;
+    b->doc.sel_anchor = b->doc.caret;
+    b->clear_pref();
+    rtx_buf_hex_nib_reset(b);
+    return cc_ok();
+}
+
+/* Append one column to every table line. One replace of [t.lo, t.hi). */
+static void !>(CCError) rtx_buf_md_insert_col(RtxBuf *b) {
+    int ti, sep;
+    const RtxMdTable *t;
+    size_t tlo, thi, n, i, start, used, dcap, caret_rel, new_caret, add;
+    CCArena src_a = {0};
+    char[:] span;
+    char *dst = NULL;
+    int src_on = 0;
+    @errhandler(CCError e) {
+        if (src_on) src_a.destroy();
+        free(dst);
+        return cc_err(e);
+    }
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "md col ins");
+    ti = rtx_layout_md_index(&b->layout, b->doc.caret);
+    if (ti < 0) return cc_ok();
+    t = &b->layout.md_tab[ti];
+    if (t->ncols >= RTX_MD_TABLE_COLS) return cc_ok();
+    tlo = t->lo;
+    thi = t->hi;
+    if (thi <= tlo) return cc_ok();
+    n = thi - tlo;
+    src_a = cc_arena_heap(n + 64);
+    if (!src_a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "md col src");
+    src_on = 1;
+    span = b->doc.scratch_span(tlo, n, src_a) !>;
+    dcap = n + 4 * n + 32;
+    dst = (char *)malloc(dcap);
+    if (!dst) {
+        src_a.destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "md col dst");
+    }
+    used = 0;
+    caret_rel = b->doc.caret >= tlo ? b->doc.caret - tlo : 0;
+    new_caret = b->doc.caret;
+    i = 0;
+    while (i < span.len) {
+        size_t ln;
+        start = i;
+        while (i < span.len && span.ptr[i] != '\n') i++;
+        ln = i - start;
+        sep = rtx_md_line_is_sep(span.ptr + start, ln);
+        add = rtx_md_line_add_col(span.ptr + start, ln, sep, dst + used,
+                                  dcap - used);
+        if (!add) {
+            src_a.destroy();
+            free(dst);
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "md col fit");
+        }
+        used += add;
+        if (caret_rel >= start && caret_rel <= i)
+            new_caret = tlo + used - (add >= 2 ? 2 : 0);
+        if (i < span.len && span.ptr[i] == '\n') {
+            if (used >= dcap) {
+                src_a.destroy();
+                free(dst);
+                return cc_err(CC_ERR_OUT_OF_MEMORY, "md col nl");
+            }
+            dst[used++] = '\n';
+            i++;
+        }
+    }
+    b->doc.replace(tlo, n, cc_slice_from_buffer(dst, used)) !>;
+    b->doc.caret = new_caret;
+    b->doc.sel_anchor = new_caret;
+    src_a.destroy();
+    src_on = 0;
+    free(dst);
+    dst = NULL;
+    b->clear_pref();
+    rtx_buf_hex_nib_reset(b);
+    return cc_ok();
+}
+
+/* Drop one body row (the physical line). Header / sep stay. */
+static void !>(CCError) rtx_buf_md_delete_row(RtxBuf *b) {
+    int ti, role;
+    const RtxMdTable *t;
+    size_t ls, le, nlen, got, del_n;
+    char ch;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "md row del");
+    ti = rtx_layout_md_index(&b->layout, b->doc.caret);
+    if (ti < 0) return cc_ok();
+    t = &b->layout.md_tab[ti];
+    role = rtx_md_table_role(t, b->doc.caret);
+    if (role != RTX_MD_ROLE_BODY) return cc_ok();
+    ls = b->doc.caret;
+    nlen = b->len();
+    if (ls < t->lo) ls = t->lo;
+    if (ls > t->hi) ls = t->hi;
+    while (ls > t->lo) {
+        ch = 0;
+        got = b->doc.read_at(ls - 1, &ch, 1) !>(e) { return cc_err(e); };
+        if (got != 1 || ch == '\n') break;
+        ls--;
+    }
+    le = ls;
+    while (le < t->hi && le < nlen) {
+        ch = 0;
+        got = b->doc.read_at(le, &ch, 1) !>(e) { return cc_err(e); };
+        if (got != 1 || ch == '\n') break;
+        le++;
+    }
+    del_n = le - ls;
+    if (le < t->hi && le < nlen) {
+        ch = 0;
+        got = b->doc.read_at(le, &ch, 1) !>(e) { return cc_err(e); };
+        if (got == 1 && ch == '\n') del_n++;
+    }
+    if (!del_n) return cc_ok();
+    b->doc.replace(ls, del_n, cc_slice_empty()) !>(e) { return cc_err(e); };
+    b->clear_pref();
+    rtx_buf_hex_nib_reset(b);
+    return cc_ok();
+}
+
+/* Drop column `col` from every table line. One replace of [t.lo, t.hi). */
+static void !>(CCError) rtx_buf_md_delete_col(RtxBuf *b, int col) {
+    int ti, keep;
+    const RtxMdTable *t;
+    size_t tlo, thi, n, i, start, used, dcap, caret_rel, new_caret, add;
+    size_t line_dst0;
+    CCArena src_a = {0};
+    char[:] span;
+    char *dst = NULL;
+    int src_on = 0;
+    RtxMdCell cells[RTX_MD_TABLE_COLS];
+    @errhandler(CCError e) {
+        if (src_on) src_a.destroy();
+        free(dst);
+        return cc_err(e);
+    }
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "md col del");
+    ti = rtx_layout_md_index(&b->layout, b->doc.caret);
+    if (ti < 0) return cc_ok();
+    t = &b->layout.md_tab[ti];
+    if (t->ncols <= 1 || col < 0 || col >= t->ncols) return cc_ok();
+    keep = col > 0 ? col - 1 : 0;
+    tlo = t->lo;
+    thi = t->hi;
+    if (thi <= tlo) return cc_ok();
+    n = thi - tlo;
+    src_a = cc_arena_heap(n + 64);
+    if (!src_a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "md col del src");
+    src_on = 1;
+    span = b->doc.scratch_span(tlo, n, src_a) !>;
+    dcap = n + 8;
+    dst = (char *)malloc(dcap);
+    if (!dst) {
+        src_a.destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "md col del dst");
+    }
+    used = 0;
+    caret_rel = b->doc.caret >= tlo ? b->doc.caret - tlo : 0;
+    new_caret = b->doc.caret;
+    i = 0;
+    while (i < span.len) {
+        size_t ln, nc, lo, hi;
+        start = i;
+        while (i < span.len && span.ptr[i] != '\n') i++;
+        ln = i - start;
+        line_dst0 = used;
+        add = rtx_md_line_del_col(span.ptr + start, ln, col, dst + used,
+                                  dcap - used);
+        if (ln && !add) {
+            src_a.destroy();
+            free(dst);
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "md col del fit");
+        }
+        used += add;
+        if (caret_rel >= start && caret_rel <= i) {
+            nc = rtx_md_row_split(dst + line_dst0, add, cells, RTX_MD_TABLE_COLS);
+            if (nc) {
+                int at = keep;
+                if (at >= (int)nc) at = (int)nc - 1;
+                lo = cells[at].lo;
+                hi = cells[at].hi;
+                rtx_md_span_trim(dst + line_dst0, &lo, &hi);
+                new_caret = tlo + line_dst0 + lo;
+            } else {
+                new_caret = tlo + line_dst0;
+            }
+        }
+        if (i < span.len && span.ptr[i] == '\n') {
+            if (used >= dcap) {
+                src_a.destroy();
+                free(dst);
+                return cc_err(CC_ERR_OUT_OF_MEMORY, "md col del nl");
+            }
+            dst[used++] = '\n';
+            i++;
+        }
+    }
+    b->doc.replace(tlo, n, cc_slice_from_buffer(dst, used)) !>;
+    b->doc.caret = new_caret;
+    b->doc.sel_anchor = new_caret;
+    src_a.destroy();
+    src_on = 0;
+    free(dst);
+    dst = NULL;
+    b->clear_pref();
+    rtx_buf_hex_nib_reset(b);
+    return cc_ok();
+}
+
+void !>(CCError) RtxBuf_move_md_col(RtxBuf *b, int dir) {
+    size_t want;
+    int c, ti;
+    const RtxMdTable *t;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "md col");
+    if (!rtx_buf_in_md_table(b)) return cc_ok();
+    ti = rtx_layout_md_index(&b->layout, b->doc.caret);
+    t = ti >= 0 ? &b->layout.md_tab[ti] : NULL;
+    c = rtx_layout_md_col_at(&b->layout, &b->doc, b->doc.caret);
+    if (dir > 0 && t && c >= 0 && c + 1 >= t->ncols)
+        return rtx_buf_md_insert_col(b);
+    if (dir < 0 && t && c == 0 && t->ncols > 1)
+        return rtx_buf_md_delete_col(b, 0);
+    want = rtx_layout_md_step_cell(&b->layout, &b->doc, b->doc.caret, dir);
+    if (want == b->doc.caret && dir > 0) return rtx_buf_md_insert_col(b);
+    b->doc.caret = want;
+    b->doc.sel_anchor = want;
+    b->doc.sel_box = 0;
+    b->doc.break_coalesce();
+    b->clear_pref();
+    rtx_buf_hex_nib_reset(b);
+    return cc_ok();
+}
+
 void !>(CCError) RtxBuf_move_vert(RtxBuf *b, const RtxMeasure *m,
                                         double width, int dir, int shift) {
     size_t n, at;
@@ -1358,6 +1652,8 @@ void !>(CCError) RtxBuf_move_edge(RtxBuf *b, int to_end, int shift,
         b->layout.move_row_edge(&b->doc, to_end, shift);
     } else {
         b->doc.move_line_edge(to_end, shift) !>;
+        rtx_buf_md_snap(b, 0);
+        if (!shift) b->doc.sel_anchor = b->doc.caret;
     }
     if (to_end) b->stick_eol();
     else b->clear_pref();
@@ -1373,6 +1669,24 @@ void !>(CCError) RtxBuf_type_cp(RtxBuf *b, uint32_t cp) {
     int hi;
     if (!b) return cc_err(CC_ERR_INVALID_ARG, "type");
     if (!rtx_layout_is_hex(&b->layout)) {
+        if (!b->doc.has_sel()) {
+            rtx_buf_md_snap(b, 0);
+            b->doc.sel_anchor = b->doc.caret;
+        }
+        if (cp == (uint32_t)'|' && rtx_buf_in_md_table(b)) {
+            int ti = rtx_layout_md_index(&b->layout, b->doc.caret);
+            char esc[2];
+            esc[0] = '\\';
+            esc[1] = '|';
+            if (ti >= 0 &&
+                rtx_md_table_role(&b->layout.md_tab[ti], b->doc.caret) !=
+                    RTX_MD_ROLE_SEP) {
+                if (rtx_buf_rich(b) && b->doc.has_sel() && !b->doc.sel_box)
+                    return b->doc.replace_join(b->doc.sel_lo(), b->doc.sel_hi(),
+                                               esc.to_slice_n(2));
+                return b->doc.type(esc.to_slice_n(2));
+            }
+        }
         if (rtx_buf_rich(b) && b->doc.has_sel() && !b->doc.sel_box) {
             char buf[4];
             int n = rtx_utf8_encode(cp, buf);
@@ -1414,6 +1728,13 @@ void !>(CCError) RtxBuf_type_cp(RtxBuf *b, uint32_t cp) {
     return cc_ok();
 }
 
+void !>(CCError) RtxBuf_enter(RtxBuf *b) {
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "enter");
+    if (rtx_layout_is_hex(&b->layout)) return cc_ok();
+    if (rtx_buf_in_md_table(b)) return rtx_buf_md_insert_row(b);
+    return b->doc.type("\n");
+}
+
 void !>(CCError) RtxBuf_backspace(RtxBuf *b) {
     if (!b) return cc_err(CC_ERR_INVALID_ARG, "backspace");
     rtx_buf_hex_nib_reset(b);
@@ -1426,8 +1747,34 @@ void !>(CCError) RtxBuf_backspace(RtxBuf *b) {
          * backspace onto a hint is unwrap (both hints go). */
         if (b->doc.has_sel())
             return b->doc.replace_join(b->doc.sel_lo(), b->doc.sel_hi(), cc_slice_empty());
-        if (b->doc.caret > 0 && RtxDoc_hint_at(&b->doc, b->doc.caret - 1, &lo, &hi))
+        if (b->doc.caret > 0 && RtxDoc_hint_at(&b->doc, b->doc.caret - 1, &lo, &hi)) {
+            if (RtxDoc_path_at(&b->doc, b->doc.caret - 1, NULL, NULL, NULL, NULL))
+                return b->doc.path_unwrap(b->doc.caret - 1);
+            if (RtxDoc_prefix_at(&b->doc, b->doc.caret - 1, NULL, NULL))
+                return b->doc.prefix_apply(b->doc.caret - 1);
             return b->doc.replace_join(lo, hi, cc_slice_empty());
+        }
+    }
+    if (!b->doc.has_sel() && b->layout.rich &&
+        !rtx_layout_is_hex(&b->layout) && !rtx_layout_is_grid(&b->layout)) {
+        size_t clo, chi;
+        rtx_buf_md_snap(b, 0);
+        b->doc.sel_anchor = b->doc.caret;
+        if (rtx_layout_md_cell_span(&b->layout, &b->doc, b->doc.caret, &clo,
+                                    &chi) &&
+            b->doc.caret <= clo) {
+            int col = rtx_layout_md_col_at(&b->layout, &b->doc, b->doc.caret);
+            int ti = rtx_layout_md_index(&b->layout, b->doc.caret);
+            int role = ti >= 0
+                           ? rtx_md_table_role(&b->layout.md_tab[ti],
+                                               b->doc.caret)
+                           : RTX_MD_ROLE_NONE;
+            if (role == RTX_MD_ROLE_BODY && col == 0)
+                return rtx_buf_md_delete_row(b);
+            if (col >= 1 && ti >= 0 && b->layout.md_tab[ti].ncols > 1)
+                return rtx_buf_md_delete_col(b, col);
+            return cc_ok();
+        }
     }
     return b->doc.backspace();
 }
@@ -1442,8 +1789,23 @@ void !>(CCError) RtxBuf_delete_forward(RtxBuf *b) {
         size_t lo, hi;
         if (b->doc.has_sel())
             return b->doc.replace_join(b->doc.sel_lo(), b->doc.sel_hi(), cc_slice_empty());
-        if (RtxDoc_hint_at(&b->doc, b->doc.caret, &lo, &hi))
+        if (RtxDoc_hint_at(&b->doc, b->doc.caret, &lo, &hi)) {
+            if (RtxDoc_path_at(&b->doc, b->doc.caret, NULL, NULL, NULL, NULL))
+                return b->doc.path_unwrap(b->doc.caret);
+            if (RtxDoc_prefix_at(&b->doc, b->doc.caret, NULL, NULL))
+                return b->doc.prefix_apply(b->doc.caret);
             return b->doc.replace_join(lo, hi, cc_slice_empty());
+        }
+    }
+    if (!b->doc.has_sel() && b->layout.rich &&
+        !rtx_layout_is_hex(&b->layout) && !rtx_layout_is_grid(&b->layout)) {
+        size_t clo, chi;
+        rtx_buf_md_snap(b, 0);
+        b->doc.sel_anchor = b->doc.caret;
+        if (rtx_layout_md_cell_span(&b->layout, &b->doc, b->doc.caret, &clo,
+                                    &chi) &&
+            b->doc.caret >= chi)
+            return cc_ok();
     }
     return b->doc.delete_forward();
 }
@@ -2236,6 +2598,56 @@ void !>(CCError) RtxWs_open_in_pane(RtxWs *w, const char *path) {
     rtx_browse_drop(&w->nav[pane]);
     RtxWs_browse_prev_drop(w, pane);
     return w->sync_live();
+}
+
+static int rtx_link_is_url(const char *s) {
+    if (!s || !s[0]) return 0;
+    if (strncmp(s, "mailto:", 7) == 0) return 1;
+    return strstr(s, "://") != NULL;
+}
+
+static void rtx_link_token(char *s) {
+    char *p, *q;
+    if (!s) return;
+    p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    q = s;
+    while (*q && *q != ' ' && *q != '\t' && *q != '\n' && *q != '\r' &&
+           *q != '"')
+        q++;
+    *q = 0;
+}
+
+void !>(CCError) RtxWs_follow_link(RtxWs *w, size_t off) {
+    RtxBuf *b;
+    size_t lo, hi, n, got;
+    char buf[1024], full[PATH_MAX], dir[PATH_MAX];
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "follow");
+    b = RtxWs_active(w);
+    if (!b) return cc_ok();
+    if (!RtxDoc_link_target(&b->doc, off, &lo, &hi) || hi <= lo) return cc_ok();
+    n = hi - lo;
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    got = b->doc.read_at(lo, buf, n) !>;
+    buf[got < n ? got : n] = 0;
+    rtx_link_token(buf);
+    if (!buf[0]) return cc_ok();
+    if (rtx_link_is_url(buf)) {
+        if (!rtx_open_url(buf)) return cc_err(CC_ERR_INVALID_ARG, "open url");
+        return cc_ok();
+    }
+    dir[0] = 0;
+    if (b->doc.path.ptr && b->doc.path.len)
+        rtx_browse_dirname(dir, sizeof(dir), b->doc.path.ptr);
+    if (!dir[0]) snprintf(dir, sizeof(dir), ".");
+    if (buf[0] == '/') {
+        if (!rtx_browse_abs(full, sizeof(full), buf))
+            snprintf(full, sizeof(full), "%s", buf);
+    } else if (!rtx_browse_join(full, sizeof(full), dir, buf)) {
+        return cc_err(CC_ERR_INVALID_ARG, "follow path");
+    }
+    return RtxWs_open_in_pane(w, full);
 }
 
 void !>(CCError) RtxWs_browse_start(RtxWs *w) {
