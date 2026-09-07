@@ -146,9 +146,10 @@ motion, selection, delete, wrap and hit — motion post‑steps the way
 - Apply = **one** `replace(lo, hi-lo, a + bytes + b)`: one hist record,
   no new primitive. Cap the selection at `RTX_HL_WIN_MAX` and refuse
   above (honest leftover) — the copy is the cost.
-- Toggle‑off finds the enclosing run by rule (planter + rule id on the run)
-  and removes its hints. Pair: same unwrap as backspace on a hint. Prefix
-  / path: apply, not `replace_join`. Rule id on the run is leftover.
+- Toggle‑off finds the enclosing run by rule (planter + `RtxRun.rule`
+  tag). Include clones of `#bold` share `cctext.apply`, so unwrap
+  compares the looked-up name, not tag equality. Pair: same unwrap as
+  backspace on a hint. Prefix / path: apply, not `replace_join`.
 - Prefix apply: `apply` is the toolbar name, `insert` is the unit
   (`#`, `>`, `- `), `max` is how many stack. Cycle the prefix on this
   line, or insert the first prefix+insert rule. Path unwrap is apply;
@@ -262,7 +263,7 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; reveal‑on‑entry; `rich` toggle key; TUI + GUI paint; atom step, unwrap, selection join rule | **done** |
 | 4 | Fence + injection: `cctext.bol` + `cctext.info`; `scopeName` / `rtx_tm_rt_for_scope()` / `rtx_tm_rt_for_info()`; depth‑2 guest lex; `RTX_RUN_INJECT`; nested inline marks; HTML `<script>`/`<style>` `RE_SPAN` | **done** |
 | 5 | MD table child | **done this cut**: classify, fill-epoch geom, `│` rails + sep rule chrome, aligned Rich paint / hit; Source raw. Lookback and cell wrap later |
-| 6 | Apply / toolbar via one `replace`; toggle‑off by rule id; prefix apply from `insert`/`max` | prefix + pair named apply + grammar table **landed**; toggle‑off by rule id leftover |
+| 6 | Apply / toolbar via one `replace`; toggle‑off by rule id; prefix apply from `insert`/`max` | prefix + pair named apply + grammar table + rule id / toggle‑off **landed** |
 | 6b | Path faces: two runs (label + dest); dest hide; `replace_join` refuses dest↔label; unwrap keeps the label | two-run plant + dest hide + join refuse + unwrap + wrap **landed** |
 | 7 | Blocks as folds — after the three blockers above | |
 
@@ -282,7 +283,7 @@ geometry) once its wedge lands.
 | Nesting | Stack is live (wedge 4). Join stays pair-only; path is two runs |
 | Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX`. Table is the path grammar, not the caret. Kind is derived. Link unwrap is apply, not join |
 | Sidecar | One `cctext` object. Recognition (`bol` / `inline` / `flank` / `lit` / `info`) ≠ topology (`arity` / `face` / `wrap`) ≠ transform (`apply` / `insert` / `max`) ≠ paint (`bold` / `italic` / `mono`). A new key answers one of those. |
-| Leftover marks | Setext, reference links, images-as-opaque, `apply: toggle`, rule id on the run |
+| Leftover marks | Setext, reference links, images-as-opaque, `apply: toggle` |
 | Children | Layout‑epoch scratch, not an arity. Paint‑time recursion; window classify; leftover, never wrong |
 | Renders | Opaque vis row of height H; Scan‑table job; epoch cache; GUI only |
 | Derived values | Layout‑epoch, read‑only, one record in window |

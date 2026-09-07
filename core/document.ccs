@@ -1793,9 +1793,13 @@ size_t RtxDoc_apply_list(const RtxDoc *d, RtxApplyEnt *out, size_t cap) {
     return rtx_tm_apply_list(rtx_doc_tm(d), out, cap);
 }
 
+static RtxTmRule *rtx_tm_rule_from_tag(const RtxTmRt *rt, size_t tag);
+
 static const char *rtx_doc_prefix_insert(const RtxDoc *d, const RtxRun *r) {
     const RtxTmRule *rule;
     if (!d || !r) return NULL;
+    rule = rtx_tm_rule_from_tag(rtx_doc_tm(d), (size_t)r->rule);
+    if (rule && rule->sc_insert && rule->sc_insert[0]) return rule->sc_insert;
     rule = rtx_tm_prefix_by_scope(rtx_doc_tm(d), r->style.scope);
     return rule ? rule->sc_insert : NULL;
 }
@@ -2011,24 +2015,33 @@ static int rtx_run_covers_off(const RtxRun *r, size_t off) {
     return r && r->hint_a && off >= r->start && off <= r->start + r->len;
 }
 
-static int rtx_pair_rule_match(const RtxTmRule *want, const RtxRun *r) {
-    if (!want || !r) return 0;
-    if (rtx_run_arity(r) != RTX_ARITY_PAIR) return 0;
-    if (r->style.scope != want->scope) return 0;
-    if (want->sc_wrap) return r->hint_a == want->sc_wrap;
-    return r->hint_a == (want->alen > 255 ? 255 : want->alen);
+/* Planter + rule id, not bit shape or scope. Include clones share
+ * `cctext.apply`; tag equality would miss an inner `#bold`. */
+static int rtx_run_apply_match(const RtxTmRt *rt, const RtxTmRule *want,
+                               const RtxRun *r) {
+    const RtxTmRule *got;
+    if (!want || !r || !rt) return 0;
+    if (r->planter != (unsigned char)RTX_RUN_TM) return 0;
+    if (!r->hint_a || rtx_run_arity(r) != RTX_ARITY_PAIR) return 0;
+    got = rtx_tm_rule_from_tag(rt, (size_t)r->rule);
+    if (!got) return 0;
+    if (want->sc_apply && want->sc_apply[0])
+        return got->sc_apply && rtx_apply_name_eq(got->sc_apply, want->sc_apply);
+    return got == want;
 }
 
 static const RtxRun *rtx_doc_pair_apply_at(const RtxDoc *d, size_t off,
                                            const RtxTmRule *want) {
     const RtxRun *hit = NULL;
+    const RtxTmRt *rt;
     size_t i;
     if (!d || !want || d->runs.len == 0) return NULL;
+    rt = rtx_doc_tm(d);
     i = rtx_doc_run_first(d, off);
     for (; i < d->runs.len && d->runs.data[i].start <= off; i++) {
         const RtxRun *r = &d->runs.data[i];
         if (!rtx_run_covers_off(r, off)) continue;
-        if (!rtx_pair_rule_match(want, r)) continue;
+        if (!rtx_run_apply_match(rt, want, r)) continue;
         hit = r;
     }
     return hit;
@@ -2575,12 +2588,16 @@ static unsigned char rtx_tm_rule_bits(const RtxTmRule *rule) {
     return bits;
 }
 
+static size_t rtx_tm_rule_tag(const RtxTmRt *rt, const RtxTmRule *rule);
+
 /* TM run: scope plus the rule's style bits, with span matched-byte
  * counts. hint_b = 0 for an unclosed span (window end reached). Regex /
- * line / keyword runs pass 0, 0. */
+ * line / keyword runs pass 0, 0. `rule` is rtx_tm_rule_tag (0 for
+ * captures). */
 static int rtx_tm_add_span(RtxDoc *d, size_t start, size_t end, size_t emit_from,
                            RtxScope scope, unsigned char bits, size_t alen,
-                           size_t blen, unsigned char planter, unsigned char mark) {
+                           size_t blen, unsigned char planter, unsigned char mark,
+                           unsigned short rule) {
     RtxRun r = {0};
     if (!d || end <= start || scope == RTX_SCOPE_NONE) return 1;
     if (end <= emit_from) return 1;
@@ -2596,6 +2613,7 @@ static int rtx_tm_add_span(RtxDoc *d, size_t start, size_t end, size_t emit_from
     r.hint_a = rtx_tm_hint(alen);
     r.hint_b = rtx_tm_hint(blen);
     r.mark = mark;
+    r.rule = rule;
     return rtx_doc_push_run(d, r);
 }
 
@@ -2621,7 +2639,8 @@ static size_t rtx_tm_span_end(const RtxTmRule *fr, size_t i, size_t endn,
 }
 
 static int rtx_tm_add(RtxDoc *d, size_t start, size_t end, size_t emit_from,
-                      const RtxTmRule *rule, unsigned char planter) {
+                      const RtxTmRt *rt, const RtxTmRule *rule,
+                      unsigned char planter) {
     size_t ha = 0, hb = 0, w;
     if (rule && rule->sc_wrap) {
         w = (size_t)rule->sc_wrap;
@@ -2648,7 +2667,8 @@ static int rtx_tm_add(RtxDoc *d, size_t start, size_t end, size_t emit_from,
     }
     return rtx_tm_add_span(d, start, end, emit_from, rule->scope,
                            rtx_tm_rule_bits(rule), ha, hb, planter,
-                           rule ? rule->mark : 0);
+                           rule ? rule->mark : 0,
+                           (unsigned short)rtx_tm_rule_tag(rt, rule));
 }
 
 /* Line start inside the lex buffer. `bol0` is whether buf[0] is at BOL
@@ -2799,7 +2819,7 @@ static int rtx_tm_try_rule(RtxTmWalkSt *W, const RtxTmRt *rt,
         {
             size_t j = *W->i + rule->alen;
             while (j < n && buf[j] != '\n') j++;
-            if (!rtx_tm_add(W->d, base + *W->i, base + j, emit_from, rule, plant))
+            if (!rtx_tm_add(W->d, base + *W->i, base + j, emit_from, rt, rule, plant))
                 return -1;
             *W->i = j;
             return 1;
@@ -2829,7 +2849,7 @@ static int rtx_tm_try_rule(RtxTmWalkSt *W, const RtxTmRt *rt,
                              (buf[j] >= 'A' && buf[j] <= 'F'))) {
                 j++;
             }
-            if (!rtx_tm_add(W->d, base + *W->i, base + j, emit_from, rule, plant))
+            if (!rtx_tm_add(W->d, base + *W->i, base + j, emit_from, rt, rule, plant))
                 return -1;
             *W->i = j;
             return 1;
@@ -2847,7 +2867,7 @@ static int rtx_tm_try_rule(RtxTmWalkSt *W, const RtxTmRt *rt,
                 if (rtx_tm_prefix(rule)) {
                     while (s < e && (buf[s] == ' ' || buf[s] == '\t')) s++;
                 }
-                if (!rtx_tm_add(W->d, base + s, base + e, emit_from, rule, plant)) {
+                if (!rtx_tm_add(W->d, base + s, base + e, emit_from, rt, rule, plant)) {
                     return -1;
                 }
             }
@@ -2855,7 +2875,8 @@ static int rtx_tm_try_rule(RtxTmWalkSt *W, const RtxTmRt *rt,
                 if (rule->cap[g] && caps.e[g] > caps.s[g]) {
                     if (!rtx_tm_add_span(W->d, base + caps.s[g], base + caps.e[g],
                                          emit_from, rule->cap[g],
-                                         rule->cap_bits[g], 0, 0, plant, 0)) {
+                                         rule->cap_bits[g], 0, 0, plant, 0,
+                                         0)) {
                         return -1;
                     }
                 }
@@ -2867,7 +2888,7 @@ static int rtx_tm_try_rule(RtxTmWalkSt *W, const RtxTmRt *rt,
                 if (rtx_tm_prefix(rule)) {
                     while (s < e && (buf[s] == ' ' || buf[s] == '\t')) s++;
                 }
-                if (!rtx_tm_add(W->d, base + s, base + e, emit_from, rule, plant)) {
+                if (!rtx_tm_add(W->d, base + s, base + e, emit_from, rt, rule, plant)) {
                     return -1;
                 }
             }
@@ -2877,7 +2898,7 @@ static int rtx_tm_try_rule(RtxTmWalkSt *W, const RtxTmRt *rt,
     }
     case RTX_TM_ESC_DOT:
         if (c != '\\' || *W->i + 1 >= n || buf[*W->i + 1] == '\n') return 0;
-        if (!rtx_tm_add(W->d, base + *W->i, base + *W->i + 2, emit_from, rule,
+        if (!rtx_tm_add(W->d, base + *W->i, base + *W->i + 2, emit_from, rt, rule,
                         plant)) {
             return -1;
         }
@@ -2893,7 +2914,7 @@ static int rtx_tm_try_rule(RtxTmWalkSt *W, const RtxTmRt *rt,
                 j++;
             }
             if (rtx_tm_word_in_list(buf + *W->i, j - *W->i, rule->a, rule->alen)) {
-                if (!rtx_tm_add(W->d, base + *W->i, base + j, emit_from, rule,
+                if (!rtx_tm_add(W->d, base + *W->i, base + j, emit_from, rt, rule,
                                 plant)) {
                     return -1;
                 }
@@ -3008,7 +3029,8 @@ static int rtx_tm_span_advance(RtxTmWalkSt *W, const RtxTmRt *rt, RtxTmRule *fr)
             if (!rtx_tm_add_span(W->d, W->base + W->stk_off[*W->sp - 1],
                                  W->base + end, W->emit_from, fr->scope,
                                  rtx_tm_rule_bits(fr), ha, blen, plant,
-                                 fr->mark)) {
+                                 fr->mark,
+                                 (unsigned short)rtx_tm_rule_tag(rt, fr))) {
                 return -1;
             }
             *W->i = end == *W->i && blen == 0 ? *W->i : end;
@@ -4624,7 +4646,8 @@ static void !>(CCError) rtx_tm_lex(RtxDoc *d, const RtxTmRt *rt, const char *buf
                         if (!rtx_tm_add_span(d, base + stk_off[sp - 1],
                                              base + end, emit_from, fr->scope,
                                              rtx_tm_rule_bits(fr), ha, blen,
-                                             plant_fr, fr->mark)) {
+                                             plant_fr, fr->mark,
+                                             (unsigned short)rtx_tm_rule_tag(frt, fr))) {
                             return cc_err(CC_ERR_OUT_OF_MEMORY, "tm run");
                         }
                         i = end == i && blen == 0 ? i : end;
@@ -4697,7 +4720,8 @@ static void !>(CCError) rtx_tm_lex(RtxDoc *d, const RtxTmRt *rt, const char *buf
                                    fr->scope, rtx_tm_rule_bits(fr),
                                    stk_alen[sp - 1] ? (size_t)stk_alen[sp - 1]
                                                     : fr->alen,
-                                   0, plant_fr, fr->mark)) {
+                                   0, plant_fr, fr->mark,
+                                   (unsigned short)rtx_tm_rule_tag(frt, fr))) {
             return cc_err(CC_ERR_OUT_OF_MEMORY, "tm run");
         }
         sp--;

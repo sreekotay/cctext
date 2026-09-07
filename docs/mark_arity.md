@@ -58,8 +58,8 @@ Pair marks keep today’s hook. A `.c` file still has no marks.
 ## Sidecar (no new `RtxRun` field)
 
 Prefer `cctext` on the TM pattern. Copy onto `RtxTmRule` like `apply` /
-`inline`. Consume via the **rule id** wedge 6 already owes the run
-(toggle-off). Do **not** add a face id to `RtxRun`. One JSON object;
+`inline`. Consume via `RtxRun.rule` (`rtx_tm_rule_tag`; toggle-off).
+Do **not** add a face id or `apply` name to `RtxRun`. One JSON object;
 four questions. A new key answers one of them.
 
 | Layer | Keys | Question |
@@ -207,7 +207,7 @@ hit next).
 | # | Slice | State |
 |---|---|---|
 | 5 | MD table child | classify + paint / hit landed. Lookback / cell wrap leftover. Not an arity. |
-| **6** | Apply / toolbar | Prefix + pair named apply from the grammar table **landed**. |
+| **6** | Apply / toolbar | Prefix + pair named apply + rule id / toggle‑off **landed**. |
 | **6b** | Path faces | Two-run plant, dest hide, join refuse, unwrap, wrap `[sel]()` **landed**. |
 | 7 | Blocks as folds | Unchanged. Setext / heading regions wait here (or a later prefix client), not 6b |
 
