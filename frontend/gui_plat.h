@@ -1,6 +1,6 @@
 /*
  * Platform draw/input surface for cctext-gui (Cocoa + Core Text).
- * Raylib-shaped names keep the editor TUs simple; paint is a display list
+ * Fixed names keep the editor TUs simple; paint is a display list
  * replayed in drawRect (see proto/cocoa_ct.m).
  */
 #ifndef RTX_GUI_PLAT_H

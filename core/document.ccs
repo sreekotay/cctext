@@ -1576,6 +1576,25 @@ static const RtxTmRule *rtx_tm_first_prefix_apply(const RtxTmRt *rt) {
     return NULL;
 }
 
+/* `insert: "off/on"` — same-length states. Third client of insert
+ * (prefix unit, pair bookends, toggle pair). */
+static int rtx_apply_toggle_parts(const char *ins, const char **off, size_t *offn,
+                                  const char **on, size_t *onn) {
+    const char *slash;
+    size_t a, b;
+    if (!ins || !ins[0]) return 0;
+    slash = strchr(ins, '/');
+    if (!slash || slash == ins || !slash[1]) return 0;
+    a = (size_t)(slash - ins);
+    b = strlen(slash + 1);
+    if (!a || a != b) return 0;
+    if (off) *off = ins;
+    if (offn) *offn = a;
+    if (on) *on = slash + 1;
+    if (onn) *onn = b;
+    return 1;
+}
+
 /* Derived: arity plus “this rule can transform” (`insert` / `wrap` / lit
  * span). Not stored on the rule or the run. */
 static int rtx_tm_apply_kind(const RtxTmRule *r) {
@@ -1586,6 +1605,8 @@ static int rtx_tm_apply_kind(const RtxTmRule *r) {
         return RTX_APPLY_PREFIX;
     if (ar == (unsigned)RTX_ARITY_PATH && !(r->mark & RTX_MARK_DEST))
         return RTX_APPLY_PATH;
+    if (rtx_apply_toggle_parts(r->sc_insert, NULL, NULL, NULL, NULL))
+        return RTX_APPLY_TOGGLE;
     if (r->sc_wrap) return RTX_APPLY_PAIR;
     if (r->op == RTX_TM_LIT_SPAN && r->a && r->b && r->alen && r->blen)
         return RTX_APPLY_PAIR;
@@ -2202,6 +2223,51 @@ static int rtx_doc_path_hit(const RtxDoc *d, size_t off) {
     return RtxDoc_path_at(d, off, NULL, NULL, NULL, NULL);
 }
 
+static const RtxRun *rtx_doc_toggle_run(const RtxDoc *d, const RtxTmRule *want) {
+    const RtxRun *r, *pre;
+    const RtxTmRt *rt;
+    size_t i, box;
+    r = rtx_doc_pair_apply_sel(d, want);
+    if (r) return r;
+    if (!d) return NULL;
+    pre = rtx_doc_line_prefix(d, d->caret);
+    if (!pre) return NULL;
+    box = pre->start + pre->hint_a;
+    rt = rtx_doc_tm(d);
+    i = rtx_doc_run_first(d, box);
+    for (; i < d->runs.len && d->runs.data[i].start <= box; i++) {
+        r = &d->runs.data[i];
+        if (r->start != box) continue;
+        if (rtx_run_apply_match(rt, want, r)) return r;
+    }
+    return NULL;
+}
+
+static void !>(CCError) rtx_doc_apply_toggle(RtxDoc *d, const RtxTmRule *rule) {
+    const RtxRun *r;
+    const char *off, *on;
+    size_t offn, onn, n, got;
+    char cur[16];
+    int is_on;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (!d || !rtx_apply_toggle_parts(rule ? rule->sc_insert : NULL, &off, &offn,
+                                      &on, &onn))
+        return cc_ok();
+    r = rtx_doc_toggle_run(d, rule);
+    if (!r) return cc_ok();
+    n = r->len;
+    if (n != offn || n != onn || n >= sizeof(cur)) return cc_ok();
+    got = d->read_at(r->start, cur, n) !>;
+    if (got != n) return cc_err(CC_ERR_INTERNAL, "toggle read");
+    is_on = memcmp(cur, on, n) == 0;
+    if (!is_on && n >= 2 && (cur[1] == 'x' || cur[1] == 'X')) is_on = 1;
+    d->replace(r->start, n, cc_slice_from_buffer((void *)(is_on ? off : on), n)) !>;
+    rtx_doc_apply_caret(d, r->start, r->start);
+    return cc_ok();
+}
+
 void !>(CCError) RtxDoc_apply_named(RtxDoc *d, const char *name) {
     const RtxTmRule *rule;
     const RtxRun *pr;
@@ -2233,6 +2299,7 @@ void !>(CCError) RtxDoc_apply_named(RtxDoc *d, const char *name) {
             return d->path_unwrap(hi - 1);
         return rtx_doc_apply_wrap_path(d);
     }
+    if (kind == RTX_APPLY_TOGGLE) return rtx_doc_apply_toggle(d, rule);
     pr = rtx_doc_pair_apply_sel(d, rule);
     if (pr) return rtx_doc_apply_unwrap_pair(d, pr);
     return rtx_doc_apply_wrap_pair(d, rule);
@@ -2651,6 +2718,10 @@ static int rtx_tm_add(RtxDoc *d, size_t start, size_t end, size_t emit_from,
     } else if (rule && rtx_tm_prefix(rule) && end > start) {
         ha = end - start;
         hb = 0;
+    } else if (rule && rtx_tm_apply_kind(rule) == RTX_APPLY_TOGGLE &&
+               end > start) {
+        ha = end - start;
+        hb = 0;
     } else if (rule && (rule->mark & RTX_MARK_ARITY) == RTX_ARITY_PATH &&
                end > start &&
                (rule->op == RTX_TM_LIT_SPAN || rule->op == RTX_TM_LIT_LINE)) {
@@ -2856,12 +2927,16 @@ static int rtx_tm_try_rule(RtxTmWalkSt *W, const RtxTmRt *rt,
         }
     case RTX_TM_REGEX: {
         size_t e = 0;
+        if (rule->bol && !rtx_tm_at_vbol(W)) return 0;
         if (rule->has_cap) {
             RtxReCaps caps;
             int g;
             if (!rtx_re_match_caps(rule->a, rule->alen, buf, *W->i, n, &e, &caps)) {
                 return 0;
             }
+            if (rtx_tm_apply_kind(rule) == RTX_APPLY_TOGGLE &&
+                (e >= n || buf[e] != ' '))
+                return 0;
             {
                 size_t s = *W->i;
                 if (rtx_tm_prefix(rule)) {
@@ -2883,6 +2958,9 @@ static int rtx_tm_try_rule(RtxTmWalkSt *W, const RtxTmRt *rt,
             }
         } else {
             if (!rtx_re_match(rule->a, rule->alen, buf, *W->i, n, &e)) return 0;
+            if (rtx_tm_apply_kind(rule) == RTX_APPLY_TOGGLE &&
+                (e >= n || buf[e] != ' '))
+                return 0;
             {
                 size_t s = *W->i;
                 if (rtx_tm_prefix(rule)) {

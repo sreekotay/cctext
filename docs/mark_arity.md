@@ -32,7 +32,8 @@ are leftover for v1.
 |---|---|---|
 | ATX heading | Prefix span `#{1,6}[ \\t]*` … `\\n`, `arity: prefix`; trailing `[ \\t]+#+$` is a second prefix | Landed. Title is ordinary / inner-able. `hint_b = 0`. Setext leftover. |
 | Quote | Prefix span `[ \\t]{0,3}>([ \\t]*>)*[ \\t]*` … `\\n` | Landed. `bol` is virtual after an open prefix. List / heading are quote inners. Fence across quote lines leftover (`while`). |
-| List | Prefix spans `[-*+]` / `[0-9]{1,9}[.]` / `[0-9]{1,9}[)]` … `\\n` | Landed. Indent is not in the hint. `***` / `---` do not plant. Task boxes leftover. |
+| List | Prefix spans `[-*+]` / `[0-9]{1,9}[.]` / `[0-9]{1,9}[)]` … `\\n` | Landed. Indent is not in the hint. `***` / `---` do not plant. |
+| Task box | Match `\\[[ xX]\\]`, `apply: toggle`, `insert: "[ ]/[x]"` | Landed. 3-byte mark after the list prefix; trailing space required. `[X]` → `[ ]`. |
 | Pair marks | `begin`/`end` + `rtx_tm_add_span` `hint_a`/`hint_b` | Honest. Do not break. |
 | `replace_join` | Pair-only: a replace that touches a pair hint removes both hints. Prefix / path refuse partner union. | Landed. Rich-only; Source is plain `replace`. |
 | Reveal / snap | `RtxDoc_mark_at` = that run; backspace on a pair hint → `replace_join`; prefix opener → apply | Landed. Per-run reveal is why path is two runs, not one run + face id. |
@@ -69,9 +70,10 @@ four questions. A new key answers one of them.
 | Transform | `apply`, `insert`, `max` | What is the named unit algebra? |
 | Paint | `bold`, `italic`, `mono` (else scope map) | How does Rich paint? |
 
-`apply` kind is derived (arity + insert/wrap/lit). Do not store it.
-`insert` is a prefix unit today and also pair bookends (`<>` + `wrap`);
-split only if a third client appears. Do not put `apply` on the run.
+`apply` kind is derived (arity + insert/wrap/lit, or `off/on` in
+`insert`). Do not store it. `insert` is a prefix unit, pair bookends
+(`<>` + `wrap`), and toggle states (`[ ]/[x]`). Split only if a fourth
+client appears. Do not put `apply` on the run.
 
 | Key | Values | Plant |
 |---|---|---|
@@ -80,7 +82,7 @@ split only if a third client appears. Do not put `apply` on the run.
 | `lit` | `true` | Force `LIT_SPAN` when begin/end are regex metacharacters. |
 | `wrap` | `1`–`255` (or `true` = 1) | **Match** plants `hint_a = hint_b = N`. Spans use begin/end lengths. |
 | `apply` | toolbar name (`heading`, `bold`, …) | Does **not** plant. Grammar-local vocabulary. |
-| `insert` | literal unit (`#`, `>`, `- `) or wrap bookends (`<>`) | Prefix apply / Backspace demote, or pair wrap with `wrap`. Not the begin regex. |
+| `insert` | literal unit (`#`, `>`, `- `), wrap bookends (`<>`), or `off/on` (`[ ]/[x]`) | Prefix apply / Backspace demote, pair wrap with `wrap`, or toggle. Not the begin regex. |
 | `max` | 1–255 (0 → 1) | How many `insert` units stack. |
 
 `hint_b==0` is **not** arity. An unclosed pair at the window end is still
@@ -207,7 +209,7 @@ hit next).
 | # | Slice | State |
 |---|---|---|
 | 5 | MD table child | classify + paint / hit landed. Lookback / cell wrap leftover. Not an arity. |
-| **6** | Apply / toolbar | Prefix + pair named apply + rule id / toggle‑off **landed**. |
+| **6** | Apply / toolbar | Prefix + pair named apply + rule id / toggle‑off + `apply: toggle` **landed**. |
 | **6b** | Path faces | Two-run plant, dest hide, join refuse, unwrap, wrap `[sel]()` **landed**. |
 | 7 | Blocks as folds | Unchanged. Setext / heading regions wait here (or a later prefix client), not 6b |
 

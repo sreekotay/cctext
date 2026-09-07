@@ -35,12 +35,12 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Inline spans stay on one line: `"cctext": {"inline": true}` drops an unclosed span at EOL (opener is text, CommonMark unmatched delimiter); `"flank": true` rejects an opener before whitespace and a closer after it (`2 * 3` is plain). Bold / italic / code declare `inline`; bold / italic add `flank` | `RtxTmRule.inl` / `flank`, `rtx_tm_span_advance`, `markdown.tmLanguage.json` | done |
 | Fence + injection: `cctext.info` + `scopeName`; guest lex at depth 2; `RTX_RUN_INJECT`; nested `#italic` / `#bold` / `#code`; Python `"""` / `'''`; closer always first; `style_at` walk-back does not stop at a sibling | `RtxTmRule.info` / `embed_scope`, `rtx_tm_rt_for_scope`, `rtx_tm_lex`, `rtx_doc_run_first` | done; HTML `<script>`/`<style>` `RE_SPAN` landed |
 | Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; table classify smoke written |
-| MD table child: classify + fill-epoch geom; Rich aligns cells, hides `|`; TUI paints `│` rails and the sep as a `├─┼─┤` rule; GUI is a clipped stroked grid (pixel col widths, no box-drawing); Source stays raw; `x_of` / hit through cells; motion skips the rule; `|` and cell pad are not a caret landing (`rtx_layout_md_snap`) | `rtx_md_table_*`, `RtxLayout.md_*`, TUI/GUI paint | done this cut; no wrap inside a record; no lookback; no invented top/bottom box |
+| MD table child: classify + fill-epoch geom; Rich aligns cells, hides `|`; TUI paints `│` rails and the sep as a `├─┼─┤` rule; GUI is a clipped stroked grid (pixel col widths, no box-drawing); Source stays raw; `x_of` / hit through cells; motion skips the rule; `|` and cell pad are not a caret landing (`rtx_layout_md_snap`); classify is window + `RTX_MARKUP_LOOKBACK` so a header above the fill still keeps body rows as a table | `rtx_md_table_*`, `RtxLayout.md_*`, TUI/GUI paint | done this cut; no wrap inside a record; no invented top/bottom box |
 | TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
 | Mark arity (pair / prefix / path): headings and links share the lens, not the pair-join | [docs/mark_arity.md](mark_arity.md) | prefix + path two-run plant + named apply table landed |
 
-Not landed: `apply: toggle`, opaque renders, blocks‑as‑folds,
-table lookback / cell wrap, heredoc / lookaround regex spans. Rich hit‑test can still land
+Not landed: opaque renders, blocks‑as‑folds,
+cell wrap, heredoc / lookaround regex spans. Rich hit‑test can still land
 between the two bytes of a *revealed* `**` (the next motion snaps out);
 hidden hints are never a landing. `\*` escapes and `_` marks have no rule
 yet, so they paint as source.
@@ -165,8 +165,11 @@ motion, selection, delete, wrap and hit — motion post‑steps the way
   whitespace since an open prefix opener (stack, not planted runs).
   A quote line can therefore host a list / heading prefix. Fence that
   spans quote lines still needs `while`.
-- `- [ ]` ↔ `- [x]` is `apply: toggle` on a 5‑byte mark: one `replace`.
-  Toggle is a transform, not a fourth arity.
+- `- [ ]` ↔ `- [x]` is `apply: toggle` on a 3‑byte box (`[ ]` / `[x]` /
+  `[X]`), `insert: "[ ]/[x]"`: one `replace`. Kind is derived from the
+  slash in `insert` (not a sidecar kind, not a fourth arity). The box
+  is a list inner (`cctext.bol` after the prefix) and must be followed
+  by a space (`[x]no` is text). `[X]` toggles off to `[ ]`.
 - TUI: Esc-. then `1–9`. GUI: Apply menu / Cmd-1..9. Same table.
 - Children (tables, later math / image) are layout-epoch policy, not
   marks. Host GFM classify is leftover. Do not invent `arity: table`.
@@ -205,7 +208,7 @@ Locked shape (unchanged from the first cut):
 - Caret stays a byte offset; hit recurses; Tab may jump cell `lo` like
   `RtxBuf_move_grid_col`.
 - Classification is **window + `RTX_MARKUP_LOOKBACK`** only. A fence opened
-  above the lookback or a table cut by the window edge is a leftover
+  above the lookback or a table whose header is above the lookback is a leftover
   painted as text, never a wrong nest. No progressive MD index; line cover
   (`line_scan_off` / island) stays the only progressive index.
 
@@ -262,7 +265,7 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 2 | Style bits from sidecar or default scope map, copied at plant; `markdown.tmLanguage.json` declares `kind: markup`; prose scanner gated to PROSE sub‑ranges | **done** |
 | 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; reveal‑on‑entry; `rich` toggle key; TUI + GUI paint; atom step, unwrap, selection join rule | **done** |
 | 4 | Fence + injection: `cctext.bol` + `cctext.info`; `scopeName` / `rtx_tm_rt_for_scope()` / `rtx_tm_rt_for_info()`; depth‑2 guest lex; `RTX_RUN_INJECT`; nested inline marks; HTML `<script>`/`<style>` `RE_SPAN` | **done** |
-| 5 | MD table child | **done this cut**: classify, fill-epoch geom, `│` rails + sep rule chrome, aligned Rich paint / hit; Source raw. Lookback and cell wrap later |
+| 5 | MD table child | **done this cut**: classify, fill-epoch geom, `│` rails + sep rule chrome, aligned Rich paint / hit; Source raw; window + `RTX_MARKUP_LOOKBACK` classify. Cell wrap later |
 | 6 | Apply / toolbar via one `replace`; toggle‑off by rule id; prefix apply from `insert`/`max` | prefix + pair named apply + grammar table + rule id / toggle‑off **landed** |
 | 6b | Path faces: two runs (label + dest); dest hide; `replace_join` refuses dest↔label; unwrap keeps the label | two-run plant + dest hide + join refuse + unwrap + wrap **landed** |
 | 7 | Blocks as folds — after the three blockers above | |
@@ -283,7 +286,7 @@ geometry) once its wedge lands.
 | Nesting | Stack is live (wedge 4). Join stays pair-only; path is two runs |
 | Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX`. Table is the path grammar, not the caret. Kind is derived. Link unwrap is apply, not join |
 | Sidecar | One `cctext` object. Recognition (`bol` / `inline` / `flank` / `lit` / `info`) ≠ topology (`arity` / `face` / `wrap`) ≠ transform (`apply` / `insert` / `max`) ≠ paint (`bold` / `italic` / `mono`). A new key answers one of those. |
-| Leftover marks | Setext, reference links, images-as-opaque, `apply: toggle` |
+| Leftover marks | Setext, reference links, images-as-opaque |
 | Children | Layout‑epoch scratch, not an arity. Paint‑time recursion; window classify; leftover, never wrong |
 | Renders | Opaque vis row of height H; Scan‑table job; epoch cache; GUI only |
 | Derived values | Layout‑epoch, read‑only, one record in window |
