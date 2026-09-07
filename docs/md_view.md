@@ -37,7 +37,7 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; table classify smoke written |
 | MD table child: classify + fill-epoch geom; Rich aligns cells, hides `|`; TUI paints `│` rails and the sep as a `├─┼─┤` rule; GUI is a clipped stroked grid (pixel col widths, no box-drawing); Source stays raw; `x_of` / hit through cells; motion skips the rule; `|` and cell pad are not a caret landing (`rtx_layout_md_snap`) | `rtx_md_table_*`, `RtxLayout.md_*`, TUI/GUI paint | done this cut; no wrap inside a record; no lookback; no invented top/bottom box |
 | TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
-| Mark arity (pair / prefix / path): headings and links share the lens, not the pair-join | [docs/mark_arity.md](mark_arity.md) | prefix plant + named apply table this cut |
+| Mark arity (pair / prefix / path): headings and links share the lens, not the pair-join | [docs/mark_arity.md](mark_arity.md) | prefix plant + named apply table landed; path two-run plant leftover |
 
 Not landed: path wrap, `apply: toggle`, opaque renders, blocks‑as‑folds,
 table lookback / cell wrap, heredoc / lookaround regex spans. Rich hit‑test can still land
@@ -135,31 +135,41 @@ motion, selection, delete, wrap and hit — motion post‑steps the way
 
 ## Apply and toolbar
 
-- Rules tagged `apply: <name>` are enumerated by the host for the caret's
-  section from the active grammar — no hard‑coded Bold for MD.
+- The apply table is a **grammar property**, not a caret property.
+  `RtxDoc_apply_list` is unique `cctext.apply` names on the document's
+  path grammar (`rtx_tm_apply_list`). Untitled / no path → empty. The
+  bar is not filtered by “you are in a heading.” Each name does that
+  arity's verb at the caret, or no-ops. Hosts do not hard-code Bold.
+- Apply kind (`RTX_APPLY_PREFIX` / `PAIR` / `PATH`) is **derived**:
+  arity plus “this rule can transform” (`insert` / `wrap` / lit span).
+  Not a sidecar key, not stored on the run.
 - Apply = **one** `replace(lo, hi-lo, a + bytes + b)`: one hist record,
   no new primitive. Cap the selection at `RTX_HL_WIN_MAX` and refuse
   above (honest leftover) — the copy is the cost.
 - Toggle‑off finds the enclosing run by rule (planter + rule id on the run)
   and removes its hints. Pair: same unwrap as backspace on a hint. Prefix
-  / path: apply, not `replace_join`.
-- Prefix apply is grammar-driven: `apply` is the toolbar name, `insert`
-  is the unit (`#`, `>`, `- `), `max` is how many stack. Cycle the
-  prefix on this line, or insert the first prefix+insert rule. Hosts
-  do not hard-code heading / quote / list. Path unwrap is 6b.
+  / path: apply, not `replace_join`. Rule id on the run is leftover.
+- Prefix apply: `apply` is the toolbar name, `insert` is the unit
+  (`#`, `>`, `- `), `max` is how many stack. Cycle the prefix on this
+  line, or insert the first prefix+insert rule. Path unwrap is apply;
+  path wrap (two-run plant) is leftover. `link` stays on the bar for
+  unwrap only — do not grow host path special cases until the plant
+  is two runs.
 - Pair apply (bold / italic / code / autolink) uses the same name: wrap
   is `a + bytes + b` from begin/end, or from `wrap` + `insert` bookends
-  (`"<>"` + `wrap: 1`). Toggle-off unwraps the covering mark. Path
-  wrap (dest face) is leftover; the table still lists `link` for unwrap.
-- Hosts enumerate unique `apply` names (`rtx_tm_apply_list`). Cmd-.
-  (Ctrl-.) opens the on-screen apply menu; `1–9` picks. Cmd-1..9
-  applies directly. Shift-Cmd-H stays prefix cycle.
+  (`"<>"` + `wrap: 1`). Toggle-off unwraps the covering mark.
+- Cmd-. (Ctrl-.) opens the on-screen menu; `1–9` picks (cap 16 names,
+  nine digits). Cmd-1..9 applies directly. Shift-Cmd-H is prefix cycle
+  (`CMD_APPLY` / `KEY_APPLY`), not a heading verb.
 - `cctext.bol` is the content-line start: physical BOL, or only
   whitespace since an open prefix opener (stack, not planted runs).
   A quote line can therefore host a list / heading prefix. Fence that
   spans quote lines still needs `while`.
 - `- [ ]` ↔ `- [x]` is `apply: toggle` on a 5‑byte mark: one `replace`.
+  Toggle is a transform, not a fourth arity.
 - TUI: Esc-. then `1–9`. GUI: Apply menu / Cmd-1..9. Same table.
+- Children (tables, later math / image) are layout-epoch policy, not
+  marks. Host GFM classify is leftover. Do not invent `arity: table`.
 
 ## Code embeds and injection
 
@@ -253,8 +263,8 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; reveal‑on‑entry; `rich` toggle key; TUI + GUI paint; atom step, unwrap, selection join rule | **done** |
 | 4 | Fence + injection: `cctext.bol` + `cctext.info`; `scopeName` / `rtx_tm_rt_for_scope()` / `rtx_tm_rt_for_info()`; depth‑2 guest lex; `RTX_RUN_INJECT`; nested inline marks; HTML `<script>`/`<style>` `RE_SPAN` | **done** |
 | 5 | MD table child | **done this cut**: classify, fill-epoch geom, `│` rails + sep rule chrome, aligned Rich paint / hit; Source raw. Lookback and cell wrap later |
-| 6 | Apply / toolbar via one `replace`; toggle‑off by rule id; prefix apply from `insert`/`max` | prefix + pair named apply + grammar table **this cut**; toggle‑off by rule id leftover |
-| 6b | Path faces: two runs (label + dest); dest hide; `replace_join` refuses dest↔label; unwrap keeps the label | **done this cut** (wrap / toolbar still 6) |
+| 6 | Apply / toolbar via one `replace`; toggle‑off by rule id; prefix apply from `insert`/`max` | prefix + pair named apply + grammar table **landed**; toggle‑off by rule id leftover |
+| 6b | Path faces: two runs (label + dest); dest hide; `replace_join` refuses dest↔label; unwrap keeps the label | unwrap + join refuse **landed**; two-run plant / wrap leftover |
 | 7 | Blocks as folds — after the three blockers above | |
 
 Smokes come from the fixtures: each README row under `testdata/rich/*` is
@@ -271,9 +281,10 @@ geometry) once its wedge lands.
 | Hints | Literal begin/end byte counts on the run; layout‑time skip gated on `has_marks`; per‑pane `rich` bit, never OR'd into `view` |
 | Atoms | Pair join is DESIGN Encoding (one content, two hints). Prefix / path extend it ([mark_arity.md](mark_arity.md)); dest never in label `hint_b`; no face id on `RtxRun` |
 | Nesting | Stack is live (wedge 4). Join stays pair-only; path is two runs |
-| Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX`. Named apply from the grammar table; link unwrap is apply, not join |
-| Leftover marks | Setext, reference links, images-as-opaque, path wrap, `apply: toggle` |
-| Children | Layout‑epoch scratch; paint‑time recursion; window + lookback classify; leftover, never wrong |
+| Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX`. Table is the path grammar, not the caret. Kind is derived. Link unwrap is apply, not join |
+| Sidecar | One `cctext` object. Recognition (`bol` / `inline` / `flank` / `lit` / `info`) ≠ topology (`arity` / `face` / `wrap`) ≠ transform (`apply` / `insert` / `max`) ≠ paint (`bold` / `italic` / `mono`). A new key answers one of those. |
+| Leftover marks | Setext, reference links, images-as-opaque, path two-run plant / wrap, `apply: toggle`, rule id on the run |
+| Children | Layout‑epoch scratch, not an arity. Paint‑time recursion; window classify; leftover, never wrong |
 | Renders | Opaque vis row of height H; Scan‑table job; epoch cache; GUI only |
 | Derived values | Layout‑epoch, read‑only, one record in window |
 | Grid / hex | Untouched by `rich` |

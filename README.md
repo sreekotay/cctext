@@ -17,22 +17,23 @@ Unpack a [release](https://github.com/sreekotay/cctext/releases) (no compiler) a
 ```bash
 tar -xzf cctext-macos-arm64.tar.gz
 ./cctext-macos-arm64/cctext --version
-./cctext-macos-arm64/cctext            # file browser
+./cctext-macos-arm64/cctext            # file browser (cwd)
+./cctext-macos-arm64/cctext .          # file browser in that directory
 ./cctext-macos-arm64/cctext file.txt   # missing path asks to create
-./cctext-macos-arm64/cctext-gui file.txt
+./cctext-macos-arm64/cctext-gui .      # same browser, Cocoa window
 ```
 
-From source: `./make.shcc @cctext` then `./bin/cctext` or `./bin/cctext file.txt`. `-h` / `--help` lists options; `-v` / `--version` prints `cctext 0.1`; `--no-blink` keeps a solid caret; `--backup` saves in place (keeps a symlink) and writes a dirty-span `path~` first; `--stats-json` prints the Esc/= engine stats as JSON on exit; `--batch` runs `-c` commands or a stdin script with no TTY (Safe journals off unless `--safe`). Save refuses if the opened file changed on disk (mtime + size + inode); the TUI/GUI asks overwrite / cancel. `--batch` save fails with `file changed on disk`.
+From source: `./make.shcc @cctext` then `./bin/cctext`, `./bin/cctext .`, or `./bin/cctext file.txt`. `-h` / `--help` lists options; `-v` / `--version` prints `cctext 0.1`; `--no-blink` keeps a solid caret; `--backup` saves in place (keeps a symlink) and writes a dirty-span `path~` first; `--stats-json` prints the Esc/= engine stats as JSON on exit; `--batch` runs `-c` commands or a stdin script with no TTY (Safe journals off unless `--safe`). Save refuses if the opened file changed on disk (mtime + size + inode); the TUI/GUI asks overwrite / cancel. `--batch` save fails with `file changed on disk`.
 
 ## Features
 
 - **Fast on huge files.** An 8 GiB open is 0.005 ms; first-screen scroll is 0.039 ms; `g 50%` is 0.005 ms. The body stays on disk (page store). The line cache is a growing prefix plus 32 pins at 1/32 file fractions — not a full-file index. Numbers, including syntax highlight: [Perf](#perf).
-- **Small.** Release `cctext` is 471 KiB. Open RSS is ~1.5 MiB on 3 MiB and on 8 GiB.
+- **Small.** Release `cctext` is 610 KiB on macOS (726 KiB on Linux). `cctext-gui` is 654 KiB. Open RSS is ~1.5 MiB on 3 MiB and on 8 GiB.
 - **UTF-8.** Caret, wrap, hit-test, and backspace walk UAX #29 extended grapheme clusters (ZWJ emoji, flags, combining marks). Hex stays a byte camera.
 - **TUI and GUI.** Same document core: **cctext** (POSIX console) and **cctext-gui** (Cocoa + Core Text).
 - **Hex / grid.** `Ctrl-L` cycles default → wrap → hex (offset | hex | UTF-8 dump) → grid (CSV/TSV/pipe columns).
 - **Multiview.** Several files, splits, two cameras on one document. Unlock (`Ctrl-U`) lets a pane scroll off the caret.
-- **File browser.** No filename opens it. `b` / `Ctrl-B` opens the listing into the focused view; `o` / `Ctrl-O` does the same. In the GUI, **File → Browse** is ⌘B (⌘O aliases it); **File → Open…** is the system dialog with no shortcut. The listing sits on the left; when the pane is wide enough the selection opens on the right as the same document core — recovered journal, camera, and view. See [Browse preview](#browse-preview). Click the preview or its byte-rail to open the file. In the browser, `Ctrl-O` / `Cmd-O` launches this frontend on the selection; `e` / `Ctrl-E` launches the other (`cctext` ↔ `cctext-gui`). A new **cctext** opens in the host terminal (Cursor when you launched from there; iTerm or Terminal.app otherwise). **cctext-gui** is a window, not a terminal. The current folder (not `..`) sizes itself with a pumped walk — the total counts up, pauses if you leave, and resumes when you return. Enter still opens in this instance. A missing path asks to create an empty file.
+- **File browser.** No filename opens it in the cwd. A directory argument (`cctext .`, `cctext-gui testdata`) opens browse there — not the directory as a file. `b` / `Ctrl-B` opens the listing into the focused view; `o` / `Ctrl-O` does the same. In the GUI, **File → Browse** is ⌘B (⌘O aliases it); **File → Open…** is the system dialog with no shortcut. The listing sits on the left; when the pane is wide enough the selection opens on the right as the same document core — recovered journal, camera, and view. See [Browse preview](#browse-preview). Click the preview or its byte-rail to open the file. In the browser, `Ctrl-O` / `Cmd-O` launches this frontend on the selection; `e` / `Ctrl-E` launches the other (`cctext` ↔ `cctext-gui`). A new **cctext** opens in the host terminal (Cursor when you launched from there; iTerm or Terminal.app otherwise). **cctext-gui** is a window, not a terminal. The current folder (not `..`) sizes itself with a pumped walk — the total counts up, pauses if you leave, and resumes when you return. Enter still opens in this instance. A missing path asks to create an empty file.
 - **Deep search.** Typing a fragment filters this directory first, then a `> Flattened search` row and nested matches append below. `>` skips the local listing and flattens immediately. A fragment is case-insensitive; `*.txt` is a real glob and stays a local listing so you can still walk directories.
 - **TextMate grammars.** Drop any `.tmLanguage.json` into `grammars/` (or `RTX_GRAMMARS`) — loaded live, no rebuild. Window lex, not a full-file pass. Shipped: C/CC, JSON, Markdown, CSS, CSV/TSV/pipe, HTML, YAML, shell, Python, JS/TS.
 - **Marks and folds.** `Ctrl-K/P` steps highlight marks already in the window (`Ctrl-E/R` for `invalid`). `Ctrl-T` folds a heading or a `{}`/`[]`/`()` pair whose other end is within a page of the caret (256KiB analysis page, plus one neighbor). The matching pair is painted while the caret sits in it. No scan, no AST.
@@ -132,6 +133,8 @@ Recipes live in `make.shcc` (`ccc --as=shcc`). There is no Makefile.
 ./bin/cctext --batch testdata/small.txt -c 'goto 50%' -c 'print 2' -c 'stats-json'
 ./bin/cctext --batch testdata/small.txt < testdata/batch/smoke.ops
 ./bin/cctext testdata/mixed.txt testdata/small.txt
+./bin/cctext .                     # browse this directory
+./bin/cctext-gui testdata          # browse testdata
 ./bin/cctext --no-blink --backup --wrap testdata/wrap.txt --hex testdata/mixed.txt --grid testdata/grid_rfc.csv
 ./bin/cctext-gui --view=hex testdata/generated/large.txt
 # ./bin/cctext-gui testdata/generated/large_8G.txt
@@ -156,7 +159,8 @@ Unpack and run in place. Grammars load from `./grammars` next to the binary. On 
 tar -xzf cctext-macos-arm64.tar.gz
 ./cctext-macos-arm64/cctext file.txt
 ./cctext-macos-arm64/cctext --wrap file.txt
-./cctext-macos-arm64/cctext-gui file.txt
+./cctext-macos-arm64/cctext .
+./cctext-macos-arm64/cctext-gui .
 ```
 
 Local tarball (same layout, current machine):
@@ -191,7 +195,7 @@ Release, best of 5, each op from a fresh `from_path`. Times include syntax highl
 
 All tests are with syntax highlighting fully active.
 
-`perf_matrix_smoke` 270.1 KiB · `cctext` 470.6 KiB
+`cctext` 610.2 KiB · `cctext-gui` 653.6 KiB (cctext-v0.1.45)
 
 | | 3M text | 8G text | 2G JSON |
 |---|---:|---:|---:|
