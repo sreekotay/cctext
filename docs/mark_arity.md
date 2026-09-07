@@ -5,10 +5,10 @@ bit; leftover, never a wrong nest). **Not** the same mark shape. DESIGN
 Encoding’s join rule is for a pair with one content. Headings and links
 are not that.
 
-This note locks arity. Prefix plant and named apply are in. Path
-**unwrap** is in; the two-run **plant** is leftover — do not grow host
-path special cases until that plant exists. Fold is a third axis
-(wedge 7). Do not reopen the three arities; do not add a fourth.
+This note locks arity. Prefix plant and named apply are in. Path is
+two runs (label + dest); unwrap, wrap, dest hide, and join-refuse are
+in. Fold is a third axis (wedge 7). Do not reopen the three arities;
+do not add a fourth.
 Toggle is a transform (`apply: toggle`), not an arity. Children
 (tables, later math / image) are layout-epoch policy, not marks.
 
@@ -36,7 +36,7 @@ are leftover for v1.
 | Pair marks | `begin`/`end` + `rtx_tm_add_span` `hint_a`/`hint_b` | Honest. Do not break. |
 | `replace_join` | Pair-only: a replace that touches a pair hint removes both hints. Prefix / path refuse partner union. | Landed. Rich-only; Source is plain `replace`. |
 | Reveal / snap | `RtxDoc_mark_at` = that run; backspace on a pair hint → `replace_join`; prefix opener → apply | Landed. Per-run reveal is why path is two runs, not one run + face id. |
-| Inline link | `match` `\\[[^\\]]+\\]\\([^)]+\\)` (`link`) | **Wrong plant.** One run; dest sits in the same run. Unwrap is apply; wrap / two-run plant leftover. `[^]]+` **cannot** nest `` `code` `` in the label. |
+| Inline link | Two spans: label `begin` `[` `end` `](`; dest `begin` `](` `end` `)` | Landed. Label `hint_a='['` `hint_b=0`; dest `hint_a=']('` `hint_b=')'`. Glue: label closer starts dest. Inners on the label. Wrap is `[sel]()`. |
 
 `rtx_tm_add` on `RTX_TM_REGEX` / `LIT_LINE` plants `hint_a=hint_b=0`.
 Captures get scope, not hints (`document.ccs` regex cap loop).
@@ -207,8 +207,8 @@ hit next).
 | # | Slice | State |
 |---|---|---|
 | 5 | MD table child | classify + paint / hit landed. Lookback / cell wrap leftover. Not an arity. |
-| **6** | Apply / toolbar | Prefix + pair named apply from the grammar table **landed**. Path wrap leftover. |
-| **6b** | Path faces | Unwrap + join refuse **landed**. Two-run plant leftover — freeze more path host code until that plant exists. |
+| **6** | Apply / toolbar | Prefix + pair named apply from the grammar table **landed**. |
+| **6b** | Path faces | Two-run plant, dest hide, join refuse, unwrap, wrap `[sel]()` **landed**. |
 | 7 | Blocks as folds | Unchanged. Setext / heading regions wait here (or a later prefix client), not 6b |
 
 ## Zero cost
@@ -260,7 +260,7 @@ Parent lifts; do not rewrite those files here.
 - Hints / Source / Rich table: prefix row (backspace = apply); path row
   (reveal is per face; dest content hidden until entered).
 - Apply: named apply from the **path grammar** (`RtxDoc_apply_list`);
-  not caret-filtered. Path wrap leftover.
+  not caret-filtered. Path wrap is `[sel]()` on the two-run plant.
 - Encoding pointer: pair sentence stays; one line that prefix / path
   extend it — this file.
 - Wedge table: 6 first client heading; **6b** path faces; 5 and 7

@@ -37,9 +37,9 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; table classify smoke written |
 | MD table child: classify + fill-epoch geom; Rich aligns cells, hides `|`; TUI paints `│` rails and the sep as a `├─┼─┤` rule; GUI is a clipped stroked grid (pixel col widths, no box-drawing); Source stays raw; `x_of` / hit through cells; motion skips the rule; `|` and cell pad are not a caret landing (`rtx_layout_md_snap`) | `rtx_md_table_*`, `RtxLayout.md_*`, TUI/GUI paint | done this cut; no wrap inside a record; no lookback; no invented top/bottom box |
 | TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
-| Mark arity (pair / prefix / path): headings and links share the lens, not the pair-join | [docs/mark_arity.md](mark_arity.md) | prefix plant + named apply table landed; path two-run plant leftover |
+| Mark arity (pair / prefix / path): headings and links share the lens, not the pair-join | [docs/mark_arity.md](mark_arity.md) | prefix + path two-run plant + named apply table landed |
 
-Not landed: path wrap, `apply: toggle`, opaque renders, blocks‑as‑folds,
+Not landed: `apply: toggle`, opaque renders, blocks‑as‑folds,
 table lookback / cell wrap, heredoc / lookaround regex spans. Rich hit‑test can still land
 between the two bytes of a *revealed* `**` (the next motion snaps out);
 hidden hints are never a landing. `\*` escapes and `_` marks have no rule
@@ -152,9 +152,8 @@ motion, selection, delete, wrap and hit — motion post‑steps the way
 - Prefix apply: `apply` is the toolbar name, `insert` is the unit
   (`#`, `>`, `- `), `max` is how many stack. Cycle the prefix on this
   line, or insert the first prefix+insert rule. Path unwrap is apply;
-  path wrap (two-run plant) is leftover. `link` stays on the bar for
-  unwrap only — do not grow host path special cases until the plant
-  is two runs.
+  path wrap is `[sel]()` (dest empty; caret in dest). `link` on the
+  bar does both.
 - Pair apply (bold / italic / code / autolink) uses the same name: wrap
   is `a + bytes + b` from begin/end, or from `wrap` + `insert` bookends
   (`"<>"` + `wrap: 1`). Toggle-off unwraps the covering mark.
@@ -264,7 +263,7 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 4 | Fence + injection: `cctext.bol` + `cctext.info`; `scopeName` / `rtx_tm_rt_for_scope()` / `rtx_tm_rt_for_info()`; depth‑2 guest lex; `RTX_RUN_INJECT`; nested inline marks; HTML `<script>`/`<style>` `RE_SPAN` | **done** |
 | 5 | MD table child | **done this cut**: classify, fill-epoch geom, `│` rails + sep rule chrome, aligned Rich paint / hit; Source raw. Lookback and cell wrap later |
 | 6 | Apply / toolbar via one `replace`; toggle‑off by rule id; prefix apply from `insert`/`max` | prefix + pair named apply + grammar table **landed**; toggle‑off by rule id leftover |
-| 6b | Path faces: two runs (label + dest); dest hide; `replace_join` refuses dest↔label; unwrap keeps the label | unwrap + join refuse **landed**; two-run plant / wrap leftover |
+| 6b | Path faces: two runs (label + dest); dest hide; `replace_join` refuses dest↔label; unwrap keeps the label | two-run plant + dest hide + join refuse + unwrap + wrap **landed** |
 | 7 | Blocks as folds — after the three blockers above | |
 
 Smokes come from the fixtures: each README row under `testdata/rich/*` is
@@ -283,7 +282,7 @@ geometry) once its wedge lands.
 | Nesting | Stack is live (wedge 4). Join stays pair-only; path is two runs |
 | Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX`. Table is the path grammar, not the caret. Kind is derived. Link unwrap is apply, not join |
 | Sidecar | One `cctext` object. Recognition (`bol` / `inline` / `flank` / `lit` / `info`) ≠ topology (`arity` / `face` / `wrap`) ≠ transform (`apply` / `insert` / `max`) ≠ paint (`bold` / `italic` / `mono`). A new key answers one of those. |
-| Leftover marks | Setext, reference links, images-as-opaque, path two-run plant / wrap, `apply: toggle`, rule id on the run |
+| Leftover marks | Setext, reference links, images-as-opaque, `apply: toggle`, rule id on the run |
 | Children | Layout‑epoch scratch, not an arity. Paint‑time recursion; window classify; leftover, never wrong |
 | Renders | Opaque vis row of height H; Scan‑table job; epoch cache; GUI only |
 | Derived values | Layout‑epoch, read‑only, one record in window |
