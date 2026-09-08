@@ -152,6 +152,7 @@ static void gui_menu_build(void) {
     viewItem.title = @"View";
     [mainMenu addItem:viewItem];
     gui_menu_add(viewMenu, @"Cycle View", @"l", (int)cmd, CMD_VIEW);
+    gui_menu_add(viewMenu, @"Wrap", @"m", (int)cmdshift, CMD_WRAP);
     gui_menu_add(viewMenu, @"Rich / Source", @"d", (int)cmd, CMD_RICH);
     gui_menu_add(viewMenu, @"Follow Caret", @"u", (int)cmd, CMD_FOLLOW);
     gui_menu_add(viewMenu, @"Split", @"\\", (int)cmd, CMD_SPLIT);
@@ -229,6 +230,7 @@ static int map_keycode(unsigned short kc) {
     case 0x26: return KEY_J;
     case 0x28: return KEY_K;
     case 0x25: return KEY_L;
+    case 0x2E: return KEY_M;
     case 0x2D: return KEY_N;
     case 0x1F: return KEY_O;
     case 0x23: return KEY_P;

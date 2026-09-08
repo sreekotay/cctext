@@ -32,6 +32,7 @@ enum {
     CMD_FOLD,
     CMD_STATS,
     CMD_RICH, /* markup lens: Source / Rich per pane */
+    CMD_WRAP, /* soft wrap on / off per pane */
     CMD_APPLY,      /* cycle the first prefix apply on this line / off */
     CMD_APPLY_NAMED, /* toolbar / help digit: name from the grammar table */
     CMD_APPLY_MENU   /* toggle the on-screen apply palette */

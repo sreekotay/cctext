@@ -1,5 +1,5 @@
 /*
- * Spike: pure Cocoa + Core Text (no Fenster buffer, no Raylib).
+ * Spike: Cocoa + Core Text (no Fenster buffer).
  *
  *   clang -O2 -fobjc-arc proto/cocoa_ct.m \
  *     -framework Cocoa -framework CoreText -framework CoreGraphics \
@@ -170,7 +170,7 @@ static void ct_draw(CGContextRef ctx, CTFontRef font, CGColorRef color,
     ct_draw(ctx, prose, fg, "The quick brown fox jumps over the lazy dog.", 16, 230);
     ct_draw(ctx, mono, dim, "cluster (e + combining acute):", 16, 280);
     ct_draw(ctx, mono, fg, "cafe\xCC\x81  (cafe + U+0301)", 16, 308);
-    ct_draw(ctx, mono, dim, "Compare footprint to fenster_ct / empty Raylib.", 16, 380);
+    ct_draw(ctx, mono, dim, "Compare footprint to fenster_ct.", 16, 380);
 
     CFRelease(mono);
     CFRelease(prose);

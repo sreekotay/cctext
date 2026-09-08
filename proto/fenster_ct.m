@@ -1,6 +1,6 @@
 /*
  * Spike: Fenster presents one CPU buffer; Core Text draws into it.
- * No document core. Goal: native-looking text + sane footprint vs Raylib.
+ * No document core. Native-looking text + a small footprint.
  *
  *   clang -O2 -ObjC proto/fenster_ct.m -Ithird_party \
  *     -framework Cocoa -framework CoreText -framework CoreGraphics \
@@ -163,7 +163,7 @@ static void paint(void) {
     draw_text(ctx, mono, fg, "cafe\xCC\x81  (cafe + U+0301)", 16, 308);
 
     draw_text(ctx, mono, dim,
-              "If this looks like system text and footprint is << Raylib, port.",
+              "If this looks like system text, port.",
               16, 380);
 
     CFRelease(mono);

@@ -47,6 +47,7 @@ static void rtx_ws_cam_from_buf(const RtxBuf *b, RtxSafeCam *c) {
     c->seek_valid = b->seek_valid;
     c->view = b->layout.view;
     c->rich = b->layout.rich;
+    c->wrap = b->layout.wrap;
     c->hex_nib = b->hex_nib;
     c->unlock = b->unlock;
     c->pin_view = b->pin_view;
@@ -77,6 +78,7 @@ static void rtx_ws_cam_to_buf(RtxBuf *b, const RtxSafeCam *c) {
     b->seek_valid = c->seek_valid;
     rtx_layout_set_view(&b->layout, c->view);
     b->layout.rich = c->rich;
+    b->layout.wrap = c->wrap;
     rtx_buf_grid_bind(b);
     b->hex_nib = c->hex_nib;
     b->unlock = c->unlock;
@@ -143,6 +145,8 @@ static uint64_t rtx_ws_safe_sig(const RtxBuf *b) {
     h ^= (uint64_t)b->doc.tree.mark_line; h *= 1099511628211ull;
     h ^= (uint64_t)b->doc.tree.mark_off; h *= 1099511628211ull;
     h ^= (uint64_t)b->layout.view; h *= 1099511628211ull;
+    h ^= (uint64_t)b->layout.wrap; h *= 1099511628211ull;
+    h ^= (uint64_t)b->layout.rich; h *= 1099511628211ull;
     h ^= (uint64_t)b->hex_nib; h *= 1099511628211ull;
     h ^= (uint64_t)b->unlock; h *= 1099511628211ull;
     h ^= (uint64_t)b->pin_view; h *= 1099511628211ull;
@@ -166,6 +170,8 @@ static void rtx_ws_safe_note(RtxBuf *b) {
     b->safe_mark = rtx_line_mark_ok(&b->doc.tree);
     b->safe_mline = b->doc.tree.mark_line;
     b->safe_view = b->layout.view;
+    b->safe_wrap = b->layout.wrap;
+    b->safe_rich = b->layout.rich;
     b->safe_nib = b->hex_nib;
     b->safe_unlock = b->unlock;
     b->safe_pin = b->pin_view;
@@ -196,7 +202,8 @@ static int rtx_ws_safe_stale(const RtxBuf *b) {
         b->safe_mline != b->doc.tree.mark_line ||
         b->safe_moff != b->doc.tree.mark_off)
         return 1;
-    if (b->safe_view != b->layout.view || b->safe_nib != b->hex_nib ||
+    if (b->safe_view != b->layout.view || b->safe_wrap != b->layout.wrap ||
+        b->safe_rich != b->layout.rich || b->safe_nib != b->hex_nib ||
         b->safe_unlock != b->unlock || b->safe_pin != b->pin_view)
         return 1;
     return 0;
@@ -561,6 +568,8 @@ void !>(CCError) RtxWs_add_empty(RtxWs *w) {
     *b = (RtxBuf){0};
     b->doc.empty() !>(e) { return cc_err(e); };
     b->doc.tree.busy_bind(w->busy_fn, w->busy_ctx);
+    b->layout.rich = 1;
+    b->layout.wrap = 1;
     w->len++;
     return cc_ok();
 }
@@ -1936,8 +1945,44 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
         rtx_buf_origin_from_row(b, ri);
         return cc_ok();
     }
-    if (ri < b->top_wrap + (size_t)vis) return cc_ok();
-    rtx_buf_origin_from_row(b, ri + 1 - (size_t)vis);
+    {
+        size_t screen = 0;
+        size_t i;
+        int rh;
+        for (i = b->top_wrap; i < ri && i < b->layout.rows.len; i++) {
+            int h = (int)(b->layout.rows.data[i].height + 0.0001);
+            if (h < 1) h = 1;
+            screen += (size_t)h;
+        }
+        rh = 1;
+        if (ri < b->layout.rows.len) {
+            rh = (int)(b->layout.rows.data[ri].height + 0.0001);
+            if (rh < 1) rh = 1;
+        }
+        /* Row starts on-screen (may spill past the bottom). */
+        if (screen < (size_t)vis) return cc_ok();
+        (void)rh;
+    }
+    {
+        /* Scroll so `ri` sits near the bottom of the pane by screen height. */
+        size_t screen = 0;
+        size_t i = ri < b->layout.rows.len ? ri : b->layout.rows.len - 1;
+        int h = (int)(b->layout.rows.data[i].height + 0.0001);
+        if (h < 1) h = 1;
+        screen = (size_t)h;
+        while (i > 0 && screen < (size_t)vis) {
+            int nh;
+            i--;
+            nh = (int)(b->layout.rows.data[i].height + 0.0001);
+            if (nh < 1) nh = 1;
+            if (screen + (size_t)nh > (size_t)vis && screen > 0) {
+                i++;
+                break;
+            }
+            screen += (size_t)nh;
+        }
+        rtx_buf_origin_from_row(b, i);
+    }
     return cc_ok();
 }
 
@@ -1986,6 +2031,17 @@ void RtxBuf_toggle_rich(RtxBuf *b) {
     b->layout.rich = !b->layout.rich;
     b->layout.reveal_lo = b->layout.reveal_hi = 0;
     b->layout.clear_rows();
+}
+
+void RtxBuf_toggle_wrap(RtxBuf *b) {
+    if (!b) return;
+    if (rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout))
+        return;
+    b->layout.wrap = !b->layout.wrap;
+    b->left_col = 0;
+    b->top_wrap = 0;
+    b->layout.clear_rows();
+    rtx_ws_flush_buf(b);
 }
 
 void !>(CCError) RtxBuf_apply_set(RtxBuf *b, const char *name, int level) {
@@ -2167,7 +2223,7 @@ void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double width,
         rtx_buf_fold_skip_cam(b, dir) !>;
         return cc_ok();
     }
-    if (b->layout.view != RTX_VIEW_WRAP) {
+    if (!b->layout.wrap) {
         b->top_wrap = 0;
         if (dir < 0 && b->top > 0) b->top--;
         if (dir > 0 && b->top + 1 < nlines) b->top++;
@@ -2415,6 +2471,9 @@ void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int 
     nlines = b->line_count();
     if (b->top >= nlines && nlines) b->top = nlines - 1;
     want = (size_t)vis + 8;
+    /* Tall MD wrap rows consume multiple screen slots; fill extra vis rows. */
+    if (rtx_layout_soft_wrap(&b->layout) && b->layout.rich)
+        want = (size_t)vis * 3 + 8;
     avail = (b->top < nlines) ? (nlines - b->top) : 0;
     need = want < avail ? want : avail;
     if (b->layout_width != width || b->layout.from_line != b->top ||
@@ -2834,6 +2893,19 @@ void RtxWs_browse_prev_cycle(RtxWs *w, int pane) {
     p->fill_view = -1;
 }
 
+void RtxWs_browse_prev_toggle_wrap(RtxWs *w, int pane) {
+    RtxBrowsePrev *p;
+    if (!w || pane < 0 || pane > 1) return;
+    p = &w->prev[pane];
+    if (!p->live) return;
+    if (rtx_layout_is_hex(&p->layout) || rtx_layout_is_grid(&p->layout))
+        return;
+    p->layout.wrap = !p->layout.wrap;
+    p->cam.left_col = 0;
+    p->cam.top_wrap = 0;
+    p->fill_view = -1;
+}
+
 static void !>(CCError) rtx_ws_prev_fill(RtxBrowsePrev *p, RtxMeasure *m,
                                         double width, int vis) {
     if (!p || !p->live) return cc_ok();
@@ -2912,6 +2984,7 @@ void !>(CCError) RtxWs_browse_prev_sync(RtxWs *w, int pane, RtxMeasure *m,
     rtx_safe_load(&p->doc, &p->cam);
     rtx_layout_set_view(&p->layout, p->cam.view);
     p->layout.rich = p->cam.rich;
+    p->layout.wrap = p->cam.wrap;
     p->live = 1;
     p->kind = RTX_BROWSE_PREV_FILE;
     return rtx_ws_prev_fill(p, m, width, vis);
@@ -3111,28 +3184,25 @@ int rtx_scroll_rail_mark_y(const RtxScrollRail *r, int track_h, size_t off) {
 }
 
 int rtx_buf_scroll_rel_row(const RtxBuf *b, int vis) {
-    size_t i, i0, i1;
+    size_t i, i0;
     size_t caret;
+    size_t screen = 0;
     if (!b || vis < 1 || !b->layout.rows.len) return 0;
     caret = b->doc.caret;
     i0 = b->top_wrap < b->layout.rows.len ? b->top_wrap : 0;
-    i1 = i0 + (size_t)vis;
-    if (i1 > b->layout.rows.len) i1 = b->layout.rows.len;
-    if (i1 <= i0) return 0;
     if (caret < b->layout.rows.data[i0].byte_start) return 0;
-    {
-        const RtxVisRow *last = &b->layout.rows.data[i1 - 1];
-        if (caret > last->byte_start + last->byte_len) {
-            return vis > 1 ? vis - 1 : 0;
-        }
-    }
-    for (i = i0; i < i1; i++) {
+    for (i = i0; i < b->layout.rows.len && screen < (size_t)vis; i++) {
         const RtxVisRow *row = &b->layout.rows.data[i];
+        int h = (int)(row->height + 0.0001);
+        if (h < 1) h = 1;
         if (caret >= row->byte_start && caret <= row->byte_start + row->byte_len) {
-            return (int)(i - i0);
+            int at = (int)screen;
+            if (at >= vis) at = vis - 1;
+            return at;
         }
+        screen += (size_t)h;
     }
-    return 0;
+    return vis > 1 ? vis - 1 : 0;
 }
 
 int rtx_buf_scroll_rel_mark_y(const RtxBuf *b, const RtxScrollRail *rail,
@@ -3222,11 +3292,17 @@ RtxScrollRail !>(RtxIndexErr) RtxBuf_scroll_rail(const RtxBuf *b, int vis_rows) 
          (!b->seek_valid && b->layout.from_line == b->top))) {
         size_t i0 = b->top_wrap < b->layout.rows.len ? b->top_wrap : 0;
         size_t i1 = i0;
-        size_t shown = 1;
+        size_t shown = 0;
+        int h0 = (int)(b->layout.rows.data[i0].height + 0.0001);
+        if (h0 < 1) h0 = 1;
+        shown = (size_t)h0;
         r.pos = b->layout.rows.data[i0].byte_start;
         while (i1 + 1 < b->layout.rows.len && shown < (size_t)vis_rows) {
+            int h;
             i1++;
-            shown++;
+            h = (int)(b->layout.rows.data[i1].height + 0.0001);
+            if (h < 1) h = 1;
+            shown += (size_t)h;
         }
         r.vis = (b->layout.rows.data[i1].byte_start + b->layout.rows.data[i1].byte_len) - r.pos;
     } else if (b->seek_valid) {

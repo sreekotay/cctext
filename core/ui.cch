@@ -63,6 +63,7 @@ int rtx_cmd_from_letter(int c) {
     case 'a': return CMD_SEL_ALL;
     case 'l': return CMD_VIEW;
     case 'd': return CMD_RICH;
+    case 'm': return CMD_WRAP;
     case 'u': return CMD_FOLLOW;
     case 'k': return CMD_NAV_NEXT;
     case 'p': return CMD_NAV_PREV;
@@ -688,7 +689,9 @@ enum { RTX_CLI_MAX = 32, RTX_CLI_CMD_MAX = 64 };
 
 typedef struct {
     int view;     /* sticky RTX_VIEW_* for the next file (and the default file) */
-    int view_set; /* 1 after --wrap/--hex/--grid/--view (journal view otherwise) */
+    int view_set; /* 1 after --hex/--grid/--view (journal view otherwise) */
+    int wrap;     /* sticky wrap bit for the next file */
+    int wrap_set; /* 1 after --wrap / --view=wrap */
     int help;
     int version;
     int no_blink;
@@ -701,6 +704,8 @@ typedef struct {
     int nfiles;
     int file_view[RTX_CLI_MAX];
     int file_view_set[RTX_CLI_MAX];
+    int file_wrap[RTX_CLI_MAX];
+    int file_wrap_set[RTX_CLI_MAX];
 } RtxCli;
 
 void rtx_ui_write_stats_json(FILE *fp, const RtxBuf *b) {
@@ -710,7 +715,7 @@ void rtx_ui_write_stats_json(FILE *fp, const RtxBuf *b) {
 int rtx_cli_view_of(const char *s) {
     if (!s || !s[0]) return -1;
     if (strcmp(s, "default") == 0 || strcmp(s, "text") == 0) return RTX_VIEW_DEFAULT;
-    if (strcmp(s, "wrap") == 0) return RTX_VIEW_WRAP;
+    if (strcmp(s, "wrap") == 0) return RTX_VIEW_WRAP; /* legacy: DEFAULT + wrap */
     if (strcmp(s, "hex") == 0) return RTX_VIEW_HEX;
     if (strcmp(s, "grid") == 0 || strcmp(s, "csv") == 0) return RTX_VIEW_GRID;
     return -1;
@@ -729,12 +734,12 @@ void rtx_cli_usage(FILE *fp, const char *prog) {
     fprintf(fp, "  --batch                    run -c / stdin cmds (no TTY)\n");
     fprintf(fp, "  -c CMD                     batch command (repeatable)\n");
     fprintf(fp, "  --safe                     with --batch: keep Safe journals\n");
-    fprintf(fp, "  --wrap                     wrap view for the following files\n");
+    fprintf(fp, "  --wrap                     soft wrap on for the following files\n");
     fprintf(fp, "  batch cmds: goto @N / N%% / LN, await index|island, print [N],\n");
     fprintf(fp, "              read @off n, insert TEXT, save, stats-json, quit\n");
     fprintf(fp, "  --hex                      hex view for the following files\n");
     fprintf(fp, "  --grid                     column view for the following files\n");
-    fprintf(fp, "  --view=default|wrap|hex|grid    view for the following files\n");
+    fprintf(fp, "  --view=default|hex|grid    view for the following files\n");
     fprintf(fp, "  --                         end of options\n");
 }
 
@@ -806,8 +811,8 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
                 continue;
             }
             if (strcmp(a, "--wrap") == 0) {
-                cli->view = RTX_VIEW_WRAP;
-                cli->view_set = 1;
+                cli->wrap = 1;
+                cli->wrap_set = 1;
                 continue;
             }
             if (strcmp(a, "--hex") == 0) {
@@ -823,24 +828,36 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
             if (strncmp(a, "--view=", 7) == 0) {
                 v = rtx_cli_view_of(a + 7);
                 if (v < 0) {
-                    fprintf(stderr, "unknown --view (default|wrap|hex|grid)\n");
+                    fprintf(stderr, "unknown --view (default|hex|grid; wrap=soft-wrap)\n");
                     return 1;
                 }
-                cli->view = v;
+                if (v == RTX_VIEW_WRAP) {
+                    cli->view = RTX_VIEW_DEFAULT;
+                    cli->wrap = 1;
+                    cli->wrap_set = 1;
+                } else {
+                    cli->view = v;
+                }
                 cli->view_set = 1;
                 continue;
             }
             if (strcmp(a, "--view") == 0) {
                 if (i + 1 >= argc) {
-                    fprintf(stderr, "--view needs default|wrap|hex|grid\n");
+                    fprintf(stderr, "--view needs default|hex|grid (or wrap)\n");
                     return 1;
                 }
                 v = rtx_cli_view_of(argv[++i]);
                 if (v < 0) {
-                    fprintf(stderr, "unknown --view (default|wrap|hex|grid)\n");
+                    fprintf(stderr, "unknown --view (default|hex|grid; wrap=soft-wrap)\n");
                     return 1;
                 }
-                cli->view = v;
+                if (v == RTX_VIEW_WRAP) {
+                    cli->view = RTX_VIEW_DEFAULT;
+                    cli->wrap = 1;
+                    cli->wrap_set = 1;
+                } else {
+                    cli->view = v;
+                }
                 cli->view_set = 1;
                 continue;
             }
@@ -853,27 +870,32 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
         }
         cli->file_view[cli->nfiles] = cli->view;
         cli->file_view_set[cli->nfiles] = cli->view_set;
+        cli->file_wrap[cli->nfiles] = cli->wrap;
+        cli->file_wrap_set[cli->nfiles] = cli->wrap_set;
         files[cli->nfiles++] = argv[i];
     }
     return 0;
 }
 
-/* CLI --view overrides the journal; otherwise keep the restored camera. */
+/* CLI --view / --wrap overrides the journal; otherwise keep the restored camera. */
 void rtx_cli_apply_views(RtxWs *w, const RtxCli *cli) {
     int i;
     if (!w || !cli) return;
     if (cli->nfiles == 0) {
-        if (cli->view_set && w->len) {
-            rtx_layout_set_view(&w->bufs[0].layout, cli->view);
-            rtx_buf_grid_bind(&w->bufs[0]);
-        } else {
-            for (i = 0; i < (int)w->len; i++) rtx_buf_grid_bind(&w->bufs[i]);
+        if (w->len) {
+            if (cli->view_set)
+                rtx_layout_set_view(&w->bufs[0].layout, cli->view);
+            if (cli->wrap_set)
+                w->bufs[0].layout.wrap = cli->wrap ? 1 : 0;
         }
+        for (i = 0; i < (int)w->len; i++) rtx_buf_grid_bind(&w->bufs[i]);
         return;
     }
     for (i = 0; i < cli->nfiles && i < (int)w->len; i++) {
         if (cli->file_view_set[i])
             rtx_layout_set_view(&w->bufs[i].layout, cli->file_view[i]);
+        if (cli->file_wrap_set[i])
+            w->bufs[i].layout.wrap = cli->file_wrap[i] ? 1 : 0;
         rtx_buf_grid_bind(&w->bufs[i]);
     }
 }

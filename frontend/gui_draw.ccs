@@ -811,6 +811,12 @@ static void gui_draw_browse_prev_text(RtxBrowsePrev *pv, GuiFonts *fonts,
             if (scratch.base) scratch.destroy();
             continue;
         }
+        /* Table chrome is painted after gui_draw_md_row is in scope. */
+        if (pv->layout.rich &&
+            rtx_layout_md_index(&pv->layout, row->byte_start) >= 0) {
+            if (scratch.base) scratch.destroy();
+            continue;
+        }
         while (k < bytes.len) {
             RtxUtf8Cl cl = rtx_utf8_cluster(bytes, k);
             size_t step = cl.n ? cl.n : 1;
@@ -1057,6 +1063,9 @@ static void gui_draw_browse_prev_rail(RtxBrowsePrev *pv, int focused,
     }
 }
 
+static void gui_draw_browse_prev_md(RtxBrowsePrev *pv, GuiFonts *fonts,
+                                    int x0, int y0, int pw, int ph);
+
 static void gui_draw_browse_prev(RtxWs *w, int pane, GuiFonts *fonts,
                                  int focused, int x0, int y0, int pw, int ph) {
     RtxBrowsePrev *pv;
@@ -1084,8 +1093,10 @@ static void gui_draw_browse_prev(RtxWs *w, int pane, GuiFonts *fonts,
             gui_draw_browse_prev_hex(pv, fonts, x0, y0, tw, ph);
         else if (rtx_layout_is_grid(&pv->layout))
             gui_draw_browse_prev_grid(pv, fonts, x0, y0, tw, ph);
-        else
+        else {
             gui_draw_browse_prev_text(pv, fonts, x0, y0, tw, ph);
+            gui_draw_browse_prev_md(pv, fonts, x0, y0, tw, ph);
+        }
         if (rw) gui_draw_browse_prev_rail(pv, focused, x0, y0, pw, ph);
         return;
     }
@@ -1613,7 +1624,8 @@ static float gui_md_text_y(double y, double h, float sz) {
 }
 
 static void gui_md_stroke(double xbase, double y, double h, double left,
-                          const int *cpx, int ncols, int role, int last) {
+                          const int *cpx, int ncols, int role, int last,
+                          int skip_top) {
     Color chrome = {132, 138, 152, 255};
     int e, x0, x1, y0, y1;
     int tw = rtx_md_px_width(cpx, ncols);
@@ -1626,10 +1638,14 @@ static void gui_md_stroke(double xbase, double y, double h, double left,
         int vx = (int)(xbase + (double)rtx_md_px_vline(cpx, ncols, e) - left);
         DrawLine(vx, y0, vx, y1, chrome);
     }
-    DrawLine(x0, y0, x1, y0, chrome);
+    /* Sep is one mid rule (TUI `├─┼─┤`). Skip the shared top when the
+     * previous record was that rule so HDR/SEP/BODY do not stack three
+     * horizontals inside the 10px band. */
     if (role == RTX_MD_ROLE_SEP) {
         int mid = y0 + (y1 - y0) / 2;
         DrawLine(x0, mid, x1, mid, chrome);
+    } else if (!skip_top) {
+        DrawLine(x0, y0, x1, y0, chrome);
     }
     if (last) DrawLine(x0, y1 - 1, x1, y1 - 1, chrome);
 }
@@ -1711,13 +1727,13 @@ static void gui_draw_md_row(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts,
     ti = rtx_layout_md_index(&b->layout, row->byte_start);
     if (ti < 0) return;
     if (fitted && !*fitted) {
-        gui_md_refit(b, fonts, ti);
+        if (!b->layout.wrap) gui_md_refit(b, fonts, ti);
         *fitted = 1;
     }
     t = &b->layout.md_tab[ti];
     ncols = t->ncols;
     nc = rtx_md_row_split(bytes.ptr, bytes.len, cells, RTX_MD_TABLE_COLS);
-    {
+    if (!b->layout.wrap) {
         int gc;
         for (gc = 0; gc < ncols && (size_t)gc < nc; gc++) {
             size_t lo = cells[gc].lo, hi = cells[gc].hi;
@@ -1746,118 +1762,194 @@ static void gui_draw_md_row(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts,
         DrawRectangle((int)(xbase - left), (int)y, tw, (int)row->height, fill);
     }
     if (role != RTX_MD_ROLE_SEP) {
+        double lh = gui_lh(fonts, (RtxStyle){0}, row->sec);
+        if (lh < 1.0) lh = 1.0;
         for (c = 0; c < ncols; c++) {
-            size_t lo = 0, hi = 0, i;
-            double cell_px, pad, x, x_right;
-            int cl, cr, cy, ch;
+            size_t lo = 0, hi = 0;
+            RtxMdCell lines[RTX_MD_WRAP_MAX];
+            size_t nl = 1;
+            size_t li;
+            int cr;
+            double x_right;
             if ((size_t)c < nc) {
                 lo = cells[c].lo;
                 hi = cells[c].hi;
                 rtx_md_span_trim(bytes.ptr, &lo, &hi);
             }
-            cell_px = gui_md_cell_px(b, fonts, row, bytes, lo, hi);
-            pad = (double)rtx_md_align_pad((int)t->align[c], cpx[c],
-                                           (int)(cell_px + 0.999));
-            x = xbase + (double)rtx_md_px_origin(cpx, ncols, c) + pad - left;
-            cl = (int)(xbase + (double)rtx_md_px_vline(cpx, ncols, c) +
-                       (double)RTX_MD_PX_LINE - left);
-            cr = (int)(xbase + (double)rtx_md_px_vline(cpx, ncols, c + 1) -
-                       left);
-            cy = (int)y;
-            ch = (int)row->height;
+            if (b->layout.wrap && hi > lo)
+                nl = rtx_layout_md_cell_wrap(&b->layout, &b->doc, &gm,
+                                             row->byte_start, bytes, lo, hi, ti,
+                                             c, row->sec, lines, RTX_MD_WRAP_MAX);
+            else {
+                lines[0].lo = 0;
+                lines[0].hi = hi > lo ? hi - lo : 0;
+                nl = 1;
+            }
+            if (nl < 1) nl = 1;
+            cr = (int)(xbase + (double)rtx_md_px_vline(cpx, ncols, c + 1) - left);
             x_right = (double)cr - (double)RTX_MD_PX_PAD;
-            (void)cl;
-            (void)cy;
-            (void)ch;
-            i = lo;
-            while ((size_t)c < nc && i < hi && x < x_right) {
-                size_t off = row->byte_start + i;
-                {
-                    RtxHintVis hv;
-                    if (rtx_layout_hint_vis(&b->layout, &b->doc, off, bytes.ptr, i,
-                                            hi, &hv)) {
-                        if (hv.gn) {
-                            RtxStyle st = b->doc.style_at(off);
-                            double gw = gui_standin_w(fonts, &hv, st, row->sec);
-                            float ty = gui_md_text_y(y, row->height,
-                                                     gui_size(fonts, st, row->sec));
-                            gui_draw_standin(fonts, &hv, st, row->sec, (float)x, ty);
-                            x += gw;
+            for (li = 0; li < nl; li++) {
+                size_t llo = lo + lines[li].lo;
+                size_t lhi = lo + lines[li].hi;
+                size_t i;
+                double cell_px, pad, x, ly;
+                if (lhi > hi) lhi = hi;
+                if (llo > lhi) llo = lhi;
+                cell_px = gui_md_cell_px(b, fonts, row, bytes, llo, lhi);
+                pad = (double)rtx_md_align_pad((int)t->align[c], cpx[c],
+                                               (int)(cell_px + 0.999));
+                x = xbase + (double)rtx_md_px_origin(cpx, ncols, c) + pad - left;
+                ly = y + (double)li * lh;
+                i = llo;
+                while ((size_t)c < nc && i < lhi && x < x_right) {
+                    size_t off = row->byte_start + i;
+                    {
+                        RtxHintVis hv;
+                        if (rtx_layout_hint_vis(&b->layout, &b->doc, off,
+                                                bytes.ptr, i, lhi, &hv)) {
+                            if (hv.gn) {
+                                RtxStyle st = b->doc.style_at(off);
+                                double gw =
+                                    gui_standin_w(fonts, &hv, st, row->sec);
+                                float ty = gui_md_text_y(ly, lh,
+                                                         gui_size(fonts, st,
+                                                                  row->sec));
+                                gui_draw_standin(fonts, &hv, st, row->sec,
+                                                 (float)x, ty);
+                                x += gw;
+                            }
+                            i += hv.skip;
+                            if (i > lhi) i = lhi;
+                            continue;
                         }
-                        i += hv.skip;
-                        if (i > hi) i = hi;
-                        continue;
                     }
-                }
-                if (i + 1 < hi && bytes.ptr[i] == '\\' &&
-                    bytes.ptr[i + 1] == '|') {
-                    RtxStyle st = b->doc.style_at(off + 1);
-                    char bar[2];
-                    Vector2 pos;
-                    double gw;
-                    bar[0] = '|';
-                    bar[1] = 0;
-                    gw = gui_measure(fonts, cc_slice_from_buffer(bar, 1), st,
-                                     row->sec);
-                    pos.x = (float)x;
-                    pos.y = gui_md_text_y(y, row->height,
-                                          gui_size(fonts, st, row->sec));
-                    if (has && (b->doc.sel_covers(off) !>))
-                        DrawRectangle((int)pos.x, (int)y, (int)gw + 1,
-                                      (int)row->height,
-                                      (Color){40, 70, 120, 255});
-                    DrawTextEx(gui_font(fonts, st, row->sec), bar, pos,
-                               gui_size(fonts, st, row->sec), 0,
-                               gui_hl_color(st.scope));
-                    x += gw;
-                    i += 2;
-                    continue;
-                }
-                {
-                    RtxUtf8Cl clu = rtx_utf8_cluster(bytes, i);
-                    size_t step = clu.n ? clu.n : 1;
-                    RtxStyle st = b->doc.style_at(off);
-                    char tmp[RTX_UTF8_LOOK + 1];
-                    Vector2 pos;
-                    int pn;
-                    double gw;
-                    if (step > RTX_UTF8_LOOK) step = RTX_UTF8_LOOK;
-                    pn = rtx_utf8_term_put(clu.cp, bytes.ptr + i, step, tmp,
-                                           RTX_UTF8_LOOK);
-                    if (pn > 0) {
-                        tmp[pn] = 0;
-                        gw = gui_measure(fonts, tmp.to_slice_n((size_t)pn), st,
+                    if (i + 1 < lhi && bytes.ptr[i] == '\\' &&
+                        bytes.ptr[i + 1] == '|') {
+                        RtxStyle st = b->doc.style_at(off + 1);
+                        char bar[2];
+                        Vector2 pos;
+                        double gw;
+                        bar[0] = '|';
+                        bar[1] = 0;
+                        gw = gui_measure(fonts, cc_slice_from_buffer(bar, 1), st,
                                          row->sec);
                         pos.x = (float)x;
-                        pos.y = gui_md_text_y(y, row->height,
+                        pos.y = gui_md_text_y(ly, lh,
                                               gui_size(fonts, st, row->sec));
                         if (has && (b->doc.sel_covers(off) !>))
-                            DrawRectangle((int)pos.x, (int)y, (int)gw + 1,
-                                          (int)row->height,
-                                          (Color){40, 70, 120, 255});
-                        else if (phave && (off == plo || off == phi))
-                            DrawRectangle((int)pos.x, (int)y, (int)gw + 1,
-                                          (int)row->height, gui_pair_color());
-                        DrawTextEx(gui_font(fonts, st, row->sec), tmp, pos,
+                            DrawRectangle((int)pos.x, (int)ly, (int)gw + 1,
+                                          (int)lh, (Color){40, 70, 120, 255});
+                        DrawTextEx(gui_font(fonts, st, row->sec), bar, pos,
                                    gui_size(fonts, st, row->sec), 0,
                                    gui_hl_color(st.scope));
-                        gui_draw_link_ul(&b->layout, &b->doc, off, pos, gw,
-                                         row->height, gui_hl_color(st.scope));
                         x += gw;
+                        i += 2;
+                        continue;
                     }
-                    i += clu.n ? clu.n : 1;
+                    {
+                        RtxUtf8Cl clu = rtx_utf8_cluster(bytes, i);
+                        size_t step = clu.n ? clu.n : 1;
+                        RtxStyle st = b->doc.style_at(off);
+                        char tmp[RTX_UTF8_LOOK + 1];
+                        Vector2 pos;
+                        int pn;
+                        double gw;
+                        if (step > RTX_UTF8_LOOK) step = RTX_UTF8_LOOK;
+                        pn = rtx_utf8_term_put(clu.cp, bytes.ptr + i, step, tmp,
+                                               RTX_UTF8_LOOK);
+                        if (pn > 0) {
+                            tmp[pn] = 0;
+                            gw = gui_measure(fonts, tmp.to_slice_n((size_t)pn),
+                                             st, row->sec);
+                            pos.x = (float)x;
+                            pos.y = gui_md_text_y(ly, lh,
+                                                  gui_size(fonts, st, row->sec));
+                            if (has && (b->doc.sel_covers(off) !>))
+                                DrawRectangle((int)pos.x, (int)ly, (int)gw + 1,
+                                              (int)lh,
+                                              (Color){40, 70, 120, 255});
+                            else if (phave && (off == plo || off == phi))
+                                DrawRectangle((int)pos.x, (int)ly, (int)gw + 1,
+                                              (int)lh, gui_pair_color());
+                            DrawTextEx(gui_font(fonts, st, row->sec), tmp, pos,
+                                       gui_size(fonts, st, row->sec), 0,
+                                       gui_hl_color(st.scope));
+                            gui_draw_link_ul(&b->layout, &b->doc, off, pos, gw,
+                                             lh, gui_hl_color(st.scope));
+                            x += gw;
+                        }
+                        i += clu.n ? clu.n : 1;
+                    }
                 }
             }
         }
     }
-    gui_md_stroke(xbase, y, row->height, left, cpx, ncols, role, last);
+    {
+        int skip_top = 0;
+        if (role != RTX_MD_ROLE_SEP && row->byte_start > 0 &&
+            rtx_md_table_role(t, row->byte_start - 1) == RTX_MD_ROLE_SEP)
+            skip_top = 1;
+        gui_md_stroke(xbase, y, row->height, left, cpx, ncols, role, last,
+                      skip_top);
+    }
     if (role != RTX_MD_ROLE_SEP && rtx_ui_here(ui, focused, 1) &&
         b->doc.caret >= row->byte_start &&
         b->doc.caret <= row->byte_start + row->byte_len) {
         double cx = b->layout.x_of(&b->doc, &gm, b->doc.caret) !>;
-        DrawRectangle((int)(xbase + cx - left), (int)y, 2, (int)row->height,
+        double lh = gui_lh(fonts, (RtxStyle){0}, row->sec);
+        int li = rtx_layout_md_wrap_li(&b->layout, &b->doc, &gm, b->doc.caret);
+        double cy;
+        if (lh < 1.0) lh = 1.0;
+        if (li < 0) li = 0;
+        cy = y + (double)li * lh;
+        if (cy + lh > y + row->height) cy = y + row->height - lh;
+        if (cy < y) cy = y;
+        DrawRectangle((int)(xbase + cx - left), (int)cy, 2, (int)lh,
                       (Color){255, 200, 80, 255});
     }
+}
+
+static void gui_draw_browse_prev_md(RtxBrowsePrev *pv, GuiFonts *fonts,
+                                    int x0, int y0, int pw, int ph) {
+    size_t i, skip;
+    float row_h = 20.0f;
+    int md_fit[RTX_MD_TABLE_FILL];
+    int tfi;
+    RtxBuf paint = {0};
+    if (!pv || !pv->live || !fonts || !pv->layout.rich) return;
+    for (tfi = 0; tfi < RTX_MD_TABLE_FILL; tfi++) md_fit[tfi] = 0;
+    paint.doc = pv->doc;
+    paint.layout = pv->layout;
+    paint.left_col = pv->cam.left_col;
+    skip = pv->cam.top_wrap;
+    for (i = skip; i < paint.layout.rows.len; i++) {
+        RtxVisRow *row = &paint.layout.rows.data[i];
+        float y = (float)y0 + (float)(i - skip) * row_h;
+        int mti;
+        CCArena scratch = {0};
+        char[:] bytes = cc_slice_empty();
+        if (y > (float)(y0 + ph)) break;
+        mti = rtx_layout_md_index(&paint.layout, row->byte_start);
+        if (mti < 0) continue;
+        if (!row->byte_len) continue;
+        scratch = cc_arena_heap(row->byte_len + 64);
+        if (!scratch.base) continue;
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                scratch.destroy();
+                continue;
+            }
+            bytes = paint.doc.scratch_span(row->byte_start, row->byte_len,
+                                           scratch) !>;
+        }
+        gui_draw_md_row(&paint, NULL, fonts, 0, 0, 0, 0, 0, row, bytes,
+                        (double)x0, (double)y, 8.0,
+                        (mti < RTX_MD_TABLE_FILL) ? &md_fit[mti] : NULL);
+        scratch.destroy();
+        (void)pw;
+    }
+    pv->layout = paint.layout;
 }
 
 static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focused,
@@ -1896,8 +1988,9 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                              &plo, &phi);
     {
         int gx = (int)(gpx + 0.5f);
+        int rw = gui_rail_w(b, vis_rows);
         int text_x = x0 + gx;
-        int clip_w = pw - gx;
+        int clip_w = pw - gx - rw;
         if (clip_w > 0 && ph > 0)
             BeginScissorMode(text_x, y0, clip_w, ph);
     {
@@ -2310,9 +2403,10 @@ void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner,
         } else {
             char pos[48];
             rtx_status_line_pos(act, pos, sizeof(pos)) !>;
-            snprintf(bar, sizeof(bar), "%s%s  %s%s%s  %s",
+            snprintf(bar, sizeof(bar), "%s%s  %s%s%s%s  %s",
                      star, path, pos,
                      (act && act->layout.rich) ? "  rich" : "",
+                     (act && act->layout.wrap) ? "  wrap" : "",
                      (act && act->unlock) ? "  unlock" : "", status);
         }
         DrawRectangle(0, hh - 26, ww, 26, (Color){36, 38, 46, 255});
