@@ -158,9 +158,13 @@ motion, selection, delete, wrap and hit — motion post‑steps the way
 - Pair apply (bold / italic / code / autolink) uses the same name: wrap
   is `a + bytes + b` from begin/end, or from `wrap` + `insert` bookends
   (`"<>"` + `wrap: 1`). Toggle-off unwraps the covering mark.
-- Cmd-. (Ctrl-.) opens the on-screen menu; `1–9` picks (cap 16 names,
+- Cmd-. (Ctrl-. / Esc-.) opens the on-screen apply menu; `1–9` picks (cap 16 names,
   nine digits). Cmd-1..9 applies directly. Shift-Cmd-H is prefix cycle
   (`CMD_APPLY` / `KEY_APPLY`), not a heading verb.
+- **Nav is not apply.** `Ctrl-K/P` steps runs with `hint_a > 0` already in
+  the window (the same mark vocabulary). It does not plant. A code buffer
+  with only paint scopes correctly reports “no mark.” Plant / cycle with
+  the apply keys above.
 - `cctext.bol` is the content-line start: physical BOL, or only
   whitespace since an open prefix opener (stack, not planted runs).
   A quote line can therefore host a list / heading prefix. Fence that
@@ -292,6 +296,7 @@ geometry) once its wedge lands.
 | Atoms | Pair join is DESIGN Encoding (one content, two hints). Prefix / path extend it ([mark_arity.md](mark_arity.md)); dest never in label `hint_b`; no face id on `RtxRun` |
 | Nesting | Stack is live (wedge 4). Join stays pair-only; path is two runs |
 | Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX`. Table is the path grammar, not the caret. Kind is derived. Link unwrap is apply, not join |
+| Nav | `Ctrl-K/P` = discover (`hint_a > 0` in the window). Apply = transform. Do not hard-code keyword scopes as marks; a `.c` file has none |
 | Sidecar | One `cctext` object. Recognition (`bol` / `inline` / `flank` / `lit` / `info`) ≠ topology (`arity` / `face` / `wrap`) ≠ transform (`apply` / `insert` / `max`) ≠ paint (`bold` / `italic` / `mono`). A new key answers one of those. |
 | Leftover marks | Setext, reference links, images-as-opaque |
 | Children | Layout‑epoch scratch, not an arity. Paint‑time recursion; one wrap oracle (`cell_wrap`) for paint / hit / `x_of` / caret; window classify; leftover, never wrong |

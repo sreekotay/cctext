@@ -322,3 +322,10 @@ by motion, selection, delete, wrap, and hit; gated on a per-fill
 `has_marks` so a plain file never pays. Source mode (`layout.rich == 0`)
 has no hint atoms — hints are plain bytes. See
 [docs/md_view.md](docs/md_view.md).
+
+**Discover vs transform.** Nav (`Ctrl-K/P`) steps among marks that already
+exist in the window (`hint_a > 0`). Apply (`.` / `h` / `1–9`) plants or
+cycles from the grammar’s `apply` catalog. Nav does not invent a mark when
+none is under the caret; that is apply’s job. Invalid (`Ctrl-E/R`) is a
+separate axis (scope prefix `invalid`). Do not hard-code a keyword list
+as “marks.”

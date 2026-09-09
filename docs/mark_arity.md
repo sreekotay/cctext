@@ -54,7 +54,20 @@ That sentence stays the pair rule. Prefix and path **extend** it:
 | Prefix | The opener is a one-sided hint. Content (title / body) is ordinary clusters. Join does not synthesize `hint_b`. Structural change is apply. |
 | Path | Two contents. Label is the shown face. Dest is a second face: hidden until entered, then typed as text. Join never crosses a face. Unwrap is apply of the path, not pair-join. |
 
-Pair marks keep today’s hook. A `.c` file still has no marks.
+Pair marks keep today’s hook. A `.c` file still has no marks — paint
+scopes (keywords) are not marks; `Ctrl-K` correctly no-ops there. Plant
+with apply.
+
+## Discover vs transform
+
+| Axis | Keys | Predicate | Missing under caret |
+|---|---|---|---|
+| **Discover** | `Ctrl-K/P` | Window run with `hint_a > 0` | Status “no mark” — do not invent |
+| **Invalid** | `Ctrl-E/R` | Scope prefix `invalid` | “no invalid” |
+| **Transform** | `.` / `h` / `1–9` | Grammar `cctext.apply` catalog | Plant / cycle (`apply_set`) |
+
+One vocabulary from the grammar (hints + arity + apply). Nav walks it;
+apply mutates it. Do not hard-code a keyword/heading scope list as marks.
 
 ## Sidecar (no new `RtxRun` field)
 
@@ -182,6 +195,9 @@ pair join, unchanged.
 | Copy | Bytes (hints included) | Bytes | Bytes (truth is bytes); a dest-hidden selection copies label bytes, not the URL |
 | Apply wrap | `a + bytes + b` | Insert / change the prefix (`# ` / `## `) | Wrap label: insert `[` + `](dest)` + `)` ; dest from toolbar / default |
 | Fold | — | Third axis (wedge 7). Not unwrap | — |
+| **Nav (`Ctrl-K/P`)** | Next / prev run with `hint_a > 0` in the window | Same | Same (label and dest runs both have hints) |
+
+Nav does not plant. Apply wrap / unwrap is the transform axis above.
 
 ## `replace_join` must refuse (path)
 
@@ -235,6 +251,7 @@ arity / face / dest walk.
 | Second document / HTML store | Lens lock |
 | Infer prefix from `hint_b==0` | Collides with unclosed pairs |
 | Caret-filtered apply bar | Table is the path grammar |
+| Keyword / heading scope list as “marks” | Nav is `hint_a > 0`; apply plants |
 | Fourth arity / `arity: table` | Toggle is a transform; children are layout |
 | Face id or `apply` name on `RtxRun` | Topology on `mark`; verb on the rule |
 
