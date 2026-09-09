@@ -101,13 +101,16 @@ void cctext_style(RtxStyle st, int sel, int here) {
     if (here) fputs("\x1b[7m", stdout);
 }
 
-/* Paint a list / task stand-in. 1 if the remaining columns cannot fit it. */
+/* Paint a list / task stand-in. 1 if the remaining columns cannot fit it.
+ * `here` inverts only the first cluster — reverse-video on a whole `[ ]`
+ * lights both brackets and hides the space (reads as two carets). */
 static int cctext_put_standin(const RtxHintVis *hv, RtxStyle st, size_t *col,
                               size_t *virt, size_t left, size_t tcols, int sel,
                               int here, int pair, RtxScope *last_scope,
                               int *last_bold, int *last_italic, int *last_sel,
                               int *last_here, int *last_pair) {
     size_t k = 0;
+    int first = 1;
     char[:] bytes;
     if (!hv || !hv->gn || !col) return 0;
     bytes = cc_slice_from_buffer((char *)hv->g, hv->gn);
@@ -117,31 +120,34 @@ static int cctext_put_standin(const RtxHintVis *hv, RtxStyle st, size_t *col,
         char put[RTX_UTF8_LOOK];
         int pn = rtx_utf8_term_put(cl.cp, bytes.ptr + k, step, put, sizeof(put));
         int pc = rtx_utf8_term_cols(cl.cp, cl.cols);
+        int cell_here = here && first;
         if (pc < 1) pc = 0;
         if ((size_t)pc > 0 && virt && *virt < left) {
             *virt += (size_t)pc;
             k += step;
+            first = 0;
             continue;
         }
         if ((size_t)pc > 0 && *col + (size_t)pc > tcols) return 1;
         if (last_scope && (st.scope != *last_scope ||
                            (int)st.bold != *last_bold ||
                            (int)st.italic != *last_italic || sel != *last_sel ||
-                           here != *last_here ||
+                           cell_here != *last_here ||
                            (last_pair && pair != *last_pair))) {
             fputs("\x1b[0m", stdout);
-            cctext_style(st, sel, here);
+            cctext_style(st, sel, cell_here);
             if (pair && !sel) fputs(rtx_theme_pair().ansi, stdout);
             *last_scope = st.scope;
             *last_bold = (int)st.bold;
             *last_italic = (int)st.italic;
             *last_sel = sel;
-            *last_here = here;
+            *last_here = cell_here;
             if (last_pair) *last_pair = pair;
         }
         if (pn > 0) fwrite(put, 1, (size_t)pn, stdout);
         *col += (size_t)pc;
         k += step;
+        first = 0;
     }
     return 0;
 }
@@ -543,8 +549,23 @@ static size_t cctext_draw_md_row(RtxLayout *L, RtxDoc *d, size_t left_col,
                                         lhi, &hv)) {
                     if (hv.gn) {
                         RtxStyle st = d->style_at(off);
-                        int pc = rtx_hint_standin_cols(hv.g, hv.gn);
-                        cctext_md_emit(&p, hv.g, hv.gn, pc, st, 0, 0, 0);
+                        int here = rtx_ui_here(ui, focused,
+                                               d->caret >= off &&
+                                               d->caret < off + hv.skip);
+                        /* First cluster only — same as cctext_put_standin. */
+                        {
+                            RtxUtf8Cl cl = rtx_utf8_cluster(
+                                cc_slice_from_buffer((char *)hv.g, hv.gn), 0);
+                            size_t step = cl.n ? cl.n : 1;
+                            int pc0 = cl.cols > 0 ? cl.cols : 1;
+                            cctext_md_emit(&p, hv.g, step, pc0, st, 0, here, 0);
+                            if (step < hv.gn) {
+                                int pc1 = rtx_hint_standin_cols(hv.g + step,
+                                                                hv.gn - step);
+                                cctext_md_emit(&p, hv.g + step, hv.gn - step,
+                                               pc1, st, 0, 0, 0);
+                            }
+                        }
                     }
                     i += hv.skip;
                     if (i > lhi) i = lhi;
@@ -784,9 +805,12 @@ void cctext_draw_pane(RtxBuf *b, const RtxUi *ui, int focused, int vis,
                                             bytes.len, &hv)) {
                         if (hv.gn) {
                             RtxStyle st = b->doc.style_at(off);
+                            int here = rtx_ui_here(ui, focused,
+                                                   b->doc.caret >= off &&
+                                                   b->doc.caret < off + hv.skip);
                             if (cctext_put_standin(&hv, st, &col, &virt,
                                                    b->left_col, (size_t)tcols, 0,
-                                                   0, 0, &last_scope, &last_bold,
+                                                   here, 0, &last_scope, &last_bold,
                                                    &last_italic, &last_sel,
                                                    &last_here, &last_pair))
                                 break;
@@ -1734,6 +1758,9 @@ static size_t cctext_prefix_cols(RtxBuf *b, const RtxVisRow *vr, char[:] bytes, 
             RtxHintVis hv;
             if (rtx_layout_hint_vis(&b->layout, &b->doc, vr->byte_start + k,
                                     bytes.ptr, k, bytes.len, &hv)) {
+                /* Caret inside this hint: stand-in origin is the cell. */
+                if (vr->byte_start + k + hv.skip > vr->byte_start + at)
+                    break;
                 cols += (size_t)rtx_hint_standin_cols(hv.g, hv.gn);
                 k += hv.skip;
                 continue;
@@ -1822,25 +1849,16 @@ static int cctext_caret_cell(RtxBuf *b, int vis, int pcols, int col0, int *row, 
     return 0;
 }
 
-static void cctext_place_cursor(RtxWs *w, RtxUi *ui, int vis, int cols) {
-    RtxBuf *act;
-    int pane, pcols, col0, row, col;
-    if (!w) return;
-    act = w->active();
-    if (!act || rtx_ui_prompting(ui) ||
-        (ui && (ui->help || ui->apply || ui->ask_quit || ui->ask_conflict)) ||
-        (w && w->browsing())) {
-        fputs("\x1b[?25l", stdout);
-        return;
-    }
-    pane = w->focus;
-    pcols = cctext_pane_cols(w, cols, pane);
-    col0 = (pane == 0) ? 1 : (cols / 2 + 2);
-    if (rtx_ui_blink(ui) && cctext_caret_cell(act, vis, pcols, col0, &row, &col)) {
-        fprintf(stdout, "\x1b[%d;%dH\x1b[?25h", row, col);
-    } else {
-        fputs("\x1b[?25l", stdout);
-    }
+static void cctext_place_cursor(RtxWs *w, RtxUi *ui, int rows, int vis, int cols) {
+    (void)vis;
+    (void)cols;
+    (void)w;
+    (void)ui;
+    /* Caret is reverse-video in the pane (rtx_ui_here). Never show the TTY
+     * cursor on a text cell — VS Code still draws a bar there even after
+     * CUP+?25l. Park on the status row and keep it hidden. */
+    if (rows < 1) rows = 1;
+    fprintf(stdout, "\x1b[%d;1H\x1b[?25l", rows);
 }
 
 /* Last "  " is the key / action split. A line with no gap is all action. */
@@ -2150,7 +2168,7 @@ void cctext_draw_chrome(RtxWs *w, RtxUi *ui, int rows, int cols) {
     } else {
         cctext_paint_chrome(w, ui, w ? w->active() : NULL, rows, cols, find_h);
     }
-    cctext_place_cursor(w, ui, vis, cols);
+    cctext_place_cursor(w, ui, rows, vis, cols);
     fflush(stdout);
 }
 
@@ -2192,6 +2210,6 @@ void cctext_draw(RtxWs *w, RtxUi *ui, int rows, int cols) {
     }
     cctext_paint_chrome(w, ui, act, rows, cols, find_h);
     fputs("\x1b[?2026l", stdout);
-    cctext_place_cursor(w, ui, vis, cols);
+    cctext_place_cursor(w, ui, rows, vis, cols);
     fflush(stdout);
 }
