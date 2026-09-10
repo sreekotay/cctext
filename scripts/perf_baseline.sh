@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Capture / check editor timings; write a dated results table.
+# Capture / check editor timings + ws_mem heap; write a dated results table.
 #
-#   ./scripts/perf_baseline.sh            # run matrix, write results, compare pins
+#   ./scripts/perf_baseline.sh            # run matrix + ws_mem, write results, compare pins
 #   ./scripts/perf_baseline.sh record     # also refresh testdata/perf/baseline.env pins
 #   ./scripts/perf_baseline.sh check      # fail on regression vs baseline.env
-#   ./scripts/perf_baseline.sh run        # matrix only (no compare)
+#   ./scripts/perf_baseline.sh run        # matrix + ws_mem only (no compare)
 #
 # Results land in testdata/perf/results/baseline_results_YYYY_MM_DD.txt
 #
@@ -13,8 +13,9 @@
 #   LARGE=path            3M text fixture (default: testdata/generated/large.txt)
 #   GIANT_JSON=path       2G JSON fixture (default: testdata/generated/large_2G.json)
 #   RTX_PERF_FACTOR=3     fail if measured > pin * factor
-#   RTX_PERF_HEADROOM=2   record stores ceil(ms * headroom)
-#   RTX_PERF_FLOOR_MS=25  min pin for ops
+#   RTX_PERF_HEADROOM=2   record stores ceil(ms * headroom) / ceil(bytes * headroom)
+#   RTX_PERF_FLOOR_MS=25  min pin for timing ops
+#   RTX_PERF_FLOOR_BYTES=262144  min pin for ws_mem heap phases (256 KiB)
 #   RTX_PERF_TRIALS=5     isolated repeats per op; RESULT is the minimum ms
 set -euo pipefail
 
@@ -25,7 +26,7 @@ MODE="${1:-}"
 case "$MODE" in
     ""|run|record|check) ;;
     -h|--help)
-        sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *)
@@ -50,6 +51,7 @@ RESULTS_DIR="${RTX_PERF_RESULTS:-testdata/perf/results}"
 FACTOR="${RTX_PERF_FACTOR:-3}"
 HEADROOM="${RTX_PERF_HEADROOM:-2}"
 FLOOR_MS="${RTX_PERF_FLOOR_MS:-25}"
+FLOOR_BYTES="${RTX_PERF_FLOOR_BYTES:-262144}"
 TRIALS="${RTX_PERF_TRIALS:-5}"
 export RTX_PERF_TRIALS="$TRIALS"
 LOG="testdata/generated/perf_runs.log"
@@ -97,6 +99,8 @@ human_bytes() {
 # Build once, warm once (first process pays dyld / page-cache), then measure.
 echo "perf_baseline: building perf_matrix_smoke ($BUILD_FLAVOR)" >&2
 "$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc perf_matrix_smoke
+echo "perf_baseline: building ws_mem_smoke ($BUILD_FLAVOR)" >&2
+"$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc ws_mem_smoke
 echo "perf_baseline: building cctext ($BUILD_FLAVOR)" >&2
 if [[ "$(uname -s)" == Darwin ]]; then
     "$CCC" "${CCC_FLAGS[@]}" --ld-flags "-framework ApplicationServices" \
@@ -166,7 +170,39 @@ for pair in "$LARGE:3M" "$GIANT:8G" "$GIANT_JSON:2Gjson"; do
     fi
 done
 
+echo "perf_baseline: ws_mem_smoke (8×512K switch/jump/edit)" >&2
+WS_MEM_OUT="$("$CCC" "${CCC_FLAGS[@]}" build --build-file build.cc run ws_mem_smoke 2>&1)" || {
+    printf '%s\n' "$WS_MEM_OUT" >&2
+    exit 1
+}
+printf '%s\n' "$WS_MEM_OUT"
+ALL_OUT+="$WS_MEM_OUT"$'\n'
+
+WS_MEM_BODY=""
+ws_mem_base=""; ws_mem_open=""; ws_mem_switch=""; ws_mem_jump_warm=""
+ws_mem_jump_again=""; ws_mem_edit=""; ws_mem_reopen=""; ws_mem_destroyed=""
+while read -r _ kv1 kv2 kv3; do
+    [[ -n "${kv1:-}" ]] || continue
+    size="${kv1#size=}"
+    op="${kv2#op=}"
+    [[ "$size" == "ws_mem" ]] || continue
+    [[ "${kv3:-}" == bytes=* ]] || continue
+    val="${kv3#bytes=}"
+    case "$op" in
+        base) ws_mem_base="$val" ;;
+        open) ws_mem_open="$val" ;;
+        switch) ws_mem_switch="$val" ;;
+        jump_warm) ws_mem_jump_warm="$val" ;;
+        jump_again) ws_mem_jump_again="$val" ;;
+        edit) ws_mem_edit="$val" ;;
+        reopen) ws_mem_reopen="$val" ;;
+        destroyed) ws_mem_destroyed="$val" ;;
+    esac
+    WS_MEM_BODY+="$(printf '%-14s %s' "$op" "$(human_bytes "$val")")"$'\n'
+done < <(printf '%s\n' "$WS_MEM_OUT" | grep '^RESULT ' || true)
+
 smoke_bytes="$(bin_bytes bin/perf_matrix_smoke)"
+ws_mem_bin="$(bin_bytes bin/ws_mem_smoke)"
 cctext_bytes="$(bin_bytes bin/cctext)"
 {
     echo "# cctext perf results"
@@ -174,11 +210,15 @@ cctext_bytes="$(bin_bytes bin/cctext)"
     echo "# note: process warmup discarded; each op from a fresh open; best of $TRIALS"
     echo "# note: jump_1m / wrap_1m / insert_mid / newline_mid are 1 MiB into every file"
     echo "# note: jump_50pct is g+50% (line_floor + island; no prefix line_of)"
+    echo "# note: ws_mem is live malloc (heap_in_use) across 8×512K switch/jump/edit"
     echo "#"
     echo "# binary                    bytes      size"
     echo "# ------------------------------------------------"
     if [[ -n "$smoke_bytes" ]]; then
         printf '%-24s %-10s %s\n' "perf_matrix_smoke" "$smoke_bytes" "$(human_bytes "$smoke_bytes")"
+    fi
+    if [[ -n "$ws_mem_bin" ]]; then
+        printf '%-24s %-10s %s\n' "ws_mem_smoke" "$ws_mem_bin" "$(human_bytes "$ws_mem_bin")"
     fi
     if [[ -n "$cctext_bytes" ]]; then
         printf '%-24s %-10s %s\n' "cctext" "$cctext_bytes" "$(human_bytes "$cctext_bytes")"
@@ -187,6 +227,10 @@ cctext_bytes="$(bin_bytes bin/cctext)"
     echo "# size       rss_open      rss_peak"
     echo "# ------------------------------------------------"
     printf '%s' "$MEM_BODY"
+    echo "#"
+    echo "# ws_mem phase           heap"
+    echo "# ------------------------------------------------"
+    printf '%s' "$WS_MEM_BODY"
     echo "#"
     echo "# size       op              ms"
     echo "# ------------------------------------------------"
@@ -232,10 +276,26 @@ ceil_ms() {
     }'
 }
 
+ceil_bytes() {
+    awk -v x="$1" -v h="$2" -v f="$3" 'BEGIN {
+        if (x + 0 != x) exit 1
+        v = x * h
+        if (v != int(v)) v = int(v) + 1
+        else v = int(v)
+        if (f > 0 && v < f) v = f
+        print v
+    }'
+}
+
 write_baseline() {
     local o s j i n
+    local wo ws wj wja we wr wd
     [[ -n "$open_ms" && -n "$screen_ms" && -n "$jump100k_ms" && -n "$insert_ms" ]] || {
         echo "perf_baseline: need 8G RESULT lines to record pins (./make.shcc @giant)" >&2
+        exit 1
+    }
+    [[ -n "$ws_mem_open" && -n "$ws_mem_destroyed" ]] || {
+        echo "perf_baseline: need ws_mem RESULT lines to record heap pins" >&2
         exit 1
     }
     o="$(ceil_ms "$open_ms" "$HEADROOM" "$FLOOR_MS")"
@@ -243,9 +303,18 @@ write_baseline() {
     j="$(ceil_ms "$jump100k_ms" "$HEADROOM" "$FLOOR_MS")"
     i="$(ceil_ms "$insert_ms" "$HEADROOM" "$FLOOR_MS")"
     n="$(ceil_ms "${newline_ms:-0}" "$HEADROOM" "$FLOOR_MS")"
+    wo="$(ceil_bytes "$ws_mem_open" "$HEADROOM" "$FLOOR_BYTES")"
+    ws="$(ceil_bytes "${ws_mem_switch:-$ws_mem_open}" "$HEADROOM" "$FLOOR_BYTES")"
+    wj="$(ceil_bytes "${ws_mem_jump_warm:-0}" "$HEADROOM" "$FLOOR_BYTES")"
+    wja="$(ceil_bytes "${ws_mem_jump_again:-0}" "$HEADROOM" "$FLOOR_BYTES")"
+    we="$(ceil_bytes "${ws_mem_edit:-0}" "$HEADROOM" "$FLOOR_BYTES")"
+    wr="$(ceil_bytes "${ws_mem_reopen:-0}" "$HEADROOM" "$FLOOR_BYTES")"
+    wd="$(ceil_bytes "$ws_mem_destroyed" "$HEADROOM" "$FLOOR_BYTES")"
     cat >"$BASELINE" <<EOF
-# Giant-open perf pin (ms ceilings). scripts/perf_baseline.sh record
-# Measured $stamp_iso on $host; pins = max(ceil(ms*$HEADROOM), ${FLOOR_MS}ms).
+# Perf + ws_mem pins. scripts/perf_baseline.sh record
+# Measured $stamp_iso on $host.
+# Timing pins = max(ceil(ms*$HEADROOM), ${FLOOR_MS}ms).
+# Heap pins = max(ceil(bytes*$HEADROOM), ${FLOOR_BYTES} B); live malloc from ws_mem_smoke.
 # check fails if measured > pin * RTX_PERF_FACTOR (default $FACTOR).
 # Full table: $RESULTS
 fixture=$GIANT
@@ -254,6 +323,13 @@ screen_ms=$s
 jump100k_ms=$j
 insert_ms=$i
 newline_ms=$n
+ws_mem_open_bytes=$wo
+ws_mem_switch_bytes=$ws
+ws_mem_jump_warm_bytes=$wj
+ws_mem_jump_again_bytes=$wja
+ws_mem_edit_bytes=$we
+ws_mem_reopen_bytes=$wr
+ws_mem_destroyed_bytes=$wd
 EOF
     echo "perf_baseline: wrote $BASELINE" >&2
     cat "$BASELINE"
@@ -266,6 +342,13 @@ load_baseline() {
     b_jump100k_ms=""
     b_insert_ms=""
     b_newline_ms=""
+    b_ws_mem_open_bytes=""
+    b_ws_mem_switch_bytes=""
+    b_ws_mem_jump_warm_bytes=""
+    b_ws_mem_jump_again_bytes=""
+    b_ws_mem_edit_bytes=""
+    b_ws_mem_reopen_bytes=""
+    b_ws_mem_destroyed_bytes=""
     while IFS='=' read -r k v; do
         case "$k" in
             open_ms) b_open_ms="$v" ;;
@@ -273,10 +356,17 @@ load_baseline() {
             jump100k_ms) b_jump100k_ms="$v" ;;
             insert_ms) b_insert_ms="$v" ;;
             newline_ms) b_newline_ms="$v" ;;
+            ws_mem_open_bytes) b_ws_mem_open_bytes="$v" ;;
+            ws_mem_switch_bytes) b_ws_mem_switch_bytes="$v" ;;
+            ws_mem_jump_warm_bytes) b_ws_mem_jump_warm_bytes="$v" ;;
+            ws_mem_jump_again_bytes) b_ws_mem_jump_again_bytes="$v" ;;
+            ws_mem_edit_bytes) b_ws_mem_edit_bytes="$v" ;;
+            ws_mem_reopen_bytes) b_ws_mem_reopen_bytes="$v" ;;
+            ws_mem_destroyed_bytes) b_ws_mem_destroyed_bytes="$v" ;;
         esac
-    done < <(grep -E '^(open|screen|jump100k|insert|newline)_ms=' "$BASELINE")
+    done < <(grep -E '^(open|screen|jump100k|insert|newline)_ms=|^ws_mem_.*_bytes=' "$BASELINE")
     if [[ -z "$b_open_ms" || -z "$b_screen_ms" || -z "$b_jump100k_ms" || -z "$b_insert_ms" ]]; then
-        echo "perf_baseline: incomplete $BASELINE" >&2
+        echo "perf_baseline: incomplete timing pins in $BASELINE" >&2
         exit 1
     fi
     if [[ -z "$b_newline_ms" ]]; then b_newline_ms="$FLOOR_MS"; fi
@@ -312,6 +402,33 @@ compare() {
             echo "ok      $name: measured=${measured}ms  pin=${pin}ms  limit=${limit}ms" >&2
         fi
     done
+    if [[ -n "${b_ws_mem_open_bytes:-}" ]]; then
+        echo "perf_baseline: compare ws_mem heap vs $BASELINE (factor=$FACTOR)" >&2
+        for name in ws_mem_open ws_mem_switch ws_mem_jump_warm ws_mem_jump_again \
+                    ws_mem_edit ws_mem_reopen ws_mem_destroyed; do
+            measured="${!name:-}"
+            if [[ -z "$measured" ]]; then continue; fi
+            case "$name" in
+                ws_mem_open) pin="$b_ws_mem_open_bytes" ;;
+                ws_mem_switch) pin="$b_ws_mem_switch_bytes" ;;
+                ws_mem_jump_warm) pin="$b_ws_mem_jump_warm_bytes" ;;
+                ws_mem_jump_again) pin="$b_ws_mem_jump_again_bytes" ;;
+                ws_mem_edit) pin="$b_ws_mem_edit_bytes" ;;
+                ws_mem_reopen) pin="$b_ws_mem_reopen_bytes" ;;
+                ws_mem_destroyed) pin="$b_ws_mem_destroyed_bytes" ;;
+            esac
+            [[ -n "$pin" ]] || continue
+            limit="$(awk -v p="$pin" -v f="$FACTOR" 'BEGIN { printf "%.0f", p * f }')"
+            if awk -v m="$measured" -v lim="$limit" 'BEGIN { exit !(m > lim) }'; then
+                echo "REGRESS $name: measured=$(human_bytes "$measured")  pin=$(human_bytes "$pin")  limit=$(human_bytes "$limit") (${FACTOR}x)" >&2
+                status=1
+            else
+                echo "ok      $name: measured=$(human_bytes "$measured")  pin=$(human_bytes "$pin")  limit=$(human_bytes "$limit")" >&2
+            fi
+        done
+    else
+        echo "perf_baseline: no ws_mem pins in $BASELINE yet (run: $0 record)" >&2
+    fi
     return "$status"
 }
 

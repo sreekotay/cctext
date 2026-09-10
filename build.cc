@@ -99,6 +99,10 @@ CC_TARGET large_file_smoke exe tests/large_file_smoke.ccs
 CC_TARGET_INCLUDE large_file_smoke .
 CC_TARGET_DEPS large_file_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
 
+CC_TARGET ws_mem_smoke exe tests/ws_mem_smoke.ccs
+CC_TARGET_INCLUDE ws_mem_smoke .
+CC_TARGET_DEPS ws_mem_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
+
 CC_TARGET dup_scale_smoke exe tests/dup_scale_smoke.ccs
 CC_TARGET_INCLUDE dup_scale_smoke .
 CC_TARGET_DEPS dup_scale_smoke rtx_piece_tree rtx_nav rtx_scope rtx_find rtx_document

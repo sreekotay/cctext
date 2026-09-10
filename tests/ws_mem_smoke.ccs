@@ -1,0 +1,284 @@
+#!ccc ccs
+/*
+ * Multi-buf leak smoke: many mid-size files, switch panes/bufs, jump,
+ * edit+undo (no save). Live malloc must not climb after warm-up; destroy
+ * returns near baseline. Peak RSS is telemetry only.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#include <mach/mach.h>
+#elif defined(__linux__)
+#include <malloc.h>
+#include <sys/resource.h>
+#endif
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+#include "../core/browse.cch"
+
+enum {
+    WS_MEM_FILES = 8,
+    WS_MEM_SWITCH_ROUNDS = 64,
+    WS_MEM_JUMP_ROUNDS = 40,
+    WS_MEM_EDIT_ROUNDS = 32,
+    WS_MEM_OPEN_ROUNDS = 24
+};
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static size_t heap_in_use(void) {
+#if defined(__APPLE__)
+    malloc_statistics_t s = {0};
+    malloc_zone_statistics(NULL, &s);
+    return (size_t)s.size_in_use;
+#elif defined(__linux__)
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ) && __GLIBC_PREREQ(2, 33)
+    return (size_t)mallinfo2().uordblks;
+#else
+    return (size_t)mallinfo().uordblks;
+#endif
+#else
+    return 0;
+#endif
+}
+
+static size_t rss_now(void) {
+#if defined(__APPLE__)
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) !=
+        KERN_SUCCESS)
+        return 0;
+    return (size_t)info.resident_size;
+#elif defined(__linux__)
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+    return (size_t)ru.ru_maxrss * 1024u;
+#else
+    return 0;
+#endif
+}
+
+static void note(const char *label, size_t heap, size_t rss) {
+    fprintf(stderr, "ws_mem %-16s heap=%7.2f MiB  rss=%7.2f MiB\n", label,
+            (double)heap / (1024.0 * 1024.0),
+            (double)rss / (1024.0 * 1024.0));
+}
+
+static void emit_heap(const char *phase, size_t heap) {
+    printf("RESULT size=ws_mem op=%s bytes=%zu\n", phase, heap);
+    fflush(stdout);
+}
+
+static void expect_flat(size_t before, size_t after, size_t slack,
+                        const char *msg) {
+    expect(after < before + slack, msg);
+    if (after >= before + slack)
+        fprintf(stderr, "  growth=%zu limit=%zu  (%.2f → %.2f MiB)\n",
+                after - before, slack, (double)before / (1024.0 * 1024.0),
+                (double)after / (1024.0 * 1024.0));
+}
+
+static double meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return (double)bytes.len;
+}
+
+static double lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+static int ws_mem_ensure_files(char *paths[WS_MEM_FILES], CCArena store) {
+    int i;
+    if (system("mkdir -p testdata/generated/ws_mem") != 0) return -1;
+    for (i = 0; i < WS_MEM_FILES; i++) {
+        CCString p = @string(`testdata/generated/ws_mem/f${i}.txt`, store);
+        const char *c = p.cstr(store);
+        paths[i] = (char *)c;
+        if (access(c, R_OK) == 0) continue;
+        {
+            CCString cmd = @string(
+                `./testdata/gen_large.sh --bytes 512K ${c}`, store);
+            if (system(cmd.cstr(store)) != 0) return -1;
+        }
+    }
+    return 0;
+}
+
+static void !>(CCError) ws_mem_switch(RtxWs *w, int round) {
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "ws_mem switch");
+    if ((round % 3) == 0) w->prev_buf();
+    else w->next_buf();
+    if ((round % 4) == 0) w->focus_other();
+    if ((round % 7) == 0) w->set_focus(round & 1);
+    return cc_ok();
+}
+
+static void !>(CCError) ws_mem_jump(RtxWs *w, int round) {
+    RtxDoc *d;
+    size_t lines, target, off;
+    @errhandler(CCError e) { return cc_err(e); }
+    @errhandler(RtxIndexErr e) {
+        return cc_err(CC_ERR_INVALID_ARG, e.message ? e.message : "line_start");
+    }
+    ws_mem_switch(w, round) !>;
+    d = w->doc();
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "ws_mem jump");
+    lines = d->line_known();
+    if (lines < 2) {
+        size_t past = d->line_start(1000000) !>;
+        (void)past;
+        lines = d->line_known();
+    }
+    if (lines < 2) lines = 2;
+    target = (size_t)(round * 97) % (lines - 1);
+    if ((round & 1) == 0) target = lines / 2;
+    if ((round % 5) == 0) target = lines > 4 ? lines - 2 : 0;
+    off = d->line_start(target) !>;
+    d->caret = off;
+    d->sel_anchor = off;
+    return cc_ok();
+}
+
+static void !>(CCError) ws_mem_edit_undo(RtxWs *w, int round) {
+    RtxDoc *d;
+    @errhandler(CCError e) { return cc_err(e); }
+    ws_mem_jump(w, round) !>;
+    d = w->doc();
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "ws_mem edit");
+    d->type("Z") !>;
+    d->undo() !>;
+    return cc_ok();
+}
+
+static void !>(CCError) ws_mem_reopen(RtxWs *w, char *paths[WS_MEM_FILES],
+                                     int round) {
+    int i;
+    @errhandler(CCError e) { return cc_err(e); }
+    ws_mem_switch(w, round) !>;
+    i = (round * 3) % WS_MEM_FILES;
+    w->open_in_pane(paths[i]) !>;
+    i = (round * 5 + 1) % WS_MEM_FILES;
+    w->focus_other();
+    w->open_in_pane(paths[i]) !>;
+    return cc_ok();
+}
+
+int main(void) {
+    rtx_safe_test_isol();
+    rtx_safe_set_enabled(0);
+    @errhandler(CCError e) { cc_error_log(e); return 1; }
+    @errhandler(RtxIndexErr e) {
+        fprintf(stderr, "%s\n", e.message ? e.message : "index");
+        return 1;
+    }
+
+    CCArena store = cc_arena_heap(kilobytes(64)) @destroy;
+    char *paths[WS_MEM_FILES];
+    RtxMeasure m;
+    size_t base, open_h, switch_h, jump1_h, jump2_h, edit_h, reopen_h, after;
+    size_t slack_flat = kilobytes(512);
+    size_t slack_edit = megabytes(2);
+    size_t slack_reopen = megabytes(3);
+    size_t slack_gone = megabytes(2);
+    int i;
+
+    m.measure = meas;
+    m.line_height = lh;
+    m.ctx = NULL;
+
+    if (ws_mem_ensure_files(paths, store) != 0) {
+        expect(0, "ws_mem fixtures");
+        return 1;
+    }
+
+    base = heap_in_use();
+    expect(base > 0, "heap_in_use");
+    note("base", base, rss_now());
+    emit_heap("base", base);
+
+    {
+        RtxWs w = {0} @destroy;
+        w.open_files(WS_MEM_FILES, paths) !>;
+        expect(w.len == (size_t)WS_MEM_FILES, "opened many bufs");
+        expect(w.npanes == 2, "split with many files");
+        open_h = heap_in_use();
+        note("open", open_h, rss_now());
+        emit_heap("open", open_h);
+
+        for (i = 0; i < WS_MEM_SWITCH_ROUNDS; i++)
+            ws_mem_switch(&w, i) !>;
+        switch_h = heap_in_use();
+        note("switch", switch_h, rss_now());
+        emit_heap("switch", switch_h);
+        expect_flat(open_h, switch_h, slack_flat,
+                    "next/prev/focus switch does not grow heap");
+
+        for (i = 0; i < WS_MEM_JUMP_ROUNDS; i++)
+            ws_mem_jump(&w, i) !>;
+        jump1_h = heap_in_use();
+        note("jump warm", jump1_h, rss_now());
+        emit_heap("jump_warm", jump1_h);
+
+        for (i = 0; i < WS_MEM_JUMP_ROUNDS; i++)
+            ws_mem_jump(&w, i + WS_MEM_JUMP_ROUNDS) !>;
+        jump2_h = heap_in_use();
+        note("jump again", jump2_h, rss_now());
+        emit_heap("jump_again", jump2_h);
+        expect_flat(jump1_h, jump2_h, slack_flat,
+                    "second jump pass stays flat (no line-cache leak)");
+
+        for (i = 0; i < WS_MEM_EDIT_ROUNDS; i++)
+            ws_mem_edit_undo(&w, i) !>;
+        edit_h = heap_in_use();
+        note("edit+undo", edit_h, rss_now());
+        emit_heap("edit", edit_h);
+        expect_flat(jump2_h, edit_h, slack_edit,
+                    "edit+undo across files stays bounded");
+        expect(!w.any_dirty(), "undo left bufs clean");
+
+        for (i = 0; i < WS_MEM_OPEN_ROUNDS; i++)
+            ws_mem_reopen(&w, paths, i) !>;
+        for (i = 0; i < WS_MEM_SWITCH_ROUNDS / 2; i++)
+            ws_mem_switch(&w, i + 100) !>;
+        reopen_h = heap_in_use();
+        note("reopen+switch", reopen_h, rss_now());
+        emit_heap("reopen", reopen_h);
+        expect_flat(edit_h, reopen_h, slack_reopen,
+                    "open_in_pane churn stays bounded");
+    }
+
+    after = heap_in_use();
+    note("destroyed", after, rss_now());
+    emit_heap("destroyed", after);
+    expect_flat(base, after, slack_gone, "workspace heap released");
+
+    if (fails) {
+        fprintf(stderr, "%d failure(s)\n", fails);
+        return 1;
+    }
+    printf("ws_mem_smoke ok  files=%d switch=%d jump=%d edit=%d reopen=%d\n",
+           WS_MEM_FILES, WS_MEM_SWITCH_ROUNDS, WS_MEM_JUMP_ROUNDS,
+           WS_MEM_EDIT_ROUNDS, WS_MEM_OPEN_ROUNDS);
+    return 0;
+}

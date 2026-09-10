@@ -1,9 +1,10 @@
 # Perf pins and dated results
 
-- `baseline.env` — regression ceilings for the 8 GiB fixture (`./make.shcc @perf_record`).
+- `baseline.env` — regression ceilings for the 8 GiB fixture timings and
+  `ws_mem_smoke` live-heap phases (`./make.shcc @perf_record`).
 - `results/baseline_results_YYYY_MM_DD.txt` — human table from
   `./make.shcc @perf` (or `scripts/perf_baseline.sh`): binary sizes, peak RSS per fixture,
-  then ops × sizes (ms).
+  ws_mem heap phases, then ops × sizes (ms).
 
 Fixtures (same ops, same byte distance):
 
@@ -24,3 +25,9 @@ minimum ms. RSS is `getrusage` max RSS after the first open and the
 process high-water mark (`rss_open` / `rss_peak`). Builds use
 `--release` unless `DEBUG=1`. Files above `RTX_LINE_SOFT_MIN` (256 KiB)
 stay progressive.
+
+`ws_mem_smoke` (also on `@smoke`): opens 8×512 KiB fixtures, switches
+bufs/panes, jumps, edit+undo, and `open_in_pane` churn (no save). Emits
+`RESULT size=ws_mem op=<phase> bytes=` live malloc (`heap_in_use`). Pins
+are `ws_mem_*_bytes` in `baseline.env`; switch/second-jump must stay flat
+inside the smoke itself.
