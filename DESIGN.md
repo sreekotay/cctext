@@ -45,8 +45,10 @@ Document’s page store is that epoch’s bytes (fds + LRU), not a peer
 epoch. Find / Layout / Workspace / Browse / Safe / TM / Frame are
 caches and stores — not kinds of camera. Find’s listing arm gives each
 lane cache replica a heap arena for the block window and hit offs
-(~4 MiB); that dies with the replica and is not the find store. Published
-hits stay on `d.find.store`.
+(~4 MiB). Island’s block loop and browse’s per-job scratch (ents/kids)
+use per-iteration heap arenas for their windows (browse grows by
+alloc+copy on that arena, same as published `br.ents`). Neither is the
+find store; published find hits stay on `d.find.store`.
 
 Analysis `secs` / `runs` / `tm_ckpt` and layout `rows` are Vecs on that
 epoch arena. Hist restore text / ins are session `vec_from` wraps.
