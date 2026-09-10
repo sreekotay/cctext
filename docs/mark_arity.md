@@ -35,7 +35,7 @@ are leftover for v1.
 | List | Prefix spans `[-*+]` / `[0-9]{1,9}[.]` / `[0-9]{1,9}[)]` … `\\n` | Landed. Indent is not in the hint. `***` / `---` do not plant. |
 | Task box | Match `\\[[ xX]\\]`, `apply: toggle`, `insert: "[ ]/[x]"` | Landed. 3-byte mark after the list prefix; trailing space required. `[X]` → `[ ]`. |
 | Pair marks | `begin`/`end` + `rtx_tm_add_span` `hint_a`/`hint_b` | Honest. Do not break. |
-| `replace_join` | Pair-only: a replace that touches a pair hint removes both hints. Prefix / path refuse partner union. | Landed. Rich-only; Source is plain `replace`. |
+| `replace_join` | Pair-only: a replace that touches a pair hint removes both hints. Prefix / path refuse partner union. | Landed. Rich panes via `rtx_buf_pair_replace`; Source is plain `replace`. Always one `replace`. |
 | Reveal / snap | `RtxDoc_mark_at` = that run; backspace on a pair hint → `replace_join`; prefix opener → apply | Landed. Per-run reveal is why path is two runs, not one run + face id. |
 | Inline link | Two spans: label `begin` `[` `end` `](`; dest `begin` `](` `end` `)` | Landed. Label `hint_a='['` `hint_b=0`; dest `hint_a=']('` `hint_b=')'`. Glue: label closer starts dest. Inners on the label. Wrap is `[sel]()`. |
 

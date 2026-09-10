@@ -30,9 +30,14 @@ Destroy / invalidate join with `cc__parallel_cancel_tree` +
 Do not Vec `ws.bufs`, `find.offs`, `browse.ents`, or `hist.recs` — grow
 would destroy live docs, publish dest-live, or drop session wraps. Those
 stay raw + `cc_arena_realloc`. Hist text / ins are session `vec_from`
-wraps: assign a new `from`, do not store `.len`.
+wraps: assign a new `from`, do not store `.len`. Find lane scratch (block
+window + hit offs) lives on a per-lane heap arena in the `@parallel`
+cache replica, not malloc — leaving arena / dest-live surfaces for
+malloc is a regression unless the scratch dies with its arm.
 
 `ui.cch` is owned by `ui.ccs` (`rtx_ui`). `ui_types.cch` is decls;
 gutter / rail / blink bodies live in `workspace.ccs`. Tree chapters
 (`piece_tree_rb.cch`, `piece_tree_lines.cch`, `piece_tree_priv.cch`)
-are not TUs — include them only from `piece_tree.ccs`.
+are not TUs — include them only from `piece_tree.ccs`. Pair-join edit
+paths go through `rtx_buf_pair_replace` (Rich pane); `RtxDoc_replace_join`
+is markup policy on top of one `replace`, not a second write.

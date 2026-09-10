@@ -2,6 +2,14 @@
 
 One document core, two frontends (`cctext`, `cctext-gui`). Memory is owned or it is a view. Lifetime is a field, not a protocol. The document type is as wide as the domain — a face is reach at the call site, not a smaller struct. Epochs say what dies when; faces say what this call may do. A TU’s write is the function that accepts only legal values for that unit; that is what the header exports. Ownership is handled at the call site.
 
+ccc enforces Result use, dest-live join, and face ownership. Product
+shapes (one write, window lex, markup arity, no Vec on live buffers,
+cooperative pumps) are author law in this file and FRICTION.md.
+Application policy (pair join, apply) sits on `replace` and is not a
+language type — Rich panes reach it through the buf helper; do not treat
+`replace_join` as a second write. Leaving arena / dest-live surfaces for
+malloc is a regression unless the scratch dies with its arm.
+
 ## Locality
 
 Construct, use, `@destroy`. The reader sees the epoch change. A constructor does not tear down a live object. Reopen is two lines:
@@ -35,9 +43,10 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 
 Document’s page store is that epoch’s bytes (fds + LRU), not a peer
 epoch. Find / Layout / Workspace / Browse / Safe / TM / Frame are
-caches and stores — not kinds of camera. Find’s listing arm may use a
-call-local heap (~4 MiB) that dies with the block; that is not the find
-store.
+caches and stores — not kinds of camera. Find’s listing arm gives each
+lane cache replica a heap arena for the block window and hit offs
+(~4 MiB); that dies with the replica and is not the find store. Published
+hits stay on `d.find.store`.
 
 Analysis `secs` / `runs` / `tm_ckpt` and layout `rows` are Vecs on that
 epoch arena. Hist restore text / ins are session `vec_from` wraps.
@@ -319,8 +328,10 @@ that sentence — they do not use this join; see
 [docs/mark_arity.md](docs/mark_arity.md). Implement the pair rule where
 clusters already are: an atom-length beside `rtx_utf8_cluster`, consumed
 by motion, selection, delete, wrap, and hit; gated on a per-fill
-`has_marks` so a plain file never pays. Source mode (`layout.rich == 0`)
-has no hint atoms — hints are plain bytes. See
+`has_marks` so a plain file never pays. The write path is
+`RtxDoc_replace_join` (always one `replace`); Rich panes call it via
+`rtx_buf_pair_replace`, Source mode (`layout.rich == 0`) has no hint
+atoms — hints are plain bytes. See
 [docs/md_view.md](docs/md_view.md).
 
 **Discover vs transform.** Nav (`Ctrl-K/P`) steps among marks that already

@@ -9,13 +9,15 @@
  */
 #include <ccc/std/prelude.cch>
 #include <limits.h>
-#include <stdlib.h>
 #include <string.h>
 #include "document.cch"
 #include "find.cch"
 #include "rtx_par.cch"
 
+/* Lane scratch: each @parallel cache replica owns a heap arena (buf + hit
+ * offs). Published hits stay on find.store. */
 typedef struct {
+    CCArena arena;
     char *buf;
     size_t *hits;
     size_t hit_cap;
@@ -157,19 +159,32 @@ static size_t rtx_find_window_adv(size_t got, size_t qn, int last) {
 }
 
 static int rtx_find_scratch_ensure(RtxFindScratch *s) {
+    size_t need;
     if (!s) return 0;
     if (s->buf) return 1;
-    s->buf = (char *)malloc((size_t)RTX_FIND_BLOCK + (size_t)RTX_FIND_QMAX);
+    if (!s->arena.base) {
+        /* Block window + hit growth (~4 MiB; DESIGN Find epoch). */
+        s->arena = cc_arena_heap((size_t)RTX_FIND_BLOCK + megabytes(1));
+        if (!s->arena.base) return 0;
+    }
+    need = (size_t)RTX_FIND_BLOCK + (size_t)RTX_FIND_QMAX;
+    s->buf = (char *)cc_arena_alloc(s->arena, need, 1);
     return s->buf != NULL;
 }
 
 static int rtx_find_scratch_hit(RtxFindScratch *s, size_t *n, size_t off) {
-    if (!s || !n) return 0;
+    size_t c, elem;
+    void *p;
+    if (!s || !n || !s->arena.base) return 0;
     if (*n >= s->hit_cap) {
-        size_t c = s->hit_cap ? s->hit_cap * 2 : 64;
-        size_t *p = (size_t *)realloc(s->hits, c * sizeof(size_t));
+        c = s->hit_cap ? s->hit_cap * 2 : 64;
+        if (c > (size_t)RTX_FIND_MAX) c = (size_t)RTX_FIND_MAX;
+        if (*n >= c) return 0;
+        elem = sizeof(size_t);
+        p = cc_arena_realloc(s->arena, s->arena, s->hits, s->hit_cap * elem,
+                             c * elem, 8);
         if (!p) return 0;
-        s->hits = p;
+        s->hits = (size_t *)p;
         s->hit_cap = c;
     }
     s->hits[(*n)++] = off;
@@ -269,8 +284,7 @@ static int rtx_find_run(RtxDoc *d) {
             return 0;
         }
         RtxFindScratch slot = {0} @destroy {
-            if (slot.buf) free(slot.buf);
-            if (slot.hits) free(slot.hits);
+            if (slot.arena.base) slot.arena.destroy();
         };
         CCArena ta = cc_arena_heap(kilobytes(64)) @destroy;
         CCTurnstile ts@(RTX_FIND_CAP, 1, ta) !> @destroy;
