@@ -32,10 +32,10 @@ would destroy live docs, publish dest-live, or drop session wraps. Those
 stay raw + `cc_arena_realloc`. Hist text / ins are session `vec_from`
 wraps: assign a new `from`, do not store `.len`. Find lane scratch (block
 window + hit offs) lives on a per-lane heap arena in the `@parallel`
-cache replica; island’s 2 MiB read window and browse job scratch
-(ents/kids) are per-iteration heap arenas (not malloc) — leaving arena /
-dest-live surfaces for malloc is a regression unless the scratch dies
-with its arm.
+cache replica; island / browse / nav / line-index splice / save pin / MD
+col rewrite scratch are short-lived heap arenas (not malloc) — leaving
+arena / dest-live surfaces for malloc is a regression unless the scratch
+dies with its arm.
 
 `ui.cch` is owned by `ui.ccs` (`rtx_ui`). `ui_types.cch` is decls;
 gutter / rail / blink bodies live in `workspace.ccs`. Tree chapters
