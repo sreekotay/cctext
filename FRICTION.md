@@ -45,6 +45,14 @@ arenas).
 lockstep with `browse.cch` — a shorter layout silently wins and
 misaligns `hold_a`.
 
+CCC nursery worker-frees: wait must not `free` until the last child's
+`wake_all` finishes (`wake_published` handoff in `cc/runtime/nursery.c`).
+Without that, `@smoke_asan` hits `heap-use-after-free` in
+`wake_primitive_wake_all` from browse/isle `@parallel wait`. Install a
+CCC build that includes the handoff. Remaining ASan `unknown-crash` on
+exclusive/turnstile wake under fibers is the usual Darwin fiber-stack
+false positive (see concurrent-c `docs/sanitizers.md`).
+
 `ui.cch` is owned by `ui.ccs` (`rtx_ui`). `ui_types.cch` is decls;
 gutter / rail / blink bodies live in `workspace.ccs`. Tree chapters
 (`piece_tree_rb.cch`, `piece_tree_lines.cch`, `piece_tree_priv.cch`)
