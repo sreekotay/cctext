@@ -35,6 +35,25 @@ the identical source passed in 3 s; a minimal repro of the new code (UFCS
 call under `!` / `&&` with `&lo, &hi` args) lowers fine. Treat a silent
 multi‑minute lower as contention first: check `pgrep -fl shadow_lower`.
 
+## Clean lowerer `--root` is the compiler install (2026-09-18)
+
+`ccc 0.4.0-415` (`--lowerer=clean`) invokes `cclower_cc --root ~/.local`.
+A quoted header that resolves outside that prefix and outside the
+including file's directory is rejected (`cannot place its lowered form`),
+so `frontend/` → `../core/` includes fail. `scripts/cclower_root.py`
+rewrites `--root` to the directory that contains `build.cc`. `make.shcc`
+sets `CC_CLEAN_TOOL` to that wrapper.
+
+A type tag may be introduced in only one file. `struct RtxNode;` in
+`piece_tree.cch` plus the body in `piece_tree_priv.cch` is still two
+definitions (`cannot extract piece_tree_rb.cch`). The node type lives
+in `piece_tree.cch` only.
+
+`!>;` / `@err` need an `@errhandler` in scope. An `@errhandler` that
+unwraps nothing is an error. UFCS inside a function-pointer call
+(`m->measure(ctx, bytes.sub(...), d->style_at(...))`) is not rewritten;
+bind the slice and style first.
+
 ## Field UFCS on a Vec member
 
 `d->runs.truncate(n)` / `L->rows.clear()` — method is on the Vec field,

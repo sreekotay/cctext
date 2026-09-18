@@ -1,4 +1,4 @@
-// cctext core tests + console + Cocoa GUI (cctext-gui).
+// cctext core tests + console + Cocoa GUI (cctext-gui) + libui GUI (cctext-ui).
 //
 //   ./make.shcc @smoke
 //   ./make.shcc @cctext
@@ -191,3 +191,7 @@ CC_TARGET_DEPS rtx_gui_input rtx_ui
 CC_TARGET cctext_gui exe frontend/gui.ccs
 CC_TARGET_INCLUDE cctext_gui .
 CC_TARGET_DEPS cctext_gui rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui rtx_ui_help rtx_gui_osx rtx_gui_chrome rtx_gui_draw rtx_gui_input
+
+CC_TARGET cctext_ui exe frontend/ui.ccs
+CC_TARGET_INCLUDE cctext_ui .
+CC_TARGET_DEPS cctext_ui rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui rtx_ui_help rtx_gui_chrome rtx_gui_draw rtx_gui_input
