@@ -52,9 +52,10 @@ find store; published find hits stay on `d.find.store`.
 
 Analysis `secs` / `runs` / `tm_ckpt` and layout `rows` are Vecs on that
 epoch arena. Hist restore text / ins are session `vec_from` wraps.
-Do not Vec `ws.bufs`, `find.hits`, `browse.ents`, or `hist.recs` — those
+Do not Vec `find.hits`, `browse.ents`, or `hist.recs` — those
 stay raw and grow with `cc_arena_realloc` in their TU (Vec grow would
-destroy live docs, publish dest-live, or drop session wraps).
+publish dest-live or drop session wraps). `ws.bufs` is a table of
+`RtxBuf *`, each allocated once.
 
 ## Interactive
 

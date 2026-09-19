@@ -19,8 +19,8 @@ The handle owner and the worker argument must be different names.
 first (`RtxDoc *scan = d`), the way browse stores the handle on `wk->h`
 and passes `br`.
 
-Destroy / invalidate join with `cc__parallel_cancel_tree` + `cc_parallel_join`,
-not UFCS `h.wait() !>`.
+Destroy / drop: resume if paused, then `h.invalidate()`. `.wait()` does
+not unpause and does not cancel adopted children.
 
 ## Long string literal in a local initializer is truncated
 

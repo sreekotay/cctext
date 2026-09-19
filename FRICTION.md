@@ -18,19 +18,16 @@ and must outlive `.wait()`. Do not assign a worker arm to a stack `int`
 loops use `for`, not `@for`. `.wait()` does not unpause — resume first
 if a write-stage honor is parked.
 
-`v->len - n` as a standalone expression is a shrink (`.len` is
-read-only). Copy `.len` into a local first. `v->data[v->len - 1]` as
-an index is fine.
-
-Destroy / invalidate join with `cc__parallel_cancel_tree` +
-`cc_parallel_join`, not UFCS `h.wait() !>`.
+Destroy / drop: resume if paused, then `h.invalidate()` (cancels the
+tree, then joins). `.wait()` does not cancel adopted children.
 
 ## cctext
 
-Do not Vec `ws.bufs`, `find.hits`, `browse.ents`, or `hist.recs` — grow
-would destroy live docs, publish dest-live, or drop session wraps. Those
-stay raw + `cc_arena_realloc` (`ws.bufs` on `w->session`; browse hold on
-`hold_a`). Browse walk (`RtxBrowseWalk`) stays `calloc` — it embeds
+Do not Vec `find.hits`, `browse.ents`, or `hist.recs` — grow
+would publish dest-live or drop session wraps. Those stay raw +
+`cc_arena_realloc` (`browse.ents` on `hold_a`). `ws.bufs` is a table of
+`RtxBuf *`; each buffer is allocated once, so growing the table does not
+move a document a find or island already holds. Browse walk (`RtxBrowseWalk`) stays `calloc` — it embeds
 `CCParallel` and must not live in a bump arena. Hist text / ins are session
 `vec_from` wraps: assign a new `from`, do not store `.len`. Find lane
 scratch (block window + hit offs) lives on a per-lane heap arena in the
@@ -40,11 +37,6 @@ short-lived heap arenas (not malloc) — leaving arena / dest-live surfaces
 for malloc is a regression unless the scratch dies with its arm. Host ObjC
 clipboard cache in `gui_plat.m` stays process-local `realloc` (outside CC
 arenas).
-`RtxBrowse` is duplicated under `RTX_BROWSE_TYPES` in `workspace.cch`
-(lowering needs the enums before `RtxBrowsePrev`); keep that copy in
-lockstep with `browse.cch` — a shorter layout silently wins and
-misaligns `hold_a`.
-
 CCC nursery worker-frees: wait must not `free` until the last child's
 `wake_all` finishes (`wake_published` handoff in `cc/runtime/nursery.c`).
 Without that, `@smoke_asan` hits `heap-use-after-free` in
