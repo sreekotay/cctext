@@ -27,7 +27,7 @@ Destroy / invalidate join with `cc__parallel_cancel_tree` +
 
 ## cctext
 
-Do not Vec `ws.bufs`, `find.offs`, `browse.ents`, or `hist.recs` — grow
+Do not Vec `ws.bufs`, `find.hits`, `browse.ents`, or `hist.recs` — grow
 would destroy live docs, publish dest-live, or drop session wraps. Those
 stay raw + `cc_arena_realloc` (`ws.bufs` on `w->session`; browse hold on
 `hold_a`). Browse walk (`RtxBrowseWalk`) stays `calloc` — it embeds

@@ -33,7 +33,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Document | piece-tree arena + page-store arena (fds + LRU page pool) | `RtxDoc.destroy()` |
 | Session | `d.session` | close (path, undo) |
 | Analysis | `d.analysis` | `analysis.reset()` on reparse |
-| Find | `d.find.store` (query + offs) | new query resets; `RtxDoc.destroy()`; edit invalidates offsets |
+| Find | `d.find.store` (query + hits) | new query resets; `RtxDoc.destroy()`; edit invalidates offsets |
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs, clipboard) |
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
@@ -52,7 +52,7 @@ find store; published find hits stay on `d.find.store`.
 
 Analysis `secs` / `runs` / `tm_ckpt` and layout `rows` are Vecs on that
 epoch arena. Hist restore text / ins are session `vec_from` wraps.
-Do not Vec `ws.bufs`, `find.offs`, `browse.ents`, or `hist.recs` — those
+Do not Vec `ws.bufs`, `find.hits`, `browse.ents`, or `hist.recs` — those
 stay raw and grow with `cc_arena_realloc` in their TU (Vec grow would
 destroy live docs, publish dest-live, or drop session wraps).
 
@@ -187,7 +187,7 @@ over directory jobs: collect is ticket-local, the write stage appends
 ents / child jobs and walks `jhead`. Gutters stay `+N` / `-L` until
 they meet the prefix. `isle_step` kicks if the handle is down — the
 host does not walk the island on the UI thread. Kick `@serial` is empty
-so the workers are the scan. Query copy and hit offsets stay on
+so the workers are the scan. Query copy and hit offsets and lines stay on
 `d.find.store` and die with the document. A longer prefix query filters
 hits and keeps `scan_off`; a cap resumes from the last accepted hit; a
 shorter or non-prefix query resets. `find_apply` plants via `find_set`.
