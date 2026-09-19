@@ -1,0 +1,266 @@
+/*
+ * Row-diff must survive a key that touches the line index.
+ *
+ * A file above RTX_LINE_SOFT_MIN stays progressive. line_start of a line
+ * already scanned still calls busy-end. The TUI hook drops the frame
+ * cache, so the next paint emits every row. Arrow right does not scan;
+ * down and type do. Capture stdout around cctext_draw and require those
+ * frames to stay a fraction of the first.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+#include "../core/browse.cch"
+#include "../frontend/cctext.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+int g_mouse_col;
+int g_mouse_row;
+int g_mouse_press;
+int g_mouse_drag;
+int g_drag_edge;
+int g_field_drag;
+int g_shift;
+int g_alt;
+int g_ctrl;
+int g_nav;
+char g_status[160];
+
+int cctext_pending(void) { return 0; }
+
+int cctext_decode_utf8(int lead, uint32_t *cp) {
+    (void)lead;
+    if (cp) *cp = 0;
+    return 0;
+}
+
+int cctext_osx_shift_down(void) { return 0; }
+int cctext_osx_alt_down(void) { return 0; }
+
+/* Same cache drop as cctext_busy: every signal, including a null label. */
+static void test_busy(void *ctx, const char *label, int pct) {
+    (void)ctx;
+    (void)label;
+    (void)pct;
+    cctext_draw_invalidate();
+}
+
+static double meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return (double)bytes.len;
+}
+
+static double lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+static int write_lines(const char *path, int n) {
+    FILE *f;
+    int i;
+    f = fopen(path, "w");
+    if (!f) return 0;
+    for (i = 0; i < n; i++) {
+        if (fputs("xxxxxxxx\n", f) < 0) {
+            fclose(f);
+            return 0;
+        }
+    }
+    if (fclose(f) != 0) return 0;
+    return 1;
+}
+
+static void !>(CCError) paint_turn(RtxWs *w, RtxMeasure *m, RtxUi *ui,
+                                   int kind, int ch, int rows, int cols) {
+    RtxBuf *act;
+    int vis = rows - 1;
+    int skip = 0;
+    int pcols;
+    int held;
+    @errhandler(CCError e) { return cc_err(e); }
+    if (vis < 1) vis = 1;
+    act = w->active();
+    if (!act) return cc_err(CC_ERR_INVALID_ARG, "no buf");
+    cctext_handle_input(w, act, m, ui, kind, ch, vis, cols, &skip);
+    held = w->hold_pane(0);
+    if (!skip) cctext_ensure_caret(act, vis);
+    pcols = cctext_pane_cols(w, cols, 0);
+    act->ensure_view(m, (double)cctext_text_cols(act, pcols, vis), vis) !>;
+    w->drop_pane(0, held);
+    return cc_ok();
+}
+
+static size_t capture_draw(RtxWs *w, RtxUi *ui, int rows, int cols) {
+    FILE *saved;
+    FILE *cap;
+    char *buf = NULL;
+    size_t n = 0;
+    fflush(stdout);
+    cap = open_memstream(&buf, &n);
+    if (!cap) return 0;
+    saved = stdout;
+    stdout = cap;
+    cctext_draw(w, ui, rows, cols);
+    fflush(stdout);
+    stdout = saved;
+    fclose(cap);
+    free(buf);
+    return n;
+}
+
+static int count_hdr_bg(const char *buf, size_t n) {
+    int c = 0;
+    size_t i;
+    if (!buf) return 0;
+    for (i = 0; i + 8 <= n; i++) {
+        if (memcmp(buf + i, "48;5;236", 8) == 0) c++;
+    }
+    return c;
+}
+
+static int capture_hdr_bg(RtxWs *w, RtxUi *ui, int rows, int cols) {
+    FILE *saved;
+    FILE *cap;
+    char *buf = NULL;
+    size_t n = 0;
+    int c;
+    fflush(stdout);
+    cap = open_memstream(&buf, &n);
+    if (!cap) return 0;
+    saved = stdout;
+    stdout = cap;
+    cctext_draw(w, ui, rows, cols);
+    fflush(stdout);
+    stdout = saved;
+    fclose(cap);
+    c = count_hdr_bg(buf, n);
+    free(buf);
+    return c;
+}
+
+static void expect_frac(size_t n, size_t first, const char *msg) {
+    if (first < 3 || n >= first / 3) {
+        fprintf(stderr, "FAIL: %s (%zu bytes, first frame %zu)\n",
+                msg, n, first);
+        fails++;
+    }
+}
+
+int main(void) {
+    const int rows = 24;
+    const int cols = 80;
+    char path[64];
+    char *paths[1];
+    size_t first, right, down, typed;
+    rtx_safe_test_isol();
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    snprintf(path, sizeof(path), "testdata/generated/draw_diff.txt");
+    if (!write_lines(path, 40000)) {
+        fprintf(stderr, "FAIL: write %s\n", path);
+        return 1;
+    }
+    {
+        RtxWs w = {0} @destroy;
+        RtxUi ui = {0};
+        RtxMeasure m;
+        RtxBuf *b;
+        m.measure = meas;
+        m.line_height = lh;
+        m.ctx = NULL;
+        paths[0] = path;
+        w.open_files(1, paths) !>;
+        w.busy_bind(test_busy, NULL);
+        b = w.active();
+        expect(b != NULL, "opened");
+        if (!b) {
+            unlink(path);
+            return 1;
+        }
+        b->layout.wrap = 1;
+        expect(b->doc.len() > (size_t)RTX_LINE_SOFT_MIN, "above soft min");
+        expect(!RtxPieceTree_lf_ready(&b->doc.tree), "index still progressive");
+        paint_turn(&w, &m, &ui, KEY_NONE, 0, rows, cols) !>;
+        expect(!RtxPieceTree_lf_ready(&b->doc.tree), "window scan did not finish the file");
+        first = capture_draw(&w, &ui, rows, cols);
+        expect(first > 500, "first frame is a full paint");
+        paint_turn(&w, &m, &ui, KEY_RIGHT, 0, rows, cols) !>;
+        right = capture_draw(&w, &ui, rows, cols);
+        paint_turn(&w, &m, &ui, KEY_DOWN, 0, rows, cols) !>;
+        down = capture_draw(&w, &ui, rows, cols);
+        paint_turn(&w, &m, &ui, KEY_CHAR, 'z', rows, cols) !>;
+        typed = capture_draw(&w, &ui, rows, cols);
+        expect_frac(right, first, "arrow right stays a diff");
+        expect_frac(down, first, "arrow down stays a diff");
+        expect_frac(typed, first, "type stays a diff");
+    }
+    {
+        RtxWs w = {0} @destroy;
+        RtxMeasure m;
+        int cols = 80;
+        int list_w;
+        int got;
+        m.measure = meas;
+        m.line_height = lh;
+        m.ctx = NULL;
+        w.add_empty() !>;
+        w.npanes = 1;
+        w.focus = 0;
+        w.pane[0] = 0;
+        w.nav[0].on = 1;
+        list_w = rtx_browse_list_cols_at(cols, 0);
+        g_mouse_row = 4;
+        g_mouse_col = 1 + list_w;
+        cctext_hit(&w, &m, cols, 24, 0);
+        g_mouse_col = 1 + 36;
+        cctext_hit(&w, &m, cols, 24, 1);
+        got = rtx_browse_list_cols_at(cols, w.browse_split[0]);
+        expect(got == 36, "drag moves the browse divider");
+    }
+    {
+        RtxWs w = {0} @destroy;
+        RtxUi ui = {0};
+        RtxMeasure m;
+        RtxBuf *b;
+        char *paths[1];
+        char csv[64];
+        m.measure = meas;
+        m.line_height = lh;
+        m.ctx = NULL;
+        snprintf(csv, sizeof(csv), "testdata/grid_rfc.csv");
+        paths[0] = csv;
+        w.open_files(1, paths) !>;
+        b = w.active();
+        expect(b != NULL, "csv opened");
+        if (b) {
+            rtx_layout_set_view(&b->layout, RTX_VIEW_GRID);
+            paint_turn(&w, &m, &ui, KEY_NONE, 0, 24, 80) !>;
+            expect(capture_hdr_bg(&w, &ui, 24, 80) > 4,
+                   "grid header keeps the frozen bar");
+        }
+    }
+    unlink(path);
+    if (fails) return 1;
+    return 0;
+}

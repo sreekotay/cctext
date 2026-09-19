@@ -81,7 +81,7 @@ CC_TARGET_DEPS piece_tree_smoke rtx_piece_tree
 
 CC_TARGET utf8_cluster_smoke exe tests/utf8_cluster_smoke.ccs
 CC_TARGET_INCLUDE utf8_cluster_smoke .
-CC_TARGET_DEPS utf8_cluster_smoke rtx_piece_tree rtx_nav rtx_scope rtx_document
+CC_TARGET_DEPS utf8_cluster_smoke rtx_piece_tree rtx_nav rtx_scope rtx_find rtx_document
 
 CC_TARGET layout_measure_smoke exe tests/layout_measure_smoke.ccs
 CC_TARGET_INCLUDE layout_measure_smoke .
@@ -98,6 +98,10 @@ CC_TARGET_DEPS find_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_brows
 CC_TARGET host_turn_smoke exe tests/host_turn_smoke.ccs
 CC_TARGET_INCLUDE host_turn_smoke .
 CC_TARGET_DEPS host_turn_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
+
+CC_TARGET draw_diff_smoke exe tests/draw_diff_smoke.ccs
+CC_TARGET_INCLUDE draw_diff_smoke .
+CC_TARGET_DEPS draw_diff_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui rtx_ui_help rtx_cctext_draw rtx_cctext_grid_draw rtx_cctext_input
 
 CC_TARGET large_file_smoke exe tests/large_file_smoke.ccs
 CC_TARGET_INCLUDE large_file_smoke .

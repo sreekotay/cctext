@@ -301,9 +301,12 @@ static void rtx_ws_write_ws(RtxWs *w) {
     ws.focus = w->focus;
     ws.pane0 = w->pane[0];
     ws.pane1 = w->pane[1];
+    ws.split0 = w->browse_split[0];
+    ws.split1 = w->browse_split[1];
     ws.n = n;
     ws.ents = ents;
     rtx_safe_ws_write(&ws);
+    w->browse_split_dirty = 0;
 }
 
 void !>(CCError) RtxWs_sync_live(RtxWs *w) {
@@ -329,7 +332,13 @@ void RtxWs_safe_flush_all(RtxWs *w) {
 }
 
 void RtxWs_safe_flush_exit(RtxWs *w) {
-    if (!w || w->any_dirty()) return;
+    if (!w) return;
+    /* Divider is a preference, not an edit. A dirty quit still skips the
+     * buffer journals, but a drag that has not debounced yet must land. */
+    if (w->any_dirty()) {
+        if (w->browse_split_dirty) rtx_ws_write_ws(w);
+        return;
+    }
     RtxWs_safe_flush_all(w);
 }
 
@@ -346,6 +355,10 @@ void RtxWs_safe_pump(RtxWs *w) {
     long now;
     if (!w) return;
     now = rtx_ws_now_ms();
+    if (w->browse_split_dirty && now >= w->browse_split_due) {
+        rtx_ws_write_ws(w);
+        w->browse_split_due = now + (long)RTX_SAFE_DEBOUNCE_MS;
+    }
     for (i = 0; i < w->len; i++) {
         RtxBuf *b = w->bufs[i];
         uint64_t sig;
@@ -635,6 +648,19 @@ void RtxWs_busy_bind(RtxWs *w, RtxBusyFn fn, void *ctx) {
     }
 }
 
+static void rtx_ws_load_browse_split(RtxWs *w) {
+    CCArena hold;
+    RtxSafeWs snap;
+    if (!w) return;
+    hold = cc_arena_heap(kilobytes(8));
+    if (!hold.base) return;
+    if (rtx_safe_ws_read(&snap, hold)) {
+        w->browse_split[0] = snap.split0;
+        w->browse_split[1] = snap.split1;
+    }
+    hold.destroy();
+}
+
 void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
     int i;
     if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
@@ -646,9 +672,13 @@ void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
     w->pane[1] = 0;
     if (npaths <= 0) {
         CCArena hold = cc_arena_heap(kilobytes(8));
-        RtxSafeWs snap;
+        RtxSafeWs snap = {0};
         int restored = 0;
-        if (hold.base && rtx_safe_ws_read(&snap, hold) && snap.n) {
+        if (hold.base && rtx_safe_ws_read(&snap, hold)) {
+            w->browse_split[0] = snap.split0;
+            w->browse_split[1] = snap.split1;
+        }
+        if (snap.ok && snap.n) {
             size_t k;
             for (k = 0; k < snap.n; k++) {
                 struct stat st;
@@ -684,6 +714,7 @@ void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
         };
         return cc_ok();
     }
+    rtx_ws_load_browse_split(w);
     for (i = 0; i < npaths; i++) {
         if (rtx_path_is_dir(paths[i])) {
             if (!w->start_dir[0]) {
@@ -2973,6 +3004,9 @@ void RtxWs_browse_prev_toggle_wrap(RtxWs *w, int pane) {
 
 static void !>(CCError) rtx_ws_prev_fill(RtxBrowsePrev *p, RtxMeasure *m,
                                         double width, int vis) {
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
     if (!p || !p->live) return cc_ok();
     if (vis < 1) vis = 1;
     {
@@ -2994,6 +3028,10 @@ static void !>(CCError) rtx_ws_prev_fill(RtxBrowsePrev *p, RtxMeasure *m,
             if (p->cam.seek_valid) from = p->cam.seek_off;
             else if (p->cam.top_byte) from = p->cam.top_byte;
             else from = p->doc.caret;
+            /* Seek and caret sit on the selection. The first row is that
+             * whole line, not the tail after the caret. Grid snaps itself. */
+            if (!rtx_layout_is_grid(&p->layout))
+                from = rtx_doc_line_floor(&p->doc, from) !>;
             p->layout.fill_off(&p->doc, m, width, from, want) !>(e) {
                 return cc_err(e);
             };
