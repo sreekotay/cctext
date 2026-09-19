@@ -10,6 +10,7 @@
 #import <Cocoa/Cocoa.h>
 #include "gui_plat.h"
 #include "ui_hook.h"
+#include "ui_turn.h"
 #include "ui.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +39,7 @@ static uiMenu *g_apply_menu;
 static uiMenuItem *g_apply_item[16];
 static uiDrawContext *g_ctx;
 static void (*g_paint)(void);
+static RtxUiTurn g_turn_state;
 static void (*g_live_resize)(void);
 
 static int g_ww = 960, g_hh = 640;
@@ -153,15 +155,20 @@ static void note_key(uiAreaKeyEvent *e) {
     sync_mods(m);
     if (e->Modifier && !e->Key && !e->ExtKey) return;
     k = key_of(e);
-    if (k < 0 || k >= UI_KEY_MAX) return;
-    if (e->Up) {
-        g_key_down[k] = 0;
+    if (k >= 0 && k < UI_KEY_MAX) {
+        if (e->Up) {
+            g_key_down[k] = 0;
+            return;
+        }
+        if (g_key_down[k]) g_key_repeat[k] = 1;
+        else g_key_pressed[k] = 1;
+        g_key_down[k] = 1;
+        if (k == g_exit_key) g_should_close = 1;
+    } else if (e->Up) {
         return;
     }
-    if (g_key_down[k]) g_key_repeat[k] = 1;
-    else g_key_pressed[k] = 1;
-    g_key_down[k] = 1;
-    if (k == g_exit_key) g_should_close = 1;
+    /* Space, '*', '>', etc. are not raylib keys. Still queue the character
+     * or the edit lands and g_dirty never sees it. */
     push_typed_char(e);
 }
 
@@ -183,10 +190,13 @@ static void on_draw(uiAreaHandler *h, uiArea *a, uiAreaDrawParams *p) {
     g_ctx = NULL;
 }
 
+static int script_open(void);
+
 static void on_mouse(uiAreaHandler *h, uiArea *a, uiAreaMouseEvent *e) {
     (void)h;
     (void)a;
     if (!e) return;
+    if (script_open()) return;
     g_mouse_x = (int)e->X;
     g_mouse_y = (int)e->Y;
     if (e->Down == 1) {
@@ -216,6 +226,9 @@ static void on_drag_broken(uiAreaHandler *h, uiArea *a) {
 static int on_key(uiAreaHandler *h, uiArea *a, uiAreaKeyEvent *e) {
     (void)h;
     (void)a;
+    /* A scripted session injects its own edges. Real keydowns (the window
+     * is key) would land in the document beside the script. */
+    if (script_open()) return 1;
     note_key(e);
     return 1;
 }
@@ -382,6 +395,116 @@ static int g_dlg = -1;
 static int g_dlg_open;
 static uiWindow *g_dlg_win;
 
+/* RTX_UI_SCRIPT plays one line per frame into the same key edges the
+ * area handler fills. macOS denies System Events keystrokes, so a
+ * session check cannot use them. `dlg` is read by the modal loop. */
+static FILE *g_script;
+static int g_script_have;
+static int g_script_wait;
+static int g_script_super;
+static char g_script_line[96];
+
+static void script_note(const char *msg) {
+    const char *path = getenv("RTX_UI_LOG");
+    FILE *fp;
+    if (!path || !path[0] || !msg) return;
+    fp = fopen(path, "a");
+    if (!fp) return;
+    fprintf(fp, "%s\n", msg);
+    fclose(fp);
+}
+
+static int script_open(void) {
+    const char *path;
+    if (g_script) return 1;
+    path = getenv("RTX_UI_SCRIPT");
+    if (!path || !path[0]) return 0;
+    g_script = fopen(path, "r");
+    return g_script != NULL;
+}
+
+static int script_pull(void) {
+    if (g_script_have) return 1;
+    if (!script_open()) return 0;
+    while (fgets(g_script_line, sizeof g_script_line, g_script)) {
+        char *s = g_script_line;
+        size_t n;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == 0 || *s == '#' || *s == '\n' || *s == '\r') continue;
+        if (s != g_script_line) memmove(g_script_line, s, strlen(s) + 1);
+        n = strlen(g_script_line);
+        while (n && (g_script_line[n - 1] == '\n' || g_script_line[n - 1] == '\r'))
+            g_script_line[--n] = 0;
+        g_script_have = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static void script_arm_frame(void) {
+    if (g_script_super) {
+        g_key_down[KEY_LEFT_SUPER] = 0;
+        g_script_super = 0;
+    }
+    if (g_script_wait > 0) {
+        g_script_wait--;
+        return;
+    }
+    if (!script_pull()) return;
+    script_note(g_script_line);
+    if (strncmp(g_script_line, "dlg", 3) == 0) return;
+    if (strcmp(g_script_line, "enter") == 0) {
+        g_key_pressed[KEY_ENTER] = 1;
+        g_script_have = 0;
+        return;
+    }
+    if (strncmp(g_script_line, "wait ", 5) == 0) {
+        g_script_wait = atoi(g_script_line + 5);
+        g_script_have = 0;
+        if (g_script_wait > 0) g_script_wait--;
+        return;
+    }
+    if (strncmp(g_script_line, "key ", 4) == 0 && g_script_line[4]) {
+        int ch = (unsigned char)g_script_line[4];
+        if (g_nchar < 64) g_chars[g_nchar++] = ch;
+        g_script_have = 0;
+        return;
+    }
+    if (strncmp(g_script_line, "esc", 3) == 0) {
+        g_key_pressed[KEY_ESCAPE] = 1;
+        g_script_have = 0;
+        return;
+    }
+    if (strncmp(g_script_line, "cmd ", 4) == 0 && g_script_line[4]) {
+        int ch = g_script_line[4];
+        int k = (ch >= 'a' && ch <= 'z') ? ch - 'a' + 'A' : ch;
+        g_key_down[KEY_LEFT_SUPER] = 1;
+        g_script_super = 1;
+        if (k >= 0 && k < UI_KEY_MAX) g_key_pressed[k] = 1;
+        g_script_have = 0;
+        return;
+    }
+    g_script_have = 0;
+}
+
+static void script_dialog(void) {
+    if (g_script_wait > 0) {
+        g_script_wait--;
+        return;
+    }
+    if (!script_pull()) return;
+    if (strncmp(g_script_line, "wait ", 5) == 0) {
+        g_script_wait = atoi(g_script_line + 5);
+        g_script_have = 0;
+        return;
+    }
+    if (strncmp(g_script_line, "dlg", 3) == 0) {
+        g_dlg = atoi(g_script_line + 3);
+        g_script_have = 0;
+        script_note(g_script_line);
+    }
+}
+
 static int dlg_closing(uiWindow *w, void *data) {
     (void)w;
     (void)data;
@@ -428,8 +551,15 @@ static int dlg_choice(const char *title, const char *msg,
     uiBoxAppend(box, uiControl(row), 0);
     uiWindowSetMargined(w, 1);
     uiWindowSetChild(w, uiControl(box));
+    ui_turn(1);
     uiControlShow(uiControl(w));
-    while (g_dlg < 0) uiMainStep(1);
+    script_note(title ? title : "dialog");
+    while (g_dlg < 0) {
+        script_dialog();
+        if (g_dlg >= 0) break;
+        uiMainStep(1);
+    }
+    ui_turn(0);
     if (g_dlg_open) {
         g_dlg_open = 0;
         uiControlDestroy(uiControl(w));
@@ -680,21 +810,54 @@ static void clear_edges(void) {
     g_resized = 0;
 }
 
+/* libui's uiMainStep(1) blocks until an NSEvent and skips updateWindows
+ * when the queue is empty, so a setNeedsDisplay never hits the screen and
+ * NSTimer does not bring the host loop back. Drain with a deadline, and
+ * always updateWindows so the area's drawRect runs. */
+static void step_until(NSDate *until) {
+    ui_turn(1);
+    for (;;) {
+        @autoreleasepool {
+            NSEvent *e = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                            untilDate:until
+                                               inMode:NSDefaultRunLoopMode
+                                              dequeue:YES];
+            if (!e) {
+                [NSApp updateWindows];
+                break;
+            }
+            [NSApp sendEvent:e];
+            [NSApp updateWindows];
+            until = [NSDate distantPast];
+        }
+    }
+    ui_turn(0);
+}
+
 static void pump(int wait) {
-    int i, n;
-    n = wait ? 1 : 32;
-    for (i = 0; i < n; i++) uiMainStep(wait);
+    step_until(wait ? [NSDate distantFuture] : [NSDate distantPast]);
 }
 
 void ui_set_paint(void (*fn)(void)) { g_paint = fn; }
+
+void ui_set_turn(void (*fn)(int enter)) { g_turn_state.fn = fn; }
+
+void ui_turn(int enter) { rtx_ui_turn(&g_turn_state, enter); }
 
 void ui_sync_paint(void) {
     NSView *view;
     if (!g_area || !g_paint) return;
     view = (__bridge NSView *)(void *)uiControlHandle(uiControl(g_area));
     if (!view) return;
+    ui_turn(1);
     [view setNeedsDisplay:YES];
-    [view display];
+    if (view.window) [view.window displayIfNeeded];
+    else [NSApp updateWindows];
+    ui_turn(0);
+}
+
+int ui_chars_waiting(void) {
+    return g_char_rd < g_nchar;
 }
 
 void fb_set_live_resize(void (*fn)(void)) { g_live_resize = fn; }
@@ -775,6 +938,7 @@ void EndDrawing(void) { ui_sync_paint(); }
 void gui_input_begin_frame(void) {
     pump(0);
     wheel_commit();
+    script_arm_frame();
 }
 
 void gui_input_consume(void) { clear_edges(); }
@@ -782,8 +946,10 @@ void gui_input_consume(void) { clear_edges(); }
 void PollInputEvents(void) { pump(0); }
 
 void WaitTime(double seconds) {
-    (void)seconds;
-    pump(1);
+    NSDate *until;
+    if (seconds < 0) seconds = 0;
+    until = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    step_until(until);
 }
 
 void ClearBackground(Color color) {
@@ -998,7 +1164,9 @@ int gui_save_panel(const char *dir, char *out, size_t n) {
     (void)dir;
     if (!out || n == 0 || !g_window) return 0;
     out[0] = 0;
+    ui_turn(1);
     p = uiSaveFile(g_window);
+    ui_turn(0);
     if (!p) return 0;
     snprintf(out, n, "%s", p);
     uiFreeText(p);
@@ -1011,7 +1179,9 @@ int gui_osx_pick_file(const char *dir, char *out, size_t n) {
     if (!out || n == 0) return 0;
     out[0] = 0;
     if (!g_window) return -1;
+    ui_turn(1);
     p = uiOpenFile(g_window);
+    ui_turn(0);
     if (!p) return 0;
     snprintf(out, n, "%s", p);
     uiFreeText(p);

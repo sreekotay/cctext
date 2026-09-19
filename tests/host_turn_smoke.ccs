@@ -1,0 +1,314 @@
+/*
+ * Host turn, pause, and terminal spawn.
+ *
+ * Pause sets a flag and returns. It does not join. A write stage that
+ * already passed the pause check may still publish; the cursor is only
+ * required to move forward.
+ *
+ * The TUI blocks in read, which cannot re-enter. It pauses scans,
+ * samples the published browse window (not the in-stage ents), then
+ * resumes before read so the workers run during the wait.
+ *
+ * Cursor does not send System Events keystrokes (macOS denies them,
+ * error 1002). The opener is Terminal `do script` unless
+ * RTX_HOST_IDE_KEYS is set. osascript's own exit is the result.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "../core/workspace.cch"
+#include "../core/find.cch"
+#include "../core/browse.cch"
+#include "../core/rtx_par.cch"
+#include "../frontend/ui_turn.h"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static int g_enters;
+static int g_leaves;
+
+static void tally_turn(int enter) {
+    if (enter) g_enters++;
+    else g_leaves++;
+}
+
+static RtxWs *g_ws;
+
+static void turn_scans(int enter) {
+    rtx_ws_scans_set(g_ws, enter);
+}
+
+static size_t name_hits(const RtxBrowse *br, const char *need) {
+    const RtxBrowseEnt *ents;
+    size_t i, n = 0, len;
+    if (!br || !need) return 0;
+    ents = rtx_browse_view_ents(br);
+    len = rtx_browse_view_len(br);
+    if (!ents) return 0;
+    for (i = 0; i < len; i++) {
+        if (strstr(ents[i].name, need)) n++;
+    }
+    return n;
+}
+
+static int write_body(const char *path) {
+    FILE *fp;
+    char blk[1 << 20];
+    int i;
+    fp = fopen(path, "w");
+    if (!fp) return 0;
+    memset(blk, 'a', sizeof blk);
+    for (i = 0; i < 16; i++) {
+        if (fwrite(blk, 1, sizeof blk, fp) != sizeof blk) {
+            fclose(fp);
+            return 0;
+        }
+    }
+    fputs("needle", fp);
+    fclose(fp);
+    return 1;
+}
+
+static void turn_depth(void) {
+    RtxUiTurn t = {0};
+    g_enters = 0;
+    g_leaves = 0;
+    t.fn = tally_turn;
+    rtx_ui_turn(&t, 1);
+    rtx_ui_turn(&t, 1);
+    rtx_ui_turn(NULL, 1);
+    expect(g_enters == 1 && g_leaves == 0, "nested enter pauses once");
+    rtx_ui_turn(&t, 0);
+    expect(g_enters == 1 && g_leaves == 0, "inner leave does not resume");
+    rtx_ui_turn(&t, 0);
+    expect(g_enters == 1 && g_leaves == 1, "outermost leave resumes");
+    rtx_ui_turn(&t, 0);
+    expect(g_leaves == 1, "extra leave is a no-op");
+}
+
+static void host_identity(void) {
+    char dst[PATH_MAX];
+    expect(rtx_host_is_ray("cctext-ui"), "cctext-ui is windowed");
+    expect(rtx_host_is_ray("/tmp/cctext_ui"), "cctext_ui basename");
+    expect(!rtx_host_is_ray("cctext"), "console is not windowed");
+    expect(rtx_host_peer_path("/tmp/cctext-ui", 1, dst, sizeof dst), "ui peer");
+    expect(strcmp(dst, "/tmp/cctext") == 0, "ui peer is the console");
+    expect(rtx_host_peer_path("/tmp/cctext", 1, dst, sizeof dst), "console peer");
+    expect(strcmp(dst, "/tmp/cctext-gui") == 0, "console peer is gui");
+}
+
+#ifdef __APPLE__
+static void host_spawn_scripts(void) {
+    char script[1200];
+    char saved_term[256];
+    char saved_trace[256];
+    const char *term;
+    const char *trace;
+    int had_term, had_trace;
+
+    expect(rtx_host_ide_script(script, sizeof script, "Cursor", "echo hi"),
+           "ide script fits");
+    expect(strstr(script, "System Events") != NULL, "ide script is System Events");
+    expect(strstr(script, "keystroke") != NULL, "ide script sends keystrokes");
+    expect(strstr(script, "Cursor") != NULL, "ide script names the process");
+    expect(strstr(script, "echo hi") != NULL, "ide script carries the command");
+
+    expect(rtx_host_terminal_script(script, sizeof script, "echo hi"),
+           "terminal script fits");
+    expect(strstr(script, "do script") != NULL, "terminal script is do script");
+    expect(strstr(script, "keystroke") == NULL, "terminal script does not keystroke");
+
+    expect(!rtx_host_osascript_ok("error \"no\""),
+           "osascript error is not success");
+    expect(rtx_host_osascript_ok("return"), "osascript success");
+
+    term = getenv("TERM_PROGRAM");
+    trace = getenv("CURSOR_TRACE_ID");
+    had_term = term != NULL;
+    had_trace = trace != NULL;
+    if (had_term) snprintf(saved_term, sizeof saved_term, "%s", term);
+    if (had_trace) snprintf(saved_trace, sizeof saved_trace, "%s", trace);
+
+    unsetenv("CURSOR_TRACE_ID");
+    unsetenv("GIT_ASKPASS");
+    unsetenv("VSCODE_GIT_ASKPASS_NODE");
+    unsetenv("VSCODE_GIT_ASKPASS_MAIN");
+    setenv("TERM_PROGRAM", "Apple_Terminal", 1);
+    expect(strcmp(rtx_host_tty_app(), "Terminal") == 0, "Terminal from TERM_PROGRAM");
+    setenv("TERM_PROGRAM", "iTerm.app", 1);
+    expect(strcmp(rtx_host_tty_app(), "iTerm") == 0, "iTerm from TERM_PROGRAM");
+    unsetenv("TERM_PROGRAM");
+    setenv("CURSOR_TRACE_ID", "1", 1);
+    expect(strcmp(rtx_host_tty_app(), "Cursor") == 0, "Cursor from CURSOR_TRACE_ID");
+
+    if (had_term) setenv("TERM_PROGRAM", saved_term, 1);
+    else unsetenv("TERM_PROGRAM");
+    if (had_trace) setenv("CURSOR_TRACE_ID", saved_trace, 1);
+    else unsetenv("CURSOR_TRACE_ID");
+}
+#endif
+
+static void find_pause(const char *path) {
+    RtxDoc d = {0} @destroy;
+    size_t n0;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    d.from_path(path) !>;
+    d.find_set("needle") !>;
+    if (!rtx_parallel_inline()) {
+        expect(d.find.h.live(), "find kick stays live until wait");
+        if (!d.find.done) {
+            rtx_find_pause(&d);
+            n0 = d.find.len;
+            expect(d.find.h.live(), "find pause does not join");
+            expect(d.find.h.paused(), "find pause flag");
+            expect(!d.find.done, "find pause does not wait for the scan");
+            usleep(20000);
+            expect(d.find.len >= n0,
+                   "find stage past the pause check may still publish");
+            expect(d.find.h.live() && d.find.h.paused(),
+                   "find stays paused without a join");
+        }
+    }
+    d.find_finish() !>;
+    expect(d.find.done && d.find.len == 1, "find still reaches the needle");
+}
+
+static void isle_pause(const char *path) {
+    RtxDoc d = {0} @destroy;
+    size_t n, from0, from1;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    d.from_path(path) !>;
+    n = d.len();
+    expect(n > (size_t)RTX_LINE_SOFT_MIN, "isle file above the soft minimum");
+    rtx_line_isle_kick(&d.tree, n > 0 ? n - 1 : 0);
+    expect(d.tree.isle_h.live(), "isle kick stays live until wait");
+    rtx_line_isle_pause(&d.tree);
+    from0 = d.tree.isle_from;
+    expect(d.tree.isle_h.live(), "isle pause does not join");
+    expect(d.tree.isle_h.paused(), "isle pause flag");
+    usleep(20000);
+    from1 = d.tree.isle_from;
+    expect(from1 <= from0, "isle stage past the pause check may still publish");
+    expect(d.tree.isle_h.paused(), "isle stays paused without a join");
+    rtx_line_isle_finish(&d.tree) !>;
+    expect(rtx_line_isle_connected(&d.tree), "isle meets the floor after resume");
+}
+
+static void ws_turn(const char *path) {
+    RtxWs w = {0} @destroy;
+    RtxUiTurn turn = {0};
+    RtxBrowse *br;
+    char *paths[2];
+    char abs[RTX_BROWSE_DIR];
+    const char *rel = "testdata/generated/host_turn_br";
+    char cmd[256];
+    int k;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    paths[0] = (char *)path;
+    paths[1] = (char *)path;
+    w.open_files(2, paths) !>;
+    w.bufs[0].doc.find_set("needle") !>;
+    w.bufs[1].doc.find_set("needle") !>;
+    w.bufs[1].parked = 1;
+    rtx_ws_scans_set(&w, 1);
+    if (!rtx_parallel_inline() && w.bufs[0].doc.find.h.live() &&
+        !w.bufs[0].doc.find.done) {
+        expect(w.bufs[0].doc.find.h.paused(), "turn pauses the live buffer");
+        expect(!w.bufs[1].doc.find.h.paused(), "turn skips a parked buffer");
+    }
+    w.bufs[1].parked = 0;
+    rtx_ws_scans_set(&w, 0);
+    w.bufs[0].doc.find_finish() !>;
+    w.bufs[1].doc.find_finish() !>;
+
+    (void)system("rm -rf testdata/generated/host_turn_br");
+    expect(system("mkdir -p testdata/generated/host_turn_br/wide") == 0,
+           "mkdir browse wide");
+    {
+        FILE *fp = fopen("testdata/generated/host_turn_br/wide/needle.txt", "w");
+        expect(fp != NULL, "write browse needle");
+        if (fp) {
+            fputs("n\n", fp);
+            fclose(fp);
+        }
+    }
+    for (k = 0; k < 24; k++) {
+        snprintf(cmd, sizeof cmd, "%s/d%02d", rel, k);
+        expect(mkdir(cmd, 0755) == 0, "mkdir browse sibling");
+    }
+    w.browse_start() !>;
+    br = RtxWs_browse(&w);
+    expect(rtx_browse_abs(abs, sizeof abs, rel) && abs[0], "browse abs");
+    snprintf(br->dir, sizeof(br->dir), "%s", abs);
+    w.browse_glob_set("needle") !>;
+    br = RtxWs_browse(&w);
+    if (!rtx_parallel_inline()) {
+        size_t n0;
+        expect(rtx_browse_listing_live(br), "glob leaves the arm live");
+        /* Published window, not the in-stage ents. */
+        expect(RtxWs_browse_busy(&w), "tui browse_busy while scanning");
+        n0 = rtx_browse_view_len(br);
+        if (!rtx_browse_paused(br))
+            RtxWs_browse_pump(&w) !>;
+        g_ws = &w;
+        turn.fn = turn_scans;
+        rtx_ui_turn(&turn, 1);
+        rtx_ui_turn(&turn, 1);
+        expect(rtx_browse_paused(br), "outer turn pauses browse");
+        expect(rtx_browse_view_len(br) >= n0,
+               "browse stage past the pause check may still publish");
+        rtx_ui_turn(&turn, 0);
+        expect(rtx_browse_paused(br), "nested leave keeps browse paused");
+        rtx_ui_turn(&turn, 0);
+        expect(!rtx_browse_paused(br), "outermost leave resumes browse");
+    }
+    rtx_browse_finish(br) !>;
+    expect(name_hits(br, "needle") >= 1, "browse still finds the needle");
+    (void)system("rm -rf testdata/generated/host_turn_br");
+}
+
+int main(void) {
+    const char *path = "testdata/generated/host_turn_body.txt";
+    rtx_safe_test_isol();
+
+    (void)system("mkdir -p testdata/generated");
+    turn_depth();
+    host_identity();
+#ifdef __APPLE__
+    host_spawn_scripts();
+#endif
+    expect(write_body(path), "write body");
+    find_pause(path);
+    isle_pause(path);
+    ws_turn(path);
+    (void)unlink(path);
+    if (fails) {
+        fprintf(stderr, "%d failure(s)\n", fails);
+        return 1;
+    }
+    printf("host_turn_smoke ok\n");
+    return 0;
+}

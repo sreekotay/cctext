@@ -13,6 +13,12 @@ Browse, find, and island plants: `@serial { noop = … }` on the caller;
 worker is an expression (`rtx_find_run` / `rtx_isle_run` /
 `rtx_*_listing_arm`), not `noop = …`.
 
+The handle owner and the worker argument must be different names.
+`d->find.h = @parallel { rtx_find_run(d); }` lowers to `__e->d = &d`
+(that slot is dead when the thunk runs). Copy into another pointer
+first (`RtxDoc *scan = d`), the way browse stores the handle on `wk->h`
+and passes `br`.
+
 Destroy / invalidate join with `cc__parallel_cancel_tree` + `cc_parallel_join`,
 not UFCS `h.wait() !>`.
 
@@ -22,7 +28,9 @@ not UFCS `h.wait() !>`.
 concatenated literal at 511 source bytes (lowered C ends mid-token, cc
 then reports `missing terminating '"'` or a short string at run time).
 File-scope initializers, a separate `s = "…" "…";` statement, and
-literals in call arguments lower intact; >2047 bytes is a proper
+literals in call arguments lower intact. Adjacent literals are not
+concatenated in a call (`MK_DIR "/file"` → `expected ')' … found a
+string literal`); build the path with snprintf. >2047 bytes is a proper
 `token spelling exceeds 2047-byte AST text field` error. Put long
 literals at file scope (see `mk_grammar` in tests/tm_grammar_smoke.ccs).
 

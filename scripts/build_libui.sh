@@ -5,10 +5,17 @@
 set -e
 cd "$(dirname "$0")/.."
 root=third_party/libui-ng
+pin=43ba1ef553c8993a43a67f1ce6e35983a2660d8c
 if [ ! -f "$root/ui.h" ]; then
-    git clone --depth 1 https://github.com/libui-ng/libui-ng.git "$root"
+    rm -rf "$root"
+    mkdir -p "$root"
+    git -C "$root" init
+    git -C "$root" remote add origin https://github.com/libui-ng/libui-ng.git
+    git -C "$root" fetch --depth 1 origin "$pin"
+    git -C "$root" checkout FETCH_HEAD
 fi
-mkdir -p out/libui
+outdir="${OUTDIR:-out}"
+mkdir -p "$outdir/libui"
 copt="${COPT:--O2}"
 cflags="$copt -I$root -Wno-unused-parameter -Wno-switch -Wno-deprecated-declarations"
 common="
@@ -28,7 +35,7 @@ winmoveresize.m nstextfield.m
 objs=""
 for f in $common; do
     src="$root/common/$f"
-    obj="out/libui/c_$f.o"
+    obj="$outdir/libui/c_$f.o"
     if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ]; then
         clang $cflags -c "$src" -o "$obj"
     fi
@@ -36,11 +43,11 @@ for f in $common; do
 done
 for f in $darwin; do
     src="$root/darwin/$f"
-    obj="out/libui/d_$f.o"
+    obj="$outdir/libui/d_$f.o"
     if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ]; then
         clang $cflags -fno-objc-arc -c "$src" -o "$obj"
     fi
     objs="$objs $obj"
 done
-ar rcs out/libui.a $objs
-echo "out/libui.a"
+ar rcs "$outdir/libui.a" $objs
+echo "$outdir/libui.a"

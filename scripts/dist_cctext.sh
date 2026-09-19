@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Pack a runnable cctext tree: binary + grammars/ next to it.
-# On macOS the tarball also includes cctext-gui (same folder so e / Ctrl-E works).
+# On macOS the tarball also includes cctext-gui and cctext-ui
+# (same folder so e / Ctrl-E works).
 #
 #   ./scripts/dist_cctext.sh          # builds if needed, writes dist/cctext-<os>-<arch>.tar.gz
 #
@@ -20,6 +21,7 @@ if [[ ! -x bin/cctext ]]; then
 fi
 
 have_gui=0
+have_ui=0
 if [[ "$(uname -s)" == Darwin ]]; then
     if [[ ! -x bin/cctext-gui ]]; then
         ./make.shcc @cctext_gui
@@ -27,7 +29,16 @@ if [[ "$(uname -s)" == Darwin ]]; then
     if [[ -x bin/cctext-gui ]]; then
         have_gui=1
     else
-        echo "dist_cctext: bin/cctext-gui missing (macOS dist includes both)" >&2
+        echo "dist_cctext: bin/cctext-gui missing (macOS dist includes it)" >&2
+        exit 1
+    fi
+    if [[ ! -x bin/cctext-ui ]]; then
+        ./make.shcc @cctext_ui
+    fi
+    if [[ -x bin/cctext-ui ]]; then
+        have_ui=1
+    else
+        echo "dist_cctext: bin/cctext-ui missing (macOS dist includes it)" >&2
         exit 1
     fi
 fi
@@ -54,11 +65,18 @@ if [[ "$have_gui" == 1 ]]; then
     cp bin/cctext-gui "$stage/cctext-gui"
     chmod +x "$stage/cctext-gui"
 fi
+if [[ "$have_ui" == 1 ]]; then
+    cp bin/cctext-ui "$stage/cctext-ui"
+    chmod +x "$stage/cctext-ui"
+fi
 cp testdata/grammars/*.tmLanguage.json "$stage/grammars/"
 {
     echo "cctext — console frontend"
     if [[ "$have_gui" == 1 ]]; then
         echo "cctext-gui — Cocoa + Core Text (same folder; e / Ctrl-E swaps)"
+    fi
+    if [[ "$have_ui" == 1 ]]; then
+        echo "cctext-ui — libui-ng window, Core Text text (same folder)"
     fi
     echo "https://github.com/sreekotay/cctext"
     echo
@@ -66,6 +84,9 @@ cp testdata/grammars/*.tmLanguage.json "$stage/grammars/"
     echo "  ./cctext --wrap file.txt"
     if [[ "$have_gui" == 1 ]]; then
         echo "  ./cctext-gui file.txt"
+    fi
+    if [[ "$have_ui" == 1 ]]; then
+        echo "  ./cctext-ui file.txt"
     fi
     echo
     echo "Grammars load from ./grammars next to the binary."

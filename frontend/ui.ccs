@@ -7,6 +7,7 @@
  */
 #include <ccc/std/prelude.cch>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include "gui_plat.h"
 #include "ui_hook.h"
@@ -46,6 +47,11 @@ static void gui_blink_show(RtxUi *ui) {
     g_dirty = 1;
 }
 
+static void on_turn(int enter) {
+    /* Whole turn, not only paint. AppKit can draw from any nested call. */
+    rtx_ws_scans_set(g_live.w, enter);
+}
+
 static void gui_idle_wait(RtxUi *ui) {
     long left_ms = RTX_UI_BLINK_MS;
     if (ui && ui->blink_at)
@@ -77,6 +83,7 @@ static int gui_saw_input(int dragging) {
         IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) return 1;
     if (dragging) return 1;
     if (gui_menu_pending()) return 1;
+    if (ui_chars_waiting()) return 1;
     return gui_keys_down();
 }
 
@@ -328,6 +335,7 @@ int main(int argc, char **argv) {
     g_live.dragging = &dragging;
     g_live.scroll_grab = &scroll_grab;
     g_live.ready = 1;
+    ui_set_turn(on_turn);
 
     for (;;) {
         gui_input_begin_frame();
@@ -361,6 +369,44 @@ int main(int argc, char **argv) {
                              pane_w, vis_rows, pad, top, inner, hh)) {
             break;
         }
+        {
+            const char *tp = getenv("RTX_UI_LOG");
+            if (tp && tp[0]) {
+                static int pd = -1, pf = -1, pb = -1, pa = -1, ph = -1, pg = -1;
+                RtxBuf *tr = w.active();
+                int dirty = w.any_dirty();
+                int find_on = ui.find;
+                int br = w.browsing();
+                int ask = ui.ask_quit;
+                int hits = (tr && find_on) ? (int)tr->doc.find.len : 0;
+                int g0 = 0;
+                if (br) {
+                    RtxBrowse *b = RtxWs_browse(&w);
+                    g0 = b && b->glob[0] ? (unsigned char)b->glob[0] : 0;
+                }
+                if (dirty != pd || find_on != pf || br != pb || ask != pa ||
+                    hits != ph || g0 != pg) {
+                    FILE *fp = fopen(tp, "a");
+                    pd = dirty;
+                    pf = find_on;
+                    pb = br;
+                    pa = ask;
+                    ph = hits;
+                    pg = g0;
+                    if (fp) {
+                        fprintf(fp,
+                                "dirty=%d find=%d hits=%d browse=%d ask=%d\n",
+                                dirty, find_on, hits, br, ask);
+                        if (br) {
+                            RtxBrowse *b = RtxWs_browse(&w);
+                            fprintf(fp, "glob=%s\n",
+                                    b && b->glob[0] ? b->glob : "-");
+                        }
+                        fclose(fp);
+                    }
+                }
+            }
+        }
         /* Before EndDrawing: that call clears edges then pumps the next
          * mouse-up. Consuming after paint ate the release and stuck drag. */
         gui_input_consume();
@@ -388,7 +434,7 @@ int main(int argc, char **argv) {
         w.safe_pump();
 
         {
-            int isle_on = act && rtx_line_isle_pumping(&act->doc.tree);
+            int isle_on = act && act->doc.tree.isle_h.live();
             long now = rtx_ui_now_ms();
             if (g_isle_was && !isle_on) {
                 g_dirty = 1;
@@ -411,7 +457,7 @@ int main(int argc, char **argv) {
             g_browse_busy_was = browse_tick;
         }
         if (RtxWs_browse_busy(&w) ||
-            rtx_ui_find_scanning(&ui, act ? &act->doc : NULL)) {
+            (act && act->doc.find.h.live())) {
             long now = rtx_ui_now_ms();
             long ms = RtxWs_browse_scanning(&w) ? (long)RTX_BROWSE_PAINT_MS
                                                 : (long)RTX_LINE_ISLE_PAINT_MS;
@@ -422,10 +468,9 @@ int main(int argc, char **argv) {
             g_dirty = 1;
         if (ui.stats) g_dirty = 1;
 
-        /* Publish dest-live before ensure_view so reline sees isle_before. */
-        if ((g_dirty || g_need_layout) && act)
-            rtx_line_isle_pause(&act->doc.tree);
-
+        /* Layout and the OS turn are one bracket. Draw runs inside the
+         * turn (flush or the wait). Nested turns do not resume. */
+        ui_turn(1);
         if (saw || g_need_layout || (act && gui_view_stale(act))) {
             for (p = 0; p < w.npanes; p++) {
                 RtxBuf *b = &w.bufs[w.pane[p]];
@@ -441,25 +486,21 @@ int main(int argc, char **argv) {
         }
 
         if (g_dirty) {
-            RtxWs_browse_pause(&w);
-            if (act) rtx_find_pause(&act->doc);
             ui_sync_paint();
             if (RtxWs_browse_busy(&w) ||
-                rtx_ui_find_scanning(&ui, act ? &act->doc : NULL) ||
-                (act && rtx_line_isle_pumping(&act->doc.tree)))
+                (act && act->doc.find.h.live()) ||
+                (act && act->doc.tree.isle_h.live()))
                 g_browse_paint_at = rtx_ui_now_ms();
             g_dirty = 0;
-            if (act) rtx_find_resume(&act->doc);
-            RtxWs_browse_resume(&w);
         }
-        if (act) rtx_line_isle_resume(&act->doc.tree);
 
         if (act && (rtx_ui_work_pumping(&ui, &act->doc) ||
-                    rtx_line_isle_pumping(&act->doc.tree) || g_isle_was)) {
+                    act->doc.tree.isle_h.live() || g_isle_was)) {
             PollInputEvents();
         } else {
             gui_idle_wait(&ui);
         }
+        ui_turn(0);
     }
 
     g_live.ready = 0;

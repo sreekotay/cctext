@@ -2,9 +2,9 @@
 
 A text editor in [Concurrent-C](https://github.com/sreekotay/concurrent-c) — a strict C11-superset preprocessor: `.ccs` lowers to plain C and compiles with your host C compile.
 
-CCText has one document core, two frontends — **cctext** (POSIX console) and **cctext-gui** (Cocoa + Core Text).
+CCText has one document core and three frontends — **cctext** (POSIX console), **cctext-gui** (Cocoa + Core Text), and **cctext-ui** (libui-ng window, Core Text text).
 
-This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). Prebuilts ship on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler): **cctext** on Linux and macOS, **cctext-gui** on macOS in the same tarball. It does not live inside the compiler repository.
+This is a standalone app. Building from source needs `ccc` on `PATH` (or `CCC=`). Prebuilts ship on [GitHub Releases](https://github.com/sreekotay/cctext/releases) (no compiler): **cctext** on Linux and macOS, **cctext-gui** and **cctext-ui** on macOS in the same tarball. It does not live inside the compiler repository.
 
 ![cctext TUI — 2 GiB JSON, syntax highlight, and a selection at line 5.8 M of 26 M](docs/cctext-tui.png)
 
@@ -21,6 +21,7 @@ tar -xzf cctext-macos-arm64.tar.gz
 ./cctext-macos-arm64/cctext .          # file browser in that directory
 ./cctext-macos-arm64/cctext file.txt   # missing path asks to create
 ./cctext-macos-arm64/cctext-gui .      # same browser, Cocoa window
+./cctext-macos-arm64/cctext-ui .       # same browser, libui window
 ```
 
 From source: `./make.shcc @cctext` then `./bin/cctext`, `./bin/cctext .`, or `./bin/cctext file.txt`. `-h` / `--help` lists options; `-v` / `--version` prints `cctext 0.1`; `--no-blink` keeps a solid caret; `--backup` saves in place (keeps a symlink) and writes a dirty-span `path~` first; `--stats-json` prints the Esc/= engine stats as JSON on exit; `--batch` runs `-c` commands or a stdin script with no TTY (Safe journals off unless `--safe`). Save refuses if the opened file changed on disk (mtime + size + inode); the TUI/GUI asks overwrite / cancel. `--batch` save fails with `file changed on disk`.
@@ -33,7 +34,7 @@ From source: `./make.shcc @cctext` then `./bin/cctext`, `./bin/cctext .`, or `./
 - **TUI and GUI.** Same document core: **cctext** (POSIX console) and **cctext-gui** (Cocoa + Core Text).
 - **Hex / grid.** `Ctrl-L` cycles default → wrap → hex (offset | hex | UTF-8 dump) → grid (CSV/TSV/pipe columns).
 - **Multiview.** Several files, splits, two cameras on one document. Unlock (`Ctrl-U`) lets a pane scroll off the caret.
-- **File browser.** No filename opens it in the cwd. A directory argument (`cctext .`, `cctext-gui testdata`) opens browse there — not the directory as a file. `b` / `Ctrl-B` opens the listing into the focused view; `o` / `Ctrl-O` does the same. In the GUI, **File → Browse** is ⌘B (⌘O aliases it); **File → Open…** is the system dialog with no shortcut. The listing sits on the left; when the pane is wide enough the selection opens on the right as the same document core — recovered journal, camera, and view. See [Browse preview](#browse-preview). Click the preview or its byte-rail to open the file. In the browser, `Ctrl-O` / `Cmd-O` launches this frontend on the selection; `e` / `Ctrl-E` launches the other (`cctext` ↔ `cctext-gui`). A new **cctext** opens in the host terminal (Cursor when you launched from there; iTerm or Terminal.app otherwise). **cctext-gui** is a window, not a terminal. The current folder (not `..`) sizes itself with a pumped walk — the total counts up, pauses if you leave, and resumes when you return. Enter still opens in this instance. A missing path asks to create an empty file.
+- **File browser.** No filename opens it in the cwd. A directory argument (`cctext .`, `cctext-gui testdata`) opens browse there — not the directory as a file. `b` / `Ctrl-B` opens the listing into the focused view; `o` / `Ctrl-O` does the same. In the GUI, **File → Browse** is ⌘B (⌘O aliases it); **File → Open…** is the system dialog with no shortcut. The listing sits on the left; when the pane is wide enough the selection opens on the right as the same document core — recovered journal, camera, and view. See [Browse preview](#browse-preview). Click the preview or its byte-rail to open the file. In the browser, `Ctrl-N` / `Cmd-N` launches this frontend on the selection; `e` / `Ctrl-E` launches the other (`cctext` ↔ `cctext-gui`). A new **cctext** opens in the host terminal (Cursor when you launched from there; iTerm or Terminal.app otherwise). **cctext-gui** is a window, not a terminal. The current folder (not `..`) sizes itself with a pumped walk — the total counts up, pauses if you leave, and resumes when you return. Enter still opens in this instance. A missing path asks to create an empty file.
 - **Deep search.** Typing a fragment filters this directory first, then a `> Flattened search` row and nested matches append below. `>` skips the local listing and flattens immediately. A fragment is case-insensitive; `*.txt` is a real glob and stays a local listing so you can still walk directories.
 - **TextMate grammars.** Drop any `.tmLanguage.json` into `grammars/` (or `RTX_GRAMMARS`) — loaded live, no rebuild. Window lex, not a full-file pass. Shipped: C/CC, JSON, Markdown, CSS, CSV/TSV/pipe, HTML, YAML, shell, Python, JS/TS.
 - **Marks and folds.** `Ctrl-K/P` steps grammar marks already in the window (hint runs from the markup lens — same vocabulary as apply; not a keyword list). `Ctrl-E/R` steps `invalid`. `Ctrl-T` folds a heading or a `{}`/`[]`/`()` pair whose other end is within a page of the caret (256KiB analysis page, plus one neighbor). The matching pair is painted while the caret sits in it. No scan, no AST. Plant / cycle a mark with apply (`h` / `.` / `1–9`), not with nav.
@@ -129,6 +130,7 @@ Recipes live in `make.shcc` (`ccc --as=shcc`). There is no Makefile.
 ./make.shcc @cctext         # console editor (`--release`; DEBUG=1 keeps asserts)
 ./make.shcc @dist_cctext    # dist/cctext-<os>-<arch>.tar.gz (binary + grammars/)
 ./make.shcc @cctext_gui     # Cocoa GUI (macOS)
+./make.shcc @cctext_ui      # libui-ng GUI (macOS)
 ./bin/cctext --help
 ./bin/cctext --batch testdata/small.txt -c 'goto 50%' -c 'print 2' -c 'stats-json'
 ./bin/cctext --batch testdata/small.txt < testdata/batch/smoke.ops
@@ -140,7 +142,7 @@ Recipes live in `make.shcc` (`ccc --as=shcc`). There is no Makefile.
 # ./bin/cctext-gui testdata/generated/large_8G.txt
 ```
 
-**cctext-gui** uses a native macOS menu bar. The GUI matches **cctext**: blinking caret, idle skip-layout, unlock scroll. **Esc** still opens the key-binding overlay in both frontends. **g** / **Ctrl-G** jumps to a line, or `N%` of the file by byte (`+1` / `-L` in the gutter until the index catches up). **b** / **Ctrl-B** opens browse ( **o** / **Ctrl-O** also); GUI **File → Open…** is the system dialog. From the browser, **Ctrl-O** / **Cmd-O** starts this app on the selection and **e** / **Ctrl-E** starts the other. **l** / **Ctrl-L** cycles default / wrap / hex / grid. Grid is a columnar paint of the same bytes (CSV/TSV/pipe): widths from this screen, cells wrap, column count follows the record. **d** / **Ctrl-D** toggles Rich on a markup pane (Markdown): `**` `*` `` ` `` hints paint at zero width and show again while the caret or selection is inside the mark; the bytes never change ([docs/md_view.md](docs/md_view.md)). **k** / **Ctrl-K** (and **p**) step grammar marks already in the window; **.** / **Cmd-.** opens apply to plant or cycle ([docs/mark_arity.md](docs/mark_arity.md)). **u** / **Ctrl-U** unlocks the pane from the caret; jump lands, and find lands when you select a hit. Wheel still scrolls while find is open. Line numbers are in the gutter. Ctrl/Cmd chords work while the overlay is closed. Unsaved quit asks Save / Don't save / Cancel. Save asks overwrite / cancel if the file changed on disk.
+**cctext-gui** uses a native macOS menu bar. The GUI matches **cctext**: blinking caret, idle skip-layout, unlock scroll. **Esc** still opens the key-binding overlay in both frontends. **g** / **Ctrl-G** jumps to a line, or `N%` of the file by byte (`+1` / `-L` in the gutter until the index catches up). **b** / **Ctrl-B** opens browse ( **o** / **Ctrl-O** also); GUI **File → Open…** is the system dialog. From the browser, **Ctrl-N** / **Cmd-N** starts this app on the selection and **e** / **Ctrl-E** starts the other. **l** / **Ctrl-L** cycles default / wrap / hex / grid. Grid is a columnar paint of the same bytes (CSV/TSV/pipe): widths from this screen, cells wrap, column count follows the record. **d** / **Ctrl-D** toggles Rich on a markup pane (Markdown): `**` `*` `` ` `` hints paint at zero width and show again while the caret or selection is inside the mark; the bytes never change ([docs/md_view.md](docs/md_view.md)). **k** / **Ctrl-K** (and **p**) step grammar marks already in the window; **.** / **Cmd-.** opens apply to plant or cycle ([docs/mark_arity.md](docs/mark_arity.md)). **u** / **Ctrl-U** unlocks the pane from the caret; jump lands, and find lands when you select a hit. Wheel still scrolls while find is open. Line numbers are in the gutter. Ctrl/Cmd chords work while the overlay is closed. Unsaved quit asks Save / Don't save / Cancel. Save asks overwrite / cancel if the file changed on disk.
 
 Install `ccc` with Homebrew (`brew tap sreekotay/concurrent-c` / `brew install --HEAD …/ccc`) or from a concurrent-c checkout (`PREFIX=$HOME/.local ./cc-install.sh`). TextMate schema parse uses `<ccc/std/json.cch>` / `include JsonKeep` (closed `TmGrammar` stays in-tree). The GUI links Core Text via `frontend/gui_plat.m`.
 
@@ -151,9 +153,9 @@ Each GitHub Release attaches:
 | Artifact | Host |
 |---|---|
 | `cctext-linux-x64.tar.gz` | Ubuntu / glibc x86_64 (**cctext**) |
-| `cctext-macos-arm64.tar.gz` | Apple Silicon (**cctext** and **cctext-gui**) |
+| `cctext-macos-arm64.tar.gz` | Apple Silicon (**cctext**, **cctext-gui**, and **cctext-ui**) |
 
-Unpack and run in place. Grammars load from `./grammars` next to the binary. On macOS the two frontends sit in the same folder so browse `e` / Ctrl-E can launch the other.
+Unpack and run in place. Grammars load from `./grammars` next to the binary. On macOS the three frontends sit in the same folder so browse `e` / Ctrl-E can launch the other.
 
 ```bash
 tar -xzf cctext-macos-arm64.tar.gz
@@ -161,6 +163,7 @@ tar -xzf cctext-macos-arm64.tar.gz
 ./cctext-macos-arm64/cctext --wrap file.txt
 ./cctext-macos-arm64/cctext .
 ./cctext-macos-arm64/cctext-gui .
+./cctext-macos-arm64/cctext-ui .
 ```
 
 Local tarball (same layout, current machine):
@@ -169,7 +172,7 @@ Local tarball (same layout, current machine):
 ./make.shcc @dist_cctext    # → dist/cctext-<os>-<arch>.tar.gz
 ```
 
-Cut a public drop: tag `cctext-v*` and push. CI installs `ccc` from [concurrent-c](https://github.com/sreekotay/concurrent-c), builds `--release`, and attaches the Linux tarball plus the macOS tarball (TUI and GUI). `workflow_dispatch` on `.github/workflows/release-cctext.yml` builds artifacts without publishing (optional `ccc_ref` pins the compiler).
+Cut a public drop: tag `cctext-v*` and push. CI installs `ccc` from [concurrent-c](https://github.com/sreekotay/concurrent-c), builds `--release`, and attaches the Linux tarball plus the macOS tarball (TUI, Cocoa GUI, and libui GUI). `workflow_dispatch` on `.github/workflows/release-cctext.yml` builds artifacts without publishing (optional `ccc_ref` pins the compiler).
 
 ```bash
 git tag cctext-v0.1.0
