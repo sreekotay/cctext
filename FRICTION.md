@@ -21,15 +21,25 @@ if a write-stage honor is parked.
 Destroy / drop: resume if paused, then `h.invalidate()` (cancels the
 tree, then joins). `.wait()` does not cancel adopted children.
 
+`@switch` `case .arm(bind):` with a `Vec::[T]` payload mis-lowers (splits
+the function). Use bare `case .arm:` and a dominated `v.arm` projection.
+`.pieces(refs)`-style struct binds are fine. Prefer `@switch` over
+`arm ?> …` when the subject is behind `const` (const temporary assign).
+
 ## cctext
 
-Do not Vec `find.hits`, `browse.ents`, or `hist.recs` — grow
-would publish dest-live or drop session wraps. Those stay raw +
-`cc_arena_realloc` (`browse.ents` on `hold_a`). `ws.bufs` is a table of
+Do not Vec `hist.recs` — rows hold owned session `Vec::[char]` payloads;
+outer-table element destroy/assign can drop those. `hist.recs` stays raw +
+`cc_arena_realloc`. `find.hits` / `browse.ents` are `Vec::[T]` on their
+epoch arena (append in `@stage`; do not copy the Vec handle across a
+grow). `browse.hold` stays raw on `hold_a` (survives `store.reset`).
+`ws.bufs` is a table of
 `RtxBuf *`; each buffer is allocated once, so growing the table does not
 move a document a find or island already holds. Browse walk (`RtxBrowseWalk`) stays `calloc` — it embeds
-`CCParallel` and must not live in a bump arena. Hist text / ins are session
-`vec_from` wraps: assign a new `from`, do not store `.len`. Find lane
+`CCParallel` and must not live in a bump arena. Hist text / ins are owned
+session `Vec::[char]`: grow with `reserve` / `at_grow` in place; never
+copy a handle into a same-arm `@variant` assign (destroy releases the
+live owner). Find lane
 scratch (block window + hit offs) lives on a per-lane heap arena in the
 `@parallel` cache replica; island / browse job scratch / nav / line-index
 splice / save pin / MD col rewrite / TUI OS-clipboard read scratch are

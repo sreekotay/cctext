@@ -3,7 +3,7 @@
 One document core, two frontends (`cctext`, `cctext-gui`). Memory is owned or it is a view. Lifetime is a field, not a protocol. The document type is as wide as the domain — a face is reach at the call site, not a smaller struct. Epochs say what dies when; faces say what this call may do. A TU’s write is the function that accepts only legal values for that unit; that is what the header exports. Ownership is handled at the call site.
 
 ccc enforces Result use, dest-live join, and face ownership. Product
-shapes (one write, window lex, markup arity, no Vec on live buffers,
+shapes (one write, window lex, markup arity, no Vec on hist.recs,
 cooperative pumps) are author law in this file and FRICTION.md.
 Application policy (pair join, apply) sits on `replace` and is not a
 language type — Rich panes reach it through the buf helper; do not treat
@@ -51,11 +51,11 @@ alloc+copy on that arena, same as published `br.ents`). Neither is the
 find store; published find hits stay on `d.find.store`.
 
 Analysis `secs` / `runs` / `tm_ckpt` and layout `rows` are Vecs on that
-epoch arena. Hist restore text / ins are session `vec_from` wraps.
-Do not Vec `find.hits`, `browse.ents`, or `hist.recs` — those
-stay raw and grow with `cc_arena_realloc` in their TU (Vec grow would
-publish dest-live or drop session wraps). `ws.bufs` is a table of
-`RtxBuf *`, each allocated once.
+epoch arena. Hist restore text / ins are owned `Vec::[char]` on session.
+`find.hits` / `browse.ents` are Vecs on their epoch arena (append in
+`@stage`). Do not Vec `hist.recs` — rows hold those payloads; keep raw +
+`cc_arena_realloc`. `browse.hold` stays raw on `hold_a`. `ws.bufs` is a
+table of `RtxBuf *`, each allocated once.
 
 ## Interactive
 
@@ -211,7 +211,7 @@ Fallible APIs are Results (`T !>(CCError)`). Value returns are only pure queries
 
 `line_start` / `line_of` are `size_t !>(RtxIndexErr)`. `RtxIndexErr` is not a face of `CCError` — do not `@typeview { as: base; }` so save/edit handlers cannot swallow an index fault. Helpers that call `line_*` are `T !>(RtxIndexErr)` and pipe. A `!>(CCError)` surface that also does index work translates once.
 
-One document read surface: `size_t !>(CCError) read_at(off, dest, n)`. Success returns `got = min(n, len - off)` (EOF clamp is success). A hole inside that range is an error. Callers that need every byte of `n` require `off + n <= len` (or check `got == n`).
+One document read surface: `size_t !>(CCError) read_at(off, dest)` with `char[:] dest`. Success returns `got = min(dest.len, len - off)` (EOF clamp is success). A hole inside that range is an error. Callers that need every byte of `dest` require `off + dest.len <= len` (or check `got == dest.len`).
 
 If an API returns owned bytes, the destination arena is the **last** parameter (receiver first, arena last). That arena *is* the product’s lifetime — the caller names WHERE. `scratch_span(from, n, a)` copies onto `a` when the range is not one piece. Call-local `@scratch` / frame stack stays inside the callee and is not returned. Views (`span`) do not take an arena. `RTX_FRAME_SCRATCH` is a stack budget, not a span cap.
 
