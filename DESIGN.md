@@ -117,7 +117,9 @@ or the last planted 1/32 pin ahead of it — after an EOF update has
 filled the slot table, that is at most one slice. `g L` counts from
 the nearest exact floor at or below L (prefix frontier, live origin,
 or a planted pin). A pin-seeded jump does not claim prefix cover for
-the gap. An edit wipes pins at or after the byte and clears the
+the gap; on land it keys the gutter origin to that exact floor so
+`seek_set` does not clear a mid-file mark and kick an island back to
+BOF. An edit wipes pins at or after the byte and clears the
 origin (BOF slot 0 stays). After open the host does not walk toward
 EOF. A far seek (>8 KiB) drops the origin and goes back to
 red `+N` / `-L` unless a planted 1/32 pin is in that slice — then
