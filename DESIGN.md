@@ -114,15 +114,17 @@ after wheel/bar — not a gutter pin.)
 `g N%` is a byte snap plus island (backfill). Land on an uncovered
 camera plants the same dest-live walk. The walk stops at the prefix
 or the last planted 1/32 pin ahead of it — after an EOF update has
-filled the slot table, that is at most one slice. `g L` is a prefix
-pump (`want_line`) — not a guess. After open the host does not walk
-toward EOF. A far seek (>8 KiB) drops the origin and goes back to
+filled the slot table, that is at most one slice. `g L` counts from
+the nearest exact floor at or below L (prefix frontier, live origin,
+or a planted pin). A pin-seeded jump does not claim prefix cover for
+the gap. An edit wipes pins at or after the byte and clears the
+origin (BOF slot 0 stays). After open the host does not walk toward
+EOF. A far seek (>8 KiB) drops the origin and goes back to
 red `+N` / `-L` unless a planted 1/32 pin is in that slice — then
 that pin re-keys the origin. Slot `i` is byte `i * len / 32` (vacant =
 `(size_t)-1`). Prefix cover or a connected island plants a pin and
-keys the origin (island does not have to sit on a slot). An edit
-wipes pins at or after the byte and clears the origin (BOF slot 0
-stays). Highlight / markup still `ensure_hl` the **window** (vis rows)
+keys the origin (island does not have to sit on a slot). Highlight /
+markup still `ensure_hl` the **window** (vis rows)
 plus `RTX_MARKUP_LOOKBACK` (and one neighbor page for pairs) — not a
 walk to BOF. Fold is stored only if both ends are in that grain.
 
@@ -168,7 +170,7 @@ field the worker is still storing into.
 | | start | one step | live | resume | deny |
 |---|---|---|---|---|---|
 | find | `find_set` | dest-live wrapper; wait-for 2 MiB blocks | `h.live()` | `scan_off` | — |
-| jump | `want_kick` | `want_step` | `want_pumping` | `line_scan_off` | — |
+| jump | `want_kick` | `want_step` | `want_pumping` | `want_off` | — |
 | prefix | — | — | — | `line_scan_off` | host does not pump |
 | island | `isle_kick` (land / gap view) | dest-live wrapper; wait-for 2 MiB blocks | `isle_h.live()` | `isle_from` | — |
 | browse | `rtx_browse_kick` | dest-live wrapper; one `RTX_BROWSE_WAVE` of dir jobs; pump joins a finished arm then starts the next | `h.live()` | `jhead` | — |
