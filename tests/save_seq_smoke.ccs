@@ -415,6 +415,25 @@ static void seq_journal(void) {
         expect(doc_is(&d, "abc") && d.dirty(), "journal: undo after clean reload");
     }
     {
+        /* Head back on the fork: still not the file. The journal header
+         * alone must say dirty (parked tabs, quit prompts peek it). */
+        RtxDoc d = {0} @destroy;
+        write_bytes(path, "abc", 3);
+        d.from_path(cc_slice_cstr(path)) !>;
+        d.replace(1, 0, "X") !>;
+        d.save() !>;
+        d.undo() !>;
+        d.replace(1, 0, "Y") !>;
+        d.undo() !>;
+        expect(d.dirty() && doc_is(&d, "abc"), "journal: head on the fork dirty");
+        expect(rtx_safe_flush(&d, NULL), "journal: fork flush");
+        expect(rtx_safe_peek_dirty(path), "journal: fork peek dirty");
+        expect(flush_reload(&d, path, &rc), "journal: fork reload");
+        expect(d.dirty() && doc_is(&d, "abc"), "journal: fork reload dirty");
+        d.redo() !>;
+        expect(d.dirty() && doc_is(&d, "aYbc"), "journal: fork reload redo");
+    }
+    {
         /* Saved state in the redo tail: reload keeps it reachable. */
         RtxDoc d = {0} @destroy;
         write_bytes(path, "abc", 3);
@@ -838,14 +857,15 @@ static void model_run(uint64_t seed, size_t base_n, int steps) {
             if (!model_edit(&m, next, nn, d.hist.head == h0)) break;
         } else if (r < 36) {
             /* A big delete (piece refs in history), then maybe more. */
-            size_t off, del, nn;
+            size_t off, del, nn, h0 = d.hist.head;
             char *next;
             if (len < 8) continue;
             off = rnd_n(len / 2);
             del = len - off > 4 ? (len - off) / 2 : 1;
             d.replace(off, del, cc_slice_empty()) !>;
             next = splice(m.st[m.head], m.stn[m.head], off, del, "", 0, &nn);
-            if (!model_edit(&m, next, nn, 0)) break;
+            /* An erase may extend the previous erase record. */
+            if (!model_edit(&m, next, nn, d.hist.head == h0)) break;
             what = "bigdel";
         } else if (r < 44) {
             /* Group of 2..4 sites. */
@@ -900,7 +920,7 @@ static void model_run(uint64_t seed, size_t base_n, int steps) {
             }
             what = "redo";
         } else if (r < 82) {
-            int bk = (int)rnd_n(2);
+            int bk = (int)rnd_n(2) && !getenv("SEQ_NOBACKUP");
             rtx_doc_set_save_backup(bk);
             d.save() !>;
             rtx_doc_set_save_backup(prev);
@@ -927,6 +947,15 @@ static void model_run(uint64_t seed, size_t base_n, int steps) {
         } else {
             /* Just read the whole doc past the cache. */
             what = "uncached read";
+        }
+        if (getenv("SEQ_TRACE")) {
+            size_t tn = 0;
+            char *tb = doc_bytes_mode(&d, &tn, 0);
+            fprintf(stderr, "step %d %s: head %zu/%zu saved %ld hist %zu/%zu doc '%.*s' model '%.*s'\n",
+                    step, what, m.head, m.nst, m.saved, d.hist.head, d.hist.len,
+                    (int)(tn > 80 ? 80 : tn), tb ? tb : "",
+                    (int)(m.stn[m.head] > 80 ? 80 : m.stn[m.head]), m.st[m.head]);
+            free(tb);
         }
         if (!model_check(&m, &d, path, what, seed, step)) break;
     }
@@ -961,7 +990,9 @@ int main(int argc, char **argv) {
     }
     if (!only || strstr(only, "model")) {
         int before = fails;
-        for (s = 1; s <= seeds; s++) {
+        const char *one = getenv("SEQ_SEED");
+        for (s = one ? (uint64_t)strtoull(one, NULL, 10) : 1;
+             s <= (one ? (uint64_t)strtoull(one, NULL, 10) : seeds); s++) {
             size_t n;
             int steps = 60;
             switch (s % 4) {

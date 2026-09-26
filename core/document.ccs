@@ -408,8 +408,52 @@ static void !>(CCError) rtx_doc_policy_replace(RtxDoc *d, size_t off, size_t n,
     return cc_ok();
 }
 
+uint64_t rtx_hist_cur_sid(const RtxHistory *h) {
+    if (!h) return 0;
+    return h->head ? h->recs[h->head - 1].sid : h->base_sid;
+}
+
+size_t rtx_hist_pos_of(const RtxHistory *h, uint64_t sid) {
+    size_t i;
+    if (!h) return (size_t)-1;
+    if (sid == h->base_sid) return 0;
+    for (i = h->len; i-- > 0;) {
+        if (h->recs[i].sid == sid) return i + 1;
+    }
+    return (size_t)-1;
+}
+
+/* A savepoint is a history state, not a stack position (DESIGN Edits):
+ * dirty unless the state at head IS the state the file holds. */
 int RtxDoc_dirty(const RtxDoc *d) {
-    return d && d->hist.head != d->saved_head;
+    return d && rtx_hist_cur_sid(&d->hist) != d->saved_sid;
+}
+
+void RtxDoc_mark_saved(RtxDoc *d) {
+    if (!d) return;
+    d->saved_sid = rtx_hist_cur_sid(&d->hist);
+    d->hist.sb = NULL;
+    d->hist.sb_len = 0;
+    d->hist.fork_sid = 0;
+    d->hist.sb_lost = 0;
+    /* The next keystroke is its own record: undo lands on the save. */
+    d->hist.coalesce = 0;
+}
+
+int RtxDoc_saved_where(const RtxDoc *d, size_t *pos) {
+    size_t p;
+    if (!d) return 0;
+    if (d->hist.sb_lost) return 0;
+    if (d->hist.sb_len) {
+        p = rtx_hist_pos_of(&d->hist, d->hist.fork_sid);
+        if (p == (size_t)-1) return 0;
+        if (pos) *pos = p;
+        return 2;
+    }
+    p = rtx_hist_pos_of(&d->hist, d->saved_sid);
+    if (p == (size_t)-1) return 0;
+    if (pos) *pos = p;
+    return 1;
 }
 
 int RtxDoc_has_sel(const RtxDoc *d) {
@@ -6572,9 +6616,81 @@ static int rtx_bytes_touch_section(char[:] p) {
     return 0;
 }
 
-static void rtx_hist_drop_tail(RtxHistory *h) {
-    if (!h || h->head >= h->len) return;
+/* Dropping the redo tail (a new edit after undo). The saved state may sit
+ * in that tail, or be a branch hanging off a state in it: keep what
+ * reaches it as the branch (hist.sb) so a journal still replays against
+ * the file. Prep allocates before the tree moves; commit only assigns. */
+typedef struct {
+    RtxHistRec *sb;
+    size_t n;
+    uint64_t fork;
+    int live;
+} RtxHistCut;
+
+static void !>(CCError) rtx_hist_cut_prep(RtxDoc *d, RtxHistCut *c) {
+    RtxHistory *h;
+    size_t sp, fp, head, n, i;
+    RtxHistRec *sb;
+    *c = (RtxHistCut){0};
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "hist cut");
+    h = &d->hist;
+    head = h->head;
+    if (head >= h->len || h->sb_lost) return cc_ok();
+    sp = rtx_hist_pos_of(h, d->saved_sid);
+    if (sp != (size_t)-1 && sp > head) {
+        n = sp - head;
+        fp = sp;
+    } else if (sp == (size_t)-1 && h->sb_len) {
+        fp = rtx_hist_pos_of(h, h->fork_sid);
+        if (fp == (size_t)-1 || fp <= head) return cc_ok();
+        n = fp - head + h->sb_len;
+    } else {
+        return cc_ok();
+    }
+    if (n > SIZE_MAX / sizeof(RtxHistRec)) return cc_err(CC_ERR_OUT_OF_MEMORY, "hist cut");
+    sb = (RtxHistRec *)cc_arena_alloc(d->session, n * sizeof(RtxHistRec), 8);
+    if (!sb) return cc_err(CC_ERR_OUT_OF_MEMORY, "hist cut");
+    for (i = head; i < fp; i++) sb[i - head] = h->recs[i];
+    if (fp - head < n) {
+        for (i = 0; i < h->sb_len; i++) sb[fp - head + i] = h->sb[i];
+    }
+    c->sb = sb;
+    c->n = n;
+    c->fork = rtx_hist_cur_sid(h);
+    c->live = 1;
+    return cc_ok();
+}
+
+static void rtx_hist_cut_commit(RtxDoc *d, const RtxHistCut *c) {
+    RtxHistory *h = &d->hist;
+    if (h->head >= h->len) return;
+    if (c && c->live) {
+        h->sb = c->sb;
+        h->sb_len = c->n;
+        h->fork_sid = c->fork;
+    } else if (!h->sb_lost) {
+        /* No prep (or it could not allocate): a saved state that was in
+         * the tail is gone for good. Dirty stays right (its id is never
+         * handed out again); only a journal can no longer name it. */
+        size_t sp = rtx_hist_pos_of(h, d->saved_sid);
+        size_t fp = h->sb_len ? rtx_hist_pos_of(h, h->fork_sid) : (size_t)-1;
+        if ((sp != (size_t)-1 && sp > h->head) ||
+            (sp == (size_t)-1 && fp != (size_t)-1 && fp > h->head)) {
+            h->sb = NULL;
+            h->sb_len = 0;
+            h->fork_sid = 0;
+            h->sb_lost = 1;
+        }
+    }
     h->len = h->head;
+}
+
+/* The record at head - 1 leads to the saved state or the branch's fork:
+ * extending it in place would change that state, so it takes no more. */
+static int rtx_hist_anchored(const RtxDoc *d, const RtxHistRec *r) {
+    if (!d || !r) return 0;
+    if (r->sid == d->saved_sid) return 1;
+    return d->hist.sb_len && r->sid == d->hist.fork_sid;
 }
 
 /* Coalesce only a pure insert onto a pure insert, or a pure erase onto a
@@ -8196,6 +8312,7 @@ void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
     size_t sel0;
     int markup;
     int coalesced = 0;
+    RtxHistCut cut = {0};
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     len = d->len();
@@ -8233,7 +8350,8 @@ void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
                  rtx_bytes_touch_section(del) ||
                  rtx_bytes_touch_section(ins);
         if (!d->hist.applying) {
-            if (d->hist.coalesce && d->hist.head > 0) {
+            if (d->hist.coalesce && d->hist.head > 0 &&
+                !rtx_hist_anchored(d, &d->hist.recs[d->hist.head - 1])) {
                 last = &d->hist.recs[d->hist.head - 1];
                 if (rtx_hist_can_coalesce_insert(last, off, n, ins)) {
                     rtx_hist_coalesce_ins_reserve(d, last, ins.len) !>(e) {
@@ -8276,6 +8394,7 @@ void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
                     rec.ins = keep;
                 }
                 rtx_hist_grow(d) !>(e) { return cc_err(e); };
+                rtx_hist_cut_prep(d, &cut) !>(e) { return cc_err(e); };
             }
         }
         rtx_find_join(&d->find);
@@ -8308,6 +8427,7 @@ void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
                 last->sel_box_after = d->sel_box;
                 last->box_acol_after = d->box_acol;
                 last->box_ccol_after = d->box_ccol;
+                last->sid = ++d->hist.sid_next; /* a different state now */
             } else if (coalesced == 2 && last) {
                 rtx_hist_coalesce_del_commit(last, del) !>(e) {
                     d->broken = 1;
@@ -8319,8 +8439,10 @@ void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
                 last->sel_box_after = d->sel_box;
                 last->box_acol_after = d->box_acol;
                 last->box_ccol_after = d->box_ccol;
+                last->sid = ++d->hist.sid_next;
             } else {
-                rtx_hist_drop_tail(&d->hist);
+                rtx_hist_cut_commit(d, &cut);
+                rec.sid = ++d->hist.sid_next;
                 rec.off = off;
                 rec.caret_before = caret0;
                 rec.sel_before = sel0;
@@ -8842,6 +8964,7 @@ void !>(CCError) rtx_doc_replace_group(RtxDoc *d, const RtxEdit *edits, size_t n
     CCArena a = {0} @destroy;
     RtxGroupOp *ops;
     RtxHistRec *prep;
+    RtxHistCut cut = {0};
     size_t i, k, t, len, caret0, sel0, bac0, bcc0, caret1;
     int box0;
     ptrdiff_t acc;
@@ -8891,6 +9014,7 @@ void !>(CCError) rtx_doc_replace_group(RtxDoc *d, const RtxEdit *edits, size_t n
         size_t need = d->hist.head + k;
         if (need < d->hist.head) return cc_err(CC_ERR_OUT_OF_MEMORY, "group hist");
         rtx_hist_reserve(d, need) !>;
+        rtx_hist_cut_prep(d, &cut) !>;
     }
     caret0 = d->caret;
     sel0 = d->sel_anchor;
@@ -8947,7 +9071,7 @@ void !>(CCError) rtx_doc_replace_group(RtxDoc *d, const RtxEdit *edits, size_t n
     d->box_ccol = 0;
     if (!d->hist.applying) {
         size_t gid;
-        rtx_hist_drop_tail(&d->hist);
+        rtx_hist_cut_commit(d, &cut);
         gid = ++d->hist.group_next;
         /* Apply order: the highest site first. */
         for (t = k; t-- > 0;) {
@@ -8965,6 +9089,7 @@ void !>(CCError) rtx_doc_replace_group(RtxDoc *d, const RtxEdit *edits, size_t n
             rec.box_ccol_after = 0;
             rec.group = gid;
             rec.xact = xact;
+            rec.sid = ++d->hist.sid_next;
             d->hist.recs[d->hist.len++] = rec;
         }
         d->hist.head = d->hist.len;
@@ -9553,6 +9678,7 @@ static void !>(CCError) rtx_bulk_land(RtxBulk *b, RtxPieceRef **olds, RtxPieceRe
 void !>(CCError) rtx_bulk_commit(RtxBulk *b, uint64_t xact) {
     RtxDoc *d;
     RtxHistBulk *hb = NULL;
+    RtxHistCut cut = {0};
     RtxPieceRef *olds = NULL, *news = NULL;
     size_t caret0, sel0, bac0, bcc0;
     int box0, rec;
@@ -9576,6 +9702,10 @@ void !>(CCError) rtx_bulk_commit(RtxBulk *b, uint64_t xact) {
         *hb = (RtxHistBulk){0};
         hb->enc = enc;
         hb->enc_n = b->enc_n;
+        rtx_hist_cut_prep(d, &cut) !>(e) {
+            rtx_bulk_drop(b);
+            return cc_err(e);
+        };
     }
     caret0 = d->caret;
     sel0 = d->sel_anchor;
@@ -9603,7 +9733,8 @@ void !>(CCError) rtx_bulk_commit(RtxBulk *b, uint64_t xact) {
         hb->news = news;
         hb->nnew = b->nnew;
         hb->ready = 1;
-        rtx_hist_drop_tail(&d->hist);
+        rtx_hist_cut_commit(d, &cut);
+        r.sid = ++d->hist.sid_next;
         r.off = b->lo;
         r.caret_before = caret0;
         r.sel_before = sel0;
@@ -9799,7 +9930,16 @@ int RtxDoc_hist_has_xact(const RtxDoc *d, uint64_t xact) {
 }
 
 void rtx_hist_cut_tail(RtxDoc *d) {
-    if (d) rtx_hist_drop_tail(&d->hist);
+    RtxHistCut cut = {0};
+    if (!d) return;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            cut.live = 0;
+        }
+        rtx_hist_cut_prep(d, &cut) !>;
+    }
+    rtx_hist_cut_commit(d, &cut);
 }
 
 void !>(CCError) RtxDoc_undo(RtxDoc *d) {
@@ -10260,7 +10400,7 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
                 unlink(tmp);
                 rtx_save_fsync_dir(p, n);
                 if (new_path.ptr) d->path = new_path;
-                d->saved_head = d->hist.head;
+                d->mark_saved();
                 rtx_doc_ident_stamp(d, path);
                 return cc_ok();
             }
@@ -10325,7 +10465,7 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
         if (close(fd) != 0) return cc_err(CC_ERR_IO, "save close");
         rtx_save_fsync_dir(p, n);
         if (new_path.ptr) d->path = new_path;
-        d->saved_head = d->hist.head;
+        d->mark_saved();
         rtx_doc_ident_stamp(d, path);
         return cc_ok();
     }
@@ -10350,7 +10490,7 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
     /* Best-effort directory fsync so the rename itself is durable. */
     rtx_save_fsync_dir(p, n);
     if (new_path.ptr) d->path = new_path;
-    d->saved_head = d->hist.head;
+    d->mark_saved();
     rtx_doc_ident_stamp(d, path);
     return cc_ok();
 }

@@ -743,7 +743,7 @@ static void rtx_safe_plant_marks(RtxDoc *d, const RtxSafeCam *cam,
 static int rtx_safe_put_session(RtxSafeW *w, RtxDoc *d, const RtxSafeCam *cam,
                                 const char *real, int64_t mtime, uint64_t sz,
                                 uint64_t ino, size_t hlen) {
-    size_t saved = d ? d->saved_head : 0;
+    size_t saved = 0;
     size_t head = d ? d->hist.head : 0;
     uint32_t pn;
     size_t oline = 0, ooff = 0;
@@ -751,6 +751,10 @@ static int rtx_safe_put_session(RtxSafeW *w, RtxDoc *d, const RtxSafeCam *cam,
     RtxLineMark marks[RTX_LINE_MARK_MAX];
     size_t nm, k;
     if (!d || !cam || !real) return -1;
+    /* The position the file's bytes replay from: the saved state, or the
+     * branch's fork (v9). Not representable: head (RTXC only; the RTXS
+     * writer refuses first). */
+    if (!RtxDoc_saved_where(d, &saved)) saved = head;
     pn = (uint32_t)strlen(real);
     if (rtx_safe_put_u32(w, pn) != 0) return -1;
     if (pn && rtx_safe_w(w, real, pn) != 0) return -1;
@@ -852,6 +856,16 @@ static int rtx_safe_write_leaf(RtxDoc *d, const RtxSafeCam *cam,
             if (rtx_safe_put_rec(&w, d, r, gend) != 0) goto fail;
         }
         rtx_safe_tear = 0;
+        if (ver >= 9) {
+            /* The branch from the fork to the saved state (the file). */
+            const RtxHistRec *sb = d->hist.sb;
+            size_t nb = d->hist.sb_len;
+            if (rtx_safe_put_u64(&w, (uint64_t)nb) != 0) goto fail;
+            for (i = 0; i < nb; i++) {
+                int gend = sb[i].group && (i + 1 >= nb || sb[i + 1].group != sb[i].group);
+                if (rtx_safe_put_rec(&w, d, &sb[i], gend) != 0) goto fail;
+            }
+        }
     }
     if (rtx_safe_put_sum(&w) != 0) goto fail;
     if (rtx_safe_rename_over(w.fd, tmp, path) != 0) {
@@ -939,14 +953,21 @@ fail:
 int rtx_safe_flush(RtxDoc *d, const RtxSafeCam *cam) {
     char path[RTX_SAFE_PATH];
     char pin[RTX_SAFE_PATH];
-    int dirty, have_pin, ok;
+    int dirty, have_pin, ok, where;
     if (!d || !d->path.ptr || d->path.len == 0) return 1;
     if (!rtx_safe_file_path(path, sizeof(path), d->path.ptr)) return 0;
-    dirty = d->saved_head != d->hist.head;
+    dirty = d->dirty();
+    /* A saved state that is neither on the stack nor a kept branch (a
+     * branch that could not be allocated) cannot be replayed against the
+     * file: no leaf is better than a wrong one. */
+    where = RtxDoc_saved_where(d, NULL);
+    if (!where) return 0;
     have_pin = rtx_safe_base_path(pin, sizeof(pin), d->path.ptr);
     /* Pin before the leaf that needs it; drop it after a clean leaf lands. */
     if (dirty && have_pin) rtx_safe_pin_base(d, pin);
-    ok = rtx_safe_write_leaf(d, cam, path, RTX_SAFE_FILE_MAGIC, RTX_SAFE_FILE_VER, 1);
+    /* v8 unless a branch must ride along: an older build still reads it. */
+    ok = rtx_safe_write_leaf(d, cam, path, RTX_SAFE_FILE_MAGIC,
+                             where == 2 ? RTX_SAFE_FILE_VER : RTX_SAFE_FILE_VER_PLAIN, 1);
     if (ok && !dirty && have_pin) unlink(pin);
     return ok;
 }
@@ -986,6 +1007,7 @@ typedef struct {
     uint32_t nmark;
     RtxLineMark marks[RTX_LINE_MARK_MAX];
     int32_t rich, wrap;    /* RTXC tail */
+    int dirty;             /* RTXS: unsaved edits (v9 carries a branch: always) */
 } RtxSafeHdr;
 
 /* Magic, ver, and the session record through the RTXC tail. 0 = not a
@@ -1058,6 +1080,9 @@ static int rtx_safe_read_hdr(RtxSafeR *r, uint32_t want, RtxSafeHdr *h) {
         }
     }
     if (h->saved > h->hlen || h->head > h->hlen) return 0;
+    /* A v9 leaf is written only with a branch: the saved state is off the
+     * stack, so no head is the file. */
+    h->dirty = h->saved != h->head || (!state && h->ver >= 9);
     return 1;
 }
 
@@ -1252,7 +1277,11 @@ static void rtx_safe_load_state(RtxDoc *d, RtxSafeCam *cam) {
     if (!rtx_safe_hdr_path_ok(&h, d->path.ptr)) goto done;
     if (h.view == 1) h.view = 0; /* RTX_VIEW_WRAP → DEFAULT (wrap bit above) */
     ident_ok = rtx_safe_doc_ident_eq(d, h.ns, h.mtime, h.sz, h.ino);
-    heads_ok = (size_t)h.saved == d->saved_head && (size_t)h.head == d->hist.head;
+    {
+        size_t sp = 0;
+        heads_ok = RtxDoc_saved_where(d, &sp) && (size_t)h.saved == sp &&
+                   (size_t)h.head == d->hist.head;
+    }
     if (cam) {
         rtx_safe_hdr_cam(&h, cam);
         cam->rich = h.rich;
@@ -1309,6 +1338,8 @@ int rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
     int rc = RTX_SAFE_LOAD_NONE;
     RtxHistRec *recs = NULL;
     unsigned char *ends = NULL;
+    RtxHistRec *brs = NULL;   /* v9 branch: fork (h.saved) to the file */
+    uint64_t nb = 0;
     if (!d || !d->path.ptr || d->path.len == 0) return rc;
     if (!rtx_safe_file_path(path, sizeof(path), d->path.ptr)) return rc;
     fd = rtx_safe_open_hdr(path, RTX_SAFE_FILE_MAGIC, &r, &h);
@@ -1328,7 +1359,7 @@ int rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
     if (!ident_ok) {
         /* Clean: only undo history is lost. Dirty: those edits are not this
          * file's to replay, and they are not ours to toss (CONFLICT). */
-        if (h.saved != h.head) rc = RTX_SAFE_LOAD_CONFLICT;
+        if (h.dirty) rc = RTX_SAFE_LOAD_CONFLICT;
         rtx_safe_clamp_doc(d, cam);
         goto done;
     }
@@ -1348,6 +1379,37 @@ int rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
                 goto done;
             }
             ends[i] = (unsigned char)gend;
+        }
+    }
+    if (h.ver >= 9) {
+        unsigned char *bends;
+        if (rtx_safe_get_u64(&r, &nb) != 0 || nb > r.left / RTX_SAFE_REC_MIN ||
+            nb > SIZE_MAX / sizeof(RtxHistRec)) {
+            rtx_safe_clamp_doc(d, cam);
+            goto done;
+        }
+        if (nb) {
+            brs = (RtxHistRec *)cc_arena_alloc(d->session,
+                                               (size_t)nb * sizeof(RtxHistRec), 8);
+            bends = (unsigned char *)cc_arena_alloc(d->session, (size_t)nb, 1);
+            if (!brs || !bends) {
+                rtx_safe_clamp_doc(d, cam);
+                goto done;
+            }
+            for (i = 0; i < (size_t)nb; i++) {
+                int gend = 0;
+                brs[i] = rtx_hist_rec_empty();
+                if (rtx_safe_load_rec(&r, d, &brs[i], h.ver, &gend) != 0) {
+                    rtx_safe_clamp_doc(d, cam);
+                    goto done;
+                }
+                bends[i] = (unsigned char)gend;
+            }
+            /* A branch is whole groups (no torn tail to fall back from). */
+            if (rtx_safe_groups_keep(brs, bends, (size_t)nb) != (size_t)nb) {
+                rtx_safe_clamp_doc(d, cam);
+                goto done;
+            }
         }
     }
     /* Nothing replays until the whole leaf checks out. */
@@ -1375,6 +1437,9 @@ int rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
             rtx_safe_clamp_doc(d, cam);
             goto done;
         }
+        for (i = 0; i < (size_t)nb; i++) {
+            if (brs[i].group > gmax) gmax = brs[i].group;
+        }
         for (i = 0; i < keep; i++) {
             if (recs[i].group > gmax) gmax = recs[i].group;
             /* A bulk group is one record. */
@@ -1386,12 +1451,14 @@ int rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
         }
         d->hist.group_next = gmax;
     }
-    if (h.hlen) {
-        d->hist.recs = recs;
-        d->hist.len = (size_t)h.hlen;
-        d->hist.cap = (size_t)h.hlen;
-        d->hist.head = (size_t)h.saved;
-        d->saved_head = (size_t)h.saved;
+    if (h.hlen || nb) {
+        size_t fork = (size_t)h.saved;
+        /* State ids: position p is p (0 = the open state); the file's
+         * state is `fork` on the stack, or a fresh id off it (branch). */
+        for (i = 0; i < (size_t)h.hlen; i++) recs[i].sid = (uint64_t)i + 1;
+        for (i = 0; i < (size_t)nb; i++) brs[i].sid = (uint64_t)h.hlen + 1 + i;
+        d->hist.base_sid = 0;
+        d->hist.sid_next = (uint64_t)h.hlen + (uint64_t)nb;
         d->hist.coalesce = 0;
         {
             /* Some recs may already be applied: the text is neither the
@@ -1399,8 +1466,41 @@ int rtx_safe_load(RtxDoc *d, RtxSafeCam *cam) {
             @errhandler(CCError e) {
                 (void)e;
                 rtx_hist_clear(&d->hist);
+                d->saved_sid = 0;
                 rc = RTX_SAFE_LOAD_FAULT;
                 goto done;
+            }
+            if (nb) {
+                /* The file is fork + branch: walk the branch back first,
+                 * over a stack that is the main recs below the fork and
+                 * then the branch. */
+                RtxHistRec *walk = (RtxHistRec *)cc_arena_alloc(
+                    d->session, (fork + (size_t)nb) * sizeof(RtxHistRec), 8);
+                if (!walk) {
+                    /* Nothing applied yet: the file as it is. */
+                    rtx_hist_clear(&d->hist);
+                    rtx_safe_clamp_doc(d, cam);
+                    goto done;
+                }
+                for (i = 0; i < fork; i++) walk[i] = recs[i];
+                for (i = 0; i < (size_t)nb; i++) walk[fork + i] = brs[i];
+                d->hist.recs = walk;
+                d->hist.len = fork + (size_t)nb;
+                d->hist.cap = d->hist.len;
+                d->hist.head = d->hist.len;
+                while (d->hist.head > fork) d->undo() !>;
+            }
+            d->hist.recs = recs;
+            d->hist.len = (size_t)h.hlen;
+            d->hist.cap = (size_t)h.hlen;
+            d->hist.head = fork;
+            if (nb) {
+                d->saved_sid = ++d->hist.sid_next;
+                d->hist.sb = brs;
+                d->hist.sb_len = (size_t)nb;
+                d->hist.fork_sid = rtx_hist_cur_sid(&d->hist);
+            } else {
+                d->saved_sid = rtx_hist_cur_sid(&d->hist);
             }
             while (d->hist.head < (size_t)h.head) d->redo() !>;
             while (d->hist.head > (size_t)h.head) d->undo() !>;
@@ -1457,7 +1557,7 @@ static int rtx_safe_dirty_hdr(const char *doc_path, RtxSafeHdr *h) {
     fd = rtx_safe_open_hdr(path, RTX_SAFE_FILE_MAGIC, &r, h);
     if (fd < 0) return 0;
     close(fd);
-    if (h->saved == h->head) return 0;
+    if (!h->dirty) return 0;
     return rtx_safe_hdr_path_ok(h, doc_path);
 }
 
@@ -1499,7 +1599,7 @@ int rtx_safe_peek_dirty(const char *doc_path) {
     fd = rtx_safe_open_hdr(path, RTX_SAFE_FILE_MAGIC, &r, &h);
     if (fd < 0) return 0;
     close(fd);
-    return h.saved != h.head;
+    return h.dirty;
 }
 
 static int rtx_safe_ws_put_tree(RtxSafeW *w, const RtxSafeWs *ws, int n, int depth) {

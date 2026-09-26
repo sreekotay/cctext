@@ -246,7 +246,7 @@ Journals live under `~/Library/Caches/cctext/safe` on macOS, or `$XDG_CACHE_HOME
 
 A **file journal** is the named buffer’s session:
 
-- Flattened undo/redo (inserts and deletes as bytes, including piece-ref deletes), with edit groups (one command, one undo step) marked by an END flag on their last record. Dirty is `hist.head != saved_head`.
+- Flattened undo/redo (inserts and deletes as bytes, including piece-ref deletes), with edit groups (one command, one undo step) marked by an END flag on their last record. Dirty means the state at head is not the state the file holds (each history state has an id; a save records it). Undo / redo back onto the saved state is clean; a new edit after undoing past a save leaves it dirty until the next Save. That saved state then rides along as a branch (`RTXS` v9) so the journal still replays against the file.
 - Caret, stream selection, and box columns.
 - Camera: line or byte (`top` / `seek_off`), wrap row, `left_col`, hex nibble, view, unlock, pin.
 - A live gutter origin (`mark_line` + `seek_rel`) plus up to 32 line→byte pins at 1/32 file fractions (vacant until known). Pins re-key the origin on land / reopen; they are not a paint-time gate. An edit drops the origin and every pin at or after that byte.
@@ -260,7 +260,7 @@ Not stored: find, clipboard, folds, highlight runs, the full line-index prefix.
 
 Both frontends call `safe_pump` every frame:
 
-1. **~250 ms after the last session change** — last-change debounce. Hist (`edit_gen` / `saved_head`) writes the `RTXS` leaf (undo recs). Caret / selection / camera / pins write only the `RTXC` sidecar (`<hash>.s`). A jump or a drag with no type still writes state once you pause. Scrolling does not rewrite hist. A failed hist write does not mark the journal current and does not allow a later park to evict. The idle retry backs off: 250 ms after the miss, doubling to 8 s (`RTX_SAFE_BACKOFF_MAX_MS`); a new edit does not jump the wait. Browse-away, quit, and Save still try at once.
+1. **~250 ms after the last session change** — last-change debounce. Hist (`edit_gen` / the saved state) writes the `RTXS` leaf (undo recs). Caret / selection / camera / pins write only the `RTXC` sidecar (`<hash>.s`). A jump or a drag with no type still writes state once you pause. Scrolling does not rewrite hist. A failed hist write does not mark the journal current and does not allow a later park to evict. The idle retry backs off: 250 ms after the miss, doubling to 8 s (`RTX_SAFE_BACKOFF_MAX_MS`); a new edit does not jump the wait. Browse-away, quit, and Save still try at once.
 2. **Browse away** — flush the journal, then **park** (evict the document from RAM) only if that hist write landed or the buffer is clean. A dirty flush miss keeps the document live and shows the fault. Live set is the pane slots. Returning unparks and reloads from path + journal. Browse does not ask and does not write your path. The [listing preview](#browse-preview) is that same load and does not flush.
 3. **Unsaved-quit prompt** — flush everything first so a crash mid-dialog is recoverable.
 4. **After a real Save** — journal refreshed to match clean hist.
