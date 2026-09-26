@@ -248,7 +248,8 @@ static double wb_fmod(double x, double y) {
 
 enum { NK_CELL = 1, NK_COL, NK_NAME, NK_LINE, NK_MA, NK_DEAD };
 
-#define WNONE ((size_t)-1)
+/* "No offset": fits the 32-bit node offsets (RTX_WB_MAX < 4 GiB). */
+#define WNONE ((size_t)UINT32_MAX)
 
 /* Literal kinds a column counts (type inference). */
 enum { LK_EMPTY = 0, LK_INT, LK_DEC, LK_FLOAT, LK_BOOL, LK_DATE, LK_TEXT, LK_FORMULA, LK__N };
@@ -263,42 +264,44 @@ typedef struct Ex Ex;
 typedef struct {
     uint8_t kind;
     uint8_t form;   /* formula (else literal / empty) */
-    uint8_t cyc;    /* in a cycle: value fixed at #cycle(path) */
+    uint8_t cyc;    /* in a cycle: value fixed at #cycle(path) (wb->cyv[cyi]) */
     uint8_t queued;
     uint8_t lk;     /* CELL: LK_* of its text */
     uint8_t lsc;    /* CELL: LK_DEC scale */
-    uint8_t ovset;  /* recalc: `ov` holds the value before this recalc */
+    uint8_t clash;  /* NAME: duplicate / case clash */
     int32_t tab;    /* CELL / COL / MA: table; NAME: sheet (-1 = params) */
     int32_t col, row; /* CELL: row is the row's id (t->rpos: its position) */
     /* Offsets: a CELL's are relative to its row's start (wb_nbase: rows
      * are relative to their leaf, a leaf's start is absolute), so an edit
      * moves O(leaves) numbers, not every cell after it. NAME / LINE:
      * absolute (they live in `ord`). */
-    size_t raw_lo, raw_hi; /* CELL: between the pipes; NAME / LINE: the line */
-    size_t f_lo, f_hi;     /* painted span (formula), f_lo == f_hi: none */
-    size_t n_lo, n_hi;     /* NAME: the defined name token */
-    size_t src_lo;         /* AST spans are relative to this */
-    const char *src;       /* literal text (unescaped) / formula text */
+    uint32_t raw_lo, raw_hi; /* CELL: between the pipes; NAME / LINE: the line */
+    uint32_t f_lo, f_hi;     /* painted span (formula), f_lo == f_hi: none */
+    uint32_t n_lo, n_hi;     /* NAME: the defined name token */
+    uint32_t src_lo;         /* AST spans are relative to this */
     uint32_t srcn;
-    const char *name;      /* NAME */
     uint32_t namen;
+    const char *src;       /* literal text (unescaped) / formula text */
+    const char *name;      /* NAME */
     Ex *ex;
+    uint32_t *deps;
+    uint32_t *mal;         /* formula: its MA nodes in AST order (re-bind reuses them) */
     WVal v;
-    WVal cv;               /* cycle member: its #cycle(path) */
-    WVal ov;               /* ovset: the value before this recalc (MA old rows) */
     uint64_t topo;         /* evaluation order: Tarjan's position << 16, so
                             * a node can be placed between two without a regraph */
+    uint32_t cyi;          /* cyc: its cycle's value in wb->cyv */
+    uint32_t ovi;          /* recalc: 0, or 1 + where wb->ovv holds the value
+                            * before this recalc (MA old rows) */
     uint32_t xr;           /* dependents added since the last regraph (wb->xrp list) */
-    uint32_t *deps;
     uint32_t ndeps;
     uint32_t nsd;          /* MA: deps[0, nsd) are scalar inputs (a change
                             * rebuilds it); the rest are its row columns */
     uint32_t rd0, rdn;     /* dependents in wb->rdeps */
-    uint8_t clash;         /* NAME: duplicate / case clash */
     uint32_t mai;          /* MA: index in wb->mas */
-    uint32_t *mal;         /* formula: its MA nodes in AST order (re-bind reuses them) */
     uint32_t nmal;
 } WNode;
+
+_Static_assert(sizeof(WNode) <= 160, "WNode: keep it small (one per cell)");
 
 typedef struct {
     const char *name;
@@ -324,6 +327,10 @@ typedef struct {
     uint32_t rowcap, nrid, ridcap;
     uint32_t nferr;        /* at least the formula cells holding an error
                             * (their text names their row); 0: none */
+    struct Ex **fsh;       /* per column: a bound row formula any row may
+                            * share (only own-row cells, literals, operators) */
+    const char **fshs;     /* ... its text */
+    uint32_t *fshn;
     WColStat *cs;
     uint8_t *ct, *csc;     /* inferred column type / dec scale */
     /* MA leaves: consecutive runs of rows (the W1 counted-leaf shape) */
@@ -403,8 +410,11 @@ struct RtxWb {
     /* recalc scratch that outlives a sync's arena (heap) */
     struct WDirty *dirty;    /* per-MA row delta lists */
     uint32_t ndirty, dirtycap;
-    uint32_t *ovl;           /* nodes with ovset */
+    uint32_t *ovl;           /* nodes with ovi */
+    WVal *ovv;               /* their old values */
     uint32_t novl, ovlcap;
+    WVal *cyv;               /* each cycle's #cycle(path) (model arena) */
+    uint32_t ncyv, cyvcap;
     struct WXr *xrp;         /* dependents added since the last regraph */
     uint32_t nxr, xrcap;
     RtxWbStats st;
@@ -2253,6 +2263,45 @@ static int wb_u32_cmp(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
+/* A bound AST that reads nothing but its own row's cells, literals and
+ * operators: the same for every row of its column (row formulas like
+ * `=@a * @b` share one; their deps come from wb_ex_rowdeps). */
+static int wb_ex_rowpure(const Ex *e) {
+    uint16_t i;
+    if (!e) return 1;
+    switch (e->op) {
+    case EX_LIT:
+    case EX_ATCELL:
+        return 1;
+    case EX_UN:
+    case EX_BIN:
+    case EX_IF:
+        return wb_ex_rowpure(e->a) && wb_ex_rowpure(e->b) && wb_ex_rowpure(e->c);
+    case EX_FN:
+        if (e->a || e->b || e->c || e->where) return 0;
+        for (i = 0; i < e->nargs; i++)
+            if (!wb_ex_rowpure(e->args[i])) return 0;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* A shared AST's deps for row `row`: the cells bd would have noted. */
+static void wb_ex_rowdeps(BCtx *c, const Ex *e) {
+    uint16_t i;
+    if (!e) return;
+    if (e->op == EX_ATCELL) {
+        bd_dep(c, wb_cell_id(&c->wb->tabs[e->tab], c->own_row, e->col));
+        return;
+    }
+    wb_ex_rowdeps(c, e->a);
+    wb_ex_rowdeps(c, e->b);
+    wb_ex_rowdeps(c, e->c);
+    if (e->op == EX_FN)
+        for (i = 0; i < e->nargs; i++) wb_ex_rowdeps(c, e->args[i]);
+}
+
 /* Parse + bind node `id`'s formula; its deps land on the node. Returns 1
  * when the dependency set changed. */
 static int wb_bind_node(RtxWb *wb, uint32_t id) {
@@ -2284,12 +2333,26 @@ static int wb_bind_node(RtxWb *wb, uint32_t id) {
     n->mal = NULL;
     n->nmal = 0;
     if (n->form && n->src) {
+        WTab *st = n->kind == NK_CELL ? &wb->tabs[n->tab] : NULL;
+        int32_t sc = n->col;
         wb->nbd = 0;
-        n->ex = wb_parse(wb, n->src, n->srcn);
-        {
-            Ex *x = bd(&c, n->ex);
+        if (st && st->fsh && st->fsh[sc] && st->fshn[sc] == n->srcn &&
+            !memcmp(st->fshs[sc], n->src, n->srcn)) {
+            n->ex = st->fsh[sc];
+            wb_ex_rowdeps(&c, n->ex);
+            n = &wb->nodes[id];
+        } else {
+            Ex *x;
+            n->ex = wb_parse(wb, n->src, n->srcn);
+            x = bd(&c, n->ex);
             n = &wb->nodes[id];
             n->ex = x;
+            if (st) st = &wb->tabs[n->tab];
+            if (st && st->fsh && !c.nmal && wb_ex_rowpure(x)) {
+                st->fsh[sc] = x;
+                st->fshs[sc] = n->src;
+                st->fshn[sc] = n->srcn;
+            }
         }
         if (wb->nbd) {
             qsort(wb->bdeps, wb->nbd, sizeof(uint32_t), wb_u32_cmp);
@@ -2348,7 +2411,7 @@ typedef struct {
 /* A node's value as this context sees it. */
 static const WVal *wb_nv(const ECtx *c, uint32_t id) {
     const WNode *n = &c->wb->nodes[id];
-    return c->old && n->ovset ? &n->ov : &n->v;
+    return c->old && n->ovi ? &c->wb->ovv[n->ovi - 1] : &n->v;
 }
 
 static WVal ev(ECtx *c, const Ex *e);
@@ -3923,7 +3986,15 @@ static WVal wb_eval_node(RtxWb *wb, uint32_t id) {
 
 static uint32_t wb_node_new(RtxWb *wb, int kind) {
     WNode *n;
-    if (!wb_grow(wb, (void **)&wb->nodes, &wb->ncap, wb->nn + 1, sizeof(WNode))) return UINT32_MAX;
+    if (wb->nn >= wb->ncap) {
+        /* the heap, not the model arena: a doubling there would leave
+         * every old copy behind until the next rebuild */
+        uint32_t nc = wb->ncap < 1024 ? 1024 : wb->ncap + wb->ncap / 2;
+        WNode *np = (WNode *)realloc(wb->nodes, (size_t)nc * sizeof(WNode));
+        if (!np) return UINT32_MAX;
+        wb->nodes = np;
+        wb->ncap = nc;
+    }
     n = &wb->nodes[wb->nn];
     memset(n, 0, sizeof *n);
     n->kind = (uint8_t)kind;
@@ -4207,6 +4278,10 @@ static int wb_table_build(RtxWb *wb, const char *buf, size_t len, const RtxMdTab
     t->rpos = (uint32_t *)wb_ma(wb, (size_t)t->ridcap * sizeof(uint32_t));
     t->cma = (uint32_t **)wb_ma(wb, (size_t)(ncols + 1) * sizeof(uint32_t *));
     t->ncma = (uint32_t *)wb_ma(wb, (size_t)(ncols + 1) * sizeof(uint32_t));
+    t->fsh = (Ex **)wb_ma(wb, (size_t)(ncols + 1) * sizeof(Ex *));
+    t->fshs = (const char **)wb_ma(wb, (size_t)(ncols + 1) * sizeof(const char *));
+    t->fshn = (uint32_t *)wb_ma(wb, (size_t)(ncols + 1) * sizeof(uint32_t));
+    if (!t->fsh || !t->fshs || !t->fshn) return 0;
     if (!t->cname || !t->cnamen || !t->cclash || !t->hlo || !t->hhi || !t->cs || !t->ct ||
         !t->csc || !t->rrel || !t->rlen || !t->rowcell || !t->rleaf || !t->cma || !t->ncma ||
         !t->prid || !t->rpos)
@@ -4688,6 +4763,7 @@ static int wb_regraph(RtxWb *wb, int seed) {
     size_t total = 0;
     wb->st.regraphs++;
     wb->st.cycles = 0;
+    wb->ncyv = 0;
     if (!nn) return 1;
     cnt = (uint32_t *)wb_alloc(wb->sa, (size_t)(nn + 1) * sizeof(uint32_t));
     index = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
@@ -4793,11 +4869,15 @@ static int wb_regraph(RtxWb *wb, int seed) {
                         wb_cycle_path(wb, s0, comp, par, queue, rank, path, sizeof path);
                     }
                     cv = wv_err(wb, WE_CYCLE, "%s", path);
+                    if (!wb_grow(wb, (void **)&wb->cyv, &wb->cyvcap, wb->ncyv + 1, sizeof(WVal)))
+                        return 0;
+                    wb->cyv[wb->ncyv] = cv;
                     /* the SCC's members sit just above sp */
                     for (j = sp; j < sp + (topo - first); j++) {
                         wb->nodes[stk[j]].cyc = 1;
-                        wb->nodes[stk[j]].cv = cv;
+                        wb->nodes[stk[j]].cyi = wb->ncyv;
                     }
+                    wb->ncyv++;
                 }
             }
             fp--;
@@ -4824,23 +4904,27 @@ static void wb_note_changed(RtxWb *wb, uint32_t id) {
 
 static void wb_ov_save(RtxWb *wb, uint32_t id) {
     WNode *n = &wb->nodes[id];
-    if (n->ovset) return;
+    if (n->ovi) return;
     if (wb->novl >= wb->ovlcap) {
         uint32_t nc = wb->ovlcap ? wb->ovlcap * 2 : 1024;
         uint32_t *nl = (uint32_t *)realloc(wb->ovl, (size_t)nc * sizeof(uint32_t));
+        WVal *nv;
         if (!nl) return;
         wb->ovl = nl;
+        nv = (WVal *)realloc(wb->ovv, (size_t)nc * sizeof(WVal));
+        if (!nv) return;
+        wb->ovv = nv;
         wb->ovlcap = nc;
     }
-    n->ov = n->v;
-    n->ovset = 1;
+    wb->ovv[wb->novl] = n->v;
     wb->ovl[wb->novl++] = id;
+    n->ovi = wb->novl;
 }
 
 /* End of a recalc: old values and queued rows are spent. */
 static void wb_recalc_done(RtxWb *wb) {
     uint32_t i;
-    for (i = 0; i < wb->novl; i++) wb->nodes[wb->ovl[i]].ovset = 0;
+    for (i = 0; i < wb->novl; i++) wb->nodes[wb->ovl[i]].ovi = 0;
     wb->novl = 0;
     if (wb->ndirty) {
         for (i = 0; i < wb->nma; i++) wb->mas[i].dhead = WN32;
@@ -4865,12 +4949,12 @@ static void wb_recalc(RtxWb *wb) {
             if (n->cyc) {
                 m->dhead = WN32;
                 m->stale = 1;
-                nv = n->cv;
+                nv = wb->cyv[n->cyi];
             } else {
                 nv = ma_update(wb, id);
             }
         } else {
-            nv = n->cyc ? n->cv : wb_eval_node(wb, id);
+            nv = n->cyc ? wb->cyv[n->cyi] : wb_eval_node(wb, id);
             if (nv.t == WV_ERR && n->kind == NK_CELL && n->form) wb->tabs[n->tab].nferr++;
         }
         n = &wb->nodes[id];
@@ -4903,7 +4987,7 @@ static void wb_calc_all(RtxWb *wb) {
             WMa *m = &wb->mas[n->mai];
             if (n->cyc) {
                 m->stale = 1;
-                n->v = n->cv;
+                n->v = wb->cyv[n->cyi];
             } else {
                 WVal x;
                 ma_build(wb, m);
@@ -4912,7 +4996,7 @@ static void wb_calc_all(RtxWb *wb) {
             }
             continue;
         }
-        if (n->cyc) n->v = n->cv;
+        if (n->cyc) n->v = wb->cyv[n->cyi];
         else {
             WVal x = wb_eval_node(wb, id);
             wb->nodes[id].v = x;
@@ -4952,7 +5036,10 @@ static void wb_reset_model(RtxWb *wb) {
     wb->va.reset();
     wb->sa.reset();
     wb->ma_mark = wb->va_mark = 0;
+    free(wb->nodes);
     wb->nodes = NULL;
+    wb->cyv = NULL;
+    wb->ncyv = wb->cyvcap = 0;
     wb->nn = wb->ncap = 0;
     wb->ord = NULL;
     wb->nord = wb->ordcap = 0;
@@ -6121,7 +6208,9 @@ static void wb_hook_destroy(void *ctx) {
     own = wb->own;
     free(wb->dirty);
     free(wb->ovl);
+    free(wb->ovv);
     free(wb->xrp);
+    free(wb->nodes);
     wb->ma.destroy();
     wb->va.destroy();
     wb->sa.destroy();
@@ -6183,6 +6272,10 @@ void rtx_wb_stats(RtxWb *wb, const RtxDoc *d, RtxWbStats *out) {
     for (i = 0; i < wb->nn; i++)
         if (wb->nodes[i].v.t == WV_ERR) wb->st.errors++;
     wb->st.off = wb->off;
+    wb->st.mem_model = wb->ma_mark;
+    wb->st.mem_values = wb->va_mark;
+    wb->st.mem_nodes = (size_t)wb->ncap * sizeof(WNode);
+    wb->st.mem_model += wb->st.mem_nodes;
     *out = wb->st;
 }
 
