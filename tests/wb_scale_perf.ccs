@@ -1,0 +1,348 @@
+#!ccc ccs
+/*
+ * Workbook W2 at scale (docs/workbook.md "W2 at scale"): generated
+ * workbooks (tests/wb_gen.cch) of `rows` rows, 1000 aggregates over column
+ * a, 100 over b, one over e, a group, a chain of names.
+ *
+ *   ./bin/wb_scale_perf [rows ...]          (default 10000 100000)
+ *   ./bin/wb_scale_perf --pins [rows]        (one size; RESULT lines for pins)
+ *
+ * RESULT op=... n= p50_ms= p95_ms= per size:
+ *   open            attach (parse, bind, Tarjan, every MA's first walk); rss_mb
+ *   edit_1 / edit_100 / edit_1000   one cell edit under 1 / 100 / 1000
+ *                   aggregates of its column (MA builds must stay 0)
+ *   row_ins_del     a new row, then its delete (row path)
+ *   param           k flips: `n_big = count(Big where a > k)`, one walk
+ *   reparse         a header edit: the whole-workbook parse
+ *   key_cell / key_cell_px   keystroke + Rich relayout in a cell (TUI cell
+ *                   measure / a GUI-like pixel measure)
+ *   key_formula     keystroke at a formula's end (live value annotation)
+ *   page            PageDown through the table (Rich)
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/wb.cch"
+#include "wb_gen.cch"
+
+#define PERF_W 120.0
+#define PERF_VIS 50
+
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return (double)rtx_utf8_cols(bytes);
+}
+
+/* A proportional-ish GUI stand-in: 8 px a column (the md_px path). */
+static double px_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 8.0 * (double)rtx_utf8_cols(bytes);
+}
+
+static double cell_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 1.0;
+}
+
+static double px_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 18.0;
+}
+
+static double mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static long proc_kb(const char *key) {
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    long v = -1;
+    size_t kn = strlen(key);
+    if (!f) return -1;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, key, kn)) {
+            v = atol(line + kn);
+            break;
+        }
+    fclose(f);
+    return v;
+}
+
+static int dcmp(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void report(long rows, const char *op, double *v, int n, const char *extra) {
+    qsort(v, (size_t)n, sizeof(double), dcmp);
+    printf("RESULT rows=%ld op=%s n=%d p50_ms=%.4f p95_ms=%.4f max_ms=%.4f %s\n", rows, op, n,
+           v[n / 2], v[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1], v[n - 1], extra ? extra : "");
+    fflush(stdout);
+}
+
+static size_t find_off(RtxDoc *d, const char *needle, size_t from) {
+    size_t n = d->len(), off = (size_t)-1, span;
+    char *p;
+    char *hit;
+    if (from >= n) return off;
+    span = n - from;
+    p = (char *)malloc(span + 1);
+    if (!p) return off;
+    if ((d->read_at(from, cc_slice_from_buffer(p, span)) ?> 0) != span) {
+        free(p);
+        return off;
+    }
+    p[span] = 0;
+    hit = strstr(p, needle);
+    if (hit) off = from + (size_t)(hit - p);
+    free(p);
+    return off;
+}
+
+/* The cell `col` (0-based) of row `id`: [lo, hi) of its bytes (trimmed). */
+static int cell_at(RtxDoc *d, long id, int col, size_t *lo, size_t *hi) {
+    char needle[48], buf[256];
+    size_t off, got, i, k = 0;
+    snprintf(needle, sizeof needle, "\n| %ld | ", id);
+    off = find_off(d, needle, 0);
+    if (off == (size_t)-1) return 0;
+    off++;
+    got = d->read_at(off, cc_slice_from_buffer(buf, sizeof buf - 1)) ?> 0;
+    buf[got] = 0;
+    *lo = *hi = 0;
+    for (i = 0; i < got && buf[i] != '\n'; i++) {
+        if (buf[i] != '|') continue;
+        if (k == (size_t)col + 1) {
+            *hi = off + i - 1;
+            return 1;
+        }
+        k++;
+        if (k == (size_t)col + 1) *lo = off + i + 2;
+    }
+    return 0;
+}
+
+static void !>(CCError) toggle_cell(RtxDoc *d, RtxWb *wb, long rows, long id, int col,
+                                    const char *op, int n) {
+    size_t lo, hi;
+    double v[64], t0;
+    int i;
+    RtxWbStats s0, s1;
+    char extra[160];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (!cell_at(d, id, col, &lo, &hi)) return cc_err(CC_ERR_INVALID_ARG, "cell");
+    rtx_wb_stats(wb, d, &s0);
+    for (i = 0; i < n; i++) {
+        t0 = mono_ms();
+        /* a leading digit: the column keeps its type and scale */
+        if (i % 2 == 0) d->replace(lo, 0, cc_slice_from_buffer((char *)"7", 1)) !>;
+        else d->replace(lo, 1, cc_slice_empty()) !>;
+        rtx_wb_sync(wb, d);
+        v[i] = mono_ms() - t0;
+    }
+    rtx_wb_stats(wb, d, &s1);
+    snprintf(extra, sizeof extra, "ma_builds=%zu ma_rows=%zu rebuilds=%zu", s1.ma_full - s0.ma_full,
+             (s1.ma_rows - s0.ma_rows) / (size_t)n, s1.rebuilds - s0.rebuilds);
+    report(rows, op, v, n, extra);
+    return cc_ok();
+}
+
+static void !>(CCError) engine(const char *dir, long rows, int pins) {
+    WbGen g = {0};
+    char path[512], extra[200], rowbuf[256];
+    size_t n = 0, off, rn;
+    char *src;
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats st, s0, s1;
+    double t0, v[64];
+    int i;
+    FILE *f;
+    long rss0 = proc_kb("VmRSS:");
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    g.rows = (int)rows;
+    g.nagg_a = 1000;
+    g.nagg_b = 100;
+    g.chain = 50;
+    src = wbgen(&g, &n);
+    if (!src) return cc_err(CC_ERR_OUT_OF_MEMORY, "gen");
+    snprintf(path, sizeof path, "%s/scale_%ld.wb.md", dir, rows);
+    f = fopen(path, "wb");
+    if (!f || fwrite(src, 1, n, f) != n) {
+        if (f) fclose(f);
+        free(src);
+        return cc_err(CC_ERR_IO, "write");
+    }
+    fclose(f);
+    free(src);
+    t0 = mono_ms();
+    d.from_path(cc_slice_cstr(path)) !>;
+    wb = rtx_wb_of(&d);
+    if (!wb) return cc_err(CC_ERR_INVALID_ARG, "not a workbook");
+    rtx_wb_stats(wb, &d, &st);
+    v[0] = mono_ms() - t0;
+    snprintf(extra, sizeof extra, "bytes=%zu nodes=%zu mas=%zu off=%d rss_mb=%.1f hwm_mb=%.1f", n,
+             st.nodes, st.mas, st.off, (proc_kb("VmRSS:") - rss0) / 1024.0,
+             proc_kb("VmHWM:") / 1024.0);
+    report(rows, "open", v, 1, extra);
+    if (st.off) {
+        RtxDoc_destroy(&d);
+        return cc_ok();
+    }
+    toggle_cell(&d, wb, rows, rows / 2 + 1, 6, "edit_1", 20) !>;    /* e: e_one */
+    toggle_cell(&d, wb, rows, rows / 2 + 1, 3, "edit_100", 20) !>;  /* b: 100 + group */
+    toggle_cell(&d, wb, rows, rows / 2 + 1, 2, "edit_1000", 20) !>; /* a: 1000 + group */
+    /* row insert / delete */
+    off = find_off(&d, "\n| 7 | ", 0) + 1;
+    rn = wbgen_row(rowbuf, sizeof rowbuf, rows + 1);
+    rtx_wb_stats(wb, &d, &s0);
+    for (i = 0; i < 20; i++) {
+        t0 = mono_ms();
+        if (i % 2 == 0) d.replace(off, 0, cc_slice_from_buffer(rowbuf, rn)) !>;
+        else d.replace(off, rn, cc_slice_empty()) !>;
+        rtx_wb_sync(wb, &d);
+        v[i] = mono_ms() - t0;
+    }
+    rtx_wb_stats(wb, &d, &s1);
+    snprintf(extra, sizeof extra, "fast_rows=%zu rebuilds=%zu ma_builds=%zu",
+             s1.fast_rows - s0.fast_rows, s1.rebuilds - s0.rebuilds, s1.ma_full - s0.ma_full);
+    report(rows, "row_ins_del", v, 20, extra);
+    /* param k: one MA walks */
+    off = find_off(&d, "k = 500", 0);
+    rtx_wb_stats(wb, &d, &s0);
+    for (i = 0; i < 20; i++) {
+        t0 = mono_ms();
+        d.replace(off + 6, 1, cc_slice_from_buffer((char *)(i % 2 ? "0" : "1"), 1)) !>;
+        rtx_wb_sync(wb, &d);
+        v[i] = mono_ms() - t0;
+    }
+    rtx_wb_stats(wb, &d, &s1);
+    snprintf(extra, sizeof extra, "ma_builds=%zu", (s1.ma_full - s0.ma_full) / 20);
+    report(rows, "param", v, 20, extra);
+    if (!pins || rows <= 100000) {
+        /* the header: a whole-workbook parse */
+        off = find_off(&d, "| id | key |", 0);
+        for (i = 0; i < 4; i++) {
+            t0 = mono_ms();
+            if (i % 2 == 0) d.replace(off + 1, 0, cc_slice_from_buffer((char *)" ", 1)) !>;
+            else d.replace(off + 1, 1, cc_slice_empty()) !>;
+            rtx_wb_sync(wb, &d);
+            v[i] = mono_ms() - t0;
+        }
+        rtx_wb_stats(wb, &d, &st);
+        snprintf(extra, sizeof extra, "rebuilds=%zu", st.rebuilds);
+        report(rows, "reparse", v, 4, extra);
+    }
+    RtxDoc_destroy(&d);
+    return cc_ok();
+}
+
+/* Keystrokes in a cell, the formula-end annotation, and paging: Rich. */
+static void !>(CCError) lens(const char *dir, long rows, int px) {
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    char path[512];
+    size_t off, line, lo, hi;
+    double v[120], t0, w = px ? 960.0 : PERF_W;
+    int k;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    m.measure = px ? px_meas : cell_meas;
+    m.line_height = px ? px_lh : cell_lh;
+    snprintf(path, sizeof path, "%s/scale_%ld.wb.md", dir, rows);
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.rich = 1;
+    b.layout.wrap = 1;
+    rtx_line_scan_to(&b.doc.tree, b.doc.len()) !>;
+    if (!cell_at(&b.doc, rows / 2 + 1, 2, &lo, &hi)) return cc_err(CC_ERR_INVALID_ARG, "cell");
+    line = b.doc.line_of(lo) !>;
+    b.top = line > 10 ? line - 10 : 0;
+    b.ensure_view(&m, w, PERF_VIS) !>;
+    b.doc.caret = b.doc.sel_anchor = hi;
+    for (k = 0; k < 100; k++) {
+        t0 = mono_ms();
+        if (k % 2 == 0) b.type_cp((uint32_t)('1' + k % 9)) !>;
+        else b.backspace() !>;
+        b.after_edit(&m, w, PERF_VIS) !>;
+        v[k] = mono_ms() - t0;
+    }
+    report(rows, px ? "key_cell_px" : "key_cell", v, 100, "");
+    if (px) return cc_ok();
+    /* the f1 formula's end: the annotation follows each keystroke */
+    if (!cell_at(&b.doc, rows / 2 + 1, 7, &lo, &hi)) return cc_err(CC_ERR_INVALID_ARG, "f1");
+    b.doc.caret = b.doc.sel_anchor = hi;
+    b.ensure_view(&m, w, PERF_VIS) !>;
+    for (k = 0; k < 100; k++) {
+        t0 = mono_ms();
+        if (k % 2 == 0) b.type_cp((uint32_t)'2') !>;
+        else b.backspace() !>;
+        b.after_edit(&m, w, PERF_VIS) !>;
+        v[k] = mono_ms() - t0;
+    }
+    report(rows, "key_formula", v, 100, b.layout.inl_on ? "annotation=1" : "annotation=0");
+    /* page down through the table */
+    for (k = 0; k < 40; k++) {
+        t0 = mono_ms();
+        b.page_vert(&m, w, 1, (size_t)PERF_VIS, 0) !>;
+        b.ensure_view(&m, w, PERF_VIS) !>;
+        v[k] = mono_ms() - t0;
+    }
+    report(rows, "page", v, 40, "");
+    (void)off;
+    return cc_ok();
+}
+
+int main(int argc, char **argv) {
+    char dir[] = "/tmp/wb_scale_XXXXXX";
+    long sizes[8];
+    int ns = 0, i, pins = 0;
+    @errhandler(CCError e) {
+        fprintf(stderr, "wb_scale_perf: %s\n", e.message ? e.message : "error");
+        return 1;
+    }
+    for (i = 1; i < argc && ns < 8; i++) {
+        if (!strcmp(argv[i], "--pins")) pins = 1;
+        else sizes[ns++] = atol(argv[i]);
+    }
+    if (!ns) {
+        sizes[ns++] = 10000;
+        sizes[ns++] = 100000;
+    }
+    if (!mkdtemp(dir)) return 1;
+    for (i = 0; i < ns; i++) {
+        char p[512];
+        engine(dir, sizes[i], pins) !>;
+        lens(dir, sizes[i], 0) !>;
+        lens(dir, sizes[i], 1) !>;
+        snprintf(p, sizeof p, "%s/scale_%ld.wb.md", dir, sizes[i]);
+        unlink(p);
+    }
+    rmdir(dir);
+    return 0;
+}
