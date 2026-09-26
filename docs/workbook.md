@@ -1,6 +1,6 @@
 # Workbooks: named tables, dependency recalc, giant data
 
-**Status: W0 (Names) and W2 (Aggregates, embedded tables) landed** — see [W0 as built](#w0-as-built): embedded named tables, `params` / `calc`, the formula language, the DAG with Tarjan and cutoff recalc on edit deltas, values in the Rich lens, rename; and [W2 as built](#w2-as-built): maintained aggregates updated by row deltas with exact float / dec sums, `group`, rows inserted and deleted as deltas, and the live value annotation while the caret is in a formula. W1 and W3–W5 are design. Open questions in §9 (decisions for W0 there).
+**Status: W0 (Names) and W2 (Aggregates, embedded tables) landed** — see [W0 as built](#w0-as-built): embedded named tables, `params` / `calc`, the formula language, the DAG with Tarjan and cutoff recalc on edit deltas, values in the Rich lens, rename; and [W2 as built](#w2-as-built): maintained aggregates updated by row deltas with exact float / dec sums, `group`, rows inserted and deleted as deltas, and the live value annotation while the caret is in a formula; [W2 at scale](#w2-at-scale): embedded tables to 1M rows, a structural reparse off the keystroke path, and what W1 must provide for 10M. W1 and W3–W5 are design. Open questions in §9 (decisions for W0 there).
 
 TODO.md: *"spreadsheets / cell references — NOT normal reference — named,
 and dependencies based."* This note answers that. A **workbook** is a
@@ -467,7 +467,7 @@ the rule that an unknown version is ignored are all the same as Safe.
 |---|---|---|
 | **W0 Names** | `.wb.md` parse; embedded tables; `params`/`calc`; formula grammar and binder; DAG, Tarjan, topo recalc with cutoff; Rich paints values (md_view Derived value); error values; rename refactor | fixtures under `testdata/wb/`: every calc and cell value asserted; cycles reported with path; rename round-trips; recalc after one cell edit visits only dependents (counter smoke) |
 | **W1 Index** | external `table` binding; header check; counted B+tree leaves; replace hook, split/merge, quote re-sync; progressive two-state parallel build; exact grid row numbers; `RTXI` persistence and validation | **1e8-row CSV (~6 GB)**: build ≥ 1 GB/s on 8 cores; reopen with cached index ≤ 50 ms; `g row N` ≤ 1 ms; RSS ≤ 64 MB above page cache; property smoke: 10k random edits, then index == fresh build (leaf-for-leaf positions) |
-| **W2 Aggregates** (built for embedded tables: [W2 as built](#w2-as-built); zone maps and pending are W1's) | typed columns, zone maps, MAs (sum/count/avg/min/max), where filters, group MA, exact dec/float, pending propagation | single-cell edit in the 1e8 table updates `sum(where)` and dependents ≤ 2 ms; incremental == from-scratch (bit-identical) after random edits, undo, and region flips; `@perf_check` pins |
+| **W2 Aggregates** (built for embedded tables to 1M rows: [W2 as built](#w2-as-built), [W2 at scale](#w2-at-scale); zone maps and pending are W1's) | typed columns, zone maps, MAs (sum/count/avg/min/max), where filters, group MA, exact dec/float, pending propagation | single-cell edit in the 1e8 table updates `sum(where)` and dependents ≤ 2 ms; incremental == from-scratch (bit-identical) after random edits, undo, and region flips; `@perf_check` pins |
 | **W3 Relations** | key/secondary indexes (RAM then LSM), lookups, computed columns, cross-table deltas, linear rewrite | Customers edit touches only leaves with that key (leaf-visit counter); `#dup` / `#schema` fixtures |
 | **W4 Views & UI** | filter and sort views, frozen key column, tabs, formula bar (TUI and GUI), externalize apply | exact scroll over a 1e8-row filter view; tab switch keeps camera via `RTXC` |
 | **W5 Scale** | columnar sidecar, append fast path, `use` imports, `export` verb | new MA over an indexed 1e8 table ≤ 2 s from sidecar; appending 1 GB to a log re-indexes only the tail |
@@ -976,6 +976,155 @@ not built. Editing a group's definition reparses the workbook (its
 readers bind its outputs by name). Inserts into a table with no body
 rows reparse. A scalar input's change costs its MA one walk of the table
 (up to `RTX_WB_ROWS_MAX` rows for an embedded table: ~20 ms at 100k).
+
+## W2 at scale
+
+Giant embedded workbooks: how far W2 goes without W1's on-disk index,
+what it costs there, and what stops it.
+
+**The generator** (`tests/wb_gen.cch`): one table `Big` of N rows —
+`id` int, `key` text (5 keys), `a` int, `b` dec(2), `c` float with
+awkward values (1e-300, 1e300, -2.5e10, 7e-5), `d` date, `e` int, and two
+row formulas (`f1 = @a * @b`, `f2 = @f1 + @c`) — params `k` / `asof` /
+`lim` that predicates read, and a calc fence of 1000 aggregates over `a`
+(sums with `where id > n`, averages by key, counts, maxes), 100 over `b`,
+one over `e`, a `group` with two lookups, and a chain of 50 names. It
+writes to memory or streams to a file (`wbgen_file`: a 10M-row file is
+never held).
+
+**What changed for scale.**
+
+- *Row ids.* A cell names its row by a stable id (`WTab.rpos` maps it
+  to a position), so a row insert rewrites one position per row after
+  it, not every cell's; error cells below the edit re-evaluate only when
+  the table has any (`WTab.nferr`). 100k rows: 43 → 0.6 ms (no
+  aggregates).
+- *Memory.* The node array lives on the heap (an arena doubling left
+  every old copy behind until the next rebuild), is reserved per table,
+  and a node is 160 bytes (32-bit offsets: the byte cap stays under
+  4 GiB; cycle values and a recalc's old values in side tables). Row
+  formulas that read only their own row, literals and operators
+  (`=@a * @b`) share one bound AST per column; their deps come from the
+  AST at bind. 100k rows: 727 → 279 MB (no aggregates).
+- *Open.* MAs over one table build in one pass over its leaves (each
+  leaf's cells read once from memory for all of them), not one walk
+  each: 100k rows × 1110 MAs, 27.8 → 6.0 s.
+- *Caps.* `RTX_WB_ROWS_MAX` 10 000 → **1 000 000** rows,
+  `RTX_WB_MAX` 8 MiB → **256 MiB**. `rtx_wb_limits` moves them at run
+  time (tests, the perf tool).
+- *The reparse leaves the keystroke path.* A structural edit (header,
+  separator, fence, caption, a table's end, garbage) reparses the whole
+  workbook: ~0.6 s at 10k rows with 1000 aggregates, 5.6 s at 100k,
+  64 s at 1M — far over ~100 ms. From `RTX_WB_DEFER_BYTES` (1 MiB,
+  ~12k rows of the generated table) the derived hooks and the status
+  line do not reparse: the values hide (the layout sees no derived marks,
+  so nothing stale paints), the status says `workbook: recalculating
+  when typing pauses`, and the host's idle loop (`rtx_ui_wb_idle`, both
+  frontends, after `RTX_WB_DEFER_MS` = 300 ms without an edit) reparses
+  and relays the views. An explicit query (`rtx_wb_eval`, stats, dump,
+  rename) reparses at once. The reparse still runs on the UI thread when
+  it runs; making it concurrent needs the model built off a byte
+  snapshot and swapped in, with the edits made meanwhile replayed —
+  W1's progressive build is that machinery.
+
+**Tests.**
+
+- `wb_scale_smoke` (in `@smoke`, `@smoke_asan`, `@smoke_tsan`; 20k rows
+  under a sanitizer): 100k rows, 30 aggregates, a 10 000-step storm —
+  cell edits in the int / dec / float columns, row inserts and deletes,
+  undo / redo, param flips, calc-line and row-formula edits — with each
+  step's counters asserted (the cell path, no MA walks its table, at most
+  8 visits for an edit under one aggregate and 200 otherwise, row edits
+  on the row path with no regraph, a param flip walking at most its one
+  MA, no reparse in the whole storm) and every value and MA compared
+  bit for bit with a scratch build every 3334 steps. About 14 s.
+- `wb_smoke`: the byte cap (lowered to 8 MiB for the test), the row cap
+  (a row insert over it refuses the table with the cap in the message;
+  undo restores it), and the deferred reparse (hidden, `rtx_wb_due_ms`,
+  idle before and after due, a query reparsing at once).
+- `tui_pty_test.py wb_deferred`: a 70k-row workbook in the terminal — a
+  structural edit hides the values and says so; the idle loop repaints
+  them.
+
+**Perf** (`wb_scale_perf`, release, a shared 4-core host; p50 of 20
+samples, 100 for keystrokes; 1000 + 100 + 10 aggregates):
+
+| Op | 10k rows | 100k rows | 1M rows |
+|---|---|---|---|
+| file | 0.8 MB | 8.1 MB | 82 MB |
+| open (parse, bind, graph, 1110 MA builds) | 0.59 s | 6.1 s | 60–69 s |
+| RSS after open | 36 MB | 338 MB | 3.55 GB |
+| cell edit, 1 aggregate over its column | 0.014 ms | 0.015 ms | 0.022 ms |
+| cell edit, 100 aggregates | 0.041 ms | 0.043 ms | 0.051 ms |
+| cell edit, 1000 aggregates | 0.41 ms | 0.43 ms | 0.43 ms |
+| row insert / delete | 1.0 ms | 9.2 ms | 84 ms |
+| param flip (one MA walks) | 0.61 ms | 22 ms | 165 ms |
+| full reparse (idle loop, not the keystroke) | 0.61 s | 5.6 s | 64 s |
+| keystroke in a Rich table cell (TUI measure) | 4.8 ms | 13.6 ms | 13.9 ms |
+| same, GUI-like pixel measure | 4.7 ms | 13.6 ms | 13.3 ms |
+| keystroke at a formula's end (annotation) | 2.5 ms | 10.8 ms | 12.1 ms |
+| PageDown in Rich | 3.6 ms | 11.2 ms | 11.4 ms |
+
+Cell edits are flat in the row count: an edit touches its MAs' deltas
+and nothing that scales with the table. The row path at 1000 aggregates
+is dominated by every MA's leaf arrays following the leaves
+(O(MAs × leaves): 0.6 ms at 100k rows with no aggregates). A param flip
+is its one MA's walk (~0.16 µs a row). A keystroke is the editor's
+Markdown pass and Rich table fit (9.1 ms a keystroke and 7.5 ms a
+PageDown over a 10M-row table with the workbook off) plus, with it on,
+a refill of the view when an edit changes more than 64 painted values
+(here every aggregate reading the column): 11–14 ms from 100k to 1M
+rows. The annotation adds nothing measurable.
+
+**Pins.** `@perf_check` runs `scripts/wb_perf_pins.sh check` first:
+`wb_scale_perf --pins 100000` against `testdata/perf/wb_pins.env`, one
+pin per op (p50 × 2, at least 0.1 ms) and the open RSS (× 1.25); a p50
+over pin × `RTX_PERF_FACTOR` (3) fails. `@wb_perf_check` runs it alone;
+`@perf_record` refreshes it.
+
+**Tiers: 5M and 10M.** `wb_scale_perf 2000000` (open only): a 165 MB file opens in 157 s to 7.1 GB RSS (peak 7.6 GB) — the largest tier under the 8 GB guard on this 15 GB host. `5000000` and `10000000` (414 MB and 829 MB, streamed to `/tmp` in 2.5 s and 4.9 s after checking 11.3 GB free, deleted after the run): the predicted model (17.4 GB, 34.4 GB) is over the guard, so the tool does not build it. Opened as shipped, the file is over the byte cap and the values are off (2 ms); with the byte cap lifted, the table is refused and the rest of the workbook parses in 1.3 s / 2.6 s at 17 MB RSS (`total` reads `#ref(Big has more than 1000000 rows (W1 indexes it))`); the Rich lens over the 10M-row table alone (workbook off) takes 9.1 ms a keystroke and 7.5 ms a PageDown. Nothing ran out of memory: the tool predicts before it builds, and a watchdog thread stops the run cleanly (file removed) if RSS passes the guard anyway.
+
+**What stops embedded tables, exactly.**
+
+1. *Memory per row.* ~3.5 KB a row at 1110 aggregates: 9 cell nodes of
+   160 B (1.44 KB), their text and the row arrays (~0.2 KB), and every
+   MA's per-leaf state (leaf counts, stop counts, min / max per leaf and
+   its segment tree: ~1.5 KB a row at 1110 MAs over 64-row leaves). 1M
+   rows is 3.55 GB; 5M would be ~18 GB and 10M ~35 GB — past this host's
+   15 GB and the 8 GB guard. With no aggregates it is ~2.8 KB a row.
+2. *Open / reparse time.* Parse and bind are ~10 s per million rows;
+   each aggregate adds a walk (batched per leaf: ~50 ns a row per MA), so
+   1000 aggregates cost a minute per million rows at open and at every
+   structural edit.
+3. *The caps.* 1M rows / 256 MiB as shipped (a 10M-row file is ~0.8 GB:
+   over the byte cap its values are off; with the byte cap lifted the
+   table is refused and references read `#ref(Big has more than 1000000
+   rows (W1 indexes it))`). Node offsets are 32-bit, so 4 GiB is the
+   hard ceiling for one embedded workbook.
+4. *The layout* is not the blocker: a keystroke in a Rich table cell is
+   13.9 ms at 1M rows and 9.1 ms over a 10M-row table (workbook off),
+   PageDown 7.5 ms.
+
+**What W1 must provide for 10M rows.**
+
+- *No node per cell.* A table is its bytes plus a counted B+tree of
+  leaves (row ranges with byte offsets); a record is parsed from the
+  leaf's bytes when evaluated. Row formulas are one AST per column
+  (as W2 already shares) with per-row values computed per leaf, not
+  stored per cell. Target: ~100 bytes a row of index (10M rows ≈ 1 GB,
+  most of it evictable leaf caches), not 3.5 KB.
+- *Aggregate state per leaf block, not per MA per 64 rows.* Per-leaf
+  column summaries (count, exact sum partials, min / max, zone maps)
+  shared by every MA over the column; per-MA partials only for MAs with
+  predicates, and at a coarser grain (4096-row blocks: 10M rows × 1110
+  MAs ≈ 170 MB). Zone maps let `where id > n` skip whole blocks.
+- *A progressive, concurrent build* over a byte snapshot, publishing at
+  stages with `pending` set (the `WMa.pending` bit and the MA interface
+  above are the hook points), cancel-and-rekick on edits, so open and
+  structural edits never block the UI thread; the persisted `RTXI` makes
+  a reopen O(leaves).
+- *Offsets past 4 GiB*: 64-bit leaf offsets (cells relative to their
+  leaf, as W2 already stores them relative to their row).
 
 ## Locks
 
