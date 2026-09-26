@@ -1202,6 +1202,199 @@ static void run_ri_linear(void) {
     a.destroy();
 }
 
+/* Budget exhaustion is INDETERMINATE, never an answer: the search stops
+ * at the start it could not decide (no later start, no "none"). The two
+ * reproductions from the review, then the window edge: a start whose
+ * decision reads the text end of a window that is not the end of the
+ * text (eof = 0) is a leftover (PARTIAL), in every engine. */
+static void run_indet(void) {
+    CCArena a = cc_arena_heap(megabytes(1));
+    RtxRxScratch s = {0};
+    static const char *pp[] = {"^(?:(a+)+b|a+)(?=$)", "(?:(a+)+b|a+)(?=$)", NULL};
+    char subj[17];
+    size_t k, ms, me, end;
+    int r;
+    memset(subj, 'a', 16);
+    subj[16] = 0;
+    for (k = 0; pp[k]; k++) {
+        RtxRxIn in = {0};
+        RtxRx *rx = try_compile(pp[k], 0, a, NULL);
+        if (!rx) {
+            expect(0, "compile", pp[k], "");
+            continue;
+        }
+        in.s = subj;
+        in.n = 16;
+        in.gpos = RTX_RX_UNSET;
+        in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+        ms = me = 99;
+        r = rtx_rx_search(rx, &in, 0, 16, 1, &s, &ms, &me);
+        expect(r == RTX_RX_INDET && ms == 0, "default budget: INDETERMINATE at 0", pp[k], subj);
+        if (r != RTX_RX_INDET || ms != 0)
+            fprintf(stderr, "  got r=%d [%zu,%zu)\n", r, ms, me);
+        r = rtx_rx_at(rx, &in, 0, &s, &end, NULL);
+        expect(r == RTX_RX_INDET, "default budget: anchored INDETERMINATE", pp[k], subj);
+        in.budget = 100000000;
+        r = rtx_rx_search(rx, &in, 0, 16, 1, &s, &ms, &me);
+        expect(r == RTX_RX_MATCH && ms == 0 && me == 16, "huge budget: [0,16)", pp[k], subj);
+        r = rtx_rx_at(rx, &in, 0, &s, &end, NULL);
+        expect(r == RTX_RX_MATCH && end == 16, "huge budget: anchored end 16", pp[k], subj);
+    }
+    /* Window edge (eof = 0): {pattern, text, lo, stop, want start}. */
+    {
+        static const struct {
+            const char *pat, *t;
+            size_t lo, stop, at;
+        } W[] = {
+            {"a(?!.*b)", "axxxx", 0, 1, 0},  /* lookahead read to the end: maybe a b */
+            {"a(?=x*b)", "axxxx", 0, 1, 0},  /* no b yet: maybe later */
+            {"x{4}$", "xxxx", 0, 1, 0},      /* $ at the cut is not an end */
+            {"x\\B", "ax", 0, 2, 1},         /* \B at the cut: the next byte decides */
+            {"(?:xy\\B|x)", "axy", 0, 2, 1}, /* a higher-priority branch died at the cut */
+            {"(x)y\\b\\1", "axy", 0, 2, 1},
+            {NULL, NULL, 0, 0, 0},
+        };
+        for (k = 0; W[k].pat; k++) {
+            RtxRx *rx = try_compile(W[k].pat, 0, a, NULL);
+            unsigned f;
+            if (!rx) {
+                expect(0, "compile", W[k].pat, "");
+                continue;
+            }
+            for (f = 0; f < 5; f++) {
+                RtxRxIn in = {0};
+                in.s = W[k].t;
+                in.n = strlen(W[k].t);
+                in.gpos = RTX_RX_UNSET;
+                in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+                in.force = f;
+                ms = me = 99;
+                r = rtx_rx_search(rx, &in, W[k].lo, W[k].stop, 0, &s, &ms, &me);
+                expect(r == RTX_RX_PARTIAL && ms == W[k].at, "window edge: a leftover", W[k].pat,
+                       W[k].t);
+                if (r != RTX_RX_PARTIAL || ms != W[k].at)
+                    fprintf(stderr, "  force %u: r=%d ms=%zu\n", f, r, ms);
+                /* the whole text: decided */
+                r = rtx_rx_search(rx, &in, W[k].lo, W[k].stop, 1, &s, &ms, &me);
+                expect(r != RTX_RX_PARTIAL && r != RTX_RX_INDET, "window edge: eof decides",
+                       W[k].pat, W[k].t);
+            }
+        }
+    }
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
+/* Property: for random backtracking patterns, a small budget gives the
+ * large budget's answer or INDETERMINATE at or before the first place
+ * they differ, never another definite answer. The whole find chain is
+ * compared (search, step past the hit, search again), plus the anchored
+ * matcher at every start. */
+static void gen_bt_pat(char *out, size_t cap, int depth) {
+    static const char *atoms[] = {"a", "b", "a+", "(a+)+", "(a|aa)*", "(?:a*)*", "(?=a)",
+                                  "(?!b)", "(?<=a)", "(?>a+)", "\\1", "[ab]", ".", "$",
+                                  "(?=$)", "\\b", "(a)", "a*?", "(?:a|ab)+", "c"};
+    size_t len = strlen(out);
+    int parts = 1 + (int)rnd(3), p;
+    for (p = 0; p < parts && len + 40 < cap; p++) {
+        int k = (int)rnd(10);
+        if (k < 6 || depth > 2) {
+            strcat(out, atoms[rnd(sizeof(atoms) / sizeof(atoms[0]))]);
+        } else if (k < 8) {
+            strcat(out, "(");
+            gen_bt_pat(out, cap, depth + 1);
+            strcat(out, "|");
+            gen_bt_pat(out, cap, depth + 1);
+            strcat(out, ")");
+        } else {
+            strcat(out, "(?:");
+            gen_bt_pat(out, cap, depth + 1);
+            strcat(out, ")+");
+        }
+        len = strlen(out);
+    }
+}
+
+static void run_indet_prop(void) {
+    CCArena a = cc_arena_heap(megabytes(8));
+    RtxRxScratch s = {0};
+    int it, bad = 0, iters = 3000, nindet = 0, nsame = 0, used = 0;
+    const char *ev = getenv("RX_INDET_N");
+    if (ev && ev[0]) iters = atoi(ev);
+    for (it = 0; it < iters; it++) {
+        char pat[512] = {0};
+        char subj[64] = {0};
+        RtxRx *rx;
+        RtxRxIn in = {0};
+        size_t n, p, ms = 0, me = 0, lms = 0, lme = 0, q;
+        int slen = 4 + (int)rnd(26), k, r, lr;
+        gen_bt_pat(pat, sizeof(pat), 0);
+        for (k = 0; k < slen; k++) subj[k] = "aaaaaaab c\n"[rnd(11)];
+        subj[slen] = 0;
+        rx = try_compile(pat, 0, a, NULL);
+        if (!rx || rtx_rx_mode(rx) != RTX_RX_BACKTRACK) continue;
+        used++;
+        n = strlen(subj);
+        in.s = subj;
+        in.n = n;
+        in.gpos = RTX_RX_UNSET;
+        in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+        /* the chain */
+        p = 0;
+        while (p < n) {
+            in.budget = 100000000;
+            lr = rtx_rx_search(rx, &in, p, n, 1, &s, &lms, &lme);
+            if (lr == RTX_RX_INDET) break; /* the reference itself gave up */
+            in.budget = 1 + rnd(rnd(2) ? 60 : 3000);
+            r = rtx_rx_search(rx, &in, p, n, 1, &s, &ms, &me);
+            if (r == RTX_RX_INDET) {
+                nindet++;
+                if (ms < p || (lr == RTX_RX_MATCH && ms > lms)) {
+                    if (bad < 12)
+                        fprintf(stderr, "INDET PAST THE ANSWER /%s/ on \"%s\" from %zu: indet at %zu, answer %d [%zu,%zu)\n",
+                                pat, subj, p, ms, lr, lms, lme);
+                    bad++;
+                }
+                break;
+            }
+            if (r != lr || (r == RTX_RX_MATCH && (ms != lms || me != lme))) {
+                if (bad < 12)
+                    fprintf(stderr, "BUDGET CHANGED THE ANSWER /%s/ on \"%s\" from %zu budget %zu: %d [%zu,%zu) vs %d [%zu,%zu)\n",
+                            pat, subj, p, in.budget, r, ms, me, lr, lms, lme);
+                bad++;
+                break;
+            }
+            nsame++;
+            if (r != RTX_RX_MATCH) break;
+            p = me > ms ? me : ms + 1;
+        }
+        /* anchored at each start */
+        for (q = 0; q <= n; q++) {
+            size_t e1 = 0, e2 = 0;
+            in.budget = 100000000;
+            lr = rtx_rx_at(rx, &in, q, &s, &e1, NULL);
+            if (lr == RTX_RX_INDET) continue;
+            in.budget = 1 + rnd(2000);
+            r = rtx_rx_at(rx, &in, q, &s, &e2, NULL);
+            if (r == RTX_RX_INDET) continue;
+            if (r != lr || (r == RTX_RX_MATCH && e1 != e2)) {
+                if (bad < 12)
+                    fprintf(stderr, "BUDGET CHANGED THE ANCHORED ANSWER /%s/ on \"%s\" at %zu: %d %zu vs %d %zu\n",
+                            pat, subj, q, r, e2, lr, e1);
+                bad++;
+                break;
+            }
+        }
+    }
+    checks++;
+    if (bad) fails++;
+    printf("indet property: %d backtracking patterns, %d agreeing searches, %d INDETERMINATE, %d wrong\n",
+           used, nsame, nindet, bad);
+    expect(used > 500 && nindet > 50, "indet property: enough coverage", "", "");
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
 /* rx_smoke --one PATTERN SUBJECT LO [EOFCUT]: print each engine's answer
  * (a hook for shrinking a fuzz mismatch by hand). */
 static int run_one(int argc, char **argv) {
@@ -1245,6 +1438,8 @@ int main(int argc, char **argv) {
     run_errors();
     run_misc();
     run_patho();
+    run_indet();
+    run_indet_prop();
     run_fuzz();
     run_pf_fuzz();
     run_ri_cases();
