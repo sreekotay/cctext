@@ -442,6 +442,28 @@ regex, Alt-C / Alt-W / Alt-R). A search is the lazy DFA (a dense
 state × byte-class table per lane scratch) behind the rarest required
 literal (prefix, inner literal on its line, or an alternation's set;
 ignore case too); a literal query is that filter alone (core/rx.cch).
+A pattern with none of those (its literal sits after an unbounded part
+that may take a newline: `\w+\s+Holmes`) may split at the top level as
+P L S (reverse inner; reverse suffix when S is empty): the filter finds
+L, P reversed (its own lazy DFA and cache budget) gives the leftmost
+start of a P that ends at the hit, and the forward DFA anchored there
+confirms it with the usual leftmost-first end. Compile builds it only
+with a proof that no earlier match can use a later hit (`rx_ri_safe`: P
+of one length; P never takes L's first byte; a required class run ends
+P that no other part of P and no first scalar of L shares, `\s+` in
+`\w+\s+`; P a chain of class runs, `.*` or `\w+\s*`), so the first
+confirmed hit is the plain engine's match. Linear time: a hit inside the
+last failed forward scan, a reverse scan still alive below where that
+scan stopped, reverse + failed forward bytes over 3x what the hits
+advanced, or hits every few bytes give the call to the plain DFA from
+`lo` and rest the strategy on that text for 1 MiB. Reverse scans never
+read below `lo`. A window that is not the text end never guesses: past
+the last whole hit, a reverse scan from the window end for a prefix of
+a match (every consuming pc of the reversed pattern) names the leftmost
+candidate the edge cuts, and the plain DFA answers from there (a
+leftover, as before). Texts under 256 bytes (grammar lines) stay on the
+plain DFA; `force` 4 runs it on any text (`rx_conform`'s fifth engine,
+`rx_smoke`'s differential and linear-time checks).
 Text is walked in units: a scalar, or a stray byte (a lead with fewer
 continuation bytes than it needs is one unit, cut where they stop). `.` and
 negated classes take one unit, never a scalar's bytes one by one
