@@ -27,6 +27,7 @@
  */
 #include <ccc/std/prelude.cch>
 #include <limits.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include "document.cch"
@@ -124,7 +125,9 @@ static void rtx_find_it(RtxFindIt *it, const RtxDoc *d, const char *t, size_t n,
 }
 
 /* 1 hit [*ms, *me); 2 leftover at *ms (undecided at the window end);
- * 0 done. Window offsets. */
+ * 3 indeterminate at *ms (the regex gave up deciding that start: no hit
+ * from there on is known); 0 done. Window offsets. */
+#define RTX_FIND_IT_INDET 3
 static int rtx_find_it_next(RtxFindIt *it, size_t *ms, size_t *me) {
     const char *t = it->in.s;
     size_t n = it->in.n;
@@ -135,6 +138,11 @@ static int rtx_find_it_next(RtxFindIt *it, size_t *ms, size_t *me) {
         if (r == RTX_RX_NONE) {
             it->p = it->stop;
             return 0;
+        }
+        if (r == RTX_RX_INDET) {
+            it->p = it->stop;
+            *ms = s;
+            return RTX_FIND_IT_INDET;
         }
         if (r == RTX_RX_PARTIAL) {
             it->p = it->stop;
@@ -510,11 +518,14 @@ static void rtx_find_append_soft(RtxDoc *d, const RtxFindRel *hits, size_t n,
  * resumes at `ce` (inside the previous block's last hit). Rescan from there
  * until a hit equals one of the lane's hits — from that hit on both chains
  * agree — or the commit edge. The result lands on `a`; *leftover may be
- * set. Returns the hit count (0 with *out NULL on OOM: cancel). */
+ * set. *indet is the lane's undecided start: kept when the chains meet
+ * (it lies past the meeting hit), else replaced by this chain's own.
+ * Returns the hit count (0 with *out NULL on OOM: cancel). */
 static size_t rtx_find_rechain(RtxDoc *d, const RtxFindRel *old, size_t nold,
                                const char *buf, size_t got, size_t wlo, size_t start,
                                size_t ce, size_t cend, int eof, size_t *leftover,
-                               CCArena a, RtxRxScratch *rxs, RtxFindRel **out) {
+                               size_t *indet, CCArena a, RtxRxScratch *rxs,
+                               RtxFindRel **out) {
     RtxFindIt it;
     RtxFindRel *nh;
     size_t k = 0, i, ms = 0, me = 0, cap, cnt = 0, pos, nl;
@@ -534,6 +545,7 @@ static size_t rtx_find_rechain(RtxDoc *d, const RtxFindRel *old, size_t nold,
                 *leftover = off;
                 break;
             }
+            if (r == RTX_FIND_IT_INDET) break;
             while (k < nold && old[k].off < off) k++;
             if (k < nold && old[k].off == off && old[k].len == me - ms) break; /* met */
             if (cnt == cap) {
@@ -551,12 +563,19 @@ static size_t rtx_find_rechain(RtxDoc *d, const RtxFindRel *old, size_t nold,
             nh[cnt].nl = 0;
             cnt++;
         }
-        /* Edge reached (or a leftover): the lane's later hits are not in
-         * this chain. Met: the lane's hits from k on are. */
-        if (r != 1) k = nold;
+        /* Edge reached (or a leftover, or undecided): the lane's later
+         * hits are not in this chain, nor is its undecided start. Met:
+         * the lane's hits from k on are, and so is what it met after. */
+        if (r != 1) {
+            k = nold;
+            *indet = r == RTX_FIND_IT_INDET ? wlo + ms : RTX_RX_UNSET;
+        }
     } else {
         k = 0;
         while (k < nold && old[k].off < ce) k++;
+        /* The chain resumes past this window: a lane start before it
+         * was never a chain position. */
+        if (*indet != RTX_RX_UNSET && *indet < ce) *indet = RTX_RX_UNSET;
     }
     for (i = k; i < nold; i++) {
         if (cnt == cap) {
@@ -647,6 +666,7 @@ static int rtx_find_run(RtxDoc *d) {
             size_t wlo;
             size_t hd;
             size_t leftover;
+            size_t indet;
             size_t span_nl;
             char *buf;
             RtxFindRel *rels;
@@ -670,9 +690,10 @@ static int rtx_find_run(RtxDoc *d) {
             nl_block = 0;
             eof = 0;
             leftover = RTX_RX_UNSET;
+            indet = RTX_RX_UNSET;
             span_nl = 0;
             slot.nl_commit = 0;
-            if (want && !d->find.cancel && !d->find.truncated
+            if (want && !d->find.cancel && !d->find.truncated && !d->find.indet
                 && rtx_find_scratch_ensure(&slot, (size_t)RTX_FIND_BLOCK +
                                                       (size_t)RTX_FIND_CTX +
                                                       (size_t)RTX_FIND_SPAN +
@@ -687,6 +708,10 @@ static int rtx_find_run(RtxDoc *d) {
                 while (hit_n < (size_t)RTX_FIND_MAX && (r = rtx_find_it_next(&it, &ms, &me))) {
                     if (r == 2) {
                         leftover = wlo + ms;
+                        break;
+                    }
+                    if (r == RTX_FIND_IT_INDET) {
+                        indet = wlo + ms;
                         break;
                     }
                     if (!rtx_find_scratch_hit(&slot, &hit_n, wlo + ms, me - ms))
@@ -705,13 +730,13 @@ static int rtx_find_run(RtxDoc *d) {
                 size_t line_base;
                 while (d->find.h.paused && !d->find.cancel)
                     cc_yield();
-                if (!d->find.cancel && !d->find.truncated) {
+                if (!d->find.cancel && !d->find.truncated && !d->find.indet) {
                     if (rtx_find_regex(d) && buf && d->find.chain_end > start) {
                         RtxFindRel *re = NULL;
                         stage_a.reset();
                         hit_n = rtx_find_rechain(d, rels, hit_n, buf, got, wlo, start,
                                                  d->find.chain_end, start + commit, eof,
-                                                 &leftover, stage_a, &stage_rx, &re);
+                                                 &leftover, &indet, stage_a, &stage_rx, &re);
                         rels = re;
                     }
                     line_base = d->find.scan_line;
@@ -751,10 +776,24 @@ static int rtx_find_run(RtxDoc *d) {
                             d->find.scan_bytes = nfile_i;
                         }
                     }
+                    if (indet != RTX_RX_UNSET && !d->find.truncated) {
+                        /* Undecided start: the list ends there, marked
+                         * incomplete; no later block publishes a hit. */
+                        size_t nl = 0;
+                        if (buf && indet >= start && indet - wlo <= got)
+                            nl = rtx_count_lf(buf + hd, indet - start);
+                        d->find.indet_off = indet;
+                        d->find.indet_line = line_base + nl;
+                        d->find.scan_off = indet;
+                        d->find.scan_line = line_base + nl;
+                        d->find.scan_bytes = nfile_i;
+                        d->find.indet = 1;
+                        d->find.done = 1;
+                    }
                 }
             }
 
-            if (d->find.truncated || d->find.cancel)
+            if (d->find.truncated || d->find.cancel || d->find.indet)
                 break;
         } !>.wait()!>;
     }
@@ -812,6 +851,10 @@ static size_t rtx_find_seam_collect(const RtxDoc *d, const char *t, size_t tn,
     while ((r = rtx_find_it_next(&it, &ms, &me)) != 0) {
         size_t local;
         size_t start;
+        if (r == RTX_FIND_IT_INDET) {
+            if (bad) *bad = 1;
+            return 0;
+        }
         if (r == 2) break;
         local = ms - pre;
         start = lo + local;
@@ -1213,6 +1256,7 @@ static int rtx_find_edit_apply_rx(RtxDoc *d, size_t at, char[:] deleted,
     if (!d || d->find.h.live() || !d->find.rx || !d->find.store.base) return 0;
     if (d->find.hits.len && !d->find.hits.data) return 0;
     if (d->find.long_n) return 0; /* a leftover's reach is unknown: rescan */
+    if (d->find.indet) return 0;  /* so is an undecided start's */
     if ((erased && !deleted.ptr) || (added && !inserted.ptr)) return 0;
     nlen = d->len();
     if (at > nlen || added > nlen || (added && at > nlen - added)) return 0;
@@ -1345,9 +1389,9 @@ static int rtx_find_edit_apply_rx(RtxDoc *d, size_t at, char[:] deleted,
     rtx_find_it(&it, d, win, whi - wlo, wlo == 0, eof, p0 - wlo, scan_stop - wlo, rxs);
     while ((r = rtx_find_it_next(&it, &ms, &me)) != 0) {
         size_t off = wlo + ms;
-        if (r == 2) {
+        if (r == 2 || r == RTX_FIND_IT_INDET) {
             wa.destroy();
-            return 0; /* a leftover inside the seam: rescan the file */
+            return 0; /* a leftover (or undecided start) in the seam: rescan the file */
         }
         while (j < d->find.hits.len &&
                d->find.hits.data[j].off - erased + added < off)
@@ -1798,6 +1842,23 @@ static void rtx_repl_fail(RtxReplace *j, const char *why, size_t at) {
     j->n = j->cap = 0;
 }
 
+/* The regex could not decide the start at document offset `at` (its step
+ * budget ran out): refuse, naming the line when the index knows it. */
+static void rtx_repl_indet(RtxReplace *j, size_t at) {
+    size_t line = 0;
+    if (j->doc && rtx_find_line_at(j->doc, at, &line))
+        snprintf(j->err_buf, sizeof(j->err_buf),
+                 "replace: pattern too complex to search exhaustively at line %zu; nothing "
+                 "replaced",
+                 line + 1);
+    else
+        snprintf(j->err_buf, sizeof(j->err_buf),
+                 "replace: pattern too complex to search exhaustively at byte %zu; nothing "
+                 "replaced",
+                 at);
+    rtx_repl_fail(j, j->err_buf, at);
+}
+
 void rtx_replace_drop(RtxReplace *j) {
     size_t ms, mb;
     if (!j) return;
@@ -1905,6 +1966,10 @@ static void !>(CCError) rtx_replace_site(RtxReplace *j, const RtxRxIn *in,
     if (j->groups == 2) {
         size_t end = 0;
         int r = rtx_rx_at(j->rx, in, ms, &j->rxs, &end, &caps);
+        if (r == RTX_RX_INDET) {
+            rtx_repl_indet(j, wlo + ms);
+            return cc_ok();
+        }
         if (r != RTX_RX_MATCH || end != me) {
             rtx_repl_fail(j, "replace: the regex gave up re-matching a site; nothing replaced",
                           wlo + ms);
@@ -2000,6 +2065,7 @@ static void !>(CCError) rtx_replace_end(RtxReplace *j) {
         size_t wlo = len - head, got = 0, end = 0;
         RtxRxIn in;
         RtxRxCaps caps;
+        int r;
         if (head) {
             got = d->read_at(wlo, cc_slice_from_buffer(j->win, head)) !>(e) {
                 return cc_err(e);
@@ -2011,8 +2077,12 @@ static void !>(CCError) rtx_replace_end(RtxReplace *j) {
         in.n = head;
         in.gpos = RTX_RX_UNSET;
         in.ctx = wlo == 0 ? (RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0) : 0u;
-        if (rtx_rx_at(j->rx, &in, head, &j->rxs, &end, &caps) == RTX_RX_MATCH &&
-            end == head &&
+        r = rtx_rx_at(j->rx, &in, head, &j->rxs, &end, &caps);
+        if (r == RTX_RX_INDET) {
+            rtx_repl_indet(j, len);
+            return cc_ok();
+        }
+        if (r == RTX_RX_MATCH && end == head &&
             (!(j->opts & RTX_FIND_WORD) || rtx_find_word_ok(j->win, head, head, head))) {
             rtx_replace_site(j, &in, wlo, head, head) !>(e) { return cc_err(e); };
             if (j->state != RTX_REPL_SCAN) return cc_ok();
@@ -2053,6 +2123,12 @@ static void !>(CCError) rtx_replace_slice(RtxReplace *j) {
         if (r == RTX_RX_NONE) {
             p = stop;
             break;
+        }
+        if (r == RTX_RX_INDET) {
+            /* Undecided at ms: the sites already staged may be the wrong
+             * set from here on. Refuse the whole job. */
+            rtx_repl_indet(j, wlo + ms);
+            return cc_ok();
         }
         if (r == RTX_RX_PARTIAL) {
             rtx_repl_fail(j, "replace: a match runs past 64 KiB; nothing replaced",
@@ -2161,8 +2237,12 @@ size_t !>(CCError) RtxDoc_replace_all(RtxDoc *d, char[:] q, unsigned opts,
     int st;
     rtx_replace_kick(&j, d, q, opts, tpl, lo, hi) !>(e) { return cc_err(e); };
     st = rtx_replace_step(&j, 0, NULL) !>(e) { return cc_err(e); };
-    if (st != RTX_REPL_READY)
-        return cc_err(CC_ERR_INVALID_ARG, j.err ? j.err : "replace refused");
+    if (st != RTX_REPL_READY) {
+        /* The job (and a message in its err_buf) dies on return. */
+        static _Thread_local char msg[sizeof(j.err_buf)];
+        snprintf(msg, sizeof(msg), "%s", j.err ? j.err : "replace refused");
+        return cc_err(CC_ERR_INVALID_ARG, msg);
+    }
     return rtx_replace_commit(&j);
 }
 
@@ -2205,6 +2285,11 @@ static char[:] !>(CCError) rtx_repl_one(RtxDoc *d, size_t off, size_t n, char[:]
         RtxRxScratch rxs = {0};
         int r = rtx_rx_at(d->find.rx, &in, head, &rxs, &end, &caps);
         rtx_rx_scratch_drop(&rxs);
+        if (r == RTX_RX_INDET) {
+            *why = "replace: pattern too complex to re-match this hit exhaustively; nothing "
+                   "replaced";
+            return cc_ok(cc_slice_empty());
+        }
         if (r != RTX_RX_MATCH || end != head + n) {
             *why = "replace: the hit no longer matches";
             return cc_ok(cc_slice_empty());
