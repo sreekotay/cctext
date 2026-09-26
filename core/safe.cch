@@ -2,10 +2,13 @@
 /*
  * On-disk session journals (linked TU: safe.ccs). Not a RAM epoch.
  * File journal: flattened hist (`RTXS`) plus a small state sidecar
- * (`RTXC`, same hash + `.s`) for caret / camera / pins. Workspace:
+ * (`RTXC`, same hash + `.s`) for caret / camera / pins. A dirty journal
+ * also pins its base (`.b`): a copy of the bytes hist is relative to, so
+ * a file that drifts on disk does not strand the edits. Workspace:
  * path list + panes + browse divider. Untitled has no journal. Identity
- * mismatch tosses hist. File leaf is little-endian magic+ver. Unknown /
- * future ver is ignored.
+ * mismatch tosses a clean journal's hist; a dirty one replays onto its
+ * pin or is held (RTX_SAFE_LOAD_CONFLICT), never tossed. File leaf is
+ * little-endian magic+ver. Unknown / future ver is ignored.
  */
 #ifndef RTX_SAFE_H
 #define RTX_SAFE_H
@@ -15,15 +18,42 @@
 #ifndef RTX_SAFE_DEBOUNCE_MS
 #define RTX_SAFE_DEBOUNCE_MS 250
 #endif
+/* A failed idle hist write retries after DEBOUNCE, doubling to this. */
+#ifndef RTX_SAFE_BACKOFF_MAX_MS
+#define RTX_SAFE_BACKOFF_MAX_MS 8000
+#endif
+/* Largest base a dirty journal copies beside itself (`<hash>.b`). Above
+ * this a drifted file holds the journal instead of recovering it. */
+#ifndef RTX_SAFE_BASE_MAX
+#define RTX_SAFE_BASE_MAX (16u << 20)
+#endif
 /* Bump FILE_VER when the payload layout or a field's meaning changes.
  * Load rejects ver < MIN or ver > FILE_VER (the whole journal).
  *   1: camera + hist
  *   2: + nmark (off,line)*
  *   3: + origin line before marks
  *   4: marks are file-fraction pins (vacant line = SIZE_MAX; density is RTX_LINE_MARK_MAX)
- *   5: + origin byte (mark_off) so load keys that pair, not seek_off */
+ *   5: + origin byte (mark_off) so load keys that pair, not seek_off
+ *   6: identity mtime is nanoseconds; FNV-1a 64 trailer over every byte
+ *      before it. Load also requires the stored path to be the realpath
+ *      and every length to fit in the bytes left. v1-5 still load
+ *      (seconds mtime, no trailer).
+ *   7: each hist rec + group id (u64, 0 = its own record), workspace
+ *      transaction id (u64), flags (u32; 1 = last member of its group).
+ *      Load keeps a group only with its END: an unterminated trailing
+ *      group is dropped (head falls back to its edge); an interrupted
+ *      group, or a head / saved inside one, ignores the journal. v1-6
+ *      still load (every rec its own record).
+ *   8: flags bit 2 = a bulk group (DESIGN Edit groups, bulk): one record
+ *      (its own group id, END set) whose del_n / ins_n are the old / new
+ *      lengths of its range [off, off + del_n) and whose payload is
+ *      u64 nsites, u64 enc_n, then the record's site list (`enc`: per
+ *      site varint gap, varint del_n<<1|same, varint ins_n<<1|same, the
+ *      bytes that are not the previous site's). A list that does not
+ *      decode to its lengths ignores the journal. Other records are v7's.
+ *      v1-7 still load. */
 #define RTX_SAFE_FILE_MAGIC 0x53585452u /* RTXS */
-#define RTX_SAFE_FILE_VER 5
+#define RTX_SAFE_FILE_VER 8
 #define RTX_SAFE_FILE_VER_MIN 1
 #define RTX_SAFE_STATE_MAGIC 0x43585452u /* RTXC */
 /* State sidecar. Same session record as the RTXS leaf (no hist recs), then
@@ -33,14 +63,24 @@
  *   2: + rich (i32, layout.rich; missing cam / clear defaults Rich;
  *      ver 1 loads rich = 0)
  *   3: + wrap (i32, layout.wrap; clear defaults wrap on; ver < 3 keeps
- *      wrap off unless legacy view == WRAP, which migrates to default+wrap) */
-#define RTX_SAFE_STATE_VER 3
+ *      wrap off unless legacy view == WRAP, which migrates to default+wrap)
+ *   4: nanosecond identity mtime + FNV-1a 64 trailer (as RTXS v6) */
+#define RTX_SAFE_STATE_VER 4
 #define RTX_SAFE_STATE_VER_MIN 1
 #define RTX_SAFE_WS_MAGIC 0x57585452u /* RTXW */
 /*   1: panes + path list
- *   2: + browse list/preview split (per-mille, 0 = default) */
-#define RTX_SAFE_WS_VER 2
+ *   2: + browse list/preview split (per-mille, 0 = default)
+ *   3: pane0 / pane1 index the written path list (-1 = untitled), not
+ *      buffer slots; restore maps them by path. v1-2 read the same way.
+ *   4: one snapshot per project (`w/<hash of the project root>`), the
+ *      root path in the header, the pane tree in preorder (leaf: path
+ *      entry + browse split; split: dir + ratio), focused leaf, FNV-1a
+ *      trailer. v1-3 live in the old global `ws` leaf: read once when a
+ *      project has no snapshot yet (migration), then that leaf is gone. */
+#define RTX_SAFE_WS_VER 4
 #define RTX_SAFE_WS_VER_MIN 1
+#define RTX_SAFE_WS_NODES 16
+#define RTX_SAFE_WS_PANES 8
 
 typedef struct {
     size_t top, top_wrap, left_col, top_byte, seek_off;
@@ -63,14 +103,32 @@ typedef struct {
     int dirty;
 } RtxSafeWsEnt;
 
+enum {
+    RTX_SAFE_WS_LEAF = 1,
+    RTX_SAFE_WS_SPLIT = 2
+};
+
+/* Pane tree node (flat table; a / b index it). Leaf: `ent` indexes ents
+ * (-1 = untitled or not listed), `split` is its browse list/pane * 1000.
+ * Split: dir (RTX_SPLIT_COLS / ROWS), ratio (first child * 1000). */
+typedef struct {
+    int kind;
+    int dir;
+    int ratio;
+    int a, b;
+    int ent;
+    int split;
+} RtxSafeWsNode;
+
 typedef struct {
     int ok;
-    int npanes;
-    int focus;
-    int pane0;
-    int pane1;
-    int split0;            /* browse list/pane * 1000; 0 = default. v2+ */
-    int split1;
+    int legacy;            /* 1: read from the pre-v4 global leaf */
+    int nnode;
+    int root;              /* -1 = no tree (one pane on the first entry) */
+    int focus_node;        /* the focused leaf */
+    RtxSafeWsNode node[RTX_SAFE_WS_NODES];
+    int splits[RTX_SAFE_WS_PANES]; /* browse split per pane, tree order first,
+                                    * then panes not shown (a preference) */
     size_t n;
     RtxSafeWsEnt *ents; /* caller arena */
 } RtxSafeWs;
@@ -82,7 +140,12 @@ int rtx_safe_enabled(void);
 int rtx_safe_dir(char *dst, size_t n);
 int rtx_safe_file_path(char *dst, size_t n, const char *doc_path);
 int rtx_safe_state_path(char *dst, size_t n, const char *doc_path);
+int rtx_safe_base_path(char *dst, size_t n, const char *doc_path);
 void rtx_safe_cam_clear(RtxSafeCam *c);
+/* Markup opens Rich (1, default) or Source (0) when no journal says
+ * (settings.json "rich"). */
+void rtx_safe_set_rich_default(int on);
+int rtx_safe_rich_default(void);
 
 /* 1 = durable write or nothing to write (untitled). 0 = journal write
  * failed. Idle / camera flushes may ignore the result. Park of a dirty
@@ -92,13 +155,54 @@ int rtx_safe_flush(RtxDoc *d, const RtxSafeCam *cam);
 int rtx_safe_flush_state(RtxDoc *d, const RtxSafeCam *cam);
 /* One-shot: next flush / flush_state write fails (smokes). */
 void rtx_safe_fail_next_write(void);
+/* One-shot crash simulation (smokes): the next RTXS leaf keeps only its
+ * first hlen - drop recs, as a writer that died mid-group would. */
+void rtx_safe_test_cut_next(size_t drop);
+/* One-shot torn group (smokes): the next RTXS leaf writes its last
+ * record without the group END flag, as a writer that died inside the
+ * last group (a one-record bulk group included) would. */
+void rtx_safe_test_tear_next(void);
+/* Leaf writes attempted so far, failed or not (smokes). */
+size_t rtx_safe_write_attempts(void);
+/* rtx_safe_load outcome. */
+enum {
+    RTX_SAFE_LOAD_NONE = 0, /* no journal, clean, ignored: camera at most */
+    RTX_SAFE_LOAD_HIST,     /* hist replayed (buffer may be recovered-dirty) */
+    RTX_SAFE_LOAD_CONFLICT, /* dirty journal whose base is not d's bytes: not
+                             * applied, left on disk untouched. Caller holds
+                             * it (no hist writes) and says so. */
+    RTX_SAFE_LOAD_FAULT     /* replay failed midway: d holds partial bytes and
+                             * empty hist. Caller destroys + reopens clean and
+                             * must not overwrite the journal (it is the only
+                             * copy of those edits). */
+};
 /* After from_path. Journal miss / corrupt / identity miss: camera only. */
-void rtx_safe_load(RtxDoc *d, RtxSafeCam *cam);
+int rtx_safe_load(RtxDoc *d, RtxSafeCam *cam);
 void rtx_safe_drop(const char *doc_path);
 int rtx_safe_peek_dirty(const char *doc_path);
+/* Before opening doc_path: 1 if its dirty journal's base drifted on disk
+ * (or is gone) and the pinned copy still holds it. `out` is the pin; the
+ * identity is the base's, for RtxDoc_from_base. */
+int rtx_safe_base(const char *doc_path, char *out, size_t n, int64_t *mtime,
+                  uint64_t *sz, uint64_t *ino);
+/* 1 if doc_path has a dirty journal and the file on disk is not its base
+ * (parked buffers: quit / save-all must not treat those edits as current). */
+int rtx_safe_peek_conflict(const char *doc_path);
 
+/* Project root of `start` (NULL = cwd): the nearest directory at or above
+ * it holding `.git` (a dir or a worktree file), else `start` itself;
+ * real path. 0 if neither resolves. */
+int rtx_project_root(char *dst, size_t n, const char *start);
+/* The project whose snapshot rtx_safe_ws_* read and write. NULL / "" =
+ * rtx_project_root(cwd), computed on first use. */
+void rtx_safe_ws_set_project(const char *root);
+const char *rtx_safe_ws_project(void);
 void rtx_safe_ws_write(const RtxSafeWs *ws);
 int rtx_safe_ws_read(RtxSafeWs *ws, CCArena a);
+/* A legacy (pre-v4) read was restored into this project: drop the global
+ * leaf so it migrates once. */
+void rtx_safe_ws_migrated(void);
+/* Drop this project's snapshot (and the pre-v4 global one). */
 void rtx_safe_ws_drop(void);
 
 #endif /* RTX_SAFE_H */

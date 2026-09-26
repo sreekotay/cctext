@@ -20,7 +20,9 @@ Tighter box (smaller dup-scale target):
 RTX_TARGETS=256 MEMORY=768m ./docker/run-smoke.sh
 ```
 
-Pin the compiler at build time:
+The images build ccc from the concurrent-c commit pinned in the
+Dockerfiles (`ARG CCC_REF`, same commit as `CCC_PIN` in
+`.github/workflows/`). Try another ref at build time:
 
 ```bash
 CCC_REF=main ./docker/run-smoke.sh
@@ -56,6 +58,12 @@ RTX_TARGETS=1000 ./make.shcc @smoke_asan
 
 Build artifacts land in `out-asan`/`bin-asan` or `out-tsan`/`bin-tsan`. ASAN and TSAN cannot be combined; run separately.
 
+`@smoke_tsan` adds `scripts/tsan.supp` (ccc runtime-internal reports
+only) to `TSAN_OPTIONS`. On Ubuntu 24.04 TSan needs
+`sudo sysctl -w vm.mmap_rnd_bits=28`. At the pinned ccc both runs still
+trip a runtime turnstile wake bug (FRICTION.md); CI runs them nightly
+(`.github/workflows/sanitize.yml`).
+
 Docker (Linux, matches CI sanitizer jobs):
 
 ```bash
@@ -65,7 +73,8 @@ Docker (Linux, matches CI sanitizer jobs):
 
 Defaults: **2 CPUs**, **4 GiB RAM**. Logs: `testdata/generated/docker_asan_smoke.log`, `docker_tsan_smoke.log`.
 
-Pin compiler / skip rebuild:
+The TSan container runs with `--security-opt seccomp=unconfined`. Another
+compiler ref / skip rebuild:
 
 ```bash
 CCC_REF=main SKIP_BUILD=1 ./docker/sanitize-smoke.sh tsan

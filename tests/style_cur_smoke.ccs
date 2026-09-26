@@ -1,0 +1,243 @@
+#!ccc ccs
+/*
+ * The forward cursors layout and paint walk with are the plain queries:
+ * RtxDoc_style_cur == style_at and style_cur_next == style_next at every
+ * byte, and rtx_layout_hidden_cur == hidden_to, over fixtures with nested
+ * and injected runs, Rich hints (pairs, prefixes, paths), a reveal span
+ * moved to random marks, and a windowed doc past RTX_MARKUP_SCAN_MAX.
+ * Forward sweeps, stride sweeps, and random jumps on one cursor.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/ui.cch"
+
+static int fails = 0;
+static size_t n_style = 0, n_next = 0, n_hide = 0, n_hidden = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        if (fails < 30) fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static unsigned long long rng_s = 0x2545f4914f6cdd1dull;
+
+static unsigned rnd(unsigned n) {
+    rng_s ^= rng_s << 13;
+    rng_s ^= rng_s >> 7;
+    rng_s ^= rng_s << 17;
+    return n ? (unsigned)(rng_s % n) : 0;
+}
+
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return (double)rtx_utf8_cols(bytes);
+}
+
+static double cell_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 1.0;
+}
+
+static int style_eq(RtxStyle a, RtxStyle b) {
+    return a.bold == b.bold && a.italic == b.italic && a.mono == b.mono &&
+           a.scope == b.scope;
+}
+
+static void one_style(RtxDoc *d, RtxStyleCur *c, size_t off, size_t len,
+                      const char *tag) {
+    char msg[256];
+    RtxStyle a = d->style_cur(c, off);
+    RtxStyle b = d->style_at(off);
+    size_t k;
+    static const size_t spans[] = {1, 3, 17, 200, 5000};
+    snprintf(msg, sizeof msg, "%s: style_cur == style_at at %zu", tag, off);
+    expect(style_eq(a, b), msg);
+    n_style++;
+    for (k = 0; k < sizeof spans / sizeof spans[0]; k++) {
+        size_t hi = off + spans[k] > len ? len : off + spans[k];
+        size_t x = d->style_cur_next(c, off, hi);
+        size_t y = d->style_next(off, hi);
+        snprintf(msg, sizeof msg, "%s: style_cur_next %zu == style_next %zu at %zu hi %zu",
+                 tag, x, y, off, hi);
+        expect(x == y, msg);
+        n_next++;
+    }
+}
+
+static void check_styles(RtxDoc *d, size_t lo, size_t hi, const char *tag) {
+    RtxStyleCur c = {0};
+    size_t off, i;
+    char t2[300];
+    if (hi > d->len()) hi = d->len();
+    snprintf(t2, sizeof t2, "%s fwd", tag);
+    for (off = lo; off < hi; off++) one_style(d, &c, off, d->len(), t2);
+    /* Stride walks skip bytes: the covering set must still be exact. */
+    {
+        RtxStyleCur s = {0};
+        snprintf(t2, sizeof t2, "%s stride", tag);
+        for (off = lo; off < hi; off += 1 + rnd(40)) one_style(d, &s, off, d->len(), t2);
+    }
+    snprintf(t2, sizeof t2, "%s jump", tag);
+    for (i = 0; i < 2000 && hi > lo; i++) {
+        off = lo + rnd((unsigned)(hi - lo));
+        one_style(d, &c, off, d->len(), t2);
+    }
+}
+
+static void check_hidden(RtxLayout *L, RtxDoc *d, size_t lo, size_t hi,
+                         const char *tag) {
+    RtxHideCur hc = {0};
+    size_t off, i;
+    char msg[256];
+    if (hi > d->len()) hi = d->len();
+    for (off = lo; off < hi; off++) {
+        size_t a = rtx_layout_hidden_cur(L, d, &hc, off);
+        size_t b = rtx_layout_hidden_to(L, d, off);
+        snprintf(msg, sizeof msg, "%s: hidden_cur %zu == hidden_to %zu at %zu", tag, a,
+                 b, off);
+        expect(a == b, msg);
+        n_hide++;
+        if (b) n_hidden++;
+    }
+    for (i = 0; i < 2000 && hi > lo; i++) {
+        size_t a, b;
+        off = lo + rnd((unsigned)(hi - lo));
+        a = rtx_layout_hidden_cur(L, d, &hc, off);
+        b = rtx_layout_hidden_to(L, d, off);
+        snprintf(msg, sizeof msg, "%s: jump hidden_cur %zu == hidden_to %zu at %zu", tag,
+                 a, b, off);
+        expect(a == b, msg);
+        n_hide++;
+    }
+}
+
+static void !>(CCError) run_file(const char *path, const RtxMeasure *m) {
+    RtxBuf b = {0} @destroy;
+    RtxLayout *L = &b.layout;
+    size_t n, lo, hi, k;
+    char tag[256];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    n = b.doc.len();
+    L->rich = 1;
+    rtx_line_scan_to(&b.doc.tree, n) !>;
+    b.top = n > (size_t)RTX_MARKUP_SCAN_MAX ? b.doc.line_count() / 2 : 0;
+    b.ensure_view((RtxMeasure *)m, 60.0, 400) !>;
+    lo = 0;
+    hi = n;
+    if (n > (size_t)RTX_MARKUP_SCAN_MAX) {
+        /* Windowed: the fill's window, its lookback, and bytes past it
+         * (UNKNOWN sections, leftover runs). */
+        lo = L->win_lo > 70000 ? L->win_lo - 70000 : 0;
+        hi = L->win_hi + 70000;
+    }
+    snprintf(tag, sizeof tag, "%s", path);
+    check_styles(&b.doc, lo, hi, tag);
+    snprintf(tag, sizeof tag, "%s rich=%d marks=%d", path, L->rich, L->has_marks);
+    check_hidden(L, &b.doc, lo, hi, tag);
+    /* Reveal a few marks: the reveal span is an edge too. */
+    for (k = 0; k < 6 && L->has_marks; k++) {
+        size_t at = lo + rnd((unsigned)(hi - lo > 0 ? hi - lo : 1));
+        if (at > n) at = n;
+        rtx_layout_reveal(L, &b.doc, at, at);
+        snprintf(tag, sizeof tag, "%s reveal@%zu [%zu,%zu)", path, at, L->reveal_lo,
+                 L->reveal_hi);
+        check_hidden(L, &b.doc, lo, hi, tag);
+    }
+    /* Source pane: no marks, every answer 0. */
+    L->rich = 0;
+    L->has_marks = 0;
+    snprintf(tag, sizeof tag, "%s source", path);
+    check_hidden(L, &b.doc, lo, lo + 4096 < hi ? lo + 4096 : hi, tag);
+    return cc_ok();
+}
+
+static int write_big(const char *out, const char *const *parts, size_t np,
+                     size_t want) {
+    FILE *o = fopen(out, "wb");
+    size_t total = 0, i;
+    char buf[4096];
+    if (!o) return 0;
+    while (total < want) {
+        for (i = 0; i < np; i++) {
+            FILE *f = fopen(parts[i], "rb");
+            size_t n;
+            if (!f) continue;
+            while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+                fwrite(buf, 1, n, o);
+                total += n;
+            }
+            fclose(f);
+        }
+    }
+    fclose(o);
+    return 1;
+}
+
+int main(void) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    static const char *files[] = {
+        "testdata/wrap.txt",
+        "testdata/mixed.txt",
+        "testdata/code_then_prose.txt",
+        "testdata/rich/code/embeds.c",
+        "testdata/rich/code/embeds.py",
+        "testdata/rich/code/embeds.html",
+        "testdata/rich/code/nested.md",
+        "testdata/rich/md/blocks.md",
+        "testdata/rich/md/edge_utf8.md",
+        "testdata/rich/md/fences.md",
+        "testdata/rich/md/headings.md",
+        "testdata/rich/md/inline.md",
+        "testdata/rich/md/links_images.md",
+        "testdata/rich/md/lists_tasks.md",
+        "testdata/rich/md/mermaid_math.md",
+        "testdata/rich/md/mixed_doc.md",
+        "testdata/rich/md/tables.md",
+        "testdata/rich/md/README.md",
+    };
+    RtxMeasure cm = {0};
+    size_t f;
+    cm.measure = cell_meas;
+    cm.line_height = cell_lh;
+    for (f = 0; f < sizeof files / sizeof files[0]; f++) {
+        run_file(files[f], &cm) !>;
+        if (fails > 30) break;
+    }
+    {
+        static const char *big = "testdata/generated/style_cur_big.md";
+        if (write_big(big, files + 6, 12, 600 * 1024)) {
+            run_file(big, &cm) !>;
+            remove(big);
+        }
+    }
+    expect(n_hidden > 100, "hidden hints were exercised");
+    if (fails) {
+        fprintf(stderr, "style_cur_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("style_cur_smoke ok  style=%zu next=%zu hide=%zu hidden=%zu\n", n_style,
+           n_next, n_hide, n_hidden);
+    return 0;
+}

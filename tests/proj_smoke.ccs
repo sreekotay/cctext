@@ -1,0 +1,961 @@
+/*
+ * Project index / quick-open / project search (core/proj.ccs).
+ *
+ *  1. gitignore semantics table (glob, anchoring, dir-only, negation,
+ *     `**`, classes, escapes, nested levels).
+ *  2. Index over a generated tree: nested .gitignore / .ignore /
+ *     .git/info/exclude, a symlink loop (with and without FOLLOW), a
+ *     dangling link, unicode names, 10k files; the listing equals the
+ *     expected set; progressive counts while a slow walk runs; a walk
+ *     dropped mid-way.
+ *  3. Fuzzy ranking cases, highlight positions, smart case; an extended
+ *     query equals a fresh score; MRU boost survives a reload.
+ *  4. Project search equals a reference scan (literal, icase, word,
+ *     regex), skips binaries and files over the size cap; a cancel mid-
+ *     scan leaves only whole groups; chunked tickets equal one file per
+ *     ticket; a search kicked during the walk equals one after it.
+ *  5. Batch verbs project-files / project-search.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <time.h>
+#include "../core/proj.cch"
+#include "../core/batch.cch"
+
+extern FILE *open_memstream(char **bufp, size_t *sizep);
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static void sleep_ms(long ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+static long now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+}
+
+/* ------------------------------------------------------------ gitignore */
+
+typedef struct {
+    const char *rules;
+    const char *path;
+    int is_dir;
+    int want;
+} IgnCase;
+
+static const IgnCase g_ign[] = {
+    { "*.o", "a.o", 0, 1 },
+    { "*.o", "dir/b.o", 0, 1 },
+    { "*.o", "a.c", 0, 0 },
+    { "*.o", "a.o/x", 0, 0 },
+    { "/build", "build", 1, 1 },
+    { "/build", "src/build", 1, 0 },
+    { "build/", "build", 1, 1 },
+    { "build/", "build", 0, 0 },
+    { "build/", "x/build", 1, 1 },
+    { "doc/*.txt", "doc/a.txt", 0, 1 },
+    { "doc/*.txt", "doc/x/a.txt", 0, 0 },
+    { "doc/*.txt", "x/doc/a.txt", 0, 0 },
+    { "**/foo", "foo", 0, 1 },
+    { "**/foo", "a/b/foo", 0, 1 },
+    { "**/foo/bar", "a/foo/bar", 0, 1 },
+    { "a/**/b", "a/b", 0, 1 },
+    { "a/**/b", "a/x/b", 0, 1 },
+    { "a/**/b", "a/x/y/b", 0, 1 },
+    { "a/**/b", "ab", 0, 0 },
+    { "a/**/b", "x/a/b", 0, 0 },
+    { "abc/**", "abc/x", 0, 1 },
+    { "abc/**", "abc/x/y", 0, 1 },
+    { "abc/**", "abc", 1, 0 },
+    { "*.log\n!keep.log", "a.log", 0, 1 },
+    { "*.log\n!keep.log", "keep.log", 0, 0 },
+    { "*.log\n!keep.log", "d/keep.log", 0, 0 },
+    { "!keep.log\n*.log", "keep.log", 0, 1 },   /* last match wins */
+    { "\\#x", "#x", 0, 1 },
+    { "#x", "#x", 0, 0 },                       /* a comment */
+    { "\\!x", "!x", 0, 1 },
+    { "foo   ", "foo", 0, 1 },                  /* trailing spaces */
+    { "foo\\ ", "foo ", 0, 1 },                 /* escaped space */
+    { "[abc].c", "a.c", 0, 1 },
+    { "[abc].c", "d.c", 0, 0 },
+    { "[!a]x", "bx", 0, 1 },
+    { "[!a]x", "ax", 0, 0 },
+    { "[a-c]*.h", "b_q.h", 0, 1 },
+    { "?.md", "a.md", 0, 1 },
+    { "?.md", "ab.md", 0, 0 },
+    { "?.md", "a/b.md", 0, 1 },
+    { "a?b", "a/b", 0, 0 },                      /* ? does not cross / */
+    { "a*b", "a/b", 0, 0 },
+    { "*", "anything/at/all", 0, 1 },
+    { "\r\n*.tmp\r\n", "x.tmp", 0, 1 },          /* CRLF files */
+    { "node_modules", "web/node_modules", 1, 1 },
+    { "/*.c\n!/keep.c", "keep.c", 0, 0 },
+    { "/*.c\n!/keep.c", "gone.c", 0, 1 },
+    { "/*.c\n!/keep.c", "sub/gone.c", 0, 0 },
+    { "*.[oa]", "lib.a", 0, 1 },
+    { "[[:digit:]]x", "7x", 0, 1 },
+    { "[[:digit:]]x", "ax", 0, 0 },
+};
+
+static void test_ignore(void) {
+    CCArena a = cc_arena_heap(kilobytes(64)) @destroy;
+    size_t i;
+    for (i = 0; i < sizeof g_ign / sizeof g_ign[0]; i++) {
+        RtxIgn set = {0};
+        int got;
+        char msg[256];
+        set.base = "";
+        rtx_ign_parse(&set, g_ign[i].rules, strlen(g_ign[i].rules), a);
+        got = rtx_ign_match(&set, g_ign[i].path, strlen(g_ign[i].path), g_ign[i].is_dir);
+        snprintf(msg, sizeof msg, "ignore [%s] %s%s = %d, want %d", g_ign[i].rules,
+                 g_ign[i].path, g_ign[i].is_dir ? "/" : "", got, g_ign[i].want);
+        expect(got == g_ign[i].want, msg);
+    }
+    /* Nested levels: the deeper level wins; a level only sees its tree. */
+    {
+        RtxIgn top = {0}, sub = {0};
+        top.base = "";
+        rtx_ign_parse(&top, "*.tmp\n", 6, a);
+        sub.base = "sub";
+        sub.base_n = 3;
+        sub.up = &top;
+        rtx_ign_parse(&sub, "!keep.tmp\n/only_here\n", 21, a);
+        expect(rtx_ign_match(&sub, "sub/keep.tmp", 12, 0) == 0, "nested: negation below");
+        expect(rtx_ign_match(&sub, "sub/x.tmp", 9, 0) == 1, "nested: parent rule applies");
+        expect(rtx_ign_match(&sub, "sub/only_here", 13, 0) == 1, "nested: anchored at sub");
+        expect(rtx_ign_match(&sub, "sub/d/only_here", 15, 0) == 0, "nested: anchored not deeper");
+        expect(rtx_ign_match(&top, "keep.tmp", 8, 0) == 1, "nested: sibling rule not seen");
+    }
+    expect(rtx_glob_match("a/**", 4, "a/b/c", 5), "glob a/**");
+    expect(!rtx_glob_match("a/**", 4, "a", 1), "glob a/** not a");
+}
+
+/* ----------------------------------------------------------------- tree */
+
+static char g_root[1024];
+static char **g_want;
+static size_t g_nwant, g_capwant;
+
+static void want(const char *rel) {
+    if (g_nwant == g_capwant) {
+        g_capwant = g_capwant ? g_capwant * 2 : 1024;
+        g_want = (char **)realloc(g_want, g_capwant * sizeof(char *));
+    }
+    g_want[g_nwant++] = strdup(rel);
+}
+
+static void mkdirs(const char *rel) {
+    char p[2048];
+    size_t i, n;
+    snprintf(p, sizeof p, "%s/%s", g_root, rel);
+    n = strlen(p);
+    for (i = strlen(g_root) + 1; i <= n; i++) {
+        if (p[i] == '/' || p[i] == 0) {
+            char c = p[i];
+            p[i] = 0;
+            mkdir(p, 0755);
+            p[i] = c;
+        }
+    }
+}
+
+static void put(const char *rel, const char *body, size_t n, int listed) {
+    char p[2048];
+    FILE *f;
+    const char *sl = strrchr(rel, '/');
+    if (sl) {
+        char d[1024];
+        snprintf(d, sizeof d, "%.*s", (int)(sl - rel), rel);
+        mkdirs(d);
+    }
+    snprintf(p, sizeof p, "%s/%s", g_root, rel);
+    f = fopen(p, "wb");
+    if (!f) {
+        fprintf(stderr, "cannot write %s\n", p);
+        fails++;
+        return;
+    }
+    if (body) fwrite(body, 1, n, f);
+    fclose(f);
+    if (listed) want(rel);
+}
+
+static void puts_(const char *rel, const char *body, int listed) {
+    put(rel, body, body ? strlen(body) : 0, listed);
+}
+
+static void link_(const char *target, const char *rel) {
+    char p[2048];
+    snprintf(p, sizeof p, "%s/%s", g_root, rel);
+    if (symlink(target, p) != 0) {
+        fprintf(stderr, "symlink %s failed\n", p);
+        fails++;
+    }
+}
+
+/* The tree lives in its own temp dir (not testdata/: browse smokes
+ * flatten that and must not see 10k extra files); removed at exit. */
+static char g_tmp[512];
+
+static void drop_tree(void) {
+    char cmd[700];
+    if (!g_tmp[0]) return;
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", g_tmp);
+    if (system(cmd) != 0) fprintf(stderr, "proj_smoke: could not remove %s\n", g_tmp);
+    g_tmp[0] = 0;
+}
+
+static void make_tree(void) {
+    int d, m;
+    char rel[256], body[512];
+    const char *td = getenv("TMPDIR");
+    snprintf(g_tmp, sizeof g_tmp, "%s/cctext_proj_XXXXXX", td && td[0] ? td : "/tmp");
+    if (!mkdtemp(g_tmp)) {
+        fprintf(stderr, "FAIL: mkdtemp\n");
+        fails++;
+        g_tmp[0] = 0;
+        return;
+    }
+    snprintf(g_root, sizeof g_root, "%s/proj_tree", g_tmp);
+    mkdir(g_root, 0755);
+    puts_(".gitignore", "*.o\nbuild/\n/top_only.txt\n!important.o\n# comment\ndocs/**/gen/\n", 1);
+    puts_(".ignore", "dotignored/\n", 1);
+    puts_(".git/HEAD", "ref: refs/heads/main\n", 0);
+    puts_(".git/info/exclude", "excluded_by_info.txt\n", 0);
+    puts_(".hidden_file", "h\n", 1);
+    puts_("a.o", "o\n", 0);
+    puts_("important.o", "o\n", 1);
+    puts_("top_only.txt", "t\n", 0);
+    puts_("excluded_by_info.txt", "e\n", 0);
+    puts_("build/x.c", "x\n", 0);
+    puts_("dotignored/y.c", "y\n", 0);
+    puts_("src/top_only.txt", "t\n", 1);
+    puts_("src/build", "a file named build\n", 1);
+    puts_("src/sub/.gitignore", "*.tmp\n!keep.tmp\n/local_only\n", 1);
+    puts_("src/sub/a.tmp", "t\n", 0);
+    puts_("src/sub/keep.tmp", "t\n", 1);
+    puts_("src/sub/local_only", "l\n", 0);
+    puts_("src/sub/deeper/local_only", "l\n", 1);
+    puts_("src/sub/deeper/b.tmp", "t\n", 0);
+    puts_("docs/gen/z.md", "z\n", 0);
+    puts_("docs/a/b/gen/z.md", "z\n", 0);
+    puts_("docs/a/keep.md", "k\n", 1);
+    puts_("\xc3\xbc\xc3\xb1\xc3\xad/\xe3\x83\x95\xe3\x82\xa1\xe3\x82\xa4\xe3\x83\xab.txt",
+          "unicode needle here\n", 1);
+    puts_("emoji_\xf0\x9f\x98\x80.md", "emoji\n", 1);
+    puts_("loop/f.txt", "loop needle\n", 1);
+    link_("..", "loop/self");
+    link_("../loop", "loop/back");
+    link_("src/top_only.txt", "link_to_file.txt");
+    want("link_to_file.txt");
+    link_("nowhere", "dangling");
+    /* Search fixtures. */
+    puts_("words.txt", "needle needles xneedle needle_x (needle)\nNEEDLE\n", 1);
+    {
+        char bin[64];
+        memset(bin, 0, sizeof bin);
+        memcpy(bin + 8, "needle", 6);
+        put("bin.dat", bin, sizeof bin, 1);
+    }
+    {
+        size_t n = 100 * 1024;
+        char *big = (char *)malloc(n);
+        size_t i;
+        for (i = 0; i < n; i++) big[i] = (i % 64 == 63) ? '\n' : 'b';
+        memcpy(big + n - 20, "needle", 6);
+        put("big.txt", big, n, 1);
+        free(big);
+    }
+    /* 930 directories: more than the walk's first job table (256), so a
+     * wave's child jobs grow it while later stages of that wave run. */
+    for (d = 0; d < 30; d++) {
+        for (m = 0; m < 30; m++) {
+            snprintf(rel, sizeof rel, "wide/a%02d/b%02d/x.txt", d, m);
+            puts_(rel, "w\n", 1);
+        }
+    }
+    for (d = 0; d < 100; d++) {
+        for (m = 0; m < 100; m++) {
+            int id = d * 100 + m;
+            int k;
+            size_t bn = 0;
+            snprintf(rel, sizeof rel, "bulk/d%02d/f%03d.c", d, m);
+            for (k = 1; k <= 5; k++) {
+                const char *extra = "";
+                if (id % 7 == 0 && k == (id % 5) + 1) extra = " needle";
+                if (id % 11 == 0 && k == 3) extra = " needleneedle";
+                bn += (size_t)snprintf(body + bn, sizeof body - bn, "alpha %d %d%s\n", d, m, extra);
+            }
+            puts_(rel, body, 1);
+        }
+    }
+}
+
+static int str_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static char **listing(RtxProj *p, size_t *n_out) {
+    size_t n = rtx_proj_nfiles(p), i;
+    char **v = (char **)calloc(n + 1, sizeof(char *));
+    char path[RTX_PROJ_PATH];
+    for (i = 0; i < n; i++) {
+        rtx_proj_path(p, (uint32_t)i, path, sizeof path);
+        v[i] = strdup(path);
+    }
+    qsort(v, n, sizeof(char *), str_cmp);
+    *n_out = n;
+    return v;
+}
+
+static void free_list(char **v, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
+
+static void check_listing(RtxProj *p, const char *tag) {
+    size_t n, i, j;
+    char **v = listing(p, &n);
+    char msg[512];
+    snprintf(msg, sizeof msg, "%s: %zu files, want %zu", tag, n, g_nwant);
+    expect(n == g_nwant, msg);
+    for (i = 0, j = 0; i < n || j < g_nwant;) {
+        int c = (i < n && j < g_nwant) ? strcmp(v[i], g_want[j]) : (i < n ? -1 : 1);
+        if (c == 0) {
+            i++;
+            j++;
+            continue;
+        }
+        snprintf(msg, sizeof msg, "%s: %s %s", tag, c < 0 ? "extra" : "missing",
+                 c < 0 ? v[i] : g_want[j]);
+        expect(0, msg);
+        if (c < 0) i++;
+        else j++;
+    }
+    free_list(v, n);
+}
+
+static void test_index(void) {
+    @errhandler(CCError e) {
+        fprintf(stderr, "FAIL: index: %s\n", e.message ? e.message : "error");
+        fails++;
+        return;
+    }
+    RtxProj *p = (RtxProj *)calloc(1, sizeof(RtxProj));
+    char root[RTX_PROJ_PATH];
+    long t0;
+    qsort(g_want, g_nwant, sizeof(char *), str_cmp);
+    expect(rtx_proj_root_of(g_root, root, sizeof root) == 1, "root_of: .git found");
+    {
+        char sub[1200];
+        snprintf(sub, sizeof sub, "%s/src/sub/keep.tmp", g_root);
+        expect(rtx_proj_root_of(sub, root, sizeof root) == 1 && !strcmp(root, g_root),
+               "root_of: walks up from a file");
+    }
+    t0 = now_us();
+    rtx_proj_open(p, cc_slice_cstr(g_root), 0) !>;
+    rtx_proj_finish(p) !>;
+    fprintf(stderr, "proj_smoke: index %zu files, %zu dirs in %.1f ms; ~%.1f B/file\n",
+            rtx_proj_nfiles(p), (size_t)atomic_load(&p->cur->pub_nd), (now_us() - t0) / 1000.0,
+            (double)(rtx_proj_nfiles(p) * sizeof(RtxProjFile) +
+                     atomic_load(&p->cur->pub_nd) * sizeof(RtxProjDir) + p->cur->npool) /
+                (double)(rtx_proj_nfiles(p) ? rtx_proj_nfiles(p) : 1));
+    check_listing(p, "index");
+    expect(!rtx_proj_walking(p), "walk finished");
+    expect(p->cur->n_ignored >= 8, "ignored entries counted");
+    rtx_proj_close(p);
+
+    /* Follow symlinked dirs: the loop is walked once (the set is equal). */
+    rtx_proj_open(p, cc_slice_cstr(g_root), RTX_PROJ_FOLLOW) !>;
+    rtx_proj_finish(p) !>;
+    check_listing(p, "index follow");
+    expect(p->cur->n_loops >= 2, "follow: loops detected");
+    rtx_proj_close(p);
+
+    /* Progressive: a slow walk publishes counts before it finishes; the
+     * pick list grows with it. */
+    rtx_proj_test_slow(3000);
+    rtx_proj_open(p, cc_slice_cstr(g_root), 0) !>;
+    {
+        int saw_partial = 0, k;
+        size_t last = 0;
+        rtx_proj_pick_set(p, cc_slice_cstr("f0")) !>;
+        for (k = 0; k < 400 && rtx_proj_walking(p); k++) {
+            size_t nf = rtx_proj_nfiles(p);
+            expect(nf >= last, "published count is monotonic");
+            last = nf;
+            if (nf > 0 && rtx_proj_walking(p)) saw_partial = 1;
+            rtx_proj_pump(p) !>;
+            rtx_proj_pick_update(p) !>;
+            sleep_ms(5);
+        }
+        expect(saw_partial || getenv("RTX_PARALLEL_INLINE"),
+               "progressive: counts published while walking");
+    }
+    rtx_proj_test_slow(0);
+    rtx_proj_finish(p) !>;
+    rtx_proj_pick_update(p) !>;
+    expect(rtx_proj_pick_n(p) > 0, "pick after progressive walk");
+    check_listing(p, "index progressive");
+    /* Re-walk: the old index stays readable, then swaps. */
+    {
+        uint64_t g = p->gen;
+        size_t k;
+        puts_("rewalk_added.txt", "new\n", 1);
+        qsort(g_want, g_nwant, sizeof(char *), str_cmp);
+        rtx_proj_rewalk(p) !>;
+        expect(rtx_proj_nfiles(p) + 1 == g_nwant, "rewalk: old index readable");
+        rtx_proj_finish(p) !>;
+        for (k = 0; k < 100 && p->next; k++) rtx_proj_pump(p) !>;
+        expect(p->gen != g, "rewalk: swapped");
+        check_listing(p, "index rewalk");
+    }
+    /* Drop mid-walk. */
+    rtx_proj_test_slow(2000);
+    rtx_proj_open(p, cc_slice_cstr(g_root), 0) !>;
+    sleep_ms(10);
+    rtx_proj_close(p);
+    rtx_proj_test_slow(0);
+    free(p);
+}
+
+/* ---------------------------------------------------------------- fuzzy */
+
+static int sc(const char *q, const char *s) {
+    size_t n = strlen(s);
+    return rtx_fuzzy_path(q, strlen(q), s, n, rtx_proj_base_off(s, n), NULL);
+}
+
+static void test_fuzzy(void) {
+    uint16_t pos[8];
+    char msg[256];
+    expect(sc("fb", "a/fb.c") > sc("fb", "foo_bar.c"), "fb: contiguous basename first");
+    expect(sc("fb", "foo_bar.c") > sc("fb", "fabulous.c"), "fb: word starts beat inner");
+    expect(sc("main", "src/main.c") > sc("main", "src/domain/remain.c"), "main: basename");
+    expect(sc("wsc", "core/workspace.ccs") != RTX_FUZZY_NONE, "wsc matches workspace.ccs");
+    expect(sc("xyz", "core/workspace.ccs") == RTX_FUZZY_NONE, "no subsequence");
+    expect(sc("UI", "gui.c") == RTX_FUZZY_NONE, "smart case: UI not gui");
+    expect(sc("UI", "UI.md") != RTX_FUZZY_NONE, "smart case: UI in UI.md");
+    expect(sc("ui", "UI.md") != RTX_FUZZY_NONE, "lowercase matches either case");
+    expect(sc("cd", "core/document.ccs") > sc("cd", "src/abcd.c"), "segment starts");
+    expect(sc("pt", "PieceTree.c") > sc("pt", "lipstick.c"), "camel humps");
+    expect(sc("proj", "core/proj.ccs") > sc("proj", "p/r/o/j.c"), "contiguous run");
+    expect(sc("ab", "xaxbx") > sc("ab", "xaxxxxbx"), "shorter gap");
+    memset(pos, 0, sizeof pos);
+    expect(rtx_fuzzy_path("fb", 2, "foo_bar.c", 9, 0, pos) != RTX_FUZZY_NONE && pos[0] == 0 &&
+               pos[1] == 4,
+           "positions fb in foo_bar.c = {0, 4}");
+    memset(pos, 0, sizeof pos);
+    rtx_fuzzy_path("mc", 2, "src/main.c", 10, 4, pos);
+    snprintf(msg, sizeof msg, "positions mc in src/main.c = {%u, %u}", pos[0], pos[1]);
+    expect(pos[0] == 4 && pos[1] == 9, msg);
+}
+
+static void top_ids(RtxProj *p, uint32_t *ids, int32_t *scores, size_t *n) {
+    size_t i;
+    *n = rtx_proj_pick_n(p);
+    if (*n > 20) *n = 20;
+    for (i = 0; i < *n; i++) {
+        ids[i] = rtx_proj_pick_at(p, i)->id;
+        scores[i] = rtx_proj_pick_at(p, i)->score;
+    }
+}
+
+static void test_pick(void) {
+    @errhandler(CCError e) {
+        fprintf(stderr, "FAIL: pick: %s\n", e.message ? e.message : "error");
+        fails++;
+        return;
+    }
+    RtxProj *p = (RtxProj *)calloc(1, sizeof(RtxProj));
+    char path[RTX_PROJ_PATH];
+    char mru_dir[1200];
+    uint32_t a_ids[20], b_ids[20];
+    int32_t a_sc[20], b_sc[20];
+    size_t an, bn, i;
+    long t0;
+    rtx_proj_open(p, cc_slice_cstr(g_root), 0) !>;
+    rtx_proj_finish(p) !>;
+    rtx_proj_pick_set(p, cc_slice_cstr("d42f017")) !>;
+    expect(rtx_proj_pick_n(p) > 0, "pick d42f017 has rows");
+    rtx_proj_path(p, rtx_proj_pick_at(p, 0)->id, path, sizeof path);
+    expect(!strcmp(path, "bulk/d42/f017.c"), "pick d42f017 → bulk/d42/f017.c");
+    rtx_proj_pick_set(p, cc_slice_cstr("keeptmp")) !>;
+    rtx_proj_path(p, rtx_proj_pick_at(p, 0)->id, path, sizeof path);
+    expect(!strcmp(path, "src/sub/keep.tmp"), "pick keeptmp");
+    /* Extension rescans candidates; equal to a fresh score. */
+    rtx_proj_pick_set(p, cc_slice_cstr("b")) !>;
+    rtx_proj_pick_set(p, cc_slice_cstr("bu")) !>;
+    rtx_proj_pick_set(p, cc_slice_cstr("bul")) !>;
+    rtx_proj_pick_set(p, cc_slice_cstr("bulkd4f1")) !>;
+    expect(p->pick.cand_ok, "extension kept candidates");
+    top_ids(p, a_ids, a_sc, &an);
+    rtx_proj_pick_set(p, cc_slice_cstr("zzzq")) !>;
+    rtx_proj_pick_set(p, cc_slice_cstr("bulkd4f1")) !>;
+    top_ids(p, b_ids, b_sc, &bn);
+    expect(an == bn && an > 0, "extension: same row count");
+    for (i = 0; i < an && i < bn; i++)
+        expect(a_ids[i] == b_ids[i] && a_sc[i] == b_sc[i], "extension: same ranking");
+    /* Timing on 10k files. */
+    t0 = now_us();
+    rtx_proj_pick_set(p, cc_slice_cstr("x")) !>;
+    rtx_proj_pick_set(p, cc_slice_cstr("f09")) !>;
+    fprintf(stderr, "proj_smoke: pick over %zu files: %.2f ms (%zu shards)\n", rtx_proj_nfiles(p),
+            (now_us() - t0) / 1000.0, p->pick.shards_last);
+    /* MRU: the recent file wins its tie and survives a reload. */
+    snprintf(mru_dir, sizeof mru_dir, "%s/../proj_mru", g_root);
+    mkdir(mru_dir, 0755);
+    {
+        char f[1300];
+        snprintf(f, sizeof f, "%s/mru-x", mru_dir);
+        (void)f;
+    }
+    rtx_proj_mru_load(p, mru_dir);
+    rtx_proj_pick_set(p, cc_slice_cstr("f099c")) !>;
+    rtx_proj_path(p, rtx_proj_pick_at(p, 0)->id, path, sizeof path);
+    expect(strcmp(path, "bulk/d77/f099.c") != 0, "mru: not first before touch");
+    rtx_proj_mru_touch(p, "bulk/d77/f099.c");
+    rtx_proj_pick_set(p, cc_slice_cstr("zz")) !>;
+    rtx_proj_pick_set(p, cc_slice_cstr("f099c")) !>;
+    rtx_proj_path(p, rtx_proj_pick_at(p, 0)->id, path, sizeof path);
+    expect(!strcmp(path, "bulk/d77/f099.c"), "mru: recent file first");
+    rtx_proj_close(p);
+    rtx_proj_open(p, cc_slice_cstr(g_root), 0) !>;
+    rtx_proj_finish(p) !>;
+    rtx_proj_mru_load(p, mru_dir);
+    expect(p->nmru >= 1 && !strcmp(p->mru[0], "bulk/d77/f099.c"), "mru: persisted");
+    rtx_proj_pick_set(p, cc_slice_cstr("")) !>;
+    rtx_proj_path(p, rtx_proj_pick_at(p, 0)->id, path, sizeof path);
+    expect(!strcmp(path, "bulk/d77/f099.c"), "mru: empty query lists recent first");
+    rtx_proj_close(p);
+    free(p);
+}
+
+/* --------------------------------------------------------------- search */
+
+typedef struct {
+    char key[1400];
+} Ref;
+
+static int ref_cmp(const void *a, const void *b) {
+    return strcmp(((const Ref *)a)->key, ((const Ref *)b)->key);
+}
+
+static int ic_eq(const char *a, const char *b, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        char x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'Z') x += 32;
+        if (y >= 'A' && y <= 'Z') y += 32;
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
+static int wordc(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           c == '_' || (unsigned char)c >= 0x80;
+}
+
+/* Reference: every non-overlapping literal occurrence, line by line. */
+static Ref *reference(RtxProj *p, const char *q, int icase, int word, size_t maxb,
+                      size_t *n_out, size_t *files_out) {
+    size_t nf = rtx_proj_nfiles(p), id, n = 0, cap = 1024, qn = strlen(q);
+    Ref *v = (Ref *)malloc(cap * sizeof(Ref));
+    char rel[RTX_PROJ_PATH], abs[RTX_PROJ_PATH + 8];
+    size_t files = 0;
+    for (id = 0; id < nf; id++) {
+        FILE *f;
+        char *buf;
+        long sz;
+        size_t got, i, line = 1, ls = 0;
+        int any = 0;
+        rtx_proj_path(p, (uint32_t)id, rel, sizeof rel);
+        snprintf(abs, sizeof abs, "%s/%s", g_root, rel);
+        f = fopen(abs, "rb");
+        if (!f) continue;
+        fseek(f, 0, SEEK_END);
+        sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz <= 0 || (size_t)sz > maxb) {
+            fclose(f);
+            continue;
+        }
+        buf = (char *)malloc((size_t)sz);
+        got = fread(buf, 1, (size_t)sz, f);
+        fclose(f);
+        if (memchr(buf, 0, got < 8192 ? got : 8192)) {
+            free(buf);
+            continue;
+        }
+        for (i = 0; i + qn <= got;) {
+            int m = icase ? ic_eq(buf + i, q, qn) : !memcmp(buf + i, q, qn);
+            if (m && word && ((i > 0 && wordc(buf[i - 1]) && wordc(buf[i])) ||
+                              (i + qn < got && wordc(buf[i + qn - 1]) && wordc(buf[i + qn]))))
+                m = 0;
+            if (m) {
+                size_t k;
+                for (k = ls; k < i; k++)
+                    if (buf[k] == '\n') {
+                        line++;
+                        ls = k + 1;
+                    }
+                if (n == cap) {
+                    cap *= 2;
+                    v = (Ref *)realloc(v, cap * sizeof(Ref));
+                }
+                snprintf(v[n].key, sizeof v[n].key, "%s:%zu:%zu", rel, line, i - ls + 1);
+                n++;
+                any = 1;
+                i += qn;
+            } else {
+                i++;
+            }
+        }
+        files += any;
+        free(buf);
+    }
+    qsort(v, n, sizeof(Ref), ref_cmp);
+    *n_out = n;
+    *files_out = files;
+    return v;
+}
+
+static void compare(RtxProj *p, const char *tag, const char *q, int icase, int word) {
+    size_t rn = 0, rf = 0, nh = rtx_proj_search_nh(p), i;
+    Ref *ref = reference(p, q, icase, word, p->ps.max_bytes, &rn, &rf);
+    Ref *got = (Ref *)malloc((nh + 1) * sizeof(Ref));
+    char msg[512];
+    for (i = 0; i < nh; i++) {
+        const RtxPsHit *h = rtx_proj_search_hit(p, i);
+        char rel[RTX_PROJ_PATH];
+        rtx_proj_path(p, h->file, rel, sizeof rel);
+        snprintf(got[i].key, sizeof got[i].key, "%s:%u:%u", rel, h->line, h->col);
+    }
+    qsort(got, nh, sizeof(Ref), ref_cmp);
+    snprintf(msg, sizeof msg, "%s: %zu hits, reference %zu", tag, nh, rn);
+    expect(nh == rn, msg);
+    snprintf(msg, sizeof msg, "%s: %zu files, reference %zu", tag, rtx_proj_search_ng(p), rf);
+    expect(rtx_proj_search_ng(p) == rf, msg);
+    for (i = 0; i < nh && i < rn; i++) {
+        if (strcmp(got[i].key, ref[i].key) != 0) {
+            snprintf(msg, sizeof msg, "%s: hit %zu %s vs reference %s", tag, i, got[i].key,
+                     ref[i].key);
+            expect(0, msg);
+            break;
+        }
+    }
+    free(ref);
+    free(got);
+}
+
+static void test_search(void) {
+    @errhandler(CCError e) {
+        fprintf(stderr, "FAIL: search: %s\n", e.message ? e.message : "error");
+        fails++;
+        return;
+    }
+    RtxProj *p = (RtxProj *)calloc(1, sizeof(RtxProj));
+    long t0;
+    size_t i;
+    rtx_proj_open(p, cc_slice_cstr(g_root), 0) !>;
+    rtx_proj_finish(p) !>;
+    t0 = now_us();
+    rtx_proj_search_set(p, cc_slice_cstr("needle"), 0) !>;
+    rtx_proj_search_finish(p) !>;
+    fprintf(stderr, "proj_smoke: search %zu files: %zu hits in %.1f ms\n", rtx_proj_nfiles(p),
+            rtx_proj_search_nh(p), (now_us() - t0) / 1000.0);
+    expect(p->ps.complete, "search complete");
+    expect(p->ps.n_bin >= 1, "binary skipped");
+    compare(p, "literal", "needle", 0, 0);
+    /* Groups are whole, in id order, and the row map round-trips. */
+    {
+        size_t ng = rtx_proj_search_ng(p), g, rows = rtx_proj_search_rows(p);
+        uint32_t last = 0;
+        size_t sum = 0;
+        for (g = 0; g < ng; g++) {
+            const RtxPsGroup *gr = rtx_proj_search_group(p, g);
+            expect(g == 0 || gr->file > last, "groups in file order");
+            expect(gr->first == sum, "groups contiguous");
+            sum += gr->n;
+            last = gr->file;
+        }
+        expect(rows == ng + rtx_proj_search_nh(p), "row count");
+        for (i = 0; i < rtx_proj_search_nh(p); i += 7) {
+            size_t r = rtx_proj_search_row_of_hit(p, i), gg, hh;
+            rtx_proj_search_row(p, r, &gg, &hh);
+            expect(hh == i, "row of hit round-trips");
+        }
+        {
+            const RtxPsHit *h = rtx_proj_search_hit(p, 0);
+            const char *pv = rtx_proj_search_pv(p, h);
+            expect(h && h->pvn > 0 && !memcmp(pv + h->pvhit, "needle", 6), "preview holds the hit");
+        }
+    }
+    rtx_proj_search_set(p, cc_slice_cstr("NeEdLe"), RTX_PS_ICASE) !>;
+    rtx_proj_search_finish(p) !>;
+    compare(p, "icase", "needle", 1, 0);
+    rtx_proj_search_set(p, cc_slice_cstr("needle"), RTX_PS_WORD) !>;
+    rtx_proj_search_finish(p) !>;
+    compare(p, "word", "needle", 0, 1);
+    rtx_proj_search_set(p, cc_slice_cstr("ne+dle"), RTX_PS_REGEX) !>;
+    rtx_proj_search_finish(p) !>;
+    compare(p, "regex", "needle", 0, 0);
+    rtx_proj_search_set(p, cc_slice_cstr("(unclosed"), RTX_PS_REGEX) !>;
+    expect(p->ps.err != NULL, "bad regex reports");
+    /* Size cap: big.txt's needle is skipped. */
+    p->ps.max_bytes = 64 * 1024;
+    rtx_proj_search_set(p, cc_slice_cstr("needle"), 0) !>;
+    rtx_proj_search_finish(p) !>;
+    expect(p->ps.n_big >= 1, "big file skipped");
+    compare(p, "size cap", "needle", 0, 0);
+    p->ps.max_bytes = 0;
+    /* Cancel mid-scan: every published group is whole. */
+    rtx_proj_test_slow(300);
+    rtx_proj_search_set(p, cc_slice_cstr("needle"), 0) !>;
+    sleep_ms(40);
+    rtx_proj_search_cancel(p);
+    rtx_proj_test_slow(0);
+    {
+        size_t ng = rtx_proj_search_ng(p), g;
+        size_t rn = 0, rf = 0;
+        Ref *ref = reference(p, "needle", 0, 0, RTX_PROJ_SEARCH_MAX, &rn, &rf);
+        fprintf(stderr, "proj_smoke: cancelled after %zu of %zu files (%zu groups)\n",
+                (size_t)atomic_load(&p->ps.pub_files), rtx_proj_nfiles(p), ng);
+        /* Inline kicks (RTX_PARALLEL_INLINE) finish inside search_set. */
+        expect(ng < rf || getenv("RTX_PARALLEL_INLINE"), "cancel: stopped before the end");
+        for (g = 0; g < ng; g++) {
+            const RtxPsGroup *gr = rtx_proj_search_group(p, g);
+            char rel[RTX_PROJ_PATH], pre[RTX_PROJ_PATH + 2];
+            size_t want_n = 0, k;
+            rtx_proj_path(p, gr->file, rel, sizeof rel);
+            snprintf(pre, sizeof pre, "%s:", rel);
+            for (k = 0; k < rn; k++)
+                if (!strncmp(ref[k].key, pre, strlen(pre))) want_n++;
+            expect(gr->n == want_n, "cancel: group is whole");
+        }
+        free(ref);
+    }
+    rtx_proj_close(p);
+    free(p);
+}
+
+/* Chunked tickets equal one file per ticket: the same hits (line, col,
+ * offset, preview) and groups in the same order, for chunk sizes that do
+ * and do not divide the index; and a search kicked while the walk still
+ * publishes (the arms chase pub_nf) equals one over the finished index. */
+typedef struct {
+    RtxPsHit *h;
+    RtxPsGroup *g;
+    char *pv;
+    size_t nh, ng, npv;
+} Snap;
+
+static Snap snap_take(RtxProj *p) {
+    Snap s;
+    size_t i;
+    memset(&s, 0, sizeof s);
+    s.nh = rtx_proj_search_nh(p);
+    s.ng = rtx_proj_search_ng(p);
+    s.h = (RtxPsHit *)calloc(s.nh + 1, sizeof(RtxPsHit));
+    s.g = (RtxPsGroup *)calloc(s.ng + 1, sizeof(RtxPsGroup));
+    s.pv = (char *)calloc(s.nh * RTX_PROJ_PV_MAX + 1, 1);
+    for (i = 0; i < s.nh; i++) {
+        const RtxPsHit *h = rtx_proj_search_hit(p, i);
+        s.h[i] = *h;
+        memcpy(s.pv + s.npv, rtx_proj_search_pv(p, h), h->pvn);
+        s.npv += h->pvn;
+        s.h[i].pv = 0; /* pool offsets differ by chunking; the bytes may not */
+    }
+    for (i = 0; i < s.ng; i++) s.g[i] = *rtx_proj_search_group(p, i);
+    return s;
+}
+
+static void snap_drop(Snap *s) {
+    free(s->h);
+    free(s->g);
+    free(s->pv);
+}
+
+static void snap_eq(const Snap *a, const Snap *b, const char *tag) {
+    char msg[256];
+    size_t i;
+    snprintf(msg, sizeof msg, "%s: %zu hits / %zu groups vs %zu / %zu", tag, b->nh, b->ng, a->nh,
+             a->ng);
+    expect(a->nh == b->nh && a->ng == b->ng && a->npv == b->npv, msg);
+    if (a->nh != b->nh || a->ng != b->ng || a->npv != b->npv) return;
+    for (i = 0; i < a->nh; i++) {
+        if (memcmp(&a->h[i], &b->h[i], sizeof(RtxPsHit)) != 0) {
+            snprintf(msg, sizeof msg, "%s: hit %zu differs", tag, i);
+            expect(0, msg);
+            return;
+        }
+    }
+    for (i = 0; i < a->ng; i++) {
+        if (memcmp(&a->g[i], &b->g[i], sizeof(RtxPsGroup)) != 0) {
+            snprintf(msg, sizeof msg, "%s: group %zu differs", tag, i);
+            expect(0, msg);
+            return;
+        }
+    }
+    expect(memcmp(a->pv, b->pv, a->npv) == 0, tag);
+}
+
+static void test_search_chunks(void) {
+    @errhandler(CCError e) {
+        fprintf(stderr, "FAIL: search chunks: %s\n", e.message ? e.message : "error");
+        fails++;
+        rtx_proj_test_chunk(0);
+        rtx_proj_test_slow(0);
+        return;
+    }
+    static const struct {
+        const char *q;
+        unsigned opts;
+    } qs[] = { { "needle", 0 }, { "ne+dle", RTX_PS_REGEX }, { "NEEDLE", RTX_PS_ICASE | RTX_PS_WORD } };
+    static const int ks[] = { 0, 7, 64, 100000 };
+    RtxProj *p = (RtxProj *)calloc(1, sizeof(RtxProj));
+    size_t qi, ki;
+    char tag[128];
+    rtx_proj_open(p, cc_slice_cstr(g_root), 0) !>;
+    rtx_proj_finish(p) !>;
+    for (qi = 0; qi < sizeof qs / sizeof qs[0]; qi++) {
+        Snap one;
+        rtx_proj_test_chunk(1);
+        rtx_proj_search_set(p, cc_slice_cstr(qs[qi].q), qs[qi].opts) !>;
+        rtx_proj_search_finish(p) !>;
+        expect(p->ps.complete, "chunk 1: complete");
+        one = snap_take(p);
+        expect(one.nh > 0, "chunk 1: hits");
+        for (ki = 0; ki < sizeof ks / sizeof ks[0]; ki++) {
+            Snap k;
+            rtx_proj_test_chunk(ks[ki]);
+            rtx_proj_search_set(p, cc_slice_cstr(qs[qi].q), qs[qi].opts) !>;
+            rtx_proj_search_finish(p) !>;
+            k = snap_take(p);
+            snprintf(tag, sizeof tag, "chunk %d vs 1 (%s)", ks[ki], qs[qi].q);
+            snap_eq(&one, &k, tag);
+            expect((size_t)atomic_load(&p->ps.pub_files) == rtx_proj_nfiles(p),
+                   "chunked: every file counted");
+            snap_drop(&k);
+        }
+        rtx_proj_test_chunk(0);
+        /* Kick the search while a slow walk still publishes. */
+        {
+            RtxProj *q = (RtxProj *)calloc(1, sizeof(RtxProj));
+            Snap ov;
+            size_t seen_mid = 0;
+            rtx_proj_test_slow(200);
+            rtx_proj_open(q, cc_slice_cstr(g_root), 0) !>;
+            rtx_proj_search_set(q, cc_slice_cstr(qs[qi].q), qs[qi].opts) !>;
+            while (rtx_proj_walking(q)) {
+                rtx_proj_pump(q) !>;
+                if (rtx_proj_walking(q) && rtx_proj_search_ng(q)) seen_mid = 1;
+                sleep_ms(2);
+            }
+            rtx_proj_test_slow(0);
+            rtx_proj_search_finish(q) !>;
+            ov = snap_take(q);
+            snprintf(tag, sizeof tag, "search during walk (%s)", qs[qi].q);
+            snap_eq(&one, &ov, tag);
+            expect(seen_mid || getenv("RTX_PARALLEL_INLINE"), "search publishes during the walk");
+            snap_drop(&ov);
+            rtx_proj_close(q);
+            free(q);
+        }
+        snap_drop(&one);
+    }
+    rtx_proj_close(p);
+    free(p);
+}
+
+/* ---------------------------------------------------------------- batch */
+
+static char *run_batch(const char *line, int *rc) {
+    char *buf = NULL;
+    size_t n = 0;
+    FILE *out = open_memstream(&buf, &n);
+    *rc = rtx_batch_exec(NULL, line, out, stderr);
+    fclose(out);
+    return buf;
+}
+
+static void test_batch(void) {
+    int rc;
+    char *s;
+    size_t lines = 0;
+    const char *c;
+    rtx_batch_set_project(g_root);
+    s = run_batch("project-files d42f017", &rc);
+    expect(rc == RTX_BATCH_OK && s && !strncmp(s, "bulk/d42/f017.c\n", 16),
+           "batch project-files QUERY");
+    free(s);
+    s = run_batch("project-files", &rc);
+    for (c = s; c && *c; c++) lines += *c == '\n';
+    expect(rc == RTX_BATCH_OK && lines == g_nwant, "batch project-files lists every file");
+    free(s);
+    s = run_batch("project-search --word needle", &rc);
+    expect(rc == RTX_BATCH_OK && s && strstr(s, "words.txt:1:1: needle needles"),
+           "batch project-search line format");
+    {
+        size_t rn = 0, rf = 0;
+        char tail[128];
+        RtxProj tmp;
+        Ref *ref;
+        memset(&tmp, 0, sizeof tmp);
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                fails++;
+                return;
+            }
+            rtx_proj_open(&tmp, cc_slice_cstr(g_root), 0) !>;
+            rtx_proj_finish(&tmp) !>;
+        }
+        ref = reference(&tmp, "needle", 0, 1, RTX_PROJ_SEARCH_MAX, &rn, &rf);
+        snprintf(tail, sizeof tail, "# %zu matches in %zu files", rn, rf);
+        expect(s && strstr(s, tail) != NULL, "batch project-search summary");
+        free(ref);
+        rtx_proj_close(&tmp);
+    }
+    free(s);
+    s = run_batch("project-search --regex '(bad'", &rc);
+    expect(rc == RTX_BATCH_ERR, "batch bad regex is an error");
+    free(s);
+    rtx_batch_project_close();
+}
+
+int main(void) {
+    test_ignore();
+    make_tree();
+    test_index();
+    test_fuzzy();
+    test_pick();
+    test_search();
+    test_search_chunks();
+    test_batch();
+    drop_tree();
+    if (fails) {
+        fprintf(stderr, "proj_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("proj_smoke: ok\n");
+    return 0;
+}

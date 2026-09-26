@@ -1,8 +1,9 @@
 #!ccc cch
 /*
- * Several documents, one or two panes. Each pane points at a buffer.
- * Face: RtxWs_* / RtxBuf_*. Listing helpers live in browse.cch.
- * Park / camera helpers stay in workspace.ccs.
+ * Several documents (the buffer list, in tab order) and up to
+ * RTX_PANES_MAX panes laid out by a split tree. Each pane shows a buffer
+ * through its own camera. Face: RtxWs_* / RtxBuf_*. Listing helpers live
+ * in browse.cch. Park / camera helpers stay in workspace.ccs.
  */
 #ifndef RTX_WORKSPACE_H
 #define RTX_WORKSPACE_H
@@ -54,8 +55,32 @@ typedef struct {
     int safe_view, safe_wrap, safe_rich, safe_nib, safe_unlock, safe_pin;
     uint64_t safe_seen_sig; /* last-change debounce; 0 idle */
     long safe_due_ms;      /* 0 idle; else flush at this monotonic ms */
+    long safe_backoff_ms;  /* 0 ok; else current idle retry gap after a miss */
+    long safe_retry_ms;    /* earliest idle hist retry after a miss */
     int safe_fault;        /* 1: last dirty hist journal write failed */
+    int safe_hold;         /* RTX_SAFE_HOLD_*: a dirty journal this buffer
+                            * could not apply. It stays on disk untouched
+                            * (no hist writes) until the user discards it. */
+    int safe_rebased;      /* 1: journal replayed onto its pinned base; the
+                            * path drifted, so Save asks before overwriting */
+    int park_fault;        /* 1: last unpark failed (file moved / deleted /
+                            * unreadable); stays parked, journal untouched */
+    /* Auto-closers typed-through / backspaced as a pair: the run
+     * [ap_lo, ap_hi) in front of the caret, live while edit_gen == ap_gen. */
+    int ap_on;
+    size_t ap_lo, ap_hi, ap_gen;
+    size_t ap_open;        /* caret of the empty pair just typed, else -1 */
+    int cam_pane;          /* pane slot whose camera the fields above are;
+                            * another pane on this buf keeps its camera in
+                            * RtxWs.cam[slot]. Not visible: stale, fixed on
+                            * show (RtxWs_panes_fix). */
 } RtxBuf;
+
+enum {
+    RTX_SAFE_HOLD_NONE = 0,
+    RTX_SAFE_HOLD_REPLAY,  /* replay failed midway; shown clean from disk */
+    RTX_SAFE_HOLD_CONFLICT /* file drifted and no pinned base; shown from disk */
+};
 
 #include "browse.cch"
 
@@ -75,6 +100,16 @@ typedef struct {
     int live;              /* 1: doc is from_path of path[] */
     int kind;              /* RTX_BROWSE_PREV_* */
     char path[RTX_BROWSE_DIR];
+    char want[RTX_BROWSE_DIR]; /* selection the open arm is for */
+    uint64_t gen;          /* bumps on cancel; host discards stale adopts */
+    CCParallel h;          /* dest-live open into staging */
+    _Atomic unsigned char load_done;
+    int load_fail;         /* 1: open failed (after load_done) */
+    int staging_live;      /* staging holds a from_path doc */
+    RtxDoc staging;
+    RtxSafeCam staging_cam;
+    int warmed;            /* 1: a file preview was adopted this browse */
+    unsigned ready_seq;    /* bumps when the painted preview changes */
     RtxDoc doc;
     RtxLayout layout;
     RtxSafeCam cam;        /* load-only; preview never writes this back */
@@ -82,6 +117,8 @@ typedef struct {
     int fill_vis;
     int fill_view;
     int fill_char;         /* wrap_char used for the cached fill */
+    size_t drag_vis, drag_len; /* preview rail drag (does not open) */
+    int drag_grab;
 } RtxBrowsePrev;
 
 /* Stream sel only. Do not call sel_covers — that can line_of, and !>
@@ -91,9 +128,11 @@ static inline int rtx_browse_prev_sel(const RtxDoc *d, size_t off) {
     return off >= d->sel_lo() && off < d->sel_hi();
 }
 
-/* Camera + layout for the other pane when both show the same buf. */
+/* Camera + layout of a pane whose buf's own camera belongs to another
+ * pane (same file in several panes). `of` is the buf it is a camera on. */
 typedef struct {
     int live;
+    const RtxBuf *of;
     RtxLayout layout;
     size_t top, top_wrap, left_col, top_byte;
     int seek_valid;
@@ -108,25 +147,82 @@ typedef struct {
     RtxPref pref;
 } RtxPaneSnap;
 
+/* Workspace transaction (DESIGN Edit groups): one command whose groups
+ * span documents. Each member doc holds its group stamped with `id`. */
+#define RTX_XACT_BUFS 8
+
 typedef struct {
-    CCArena session;       /* workspace epoch: pointer table + each buf + clipboard */
-    RtxBuf **bufs;         /* table may move; each RtxBuf is allocated once */
+    uint64_t id;
+    int nbuf;
+    int bufs[RTX_XACT_BUFS]; /* ws.bufs indices (closing a buf renumbers) */
+} RtxWsXact;
+
+/* Pane tree (DESIGN Interactive, Panes). Slots are stable ids 0..MAX-1;
+ * a leaf names a slot, a split lays its two children side by side
+ * (RTX_SPLIT_COLS, a vertical divider) or stacked (RTX_SPLIT_ROWS). */
+#define RTX_PANES_MAX 8
+#define RTX_PANE_NODES (2 * RTX_PANES_MAX)
+enum {
+    RTX_SPLIT_COLS = 0,    /* a | b */
+    RTX_SPLIT_ROWS = 1     /* a over b */
+};
+enum {
+    RTX_PANE_NODE_FREE = 0,
+    RTX_PANE_NODE_LEAF,
+    RTX_PANE_NODE_SPLIT
+};
+typedef struct {
+    int kind;              /* RTX_PANE_NODE_* */
+    int pane;              /* leaf: slot */
+    int dir;               /* split: RTX_SPLIT_* */
+    int ratio;             /* split: first child's share * 1000 */
+    int a, b;              /* split: children */
+    int up;                /* parent node, -1 at the root */
+} RtxPaneNode;
+
+typedef struct {
+    int x, y, w, h;
+} RtxPaneRect;
+
+typedef struct {
+    CCArena session;       /* workspace epoch: pointer table + each buf */
+    RtxBuf **bufs;         /* table may move; each RtxBuf is allocated once;
+                            * closing one shifts the table (tab order) */
     size_t len;
     size_t cap;
-    int pane[2];
-    int npanes;
-    int focus;
-    RtxPaneSnap side;
-    RtxBrowse nav[2];
-    RtxBrowsePrev prev[2];
-    int browse_split[2];   /* list/pane * 1000; 0 = preview at its minimum */
+    int pane[RTX_PANES_MAX];  /* slot -> buf index */
+    int npanes;            /* live slots */
+    int focus;             /* focused slot */
+    int order[RTX_PANES_MAX]; /* live slots in tree order (left/top first) */
+    unsigned live_mask;    /* bit per live slot */
+    RtxPaneNode node[RTX_PANE_NODES];
+    int root;              /* node index; node[root] FREE = no tree yet */
+    int tree_n;            /* npanes the tree was built for */
+    RtxPaneSnap cam[RTX_PANES_MAX]; /* per slot, live while that slot is not
+                                     * its buf's cam_pane */
+    RtxBrowse nav[RTX_PANES_MAX];
+    RtxBrowsePrev prev[RTX_PANES_MAX];
+    int browse_split[RTX_PANES_MAX]; /* list/pane * 1000; 0 = preview at its minimum */
+    double pane_w[RTX_PANES_MAX]; /* host: text width of each pane (0 = unknown) */
+    int pane_vis[RTX_PANES_MAX];  /* host: rows of each pane (0 = unknown) */
     long browse_split_due; /* debounce the journal write while dragging */
     int browse_split_dirty;
-    char[:] clip;
+    /* open_files' sync_live: the RTXW snapshot is written by the next
+     * safe_pump (after the frame), flush_all or exit — never on the
+     * open → first paint path. ws_hold is set only around that sync. */
+    int ws_pending;
+    int ws_hold;
+    char[:] clip;         /* view on clip_a */
+    CCArena clip_a;        /* the clip's own heap arena, replaced per new value */
     /* UI progress drawer; stamped onto each tree (and new add_path bufs). */
     RtxBusyFn busy_fn;
     void *busy_ctx;
     char start_dir[RTX_BROWSE_DIR]; /* first directory argv; browse prefers this */
+    RtxWsXact *xacts;      /* raw on session (cc_arena_realloc); this process only */
+    size_t xact_n;
+    size_t xact_cap;
+    uint64_t xact_last;    /* last id handed out; seeded from the clock so a
+                            * journaled id from an earlier run does not match */
 } RtxWs;
 
 int RtxWs_ensure(RtxWs *w);
@@ -150,32 +246,142 @@ void RtxWs_safe_flush_all(RtxWs *w);
 /* Clean exit only. Discard leaves memory dirty; do not rewrite those journals. */
 void RtxWs_safe_flush_exit(RtxWs *w);
 void RtxWs_safe_pump(RtxWs *w);
+/* ms until RtxWs_safe_pump has a debounce or retry due (0 = now), or -1
+ * = nothing pending: an idle host may sleep until input. */
+long RtxWs_safe_next_ms(const RtxWs *w, long now);
 /* 1: a dirty hist journal write failed; that buffer stayed live. */
 int rtx_ws_safe_fault(const RtxWs *w);
+/* Status-bar text for the first Safe fault (held journal, write miss).
+ * 0 = nothing to show. */
+int rtx_ws_safe_fault_msg(const RtxWs *w, char *out, size_t n);
+/* Hash of that text (0 = none). A host that sleeps until input compares
+ * it after safe_pump: a fault that appears while idle still repaints. */
+unsigned rtx_ws_safe_fault_sig(const RtxWs *w);
 void !>(CCError) RtxWs_save_dirty(RtxWs *w);
 int RtxWs_any_disk_changed(const RtxWs *w);
 void RtxWs_safe_discard_dirty(RtxWs *w);
 
 void RtxWs_set_view(RtxWs *w, int view);
 void RtxWs_set_views(RtxWs *w, const int *views, int n);
+/* One pane: split right with the next buffer. Several: back to the first. */
 void RtxWs_toggle_split(RtxWs *w);
 void RtxWs_next_buf(RtxWs *w);
 void RtxWs_prev_buf(RtxWs *w);
 void RtxWs_set_focus(RtxWs *w, int pane);
 void RtxWs_focus_other(RtxWs *w);
+/* 1 when two live panes show one buffer. */
 int RtxWs_same_split(const RtxWs *w);
 /* Put pane p's camera on its buf. 1 = caller must RtxWs_drop_pane. */
 int RtxWs_hold_pane(RtxWs *w, int p);
 void RtxWs_drop_pane(RtxWs *w, int p, int held);
+/* After the frame's layout: each doc keeps only the runs near its cameras
+ * (every pane on it, held or not) and caret — RtxDoc_hl_trim. */
+void RtxWs_hl_trim(RtxWs *w);
+/* The same for one buffer's own camera and caret. */
+void RtxBuf_hl_trim(RtxBuf *b);
+
+/* --- pane tree --- */
+/* Rebuild the tree when npanes / pane[] were set by hand, recompute
+ * order / live_mask, and put every camera where it belongs: the focused
+ * pane's on its buf, every other pane on that buf in cam[slot]. */
+void RtxWs_panes_fix(RtxWs *w);
+int RtxWs_pane_live(const RtxWs *w, int p);
+/* Split the focused pane (RTX_SPLIT_COLS: a new pane to its right;
+ * ROWS: below). The new pane shows the same buffer on its own camera and
+ * takes focus. Slot, or -1 at RTX_PANES_MAX. */
+int RtxWs_split(RtxWs *w, int dir);
+/* Close pane p (not the last). Its sibling takes its space; focus goes
+ * there when p had it. 1 = closed. */
+int RtxWs_close_pane(RtxWs *w, int p);
+/* Focus the next (dir 1) / previous pane in tree order. */
+void RtxWs_focus_step(RtxWs *w, int dir);
+/* Focus the pane nearest the focused one in a direction (dx, dy one of
+ * -1/0/1) inside `area`. 1 = moved. */
+int RtxWs_focus_dir(RtxWs *w, RtxPaneRect area, int gx, int gy, int dx, int dy);
+/* Move the divider nearest the focused pane on `axis` (RTX_SPLIT_*) by
+ * delta per mille (right / down positive). 1 = moved. */
+int RtxWs_pane_nudge(RtxWs *w, int axis, int delta);
+/* Show the focused pane's buffer in the next pane (dir 1) / previous and
+ * focus it; the old pane steps to another buffer when one is left. */
+void RtxWs_move_to_pane(RtxWs *w, int dir);
+/* Pane rects inside `area`: gx columns between side-by-side panes, gy
+ * rows between stacked ones. out[slot]; dead slots are zero. */
+void RtxWs_pane_rects(RtxWs *w, RtxPaneRect area, int gx, int gy, RtxPaneRect *out);
+/* Split node whose divider gap holds (x, y) (slop widens it), else -1. */
+int RtxWs_divider_at(RtxWs *w, RtxPaneRect area, int gx, int gy, int x, int y,
+                     int slop);
+/* Drag that divider to (x, y). 1 = the ratio changed. */
+int RtxWs_divider_drag(RtxWs *w, RtxPaneRect area, int gx, int gy, int node,
+                       int x, int y);
+/* Every divider gap inside `area`: node[i], gap[i] (at most max). */
+int RtxWs_dividers(RtxWs *w, RtxPaneRect area, int gx, int gy, int *node,
+                   RtxPaneRect *gap, int max);
+/* Axis of a split node's divider (RTX_SPLIT_*), -1 if not a split. */
+int RtxWs_divider_dir(const RtxWs *w, int node);
+/* Host geometry for after_edit on unfocused cameras. */
+void RtxWs_pane_geom(RtxWs *w, int p, double width, int vis);
+
+/* --- buffer list (tab order = bufs[]) --- */
+/* Path of buffer i (NULL = untitled) and its unsaved state (parked
+ * dirty and held journals count). */
+const char *RtxWs_buf_path(const RtxWs *w, int bufi);
+int RtxWs_buf_dirty(const RtxWs *w, int bufi);
+int RtxWs_buf_shown(const RtxWs *w, int bufi);
+/* The focused pane shows buffer bufi. */
+void RtxWs_show_buf(RtxWs *w, int bufi);
+/* Save buffer bufi (unparks a parked dirty one). Refuses a held journal,
+ * untitled, or a file changed on disk (CC_ERR_IO "file changed on disk"). */
+void !>(CCError) RtxWs_save_buf(RtxWs *w, int bufi);
+/* Close buffer bufi. discard = "Don't save": drop its Safe journal (as
+ * quit-q does). A dirty buffer without discard is refused: the host asks.
+ * Every pane that showed it steps to the next buffer in tab order, an
+ * untitled one when none is left. Transactions forget it. */
+void !>(CCError) RtxWs_close_buf(RtxWs *w, int bufi, int discard);
 
 void !>(CCError) RtxWs_set_clip(RtxWs *w, char[:] src);
 /* 0 = nothing to do (no selection). 1 = copied. */
 int !>(CCError) RtxWs_copy(RtxWs *w);
 void !>(CCError) RtxWs_cut(RtxWs *w);
 void !>(CCError) RtxWs_paste(RtxWs *w);
+/* Reparse once, then patch or refill every camera on bufi. The focused
+ * pane uses width0 / vis; other panes use their RtxWs_pane_geom (else
+ * width1 / vis). */
 void !>(CCError) RtxWs_after_edit(RtxWs *w, int bufi, RtxMeasure *m,
                                         double width0, double width1, int vis);
 void RtxWs_invalidate_buf_views(RtxWs *w, int bufi);
+
+/* One member of a workspace transaction: a group on one buffer. */
+typedef struct {
+    int bufi;
+    const RtxEdit *edits;
+    size_t n;
+} RtxWsEdits;
+
+/* Apply every member's group, all stamped with one transaction id, and
+ * return that id (0 if nothing changed). All or nothing: a member that
+ * fails undoes the members already applied (and drops that redo). A
+ * parked, repeated or out-of-range buffer, or more than RTX_XACT_BUFS
+ * members, is refused before any edit. The host refreshes each member's
+ * views (RtxWs_after_edit per bufi). */
+uint64_t !>(CCError) RtxWs_replace_xact(RtxWs *w, const RtxWsEdits *m, size_t n);
+
+enum {
+    RTX_UNDO_ONE = 0, /* this buffer's head step */
+    RTX_UNDO_ALL = 1, /* every member of the head transaction */
+    RTX_UNDO_ASK = 2  /* split transaction: ask all / this file / cancel */
+};
+/* What undo on `bufi` means. ONE: not a live transaction. ALL: its head
+ * group is a transaction and every member doc is still at head. ASK: some
+ * member moved on, undid it, or is parked. */
+int RtxWs_undo_scope(const RtxWs *w, int bufi);
+/* ONE: RtxDoc_undo on bufi. ALL: undo the transaction in every member —
+ * a member that moved on undoes back through it. Members other than
+ * bufi are reparsed and their views invalidated; bufi is the caller's
+ * after_edit. A parked member refuses ALL before any edit. */
+void !>(CCError) RtxWs_undo(RtxWs *w, int bufi, int scope);
+/* Redo on bufi; a transaction whose members all sit just below it redoes
+ * in every member, else only bufi. */
+void !>(CCError) RtxWs_redo(RtxWs *w, int bufi);
 
 void RtxBuf_destroy(RtxBuf *b);
 void rtx_buf_grid_bind(RtxBuf *b);
@@ -193,10 +399,63 @@ void !>(CCError) RtxBuf_move_grid_col(RtxBuf *b, int dir);
 void !>(CCError) RtxBuf_move_md_col(RtxBuf *b, int dir);
 void !>(CCError) RtxBuf_move_vert(RtxBuf *b, const RtxMeasure *m,
                                         double width, int dir, int shift);
+/* PageUp / PageDown: `n` rows of move_vert, laid out once. */
+void !>(CCError) RtxBuf_page_vert(RtxBuf *b, const RtxMeasure *m,
+                                        double width, int dir, size_t n, int shift);
 void !>(CCError) RtxBuf_move_edge(RtxBuf *b, int to_end, int shift,
                                         int physical);
+/* Typing. In a document with an auto-pair table (docs/md_view.md,
+ * Editing) a typed opener closes itself, a closer steps over the one it
+ * inserted, and an opener over a selection wraps it. */
 void !>(CCError) RtxBuf_type_cp(RtxBuf *b, uint32_t cp);
+/* Enter. Markdown: continue the list item / quote on the new line (next
+ * number, fresh `[ ]`), leave it from an empty item (outdent when
+ * nested), keep the indent inside a fence; ordered siblings renumber.
+ * One undo step. */
 void !>(CCError) RtxBuf_enter(RtxBuf *b);
+/* Shift-Enter (Alt-Enter in a terminal): a new line inside the item —
+ * quote prefix and the item's content indent, no marker. */
+void !>(CCError) RtxBuf_enter_soft(RtxBuf *b);
+/* Tab / Shift-Tab (dir -1). Grid and Rich table: next / previous cell.
+ * Markdown list items (caret line or every selected line): nest under
+ * the previous sibling / back to the parent, renumbering ordered lists.
+ * Else a tab (or rtx_edit_tab_spaces() spaces); Shift-Tab takes one
+ * indent unit off the line. 1 if the document changed. */
+int !>(CCError) RtxBuf_tab(RtxBuf *b, int dir);
+/* Paste bytes at the caret (one undo step). Markdown: a URL over a
+ * one-line selection becomes `[selection](url)`; on a quote line every
+ * pasted line keeps the quote prefix. */
+void !>(CCError) RtxBuf_paste_text(RtxBuf *b, char[:] bytes);
+/* 1 when typing here may auto-pair (hosts then feed a typed run one
+ * scalar at a time). */
+int RtxBuf_autopair_live(const RtxBuf *b);
+/* Process settings: auto-pairs on / off (`--no-autopair`), and Tab as
+ * N spaces (0 = a tab byte; `--tab-spaces=N`). */
+void rtx_edit_set_autopair(int on);
+int rtx_edit_autopair(void);
+void rtx_edit_set_tab_spaces(int n);
+int rtx_edit_tab_spaces(void);
+
+/* Markdown table commands (Apply menu while the caret is in a table;
+ * Source and Rich). Each is one undo step; the caret lands in the cell
+ * the command made or kept. */
+enum {
+    RTX_TBL_ROW_ABOVE = 0,
+    RTX_TBL_ROW_BELOW,
+    RTX_TBL_ROW_DEL,
+    RTX_TBL_COL_LEFT,
+    RTX_TBL_COL_RIGHT,
+    RTX_TBL_COL_DEL,
+    RTX_TBL_COL_MOVE_L,
+    RTX_TBL_COL_MOVE_R,
+    RTX_TBL_OPS
+};
+int RtxBuf_in_table(const RtxBuf *b);
+void !>(CCError) RtxBuf_table_op(RtxBuf *b, int op);
+/* Menu label / key of a table command; key → command (-1 = none). */
+const char *rtx_table_op_name(int op);
+int rtx_table_op_key(int op);
+int rtx_table_op_of_key(int ch);
 void !>(CCError) RtxBuf_backspace(RtxBuf *b);
 void !>(CCError) RtxBuf_delete_forward(RtxBuf *b);
 size_t RtxBuf_view_off(const RtxBuf *b);
@@ -263,8 +522,21 @@ void !>(CCError) RtxWs_browse_backspace(RtxWs *w);
 void RtxWs_browse_prev_drop(RtxWs *w, int pane);
 void !>(CCError) RtxWs_browse_prev_sync(RtxWs *w, int pane, RtxMeasure *m,
                                         double width, int vis);
+/* Join a deferred open and adopt it (tests / settle). */
+void !>(CCError) RtxWs_browse_prev_flush(RtxWs *w, int pane);
+/* Join finished open arms (non-blocking when still running). */
+void !>(CCError) RtxWs_browse_prev_pump(RtxWs *w);
+int RtxWs_browse_prev_busy(const RtxWs *w);
+/* Bumps when a finished open is adopted into the painted preview. */
+unsigned RtxWs_browse_prev_ready_seq(const RtxWs *w);
 void RtxWs_browse_prev_cycle(RtxWs *w, int pane);
 void RtxWs_browse_prev_toggle_wrap(RtxWs *w, int pane);
+/* Scroll the preview camera. Does not open the file / write the journal. */
+void !>(CCError) rtx_browse_prev_scroll_vis(RtxBrowsePrev *p, RtxMeasure *m,
+                                            double width, int vis, int dir);
+void !>(CCError) rtx_browse_prev_scroll_to_off(RtxBrowsePrev *p, RtxMeasure *m,
+                                               double width, int vis, size_t off);
+void rtx_browse_prev_drag_end(RtxBrowsePrev *p);
 
 #include "utf8.cch"
 

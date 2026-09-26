@@ -1,0 +1,398 @@
+#!ccc ccs
+/*
+ * Markdown editing affordances (docs/md_view.md, Editing): Enter
+ * continues lists / quotes and leaves them from an empty item, Tab nests
+ * list items, typed pairs close themselves, a URL pasted over a selection
+ * becomes a link, pair apply trims / splits lines / toggles, and table
+ * rows / columns have commands. Every case checks the exact bytes, the
+ * caret, and that undo walks back to the original in the expected number
+ * of steps (one per command) and redo walks forward again.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/ui.cch"
+
+static int fails = 0;
+static int cases = 0;
+
+static double meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return (double)bytes.len;
+}
+
+static double lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+#define MD_CAP 1024
+
+static int md_read(RtxDoc *d, char *dst) {
+    size_t n = d->len(), got;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    if (n >= MD_CAP) return 0;
+    got = d->read_at(0, cc_slice_from_buffer(dst, n)) !>;
+    dst[got] = 0;
+    return got == n;
+}
+
+/* Script tokens, space separated:
+ *   @N caret+anchor   ~N caret only (extends the selection)
+ *   'abc type each byte (RtxBuf_type_cp)   _ type one space
+ *   E Enter   S Shift-Enter   T Tab   R Shift-Tab   < Backspace   > Delete
+ *   !name apply   Ptext paste   Kn table command n   A0 / A1 autopair off/on */
+static void !>(CCError) md_op(RtxWs *w, RtxBuf *b, RtxMeasure *m, const char *tok,
+                              size_t tn) {
+    char name[64];
+    size_t i;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    (void)w;
+    switch (tok[0]) {
+        case '@':
+            b->doc.caret = (size_t)atoi(tok + 1);
+            b->doc.sel_anchor = b->doc.caret;
+            return cc_ok();
+        case '~':
+            b->doc.caret = (size_t)atoi(tok + 1);
+            return cc_ok();
+        case '\'':
+            for (i = 1; i < tn; i++) {
+                b->type_cp((uint32_t)(unsigned char)tok[i]) !>;
+                b->after_edit(m, 800.0, 20) !>;
+            }
+            return cc_ok();
+        case '_': b->type_cp((uint32_t)' ') !>; break;
+        case 'E': b->enter() !>; break;
+        case 'S': b->enter_soft() !>; break;
+        case 'T': (void)(b->tab(1) !>); break;
+        case 'R': (void)(b->tab(-1) !>); break;
+        case '<': b->backspace() !>; break;
+        case '>': b->delete_forward() !>; break;
+        case 'K': b->table_op(atoi(tok + 1)) !>; break;
+        case 'A': rtx_edit_set_autopair(tok[1] == '1'); return cc_ok();
+        case 'P':
+            if (tn - 1 >= sizeof name) return cc_err(CC_ERR_INVALID_ARG, "paste");
+            memcpy(name, tok + 1, tn - 1);
+            for (i = 0; i + 1 < tn; i++) {
+                if (name[i] == '^') name[i] = '\n';
+            }
+            b->paste_text(cc_slice_from_buffer(name, tn - 1)) !>;
+            break;
+        case '!':
+            if (tn - 1 >= sizeof name) return cc_err(CC_ERR_INVALID_ARG, "name");
+            memcpy(name, tok + 1, tn - 1);
+            name[tn - 1] = 0;
+            b->apply_named(cc_slice_cstr(name)) !>;
+            break;
+        default:
+            return cc_err(CC_ERR_INVALID_ARG, "token");
+    }
+    return b->after_edit(m, 800.0, 20);
+}
+
+/* One case. `ext` picks the grammar (md / c / txt). want_caret /
+ * want_anchor < 0 skip that check; undos < 0 skips the step count. */
+static void md_case(const char *tag, const char *ext, int rich, const char *text,
+                    const char *script, const char *want, long want_caret,
+                    long want_anchor, int undos) {
+    RtxWs w = {0} @destroy;
+    RtxBuf *b;
+    RtxMeasure m;
+    char *paths[1];
+    char path[] = "/tmp/rtx_md_edit_XXXXXX";
+    char fpath[64];
+    char now[MD_CAP], fin[MD_CAP];
+    const char *p;
+    int fd, k;
+    @errhandler(CCError e) {
+        fprintf(stderr, "FAIL: %s: ", tag);
+        cc_error_log(e);
+        fails++;
+        remove(fpath);
+        return;
+    }
+    cases++;
+    m.measure = meas;
+    m.line_height = lh;
+    m.ctx = NULL;
+    fpath[0] = 0;
+    fd = mkstemp(path);
+    if (fd < 0) {
+        fprintf(stderr, "FAIL: %s: tmp\n", tag);
+        fails++;
+        return;
+    }
+    (void)!write(fd, text, strlen(text));
+    close(fd);
+    snprintf(fpath, sizeof fpath, "%s.%s", path, ext);
+    rename(path, fpath);
+    paths[0] = fpath;
+    w.open_files(1, paths) !>;
+    b = w.active();
+    b->layout.rich = rich;
+    b->layout.doc(&b->doc, &m, 800.0) !>;
+    p = script;
+    while (*p) {
+        const char *q;
+        while (*p == ' ') p++;
+        if (!*p) break;
+        q = p;
+        while (*q && *q != ' ') q++;
+        md_op(&w, b, &m, p, (size_t)(q - p)) !>;
+        p = q;
+    }
+    rtx_edit_set_autopair(1);
+    md_read(&b->doc, fin);
+    if (strcmp(fin, want) != 0) {
+        fprintf(stderr, "FAIL: %s: got '%s' want '%s'\n", tag, fin, want);
+        fails++;
+    }
+    if (want_caret >= 0 && b->doc.caret != (size_t)want_caret) {
+        fprintf(stderr, "FAIL: %s: caret %zu want %ld\n", tag, b->doc.caret, want_caret);
+        fails++;
+    }
+    if (want_anchor >= 0 && b->doc.sel_anchor != (size_t)want_anchor) {
+        fprintf(stderr, "FAIL: %s: anchor %zu want %ld\n", tag, b->doc.sel_anchor,
+                want_anchor);
+        fails++;
+    }
+    k = 0;
+    while (b->doc.can_undo() && k < 64) {
+        b->doc.undo() !>;
+        b->after_edit(&m, 800.0, 20) !>;
+        k++;
+    }
+    md_read(&b->doc, now);
+    if (strcmp(now, text) != 0) {
+        fprintf(stderr, "FAIL: %s: undo got '%s' want '%s'\n", tag, now, text);
+        fails++;
+    }
+    if (undos >= 0 && k != undos) {
+        fprintf(stderr, "FAIL: %s: %d undo steps, want %d\n", tag, k, undos);
+        fails++;
+    }
+    while (b->doc.can_redo()) {
+        b->doc.redo() !>;
+        b->after_edit(&m, 800.0, 20) !>;
+    }
+    md_read(&b->doc, now);
+    if (strcmp(now, fin) != 0) {
+        fprintf(stderr, "FAIL: %s: redo got '%s' want '%s'\n", tag, now, fin);
+        fails++;
+    }
+    remove(fpath);
+}
+
+static void line_parse_cases(void) {
+    RtxMdLine L;
+    rtx_md_line_parse("> > - [x] t", 11, &L);
+    if (L.qdepth != 2 || L.qhi != 4 || L.kind != RTX_MDL_BULLET || !L.task ||
+        L.clo != 10 || L.blank) {
+        fprintf(stderr, "FAIL: parse quote list task\n");
+        fails++;
+    }
+    rtx_md_line_parse("12) x", 5, &L);
+    if (L.kind != RTX_MDL_ORDERED || L.num != 12 || L.delim != ')' || L.chi != 4) {
+        fprintf(stderr, "FAIL: parse ordered\n");
+        fails++;
+    }
+    rtx_md_line_parse("* * *", 5, &L);
+    if (L.kind) {
+        fprintf(stderr, "FAIL: thematic break is not an item\n");
+        fails++;
+    }
+    rtx_md_line_parse("  ```py", 7, &L);
+    if (L.fence != '`' || L.fence_n != 3 || !L.fence_info) {
+        fprintf(stderr, "FAIL: parse fence\n");
+        fails++;
+    }
+    rtx_md_line_parse("## h", 4, &L);
+    if (!L.heading || L.clo != 3) {
+        fprintf(stderr, "FAIL: parse heading\n");
+        fails++;
+    }
+    rtx_md_line_parse("- ", 2, &L);
+    if (L.kind != RTX_MDL_BULLET || !L.blank || L.clo != 2) {
+        fprintf(stderr, "FAIL: parse empty item\n");
+        fails++;
+    }
+}
+
+static const char *const TBL = "| A | B |\n|---|---|\n| x | y |\n";
+
+int main(void) {
+    int rich;
+    line_parse_cases();
+    for (rich = 0; rich <= 1; rich++) {
+        char t[64];
+#define T(s) (snprintf(t, sizeof t, "%s%s", rich ? "rich " : "", s), t)
+        /* 1. Enter continues containers. */
+        md_case(T("enter bullet"), "md", rich, "- a", "@3 E", "- a\n- ", 6, 6, 1);
+        md_case(T("enter bullet nl"), "md", rich, "- a\n", "@3 E", "- a\n- \n", 6, 6, 1);
+        md_case(T("enter star"), "md", rich, "* a", "@3 E", "* a\n* ", 6, 6, 1);
+        md_case(T("enter plus"), "md", rich, "+ a", "@3 E", "+ a\n+ ", 6, 6, 1);
+        md_case(T("enter ordered renumber"), "md", rich, "1. a\n2. b\n3. c", "@4 E",
+                "1. a\n2. \n3. b\n4. c", 8, 8, 1);
+        md_case(T("enter ordered paren"), "md", rich, "1) x", "@4 E", "1) x\n2) ", 8, 8, 1);
+        md_case(T("enter ordered lazy"), "md", rich, "1. a\n1. b", "@4 E",
+                "1. a\n1. \n1. b", 8, 8, 1);
+        md_case(T("enter task"), "md", rich, "- [x] done", "@10 E",
+                "- [x] done\n- [ ] ", 17, 17, 1);
+        md_case(T("enter quote"), "md", rich, "> q", "@3 E", "> q\n> ", 6, 6, 1);
+        md_case(T("enter nested quote"), "md", rich, "> > q", "@5 E", "> > q\n> > ", 10, 10, 1);
+        md_case(T("enter quote list"), "md", rich, "> - item", "@8 E",
+                "> - item\n> - ", 13, 13, 1);
+        md_case(T("enter nested item"), "md", rich, "- a\n  - b", "@9 E",
+                "- a\n  - b\n  - ", 14, 14, 1);
+        md_case(T("enter split"), "md", rich, "- ab", "@3 E", "- a\n- b", 6, 6, 1);
+        md_case(T("enter split trims"), "md", rich, "- a b", "@3 E", "- a\n- b", 6, 6, 1);
+        md_case(T("enter selection"), "md", rich, "- abc", "@2 ~4 E", "- \n- c", 5, 5, 1);
+        md_case(T("enter bol"), "md", rich, "- a", "@0 E", "\n- a", 1, 1, 1);
+        md_case(T("enter heading"), "md", rich, "# h", "@3 E", "# h\n", 4, 4, 1);
+        md_case(T("enter paragraph"), "md", rich, "ab", "@2 E", "ab\n", 3, 3, 1);
+        md_case(T("enter fence indent"), "md", rich, "```\n    x", "@9 E",
+                "```\n    x\n    ", 14, 14, 1);
+        md_case(T("enter fence no marker"), "md", rich, "```\n- a", "@7 E",
+                "```\n- a\n", 8, 8, 1);
+        md_case(T("enter after fence closes"), "md", rich, "```\nx\n```\n- a", "@13 E",
+                "```\nx\n```\n- a\n- ", 16, 16, 1);
+        /* Empty item / quote: leave the container. */
+        md_case(T("enter empty item exits"), "md", rich, "- a\n- ", "@6 E", "- a\n", 4, 4, 1);
+        md_case(T("enter empty nested outdents"), "md", rich, "- a\n  - ", "@8 E",
+                "- a\n- ", 6, 6, 1);
+        md_case(T("enter empty ordered renumbers"), "md", rich, "1. a\n2. \n3. c", "@8 E",
+                "1. a\n\n2. c", 5, 5, 1);
+        md_case(T("enter empty quote exits"), "md", rich, "> a\n> ", "@6 E", "> a\n", 4, 4, 1);
+        md_case(T("enter empty nested quote"), "md", rich, "> > a\n> > ", "@10 E",
+                "> > a\n> ", 8, 8, 1);
+        md_case(T("enter empty task exits"), "md", rich, "- [ ] a\n- [ ] ", "@14 E",
+                "- [ ] a\n", 8, 8, 1);
+        md_case(T("enter twice ends list"), "md", rich, "- a", "@3 E E", "- a\n", 4, 4, 2);
+        /* Soft newline: indent continuation, no marker. */
+        md_case(T("soft item"), "md", rich, "- ab", "@4 S", "- ab\n  ", 7, 7, 1);
+        md_case(T("soft ordered"), "md", rich, "10. ab", "@6 S", "10. ab\n    ", 11, 11, 1);
+        md_case(T("soft quote item"), "md", rich, "> - a", "@5 S", "> - a\n>   ", 10, 10, 1);
+        md_case(T("soft plain"), "md", rich, "ab", "@1 S", "a\nb", 2, 2, 1);
+        /* 2. Tab / Shift-Tab. */
+        md_case(T("tab nests"), "md", rich, "- a\n- b", "@6 T", "- a\n  - b", 8, 8, 1);
+        md_case(T("shift-tab un-nests"), "md", rich, "- a\n  - b", "@8 R", "- a\n- b", 6, 6, 1);
+        md_case(T("tab ordered restarts"), "md", rich, "1. a\n2. b\n3. c", "@9 T",
+                "1. a\n   1. b\n2. c", 12, 12, 1);
+        md_case(T("shift-tab ordered joins"), "md", rich, "1. a\n   1. b\n2. c", "@12 R",
+                "1. a\n2. b\n3. c", 9, 9, 1);
+        md_case(T("tab selection"), "md", rich, "- a\n- b\n- c", "@4 ~11 T",
+                "- a\n  - b\n  - c", 15, 6, 1);
+        md_case(T("tab caret mid item"), "md", rich, "- a\n- bc", "@7 T", "- a\n  - bc", 9, 9, 1);
+        md_case(T("tab first item"), "md", rich, "- a", "@3 T", "  - a", 5, 5, 1);
+        md_case(T("shift-tab top level"), "md", rich, "- a", "@3 R", "- a", 3, 3, 0);
+        md_case(T("tab quote item"), "md", rich, "> - a\n> - b", "@11 T",
+                "> - a\n>   - b", 13, 13, 1);
+        md_case(T("tab plain inserts"), "md", rich, "ab", "@1 T", "a\tb", 2, 2, 1);
+        /* 3. Auto-pairs. */
+        md_case(T("pair bracket link"), "md", rich, "", "'[x] '(u)",
+                "[x](u)", 6, 6, -1);
+        md_case(T("pair paren needs ]"), "md", rich, "", "'(", "(", 1, 1, -1);
+        md_case(T("pair backticks"), "md", rich, "", "'`", "``", 1, 1, 1);
+        md_case(T("pair fence typing"), "md", rich, "", "'```", "```", 3, 3, -1);
+        md_case(T("pair star bold"), "md", rich, "a ", "@2 '**b**", "a **b**", 7, 7, -1);
+        md_case(T("pair star at bol"), "md", rich, "", "'*", "*", 1, 1, 1);
+        md_case(T("pair backspace empty"), "md", rich, "a ", "@2 '[ <", "a ", 2, 2, -1);
+        md_case(T("pair mid word"), "md", rich, "ab", "@1 '\"", "a\"b", 2, 2, 1);
+        md_case(T("pair quote"), "md", rich, "a ", "@2 '\"x\"", "a \"x\"", 5, 5, -1);
+        md_case(T("pair wrap selection"), "md", rich, "x word y", "@2 ~6 '*",
+                "x *word* y", 7, 3, 1);
+        md_case(T("pair wrap twice"), "md", rich, "x word y", "@2 ~6 '* '*",
+                "x **word** y", 8, 4, 2);
+        md_case(T("pair wrap trims"), "md", rich, "x word y", "@2 ~7 '`",
+                "x `word` y", 7, 3, 1);
+        md_case(T("pair wrap lines"), "md", rich, "a\nb", "@0 ~3 '_", "_a_\n_b_", 6, 1, 1);
+        md_case(T("pair off"), "md", rich, "", "A0 '[", "[", 1, 1, 1);
+        md_case(T("pair in fence is code"), "md", rich, "```\n", "@4 'f(", "```\nf()", 6, 6, -1);
+        md_case(T("pair txt none"), "txt", rich, "", "'[(", "[(", 2, 2, -1);
+        md_case(T("pair c paren"), "c", rich, "f", "@1 '()", "f()", 3, 3, -1);
+        md_case(T("pair c brace"), "c", rich, "x ", "@2 '{", "x {}", 3, 3, 1);
+        md_case(T("pair c no pair before word"), "c", rich, "ab", "@0 '(", "(ab", 1, 1, 1);
+        /* 4. Smart paste. */
+        md_case(T("paste url link"), "md", rich, "see here", "@4 ~8 Phttps://x.io",
+                "see [here](https://x.io)", 24, 24, 1);
+        md_case(T("paste url trims sel"), "md", rich, "see here ok", "@3 ~9 Phttps://x.io",
+                "see [here](https://x.io) ok", 24, 24, 1);
+        md_case(T("paste url plain"), "md", rich, "a ", "@2 Phttps://x.io",
+                "a https://x.io", 14, 14, 1);
+        md_case(T("paste text over sel"), "md", rich, "see here", "@4 ~8 Pthere",
+                "see there", 9, 9, 1);
+        md_case(T("paste quote lines"), "md", rich, "> ", "@2 Pa^b", "> a\n> b", 7, 7, 1);
+        md_case(T("paste url in txt"), "txt", rich, "see here", "@4 ~8 Phttps://x.io",
+                "see https://x.io", 16, 16, 1);
+        /* 5. Apply. */
+        md_case(T("apply bold trims"), "md", rich, "x word y", "@1 ~7 !bold",
+                "x **word** y", 8, 4, 1);
+        md_case(T("apply bold lines"), "md", rich, "- a\n- b", "@0 ~7 !bold",
+                "- **a**\n- **b**", 13, 4, 1);
+        md_case(T("apply bold off content"), "md", rich, "x **word** y", "@4 ~8 !bold",
+                "x word y", 6, 2, 1);
+        md_case(T("apply bold off whole"), "md", rich, "x **word** y", "@2 ~10 !bold",
+                "x word y", 6, 2, 1);
+        md_case(T("apply bold off lines"), "md", rich, "**a**\n**b**", "@0 ~11 !bold",
+                "a\nb", 3, 0, 1);
+        md_case(T("apply caret after mark"), "md", rich, "a **b** c", "@7 !bold",
+                "a **b****** c", 9, 9, 1);
+        md_case(T("apply caret inside mark"), "md", rich, "a **b** c", "@5 !bold",
+                "a b c", 3, 2, 1);
+        md_case(T("apply empty pair"), "md", rich, "a ", "@2 !bold", "a ****", 4, 4, 1);
+        md_case(T("apply empty pair toggles"), "md", rich, "a ", "@2 !bold !bold", "a ", 2, 2, 2);
+        md_case(T("apply word"), "md", rich, "ab cd", "@4 !italic", "ab *cd*", 6, 4, 1);
+        md_case(T("apply italic on bold"), "md", rich, "x **w** y", "@4 ~5 !italic",
+                "x ***w*** y", 6, 5, 1);
+        md_case(T("apply code off"), "md", rich, "a `c` b", "@3 ~4 !code", "a c b", 3, 2, 1);
+        md_case(T("apply link trims"), "md", rich, "x ab y", "@1 ~5 !link", "x [ab]() y", 7, 7, 1);
+        /* 6. Table commands. */
+        md_case(T("table col delete"), "md", rich, TBL, "@22 K5",
+                "| B |\n|---|\n| y |\n", 14, 14, 1);
+        md_case(T("table col right"), "md", rich, TBL, "@22 K4",
+                "| A |  | B |\n|---|---|---|\n| x |  | y |\n", 33, 33, 1);
+        md_case(T("table col left"), "md", rich, TBL, "@22 K3",
+                "|  | A | B |\n|---|---|---|\n|  | x | y |\n", 29, 29, 1);
+        md_case(T("table col move right"), "md", rich, TBL, "@22 K7",
+                "| B | A |\n|---|---|\n| y | x |\n", 26, 26, 1);
+        md_case(T("table col move left at 0"), "md", rich, TBL, "@22 K6", TBL, 22, 22, 0);
+        md_case(T("table col move left"), "md", rich, TBL, "@26 K6",
+                "| B | A |\n|---|---|\n| y | x |\n", 22, 22, 1);
+        md_case(T("table row below"), "md", rich, TBL, "@22 K1",
+                "| A | B |\n|---|---|\n| x | y |\n|  |  |\n", 32, 32, 1);
+        md_case(T("table row above"), "md", rich, TBL, "@22 K0",
+                "| A | B |\n|---|---|\n|  |  |\n| x | y |\n", 22, 22, 1);
+        md_case(T("table row from header"), "md", rich, TBL, "@2 K0",
+                "| A | B |\n|---|---|\n|  |  |\n| x | y |\n", 22, 22, 1);
+        md_case(T("table row delete"), "md", rich, TBL, "@22 K2",
+                "| A | B |\n|---|---|\n", 20, 20, 1);
+        md_case(T("table row delete last no nl"), "md", rich,
+                "| A |\n|---|\n| x |\n| y |", "@20 K2", "| A |\n|---|\n| x |", 12, 12, 1);
+        md_case(T("table header row delete no-op"), "md", rich, TBL, "@2 K2", TBL, 2, 2, 0);
+        md_case(T("table col delete last col no-op"), "md", rich,
+                "| A |\n|---|\n| x |\n", "@14 K5", "| A |\n|---|\n| x |\n", 14, 14, 0);
+        md_case(T("table not in table"), "md", rich, "text\n", "@2 K5", "text\n", 2, 2, 0);
+#undef T
+    }
+    if (fails) {
+        fprintf(stderr, "md_edit_smoke: %d failure(s) in %d cases\n", fails, cases);
+        return 1;
+    }
+    printf("md_edit_smoke ok  %d cases\n", cases);
+    return 0;
+}

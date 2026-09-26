@@ -1,0 +1,710 @@
+#!ccc ccs
+/*
+ * cctext presentation mode (docs/slides.md): the current slide of a Marp
+ * deck, centred in a box sized to the deck's aspect (a cell is about
+ * twice as tall as it is wide), rendered from the slide's lines
+ * (core/slides.cch): headings bold, lists with their markers, code with
+ * the grammar's colours on a dark band, tables in columns, a placeholder
+ * for images, header / footer / page number. Build steps hide their
+ * lines (the space stays, as in Marp). Transitions are a wipe or a
+ * horizontal move of cell columns; a fade has no terminal form.
+ *
+ * Paint goes into a cell grid, then one CUP + row + EL per screen row, so
+ * the frame diff (cctext_draw.ccs) sends only the rows that changed.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/nav_pair.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+#include "../core/slides.cch"
+
+void cctext_draw_present(RtxUi *ui, RtxBuf *act, int rows, int cols);
+
+enum {
+    TP_BOLD = 1,
+    TP_ITAL = 2,
+    TP_UL = 4,
+    TP_STRIKE = 8,
+    TP_DIM = 16
+};
+
+typedef struct {
+    char s[16];            /* one cluster, sanitized ("" = the right half of
+                            * a wide cluster) */
+    unsigned char n;
+    unsigned char attr;    /* TP_* */
+    unsigned char wide;    /* a two-column cluster (the next cell is n == 0) */
+    short fg, bg;          /* xterm-256 index, -1 = terminal default */
+} TpCell;
+
+typedef struct {
+    int rows, cols;
+    TpCell *c;
+} TpGrid;
+
+static int tp_256(uint32_t rgb) {
+    int r = (int)((rgb >> 16) & 255), g = (int)((rgb >> 8) & 255), b = (int)(rgb & 255);
+    int ri = r < 48 ? 0 : r < 115 ? 1 : (r - 35) / 40;
+    int gi = g < 48 ? 0 : g < 115 ? 1 : (g - 35) / 40;
+    int bi = b < 48 ? 0 : b < 115 ? 1 : (b - 35) / 40;
+    int cube = 16 + 36 * ri + 6 * gi + bi;
+    /* A grey ramp step when the channels agree. */
+    if (r == g && g == b) {
+        if (r < 8) return 16;
+        if (r > 248) return 231;
+        return 232 + (r - 8) / 10;
+    }
+    return cube;
+}
+
+static TpCell *tp_at(TpGrid *G, int y, int x) {
+    if (!G || !G->c || y < 0 || x < 0 || y >= G->rows || x >= G->cols) return NULL;
+    return &G->c[(size_t)y * (size_t)G->cols + (size_t)x];
+}
+
+static void tp_clear(TpGrid *G) {
+    size_t i, n = (size_t)G->rows * (size_t)G->cols;
+    for (i = 0; i < n; i++) {
+        G->c[i].s[0] = ' ';
+        G->c[i].n = 1;
+        G->c[i].attr = 0;
+        G->c[i].wide = 0;
+        G->c[i].fg = -1;
+        G->c[i].bg = -1;
+    }
+}
+
+static void tp_fill(TpGrid *G, int y0, int x0, int h, int w, short bg) {
+    int y, x;
+    for (y = y0; y < y0 + h; y++) {
+        for (x = x0; x < x0 + w; x++) {
+            TpCell *c = tp_at(G, y, x);
+            if (!c) continue;
+            c->s[0] = ' ';
+            c->n = 1;
+            c->attr = 0;
+            c->wide = 0;
+            c->bg = bg;
+        }
+    }
+}
+
+/* Put one UTF-8 string (sanitized, whole clusters) at (y, x), clipped to
+ * [x, xmax). Returns the columns used. */
+static int tp_put(TpGrid *G, int y, int x, int xmax, const char *s, size_t n,
+                  short fg, unsigned char attr) {
+    size_t i = 0;
+    int x0 = x;
+    char[:] b = cc_slice_from_buffer((char *)s, n);
+    while (i < n && x < xmax) {
+        RtxUtf8Cl cl = rtx_utf8_cluster(b, i);
+        size_t step = cl.n ? cl.n : 1;
+        int w = rtx_utf8_term_cols(cl.cp, cl.cols);
+        TpCell *c = tp_at(G, y, x);
+        char tmp[16];
+        int k;
+        if (w < 1) w = 1;
+        if (x + w > xmax) break;
+        k = rtx_utf8_term_put(cl.cp, s + i, step, tmp, sizeof tmp);
+        if (k <= 0) {
+            i += step;
+            continue;
+        }
+        if (c) {
+            memcpy(c->s, tmp, (size_t)k);
+            c->n = (unsigned char)k;
+            c->attr = attr;
+            c->wide = w == 2;
+            c->fg = fg;
+        }
+        if (w == 2) {
+            TpCell *c2 = tp_at(G, y, x + 1);
+            if (c2) {
+                c2->n = 0;
+                c2->wide = 0;
+                c2->attr = attr;
+                c2->fg = fg;
+            }
+        }
+        x += w;
+        i += step;
+    }
+    return x - x0;
+}
+
+static int tp_cols(const char *s, size_t n) {
+    size_t i = 0;
+    int w = 0;
+    char[:] b = cc_slice_from_buffer((char *)s, n);
+    while (i < n) {
+        RtxUtf8Cl cl = rtx_utf8_cluster(b, i);
+        w += rtx_utf8_term_cols(cl.cp, cl.cols) > 0 ? rtx_utf8_term_cols(cl.cp, cl.cols) : 1;
+        i += cl.n ? cl.n : 1;
+    }
+    return w;
+}
+
+/* One styled cluster of a line, for wrapping. */
+typedef struct {
+    const char *p;
+    unsigned char n;
+    unsigned char w;
+    unsigned char attr;
+    unsigned char sp;      /* a space: a break point */
+    short fg;
+} TpCh;
+
+#define TP_LINE_MAX 2048
+
+typedef struct {
+    RtxSlideTheme th;
+    short fg, head, accent, dim, bg, code_bg;
+} TpPal;
+
+/* Clusters of line `l` (cell `cell` only when >= 0). */
+static int tp_chars(const RtxSlideView *v, const RtxSlLine *l, int cell, const TpPal *P,
+                    short base_fg, unsigned char base_attr, int code, TpCh *out, int cap) {
+    unsigned g;
+    int n = 0;
+    for (g = l->seg0; g < l->seg0 + l->nseg && g < v->ns; g++) {
+        const RtxSlSeg *s = &v->segs[g];
+        size_t a, z, i;
+        short fg = base_fg;
+        unsigned char attr = base_attr;
+        char[:] b;
+        if (cell >= 0 && s->cell != cell) continue;
+        if (s->lo < v->base || s->hi > v->base + v->tlen) continue;
+        a = s->lo - v->base;
+        z = s->hi - v->base;
+        if (code) {
+            RtxThemeColor c = rtx_theme_color(s->st.scope);
+            if (s->st.scope) fg = (short)tp_256(((uint32_t)c.r << 16) | ((uint32_t)c.g << 8) | c.b);
+        } else {
+            if (s->st.bold) attr |= TP_BOLD;
+            if (s->st.italic) attr |= TP_ITAL;
+            if (s->st.strike) attr |= TP_STRIKE;
+            if (s->st.mono) fg = P->accent;
+            if (s->link) {
+                fg = P->accent;
+                attr |= TP_UL;
+            }
+        }
+        b = cc_slice_from_buffer(v->text, v->tlen);
+        i = a;
+        while (i < z && n < cap) {
+            RtxUtf8Cl cl = rtx_utf8_cluster(b, i);
+            size_t step = cl.n ? cl.n : 1;
+            int w = rtx_utf8_term_cols(cl.cp, cl.cols);
+            if (i + step > z) step = z - i;
+            out[n].p = v->text + i;
+            out[n].n = (unsigned char)(step > 15 ? 15 : step);
+            out[n].w = (unsigned char)(w < 1 ? 1 : w > 2 ? 2 : w);
+            out[n].attr = attr;
+            out[n].fg = fg;
+            out[n].sp = v->text[i] == ' ' || v->text[i] == '\t';
+            n++;
+            i += step;
+        }
+    }
+    return n;
+}
+
+/* Wrap clusters into [x0, x1) from row *y (a continuation starts at xc).
+ * Only rows in [ytop, ybot) are drawn; `draw` 0 only counts. Returns the
+ * widest row. */
+static int tp_flow(TpGrid *G, const TpCh *ch, int n, int x0, int xc, int x1, int *y,
+                   int ytop, int ybot, int draw, int center) {
+    int i = 0, widest = 0;
+    int first = 1;
+    if (n == 0) {
+        (*y)++;
+        return 0;
+    }
+    while (i < n) {
+        int xs = first ? x0 : xc;
+        int width = x1 - xs, used = 0, j = i, brk = -1, end;
+        if (width < 4) width = 4;
+        while (j < n && used + ch[j].w <= width) {
+            if (ch[j].sp) brk = j;
+            used += ch[j].w;
+            j++;
+        }
+        end = j;
+        if (j < n && brk > i) end = brk; /* break at the last space */
+        if (end == i) end = i + 1;
+        {
+            int k, w = 0, x;
+            for (k = i; k < end; k++) w += ch[k].w;
+            while (w > 0 && end > i && ch[end - 1].sp) {
+                w -= ch[end - 1].w;
+                end--;
+            }
+            if (w > widest) widest = w;
+            x = xs + (center && width > w ? (width - w) / 2 : 0);
+            if (draw && *y >= ytop && *y < ybot) {
+                for (k = i; k < end; k++) {
+                    tp_put(G, *y, x, x1, ch[k].p, ch[k].n, ch[k].fg, ch[k].attr);
+                    x += ch[k].w;
+                }
+            }
+        }
+        (*y)++;
+        i = end;
+        while (i < n && ch[i].sp) i++;
+        first = 0;
+    }
+    return widest;
+}
+
+typedef struct {
+    int x0, x1, y0, y1;    /* content area */
+} TpArea;
+
+/* Lay the slide's lines out; `draw` 0 measures the height. */
+static int tp_layout(TpGrid *G, const RtxSlideView *v, const TpPal *P, TpArea A,
+                     int step, int draw, int center, int ystart) {
+    static TpCh ch[TP_LINE_MAX];
+    size_t li = 0;
+    int y = ystart;
+    while (li < v->nl) {
+        const RtxSlLine *l = &v->lines[li];
+        int hidden = l->frag > step;
+        int dr = draw && !hidden;
+        int qx = A.x0 + 2 * l->quote;
+        if (l->quote && dr) {
+            int q;
+            for (q = 0; q < l->quote; q++)
+                tp_put(G, y, A.x0 + 2 * q, A.x1, "\xe2\x94\x82", 3, P->dim, 0);
+        }
+        switch (l->kind) {
+        case RTX_SL_BLANK:
+            y++;
+            li++;
+            break;
+        case RTX_SL_HEAD: {
+            unsigned char at = TP_BOLD;
+            int n;
+            if (l->level == 1) at |= TP_UL;
+            n = tp_chars(v, l, -1, P, l->level <= 2 ? P->head : P->fg, at, 0, ch, TP_LINE_MAX);
+            tp_flow(G, ch, n, qx, qx, A.x1, &y, A.y0, A.y1, dr, center);
+            li++;
+            break;
+        }
+        case RTX_SL_PARA: {
+            int x = qx + 2 * l->indent;
+            int n = tp_chars(v, l, -1, P, P->fg, 0, 0, ch, TP_LINE_MAX);
+            tp_flow(G, ch, n, x, x, A.x1, &y, A.y0, A.y1, dr, center);
+            li++;
+            break;
+        }
+        case RTX_SL_ITEM: {
+            int x = qx + 2 * (l->level - 1);
+            int mw = tp_cols(l->marker, strlen(l->marker));
+            int n = tp_chars(v, l, -1, P, P->fg, 0, 0, ch, TP_LINE_MAX);
+            if (dr && y >= A.y0 && y < A.y1)
+                tp_put(G, y, x, A.x1, l->marker, strlen(l->marker), P->accent, TP_BOLD);
+            tp_flow(G, ch, n, x + mw + 1, x + mw + 1, A.x1, &y, A.y0, A.y1, dr, 0);
+            li++;
+            break;
+        }
+        case RTX_SL_CODE: {
+            /* The run of code lines is one dark band, clipped, no wrap. */
+            size_t e = li;
+            while (e < v->nl && v->lines[e].kind == RTX_SL_CODE) e++;
+            for (; li < e; li++) {
+                const RtxSlLine *c = &v->lines[li];
+                int n;
+                if (draw && c->frag <= step && y >= A.y0 && y < A.y1) {
+                    int k, x = qx + 1;
+                    tp_fill(G, y, qx, 1, A.x1 - qx, P->code_bg);
+                    n = tp_chars(v, c, -1, P, (short)tp_256(0xd8dee9), 0, 1, ch, TP_LINE_MAX);
+                    for (k = 0; k < n; k++) {
+                        TpCell *cell;
+                        tp_put(G, y, x, A.x1 - 1, ch[k].p, ch[k].n, ch[k].fg, 0);
+                        cell = tp_at(G, y, x);
+                        if (cell) cell->bg = P->code_bg;
+                        if (ch[k].w == 2 && (cell = tp_at(G, y, x + 1))) cell->bg = P->code_bg;
+                        x += ch[k].w;
+                    }
+                }
+                y++;
+            }
+            break;
+        }
+        case RTX_SL_ROW: {
+            /* The run of rows is a table: widths from every cell. */
+            size_t e = li, r;
+            int wcol[16], nc = 0, c, total = 0, avail = A.x1 - qx;
+            memset(wcol, 0, sizeof wcol);
+            while (e < v->nl && v->lines[e].kind == RTX_SL_ROW) e++;
+            for (r = li; r < e; r++) {
+                const RtxSlLine *t = &v->lines[r];
+                if (t->ncells > nc) nc = t->ncells > 16 ? 16 : t->ncells;
+                for (c = 0; c < t->ncells && c < 16; c++) {
+                    int n = tp_chars(v, t, c, P, P->fg, 0, 0, ch, TP_LINE_MAX), k, w = 0;
+                    for (k = 0; k < n; k++) w += ch[k].w;
+                    if (w > wcol[c]) wcol[c] = w;
+                }
+            }
+            for (c = 0; c < nc; c++) total += wcol[c] + (c ? 3 : 0);
+            while (total > avail && nc > 0) {
+                int big = 0;
+                for (c = 1; c < nc; c++)
+                    if (wcol[c] > wcol[big]) big = c;
+                if (wcol[big] <= 3) break;
+                wcol[big]--;
+                total--;
+            }
+            for (r = li; r < e; r++) {
+                const RtxSlLine *t = &v->lines[r];
+                int x = qx + (center && avail > total ? (avail - total) / 2 : 0);
+                if (draw && t->frag <= step && y >= A.y0 && y < A.y1) {
+                    for (c = 0; c < nc; c++) {
+                        int n = tp_chars(v, t, c, P, t->header ? P->head : P->fg,
+                                         t->header ? TP_BOLD : 0, 0, ch, TP_LINE_MAX);
+                        int k, w = 0, pad = 0, xx;
+                        for (k = 0; k < n; k++) w += ch[k].w;
+                        if (w < wcol[c]) {
+                            int al = c < 16 ? v->talign[c] : 0;
+                            pad = al == RTX_MD_ALIGN_RIGHT ? wcol[c] - w
+                                : al == RTX_MD_ALIGN_CENTER ? (wcol[c] - w) / 2 : 0;
+                        }
+                        if (c) {
+                            tp_put(G, y, x, A.x1, " \xe2\x94\x82 ", 5, P->dim, 0);
+                            x += 3;
+                        }
+                        xx = x + pad;
+                        for (k = 0; k < n && xx + ch[k].w <= x + wcol[c]; k++) {
+                            tp_put(G, y, xx, A.x1, ch[k].p, ch[k].n, ch[k].fg, ch[k].attr);
+                            xx += ch[k].w;
+                        }
+                        x += wcol[c];
+                    }
+                }
+                y++;
+                if (t->header) {
+                    if (draw && t->frag <= step && y >= A.y0 && y < A.y1) {
+                        int x2 = qx + (center && avail > total ? (avail - total) / 2 : 0);
+                        for (c = 0; c < nc; c++) {
+                            int k;
+                            if (c) {
+                                tp_put(G, y, x2, A.x1, "\xe2\x94\x80\xe2\x94\xbc\xe2\x94\x80", 9,
+                                       P->dim, 0);
+                                x2 += 3;
+                            }
+                            for (k = 0; k < wcol[c]; k++)
+                                tp_put(G, y, x2 + k, A.x1, "\xe2\x94\x80", 3, P->dim, 0);
+                            x2 += wcol[c];
+                        }
+                    }
+                    y++;
+                }
+            }
+            li = e;
+            break;
+        }
+        case RTX_SL_HR: {
+            if (dr && y >= A.y0 && y < A.y1) {
+                int x;
+                for (x = qx; x < A.x1; x++) tp_put(G, y, x, A.x1, "\xe2\x94\x80", 3, P->dim, 0);
+            }
+            y++;
+            li++;
+            break;
+        }
+        case RTX_SL_IMAGE: {
+            char buf[256];
+            size_t k = 0;
+            const RtxSlSeg *alt = l->nseg > 0 ? &v->segs[l->seg0] : NULL;
+            const RtxSlSeg *src = l->nseg > 1 ? &v->segs[l->seg0 + 1] : NULL;
+            k = (size_t)snprintf(buf, sizeof buf, "[image %.*s]",
+                                 src ? (int)(src->hi - src->lo) : 0,
+                                 src ? v->text + (src->lo - v->base) : "");
+            (void)alt;
+            if (k >= sizeof buf) k = sizeof buf - 1;
+            if (dr && y >= A.y0 && y < A.y1) {
+                int w = tp_cols(buf, k);
+                int x = qx + (center && A.x1 - qx > w ? (A.x1 - qx - w) / 2 : 0);
+                tp_put(G, y, x, A.x1, buf, k, P->dim, TP_ITAL);
+            }
+            y++;
+            li++;
+            break;
+        }
+        default:
+            y++;
+            li++;
+            break;
+        }
+    }
+    return y - ystart;
+}
+
+/* Slide box: the deck's aspect in cells (a cell ~1:2), centred. */
+static void tp_box(const RtxDeck *k, int rows, int cols, int *bx, int *by, int *bw, int *bh) {
+    int w = cols - 2, h;
+    double aspect = k && k->h ? (double)k->w / (double)k->h : 16.0 / 9.0;
+    if (w < 20) w = cols;
+    h = (int)((double)w / (aspect * 2.0) + 0.5);
+    if (h > rows - 1) {
+        h = rows - 1;
+        w = (int)((double)h * aspect * 2.0 + 0.5);
+        if (w > cols) w = cols;
+    }
+    if (h < 5) h = rows > 5 ? 5 : rows;
+    *bw = w;
+    *bh = h;
+    *bx = (cols - w) / 2;
+    *by = (rows - 1 - h) / 2;
+    if (*by < 0) *by = 0;
+}
+
+static RtxSlideView g_tpv[2];
+
+static const RtxSlideView *tp_view(RtxDoc *d, int slot, int slide) {
+    RtxSlideView *v = &g_tpv[slot];
+    if (v->text && v->slide == slide && v->gen == d->edit_gen) return v;
+    if (!rtx_slide_view(d, slide, v)) return NULL;
+    return v;
+}
+
+/* Paint slide `s` at `step` into the box of grid G. */
+static void tp_slide(TpGrid *G, RtxDoc *d, const RtxDeck *k, int slot, int s, int step,
+                     int bx, int by, int bw, int bh) {
+    const RtxSlideView *v = tp_view(d, slot, s);
+    const RtxSlide *sl;
+    TpPal P;
+    TpArea A;
+    int y, x;
+    if (!k || s < 0 || (size_t)s >= k->n) return;
+    sl = &k->s[s];
+    P.th = rtx_slide_theme(k, sl);
+    P.fg = (short)tp_256(P.th.fg);
+    P.head = (short)tp_256(P.th.head);
+    P.accent = (short)tp_256(P.th.accent);
+    P.dim = (short)tp_256(P.th.dim);
+    P.bg = (short)tp_256(P.th.bg);
+    P.code_bg = (short)tp_256(0x1f2430);
+    tp_fill(G, by, bx, bh, bw, P.bg);
+    /* Frame. */
+    for (x = bx + 1; x < bx + bw - 1; x++) {
+        tp_put(G, by, x, bx + bw, "\xe2\x94\x80", 3, P.dim, 0);
+        tp_put(G, by + bh - 1, x, bx + bw, "\xe2\x94\x80", 3, P.dim, 0);
+    }
+    for (y = by + 1; y < by + bh - 1; y++) {
+        tp_put(G, y, bx, bx + bw, "\xe2\x94\x82", 3, P.dim, 0);
+        tp_put(G, y, bx + bw - 1, bx + bw, "\xe2\x94\x82", 3, P.dim, 0);
+    }
+    tp_put(G, by, bx, bx + bw, "\xe2\x94\x8c", 3, P.dim, 0);
+    tp_put(G, by, bx + bw - 1, bx + bw, "\xe2\x94\x90", 3, P.dim, 0);
+    tp_put(G, by + bh - 1, bx, bx + bw, "\xe2\x94\x94", 3, P.dim, 0);
+    tp_put(G, by + bh - 1, bx + bw - 1, bx + bw, "\xe2\x94\x98", 3, P.dim, 0);
+    A.x0 = bx + 3;
+    A.x1 = bx + bw - 3;
+    A.y0 = by + 2;
+    A.y1 = by + bh - 2;
+    if (sl->dir.header[0])
+        tp_put(G, by + 1, bx + 2, bx + bw - 2, sl->dir.header, strlen(sl->dir.header), P.dim, 0);
+    if (sl->dir.footer[0])
+        tp_put(G, by + bh - 2, bx + 2, bx + bw - 8, sl->dir.footer, strlen(sl->dir.footer),
+               P.dim, 0);
+    if (sl->dir.paginate == 1 || sl->dir.paginate == 2) {
+        char pg[16];
+        int n = snprintf(pg, sizeof pg, "%d", sl->page);
+        if (n > 0) tp_put(G, by + bh - 2, bx + bw - 3 - n, bx + bw - 2, pg, (size_t)n, P.dim, 0);
+    }
+    /* Background image: a hatched side (split) or a note (whole slide). */
+    if (sl->nbg) {
+        char lab[160];
+        size_t sn = sl->bg_src_hi > sl->bg_src_lo ? sl->bg_src_hi - sl->bg_src_lo : 0;
+        char src[128];
+        int ln;
+        if (sn >= sizeof src) sn = sizeof src - 1;
+        src[0] = 0;
+        if (sn) {
+            char tmp[128];
+            size_t got = RtxDoc_read_at(d, sl->bg_src_lo, cc_slice_from_buffer(tmp, sn)) !>(e) {
+                (void)e;
+                @ok((size_t)0);
+            };
+            memcpy(src, tmp, got);
+            src[got] = 0;
+        }
+        ln = snprintf(lab, sizeof lab, "[bg %s]", src);
+        if (ln < 0) ln = 0;
+        if ((size_t)ln >= sizeof lab) ln = (int)sizeof lab - 1;
+        if (sl->bg_side) {
+            int iw = (bw - 2) * sl->bg_pct / 100;
+            int ix = sl->bg_side == 1 ? bx + 1 : bx + bw - 1 - iw;
+            for (y = by + 1; y < by + bh - 1; y++)
+                for (x = ix; x < ix + iw; x++) tp_put(G, y, x, ix + iw, "\xe2\x96\x91", 3, P.dim, 0);
+            tp_put(G, by + bh / 2, ix + (iw > ln ? (iw - ln) / 2 : 0), ix + iw, lab, (size_t)ln,
+                   P.fg, TP_ITAL);
+            if (sl->bg_side == 1) A.x0 = ix + iw + 2;
+            else A.x1 = ix - 2;
+        } else {
+            tp_put(G, by + 1, bx + bw - 2 - ln, bx + bw - 1, lab, (size_t)ln, P.dim, TP_ITAL);
+        }
+    }
+    if (!v) return;
+    {
+        int center = P.th.center;
+        int ytop = A.y0;
+        if (center) {
+            int h = tp_layout(G, v, &P, A, step, 0, center, 0);
+            if (h < A.y1 - A.y0) ytop = A.y0 + (A.y1 - A.y0 - h) / 2;
+        }
+        tp_layout(G, v, &P, A, step, 1, center, ytop);
+    }
+}
+
+static void tp_emit(const TpGrid *G, int rows, int cols) {
+    int y, x;
+    for (y = 0; y < rows && y < G->rows; y++) {
+        int cf = -2, cb = -2, ca = -1;
+        fprintf(stdout, "\x1b[%d;1H\x1b[0m", y + 1);
+        for (x = 0; x < cols && x < G->cols; x++) {
+            const TpCell *c = &G->c[(size_t)y * (size_t)G->cols + (size_t)x];
+            if (c->n == 0) continue; /* right half of a wide cluster */
+            if (c->fg != cf || c->bg != cb || c->attr != ca) {
+                fputs("\x1b[0", stdout);
+                if (c->attr & TP_BOLD) fputs(";1", stdout);
+                if (c->attr & TP_ITAL) fputs(";3", stdout);
+                if (c->attr & TP_UL) fputs(";4", stdout);
+                if (c->attr & TP_STRIKE) fputs(";9", stdout);
+                if (c->fg >= 0) fprintf(stdout, ";38;5;%d", c->fg);
+                if (c->bg >= 0) fprintf(stdout, ";48;5;%d", c->bg);
+                fputc('m', stdout);
+                cf = c->fg;
+                cb = c->bg;
+                ca = c->attr;
+            }
+            fwrite(c->s, 1, c->n, stdout);
+        }
+        fputs("\x1b[0m\x1b[K", stdout);
+    }
+}
+
+/* Composite the transition into T from A (old) and B (new): box columns
+ * [bx, bx + bw) of rows [by, by + bh). */
+static void tp_mix(TpGrid *T, const TpGrid *A, const TpGrid *B, int tr, int dir, double p,
+                   int bx, int by, int bw, int bh) {
+    int y, x, o = (int)(p * (double)bw + 0.5);
+    for (y = by; y < by + bh; y++) {
+        for (x = 0; x < bw; x++) {
+            const TpCell *src = NULL;
+            int u;
+            switch (tr) {
+            case RTX_TR_SLIDE:
+            case RTX_TR_PUSH:
+                if (dir > 0) {
+                    u = x + o;
+                    src = u < bw ? tp_at((TpGrid *)A, y, bx + u) : tp_at((TpGrid *)B, y, bx + u - bw);
+                } else {
+                    u = x + bw - o;
+                    src = u < bw ? tp_at((TpGrid *)B, y, bx + u) : tp_at((TpGrid *)A, y, bx + u - bw);
+                }
+                break;
+            case RTX_TR_COVER:
+                if (dir > 0) src = x >= bw - o ? tp_at((TpGrid *)B, y, bx + x - (bw - o))
+                                               : tp_at((TpGrid *)A, y, bx + x);
+                else src = x < o ? tp_at((TpGrid *)B, y, bx + x + (bw - o))
+                                 : tp_at((TpGrid *)A, y, bx + x);
+                break;
+            case RTX_TR_REVEAL:
+                if (dir > 0) src = x + o < bw ? tp_at((TpGrid *)A, y, bx + x + o)
+                                              : tp_at((TpGrid *)B, y, bx + x);
+                else src = x - o >= 0 ? tp_at((TpGrid *)A, y, bx + x - o)
+                                      : tp_at((TpGrid *)B, y, bx + x);
+                break;
+            default: /* wipe: fades and the rest have no cell form */
+                if (dir > 0) src = x < o ? tp_at((TpGrid *)B, y, bx + x) : tp_at((TpGrid *)A, y, bx + x);
+                else src = x >= bw - o ? tp_at((TpGrid *)B, y, bx + x) : tp_at((TpGrid *)A, y, bx + x);
+                break;
+            }
+            if (src) {
+                TpCell *dst = tp_at(T, y, bx + x);
+                if (dst) *dst = *src;
+            }
+        }
+        /* A wide cluster cut in half by the move reads as a space. */
+        for (x = 0; x < bw; x++) {
+            TpCell *c = tp_at(T, y, bx + x);
+            TpCell *nx = x + 1 < bw ? tp_at(T, y, bx + x + 1) : NULL;
+            TpCell *pv = x > 0 ? tp_at(T, y, bx + x - 1) : NULL;
+            if (!c) continue;
+            if ((c->n == 0 && (!pv || !pv->wide)) || (c->wide && (!nx || nx->n != 0))) {
+                c->s[0] = ' ';
+                c->n = 1;
+                c->wide = 0;
+            }
+        }
+    }
+}
+
+static TpGrid g_tg[3];
+
+static int tp_grid(TpGrid *G, int rows, int cols) {
+    if (G->rows != rows || G->cols != cols || !G->c) {
+        free(G->c);
+        G->c = (TpCell *)calloc((size_t)rows * (size_t)cols, sizeof(TpCell));
+        if (!G->c) {
+            G->rows = G->cols = 0;
+            return 0;
+        }
+        G->rows = rows;
+        G->cols = cols;
+    }
+    tp_clear(G);
+    return 1;
+}
+
+void cctext_draw_present(RtxUi *ui, RtxBuf *act, int rows, int cols) {
+    RtxPresent *p = rtx_present();
+    const RtxDeck *k;
+    RtxDoc *d;
+    int bx, by, bw, bh;
+    long now = rtx_ui_now_ms();
+    (void)ui;
+    if (!act || rows < 1 || cols < 1) return;
+    d = &act->doc;
+    k = rtx_deck_for(d);
+    if (!tp_grid(&g_tg[0], rows, cols)) return;
+    if (!k || !k->n) {
+        tp_put(&g_tg[0], 0, 0, cols, "not a Marp deck", 15, -1, 0);
+        tp_emit(&g_tg[0], rows, cols);
+        return;
+    }
+    if ((size_t)p->slide >= k->n) p->slide = (int)k->n - 1;
+    tp_box(k, rows, cols, &bx, &by, &bw, &bh);
+    if (p->tr && p->tr != RTX_TR_FRAG && p->from_slide != p->slide &&
+        tp_grid(&g_tg[1], rows, cols) && tp_grid(&g_tg[2], rows, cols)) {
+        double t = rtx_ease(rtx_present_t(p, now));
+        tp_slide(&g_tg[1], d, k, 1, p->from_slide, p->from_step, bx, by, bw, bh);
+        tp_slide(&g_tg[2], d, k, 0, p->slide, p->step, bx, by, bw, bh);
+        memcpy(g_tg[0].c, g_tg[2].c, (size_t)rows * (size_t)cols * sizeof(TpCell));
+        tp_mix(&g_tg[0], &g_tg[1], &g_tg[2], p->tr, p->dir, t, bx, by, bw, bh);
+        p->frames++;
+    } else {
+        tp_slide(&g_tg[0], d, k, 0, p->slide, p->step, bx, by, bw, bh);
+    }
+    {
+        /* Bottom row: position and keys (the status row of the editor). */
+        char st[160];
+        int n = snprintf(st, sizeof st, " slide %d/%zu%s%s  step %d/%d  %s%s  ->/Space next  <- back  N Enter go  Esc exit",
+                         p->slide + 1, k->n, k->complete ? "" : "+", "", p->step,
+                         k->s[p->slide].nfrag, p->num_len ? "go to " : "",
+                         p->num_len ? p->num : "");
+        if (n < 0) n = 0;
+        if ((size_t)n >= sizeof st) n = (int)sizeof st - 1;
+        tp_put(&g_tg[0], rows - 1, 0, cols, st, (size_t)n, 244, 0);
+    }
+    tp_emit(&g_tg[0], rows, cols);
+}

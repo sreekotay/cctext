@@ -1,0 +1,168 @@
+#!ccc ccs
+/*
+ * Regex engine throughput (a perf tool, not a smoke): one thread, the
+ * whole file as one text, every match from offset 0 (eof search).
+ *
+ *   ./bin/rx_perf FILE [PATTERN [FLAGS]]    FLAGS: i (ignore case), l (literal)
+ *   ./bin/rx_perf --compile PATFILE         compile every line (a grammar's
+ *                                           patterns): us per pattern
+ *
+ * With no PATTERN it runs a fixed query list. RESULT lines: ms, MB/s,
+ * matches, best of RTX_PERF_TRIALS (default 3).
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "../core/rx.cch"
+
+static double perf_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+typedef struct {
+    const char *name;
+    const char *pat;
+    const char *fl;
+} PerfQ;
+
+static const PerfQ qs[] = {
+    {"lit_none", "xylophone", "l"},
+    {"lit_exit", "EXIT_FAILURE", "l"},
+    {"icase_exit", "EXIT_failure", "il"},
+    {"icase_rare", "FN_9999(", "il"},
+    {"re_word_pre", "\\bxylo\\w*", ""},
+    {"re_send", "[a-z]+_send\\(", ""},
+    {"re_cc_send", "cc_[a-z]+_send\\(", ""},
+    {"re_alt5", "alpha|bravo|charlie|delta|foxtrot", ""},
+    {"re_alt5_icase", "alpha|bravo|charlie|delta|foxtrot", "i"},
+    {"re_rare_word", "\\bxylo\\w*|\\d{12}", ""},
+    {"re_rare_fn", "fn_99[0-9]9\\(", ""},
+    {NULL, NULL, NULL},
+};
+
+static int run(const char *name, const char *pat, const char *fls, const char *t, size_t n,
+               int trials) {
+    CCArena a = cc_arena_heap(megabytes(1));
+    RtxRxScratch s = {0};
+    RtxRxIn in = {0};
+    unsigned fl = 0;
+    double best = -1.0;
+    size_t hits = 0;
+    int k;
+    RtxRx *rx;
+    if (strchr(fls, 'i')) fl |= RTX_RX_ICASE;
+    if (strchr(fls, 'l')) fl |= RTX_RX_LITERAL;
+    rx = rtx_rx_compile(cc_slice_cstr(pat), fl, a) !>(e) {
+        fprintf(stderr, "rx_perf: %s: %s\n", pat, e.message ? e.message : "?");
+        a.destroy();
+        return 1;
+    };
+    in.s = t;
+    in.n = n;
+    in.gpos = RTX_RX_UNSET;
+    in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+    for (k = 0; k < trials; k++) {
+        size_t p = 0, ms = 0, me = 0;
+        double t0 = perf_ms(), t1;
+        hits = 0;
+        while (p < n) {
+            if (rtx_rx_search(rx, &in, p, n, 1, &s, &ms, &me) != RTX_RX_MATCH) break;
+            hits++;
+            p = me > ms ? me : ms + 1;
+        }
+        t1 = perf_ms();
+        if (best < 0 || t1 - t0 < best) best = t1 - t0;
+    }
+    printf("RESULT op=rx_%s bytes=%zu ms=%.3f MBps=%.0f hits=%zu\n", name, n, best,
+           best > 0 ? (double)n / 1048576.0 / (best / 1000.0) : 0.0, hits);
+    fflush(stdout);
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+    return 0;
+}
+
+static RtxRx *perf_compile(const char *p, CCArena a) {
+    RtxRx *rx = rtx_rx_compile(cc_slice_cstr(p), 0, a) !>(e) {
+        (void)e;
+        return NULL;
+    };
+    return rx;
+}
+
+/* Compile cost: every line of `path` as a pattern, best of trials. */
+static int run_compile(const char *path, int trials) {
+    FILE *f = fopen(path, "rb");
+    static char line[65536];
+    char **pats = NULL;
+    size_t np = 0, cap = 0, k, ok = 0;
+    double best = -1.0;
+    int t;
+    if (!f) {
+        perror(path);
+        return 1;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        size_t l = strlen(line);
+        if (l && line[l - 1] == '\n') line[--l] = 0;
+        if (np == cap) {
+            cap = cap ? cap * 2 : 256;
+            pats = (char **)realloc(pats, sizeof(char *) * cap);
+            if (!pats) return 1;
+        }
+        pats[np] = strdup(line);
+        np++;
+    }
+    fclose(f);
+    for (t = 0; t < trials * 5; t++) {
+        double t0 = perf_ms(), t1;
+        ok = 0;
+        for (k = 0; k < np; k++) {
+            CCArena a = cc_arena_heap(kilobytes(16));
+            if (perf_compile(pats[k], a)) ok++;
+            a.destroy();
+        }
+        t1 = perf_ms();
+        if (best < 0 || t1 - t0 < best) best = t1 - t0;
+    }
+    printf("RESULT op=rx_compile patterns=%zu compiled=%zu ms=%.3f us_per=%.2f\n", np, ok, best,
+           np ? best * 1000.0 / (double)np : 0.0);
+    for (k = 0; k < np; k++) free(pats[k]);
+    free(pats);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    const char *te = getenv("RTX_PERF_TRIALS");
+    int trials = te && te[0] ? atoi(te) : 3;
+    FILE *f;
+    char *t;
+    long sz;
+    size_t n, k;
+    if (argc < 2) {
+        fprintf(stderr, "usage: rx_perf FILE [PATTERN [FLAGS]]\n");
+        return 2;
+    }
+    if (trials < 1) trials = 1;
+    if (!strcmp(argv[1], "--compile")) return argc > 2 ? run_compile(argv[2], trials) : 2;
+    f = fopen(argv[1], "rb");
+    if (!f) {
+        perror(argv[1]);
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    t = (char *)malloc((size_t)sz + 1);
+    if (!t) return 1;
+    n = fread(t, 1, (size_t)sz, f);
+    fclose(f);
+    if (argc > 2) return run("arg", argv[2], argc > 3 ? argv[3] : "", t, n, trials);
+    for (k = 0; qs[k].name; k++) run(qs[k].name, qs[k].pat, qs[k].fl, t, n, trials);
+    free(t);
+    return 0;
+}

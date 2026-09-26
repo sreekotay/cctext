@@ -1,0 +1,4772 @@
+#!ccc ccs
+/*
+ * Regex engine (linked TU; face rx.cch).
+ *
+ * Pipeline: parse → AST (temp arena) → byte program on the caller's
+ * arena. The program is immutable; matchers keep their state in the
+ * caller's RtxRxScratch. Three matchers share one instruction set:
+ *
+ *   Pike VM     linear, priority-ordered threads (leftmost-first), captures.
+ *   Backtracker explicit stack, step budget; the only one that runs
+ *               backrefs, lookaround and atomic groups.
+ *   Lazy DFA    forward (leftmost-first, cut on match) finds the match
+ *               end; reverse (longest) from that end finds the start
+ *               (the RE2 scheme). States are cached per scratch in a
+ *               dense table (state x byte class -> premultiplied next
+ *               state + match / special tags): the hot loop is one load
+ *               per byte, unrolled by 4, and leaves only on a tag.
+ *
+ * Prefilter: compile picks the rarest required literal (set) from the
+ * AST; search finds it with a vector pair filter and hands the DFA /
+ * Pike VM / backtracker a lower bound for the next match start.
+ *
+ * Classes are UTF-8 byte automata: an ASCII-only class is one BYTE / SET
+ * instruction; a class with non-ASCII scalars is one SWITCH on the first
+ * byte (table → out, fail, or the continuation-byte chains).
+ */
+#include <ccc/std/prelude.cch>
+#include <stdlib.h>
+#include <string.h>
+#include <stdatomic.h>
+#include "rx.cch"
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h> /* SSE2 baseline; AVX2 behind a target attribute */
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+void *memmem(const void *hay, size_t hn, const void *nd, size_t nn);
+void *memrchr(const void *s, int c, size_t n);
+
+#define RX_MAX_INSTS (1u << 20)
+#define RX_MAX_REPEAT 100000
+#define RX_MAX_NEST 200
+#define RX_MAX_LOOK 16
+#define RX_MAX_CP 0x10FFFFu
+#define RX_INF (-1)
+#define RX_NAMES 64
+#define RX_DFA_MEM ((size_t)8 << 20) /* per lazy DFA (forward, reverse) */
+#define RX_PF_LITS 8                  /* literals in a prefilter set */
+#define RX_SQ_MAX 64                  /* bytes a prefilter literal keeps */
+#define RX_BT_STACK_MAX ((size_t)1 << 22)
+
+enum {
+    RXO_FAIL = 0,
+    RXO_BYTE,
+    RXO_SET,
+    RXO_SWITCH,
+    RXO_SPLIT,
+    RXO_JMP,
+    RXO_SAVE,
+    RXO_MARK,
+    RXO_CHK,
+    RXO_ASSERT,
+    RXO_BREF,
+    RXO_LOOK,
+    RXO_ATOMIC,
+    RXO_SUCCEED,
+    RXO_MATCH
+};
+
+enum {
+    RXA_BOL = 0,
+    RXA_EOL,
+    RXA_BOT,
+    RXA_EOT,
+    RXA_EOTNL,
+    RXA_WB,
+    RXA_NWB,
+    RXA_GPOS
+};
+
+typedef struct {
+    uint8_t op;
+    uint8_t fl;
+    uint16_t aux;
+    int32_t x;
+    int32_t y;
+    int32_t z;
+} RxInst;
+
+typedef struct {
+    RxInst *ins;
+    uint32_t n;
+    uint8_t *sets;  /* 32 bytes each */
+    uint32_t nsets;
+    int32_t *tabs;  /* 256 entries each: -1 fail, -2 out (x), else pc */
+    uint32_t ntabs;
+    uint32_t start;
+    uint32_t ustart; /* forward: unanchored loop SPLIT; 0 = none */
+    uint32_t uany;   /* forward: the loop's any-byte SET */
+} RxProg;
+
+/* A prefilter literal: m positions, each a byte set (32 bytes). The
+ * vector filter compares the two rarest positions i1 <= i2 against up to
+ * three bytes each (b1 / b2, padded with repeats). */
+typedef struct {
+    uint32_t m;
+    uint8_t i1;
+    uint8_t i2;
+    uint8_t n1;
+    uint8_t n2;
+    uint8_t k;  /* distinct bytes to compare per position (1..3) */
+    uint8_t b1[3];
+    uint8_t b2[3];
+    const uint8_t *set;
+} RxLit;
+
+/* Every match holds one of lit[0..n) starting at most `back` bytes after
+ * the match start (RTX_RX_UNSET: unbounded); `line`: no match crosses a
+ * newline, so it starts on the literal's line. */
+typedef struct {
+    uint32_t n;
+    uint32_t minm;
+    uint32_t maxm;
+    uint32_t span; /* largest compare offset */
+    uint32_t k;    /* most distinct bytes a compare position holds (1..3) */
+    int line;
+    size_t back;
+    RxLit lit[RX_PF_LITS];
+} RxPf;
+
+struct RtxRx {
+    RxProg fwd;
+    RxProg rev;      /* rev.n == 0 when there is no DFA */
+    uint32_t ncap;   /* groups incl. 0 */
+    uint32_t nslot;  /* 2 * ncap + registers */
+    int mode;
+    int dfa;
+    int nullable;
+    int asserts;     /* program has zero-width assertions */
+    int wb;          /* ... among them \b / \B */
+    int cap_loop;    /* captures inside a nullable loop: Onig keeps the last
+                      * (empty) iteration's group; only the backtracker does */
+    uint8_t first[32];
+    uint32_t nfirst;
+    int first_byte;
+    const char *pre; /* required literal prefix */
+    size_t pren;
+    int lit;         /* whole pattern is `pre` */
+    size_t maxlen;
+    uint8_t cls[256];
+    uint32_t ncls;
+    RxPf pf;         /* required-literal prefilter (pf.n == 0: none) */
+    int pf_exact;    /* the whole pattern is pf.lit[0]: a hit is the match */
+    uint32_t id;     /* compile serial (DFA caches key on it) */
+    const char *names; /* named groups: `name\0` runs, on the program arena */
+    const int32_t *name_idx;
+    uint32_t nnames;
+};
+
+/* ---------------------------------------------------------------- stats */
+
+static _Atomic size_t rtx_rx_budget_n;
+static _Atomic uint32_t rtx_rx_serial;
+
+size_t rtx_rx_budget_hits(void) {
+    return atomic_load_explicit(&rtx_rx_budget_n, memory_order_relaxed);
+}
+
+void rtx_rx_note_budget(size_t n) {
+    if (n) atomic_fetch_add_explicit(&rtx_rx_budget_n, n, memory_order_relaxed);
+}
+
+/* ------------------------------------------------------------ utilities */
+
+static void *rx_alloc(CCArena a, size_t n) {
+    void *p;
+    if (n == 0) n = 1;
+    p = cc_arena_alloc(a, n, 8);
+    if (p) memset(p, 0, n);
+    return p;
+}
+
+/* Grow `*p` (elem bytes each) to hold `need`. Old storage stays in the
+ * arena (bump); doubling bounds the waste. */
+static int rx_grow(CCArena a, void **p, uint32_t *cap, uint32_t need, size_t elem) {
+    uint32_t nc;
+    void *q;
+    if (need <= *cap) return 1;
+    nc = *cap ? *cap * 2 : 16;
+    while (nc < need) nc *= 2;
+    q = rx_alloc(a, (size_t)nc * elem);
+    if (!q) return 0;
+    if (*p && *cap) memcpy(q, *p, (size_t)*cap * elem);
+    *p = q;
+    *cap = nc;
+    return 1;
+}
+
+/* ASCII word byte (the DFA's view; non-ASCII is decided per scalar). */
+static int rx_isw(unsigned b) {
+    return (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') ||
+           (b >= 'a' && b <= 'z') || b == '_';
+}
+
+/* Decode one scalar from the pattern. Invalid → *raw = 1, cp = byte. */
+static size_t rx_dec(const unsigned char *p, size_t n, uint32_t *cp, int *raw) {
+    unsigned c = p[0];
+    size_t len, k;
+    uint32_t v;
+    *raw = 0;
+    if (c < 0x80) {
+        *cp = c;
+        return 1;
+    }
+    if (c >= 0xC2 && c <= 0xDF) {
+        len = 2;
+        v = c & 0x1F;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+        len = 3;
+        v = c & 0x0F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        len = 4;
+        v = c & 0x07;
+    } else {
+        *raw = 1;
+        *cp = c;
+        return 1;
+    }
+    if (len > n) {
+        *raw = 1;
+        *cp = c;
+        return 1;
+    }
+    for (k = 1; k < len; k++) {
+        if ((p[k] & 0xC0) != 0x80) {
+            *raw = 1;
+            *cp = c;
+            return 1;
+        }
+        v = (v << 6) | (p[k] & 0x3F);
+    }
+    if ((len == 3 && (v < 0x800 || (v >= 0xD800 && v <= 0xDFFF))) ||
+        (len == 4 && (v < 0x10000 || v > RX_MAX_CP))) {
+        *raw = 1;
+        *cp = c;
+        return 1;
+    }
+    *cp = v;
+    return len;
+}
+
+static int rx_enc(uint32_t cp, uint8_t *b) {
+    if (cp < 0x80) {
+        b[0] = (uint8_t)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        b[0] = (uint8_t)(0xC0 | (cp >> 6));
+        b[1] = (uint8_t)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        b[0] = (uint8_t)(0xE0 | (cp >> 12));
+        b[1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+        b[2] = (uint8_t)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    b[0] = (uint8_t)(0xF0 | (cp >> 18));
+    b[1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+    b[2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+    b[3] = (uint8_t)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+static size_t rx_cplen(uint32_t cp) {
+    if (cp < 0x80) return 1;
+    if (cp < 0x800) return 2;
+    if (cp < 0x10000) return 3;
+    return 4;
+}
+
+uint32_t rtx_rx_fold(uint32_t c) {
+    if (c < 0x41) return c;
+    if (c <= 0x5A) return c + 32;
+    if (c >= 0x61 && c <= 0x7A) return c - 32;
+    if (c < 0xC0) return c;
+    if (c <= 0xDE) return c == 0xD7 ? c : c + 32;
+    if (c >= 0xE0 && c <= 0xFE) return c == 0xF7 ? c : c - 32;
+    if (c == 0xFF) return 0x178;
+    if (c == 0x178) return 0xFF;
+    if (c >= 0x100 && c <= 0x12F) return (c & 1) ? c - 1 : c + 1;
+    if (c >= 0x132 && c <= 0x137) return (c & 1) ? c - 1 : c + 1;
+    if (c >= 0x139 && c <= 0x148) return (c & 1) ? c + 1 : c - 1;
+    if (c >= 0x14A && c <= 0x177) return (c & 1) ? c - 1 : c + 1;
+    if (c >= 0x179 && c <= 0x17E) return (c & 1) ? c + 1 : c - 1;
+    if (c >= 0x391 && c <= 0x3A9) return c == 0x3A2 ? c : c + 32;
+    if (c >= 0x3B1 && c <= 0x3C9) return c == 0x3C2 ? c : c - 32;
+    if (c >= 0x400 && c <= 0x40F) return c + 80;
+    if (c >= 0x410 && c <= 0x42F) return c + 32;
+    if (c >= 0x430 && c <= 0x44F) return c - 32;
+    if (c >= 0x450 && c <= 0x45F) return c - 80;
+    if (c >= 0x531 && c <= 0x556) return c + 48;
+    if (c >= 0x561 && c <= 0x586) return c - 48;
+    return c;
+}
+
+/* ------------------------------------------------------------ range sets */
+
+typedef struct {
+    uint32_t lo;
+    uint32_t hi;
+} RxR;
+
+typedef struct {
+    RxR *r;
+    uint32_t n;
+    uint32_t cap;
+} RxSet;
+
+static int rx_set_add(CCArena a, RxSet *s, uint32_t lo, uint32_t hi) {
+    if (lo > hi) return 1;
+    if (!rx_grow(a, (void **)&s->r, &s->cap, s->n + 1, sizeof(RxR))) return 0;
+    s->r[s->n].lo = lo;
+    s->r[s->n].hi = hi;
+    s->n++;
+    return 1;
+}
+
+static int rx_r_cmp(const void *pa, const void *pb) {
+    const RxR *a = (const RxR *)pa;
+    const RxR *b = (const RxR *)pb;
+    if (a->lo != b->lo) return a->lo < b->lo ? -1 : 1;
+    if (a->hi != b->hi) return a->hi < b->hi ? -1 : 1;
+    return 0;
+}
+
+static void rx_set_norm(RxSet *s) {
+    uint32_t i, o;
+    if (s->n < 2) return;
+    qsort(s->r, s->n, sizeof(RxR), rx_r_cmp);
+    o = 0;
+    for (i = 1; i < s->n; i++) {
+        if (s->r[i].lo <= s->r[o].hi + 1 || s->r[o].hi == RX_MAX_CP) {
+            if (s->r[i].hi > s->r[o].hi) s->r[o].hi = s->r[i].hi;
+        } else {
+            s->r[++o] = s->r[i];
+        }
+    }
+    s->n = o + 1;
+}
+
+static int rx_set_union(CCArena a, RxSet *d, const RxSet *s) {
+    uint32_t i;
+    for (i = 0; i < s->n; i++)
+        if (!rx_set_add(a, d, s->r[i].lo, s->r[i].hi)) return 0;
+    rx_set_norm(d);
+    return 1;
+}
+
+static int rx_set_neg(CCArena a, RxSet *s) {
+    RxSet o = {0};
+    uint32_t i, prev = 0;
+    rx_set_norm(s);
+    for (i = 0; i < s->n; i++) {
+        if (s->r[i].lo > prev && !rx_set_add(a, &o, prev, s->r[i].lo - 1)) return 0;
+        if (s->r[i].hi >= RX_MAX_CP) {
+            prev = RX_MAX_CP + 1;
+            break;
+        }
+        prev = s->r[i].hi + 1;
+    }
+    if (prev <= RX_MAX_CP && !rx_set_add(a, &o, prev, RX_MAX_CP)) return 0;
+    *s = o;
+    return 1;
+}
+
+static int rx_set_inter(CCArena a, RxSet *d, RxSet *x, RxSet *y) {
+    RxSet o = {0};
+    uint32_t i = 0, j = 0;
+    rx_set_norm(x);
+    rx_set_norm(y);
+    while (i < x->n && j < y->n) {
+        uint32_t lo = x->r[i].lo > y->r[j].lo ? x->r[i].lo : y->r[j].lo;
+        uint32_t hi = x->r[i].hi < y->r[j].hi ? x->r[i].hi : y->r[j].hi;
+        if (lo <= hi && !rx_set_add(a, &o, lo, hi)) return 0;
+        if (x->r[i].hi < y->r[j].hi) i++;
+        else j++;
+    }
+    *d = o;
+    return 1;
+}
+
+static int rx_set_fold(CCArena a, RxSet *s) {
+    uint32_t i, n = s->n, cp;
+    for (i = 0; i < n; i++) {
+        uint32_t lo = s->r[i].lo < 0x41 ? 0x41 : s->r[i].lo;
+        uint32_t hi = s->r[i].hi > 0x586 ? 0x586 : s->r[i].hi;
+        for (cp = lo; cp <= hi; cp++) {
+            uint32_t f = rtx_rx_fold(cp);
+            if (f != cp && !rx_set_add(a, s, f, f)) return 0;
+        }
+    }
+    rx_set_norm(s);
+    return 1;
+}
+
+static int rx_set_has(const RxSet *s, uint32_t cp) {
+    uint32_t i;
+    for (i = 0; i < s->n; i++)
+        if (cp >= s->r[i].lo && cp <= s->r[i].hi) return 1;
+    return 0;
+}
+
+/* Unicode spaces beyond ASCII (\s, rtx_utf8_space_cp). */
+static const uint32_t rx_space_hi[] = {
+    0x85, 0x85, 0xA0, 0xA0, 0x1680, 0x1680, 0x2000, 0x200A, 0x2028, 0x2029,
+    0x202F, 0x202F, 0x205F, 0x205F, 0x3000, 0x3000,
+};
+
+/* Non-word scalars >= U+0080: C1 controls, spaces, and the punctuation /
+ * symbol blocks (dashes, quotes, math, arrows, box drawing, shapes,
+ * dingbats, CJK punctuation, fullwidth punctuation, emoji, private use).
+ * Everything else — letters, marks, digits of any script — is word.
+ * Sorted, disjoint (lo, hi) pairs. An approximation of Onig's
+ * Letter | Mark | Nd | Pc without a general-category table. */
+static const uint32_t rx_nonword_hi[] = {
+    0x80,    0xA9,    0xAB,    0xB1,    0xB4,    0xB4,    0xB6,    0xB8,
+    0xBB,    0xBB,    0xBF,    0xBF,    0xD7,    0xD7,    0xF7,    0xF7,
+    0x37E,   0x37E,   0x387,   0x387,   0x55A,   0x55F,   0x589,   0x58A,
+    0x5BE,   0x5BE,   0x5C0,   0x5C0,   0x5C3,   0x5C3,   0x5C6,   0x5C6,
+    0x5F3,   0x5F4,   0x60C,   0x60D,   0x61B,   0x61B,   0x61F,   0x61F,
+    0x66A,   0x66D,   0x6D4,   0x6D4,   0x964,   0x965,   0xE3F,   0xE3F,
+    0xE4F,   0xE4F,   0xE5A,   0xE5B,   0x1680,  0x1680,  0x2000,  0x203E,
+    0x2041,  0x2053,  0x2055,  0x206F,  0x20A0,  0x20CF,  0x2190,  0x245F,
+    0x2460,  0x24FF,  0x2500,  0x2BFF,  0x2E00,  0x2E7F,  0x3000,  0x3004,
+    0x3008,  0x3020,  0x3030,  0x3030,  0x303D,  0x303F,  0x30FB,  0x30FB,
+    0xE000,  0xF8FF,  0xFD3E,  0xFD3F,  0xFE10,  0xFE1F,  0xFE30,  0xFE32,
+    0xFE35,  0xFE4C,  0xFE50,  0xFE6F,  0xFF01,  0xFF0F,  0xFF1A,  0xFF20,
+    0xFF3B,  0xFF3E,  0xFF40,  0xFF40,  0xFF5B,  0xFF65,  0xFFF0,  0xFFFF,
+    0x1F000, 0x1FAFF, 0xF0000, 0x10FFFF,
+};
+
+static int rx_set_tab(CCArena a, RxSet *s, const uint32_t *t, size_t n) {
+    size_t i;
+    for (i = 0; i + 1 < n; i += 2)
+        if (!rx_set_add(a, s, t[i], t[i + 1])) return 0;
+    return 1;
+}
+
+static int rx_set_word(CCArena a, RxSet *s) {
+    RxSet nw = {0};
+    if (!rx_set_add(a, s, '0', '9') || !rx_set_add(a, s, 'A', 'Z') ||
+        !rx_set_add(a, s, '_', '_') || !rx_set_add(a, s, 'a', 'z'))
+        return 0;
+    if (!rx_set_tab(a, &nw, rx_nonword_hi,
+                    sizeof(rx_nonword_hi) / sizeof(rx_nonword_hi[0])))
+        return 0;
+    if (!rx_set_add(a, &nw, 0, 0x7F)) return 0;
+    if (!rx_set_neg(a, &nw)) return 0;
+    return rx_set_union(a, s, &nw);
+}
+
+static int rx_set_space(CCArena a, RxSet *s) {
+    if (!rx_set_add(a, s, 0x09, 0x0D) || !rx_set_add(a, s, ' ', ' ')) return 0;
+    if (!rx_set_tab(a, s, rx_space_hi, sizeof(rx_space_hi) / sizeof(rx_space_hi[0])))
+        return 0;
+    rx_set_norm(s);
+    return 1;
+}
+
+/* \d \D \w \W \s \S \h \H into s (normalized). */
+static int rx_set_esc(CCArena a, int e, RxSet *s) {
+    int neg = (e >= 'A' && e <= 'Z');
+    int k = neg ? e + 32 : e;
+    *s = (RxSet){0};
+    if (k == 'd') {
+        if (!rx_set_add(a, s, '0', '9')) return 0;
+    } else if (k == 'w') {
+        if (!rx_set_word(a, s)) return 0;
+    } else if (k == 's') {
+        if (!rx_set_space(a, s)) return 0;
+    } else if (k == 'h') {
+        if (!rx_set_add(a, s, '0', '9') || !rx_set_add(a, s, 'A', 'F') ||
+            !rx_set_add(a, s, 'a', 'f'))
+            return 0;
+    } else {
+        return 0;
+    }
+    rx_set_norm(s);
+    if (neg && !rx_set_neg(a, s)) return 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------------ AST */
+
+enum {
+    RXN_EMPTY = 0,
+    RXN_SET,    /* scalar set (fl bit0: single case-sensitive literal) */
+    RXN_BYTE,   /* raw byte range a..b (invalid UTF-8 in the pattern) */
+    RXN_CAT,
+    RXN_ALT,
+    RXN_REP,    /* a = min, b = max (RX_INF), fl 0 greedy 1 lazy 2 possessive */
+    RXN_GROUP,  /* a = capture index (>= 1) */
+    RXN_ASSERT, /* aux = RXA_* */
+    RXN_BREF,   /* a = group; fl bit0 icase, bit1 extref */
+    RXN_LOOK,   /* fl bit0 behind, bit1 negative */
+    RXN_ATOMIC
+};
+
+typedef struct RxNode RxNode;
+struct RxNode {
+    uint8_t k;
+    uint8_t fl;
+    uint16_t aux;
+    int32_t a;
+    int32_t b;
+    RxSet set;
+    RxNode **kid;
+    uint32_t nk;
+    uint32_t capk;
+};
+
+typedef struct {
+    const char *s;
+    uint32_t n;
+    int32_t idx;
+} RxName;
+
+typedef struct {
+    const unsigned char *p;
+    size_t n;
+    size_t i;
+    CCArena a;
+    unsigned fl;
+    int32_t ncap;
+    int named;      /* pattern has named groups: plain ( ) does not capture */
+    int extref;
+    RxName names[RX_NAMES];
+    int nnames;
+    const char *err;
+    int depth;
+    int look;
+    int bt;
+    int dfa_no;     /* \G or \Z present */
+    int asserts;
+    int wb;         /* \b or \B present */
+    int32_t maxref;
+} RxP;
+
+static RxNode *rx_node(RxP *P, int k) {
+    RxNode *n = (RxNode *)rx_alloc(P->a, sizeof(RxNode));
+    if (!n) {
+        P->err = "out of memory";
+        return NULL;
+    }
+    n->k = (uint8_t)k;
+    return n;
+}
+
+static int rx_kid(RxP *P, RxNode *n, RxNode *k) {
+    if (!rx_grow(P->a, (void **)&n->kid, &n->capk, n->nk + 1, sizeof(RxNode *))) {
+        P->err = "out of memory";
+        return 0;
+    }
+    n->kid[n->nk++] = k;
+    return 1;
+}
+
+static RxNode *rx_wrap(RxP *P, int k, RxNode *child) {
+    RxNode *n = rx_node(P, k);
+    if (!n || !rx_kid(P, n, child)) return NULL;
+    return n;
+}
+
+static RxNode *rx_set_node(RxP *P, RxSet *s) {
+    RxNode *n = rx_node(P, RXN_SET);
+    if (!n) return NULL;
+    rx_set_norm(s);
+    n->set = *s;
+    return n;
+}
+
+static RxNode *rx_lit(RxP *P, uint32_t cp) {
+    RxSet s = {0};
+    RxNode *n;
+    if (!rx_set_add(P->a, &s, cp, cp)) goto oom;
+    if ((P->fl & RTX_RX_ICASE) && rtx_rx_fold(cp) != cp) {
+        if (!rx_set_fold(P->a, &s)) goto oom;
+    }
+    n = rx_set_node(P, &s);
+    if (n && s.n == 1 && s.r[0].lo == s.r[0].hi) n->fl = 1;
+    return n;
+oom:
+    P->err = "out of memory";
+    return NULL;
+}
+
+static RxNode *rx_raw_byte(RxP *P, uint32_t b) {
+    RxNode *n = rx_node(P, RXN_BYTE);
+    if (!n) return NULL;
+    n->a = (int32_t)b;
+    n->b = (int32_t)b;
+    n->fl = 1;
+    return n;
+}
+
+static RxNode *rx_assert(RxP *P, int kind) {
+    RxNode *n = rx_node(P, RXN_ASSERT);
+    if (!n) return NULL;
+    n->aux = (uint16_t)kind;
+    P->asserts = 1;
+    if (kind == RXA_WB || kind == RXA_NWB) P->wb = 1;
+    if (kind == RXA_GPOS || kind == RXA_EOTNL) P->dfa_no = 1;
+    return n;
+}
+
+static void rx_skip_ext(RxP *P) {
+    if (!(P->fl & RTX_RX_EXTENDED)) return;
+    while (P->i < P->n) {
+        unsigned c = P->p[P->i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
+            c == '\v') {
+            P->i++;
+            continue;
+        }
+        if (c == '#') {
+            while (P->i < P->n && P->p[P->i] != '\n') P->i++;
+            continue;
+        }
+        break;
+    }
+}
+
+static int rx_hexv(unsigned c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A' + 10);
+    return -1;
+}
+
+/* Scalar escapes shared by atoms and classes. `c` is the letter after
+ * the backslash (already consumed). 1 = *cp set; 0 = not a scalar
+ * escape; -1 = error (P->err). */
+static int rx_esc_scalar(RxP *P, unsigned c, uint32_t *cp) {
+    switch (c) {
+    case 'n': *cp = 10; return 1;
+    case 't': *cp = 9; return 1;
+    case 'r': *cp = 13; return 1;
+    case 'f': *cp = 12; return 1;
+    case 'v': *cp = 11; return 1;
+    case 'a': *cp = 7; return 1;
+    case 'e': *cp = 27; return 1;
+    case 'x': {
+        uint32_t v = 0;
+        int k = 0, d;
+        if (P->i < P->n && P->p[P->i] == '{') {
+            P->i++;
+            while (P->i < P->n && (d = rx_hexv(P->p[P->i])) >= 0 && k < 8) {
+                v = v * 16 + (uint32_t)d;
+                P->i++;
+                k++;
+            }
+            if (!k || P->i >= P->n || P->p[P->i] != '}' || v > RX_MAX_CP) {
+                P->err = "invalid code point value";
+                return -1;
+            }
+            P->i++;
+            *cp = v;
+            return 1;
+        }
+        while (k < 2 && P->i < P->n && (d = rx_hexv(P->p[P->i])) >= 0) {
+            v = v * 16 + (uint32_t)d;
+            P->i++;
+            k++;
+        }
+        *cp = v;
+        return 1;
+    }
+    case 'u': {
+        uint32_t v = 0;
+        int k, d;
+        for (k = 0; k < 4; k++) {
+            if (P->i >= P->n || (d = rx_hexv(P->p[P->i])) < 0) {
+                P->err = "invalid Unicode escape";
+                return -1;
+            }
+            v = v * 16 + (uint32_t)d;
+            P->i++;
+        }
+        *cp = v;
+        return 1;
+    }
+    case '0': {
+        uint32_t v = 0;
+        int k = 0;
+        while (k < 2 && P->i < P->n && P->p[P->i] >= '0' && P->p[P->i] <= '7') {
+            v = v * 8 + (uint32_t)(P->p[P->i] - '0');
+            P->i++;
+            k++;
+        }
+        *cp = v;
+        return 1;
+    }
+    case 'c':
+        if (P->i >= P->n) {
+            P->err = "end pattern at control";
+            return -1;
+        }
+        *cp = (uint32_t)(P->p[P->i++] & 0x1F);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int rx_posix(RxP *P, RxSet *s, int *done) {
+    /* P->i at "[:" */
+    size_t j = P->i + 2, st;
+    int neg = 0;
+    char name[16];
+    size_t k = 0;
+    RxSet t = {0};
+    CCArena a = P->a;
+    *done = 0;
+    if (j < P->n && P->p[j] == '^') {
+        neg = 1;
+        j++;
+    }
+    st = j;
+    while (j < P->n && P->p[j] >= 'a' && P->p[j] <= 'z' && k < sizeof(name) - 1)
+        name[k++] = (char)P->p[j++];
+    name[k] = 0;
+    if (j + 1 >= P->n || P->p[j] != ':' || P->p[j + 1] != ']' || j == st) return 1;
+    if (!strcmp(name, "alpha") || !strcmp(name, "alnum") || !strcmp(name, "word")) {
+        if (!rx_set_word(a, &t)) goto oom;
+        if (!strcmp(name, "alpha")) {
+            RxSet dg = {0};
+            if (!rx_set_add(a, &dg, '0', '9') || !rx_set_add(a, &dg, '_', '_') ||
+                !rx_set_neg(a, &dg) || !rx_set_inter(a, &t, &t, &dg))
+                goto oom;
+        } else if (!strcmp(name, "alnum")) {
+            RxSet us = {0};
+            if (!rx_set_add(a, &us, '_', '_') || !rx_set_neg(a, &us) ||
+                !rx_set_inter(a, &t, &t, &us))
+                goto oom;
+        }
+    } else if (!strcmp(name, "digit")) {
+        if (!rx_set_add(a, &t, '0', '9')) goto oom;
+    } else if (!strcmp(name, "xdigit")) {
+        if (!rx_set_esc(a, 'h', &t)) goto oom;
+    } else if (!strcmp(name, "upper")) {
+        if (!rx_set_add(a, &t, 'A', 'Z')) goto oom;
+        if ((P->fl & RTX_RX_ICASE) && !rx_set_add(a, &t, 'a', 'z')) goto oom;
+    } else if (!strcmp(name, "lower")) {
+        if (!rx_set_add(a, &t, 'a', 'z')) goto oom;
+        if ((P->fl & RTX_RX_ICASE) && !rx_set_add(a, &t, 'A', 'Z')) goto oom;
+    } else if (!strcmp(name, "space")) {
+        if (!rx_set_space(a, &t)) goto oom;
+    } else if (!strcmp(name, "blank")) {
+        if (!rx_set_add(a, &t, ' ', ' ') || !rx_set_add(a, &t, '\t', '\t')) goto oom;
+    } else if (!strcmp(name, "cntrl")) {
+        if (!rx_set_add(a, &t, 0, 0x1F) || !rx_set_add(a, &t, 0x7F, 0x7F)) goto oom;
+    } else if (!strcmp(name, "punct")) {
+        if (!rx_set_add(a, &t, '!', '/') || !rx_set_add(a, &t, ':', '@') ||
+            !rx_set_add(a, &t, '[', '`') || !rx_set_add(a, &t, '{', '~'))
+            goto oom;
+    } else if (!strcmp(name, "graph") || !strcmp(name, "print")) {
+        RxSet sp = {0};
+        if (!rx_set_space(a, &sp) || !rx_set_add(a, &sp, 0, 0x1F) ||
+            !rx_set_add(a, &sp, 0x7F, 0x9F) || !rx_set_neg(a, &sp))
+            goto oom;
+        t = sp;
+        if (!strcmp(name, "print") && !rx_set_add(a, &t, ' ', ' ')) goto oom;
+    } else if (!strcmp(name, "ascii")) {
+        if (!rx_set_add(a, &t, 0, 0x7F)) goto oom;
+    } else {
+        P->err = "invalid POSIX bracket type";
+        return 0;
+    }
+    rx_set_norm(&t);
+    if (neg && !rx_set_neg(a, &t)) goto oom;
+    if (!rx_set_union(a, s, &t)) goto oom;
+    P->i = j + 2;
+    *done = 1;
+    return 1;
+oom:
+    P->err = "out of memory";
+    return 0;
+}
+
+static int rx_class_body(RxP *P, RxSet *s, int first);
+
+/* P->i at '['. Result is normalized, folded, and negated as written. */
+static int rx_parse_class(RxP *P, RxSet *out) {
+    int neg = 0;
+    RxSet s = {0};
+    if (++P->depth > RX_MAX_NEST) {
+        P->err = "char-class nested too deep";
+        return 0;
+    }
+    P->i++;
+    if (P->i < P->n && P->p[P->i] == '^') {
+        neg = 1;
+        P->i++;
+    }
+    if (!rx_class_body(P, &s, 1)) return 0;
+    if ((P->fl & RTX_RX_ICASE) && !rx_set_fold(P->a, &s)) {
+        P->err = "out of memory";
+        return 0;
+    }
+    rx_set_norm(&s);
+    if (neg && !rx_set_neg(P->a, &s)) {
+        P->err = "out of memory";
+        return 0;
+    }
+    P->depth--;
+    *out = s;
+    return 1;
+}
+
+/* One class item: a scalar (*isset = 0) or a set (*isset = 1, into *st). */
+static int rx_class_item(RxP *P, uint32_t *cp, int *isset, RxSet *st) {
+    unsigned c = P->p[P->i];
+    *isset = 0;
+    if (c == '\\') {
+        int r;
+        P->i++;
+        if (P->i >= P->n) {
+            P->err = "end pattern at escape";
+            return 0;
+        }
+        c = P->p[P->i++];
+        if (c == 'd' || c == 'D' || c == 'w' || c == 'W' || c == 's' ||
+            c == 'S' || c == 'h' || c == 'H') {
+            if (!rx_set_esc(P->a, (int)c, st)) {
+                P->err = "out of memory";
+                return 0;
+            }
+            *isset = 1;
+            return 1;
+        }
+        if (c == 'b') {
+            *cp = 8;
+            return 1;
+        }
+        r = rx_esc_scalar(P, c, cp);
+        if (r < 0) return 0;
+        if (r > 0) return 1;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9')) {
+            P->err = "unknown escape in char-class";
+            return 0;
+        }
+        if (c >= 0x80) {
+            int raw;
+            P->i--;
+            P->i += rx_dec(P->p + P->i, P->n - P->i, cp, &raw);
+            return 1;
+        }
+        *cp = c;
+        return 1;
+    }
+    {
+        int raw;
+        P->i += rx_dec(P->p + P->i, P->n - P->i, cp, &raw);
+    }
+    return 1;
+}
+
+static int rx_class_body(RxP *P, RxSet *s, int first) {
+    for (;;) {
+        unsigned c;
+        uint32_t lo, hi;
+        int isset;
+        RxSet st = {0};
+        if (P->i >= P->n) {
+            P->err = "premature end of char-class";
+            return 0;
+        }
+        c = P->p[P->i];
+        if (c == ']' && !first) {
+            P->i++;
+            return 1;
+        }
+        first = 0;
+        if (c == '[') {
+            if (P->i + 1 < P->n && P->p[P->i + 1] == ':') {
+                int done = 0;
+                if (!rx_posix(P, s, &done)) return 0;
+                if (done) continue;
+            }
+            if (!rx_parse_class(P, &st)) return 0;
+            if (!rx_set_union(P->a, s, &st)) goto oom;
+            continue;
+        }
+        if (c == '&' && P->i + 1 < P->n && P->p[P->i + 1] == '&') {
+            RxSet rest = {0};
+            P->i += 2;
+            if (!rx_class_body(P, &rest, 0)) return 0;
+            if (s->n == 0) {
+                if (!rx_set_add(P->a, s, 0, RX_MAX_CP)) goto oom;
+            }
+            if (!rx_set_inter(P->a, s, s, &rest)) goto oom;
+            return 1;
+        }
+        if (!rx_class_item(P, &lo, &isset, &st)) return 0;
+        if (isset) {
+            if (!rx_set_union(P->a, s, &st)) goto oom;
+            continue;
+        }
+        if (P->i + 1 < P->n && P->p[P->i] == '-' && P->p[P->i + 1] != ']') {
+            P->i++;
+            if (!rx_class_item(P, &hi, &isset, &st)) return 0;
+            if (isset) {
+                P->err = "char-class value at end of range";
+                return 0;
+            }
+            if (hi < lo) {
+                P->err = "empty range in char class";
+                return 0;
+            }
+            if (!rx_set_add(P->a, s, lo, hi)) goto oom;
+        } else {
+            if (!rx_set_add(P->a, s, lo, lo)) goto oom;
+        }
+    }
+oom:
+    P->err = "out of memory";
+    return 0;
+}
+
+static RxNode *rx_parse_alt(RxP *P);
+
+static int rx_name_get(RxP *P, char close, const char **s, uint32_t *n) {
+    size_t st = P->i;
+    while (P->i < P->n && P->p[P->i] != (unsigned char)close) {
+        unsigned c = P->p[P->i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' || c >= 0x80)) {
+            P->err = "invalid group name";
+            return 0;
+        }
+        P->i++;
+    }
+    if (P->i >= P->n || P->i == st) {
+        P->err = "invalid group name";
+        return 0;
+    }
+    *s = (const char *)P->p + st;
+    *n = (uint32_t)(P->i - st);
+    P->i++; /* close */
+    return 1;
+}
+
+static int32_t rx_name_find(RxP *P, const char *s, uint32_t n) {
+    int k;
+    for (k = P->nnames; k > 0; k--) {
+        if (P->names[k - 1].n == n && !memcmp(P->names[k - 1].s, s, n))
+            return P->names[k - 1].idx;
+    }
+    return -1;
+}
+
+static RxNode *rx_group_body(RxP *P, int kind, int32_t cap, unsigned fl) {
+    unsigned saved = P->fl;
+    RxNode *body, *n;
+    if (++P->depth > RX_MAX_NEST) {
+        P->err = "group nested too deep";
+        return NULL;
+    }
+    P->fl = fl;
+    body = rx_parse_alt(P);
+    P->fl = saved;
+    if (!body) return NULL;
+    if (P->i >= P->n || P->p[P->i] != ')') {
+        P->err = "end pattern with unmatched parenthesis";
+        return NULL;
+    }
+    P->i++;
+    P->depth--;
+    if (kind == RXN_EMPTY) return body; /* (?:…) */
+    n = rx_wrap(P, kind, body);
+    if (n) n->a = cap;
+    return n;
+}
+
+static RxNode *rx_parse_group(RxP *P, int *skip) {
+    unsigned c;
+    P->i++; /* '(' */
+    if (P->i < P->n && P->p[P->i] == '?') {
+        P->i++;
+        if (P->i >= P->n) {
+            P->err = "end pattern in group";
+            return NULL;
+        }
+        c = P->p[P->i];
+        if (c == '#') {
+            while (P->i < P->n && P->p[P->i] != ')') P->i++;
+            if (P->i >= P->n) {
+                P->err = "end pattern in group";
+                return NULL;
+            }
+            P->i++;
+            *skip = 1;
+            return NULL;
+        }
+        if (c == ':') {
+            P->i++;
+            return rx_group_body(P, RXN_EMPTY, 0, P->fl);
+        }
+        if (c == '>') {
+            P->i++;
+            P->bt = 1;
+            return rx_group_body(P, RXN_ATOMIC, 0, P->fl);
+        }
+        if (c == '=' || c == '!' ||
+            (c == '<' && P->i + 1 < P->n &&
+             (P->p[P->i + 1] == '=' || P->p[P->i + 1] == '!'))) {
+            RxNode *n;
+            int behind = (c == '<');
+            int neg;
+            if (behind) P->i++;
+            neg = P->p[P->i] == '!';
+            P->i++;
+            if (++P->look > RX_MAX_LOOK) {
+                P->err = "look-around nested too deep";
+                return NULL;
+            }
+            P->bt = 1;
+            n = rx_group_body(P, RXN_LOOK, 0, P->fl);
+            P->look--;
+            if (n) n->fl = (uint8_t)((behind ? 1 : 0) | (neg ? 2 : 0));
+            return n;
+        }
+        if (c == '<' || c == '\'' || (c == 'P' && P->i + 1 < P->n && P->p[P->i + 1] == '<')) {
+            const char *nm;
+            uint32_t nn;
+            int32_t idx;
+            if (c == 'P') P->i++;
+            P->i++;
+            if (!rx_name_get(P, c == '\'' ? '\'' : '>', &nm, &nn)) return NULL;
+            idx = ++P->ncap;
+            if (P->nnames < RX_NAMES) {
+                P->names[P->nnames].s = nm;
+                P->names[P->nnames].n = nn;
+                P->names[P->nnames].idx = idx;
+                P->nnames++;
+            }
+            return rx_group_body(P, RXN_GROUP, idx, P->fl);
+        }
+        {
+            unsigned on = 0, off = 0;
+            int neg = 0;
+            while (P->i < P->n) {
+                unsigned f = 0;
+                c = P->p[P->i];
+                if (c == '-') {
+                    neg = 1;
+                    P->i++;
+                    continue;
+                }
+                if (c == 'i') f = RTX_RX_ICASE;
+                else if (c == 'm') f = RTX_RX_DOTALL;
+                else if (c == 's') f = RTX_RX_DOTALL;
+                else if (c == 'x') f = RTX_RX_EXTENDED;
+                else break;
+                if (neg) off |= f;
+                else on |= f;
+                P->i++;
+            }
+            if (P->i < P->n && P->p[P->i] == ')') {
+                P->i++;
+                P->fl = (P->fl | on) & ~off;
+                *skip = 1;
+                return NULL;
+            }
+            if (P->i < P->n && P->p[P->i] == ':') {
+                P->i++;
+                return rx_group_body(P, RXN_EMPTY, 0, (P->fl | on) & ~off);
+            }
+            P->err = "undefined group option";
+            return NULL;
+        }
+    }
+    if (P->named) return rx_group_body(P, RXN_EMPTY, 0, P->fl);
+    {
+        int32_t idx = ++P->ncap;
+        return rx_group_body(P, RXN_GROUP, idx, P->fl);
+    }
+}
+
+static RxNode *rx_bref(RxP *P, int32_t g, int ext) {
+    RxNode *n = rx_node(P, RXN_BREF);
+    if (!n) return NULL;
+    n->a = g;
+    n->fl = (uint8_t)(((P->fl & RTX_RX_ICASE) ? 1 : 0) | (ext ? 2 : 0));
+    P->bt = 1;
+    if (!ext && g > P->maxref) P->maxref = g;
+    return n;
+}
+
+static RxNode *rx_parse_escape(RxP *P) {
+    unsigned c;
+    uint32_t cp;
+    int r;
+    P->i++;
+    if (P->i >= P->n) {
+        P->err = "end pattern at escape";
+        return NULL;
+    }
+    c = P->p[P->i++];
+    switch (c) {
+    case 'A': return rx_assert(P, RXA_BOT);
+    case 'z': return rx_assert(P, RXA_EOT);
+    case 'Z': return rx_assert(P, RXA_EOTNL);
+    case 'G': return rx_assert(P, RXA_GPOS);
+    case 'b': return rx_assert(P, RXA_WB);
+    case 'B': return rx_assert(P, RXA_NWB);
+    case 'd': case 'D': case 'w': case 'W':
+    case 's': case 'S': case 'h': case 'H': {
+        RxSet s = {0};
+        if (!rx_set_esc(P->a, (int)c, &s)) {
+            P->err = "out of memory";
+            return NULL;
+        }
+        return rx_set_node(P, &s);
+    }
+    case 'R': {
+        /* \r\n | [\n\v\f\r\x85  ] (first-match: CRLF first) */
+        RxNode *alt = rx_node(P, RXN_ALT);
+        RxNode *crlf = rx_node(P, RXN_CAT);
+        RxSet s = {0};
+        if (!alt || !crlf) return NULL;
+        if (!rx_kid(P, crlf, rx_lit(P, 13)) || !rx_kid(P, crlf, rx_lit(P, 10)))
+            return NULL;
+        if (!rx_set_add(P->a, &s, 10, 13) || !rx_set_add(P->a, &s, 0x85, 0x85) ||
+            !rx_set_add(P->a, &s, 0x2028, 0x2029)) {
+            P->err = "out of memory";
+            return NULL;
+        }
+        if (!rx_kid(P, alt, crlf) || !rx_kid(P, alt, rx_set_node(P, &s))) return NULL;
+        return alt;
+    }
+    case 'k': {
+        const char *nm;
+        uint32_t nn;
+        int32_t g = -1;
+        char close;
+        if (P->i >= P->n || (P->p[P->i] != '<' && P->p[P->i] != '\'')) {
+            P->err = "invalid backref";
+            return NULL;
+        }
+        close = P->p[P->i] == '<' ? '>' : '\'';
+        P->i++;
+        if (P->i < P->n && P->p[P->i] >= '0' && P->p[P->i] <= '9') {
+            g = 0;
+            while (P->i < P->n && P->p[P->i] >= '0' && P->p[P->i] <= '9') {
+                g = g * 10 + (int32_t)(P->p[P->i] - '0');
+                if (g > 1000) break;
+                P->i++;
+            }
+            if (P->i >= P->n || P->p[P->i] != (unsigned char)close || g < 1) {
+                P->err = "invalid backref number";
+                return NULL;
+            }
+            P->i++;
+            return rx_bref(P, g, P->extref);
+        }
+        if (!rx_name_get(P, close, &nm, &nn)) return NULL;
+        g = rx_name_find(P, nm, nn);
+        if (g < 0) {
+            P->err = "undefined name reference";
+            return NULL;
+        }
+        return rx_bref(P, g, 0);
+    }
+    case 'K': case 'X': case 'p': case 'P': case 'g':
+    case 'y': case 'Y': case 'Q': case 'E': case 'N': case 'O':
+        P->err = "unsupported escape";
+        return NULL;
+    default:
+        break;
+    }
+    if (c >= '1' && c <= '9') {
+        int32_t g = (int32_t)(c - '0');
+        while (P->i < P->n && P->p[P->i] >= '0' && P->p[P->i] <= '9' && g < 1000) {
+            g = g * 10 + (int32_t)(P->p[P->i] - '0');
+            P->i++;
+        }
+        return rx_bref(P, g, P->extref);
+    }
+    r = rx_esc_scalar(P, c, &cp);
+    if (r < 0) return NULL;
+    if (r > 0) return rx_lit(P, cp);
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+        P->err = "unknown escape";
+        return NULL;
+    }
+    if (c >= 0x80) {
+        int raw;
+        P->i--;
+        P->i += rx_dec(P->p + P->i, P->n - P->i, &cp, &raw);
+        return raw ? rx_raw_byte(P, cp) : rx_lit(P, cp);
+    }
+    return rx_lit(P, c);
+}
+
+/* `{n}` `{n,}` `{,m}` `{n,m}` at P->i. 1 = parsed; 0 = not an interval
+ * (a literal `{`); -1 = error. */
+static int rx_interval(RxP *P, int32_t *mn, int32_t *mx) {
+    size_t j = P->i + 1;
+    int32_t a = -1, b = -1;
+    int comma = 0;
+    while (j < P->n && P->p[j] >= '0' && P->p[j] <= '9') {
+        if (a < 0) a = 0;
+        a = a * 10 + (int32_t)(P->p[j] - '0');
+        if (a > RX_MAX_REPEAT) {
+            P->err = "too big number for repeat range";
+            return -1;
+        }
+        j++;
+    }
+    if (j < P->n && P->p[j] == ',') {
+        comma = 1;
+        j++;
+        while (j < P->n && P->p[j] >= '0' && P->p[j] <= '9') {
+            if (b < 0) b = 0;
+            b = b * 10 + (int32_t)(P->p[j] - '0');
+            if (b > RX_MAX_REPEAT) {
+                P->err = "too big number for repeat range";
+                return -1;
+            }
+            j++;
+        }
+    }
+    if (j >= P->n || P->p[j] != '}') return 0;
+    if (a < 0 && b < 0) return 0;
+    if (!comma) b = a;
+    if (a < 0) a = 0;
+    if (b >= 0 && b < a) {
+        P->err = "upper bound must be greater than lower bound";
+        return -1;
+    }
+    *mn = a;
+    *mx = b; /* -1 = inf */
+    P->i = j + 1;
+    return 1;
+}
+
+static RxNode *rx_parse_quant(RxP *P, RxNode *atom) {
+    for (;;) {
+        unsigned c;
+        int32_t mn, mx;
+        int mode = 0;
+        RxNode *rep;
+        rx_skip_ext(P);
+        if (P->i >= P->n) break;
+        c = P->p[P->i];
+        if (c == '*') {
+            mn = 0;
+            mx = RX_INF;
+            P->i++;
+        } else if (c == '+') {
+            mn = 1;
+            mx = RX_INF;
+            P->i++;
+        } else if (c == '?') {
+            mn = 0;
+            mx = 1;
+            P->i++;
+        } else if (c == '{') {
+            int r = rx_interval(P, &mn, &mx);
+            if (r < 0) return NULL;
+            if (r == 0) break;
+        } else {
+            break;
+        }
+        if (P->i < P->n && P->p[P->i] == '?') {
+            mode = 1;
+            P->i++;
+        } else if (c != '{' && P->i < P->n && P->p[P->i] == '+') {
+            mode = 2;
+            P->i++;
+            P->bt = 1;
+        }
+        rep = rx_wrap(P, RXN_REP, atom);
+        if (!rep) return NULL;
+        rep->a = mn;
+        rep->b = mx;
+        rep->fl = (uint8_t)mode;
+        atom = rep;
+    }
+    return atom;
+}
+
+static RxNode *rx_parse_atom(RxP *P, int *skip) {
+    unsigned c = P->p[P->i];
+    *skip = 0;
+    switch (c) {
+    case '(':
+        return rx_parse_group(P, skip);
+    case '[': {
+        RxSet s = {0};
+        if (!rx_parse_class(P, &s)) return NULL;
+        return rx_set_node(P, &s);
+    }
+    case '.': {
+        RxSet s = {0};
+        P->i++;
+        if (P->fl & RTX_RX_DOTALL) {
+            if (!rx_set_add(P->a, &s, 0, RX_MAX_CP)) goto oom;
+        } else {
+            if (!rx_set_add(P->a, &s, 0, 9) || !rx_set_add(P->a, &s, 11, RX_MAX_CP))
+                goto oom;
+        }
+        return rx_set_node(P, &s);
+    }
+    case '^':
+        P->i++;
+        return rx_assert(P, RXA_BOL);
+    case '$':
+        P->i++;
+        return rx_assert(P, RXA_EOL);
+    case '\\':
+        return rx_parse_escape(P);
+    case '*':
+    case '+':
+    case '?':
+        P->err = "target of repeat operator is not specified";
+        return NULL;
+    case '{': {
+        int32_t mn, mx;
+        size_t save = P->i;
+        int r = rx_interval(P, &mn, &mx);
+        if (r < 0) return NULL;
+        if (r > 0) {
+            P->i = save;
+            P->err = "target of repeat operator is not specified";
+            return NULL;
+        }
+        P->i++;
+        return rx_lit(P, '{');
+    }
+    default: {
+        uint32_t cp;
+        int raw;
+        P->i += rx_dec(P->p + P->i, P->n - P->i, &cp, &raw);
+        return raw ? rx_raw_byte(P, cp) : rx_lit(P, cp);
+    }
+    }
+oom:
+    P->err = "out of memory";
+    return NULL;
+}
+
+static RxNode *rx_parse_cat(RxP *P) {
+    RxNode *cat = rx_node(P, RXN_CAT);
+    if (!cat) return NULL;
+    for (;;) {
+        RxNode *at;
+        int skip = 0;
+        unsigned c;
+        rx_skip_ext(P);
+        if (P->i >= P->n) break;
+        c = P->p[P->i];
+        if (c == '|' || c == ')') break;
+        at = rx_parse_atom(P, &skip);
+        if (P->err) return NULL;
+        if (skip) continue;
+        if (!at) return NULL;
+        at = rx_parse_quant(P, at);
+        if (!at || !rx_kid(P, cat, at)) return NULL;
+    }
+    if (cat->nk == 1) return cat->kid[0];
+    if (cat->nk == 0) cat->k = RXN_EMPTY;
+    return cat;
+}
+
+static RxNode *rx_parse_alt(RxP *P) {
+    RxNode *first = rx_parse_cat(P), *alt;
+    if (!first) return NULL;
+    if (P->i >= P->n || P->p[P->i] != '|') return first;
+    alt = rx_node(P, RXN_ALT);
+    if (!alt || !rx_kid(P, alt, first)) return NULL;
+    while (P->i < P->n && P->p[P->i] == '|') {
+        RxNode *k;
+        P->i++;
+        k = rx_parse_cat(P);
+        if (!k || !rx_kid(P, alt, k)) return NULL;
+    }
+    return alt;
+}
+
+/* Named groups turn plain ( ) into non-capturing (Onig / Ruby). */
+static int rx_has_named(const unsigned char *p, size_t n) {
+    size_t i;
+    int incls = 0;
+    for (i = 0; i + 2 < n; i++) {
+        if (p[i] == '\\') {
+            i++;
+            continue;
+        }
+        if (incls) {
+            if (p[i] == ']') incls = 0;
+            continue;
+        }
+        if (p[i] == '[') {
+            incls = 1;
+            continue;
+        }
+        if (p[i] == '(' && p[i + 1] == '?') {
+            unsigned c = p[i + 2];
+            if (c == '\'') return 1;
+            if (c == 'P' && i + 3 < n && p[i + 3] == '<') return 1;
+            if (c == '<' && i + 3 < n && p[i + 3] != '=' && p[i + 3] != '!') return 1;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------- AST analysis */
+
+static int rx_nullable(const RxNode *n) {
+    uint32_t i;
+    switch (n->k) {
+    case RXN_EMPTY:
+    case RXN_ASSERT:
+    case RXN_LOOK:
+    case RXN_BREF:
+        return 1;
+    case RXN_SET:
+    case RXN_BYTE:
+        return 0;
+    case RXN_CAT:
+        for (i = 0; i < n->nk; i++)
+            if (!rx_nullable(n->kid[i])) return 0;
+        return 1;
+    case RXN_ALT:
+        for (i = 0; i < n->nk; i++)
+            if (rx_nullable(n->kid[i])) return 1;
+        return 0;
+    case RXN_REP:
+        return n->a == 0 || rx_nullable(n->kid[0]);
+    default:
+        return rx_nullable(n->kid[0]);
+    }
+}
+
+/* The empty match of a nullable node is its lowest-priority path. Then an
+ * empty loop iteration exits exactly where the loop's own exit branch
+ * would, and Pike / DFA (dedupe by pc) agree with Onig's empty check.
+ * Otherwise (`(|a)*`, `(a*?)*`) only the backtracker is exact. */
+static int rx_lastnull(const RxNode *n) {
+    uint32_t i;
+    switch (n->k) {
+    case RXN_SET:
+    case RXN_BYTE:
+    case RXN_EMPTY:
+    case RXN_ASSERT:
+    case RXN_LOOK:
+        return 1;
+    case RXN_CAT:
+        for (i = 0; i < n->nk; i++)
+            if (!rx_lastnull(n->kid[i])) return 0;
+        return 1;
+    case RXN_ALT:
+        for (i = 0; i + 1 < n->nk; i++)
+            if (rx_nullable(n->kid[i])) return 0;
+        return n->nk ? rx_lastnull(n->kid[n->nk - 1]) : 1;
+    case RXN_REP:
+        if (n->fl == 1 && rx_nullable(n)) return 0;
+        return rx_lastnull(n->kid[0]);
+    case RXN_GROUP:
+    case RXN_ATOMIC:
+        return rx_lastnull(n->kid[0]);
+    default:
+        return 0;
+    }
+}
+
+static int rx_has_group(const RxNode *n) {
+    uint32_t i;
+    if (n->k == RXN_GROUP) return 1;
+    for (i = 0; i < n->nk; i++)
+        if (rx_has_group(n->kid[i])) return 1;
+    return 0;
+}
+
+#define RX_LEN_INF ((size_t)-1)
+
+static size_t rx_ladd(size_t a, size_t b) {
+    if (a == RX_LEN_INF || b == RX_LEN_INF) return RX_LEN_INF;
+    if (a + b < a) return RX_LEN_INF;
+    return a + b;
+}
+
+static size_t rx_lmul(size_t a, int32_t k) {
+    if (k < 0) return a == 0 ? 0 : RX_LEN_INF;
+    if (a == RX_LEN_INF) return k == 0 ? 0 : RX_LEN_INF;
+    if (k && a > RX_LEN_INF / (size_t)k) return RX_LEN_INF;
+    return a * (size_t)k;
+}
+
+/* Byte length bounds of a node (for lookbehind and the find cap). */
+static void rx_len(const RxNode *n, size_t *mn, size_t *mx) {
+    uint32_t i;
+    size_t a, b;
+    switch (n->k) {
+    case RXN_EMPTY:
+    case RXN_ASSERT:
+    case RXN_LOOK:
+        *mn = *mx = 0;
+        return;
+    case RXN_BYTE:
+        *mn = *mx = 1;
+        return;
+    case RXN_SET:
+        if (n->set.n == 0) {
+            *mn = *mx = 0;
+            return;
+        }
+        *mn = rx_cplen(n->set.r[0].lo);
+        *mx = rx_cplen(n->set.r[n->set.n - 1].hi);
+        if (n->set.r[n->set.n - 1].hi >= 0x80 && *mn > 1) *mn = 1; /* stray byte */
+        return;
+    case RXN_BREF:
+        *mn = 0;
+        *mx = RX_LEN_INF;
+        return;
+    case RXN_CAT:
+        *mn = *mx = 0;
+        for (i = 0; i < n->nk; i++) {
+            rx_len(n->kid[i], &a, &b);
+            *mn = rx_ladd(*mn, a);
+            *mx = rx_ladd(*mx, b);
+        }
+        return;
+    case RXN_ALT:
+        *mn = RX_LEN_INF;
+        *mx = 0;
+        for (i = 0; i < n->nk; i++) {
+            rx_len(n->kid[i], &a, &b);
+            if (a < *mn) *mn = a;
+            if (*mx != RX_LEN_INF && (b == RX_LEN_INF || b > *mx)) *mx = b;
+        }
+        if (*mn == RX_LEN_INF) *mn = 0;
+        return;
+    case RXN_REP:
+        rx_len(n->kid[0], &a, &b);
+        *mn = rx_lmul(a, n->a);
+        *mx = rx_lmul(b, n->b);
+        return;
+    default:
+        rx_len(n->kid[0], mn, mx);
+        return;
+    }
+}
+
+/* Required literal prefix: leading case-sensitive scalars / raw bytes. */
+static int rx_prefix(const RxNode *n, uint8_t *buf, size_t cap, size_t *len) {
+    uint32_t i;
+    switch (n->k) {
+    case RXN_SET:
+        if (!(n->fl & 1)) return 0;
+        {
+            uint8_t b[4];
+            int k = rx_enc(n->set.r[0].lo, b), j;
+            if (*len + (size_t)k > cap) return 0;
+            for (j = 0; j < k; j++) buf[(*len)++] = b[j];
+        }
+        return 1;
+    case RXN_BYTE:
+        if (n->a != n->b || *len + 1 > cap) return 0;
+        buf[(*len)++] = (uint8_t)n->a;
+        return 1;
+    case RXN_CAT:
+        for (i = 0; i < n->nk; i++)
+            if (!rx_prefix(n->kid[i], buf, cap, len)) return 0;
+        return 1;
+    case RXN_GROUP:
+        return rx_prefix(n->kid[0], buf, cap, len);
+    case RXN_EMPTY:
+        return 1;
+    case RXN_REP:
+        if (n->a >= 1 && n->kid[0]->k == RXN_SET && (n->kid[0]->fl & 1)) {
+            rx_prefix(n->kid[0], buf, cap, len);
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------ compiler */
+
+typedef struct {
+    CCArena a;
+    RxInst *ins;
+    uint32_t n;
+    uint32_t cap;
+    uint8_t *sets;
+    uint32_t nsets;
+    uint32_t capsets;
+    int32_t *tabs;
+    uint32_t ntabs;
+    uint32_t captabs;
+    int rev;
+    uint32_t reg_base;
+    uint32_t nreg;
+    int bt_loop;   /* a nullable loop body whose empty path is not its last */
+    int cap_loop;  /* a nullable loop body holds a capture group */
+    const char *err;
+} RxC;
+
+typedef struct {
+    uint32_t start;
+    uint32_t holes;
+} RxFrag;
+
+static uint32_t rx_emit(RxC *C, int op) {
+    uint32_t pc;
+    if (C->err) return 0;
+    if (C->n >= RX_MAX_INSTS) {
+        C->err = "pattern too large";
+        return 0;
+    }
+    if (!rx_grow(C->a, (void **)&C->ins, &C->cap, C->n + 1, sizeof(RxInst))) {
+        C->err = "out of memory";
+        return 0;
+    }
+    pc = C->n++;
+    memset(&C->ins[pc], 0, sizeof(RxInst));
+    C->ins[pc].op = (uint8_t)op;
+    return pc;
+}
+
+static int32_t *rx_field(RxC *C, uint32_t h) {
+    return (h & 1) ? &C->ins[h >> 1].y : &C->ins[h >> 1].x;
+}
+
+static void rx_patch(RxC *C, uint32_t l, uint32_t tgt) {
+    while (l) {
+        int32_t *f = rx_field(C, l);
+        uint32_t nx = (uint32_t)*f;
+        *f = (int32_t)tgt;
+        l = nx;
+    }
+}
+
+static uint32_t rx_append(RxC *C, uint32_t l1, uint32_t l2) {
+    uint32_t l;
+    if (!l1) return l2;
+    if (!l2) return l1;
+    l = l1;
+    for (;;) {
+        int32_t *f = rx_field(C, l);
+        if (*f == 0) {
+            *f = (int32_t)l2;
+            return l1;
+        }
+        l = (uint32_t)*f;
+    }
+}
+
+static RxFrag rx_frag1(uint32_t pc) {
+    RxFrag f;
+    f.start = pc;
+    f.holes = pc ? pc << 1 : 0;
+    return f;
+}
+
+static RxFrag rx_cat2(RxC *C, RxFrag a, RxFrag b) {
+    if (!a.start) return b;
+    if (!b.start) return a;
+    rx_patch(C, a.holes, b.start);
+    a.holes = b.holes;
+    return a;
+}
+
+static uint32_t rx_set_intern(RxC *C, const uint8_t *bits) {
+    uint32_t i;
+    for (i = 0; i < C->nsets; i++)
+        if (!memcmp(C->sets + (size_t)i * 32, bits, 32)) return i;
+    if (!rx_grow(C->a, (void **)&C->sets, &C->capsets, C->nsets + 1, 32)) {
+        C->err = "out of memory";
+        return 0;
+    }
+    memcpy(C->sets + (size_t)C->nsets * 32, bits, 32);
+    return C->nsets++;
+}
+
+/* One byte-range step. */
+static uint32_t rx_byte(RxC *C, unsigned lo, unsigned hi) {
+    uint32_t pc = rx_emit(C, RXO_BYTE);
+    if (pc) C->ins[pc].aux = (uint16_t)(lo | (hi << 8));
+    return pc;
+}
+
+/* A UTF-8 byte sequence of 1..4 ranges. */
+typedef struct {
+    uint8_t nb;
+    uint8_t lo[4];
+    uint8_t hi[4];
+} RxSeq;
+
+typedef struct {
+    RxSeq *s;
+    uint32_t n;
+    uint32_t cap;
+} RxSeqs;
+
+static int rx_seq_push(RxC *C, RxSeqs *q, uint32_t lo, uint32_t hi) {
+    uint8_t a[4], b[4];
+    int n = rx_enc(lo, a), k;
+    rx_enc(hi, b);
+    if (!rx_grow(C->a, (void **)&q->s, &q->cap, q->n + 1, sizeof(RxSeq))) {
+        C->err = "out of memory";
+        return 0;
+    }
+    q->s[q->n].nb = (uint8_t)n;
+    for (k = 0; k < n; k++) {
+        q->s[q->n].lo[k] = a[k];
+        q->s[q->n].hi[k] = b[k];
+    }
+    q->n++;
+    return 1;
+}
+
+static int rx_seq_rec(RxC *C, RxSeqs *q, uint32_t lo, uint32_t hi) {
+    int n = (int)rx_cplen(lo), i;
+    for (i = 1; i < n; i++) {
+        uint32_t m = (1u << (6 * i)) - 1;
+        if ((lo & ~m) != (hi & ~m)) {
+            if ((lo & m) != 0)
+                return rx_seq_rec(C, q, lo, lo | m) && rx_seq_rec(C, q, (lo | m) + 1, hi);
+            if ((hi & m) != m)
+                return rx_seq_rec(C, q, lo, (hi & ~m) - 1) && rx_seq_rec(C, q, hi & ~m, hi);
+        }
+    }
+    return rx_seq_push(C, q, lo, hi);
+}
+
+static int rx_seq_split(RxC *C, RxSeqs *q, uint32_t lo, uint32_t hi) {
+    if (lo < 0x80) lo = 0x80;
+    if (lo > hi) return 1;
+    if (lo <= 0xDFFF && hi >= 0xD800) {
+        if (lo < 0xD800 && !rx_seq_split(C, q, lo, 0xD7FF)) return 0;
+        if (hi > 0xDFFF && !rx_seq_split(C, q, 0xE000, hi)) return 0;
+        return 1;
+    }
+    if (lo <= 0x7FF && hi > 0x7FF)
+        return rx_seq_split(C, q, lo, 0x7FF) && rx_seq_split(C, q, 0x800, hi);
+    if (lo <= 0xFFFF && hi > 0xFFFF)
+        return rx_seq_split(C, q, lo, 0xFFFF) && rx_seq_split(C, q, 0x10000, hi);
+    return rx_seq_rec(C, q, lo, hi);
+}
+
+/* Every non-ASCII scalar (surrogates aside) is in the set. */
+static int rx_set_full_hi(const RxSet *s) {
+    uint32_t i;
+    uint32_t need = 0x80;
+    for (i = 0; i < s->n; i++) {
+        if (s->r[i].hi < need) continue;
+        if (s->r[i].lo > need) {
+            if (need >= 0xD800 && need <= 0xDFFF && s->r[i].lo <= 0xE000) {
+                /* gap is only surrogates */
+            } else {
+                return 0;
+            }
+        }
+        need = s->r[i].hi + 1;
+        if (need > RX_MAX_CP) return 1;
+    }
+    return 0;
+}
+
+/* Alternatives: starts[k] (0 = "out" → a hole). Returns the entry pc,
+ * or -2 when the only alternative is out. */
+static int32_t rx_alts(RxC *C, const uint32_t *starts, uint32_t n, uint32_t *holes) {
+    uint32_t k, s, first;
+    if (n == 1) return starts[0] ? (int32_t)starts[0] : -2;
+    first = s = rx_emit(C, RXO_SPLIT);
+    if (!s) return -1;
+    for (k = 0; k < n; k++) {
+        if (k + 1 < n) {
+            if (starts[k]) C->ins[s].x = (int32_t)starts[k];
+            else *holes = rx_append(C, s << 1, *holes);
+            if (k + 2 < n) {
+                uint32_t s2 = rx_emit(C, RXO_SPLIT);
+                if (!s2) return -1;
+                C->ins[s].y = (int32_t)s2;
+                s = s2;
+            }
+        } else {
+            if (starts[k]) C->ins[s].y = (int32_t)starts[k];
+            else *holes = rx_append(C, (s << 1) | 1, *holes);
+        }
+    }
+    return (int32_t)first;
+}
+
+static RxFrag rx_class_frag(RxC *C, const RxSet *s) {
+    uint8_t ascii[32];
+    uint32_t i, b;
+    int anyhi = 0, full;
+    RxSeqs q = {0};
+    RxFrag f = {0, 0};
+    memset(ascii, 0, sizeof(ascii));
+    for (i = 0; i < s->n; i++) {
+        uint32_t lo = s->r[i].lo, hi = s->r[i].hi;
+        for (b = lo; b <= hi && b < 0x80; b++) ascii[b >> 3] |= (uint8_t)(1u << (b & 7));
+        if (hi >= 0x80) anyhi = 1;
+    }
+    if (s->n == 0) {
+        uint32_t pc = rx_emit(C, RXO_FAIL);
+        return rx_frag1(pc);
+    }
+    if (!anyhi) {
+        /* One range → BYTE, else SET. */
+        if (s->n == 1) return rx_frag1(rx_byte(C, s->r[0].lo, s->r[0].hi));
+        {
+            uint32_t pc = rx_emit(C, RXO_SET);
+            if (!pc) return f;
+            C->ins[pc].y = (int32_t)rx_set_intern(C, ascii);
+            return rx_frag1(pc);
+        }
+    }
+    full = rx_set_full_hi(s);
+    if (full) {
+        RxSeq z;
+        memset(&z, 0, sizeof(z));
+        if (!rx_grow(C->a, (void **)&q.s, &q.cap, 3, sizeof(RxSeq))) goto oom;
+        z.nb = 2; z.lo[0] = 0xC0; z.hi[0] = 0xDF; z.lo[1] = 0x80; z.hi[1] = 0xBF;
+        q.s[q.n++] = z;
+        z.nb = 3; z.lo[0] = 0xE0; z.hi[0] = 0xEF; z.lo[2] = 0x80; z.hi[2] = 0xBF;
+        q.s[q.n++] = z;
+        z.nb = 4; z.lo[0] = 0xF0; z.hi[0] = 0xF7; z.lo[3] = 0x80; z.hi[3] = 0xBF;
+        q.s[q.n++] = z;
+    } else {
+        for (i = 0; i < s->n; i++)
+            if (s->r[i].hi >= 0x80 && !rx_seq_split(C, &q, s->r[i].lo, s->r[i].hi))
+                return f;
+    }
+    if (C->rev) {
+        for (i = 0; i < q.n; i++) {
+            RxSeq *x = &q.s[i];
+            int k;
+            for (k = 0; k < x->nb / 2; k++) {
+                uint8_t t = x->lo[k];
+                x->lo[k] = x->lo[x->nb - 1 - k];
+                x->lo[x->nb - 1 - k] = t;
+                t = x->hi[k];
+                x->hi[k] = x->hi[x->nb - 1 - k];
+                x->hi[x->nb - 1 - k] = t;
+            }
+        }
+    }
+    {
+        /* SWITCH on the first byte. Lead bytes that share the same list of
+         * sequences share one alternative chain. */
+        uint32_t sw = rx_emit(C, RXO_SWITCH);
+        uint32_t tab, holes;
+        uint32_t *keyset = NULL, nkeys = 0, capkeys = 0; /* flattened keys */
+        uint32_t *keyoff = NULL, capoff = 0;
+        int32_t *keyent = NULL;
+        uint32_t capent = 0;
+        uint32_t *idx = NULL, capidx = 0;
+        uint32_t *starts = NULL, capstarts = 0;
+        if (!sw) return f;
+        if (!rx_grow(C->a, (void **)&C->tabs, &C->captabs, (C->ntabs + 1) * 256,
+                     sizeof(int32_t)))
+            goto oom;
+        tab = C->ntabs++;
+        holes = sw << 1;
+        if (!rx_grow(C->a, (void **)&idx, &capidx, q.n + 2, sizeof(uint32_t)) ||
+            !rx_grow(C->a, (void **)&starts, &capstarts, q.n + 2, sizeof(uint32_t)))
+            goto oom;
+        for (b = 0; b < 256; b++) {
+            uint32_t ni = 0, k, j;
+            int32_t ent = -1;
+            int fb = full && b >= 0x80;
+            if (b < 0x80 && (ascii[b >> 3] & (1u << (b & 7)))) {
+                C->tabs[(size_t)tab * 256 + b] = -2;
+                continue;
+            }
+            for (k = 0; k < q.n; k++)
+                if (b >= q.s[k].lo[0] && b <= q.s[k].hi[0]) idx[ni++] = k;
+            if (!ni && !fb) {
+                C->tabs[(size_t)tab * 256 + b] = -1;
+                continue;
+            }
+            /* Key: seq indices + fallback marker. */
+            for (k = 0; k < nkeys; k++) {
+                uint32_t o = keyoff[k], len = keyoff[k + 1] - o;
+                if (len != ni + 1) continue;
+                for (j = 0; j < ni; j++)
+                    if (keyset[o + j] != idx[j]) break;
+                if (j == ni && keyset[o + ni] == (uint32_t)fb) {
+                    ent = keyent[k];
+                    break;
+                }
+            }
+            if (k == nkeys) {
+                uint32_t na = 0;
+                for (j = 0; j < ni; j++) {
+                    RxSeq *x = &q.s[idx[j]];
+                    uint32_t pc0 = 0, prev = 0, m;
+                    if (x->nb == 1) {
+                        starts[na++] = 0;
+                        continue;
+                    }
+                    for (m = 1; m < x->nb; m++) {
+                        uint32_t pc = rx_byte(C, x->lo[m], x->hi[m]);
+                        if (!pc) return f;
+                        if (prev) C->ins[prev].x = (int32_t)pc;
+                        else pc0 = pc;
+                        prev = pc;
+                    }
+                    holes = rx_append(C, prev << 1, holes);
+                    starts[na++] = pc0;
+                }
+                if (fb) starts[na++] = 0;
+                ent = rx_alts(C, starts, na, &holes);
+                if (C->err) return f;
+                if (!rx_grow(C->a, (void **)&keyoff, &capoff, nkeys + 2, sizeof(uint32_t)) ||
+                    !rx_grow(C->a, (void **)&keyset, &capkeys,
+                             (nkeys ? keyoff[nkeys] : 0) + ni + 1, sizeof(uint32_t)) ||
+                    !rx_grow(C->a, (void **)&keyent, &capent, nkeys + 1, sizeof(int32_t)))
+                    goto oom;
+                if (nkeys == 0) keyoff[0] = 0;
+                for (j = 0; j < ni; j++) keyset[keyoff[nkeys] + j] = idx[j];
+                keyset[keyoff[nkeys] + ni] = (uint32_t)fb;
+                keyoff[nkeys + 1] = keyoff[nkeys] + ni + 1;
+                keyent[nkeys] = ent;
+                nkeys++;
+            }
+            C->tabs[(size_t)tab * 256 + b] = ent;
+        }
+        C->ins[sw].y = (int32_t)tab;
+        f.start = sw;
+        f.holes = holes;
+        return f;
+    }
+oom:
+    C->err = "out of memory";
+    return f;
+}
+
+static RxFrag rx_emit_node(RxC *C, const RxNode *n);
+
+static RxFrag rx_nop(RxC *C) {
+    return rx_frag1(rx_emit(C, RXO_JMP));
+}
+
+static RxFrag rx_star(RxC *C, const RxNode *child, int lazy) {
+    uint32_t L = rx_emit(C, RXO_SPLIT);
+    RxFrag body = rx_emit_node(C, child);
+    uint32_t in, exits = 0;
+    RxFrag f = {0, 0};
+    if (C->err) return f;
+    if (rx_nullable(child)) {
+        uint32_t r = C->reg_base + C->nreg++;
+        if (!rx_lastnull(child)) C->bt_loop = 1;
+        if (rx_has_group(child)) C->cap_loop = 1;
+        uint32_t M = rx_emit(C, RXO_MARK);
+        uint32_t K = rx_emit(C, RXO_CHK);
+        if (C->err) return f;
+        C->ins[M].y = (int32_t)r;
+        C->ins[M].x = (int32_t)body.start;
+        C->ins[K].x = (int32_t)L;
+        C->ins[K].z = (int32_t)r;
+        rx_patch(C, body.holes, K);
+        exits = (K << 1) | 1;
+        in = M;
+    } else {
+        rx_patch(C, body.holes, L);
+        in = body.start;
+    }
+    if (lazy) {
+        C->ins[L].y = (int32_t)in;
+        exits = rx_append(C, exits, L << 1);
+    } else {
+        C->ins[L].x = (int32_t)in;
+        exits = rx_append(C, exits, (L << 1) | 1);
+    }
+    f.start = L;
+    f.holes = exits;
+    return f;
+}
+
+static RxFrag rx_plus(RxC *C, const RxNode *child, int lazy) {
+    RxFrag body = rx_emit_node(C, child);
+    uint32_t L = rx_emit(C, RXO_SPLIT);
+    uint32_t start, loop, exits = 0;
+    RxFrag f = {0, 0};
+    if (C->err) return f;
+    if (rx_nullable(child)) {
+        uint32_t r = C->reg_base + C->nreg++;
+        if (!rx_lastnull(child)) C->bt_loop = 1;
+        if (rx_has_group(child)) C->cap_loop = 1;
+        uint32_t M = rx_emit(C, RXO_MARK);
+        uint32_t K = rx_emit(C, RXO_CHK);
+        if (C->err) return f;
+        C->ins[M].y = (int32_t)r;
+        C->ins[M].x = (int32_t)body.start;
+        C->ins[K].x = (int32_t)L;
+        C->ins[K].z = (int32_t)r;
+        rx_patch(C, body.holes, K);
+        exits = (K << 1) | 1;
+        start = loop = M;
+    } else {
+        rx_patch(C, body.holes, L);
+        start = loop = body.start;
+    }
+    if (lazy) {
+        C->ins[L].y = (int32_t)loop;
+        exits = rx_append(C, exits, L << 1);
+    } else {
+        C->ins[L].x = (int32_t)loop;
+        exits = rx_append(C, exits, (L << 1) | 1);
+    }
+    f.start = start;
+    f.holes = exits;
+    return f;
+}
+
+static RxFrag rx_sub(RxC *C, int op, const RxNode *child, uint32_t *owner) {
+    /* Sub-program run by LOOK / ATOMIC; ends in SUCCEED (z = owner). */
+    RxFrag body = rx_emit_node(C, child);
+    uint32_t S = rx_emit(C, RXO_SUCCEED);
+    uint32_t O = rx_emit(C, op);
+    RxFrag f = {0, 0};
+    if (C->err) return f;
+    rx_patch(C, body.holes, S);
+    C->ins[S].z = (int32_t)O;
+    C->ins[O].y = (int32_t)body.start;
+    *owner = O;
+    return rx_frag1(O);
+}
+
+static RxFrag rx_rep(RxC *C, const RxNode *n) {
+    const RxNode *child = n->kid[0];
+    int32_t mn = n->a, mx = n->b, k;
+    int lazy = n->fl == 1;
+    RxFrag f = {0, 0};
+    if (n->fl == 2) {
+        /* Possessive: the greedy loop inside an atomic group. */
+        RxNode tmp = *n;
+        uint32_t owner;
+        tmp.fl = 0;
+        return rx_sub(C, RXO_ATOMIC, &tmp, &owner);
+    }
+    if (mx == RX_INF) {
+        for (k = 0; k + 1 < mn; k++) f = rx_cat2(C, f, rx_emit_node(C, child));
+        if (mn >= 1) f = rx_cat2(C, f, rx_plus(C, child, lazy));
+        else f = rx_cat2(C, f, rx_star(C, child, lazy));
+        return f;
+    }
+    for (k = 0; k < mn; k++) f = rx_cat2(C, f, rx_emit_node(C, child));
+    if (mx > mn) {
+        uint32_t exits = 0, prevh = 0, first = 0;
+        for (k = 0; k < mx - mn; k++) {
+            uint32_t s = rx_emit(C, RXO_SPLIT);
+            RxFrag body = rx_emit_node(C, child);
+            if (C->err) return f;
+            if (lazy) {
+                C->ins[s].y = (int32_t)body.start;
+                exits = rx_append(C, s << 1, exits);
+            } else {
+                C->ins[s].x = (int32_t)body.start;
+                exits = rx_append(C, (s << 1) | 1, exits);
+            }
+            if (!first) first = s;
+            else rx_patch(C, prevh, s);
+            prevh = body.holes;
+        }
+        {
+            RxFrag opt;
+            opt.start = first;
+            opt.holes = rx_append(C, exits, prevh);
+            f = rx_cat2(C, f, opt);
+        }
+    }
+    if (!f.start) f = rx_nop(C);
+    return f;
+}
+
+static RxFrag rx_emit_node(RxC *C, const RxNode *n) {
+    RxFrag f = {0, 0};
+    uint32_t i;
+    if (C->err) return f;
+    switch (n->k) {
+    case RXN_EMPTY:
+        return rx_nop(C);
+    case RXN_SET:
+        return rx_class_frag(C, &n->set);
+    case RXN_BYTE:
+        return rx_frag1(rx_byte(C, (unsigned)n->a, (unsigned)n->b));
+    case RXN_CAT:
+        if (C->rev) {
+            for (i = n->nk; i > 0; i--) f = rx_cat2(C, f, rx_emit_node(C, n->kid[i - 1]));
+        } else {
+            for (i = 0; i < n->nk; i++) f = rx_cat2(C, f, rx_emit_node(C, n->kid[i]));
+        }
+        if (!f.start) f = rx_nop(C);
+        return f;
+    case RXN_ALT: {
+        uint32_t s = 0, first = 0, holes = 0;
+        for (i = 0; i < n->nk; i++) {
+            RxFrag k = rx_emit_node(C, n->kid[i]);
+            if (C->err) return f;
+            holes = rx_append(C, k.holes, holes);
+            if (i + 1 < n->nk) {
+                uint32_t s2 = rx_emit(C, RXO_SPLIT);
+                if (!s2) return f;
+                C->ins[s2].x = (int32_t)k.start;
+                if (s) C->ins[s].y = (int32_t)s2;
+                else first = s2;
+                s = s2;
+            } else {
+                if (s) C->ins[s].y = (int32_t)k.start;
+                else first = k.start;
+            }
+        }
+        f.start = first;
+        f.holes = holes;
+        return f;
+    }
+    case RXN_REP:
+        return rx_rep(C, n);
+    case RXN_GROUP: {
+        uint32_t a, b;
+        RxFrag body;
+        if (C->rev) return rx_emit_node(C, n->kid[0]);
+        a = rx_emit(C, RXO_SAVE);
+        body = rx_emit_node(C, n->kid[0]);
+        b = rx_emit(C, RXO_SAVE);
+        if (C->err) return f;
+        C->ins[a].y = 2 * n->a;
+        C->ins[b].y = 2 * n->a + 1;
+        C->ins[a].x = (int32_t)body.start;
+        rx_patch(C, body.holes, b);
+        f.start = a;
+        f.holes = b << 1;
+        return f;
+    }
+    case RXN_ASSERT: {
+        uint32_t pc = rx_emit(C, RXO_ASSERT);
+        if (pc) C->ins[pc].aux = n->aux;
+        return rx_frag1(pc);
+    }
+    case RXN_BREF: {
+        uint32_t pc = rx_emit(C, RXO_BREF);
+        if (pc) {
+            C->ins[pc].aux = (uint16_t)n->a;
+            C->ins[pc].fl = n->fl;
+        }
+        return rx_frag1(pc);
+    }
+    case RXN_LOOK: {
+        uint32_t owner = 0;
+        size_t mn = 0, mx = 0;
+        f = rx_sub(C, RXO_LOOK, n->kid[0], &owner);
+        if (C->err) return f;
+        C->ins[owner].fl = n->fl;
+        if (n->fl & 1) {
+            rx_len(n->kid[0], &mn, &mx);
+            if (mx == RX_LEN_INF || mx > RTX_RX_LOOKBEHIND_MAX) {
+                C->err = "invalid pattern in look-behind";
+                return f;
+            }
+            C->ins[owner].aux = (uint16_t)mn;
+            C->ins[owner].z = (int32_t)mx;
+        }
+        return f;
+    }
+    case RXN_ATOMIC: {
+        uint32_t owner = 0;
+        return rx_sub(C, RXO_ATOMIC, n->kid[0], &owner);
+    }
+    }
+    C->err = "internal";
+    return f;
+}
+
+static int rx_prog_build(RxC *C, const RxNode *root, int rev, int unanch) {
+    RxFrag body;
+    C->rev = rev;
+    (void)rx_emit(C, RXO_FAIL); /* pc 0: never a jump target */
+    if (rev) {
+        uint32_t m;
+        body = rx_emit_node(C, root);
+        m = rx_emit(C, RXO_MATCH);
+        if (C->err) return 0;
+        rx_patch(C, body.holes, m);
+        return (int)body.start;
+    }
+    {
+        uint32_t s0 = rx_emit(C, RXO_SAVE), s1, m;
+        body = rx_emit_node(C, root);
+        s1 = rx_emit(C, RXO_SAVE);
+        m = rx_emit(C, RXO_MATCH);
+        if (C->err) return 0;
+        C->ins[s0].y = 0;
+        C->ins[s0].x = (int32_t)body.start;
+        rx_patch(C, body.holes, s1);
+        C->ins[s1].y = 1;
+        C->ins[s1].x = (int32_t)m;
+        (void)unanch;
+        return (int)s0;
+    }
+}
+
+static int rx_prog_copy(RxC *C, RxProg *P, CCArena a, uint32_t start) {
+    P->n = C->n;
+    P->ins = (RxInst *)rx_alloc(a, sizeof(RxInst) * C->n);
+    P->nsets = C->nsets;
+    P->sets = (uint8_t *)rx_alloc(a, (size_t)C->nsets * 32);
+    P->ntabs = C->ntabs;
+    P->tabs = (int32_t *)rx_alloc(a, (size_t)C->ntabs * 256 * sizeof(int32_t));
+    if (!P->ins || !P->sets || !P->tabs) return 0;
+    memcpy(P->ins, C->ins, sizeof(RxInst) * C->n);
+    if (C->nsets) memcpy(P->sets, C->sets, (size_t)C->nsets * 32);
+    if (C->ntabs) memcpy(P->tabs, C->tabs, (size_t)C->ntabs * 256 * sizeof(int32_t));
+    P->start = start;
+    return 1;
+}
+
+/* Consuming instruction step: target pc, or 0. */
+static inline uint32_t rx_step(const RxProg *pg, const RxInst *I, unsigned b) {
+    switch (I->op) {
+    case RXO_BYTE:
+        return (b >= (unsigned)(I->aux & 0xFF) && b <= (unsigned)(I->aux >> 8))
+                   ? (uint32_t)I->x
+                   : 0;
+    case RXO_SET:
+        return (pg->sets[(size_t)I->y * 32 + (b >> 3)] & (1u << (b & 7))) ? (uint32_t)I->x
+                                                                          : 0;
+    case RXO_SWITCH: {
+        int32_t v = pg->tabs[(size_t)I->y * 256 + b];
+        if (v == -1) return 0;
+        return v == -2 ? (uint32_t)I->x : (uint32_t)v;
+    }
+    default:
+        return 0;
+    }
+}
+
+static int rx_consumes(int op) {
+    return op == RXO_BYTE || op == RXO_SET || op == RXO_SWITCH;
+}
+
+/* First-byte set: closure from start treating assertions / lookaround as
+ * passable. A reachable MATCH or a backref means any byte. */
+static void rx_first_set(const RxProg *pg, uint8_t *out, CCArena a) {
+    uint32_t *stk = (uint32_t *)rx_alloc(a, sizeof(uint32_t) * (pg->n * 2 + 4));
+    uint8_t *seen = (uint8_t *)rx_alloc(a, pg->n + 1);
+    uint32_t top = 0, b;
+    memset(out, 0, 32);
+    if (!stk || !seen) {
+        memset(out, 0xFF, 32);
+        return;
+    }
+    stk[top++] = pg->start;
+    while (top) {
+        uint32_t pc = stk[--top];
+        const RxInst *I;
+        if (!pc || seen[pc]) continue;
+        seen[pc] = 1;
+        I = &pg->ins[pc];
+        switch (I->op) {
+        case RXO_JMP:
+        case RXO_SAVE:
+        case RXO_MARK:
+        case RXO_ASSERT:
+        case RXO_LOOK:
+            stk[top++] = (uint32_t)I->x;
+            break;
+        case RXO_SPLIT:
+        case RXO_CHK:
+            stk[top++] = (uint32_t)I->x;
+            stk[top++] = (uint32_t)I->y;
+            break;
+        case RXO_ATOMIC:
+            stk[top++] = (uint32_t)I->y;
+            break;
+        case RXO_SUCCEED: {
+            const RxInst *O = &pg->ins[I->z];
+            if (O->op == RXO_ATOMIC) stk[top++] = (uint32_t)O->x;
+            break;
+        }
+        case RXO_BYTE:
+        case RXO_SET:
+        case RXO_SWITCH:
+            for (b = 0; b < 256; b++)
+                if (rx_step(pg, I, b)) out[b >> 3] |= (uint8_t)(1u << (b & 7));
+            break;
+        case RXO_MATCH:
+        case RXO_BREF:
+            memset(out, 0xFF, 32);
+            return;
+        default:
+            break;
+        }
+    }
+}
+
+/* Byte-class edges: every byte where some consuming instruction changes
+ * its answer. Sets and switch tables are scanned once each. */
+static void rx_bounds(const RxProg *pg, uint8_t *bnd, CCArena a) {
+    uint32_t pc, b, k;
+    uint8_t *seen_set = (uint8_t *)rx_alloc(a, pg->nsets + 1);
+    uint8_t *seen_tab = (uint8_t *)rx_alloc(a, pg->ntabs + 1);
+    for (pc = 1; pc < pg->n; pc++) {
+        const RxInst *I = &pg->ins[pc];
+        if (I->op == RXO_BYTE) {
+            unsigned lo = I->aux & 0xFF, hi = I->aux >> 8;
+            if (lo > 0) bnd[lo] = 1;
+            if (hi < 255) bnd[hi + 1] = 1;
+        } else if (I->op == RXO_SET) {
+            const uint8_t *s = pg->sets + (size_t)I->y * 32;
+            if (seen_set && seen_set[I->y]) continue;
+            if (seen_set) seen_set[I->y] = 1;
+            for (b = 1; b < 256; b++) {
+                int u = (s[b >> 3] >> (b & 7)) & 1, v = (s[(b - 1) >> 3] >> ((b - 1) & 7)) & 1;
+                if (u != v) bnd[b] = 1;
+            }
+        } else if (I->op == RXO_SWITCH) {
+            const int32_t *t = pg->tabs + (size_t)I->y * 256;
+            if (seen_tab && seen_tab[I->y]) continue;
+            if (seen_tab) seen_tab[I->y] = 1;
+            for (k = 1; k < 256; k++)
+                if (t[k] != t[k - 1]) bnd[k] = 1;
+        }
+    }
+}
+
+/* ------------------------------------------------------ literal prefilter */
+
+/* Byte frequency (per 65536) in a code corpus (/usr/include, C sources,
+ * docs); non-ASCII floored for UTF-8 prose. The prefilter looks for the
+ * rarest bytes of a required literal. */
+static const uint16_t rx_freq[256] = {
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 290, 1782, 1, 1, 4, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    13738, 62, 512, 289, 11, 19, 165, 84, 763, 763, 681, 81, 723, 578, 531, 612,
+    367, 277, 215, 145, 128, 98, 116, 76, 107, 81, 162, 621, 81, 394, 238, 12,
+    50, 364, 110, 751, 224, 483, 137, 179, 89, 332, 11, 85, 416, 151, 307, 237,
+    284, 11, 340, 380, 408, 168, 146, 53, 82, 63, 30, 63, 43, 62, 3, 2354,
+    119, 1986, 420, 2210, 1097, 4001, 879, 457, 875, 2262, 52, 288, 1654, 687, 2245, 1794,
+    1104, 45, 2305, 1999, 2769, 851, 305, 558, 316, 449, 94, 167, 68, 167, 24, 1,
+    40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+    40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+    40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+    40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+    1, 1, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    5, 5, 5, 5, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+};
+
+/* A literal under construction: per-position byte sets. */
+typedef struct {
+    uint32_t m;
+    int exact; /* each position is exactly its bytes (no cross product) */
+    uint8_t set[RX_SQ_MAX][32];
+} RxSq;
+
+/* Required literals: every match holds one of them, starting at most
+ * `back` bytes after the match start (RX_LEN_INF: unbounded). */
+typedef struct {
+    uint32_t n;
+    RxSq *sq[RX_PF_LITS];
+    size_t back;
+    uint64_t score;
+} RxCand;
+
+static uint32_t rx_bits_n(const uint8_t *s) {
+    uint32_t k, c = 0;
+    for (k = 0; k < 32; k++) c += (uint32_t)__builtin_popcount(s[k]);
+    return c;
+}
+
+static uint64_t rx_bits_freq(const uint8_t *s) {
+    uint64_t f = 0;
+    unsigned k;
+    for (k = 0; k < 32; k++) {
+        unsigned m = s[k];
+        while (m) {
+            f += rx_freq[k * 8 + (unsigned)__builtin_ctz(m)];
+            m &= m - 1;
+        }
+    }
+    return f;
+}
+
+/* Append n's bytes when n is a fixed string with at most 3 choices per
+ * scalar (a literal, an ignore-case pair, a tiny class). 0: not one (q
+ * unchanged). */
+static int rx_sq_node(const RxNode *n, RxSq *q) {
+    uint32_t m0 = q->m, i;
+    int ex0 = q->exact;
+    switch (n->k) {
+    case RXN_EMPTY:
+        return 1;
+    case RXN_BYTE: {
+        uint32_t b;
+        if (n->b - n->a > 2 || q->m >= RX_SQ_MAX) return 0;
+        memset(q->set[q->m], 0, 32);
+        for (b = (uint32_t)n->a; b <= (uint32_t)n->b; b++) q->set[q->m][b >> 3] |= (uint8_t)(1u << (b & 7));
+        q->m++;
+        return 1;
+    }
+    case RXN_SET: {
+        uint32_t cnt = 0, cps[3], L = 0, j, k;
+        for (i = 0; i < n->set.n; i++) {
+            uint32_t c;
+            if (n->set.r[i].hi - n->set.r[i].lo >= 3) return 0;
+            for (c = n->set.r[i].lo; c <= n->set.r[i].hi; c++) {
+                if (cnt >= 3) return 0;
+                cps[cnt++] = c;
+            }
+        }
+        if (!cnt) return 0;
+        L = (uint32_t)rx_cplen(cps[0]);
+        for (k = 1; k < cnt; k++)
+            if (rx_cplen(cps[k]) != L) return 0;
+        if (q->m + L > RX_SQ_MAX) return 0;
+        for (j = 0; j < L; j++) memset(q->set[q->m + j], 0, 32);
+        for (k = 0; k < cnt; k++) {
+            uint8_t b[4];
+            rx_enc(cps[k], b);
+            for (j = 0; j < L; j++) q->set[q->m + j][b[j] >> 3] |= (uint8_t)(1u << (b[j] & 7));
+        }
+        if (cnt > 1 && L > 1) q->exact = 0;
+        q->m += L;
+        return 1;
+    }
+    case RXN_CAT:
+        for (i = 0; i < n->nk; i++) {
+            if (!rx_sq_node(n->kid[i], q)) {
+                q->m = m0;
+                q->exact = ex0;
+                return 0;
+            }
+        }
+        return 1;
+    case RXN_GROUP:
+        return rx_sq_node(n->kid[0], q);
+    case RXN_REP:
+        if (n->a != n->b || n->a < 1 || n->a > 8 || n->fl == 2) return 0;
+        for (i = 0; i < (uint32_t)n->a; i++) {
+            if (!rx_sq_node(n->kid[0], q)) {
+                q->m = m0;
+                q->exact = ex0;
+                return 0;
+            }
+        }
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* The two rarest positions with at most 3 bytes each. */
+static uint64_t rx_sq_score(const RxSq *q, uint32_t *i1, uint32_t *i2) {
+    uint64_t f1 = UINT64_MAX, f2 = UINT64_MAX;
+    uint32_t i, p1 = 0, p2 = 0;
+    for (i = 0; i < q->m; i++) {
+        uint64_t f;
+        if (rx_bits_n(q->set[i]) > 3) continue;
+        f = rx_bits_freq(q->set[i]);
+        if (f < f1) {
+            f2 = f1;
+            p2 = p1;
+            f1 = f;
+            p1 = i;
+        } else if (f < f2) {
+            f2 = f;
+            p2 = i;
+        }
+    }
+    if (f1 == UINT64_MAX) return UINT64_MAX;
+    if (f2 == UINT64_MAX) {
+        f2 = 65536;
+        p2 = p1;
+    }
+    if (i1) *i1 = p1;
+    if (i2) *i2 = p2;
+    return f1 * f2;
+}
+
+static void rx_cand_clear(RxCand *c) {
+    c->n = 0;
+    c->back = 0;
+    c->score = UINT64_MAX;
+}
+
+/* Lower is better. Unusable (no start bound): UINT64_MAX. */
+static uint64_t rx_cand_eff(const RxCand *c, int line) {
+    if (!c->n || c->score == UINT64_MAX) return UINT64_MAX;
+    if (c->back == RX_LEN_INF && !line) return UINT64_MAX;
+    return c->back == 0 ? c->score : c->score * 2;
+}
+
+static void rx_cand_keep(RxCand *best, const RxCand *c, int line) {
+    if (rx_cand_eff(c, line) < rx_cand_eff(best, line)) *best = *c;
+}
+
+static RxSq *rx_sq_new(CCArena a) {
+    RxSq *q = (RxSq *)cc_arena_alloc(a, sizeof(RxSq), 8);
+    if (q) {
+        q->m = 0;
+        q->exact = 1;
+    }
+    return q;
+}
+
+static void rx_cand_of(CCArena a, const RxNode *n, int line, int depth, RxCand *out);
+
+static void rx_cand_run(RxSq *run, size_t back, int line, RxCand *best) {
+    RxCand c;
+    if (!run || !run->m) return;
+    c.n = 1;
+    c.sq[0] = run;
+    c.back = back;
+    c.score = rx_sq_score(run, NULL, NULL);
+    rx_cand_keep(best, &c, line);
+}
+
+/* Best required-literal candidate of a node (offsets from its start). */
+static void rx_cand_of(CCArena a, const RxNode *n, int line, int depth, RxCand *out) {
+    uint32_t i, ne;
+    const RxNode *const *el;
+    const RxNode *one[1];
+    size_t pre = 0, run_back = 0;
+    RxSq *run;
+    rx_cand_clear(out);
+    if (depth > 8) return;
+    switch (n->k) {
+    case RXN_GROUP:
+    case RXN_ATOMIC:
+        rx_cand_of(a, n->kid[0], line, depth + 1, out);
+        return;
+    case RXN_REP:
+        if (n->a >= 1) rx_cand_of(a, n->kid[0], line, depth + 1, out);
+        if (n->a >= 1 && n->a == n->b) break; /* x{3}: maybe a longer run */
+        return;
+    case RXN_ALT: {
+        RxCand u, k;
+        rx_cand_clear(&u);
+        u.score = 0;
+        u.back = 0;
+        for (i = 0; i < n->nk; i++) {
+            uint32_t j;
+            rx_cand_of(a, n->kid[i], line, depth + 1, &k);
+            if (rx_cand_eff(&k, line) == UINT64_MAX || u.n + k.n > RX_PF_LITS) return;
+            for (j = 0; j < k.n; j++) u.sq[u.n++] = k.sq[j];
+            if (k.back == RX_LEN_INF || u.back == RX_LEN_INF) u.back = RX_LEN_INF;
+            else if (k.back > u.back) u.back = k.back;
+            if (k.score > u.score) u.score = k.score;
+        }
+        if (u.n) *out = u;
+        return;
+    }
+    default:
+        break;
+    }
+    if (n->k == RXN_CAT) {
+        el = (const RxNode *const *)n->kid;
+        ne = n->nk;
+    } else {
+        one[0] = n;
+        el = one;
+        ne = 1;
+    }
+    run = rx_sq_new(a);
+    if (!run) return;
+    for (i = 0; i < ne; i++) {
+        const RxNode *e = el[i];
+        size_t mn = 0, mx = 0;
+        RxCand sub;
+        if (e->k == RXN_ASSERT || e->k == RXN_LOOK) continue; /* zero width */
+        rx_len(e, &mn, &mx);
+        if (rx_sq_node(e, run)) {
+            pre = rx_ladd(pre, mx);
+            continue;
+        }
+        if (run->m) {
+            rx_cand_run(run, run_back, line, out);
+            run = rx_sq_new(a);
+            if (!run) return;
+        }
+        if (e != n) {
+            rx_cand_of(a, e, line, depth + 1, &sub);
+            if (sub.n) {
+                sub.back = rx_ladd(pre, sub.back);
+                rx_cand_keep(out, &sub, line);
+            }
+        }
+        pre = rx_ladd(pre, mx);
+        run_back = pre;
+    }
+    rx_cand_run(run, run_back, line, out);
+}
+
+/* No consuming instruction of the program takes '\n' (outside the
+ * unanchored loop): every match lies on one line. */
+static int rx_prog_no_nl(const RxProg *pg) {
+    uint32_t pc;
+    for (pc = 1; pc < pg->n; pc++) {
+        const RxInst *I = &pg->ins[pc];
+        if (pc == pg->uany) continue;
+        if (rx_consumes(I->op) && rx_step(pg, I, '\n')) return 0;
+    }
+    return 1;
+}
+
+static void rx_lit_make(RxLit *L, const RxSq *q, uint8_t *set) {
+    uint32_t i1 = 0, i2 = 0, b;
+    memset(L, 0, sizeof(*L));
+    L->m = q->m;
+    memcpy(set, q->set, (size_t)q->m * 32);
+    L->set = set;
+    rx_sq_score(q, &i1, &i2);
+    if (i2 < i1) {
+        uint32_t x = i1;
+        i1 = i2;
+        i2 = x;
+    }
+    L->i1 = (uint8_t)i1;
+    L->i2 = (uint8_t)i2;
+    for (b = 0; b < 256; b++) {
+        if ((q->set[i1][b >> 3] & (1u << (b & 7))) && L->n1 < 3) L->b1[L->n1++] = (uint8_t)b;
+        if ((q->set[i2][b >> 3] & (1u << (b & 7))) && L->n2 < 3) L->b2[L->n2++] = (uint8_t)b;
+    }
+    L->k = L->n1 > L->n2 ? L->n1 : L->n2;
+    /* Pad with repeats: a loop compares k (or 3) bytes per position. */
+    while (L->n1 < 3) {
+        L->b1[L->n1] = L->b1[0];
+        L->n1++;
+    }
+    while (L->n2 < 3) {
+        L->b2[L->n2] = L->b2[0];
+        L->n2++;
+    }
+}
+
+/* Pick the prefilter: the rarest required literal (set). Returns 0 on OOM
+ * only; no candidate leaves pf->n = 0. */
+static int rx_pf_build(RtxRx *rx, const RxNode *root, CCArena a, CCArena t) {
+    RxCand best;
+    RxSq *whole;
+    int line;
+    uint32_t k;
+    uint8_t *sets;
+    size_t tot = 0;
+    line = rx_prog_no_nl(&rx->fwd);
+    rx_cand_clear(&best);
+    whole = rx_sq_new(t);
+    if (whole && rx_sq_node(root, whole) && whole->m) {
+        best.n = 1;
+        best.sq[0] = whole;
+        best.back = 0;
+        best.score = rx_sq_score(whole, NULL, NULL);
+        rx->pf_exact = whole->exact && rx->ncap == 1 && !rx->asserts;
+        if (best.score == UINT64_MAX) rx->pf_exact = 0;
+    } else {
+        rx_cand_of(t, root, line, 0, &best);
+    }
+    if (rx_cand_eff(&best, line) == UINT64_MAX) {
+        rx->pf_exact = 0;
+        return 1;
+    }
+    for (k = 0; k < best.n; k++) tot += (size_t)best.sq[k]->m * 32;
+    sets = (uint8_t *)rx_alloc(a, tot);
+    if (!sets) {
+        rx->pf_exact = 0;
+        return 0;
+    }
+    rx->pf.minm = UINT32_MAX;
+    rx->pf.maxm = 0;
+    rx->pf.span = 0;
+    for (k = 0; k < best.n; k++) {
+        RxLit *L = &rx->pf.lit[k];
+        rx_lit_make(L, best.sq[k], sets);
+        sets += (size_t)L->m * 32;
+        if (L->m < rx->pf.minm) rx->pf.minm = L->m;
+        if (L->m > rx->pf.maxm) rx->pf.maxm = L->m;
+        if (L->i2 > rx->pf.span) rx->pf.span = L->i2;
+        if (L->k > rx->pf.k) rx->pf.k = L->k;
+    }
+    rx->pf.n = best.n;
+    rx->pf.back = best.back == RX_LEN_INF ? RTX_RX_UNSET : best.back;
+    rx->pf.line = line && best.back != 0;
+    return 1;
+}
+
+static unsigned rx_lead_cls(unsigned b);
+static inline unsigned rx_lead_len(unsigned b);
+
+RtxRx *!>(CCError) rtx_rx_compile(char[:] pat, unsigned flags, CCArena a) {
+    RxP P;
+    RxC C;
+    RxNode *root;
+    RtxRx *rx;
+    CCArena tmp;
+    uint32_t fstart, b;
+    const char *err = NULL;
+    uint8_t bnd[256];
+    size_t mn = 0, mx = 0;
+    if (!a.base) return cc_err(CC_ERR_INVALID_ARG, "rx: no arena");
+    if (pat.len && !pat.ptr) return cc_err(CC_ERR_INVALID_ARG, "rx: null pattern");
+    tmp = cc_arena_heap(kilobytes(64));
+    if (!tmp.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "rx: scratch");
+    memset(&P, 0, sizeof(P));
+    P.p = (const unsigned char *)pat.ptr;
+    P.n = pat.len;
+    P.a = tmp;
+    P.fl = flags & (RTX_RX_ICASE | RTX_RX_DOTALL | RTX_RX_EXTENDED);
+    P.extref = (flags & RTX_RX_EXTREF) != 0;
+    if (flags & RTX_RX_LITERAL) {
+        size_t i = 0;
+        root = rx_node(&P, RXN_CAT);
+        while (root && i < P.n) {
+            uint32_t cp;
+            int raw;
+            RxNode *k;
+            size_t l = rx_dec(P.p + i, P.n - i, &cp, &raw);
+            if (!(flags & RTX_RX_ICASE)) {
+                size_t j;
+                for (j = 0; j < l && root; j++)
+                    if (!rx_kid(&P, root, rx_raw_byte(&P, P.p[i + j]))) root = NULL;
+                i += l;
+                continue;
+            }
+            k = raw ? rx_raw_byte(&P, cp) : rx_lit(&P, cp);
+            if (!k || !rx_kid(&P, root, k)) root = NULL;
+            i += l;
+        }
+        if (root && root->nk == 0) root->k = RXN_EMPTY;
+    } else {
+        P.named = rx_has_named(P.p, P.n);
+        root = rx_parse_alt(&P);
+        if (root && P.i < P.n) {
+            P.err = "unmatched close parenthesis";
+            root = NULL;
+        }
+        if (root && P.maxref > P.ncap) {
+            P.err = "invalid backref number";
+            root = NULL;
+        }
+    }
+    if (!root) {
+        err = P.err ? P.err : "out of memory";
+        tmp.destroy();
+        return cc_err(CC_ERR_INVALID_ARG, err);
+    }
+    rx = (RtxRx *)rx_alloc(a, sizeof(RtxRx));
+    if (!rx) {
+        tmp.destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "rx: program");
+    }
+    rx->ncap = (uint32_t)P.ncap + 1;
+    rx->id = atomic_fetch_add_explicit(&rtx_rx_serial, 1u, memory_order_relaxed) + 1u;
+    rx->mode = P.bt ? RTX_RX_BACKTRACK : RTX_RX_LINEAR;
+    rx->dfa = !P.bt && !P.dfa_no;
+    rx->asserts = P.asserts;
+    rx->wb = P.wb;
+    rx->nullable = rx_nullable(root);
+    rx->first_byte = -1;
+    rx_len(root, &mn, &mx);
+    rx->maxlen = mx == RX_LEN_INF ? RTX_RX_UNSET : mx;
+
+    /* Forward program + unanchored loop. */
+    memset(&C, 0, sizeof(C));
+    C.a = tmp;
+    C.reg_base = 2 * rx->ncap;
+    fstart = (uint32_t)rx_prog_build(&C, root, 0, 1);
+    if (!C.err) {
+        uint32_t L = rx_emit(&C, RXO_SPLIT);
+        uint32_t A = rx_emit(&C, RXO_SET);
+        uint8_t all[32];
+        memset(all, 0xFF, sizeof(all));
+        if (!C.err) {
+            C.ins[L].x = (int32_t)fstart;
+            C.ins[L].y = (int32_t)A;
+            C.ins[A].y = (int32_t)rx_set_intern(&C, all);
+            C.ins[A].x = (int32_t)L;
+            rx->fwd.ustart = L;
+            rx->fwd.uany = A;
+        }
+    }
+    if (C.err || !rx_prog_copy(&C, &rx->fwd, a, fstart)) {
+        err = C.err ? C.err : "out of memory";
+        tmp.destroy();
+        return cc_err(CC_ERR_INVALID_ARG, err);
+    }
+    rx->nslot = 2 * rx->ncap + C.nreg;
+    rx->cap_loop = C.cap_loop;
+    if (C.bt_loop) {
+        /* A loop whose body can match empty ahead of a consuming path:
+         * Onig ends the loop on that empty iteration (with its priority).
+         * Only the backtracker tracks the per-iteration start; Pike / DFA
+         * dedupe by pc and would pick a different winner. */
+        rx->mode = RTX_RX_BACKTRACK;
+        rx->dfa = 0;
+    }
+    if (rx->dfa) {
+        uint32_t rstart;
+        memset(&C, 0, sizeof(C));
+        C.a = tmp;
+        C.reg_base = 2 * rx->ncap;
+        rstart = (uint32_t)rx_prog_build(&C, root, 1, 0);
+        if (C.err || !rx_prog_copy(&C, &rx->rev, a, rstart)) {
+            err = C.err ? C.err : "out of memory";
+            tmp.destroy();
+            return cc_err(CC_ERR_INVALID_ARG, err);
+        }
+    }
+    /* Prefilters. */
+    rx_first_set(&rx->fwd, rx->first, tmp);
+    for (b = 0; b < 256; b++) {
+        if (rx->first[b >> 3] & (1u << (b & 7))) {
+            rx->nfirst++;
+            rx->first_byte = (int)b;
+        }
+    }
+    if (rx->nfirst != 1) rx->first_byte = -1;
+    {
+        uint8_t buf[256];
+        size_t len = 0;
+        int all = rx_prefix(root, buf, sizeof(buf), &len);
+        if (len) {
+            char *pre = (char *)rx_alloc(a, len);
+            if (pre) {
+                memcpy(pre, buf, len);
+                rx->pre = pre;
+                rx->pren = len;
+                rx->lit = all && rx->ncap == 1 && !P.asserts;
+            }
+        }
+    }
+    if (!rx_pf_build(rx, root, a, tmp)) {
+        tmp.destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "rx: prefilter");
+    }
+    /* DFA byte classes. */
+    memset(bnd, 0, sizeof(bnd));
+    rx_bounds(&rx->fwd, bnd, tmp);
+    if (rx->rev.n) rx_bounds(&rx->rev, bnd, tmp);
+    if (rx->asserts) {
+        static const uint8_t wb[] = {10, 11, '0', ':', 'A', '[', '_', '`', 'a', '{', 0x80};
+        size_t k;
+        for (k = 0; k < sizeof(wb); k++) bnd[wb[k]] = 1;
+        if (rx->wb) {
+            /* the look-behind tracker: continuation / lead length / lead class */
+            bnd[0xC0] = 1;
+            for (k = 0xC1; k < 256; k++)
+                if (rx_lead_cls((unsigned)k) != rx_lead_cls((unsigned)k - 1) ||
+                    rx_lead_len((unsigned)k) != rx_lead_len((unsigned)k - 1))
+                    bnd[k] = 1;
+        }
+    }
+    rx->ncls = 0;
+    for (b = 0; b < 256; b++) {
+        if (b && bnd[b]) rx->ncls++;
+        rx->cls[b] = (uint8_t)rx->ncls;
+    }
+    rx->ncls++;
+    /* Named groups outlive the pattern text: copy them onto `a`. */
+    if (P.nnames > 0) {
+        size_t tot = 0;
+        int k;
+        char *nb;
+        int32_t *ix;
+        for (k = 0; k < P.nnames; k++) tot += (size_t)P.names[k].n + 1;
+        nb = (char *)rx_alloc(a, tot);
+        ix = (int32_t *)rx_alloc(a, sizeof(int32_t) * (size_t)P.nnames);
+        if (!nb || !ix) {
+            tmp.destroy();
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "rx: names");
+        }
+        tot = 0;
+        for (k = 0; k < P.nnames; k++) {
+            memcpy(nb + tot, P.names[k].s, P.names[k].n);
+            nb[tot + P.names[k].n] = 0;
+            tot += (size_t)P.names[k].n + 1;
+            ix[k] = P.names[k].idx;
+        }
+        rx->names = nb;
+        rx->name_idx = ix;
+        rx->nnames = (uint32_t)P.nnames;
+    }
+    tmp.destroy();
+    return cc_ok(rx);
+}
+
+int rtx_rx_can_start(const RtxRx *rx, unsigned char c) {
+    return rx && (rx->first[c >> 3] & (1u << (c & 7))) != 0;
+}
+
+int rtx_rx_first_byte(const RtxRx *rx) {
+    return rx ? rx->first_byte : -1;
+}
+
+int rtx_rx_mode(const RtxRx *rx) {
+    return rx ? rx->mode : RTX_RX_LINEAR;
+}
+
+unsigned rtx_rx_groups(const RtxRx *rx) {
+    return rx ? rx->ncap : 0;
+}
+
+int rtx_rx_group_named(const RtxRx *rx, const char *name, size_t n) {
+    const char *p;
+    uint32_t k;
+    int found = -1;
+    if (!rx || !name || !rx->names) return -1;
+    p = rx->names;
+    /* The last definition of a repeated name wins (as \k<name>). */
+    for (k = 0; k < rx->nnames; k++) {
+        size_t l = strlen(p);
+        if (l == n && !memcmp(p, name, n)) found = (int)rx->name_idx[k];
+        p += l + 1;
+    }
+    return found;
+}
+
+int rtx_rx_has_dfa(const RtxRx *rx) {
+    return rx ? rx->dfa : 0;
+}
+
+int rtx_rx_has_prefilter(const RtxRx *rx) {
+    return rx ? rx->pf.n != 0 : 0;
+}
+
+int rtx_rx_is_literal(const RtxRx *rx) {
+    return rx ? rx->lit : 0;
+}
+
+size_t rtx_rx_max_len(const RtxRx *rx) {
+    return rx ? rx->maxlen : RTX_RX_UNSET;
+}
+
+/* --------------------------------------------------------------- scratch */
+
+typedef struct {
+    int32_t pc;   /* >= 0 choice / explore; -1 restore */
+    int32_t slot;
+    size_t val;
+} RxStk;
+
+typedef struct {
+    uint32_t *dense;
+    uint32_t *sparse;
+    uint32_t n;
+} RxSparse;
+
+/* Lazy DFA transition values (uint32): a premultiplied state id (row
+ * offset into T) plus tags. Any value >= RX_T_TAG leaves the hot loop. */
+#define RX_T_SID 0x3FFFFFFFu
+#define RX_T_TAG 0x40000000u
+#define RX_T_MATCH 0x40000000u /* a match ended just before the byte consumed */
+#define RX_T_SPEC 0x80000000u  /* target is dead, or idle while the prefilter runs */
+#define RX_T_VIOL 0xFFFFFFFDu  /* a valid-UTF-8 assumption broke (see RX_FL_ASSUME) */
+#define RX_T_AMB 0xFFFFFFFEu   /* \\b beside non-ASCII: exact variant in TA */
+#define RX_T_UNK 0xFFFFFFFFu   /* not computed yet */
+
+typedef struct {
+    uint32_t off;  /* pcs at pool[off] */
+    uint32_t npc;
+    uint32_t hash;
+    int32_t chain;
+    uint16_t fl;   /* context bits (see rx_binfo) */
+    uint8_t m;     /* entered by a transition that ended a match */
+    uint8_t idle;  /* forward: only the unanchored loop (no candidate open) */
+} RxDSt;
+
+/* One lazy DFA: a dense table T[state][class] (row = stride cells),
+ * states interned by (pcs, fl, m) in a hash. Buffers are malloc'ed and
+ * bounded by RX_DFA_MEM; a full cache is cleared and the search goes on. */
+typedef struct {
+    const RtxRx *rx;
+    uint32_t rx_id;
+    const RxProg *pg;
+    int rev;
+    int pf_on;
+    uint32_t stride;
+    uint32_t shift;
+    uint32_t *T;
+    uint32_t *TA;  /* 4 exact (word before, word after) variants per cell */
+    RxDSt *st;
+    uint32_t nst;
+    uint32_t capst;
+    uint32_t *pool;
+    uint32_t npool;
+    uint32_t cappool;
+    int32_t *ht;
+    uint32_t hcap;
+    uint32_t start[32]; /* premultiplied start state by context; RX_T_UNK = none */
+} RxDfa;
+
+typedef struct {
+    const RtxRx *rx;   /* program the buffers are sized for */
+    CCArena home;      /* the scratch arena this block lives on */
+    uint32_t cap_n;
+    uint32_t cap_slot;
+    RxSparse sp[3];
+    size_t *caps[2];
+    size_t *tcaps;
+    RxStk *stk;
+    size_t stk_cap;
+    RxStk *bt;
+    size_t bt_cap;
+    size_t bt_top;
+    size_t *bt_caps;
+    size_t *look_snap; /* RX_MAX_LOOK + 1 levels × cap_slot */
+    int look_lv;
+    uint32_t *lbuf;
+    uint32_t *tbuf;
+    RxDfa fwd;         /* malloc'ed tables: they move with the work block */
+    RxDfa rev;
+    /* Prefilter memo: from pf_from, the first literal is at pf_hit and a
+     * match starts at >= pf_bound (same text only). */
+    const unsigned char *pf_t;
+    size_t pf_n;
+    size_t pf_from;
+    size_t pf_hit;
+    size_t pf_bound;
+    size_t pf_finds;   /* vector scans run / bytes they passed (density) */
+    size_t pf_bytes;
+} RxWork;
+
+static void rx_dfa_free(RxDfa *D);
+
+void rtx_rx_scratch_drop(RtxRxScratch *s) {
+    RxWork *W;
+    if (!s) return;
+    W = (RxWork *)s->w;
+    if (W) {
+        rx_dfa_free(&W->fwd);
+        rx_dfa_free(&W->rev);
+    }
+    if (s->a.base) s->a.destroy();
+    s->w = NULL;
+}
+
+static RxWork *rx_work(RtxRxScratch *s, const RtxRx *rx) {
+    RxWork *W = (RxWork *)s->w;
+    uint32_t n = rx->fwd.n > rx->rev.n ? rx->fwd.n : rx->rev.n;
+    uint32_t ns = rx->nslot < 2 ? 2 : rx->nslot;
+    RxDfa keep_f, keep_r;
+    int k;
+    if (W && W->cap_n >= n && W->cap_slot >= ns) {
+        if (W->rx != rx) {
+            W->rx = rx;
+            W->pf_t = NULL;
+        }
+        return W;
+    }
+    {
+        memset(&keep_f, 0, sizeof(keep_f));
+        memset(&keep_r, 0, sizeof(keep_r));
+        if (W) {
+            keep_f = W->fwd;
+            keep_r = W->rev;
+        }
+        s->w = NULL;
+        if (!s->a.base) {
+            s->a = cc_arena_heap(kilobytes(256));
+            if (!s->a.base) goto fail;
+        } else {
+            s->a.reset();
+        }
+        if (n < 64) n = 64;
+        if (ns < 32) ns = 32;
+        W = (RxWork *)rx_alloc(s->a, sizeof(RxWork));
+        if (!W) goto fail;
+        memset(W, 0, sizeof(*W));
+        W->fwd = keep_f;
+        W->rev = keep_r;
+        W->home = s->a;
+        W->cap_n = n;
+        W->cap_slot = ns;
+        s->w = W; /* owns the DFA tables from here (drop frees them) */
+        for (k = 0; k < 3; k++) {
+            W->sp[k].dense = (uint32_t *)rx_alloc(s->a, sizeof(uint32_t) * n);
+            W->sp[k].sparse = (uint32_t *)rx_alloc(s->a, sizeof(uint32_t) * n);
+            if (!W->sp[k].dense || !W->sp[k].sparse) goto fail_w;
+        }
+        W->caps[0] = W->caps[1] = NULL; /* Pike thread slots: on first Pike use */
+        W->tcaps = (size_t *)rx_alloc(s->a, sizeof(size_t) * ns);
+        W->stk_cap = (size_t)n * 2 + ns + 8;
+        W->stk = (RxStk *)rx_alloc(s->a, sizeof(RxStk) * W->stk_cap);
+        W->bt_caps = (size_t *)rx_alloc(s->a, sizeof(size_t) * ns);
+        W->look_snap = (size_t *)rx_alloc(s->a, sizeof(size_t) * ns * (RX_MAX_LOOK + 2));
+        W->lbuf = (uint32_t *)rx_alloc(s->a, sizeof(uint32_t) * n);
+        W->tbuf = (uint32_t *)rx_alloc(s->a, sizeof(uint32_t) * n);
+        if (!W->tcaps || !W->stk || !W->bt_caps || !W->look_snap || !W->lbuf || !W->tbuf)
+            goto fail_w;
+        W->rx = rx;
+        /* instruction buffers were resized: the DFAs rebind on next use */
+        W->fwd.rx = NULL;
+        W->rev.rx = NULL;
+    }
+    return W;
+fail_w:
+    rx_dfa_free(&W->fwd);
+    rx_dfa_free(&W->rev);
+    s->w = NULL;
+    return NULL;
+fail:
+    rx_dfa_free(&keep_f);
+    rx_dfa_free(&keep_r);
+    return NULL;
+}
+
+static inline void rx_sp_clear(RxSparse *s) {
+    s->n = 0;
+}
+
+static inline int rx_sp_has(const RxSparse *s, uint32_t pc) {
+    uint32_t i = s->sparse[pc];
+    return i < s->n && s->dense[i] == pc;
+}
+
+static inline uint32_t rx_sp_add(RxSparse *s, uint32_t pc) {
+    uint32_t i = s->n++;
+    s->dense[i] = pc;
+    s->sparse[pc] = i;
+    return i;
+}
+
+static int rx_word_cp(uint32_t cp) {
+    size_t lo = 0, hi = sizeof(rx_nonword_hi) / sizeof(rx_nonword_hi[0]) / 2;
+    if (cp < 0x80) return rx_isw(cp);
+    /* sorted disjoint pairs: the last pair starting at or below cp */
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (rx_nonword_hi[2 * mid] <= cp) lo = mid + 1;
+        else hi = mid;
+    }
+    return !(lo && cp <= rx_nonword_hi[2 * (lo - 1) + 1]);
+}
+
+/* Word-ness of the scalar ending at / starting at pos (\\b is \\w vs \\W,
+ * scalar by scalar; an invalid byte is not a word). */
+static int rx_word_before(const unsigned char *t, size_t pos) {
+    size_t k = pos, lim = pos > 4 ? pos - 4 : 0;
+    uint32_t cp;
+    int raw;
+    if (pos == 0) return 0;
+    if (t[pos - 1] < 0x80) return rx_isw(t[pos - 1]);
+    while (k > lim && (t[k - 1] & 0xC0) == 0x80) k--;
+    if (k == 0 || k == pos) return 0;
+    k--;
+    if (rx_dec(t + k, pos - k, &cp, &raw) != pos - k || raw) return 0;
+    return rx_word_cp(cp);
+}
+
+static int rx_word_after(const unsigned char *t, size_t pos, size_t n) {
+    uint32_t cp;
+    int raw;
+    if (pos >= n) return 0;
+    if (t[pos] < 0x80) return rx_isw(t[pos]);
+    rx_dec(t + pos, n - pos, &cp, &raw);
+    return !raw && rx_word_cp(cp);
+}
+
+int rtx_rx_word_before(const char *t, size_t pos) {
+    return t ? rx_word_before((const unsigned char *)t, pos) : 0;
+}
+
+int rtx_rx_word_after(const char *t, size_t pos, size_t n) {
+    return t ? rx_word_after((const unsigned char *)t, pos, n) : 0;
+}
+
+/* Assertion on the text (Pike / backtracker). */
+static int rx_holds(int kind, const RtxRxIn *in, size_t pos) {
+    const unsigned char *t = (const unsigned char *)in->s;
+    size_t n = in->n;
+    switch (kind) {
+    case RXA_BOL:
+        return pos == 0 ? (in->ctx & RTX_RX_CTX_BOL0) != 0 : t[pos - 1] == '\n';
+    case RXA_EOL:
+        return pos >= n || t[pos] == '\n';
+    case RXA_BOT:
+        return pos == 0 && (in->ctx & RTX_RX_CTX_BOT0);
+    case RXA_EOT:
+        return pos >= n;
+    case RXA_EOTNL:
+        return pos >= n || (pos + 1 == n && t[pos] == '\n');
+    case RXA_WB:
+    case RXA_NWB: {
+        int a = rx_word_before(t, pos);
+        int b = rx_word_after(t, pos, n);
+        return kind == RXA_WB ? a != b : a == b;
+    }
+    case RXA_GPOS:
+        return pos == in->gpos;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------- Pike VM */
+
+typedef struct {
+    const RtxRx *rx;
+    const RxProg *pg;
+    const RtxRxIn *in;
+    RxWork *W;
+    uint32_t nslot;
+    size_t steps;
+    size_t budget; /* 0 = unlimited */
+} RxPike;
+
+static void rx_pike_add(RxPike *V, int li, uint32_t pc0, size_t pos) {
+    RxWork *W = V->W;
+    RxSparse *L = &W->sp[li];
+    size_t *tc = W->tcaps;
+    size_t top = 0;
+    uint32_t ns = V->nslot;
+    W->stk[top].pc = (int32_t)pc0;
+    W->stk[top].slot = -1;
+    top++;
+    while (top) {
+        RxStk e = W->stk[--top];
+        uint32_t pc;
+        if (e.slot >= 0) {
+            tc[e.slot] = e.val;
+            continue;
+        }
+        pc = (uint32_t)e.pc;
+        for (;;) {
+            const RxInst *I;
+            uint32_t k;
+            if (!pc || rx_sp_has(L, pc)) break;
+            k = rx_sp_add(L, pc);
+            V->steps++;
+            I = &V->pg->ins[pc];
+            switch (I->op) {
+            case RXO_JMP:
+            case RXO_MARK:
+                pc = (uint32_t)I->x;
+                continue;
+            case RXO_SPLIT:
+            case RXO_CHK:
+                W->stk[top].pc = I->y;
+                W->stk[top].slot = -1;
+                top++;
+                pc = (uint32_t)I->x;
+                continue;
+            case RXO_SAVE:
+                if ((uint32_t)I->y < ns) {
+                    W->stk[top].pc = 0;
+                    W->stk[top].slot = I->y;
+                    W->stk[top].val = tc[I->y];
+                    top++;
+                    tc[I->y] = pos;
+                }
+                pc = (uint32_t)I->x;
+                continue;
+            case RXO_ASSERT:
+                if (rx_holds(I->aux, V->in, pos)) {
+                    pc = (uint32_t)I->x;
+                    continue;
+                }
+                break;
+            case RXO_BYTE:
+            case RXO_SET:
+            case RXO_SWITCH:
+            case RXO_MATCH:
+                memcpy(W->caps[li] + (size_t)k * ns, tc, sizeof(size_t) * ns);
+                break;
+            default:
+                break;
+            }
+            break;
+        }
+    }
+}
+
+/* ------------------------------------------------------ prefilter scan */
+
+static inline int rx_lit_at(const RxLit *L, const unsigned char *t, size_t s) {
+    const uint8_t *set = L->set;
+    uint32_t i;
+    for (i = 0; i < L->m; i++, set += 32) {
+        unsigned b = t[s + i];
+        if (!(set[b >> 3] & (1u << (b & 7)))) return 0;
+    }
+    return 1;
+}
+
+static inline int rx_pf_at(const RxPf *F, const unsigned char *t, size_t s, size_t n) {
+    uint32_t k;
+    for (k = 0; k < F->n; k++)
+        if (F->lit[k].m <= n - s && rx_lit_at(&F->lit[k], t, s)) return 1;
+    return 0;
+}
+
+#if defined(__SSE2__)
+/* Vector pair filter: 16 (SSE2) or 32 (AVX2) starts at a time; each
+ * literal's two rarest positions (K distinct bytes each, 1..3) must both
+ * hit; candidates verify. 1 and *sp = the hit; 0 and *sp = where the
+ * scalar tail goes on. */
+static inline __attribute__((always_inline)) __m128i rx_eq_128(__m128i u, const __m128i *a,
+                                                               int K) {
+    __m128i m = _mm_cmpeq_epi8(u, a[0]);
+    if (K > 1) m = _mm_or_si128(m, _mm_cmpeq_epi8(u, a[1]));
+    if (K > 2) m = _mm_or_si128(m, _mm_cmpeq_epi8(u, a[2]));
+    return m;
+}
+
+static inline __attribute__((always_inline)) int rx_pf1_sse(const RxLit *L, const unsigned char *t,
+                                                            size_t *sp, size_t n, size_t end,
+                                                            int K) {
+    __m128i x[3], y[3];
+    const unsigned char *p1 = t + L->i1, *p2 = t + L->i2;
+    size_t s = *sp;
+    int j;
+    for (j = 0; j < 3; j++) {
+        x[j] = _mm_set1_epi8((char)L->b1[j]);
+        y[j] = _mm_set1_epi8((char)L->b2[j]);
+    }
+    for (; s <= end; s += 16) {
+        __m128i m1 = rx_eq_128(_mm_loadu_si128((const __m128i *)(p1 + s)), x, K);
+        __m128i m2 = rx_eq_128(_mm_loadu_si128((const __m128i *)(p2 + s)), y, K);
+        unsigned mask = (unsigned)_mm_movemask_epi8(_mm_and_si128(m1, m2));
+        while (mask) {
+            size_t c = s + (size_t)__builtin_ctz(mask);
+            if (L->m <= n - c && rx_lit_at(L, t, c)) {
+                *sp = c;
+                return 1;
+            }
+            mask &= mask - 1;
+        }
+    }
+    *sp = s;
+    return 0;
+}
+
+static inline __attribute__((always_inline)) int rx_pfn_sse(const RxPf *F, const unsigned char *t,
+                                                            size_t *sp, size_t n, size_t end,
+                                                            int K) {
+    __m128i a1[RX_PF_LITS][3], a2[RX_PF_LITS][3];
+    size_t s = *sp;
+    uint32_t k, j;
+    for (k = 0; k < F->n; k++) {
+        for (j = 0; j < 3; j++) {
+            a1[k][j] = _mm_set1_epi8((char)F->lit[k].b1[j]);
+            a2[k][j] = _mm_set1_epi8((char)F->lit[k].b2[j]);
+        }
+    }
+    for (; s <= end; s += 16) {
+        unsigned mask = 0;
+        for (k = 0; k < F->n; k++) {
+            const RxLit *L = &F->lit[k];
+            __m128i m1 = rx_eq_128(_mm_loadu_si128((const __m128i *)(t + s + L->i1)), a1[k], K);
+            __m128i m2 = rx_eq_128(_mm_loadu_si128((const __m128i *)(t + s + L->i2)), a2[k], K);
+            mask |= (unsigned)_mm_movemask_epi8(_mm_and_si128(m1, m2));
+        }
+        while (mask) {
+            size_t c = s + (size_t)__builtin_ctz(mask);
+            if (rx_pf_at(F, t, c, n)) {
+                *sp = c;
+                return 1;
+            }
+            mask &= mask - 1;
+        }
+    }
+    *sp = s;
+    return 0;
+}
+
+static int rx_pf_find_sse(const RxPf *F, const unsigned char *t, size_t *sp, size_t n) {
+    size_t end;
+    if (n - *sp < (size_t)F->span + 32) return 0;
+    end = n - F->span - 16; /* last s whose loads stay in [0, n) */
+    if (F->n == 1) {
+        switch (F->k) {
+        case 1: return rx_pf1_sse(&F->lit[0], t, sp, n, end, 1);
+        case 2: return rx_pf1_sse(&F->lit[0], t, sp, n, end, 2);
+        default: return rx_pf1_sse(&F->lit[0], t, sp, n, end, 3);
+        }
+    }
+    switch (F->k) {
+    case 1: return rx_pfn_sse(F, t, sp, n, end, 1);
+    case 2: return rx_pfn_sse(F, t, sp, n, end, 2);
+    default: return rx_pfn_sse(F, t, sp, n, end, 3);
+    }
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define RX_AVX2 1
+static inline __attribute__((always_inline, target("avx2"))) __m256i
+rx_eq_256(__m256i u, const __m256i *a, int K) {
+    __m256i m = _mm256_cmpeq_epi8(u, a[0]);
+    if (K > 1) m = _mm256_or_si256(m, _mm256_cmpeq_epi8(u, a[1]));
+    if (K > 2) m = _mm256_or_si256(m, _mm256_cmpeq_epi8(u, a[2]));
+    return m;
+}
+
+static inline __attribute__((always_inline, target("avx2"))) int
+rx_pf1_avx2(const RxLit *L, const unsigned char *t, size_t *sp, size_t n, size_t end, int K) {
+    __m256i x[3], y[3];
+    const unsigned char *p1 = t + L->i1, *p2 = t + L->i2;
+    size_t s = *sp;
+    int j;
+    for (j = 0; j < 3; j++) {
+        x[j] = _mm256_set1_epi8((char)L->b1[j]);
+        y[j] = _mm256_set1_epi8((char)L->b2[j]);
+    }
+    for (; s <= end; s += 32) {
+        __m256i m1 = rx_eq_256(_mm256_loadu_si256((const __m256i *)(p1 + s)), x, K);
+        __m256i m2 = rx_eq_256(_mm256_loadu_si256((const __m256i *)(p2 + s)), y, K);
+        unsigned mask = (unsigned)_mm256_movemask_epi8(_mm256_and_si256(m1, m2));
+        while (mask) {
+            size_t c = s + (size_t)__builtin_ctz(mask);
+            if (L->m <= n - c && rx_lit_at(L, t, c)) {
+                *sp = c;
+                return 1;
+            }
+            mask &= mask - 1;
+        }
+    }
+    *sp = s;
+    return 0;
+}
+
+static inline __attribute__((always_inline, target("avx2"))) int
+rx_pfn_avx2(const RxPf *F, const unsigned char *t, size_t *sp, size_t n, size_t end, int K) {
+    __m256i a1[RX_PF_LITS][3], a2[RX_PF_LITS][3];
+    size_t s = *sp;
+    uint32_t k, j;
+    for (k = 0; k < F->n; k++) {
+        for (j = 0; j < 3; j++) {
+            a1[k][j] = _mm256_set1_epi8((char)F->lit[k].b1[j]);
+            a2[k][j] = _mm256_set1_epi8((char)F->lit[k].b2[j]);
+        }
+    }
+    for (; s <= end; s += 32) {
+        unsigned mask = 0;
+        for (k = 0; k < F->n; k++) {
+            const RxLit *L = &F->lit[k];
+            __m256i m1 = rx_eq_256(_mm256_loadu_si256((const __m256i *)(t + s + L->i1)), a1[k], K);
+            __m256i m2 = rx_eq_256(_mm256_loadu_si256((const __m256i *)(t + s + L->i2)), a2[k], K);
+            mask |= (unsigned)_mm256_movemask_epi8(_mm256_and_si256(m1, m2));
+        }
+        while (mask) {
+            size_t c = s + (size_t)__builtin_ctz(mask);
+            if (rx_pf_at(F, t, c, n)) {
+                *sp = c;
+                return 1;
+            }
+            mask &= mask - 1;
+        }
+    }
+    *sp = s;
+    return 0;
+}
+
+static __attribute__((target("avx2"))) int rx_pf_find_avx2(const RxPf *F, const unsigned char *t,
+                                                            size_t *sp, size_t n) {
+    size_t end;
+    if (n - *sp < (size_t)F->span + 64) return 0;
+    end = n - F->span - 32;
+    if (F->n == 1) {
+        switch (F->k) {
+        case 1: return rx_pf1_avx2(&F->lit[0], t, sp, n, end, 1);
+        case 2: return rx_pf1_avx2(&F->lit[0], t, sp, n, end, 2);
+        default: return rx_pf1_avx2(&F->lit[0], t, sp, n, end, 3);
+        }
+    }
+    switch (F->k) {
+    case 1: return rx_pfn_avx2(F, t, sp, n, end, 1);
+    case 2: return rx_pfn_avx2(F, t, sp, n, end, 2);
+    default: return rx_pfn_avx2(F, t, sp, n, end, 3);
+    }
+}
+#endif
+#endif
+
+/* First s >= p where a literal of F sits whole in [s, n); n when none. */
+static size_t rx_pf_find(const RxPf *F, const unsigned char *t, size_t p, size_t n) {
+    size_t s = p;
+    if (n < F->minm || p > n - F->minm) return n;
+#if defined(RX_AVX2)
+    if (__builtin_cpu_supports("avx2")) {
+        if (rx_pf_find_avx2(F, t, &s, n)) return s;
+    }
+#endif
+#if defined(__SSE2__)
+    if (rx_pf_find_sse(F, t, &s, n)) return s;
+#endif
+    for (; s + F->minm <= n; s++)
+        if (rx_pf_at(F, t, s, n)) return s;
+    return n;
+}
+
+/* No literal: the first byte a match can start with (a set scan). */
+static size_t rx_skip_first(const RtxRx *rx, const unsigned char *t, size_t p, size_t n) {
+    if (rx->pren >= 2) {
+        const void *h = memmem(t + p, n - p, rx->pre, rx->pren);
+        return h ? (size_t)((const unsigned char *)h - t) : n;
+    }
+    if (rx->first_byte >= 0) {
+        const void *h = memchr(t + p, rx->first_byte, n - p);
+        return h ? (size_t)((const unsigned char *)h - t) : n;
+    }
+    if (rx->nfirst >= 256) return p;
+    while (p + 4 <= n) {
+        if (rx->first[t[p] >> 3] & (1u << (t[p] & 7))) return p;
+        if (rx->first[t[p + 1] >> 3] & (1u << (t[p + 1] & 7))) return p + 1;
+        if (rx->first[t[p + 2] >> 3] & (1u << (t[p + 2] & 7))) return p + 2;
+        if (rx->first[t[p + 3] >> 3] & (1u << (t[p + 3] & 7))) return p + 3;
+        p += 4;
+    }
+    while (p < n && !(rx->first[t[p] >> 3] & (1u << (t[p] & 7)))) p++;
+    return p;
+}
+
+/* Prefilter: a lower bound (>= p) for the next match start, or n. With a
+ * literal: the first literal hit h at or after p, then the match starts at
+ * >= h - back and (a pattern without \n) at >= the start of h's line. A
+ * literal that may run past n (a window edge) counts as a hit there. */
+static size_t rx_skip(const RtxRx *rx, RxWork *W, const unsigned char *t, size_t p, size_t n) {
+    if (p >= n) return n;
+    if (rx->pf.n) {
+        const RxPf *F = &rx->pf;
+        size_t h, b = p;
+        if (W && W->pf_t == t && W->pf_n == n && p >= W->pf_from && p <= W->pf_hit)
+            return p > W->pf_bound ? p : W->pf_bound;
+        h = rx_pf_find(F, t, p, n);
+        if (h >= n) h = n >= F->maxm && n - F->maxm + 1 > p ? n - F->maxm + 1 : p;
+        if (F->back != RTX_RX_UNSET && h >= F->back && h - F->back > b) b = h - F->back;
+        if (F->line && h > b) {
+            const unsigned char *nl = (const unsigned char *)memrchr(t + b, '\n', h - b);
+            if (nl) b = (size_t)(nl - t) + 1;
+        }
+        if (W) {
+            W->pf_t = t;
+            W->pf_n = n;
+            W->pf_from = p;
+            W->pf_hit = h;
+            W->pf_bound = b;
+            W->pf_finds++;
+            W->pf_bytes += h - p;
+        }
+        return b;
+    }
+    {
+        size_t q = rx_skip_first(rx, t, p, n);
+        if (W) {
+            W->pf_finds++;
+            W->pf_bytes += q - p;
+        }
+        return q;
+    }
+}
+
+/* Pike VM. anchored: one start at `lo`. Else leftmost-first search for a
+ * start in [lo, stop). Returns RTX_RX_* ; caps (nslot) of the winner in
+ * `out`. */
+static int rx_pike(const RtxRx *rx, const RtxRxIn *in, RxWork *W, size_t lo,
+                   size_t stop, int anchored, int eof, uint32_t nslot,
+                   size_t budget, size_t *out, size_t *ms, size_t *me) {
+    RxPike V;
+    const unsigned char *t = (const unsigned char *)in->s;
+    size_t n = in->n, pos = lo, k;
+    int cur = 0, matched = 0, live = 0;
+    size_t live_min = RTX_RX_UNSET;
+    uint32_t i;
+    if (!W->caps[0]) {
+        /* Lazy: a DFA-only scratch (find lanes) never pays for these. */
+        for (i = 0; i < 2; i++) {
+            W->caps[i] = (size_t *)cc_arena_alloc(W->home, sizeof(size_t) * (size_t)W->cap_n *
+                                                              W->cap_slot, 8);
+            if (!W->caps[i]) return RTX_RX_NONE;
+        }
+    }
+    V.rx = rx;
+    V.pg = &rx->fwd;
+    V.in = in;
+    V.W = W;
+    V.nslot = nslot;
+    V.steps = 0;
+    V.budget = budget;
+    rx_sp_clear(&W->sp[0]);
+    rx_sp_clear(&W->sp[1]);
+    for (;;) {
+        RxSparse *CL = &W->sp[cur], *NL = &W->sp[cur ^ 1];
+        if (!matched && pos <= n && (anchored ? pos == lo : pos < stop)) {
+            if (!anchored && CL->n == 0) {
+                size_t q = rx_skip(rx, W, t, pos, n);
+                if (q > pos) {
+                    if (q >= stop) break;
+                    pos = q;
+                }
+            }
+            for (i = 0; i < nslot; i++) W->tcaps[i] = RTX_RX_UNSET;
+            rx_pike_add(&V, cur, rx->fwd.start, pos);
+        }
+        if (CL->n == 0) break;
+        if (budget && V.steps > budget) return RTX_RX_BUDGET;
+        rx_sp_clear(NL);
+        live = 0;
+        live_min = RTX_RX_UNSET;
+        for (k = 0; k < CL->n; k++) {
+            uint32_t pc = CL->dense[k];
+            const RxInst *I = &rx->fwd.ins[pc];
+            size_t *tc = W->caps[cur] + k * nslot;
+            if (I->op == RXO_MATCH) {
+                matched = 1;
+                memcpy(out, tc, sizeof(size_t) * nslot);
+                *ms = tc[0];
+                *me = pos;
+                break; /* cut lower priority */
+            }
+            if (!rx_consumes(I->op)) continue;
+            if (pos >= n) {
+                live = 1;
+                if (tc[0] < live_min) live_min = tc[0];
+                continue;
+            }
+            {
+                uint32_t tgt = rx_step(&rx->fwd, I, t[pos]);
+                if (tgt) {
+                    memcpy(W->tcaps, tc, sizeof(size_t) * nslot);
+                    rx_pike_add(&V, cur ^ 1, tgt, pos + 1);
+                }
+            }
+        }
+        if (budget && V.steps > budget) return RTX_RX_BUDGET;
+        if (pos >= n) break;
+        cur ^= 1;
+        pos++;
+    }
+    if (!anchored && !eof && live) {
+        if (matched) return RTX_RX_PARTIAL;
+        if (live_min < stop) {
+            *ms = live_min;
+            *me = n;
+            return RTX_RX_PARTIAL;
+        }
+    }
+    return matched ? RTX_RX_MATCH : RTX_RX_NONE;
+}
+
+/* --------------------------------------------------------- backtracker */
+
+typedef struct {
+    const RtxRx *rx;
+    const RxProg *pg;
+    const RtxRxIn *in;
+    RtxRxScratch *S;
+    RxWork *W;
+    size_t steps;
+    size_t budget;
+    uint32_t nslot;
+} RxBt;
+
+static int rx_bt_push(RxBt *B, int32_t pc, int32_t slot, size_t val) {
+    RxWork *W = B->W;
+    if (W->bt_top >= W->bt_cap) {
+        size_t nc = W->bt_cap ? W->bt_cap * 2 : 4096;
+        RxStk *q;
+        if (nc > RX_BT_STACK_MAX) return 0;
+        q = (RxStk *)rx_alloc(B->S->a, sizeof(RxStk) * nc);
+        if (!q) return 0;
+        if (W->bt_top) memcpy(q, W->bt, sizeof(RxStk) * W->bt_top);
+        W->bt = q;
+        W->bt_cap = nc;
+    }
+    W->bt[W->bt_top].pc = pc;
+    W->bt[W->bt_top].slot = slot;
+    W->bt[W->bt_top].val = val;
+    W->bt_top++;
+    return 1;
+}
+
+static int rx_bref_eq(const unsigned char *t, size_t n, size_t pos,
+                      const unsigned char *src, size_t len, int icase, size_t *adv) {
+    size_t i = 0, j = 0;
+    if (!icase) {
+        if (len > n - pos) return 0;
+        if (len && memcmp(t + pos, src, len)) return 0;
+        *adv = len;
+        return 1;
+    }
+    while (i < len) {
+        uint32_t a, b;
+        int ra, rb;
+        size_t la, lb;
+        if (pos + j >= n) return 0;
+        la = rx_dec(src + i, len - i, &a, &ra);
+        lb = rx_dec(t + pos + j, n - pos - j, &b, &rb);
+        if (a != b && (ra || rb || rtx_rx_fold(a) != b)) return 0;
+        i += la;
+        j += lb;
+    }
+    *adv = j;
+    return 1;
+}
+
+/* 1 match (*end), 0 fail, -1 budget / stack. */
+static int rx_bt_run(RxBt *B, uint32_t pc, size_t pos, size_t *caps, size_t target,
+                     size_t *end) {
+    RxWork *W = B->W;
+    const RxProg *pg = B->pg;
+    const unsigned char *t = (const unsigned char *)B->in->s;
+    size_t n = B->in->n;
+    size_t base = W->bt_top;
+    for (;;) {
+        const RxInst *I;
+        if (++B->steps > B->budget) {
+            W->bt_top = base;
+            return -1;
+        }
+        I = &pg->ins[pc];
+        switch (I->op) {
+        case RXO_BYTE:
+        case RXO_SET:
+        case RXO_SWITCH: {
+            uint32_t tgt;
+            if (pos >= n) goto fail;
+            tgt = rx_step(pg, I, t[pos]);
+            if (!tgt) goto fail;
+            pos++;
+            pc = tgt;
+            continue;
+        }
+        case RXO_SPLIT:
+            if (!rx_bt_push(B, I->y, 0, pos)) goto over;
+            pc = (uint32_t)I->x;
+            continue;
+        case RXO_JMP:
+            pc = (uint32_t)I->x;
+            continue;
+        case RXO_SAVE:
+        case RXO_MARK:
+            if (!rx_bt_push(B, -1, I->y, caps[I->y])) goto over;
+            caps[I->y] = pos;
+            pc = (uint32_t)I->x;
+            continue;
+        case RXO_CHK:
+            pc = caps[I->z] == pos ? (uint32_t)I->y : (uint32_t)I->x;
+            continue;
+        case RXO_ASSERT:
+            if (!rx_holds(I->aux, B->in, pos)) goto fail;
+            pc = (uint32_t)I->x;
+            continue;
+        case RXO_BREF: {
+            uint32_t g = I->aux;
+            const unsigned char *src;
+            size_t s0, e0, adv = 0;
+            if (I->fl & 2) {
+                if (!B->in->ext || !B->in->ext_s || !B->in->ext_e || g >= B->in->ext_n)
+                    goto fail;
+                s0 = B->in->ext_s[g];
+                e0 = B->in->ext_e[g];
+                if (s0 == RTX_RX_UNSET || e0 == RTX_RX_UNSET || e0 < s0) goto fail;
+                src = (const unsigned char *)B->in->ext + s0;
+            } else {
+                if (2 * g + 1 >= B->nslot) goto fail;
+                s0 = caps[2 * g];
+                e0 = caps[2 * g + 1];
+                if (s0 == RTX_RX_UNSET || e0 == RTX_RX_UNSET || e0 < s0) goto fail;
+                src = t + s0;
+            }
+            if (!rx_bref_eq(t, n, pos, src, e0 - s0, I->fl & 1, &adv)) goto fail;
+            pos += adv;
+            pc = (uint32_t)I->x;
+            continue;
+        }
+        case RXO_LOOK:
+        case RXO_ATOMIC: {
+            int behind = I->op == RXO_LOOK && (I->fl & 1);
+            int neg = I->op == RXO_LOOK && (I->fl & 2);
+            size_t *snap, e2 = pos;
+            int r = 0;
+            uint32_t sl;
+            if (W->look_lv > RX_MAX_LOOK) goto over;
+            snap = W->look_snap + (size_t)W->look_lv * W->cap_slot;
+            memcpy(snap, caps, sizeof(size_t) * B->nslot);
+            W->look_lv++;
+            if (!behind) {
+                r = rx_bt_run(B, (uint32_t)I->y, pos, caps, RTX_RX_UNSET, &e2);
+            } else {
+                size_t k;
+                for (k = I->aux; k <= (size_t)I->z; k++) {
+                    if (k > pos) break;
+                    r = rx_bt_run(B, (uint32_t)I->y, pos - k, caps, pos, &e2);
+                    if (r != 0) break;
+                }
+            }
+            W->look_lv--;
+            if (r < 0) {
+                W->bt_top = base;
+                return -1;
+            }
+            if (neg) {
+                memcpy(caps, snap, sizeof(size_t) * B->nslot);
+                if (r == 1) goto fail;
+                pc = (uint32_t)I->x;
+                continue;
+            }
+            if (r == 0) goto fail;
+            for (sl = 0; sl < B->nslot; sl++) {
+                if (caps[sl] != snap[sl] && !rx_bt_push(B, -1, (int32_t)sl, snap[sl]))
+                    goto over;
+            }
+            if (I->op == RXO_ATOMIC) pos = e2;
+            pc = (uint32_t)I->x;
+            continue;
+        }
+        case RXO_SUCCEED:
+            if (target != RTX_RX_UNSET && pos != target) goto fail;
+            *end = pos;
+            W->bt_top = base;
+            return 1;
+        case RXO_MATCH:
+            *end = pos;
+            W->bt_top = base;
+            return 1;
+        default:
+            goto fail;
+        }
+    fail:
+        for (;;) {
+            RxStk e;
+            if (W->bt_top == base) return 0;
+            e = W->bt[--W->bt_top];
+            if (e.pc < 0) {
+                caps[e.slot] = e.val;
+                continue;
+            }
+            pc = (uint32_t)e.pc;
+            pos = e.val;
+            break;
+        }
+    }
+over:
+    W->bt_top = base;
+    return -1;
+}
+
+static int rx_bt_at(const RtxRx *rx, const RtxRxIn *in, RtxRxScratch *S, RxWork *W,
+                    size_t at, size_t budget, size_t *caps, size_t *end) {
+    RxBt B;
+    uint32_t i;
+    int r;
+    B.rx = rx;
+    B.pg = &rx->fwd;
+    B.in = in;
+    B.S = S;
+    B.W = W;
+    B.steps = 0;
+    B.budget = budget;
+    B.nslot = rx->nslot;
+    for (i = 0; i < rx->nslot; i++) caps[i] = RTX_RX_UNSET;
+    W->bt_top = 0;
+    W->look_lv = 0;
+    r = rx_bt_run(&B, rx->fwd.start, at, caps, RTX_RX_UNSET, end);
+    if (r < 0) return RTX_RX_BUDGET;
+    return r ? RTX_RX_MATCH : RTX_RX_NONE;
+}
+
+/* ----------------------------------------------------------- lazy DFA */
+
+/* Context. A state carries its look-behind (forward) / look-ahead
+ * (reverse) context, so \\b and ^ $ resolve inside cached transitions.
+ *
+ * Reverse state: after-info of the next byte (bit0 line end, bit1 text
+ * end, bit2 ASCII word, bit3 non-ASCII: word-ness needs the scalar).
+ *
+ * Forward state (a pattern with \\b / \\B): the look-behind is exact — the
+ * state tracks the UTF-8 scalar in progress (RX_FL_*): bit0 line start,
+ * bit1 doc start, bit2 the scalar before is a word, bit3 unknown (a scalar
+ * from a lead whose range mixes word and non-word), bits 4-5 continuation
+ * bytes still due, bits 6-7 their lead's class. The look-ahead of a
+ * transition is its byte: exact for ASCII, a continuation or a lead of a
+ * non-word range; a lead of an all-word range is a word if the scalar is
+ * valid UTF-8, which the DFA assumes (RX_FL_ASSUME) and checks as the
+ * continuation bytes arrive — a \\b that took the assumption (RX_FL_USED)
+ * and meets a broken scalar stops the search (RX_T_VIOL), which reruns
+ * without it. Mixed leads (and a mixed scalar's end) are marked RX_T_AMB:
+ * resolved per (state, class, word before, word after) through a second
+ * cache (TA) from the text, still on the DFA. Without \\b only bit0 / bit1
+ * matter and nothing else splits states. */
+#define RX_FL_REM(f) (((f) >> 4) & 3u)
+#define RX_FL_CLS(f) (((f) >> 6) & 3u)
+#define RX_FL_USED 0x100u
+#define RX_FL_ASSUME 0x200u
+enum { RX_LC_NONWORD = 0, RX_LC_WORD = 1, RX_LC_MIXED = 2, RX_LC_BAD = 3 };
+
+static inline unsigned rx_binfo(unsigned b) {
+    return (b == '\n' ? 1u : 0u) | (rx_isw(b) ? 4u : 0u) | (b >= 0x80 ? 8u : 0u);
+}
+
+/* Word class of every valid scalar a lead byte starts (RX_LC_*), C0..FF:
+ * the lead's scalar range against rx_nonword_hi (regenerate with it). E0
+ * ED F0 F4 are mixed: their second byte decides validity. */
+static const uint8_t rx_lead_tab[64] = {
+    3, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 1,
+    1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 1, 2, 1, 1, 1, 1,
+    2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 0, 2,
+    2, 1, 1, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+};
+
+static unsigned rx_lead_cls(unsigned b) {
+    return b >= 0xC0 ? rx_lead_tab[b - 0xC0] : RX_LC_BAD;
+}
+
+static inline unsigned rx_lead_len(unsigned b) {
+    return b >= 0xF0 ? 4u : b >= 0xE0 ? 3u : 2u;
+}
+
+/* Forward look-behind after byte b from context fl. */
+static unsigned rx_fl_fwd(const RtxRx *rx, unsigned fl, unsigned b, int used) {
+    unsigned mode = fl & RX_FL_ASSUME, r, c;
+    if (!rx->asserts) return 0;
+    if (!rx->wb) return b == '\n' ? 1u : 0u;
+    if (b < 0x80) return mode | (b == '\n' ? 1u : 0u) | (rx_isw(b) ? 4u : 0u);
+    if (b < 0xC0) {
+        r = RX_FL_REM(fl);
+        if (!r) return mode; /* stray continuation: not a word */
+        c = RX_FL_CLS(fl);
+        if (r > 1) return mode | ((r - 1) << 4) | (c << 6) | (fl & RX_FL_USED);
+        return mode | (c == RX_LC_WORD ? 4u : c == RX_LC_MIXED ? 8u : 0u);
+    }
+    c = rx_lead_cls(b);
+    if (c == RX_LC_BAD) return mode;
+    return mode | ((rx_lead_len(b) - 1) << 4) | (c << 6) | (used ? RX_FL_USED : 0u);
+}
+
+/* Forward look-ahead of byte b (bit4: word only if the scalar is valid). */
+static unsigned rx_ainfo_fwd(const RtxRx *rx, unsigned b, unsigned mode) {
+    unsigned c;
+    if (!rx->wb || b < 0x80) return rx_binfo(b) & 7u;
+    if (b < 0xC0) return 0; /* no scalar starts on a continuation */
+    c = rx_lead_cls(b);
+    if (c == RX_LC_BAD || c == RX_LC_NONWORD) return 0;
+    if (c == RX_LC_WORD && mode) return 4u | 16u;
+    return 8u;
+}
+
+/* Forward context at offset p (a start, or a prefilter jump). */
+static unsigned rx_fl_at(const RtxRx *rx, const RtxRxIn *in, size_t p, unsigned mode) {
+    const unsigned char *t = (const unsigned char *)in->s;
+    unsigned fl;
+    size_t k;
+    if (!rx->asserts) return 0;
+    if (!rx->wb) mode = 0;
+    if (p == 0)
+        return mode | ((in->ctx & RTX_RX_CTX_BOL0) ? 1u : 0u) | ((in->ctx & RTX_RX_CTX_BOT0) ? 2u : 0u);
+    fl = mode;
+    for (k = p > 4 ? p - 4 : 0; k < p; k++) fl = rx_fl_fwd(rx, fl, t[k], 0);
+    return fl;
+}
+
+/* 1 holds, 0 fails, -1 undecidable from bytes (word test beside non-ASCII). */
+static int rx_dholds(int kind, unsigned B, unsigned A) {
+    switch (kind) {
+    case RXA_BOL: return (B & 1) != 0;
+    case RXA_EOL: return (A & 1) != 0;
+    case RXA_BOT: return (B & 2) != 0;
+    case RXA_EOT: return (A & 2) != 0;
+    case RXA_WB:
+    case RXA_NWB:
+        if ((B | A) & 8) return -1;
+        return (((B >> 2) & 1) != ((A >> 2) & 1)) == (kind == RXA_WB);
+    }
+    return 0;
+}
+
+/* Epsilon closure of `pcs` in priority order under (B, A). Consuming
+ * pcs land in `out`. MATCH sets *matched and, with `cut`, drops every
+ * lower-priority thread. */
+static uint32_t rx_resolve(const RxProg *pg, RxWork *W, const uint32_t *pcs,
+                           uint32_t npc, unsigned B, unsigned A, int cut,
+                           uint32_t *out, int *matched, int *amb, int *used) {
+    RxSparse *V = &W->sp[2];
+    uint32_t nout = 0, i;
+    size_t top = 0;
+    *matched = 0;
+    *amb = 0;
+    *used = 0;
+    rx_sp_clear(V);
+    for (i = 0; i < npc; i++) {
+        W->stk[top].pc = (int32_t)pcs[i];
+        top = 1;
+        while (top) {
+            uint32_t pc = (uint32_t)W->stk[--top].pc;
+            for (;;) {
+                const RxInst *I;
+                if (!pc || rx_sp_has(V, pc)) break;
+                rx_sp_add(V, pc);
+                I = &pg->ins[pc];
+                switch (I->op) {
+                case RXO_JMP:
+                case RXO_SAVE:
+                case RXO_MARK:
+                    pc = (uint32_t)I->x;
+                    continue;
+                case RXO_SPLIT:
+                case RXO_CHK:
+                    W->stk[top++].pc = I->y;
+                    pc = (uint32_t)I->x;
+                    continue;
+                case RXO_ASSERT: {
+                    int h = rx_dholds(I->aux, B, A);
+                    if ((A & 16u) && (I->aux == RXA_WB || I->aux == RXA_NWB)) *used = 1;
+                    if (h < 0) {
+                        *amb = 1;
+                        return nout;
+                    }
+                    if (h) {
+                        pc = (uint32_t)I->x;
+                        continue;
+                    }
+                    break;
+                }
+                case RXO_BYTE:
+                case RXO_SET:
+                case RXO_SWITCH:
+                    out[nout++] = pc;
+                    break;
+                case RXO_MATCH:
+                    *matched = 1;
+                    if (cut) return nout;
+                    break;
+                default:
+                    break;
+                }
+                break;
+            }
+        }
+    }
+    return nout;
+}
+
+static uint32_t rx_dhash(const uint32_t *pcs, uint32_t n, unsigned key) {
+    uint32_t h = 2166136261u ^ key;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        h ^= pcs[i];
+        h *= 16777619u;
+    }
+    return h ^ (h >> 15);
+}
+
+static size_t rx_dfa_bytes(const RxDfa *D, uint32_t capst, uint32_t cappool, uint32_t hcap,
+                           int ta) {
+    size_t row = (size_t)D->stride * sizeof(uint32_t);
+    return (size_t)capst * (row + sizeof(RxDSt) + (ta ? row * 4 : 0)) +
+           (size_t)cappool * sizeof(uint32_t) + (size_t)hcap * sizeof(int32_t);
+}
+
+/* Forget every state; buffers stay (clear and continue). */
+static void rx_dfa_clear(RxDfa *D) {
+    uint32_t f;
+    D->nst = 0;
+    D->npool = 0;
+    if (D->ht) memset(D->ht, 0xFF, sizeof(int32_t) * D->hcap);
+    for (f = 0; f < 32; f++) D->start[f] = RX_T_UNK;
+}
+
+static void rx_dfa_free(RxDfa *D) {
+    free(D->T);
+    free(D->TA);
+    free(D->st);
+    free(D->pool);
+    free(D->ht);
+    memset(D, 0, sizeof(*D));
+}
+
+/* Transition value into state index ti. */
+static inline uint32_t rx_dfa_val(const RxDfa *D, uint32_t ti) {
+    const RxDSt *Y = &D->st[ti];
+    uint32_t v = ti << D->shift;
+    if (Y->m) v |= RX_T_MATCH;
+    if (Y->npc == 0 || (Y->idle && D->pf_on)) v |= RX_T_SPEC;
+    return v;
+}
+
+/* Idle states are special only while the prefilter runs: retag every
+ * cached transition into one. */
+static void rx_dfa_set_pf(RxDfa *D, int on) {
+    size_t i, nt;
+    if (D->pf_on == on) return;
+    D->pf_on = on;
+    nt = (size_t)D->nst << D->shift;
+    for (i = 0; i < nt; i++) {
+        uint32_t v = D->T[i];
+        if (v < RX_T_VIOL && D->st[(v & RX_T_SID) >> D->shift].idle)
+            D->T[i] = on ? v | RX_T_SPEC : v & ~RX_T_SPEC;
+    }
+    if (D->TA) {
+        for (i = 0; i < nt * 4; i++) {
+            uint32_t v = D->TA[i];
+            if (v < RX_T_VIOL && D->st[(v & RX_T_SID) >> D->shift].idle)
+                D->TA[i] = on ? v | RX_T_SPEC : v & ~RX_T_SPEC;
+        }
+    }
+}
+
+/* Room for one more state (rows, info, TA). 0 OOM, -2 over budget. */
+static int rx_dfa_room(RxDfa *D) {
+    uint32_t nc;
+    size_t row = (size_t)D->stride * sizeof(uint32_t);
+    void *p;
+    if (D->nst < D->capst) return 1;
+    nc = D->capst ? D->capst * 2 : 64;
+    if ((size_t)nc << D->shift > RX_T_SID) return -2;
+    if (rx_dfa_bytes(D, nc, D->cappool, D->hcap, D->TA != NULL) > RX_DFA_MEM && D->nst > 8)
+        return -2;
+    p = realloc(D->T, (size_t)nc * row);
+    if (!p) return 0;
+    D->T = (uint32_t *)p;
+    p = realloc(D->st, (size_t)nc * sizeof(RxDSt));
+    if (!p) return 0;
+    D->st = (RxDSt *)p;
+    if (D->TA) {
+        p = realloc(D->TA, (size_t)nc * row * 4);
+        if (!p) return 0;
+        D->TA = (uint32_t *)p;
+    }
+    D->capst = nc;
+    return 1;
+}
+
+/* State index; -1 OOM; -2 over the memory budget (caller clears). */
+static int32_t rx_dfa_intern(RxDfa *D, const uint32_t *pcs, uint32_t n, unsigned fl,
+                             unsigned m) {
+    uint32_t h, i, key;
+    int32_t si;
+    RxDSt *S;
+    int r;
+    if (n == 0 && !(fl & RX_FL_USED)) fl = 0; /* dead; a pending assumption stays */
+    key = fl | (m << 16);
+    h = rx_dhash(pcs, n, key);
+    if (D->hcap) {
+        for (si = D->ht[h & (D->hcap - 1)]; si >= 0; si = D->st[si].chain) {
+            const RxDSt *x = &D->st[si];
+            if (x->hash == h && x->npc == n && x->fl == fl && x->m == m &&
+                (!n || !memcmp(D->pool + x->off, pcs, sizeof(uint32_t) * n)))
+                return si;
+        }
+    }
+    r = rx_dfa_room(D);
+    if (r <= 0) return r == 0 ? -1 : -2;
+    if (D->npool + n > D->cappool) {
+        uint32_t nc = D->cappool ? D->cappool : 256;
+        void *p;
+        while (nc < D->npool + n) nc *= 2;
+        if (rx_dfa_bytes(D, D->capst, nc, D->hcap, D->TA != NULL) > RX_DFA_MEM && D->nst > 8)
+            return -2;
+        p = realloc(D->pool, sizeof(uint32_t) * nc);
+        if (!p) return -1;
+        D->pool = (uint32_t *)p;
+        D->cappool = nc;
+    }
+    if (D->nst + 1 > D->hcap / 2) {
+        uint32_t nc = D->hcap ? D->hcap * 2 : 256, b;
+        int32_t *ht = (int32_t *)malloc(sizeof(int32_t) * nc);
+        if (!ht) return -1;
+        memset(ht, 0xFF, sizeof(int32_t) * nc);
+        for (i = 0; i < D->nst; i++) {
+            b = D->st[i].hash & (nc - 1);
+            D->st[i].chain = ht[b];
+            ht[b] = (int32_t)i;
+        }
+        free(D->ht);
+        D->ht = ht;
+        D->hcap = nc;
+    }
+    si = (int32_t)D->nst++;
+    S = &D->st[si];
+    S->off = D->npool;
+    S->npc = n;
+    S->hash = h;
+    S->fl = (uint16_t)fl;
+    S->m = (uint8_t)m;
+    S->idle = !D->rev && !m && n == 1 && pcs[0] == D->pg->ustart;
+    if (n) memcpy(D->pool + D->npool, pcs, sizeof(uint32_t) * n);
+    D->npool += n;
+    memset(D->T + ((size_t)si << D->shift), 0xFF, sizeof(uint32_t) * D->stride);
+    if (D->TA) memset(D->TA + ((size_t)si << D->shift) * 4, 0xFF, sizeof(uint32_t) * 4 * D->stride);
+    S->chain = D->ht[h & (D->hcap - 1)];
+    D->ht[h & (D->hcap - 1)] = si;
+    return si;
+}
+
+/* Intern with one clear on overflow (*reset = 1: every cached id died). */
+static int32_t rx_dfa_get(RtxRxScratch *S, RxDfa *D, const uint32_t *pcs, uint32_t n,
+                          unsigned fl, unsigned m, int *reset) {
+    int32_t si = rx_dfa_intern(D, pcs, n, fl, m);
+    if (si == -2) {
+        rx_dfa_clear(D);
+        S->dfa_resets++;
+        *reset = 1;
+        si = rx_dfa_intern(D, pcs, n, fl, m);
+    }
+    return si;
+}
+
+static int rx_dfa_bind(RxDfa *D, const RtxRx *rx, int rev) {
+    uint32_t stride = 4, shift = 2;
+    if (D->rx == rx && D->rx_id == rx->id) return 1;
+    while (stride < rx->ncls) {
+        stride <<= 1;
+        shift++;
+    }
+    if (D->stride != stride) {
+        /* rows change size: drop the tables */
+        rx_dfa_free(D);
+    }
+    D->rx = rx;
+    D->rx_id = rx->id;
+    D->pg = rev ? &rx->rev : &rx->fwd;
+    D->rev = rev;
+    D->stride = stride;
+    D->shift = shift;
+    D->pf_on = 0;
+    rx_dfa_clear(D);
+    return 1;
+}
+
+/* Premultiplied start state for context `fl`; RX_T_UNK on failure. */
+static uint32_t rx_dfa_start(RtxRxScratch *S, RxDfa *D, unsigned fl, int *reset) {
+    uint32_t pc;
+    int32_t si;
+    int k = (fl & ~(15u | RX_FL_ASSUME)) ? -1 : (int)((fl & 15u) | ((fl & RX_FL_ASSUME) ? 16u : 0u));
+    if (k >= 0 && D->start[k] != RX_T_UNK) return D->start[k];
+    pc = D->rev ? D->pg->start : D->pg->ustart;
+    si = rx_dfa_get(S, D, &pc, 1, fl, 0, reset);
+    if (si < 0) return RX_T_UNK;
+    if (k < 0) return (uint32_t)si << D->shift; /* mid-scalar start: interned, not memoized */
+    D->start[k] = (uint32_t)si << D->shift;
+    return D->start[k];
+}
+
+/* Compute (and cache) the transition of state index si on byte b at the
+ * boundary q of t[0, n) (fwd: b = t[q]; rev: b = t[q - 1]). RX_T_UNK on
+ * failure. *reset: the cache was cleared (only the result is valid). */
+static uint32_t rx_dfa_step(RtxRxScratch *S, RxWork *W, RxDfa *D, uint32_t si, unsigned b,
+                            const unsigned char *t, size_t q, size_t n, int *reset) {
+    const RtxRx *rx = D->rx;
+    size_t slot = ((size_t)si << D->shift) + rx->cls[b];
+    uint32_t v = D->T[slot], nl, nt = 0, i, key = 0, npc;
+    const uint32_t *pcs;
+    unsigned B, A, nfl, fl;
+    int matched = 0, amb = 0, exact = 0, used = 0;
+    int32_t ti;
+    *reset = 0;
+    if (v <= RX_T_VIOL) return v; /* computed, or a broken assumption */
+    fl = D->st[si].fl;
+    npc = D->st[si].npc;
+    pcs = D->pool + D->st[si].off;
+    if (D->rev) {
+        A = fl;
+        B = rx_binfo(b);
+    } else {
+        if ((fl & RX_FL_USED) && RX_FL_REM(fl) && (b < 0x80 || b >= 0xC0)) {
+            /* a \b took this scalar for valid UTF-8 and it is not */
+            D->T[slot] = RX_T_VIOL;
+            return RX_T_VIOL;
+        }
+        B = fl;
+        A = rx_ainfo_fwd(rx, b, fl & RX_FL_ASSUME);
+    }
+    if (v == RX_T_UNK) {
+        nl = rx_resolve(D->pg, W, pcs, npc, B, A, !D->rev, W->lbuf, &matched, &amb, &used);
+        if (amb) D->T[slot] = RX_T_AMB;
+    } else {
+        amb = 1;
+    }
+    if (amb) {
+        unsigned wb = (unsigned)rx_word_before(t, q), wa = (unsigned)rx_word_after(t, q, n);
+        key = (wb << 1) | wa;
+        if (D->TA) {
+            v = D->TA[slot * 4 + key];
+            if (v < RX_T_AMB) return v;
+        }
+        B = (B & 3u) | (wb ? 4u : 0u);
+        A = (A & 3u) | (wa ? 4u : 0u);
+        nl = rx_resolve(D->pg, W, pcs, npc, B, A, !D->rev, W->lbuf, &matched, &amb, &used);
+        if (amb) return RX_T_UNK;
+        exact = 1;
+    }
+    if (D->rev) nfl = !rx->asserts ? 0 : !rx->wb ? (b == '\n' ? 1u : 0u) : rx_binfo(b);
+    else nfl = rx_fl_fwd(rx, fl, b, used);
+    rx_sp_clear(&W->sp[1]);
+    for (i = 0; i < nl; i++) {
+        uint32_t tgt = rx_step(D->pg, &D->pg->ins[W->lbuf[i]], b);
+        if (tgt && !rx_sp_has(&W->sp[1], tgt)) {
+            rx_sp_add(&W->sp[1], tgt);
+            W->tbuf[nt++] = tgt;
+        }
+    }
+    ti = rx_dfa_get(S, D, W->tbuf, nt, nfl, matched ? 1u : 0u, reset);
+    if (ti < 0) return RX_T_UNK;
+    v = rx_dfa_val(D, (uint32_t)ti);
+    if (*reset) return v;
+    if (!exact) {
+        D->T[slot] = v;
+    } else {
+        if (!D->TA && rx_dfa_bytes(D, D->capst, D->cappool, D->hcap, 1) <= RX_DFA_MEM) {
+            size_t cells = ((size_t)D->capst << D->shift) * 4;
+            D->TA = (uint32_t *)malloc(sizeof(uint32_t) * cells);
+            if (D->TA) memset(D->TA, 0xFF, sizeof(uint32_t) * cells);
+        }
+        if (D->TA) D->TA[slot * 4 + key] = v;
+    }
+    return v;
+}
+
+/* Final resolve with no byte after (fwd: text end; rev: at `lo`, B given)
+ * at boundary q of t[0, n). A \\b beside non-ASCII reads the scalars. */
+static int rx_dfa_final(RxDfa *D, RxWork *W, uint32_t si, unsigned B, unsigned A,
+                        const unsigned char *t, size_t q, size_t n,
+                        int *matched, int *live) {
+    const uint32_t *pcs = D->pool + D->st[si].off;
+    uint32_t npc = D->st[si].npc;
+    uint32_t nl, i;
+    int amb, used;
+    nl = rx_resolve(D->pg, W, pcs, npc, B, A, !D->rev, W->lbuf, matched, &amb, &used);
+    if (amb) {
+        B = (B & 3u) | (rx_word_before(t, q) ? 4u : 0u);
+        A = (A & 3u) | (rx_word_after(t, q, n) ? 4u : 0u);
+        nl = rx_resolve(D->pg, W, pcs, npc, B, A, !D->rev, W->lbuf, matched, &amb, &used);
+        if (amb) return 0;
+    }
+    *live = 0;
+    for (i = 0; i < nl; i++)
+        if (W->lbuf[i] != D->pg->uany) *live = 1;
+    return 1;
+}
+
+#define RX_TRACK_TAIL 4096          /* bytes before the end where idle offsets are noted */
+#define RX_PF_RETRY ((size_t)1 << 20) /* a dense prefilter sleeps this long */
+#define RX_DFA_VIOL (-3)             /* the valid-UTF-8 assumption broke: rerun exact */
+
+/* A \\b that assumed the scalar in progress is valid UTF-8 still holds
+ * if its continuation bytes are in the text (checked when the search
+ * leaves the state before they were read). */
+static int rx_fl_pending_ok(const RxDfa *D, uint32_t si, const unsigned char *t, size_t p,
+                            size_t n) {
+    unsigned fl = D->st[si].fl, r = RX_FL_REM(fl), k;
+    if (D->rev || !(fl & RX_FL_USED) || !r) return 1;
+    if (p + r > n) return 0;
+    for (k = 0; k < r; k++)
+        if ((t[p + k] & 0xC0) != 0x80) return 0;
+    return 1;
+}
+
+/* Forward leftmost-first. 1 match (*end), 0 none, 2 partial (*end may be
+ * unset; *idle = last idle offset), -1 give up, RX_DFA_VIOL rerun with
+ * assume = 0. use_pf: skip from idle states with the literal prefilter;
+ * assume: leads of all-word ranges are valid UTF-8 (see RX_FL_ASSUME). */
+static int rx_dfa_fwd(RtxRxScratch *S, RxWork *W, const RtxRx *rx, const RtxRxIn *in,
+                      size_t lo, size_t stop, int eof, int use_pf, int assume, size_t *end,
+                      size_t *idle) {
+    RxDfa *D = &W->fwd;
+    const unsigned char *t = (const unsigned char *)in->s;
+    const uint8_t *cls = rx->cls;
+    size_t n = in->n, p = lo, last = RTX_RX_UNSET, reset_at = lo, track, retry = RTX_RX_UNSET;
+    size_t finds0 = W->pf_finds, bytes0 = W->pf_bytes;
+    const uint32_t *T;
+    uint32_t s, v, shift;
+    unsigned mode = assume ? RX_FL_ASSUME : 0u;
+    int reset = 0, resets = 0;
+    if (!rx_dfa_bind(D, rx, 0)) return -1;
+    /* a literal prefilter, else a first-byte set scan (both rest when dense) */
+    use_pf = use_pf && (rx->pf.n || rx->nfirst < 256);
+    rx_dfa_set_pf(D, use_pf);
+    shift = D->shift;
+    s = rx_dfa_start(S, D, rx_fl_at(rx, in, lo, mode), &reset);
+    if (s == RX_T_UNK) return -1;
+    T = D->T;
+    *idle = lo;
+    /* Past `track` the loop notes idle offsets (a partial answer needs
+     * the last one) and stops at `stop` once idle. At eof only the stop
+     * matters. */
+    track = stop < n ? stop : n;
+    if (!eof) track = track > lo + RX_TRACK_TAIL ? track - RX_TRACK_TAIL : lo;
+    if (use_pf) goto on_idle;
+    for (;;) {
+        size_t fend = track < retry ? track : retry;
+        if (p < fend) {
+            /* Hot loop: one table load per byte; any tag leaves. */
+            while (p + 4 <= fend) {
+                uint32_t a = T[s + cls[t[p]]], b, c, d;
+                if (a >= RX_T_TAG) {
+                    v = a;
+                    goto tagged;
+                }
+                b = T[a + cls[t[p + 1]]];
+                if (b >= RX_T_TAG) {
+                    s = a;
+                    p += 1;
+                    v = b;
+                    goto tagged;
+                }
+                c = T[b + cls[t[p + 2]]];
+                if (c >= RX_T_TAG) {
+                    s = b;
+                    p += 2;
+                    v = c;
+                    goto tagged;
+                }
+                d = T[c + cls[t[p + 3]]];
+                if (d >= RX_T_TAG) {
+                    s = c;
+                    p += 3;
+                    v = d;
+                    goto tagged;
+                }
+                s = d;
+                p += 4;
+            }
+            while (p < fend) {
+                v = T[s + cls[t[p]]];
+                if (v >= RX_T_TAG) goto tagged;
+                s = v;
+                p++;
+            }
+            continue;
+        }
+        if (p >= retry) {
+            /* the prefilter's rest is over: try it again */
+            retry = RTX_RX_UNSET;
+            rx_dfa_set_pf(D, 1);
+            finds0 = W->pf_finds;
+            bytes0 = W->pf_bytes;
+            if (D->st[s >> shift].idle) goto on_idle;
+            continue;
+        }
+        if (p >= n) break;
+        /* Tail: note idle offsets byte by byte (a partial result restarts
+         * the Pike VM from the last one). */
+        if (D->st[s >> shift].idle) {
+            *idle = p;
+            if (p >= stop) return rx_fl_pending_ok(D, s >> shift, t, p, n) ? RTX_RX_NONE : RX_DFA_VIOL;
+        }
+        v = T[s + cls[t[p]]];
+        if (v < RX_T_TAG) {
+            s = v;
+            p++;
+            continue;
+        }
+    tagged:
+        if (v == RX_T_AMB && D->TA) {
+            /* \\b beside non-ASCII seen before: its exact variant */
+            uint32_t k = (rx_word_before(t, p) ? 2u : 0u) | (rx_word_after(t, p, n) ? 1u : 0u);
+            uint32_t w = D->TA[((size_t)s + cls[t[p]]) * 4 + k];
+            if (w < RX_T_VIOL) v = w;
+        }
+        if (v >= RX_T_VIOL) {
+            v = rx_dfa_step(S, W, D, s >> shift, t[p], t, p, n, &reset);
+            if (v == RX_T_UNK) return -1;
+            if (v == RX_T_VIOL) return RX_DFA_VIOL;
+            T = D->T;
+            if (reset) {
+                /* The cache thrashes when it refills every few KiB: Pike. */
+                resets++;
+                if (p - reset_at < ((size_t)64 << 10) && resets > 4) {
+                    S->dfa_giveups++;
+                    return -1;
+                }
+                reset_at = p;
+            }
+        }
+        p++;
+        s = v & RX_T_SID;
+        if (v & RX_T_MATCH) last = p - 1;
+        if (!(v & RX_T_SPEC)) continue;
+        if (D->st[s >> shift].npc == 0) {
+            if (!rx_fl_pending_ok(D, s >> shift, t, p, n)) return RX_DFA_VIOL;
+            if (last != RTX_RX_UNSET) {
+                *end = last;
+                return RTX_RX_MATCH;
+            }
+            return RTX_RX_NONE;
+        }
+    on_idle:
+        /* Idle with the prefilter on: no candidate is open here. */
+        *idle = p;
+        if (p >= stop) return rx_fl_pending_ok(D, s >> shift, t, p, n) ? RTX_RX_NONE : RX_DFA_VIOL;
+        {
+            size_t q = rx_skip(rx, W, t, p, n);
+            size_t nf = W->pf_finds - finds0;
+            if (nf >= 64 && W->pf_bytes - bytes0 < nf * 24) {
+                /* Candidates every few bytes: the table walk is faster.
+                 * Rest the prefilter, then measure again. */
+                rx_dfa_set_pf(D, 0);
+                T = D->T;
+                retry = p + RX_PF_RETRY;
+            }
+            if (q > p) {
+                unsigned f;
+                if (!rx_fl_pending_ok(D, s >> shift, t, p, n)) return RX_DFA_VIOL;
+                if (q >= stop) return RTX_RX_NONE;
+                p = q;
+                *idle = p;
+                f = rx_fl_at(rx, in, p, mode);
+                if (f != D->st[s >> shift].fl) {
+                    s = rx_dfa_start(S, D, f, &reset);
+                    if (s == RX_T_UNK) return -1;
+                    T = D->T;
+                }
+            }
+        }
+    }
+    {
+        int matched = 0, live = 0;
+        uint32_t si = s >> shift;
+        if (!rx_fl_pending_ok(D, si, t, n, n)) return RX_DFA_VIOL;
+        if (!rx_dfa_final(D, W, si, D->st[si].fl, 1u | 2u, t, n, n, &matched, &live))
+            return -1;
+        if (matched) last = n;
+        if (D->st[si].idle) *idle = n;
+        if (!eof && live) {
+            *end = last;
+            return 2;
+        }
+    }
+    if (last != RTX_RX_UNSET) {
+        *end = last;
+        return RTX_RX_MATCH;
+    }
+    return RTX_RX_NONE;
+}
+
+/* Reverse longest from `e` down to `lo`: smallest start. -1 give up. */
+static int rx_dfa_rev(RtxRxScratch *S, RxWork *W, const RtxRx *rx, const RtxRxIn *in,
+                      size_t lo, size_t e, size_t *start) {
+    RxDfa *D = &W->rev;
+    const unsigned char *t = (const unsigned char *)in->s;
+    const uint8_t *cls = rx->cls;
+    size_t n = in->n, p = e, best = RTX_RX_UNSET;
+    const uint32_t *T;
+    uint32_t s, v, shift;
+    unsigned fl0;
+    int reset = 0;
+    if (!rx_dfa_bind(D, rx, 1)) return -1;
+    shift = D->shift;
+    fl0 = e < n ? (rx->wb ? rx_binfo(t[e]) : (t[e] == '\n' ? 1u : 0u)) : (1u | 2u);
+    if (!rx->asserts) fl0 = 0;
+    s = rx_dfa_start(S, D, fl0, &reset);
+    if (s == RX_T_UNK) return -1;
+    T = D->T;
+    while (p > lo) {
+        v = T[s + cls[t[p - 1]]];
+        if (v < RX_T_TAG) {
+            s = v;
+            p--;
+            continue;
+        }
+        if (v >= RX_T_VIOL) {
+            v = rx_dfa_step(S, W, D, s >> shift, t[p - 1], t, p, n, &reset);
+            if (v == RX_T_UNK) return -1;
+            T = D->T;
+        }
+        p--;
+        s = v & RX_T_SID;
+        if (v & RX_T_MATCH) best = p + 1;
+        if ((v & RX_T_SPEC) && D->st[s >> shift].npc == 0) break;
+    }
+    if (p == lo && D->st[s >> shift].npc) {
+        int matched = 0, live = 0;
+        uint32_t si = s >> shift;
+        unsigned B = lo == 0 ? (((in->ctx & RTX_RX_CTX_BOL0) ? 1u : 0u) |
+                                ((in->ctx & RTX_RX_CTX_BOT0) ? 2u : 0u))
+                             : rx_binfo(t[lo - 1]);
+        if (!rx_dfa_final(D, W, si, B, D->st[si].fl, t, lo, n, &matched, &live)) return -1;
+        if (matched) best = lo;
+    }
+    if (best == RTX_RX_UNSET) return 0;
+    *start = best;
+    return 1;
+}
+
+/* --------------------------------------------------------------- entry */
+
+int rtx_rx_at(const RtxRx *rx, const RtxRxIn *in, size_t at, RtxRxScratch *s,
+              size_t *end, RtxRxCaps *caps) {
+    const unsigned char *t;
+    RxWork *W;
+    size_t e = 0, budget, ms = 0, me = 0;
+    size_t *slots;
+    int r;
+    uint32_t g;
+    if (!rx || !in || !s || !end) return RTX_RX_NONE;
+    if (at > in->n) return RTX_RX_NONE;
+    t = (const unsigned char *)in->s;
+    if (!rx->nullable) {
+        if (at >= in->n || !rtx_rx_can_start(rx, t[at])) return RTX_RX_NONE;
+    }
+    if (rx->pf_exact && !in->force) {
+        const RxLit *L = &rx->pf.lit[0];
+        if (L->m > in->n - at || !rx_lit_at(L, t, at)) return RTX_RX_NONE;
+        *end = at + L->m;
+        if (caps) {
+            for (g = 0; g < RTX_RX_CAPS; g++) caps->s[g] = caps->e[g] = RTX_RX_UNSET;
+            caps->s[0] = at;
+            caps->e[0] = *end;
+        }
+        return RTX_RX_MATCH;
+    }
+    if (rx->lit && !in->force) {
+        if (rx->pren > in->n - at || memcmp(t + at, rx->pre, rx->pren)) return RTX_RX_NONE;
+        *end = at + rx->pren;
+        if (caps) {
+            for (g = 0; g < RTX_RX_CAPS; g++) caps->s[g] = caps->e[g] = RTX_RX_UNSET;
+            caps->s[0] = at;
+            caps->e[0] = *end;
+        }
+        return RTX_RX_MATCH;
+    }
+    W = rx_work(s, rx);
+    if (!W) return RTX_RX_NONE;
+    budget = in->budget ? in->budget : RTX_RX_BUDGET_DEFAULT;
+    slots = W->bt_caps;
+    if (rx->mode == RTX_RX_BACKTRACK || in->force == 2 ||
+        (caps && rx->cap_loop && in->force != 1)) {
+        r = rx_bt_at(rx, in, s, W, at, budget, slots, &e);
+    } else {
+        r = rx_pike(rx, in, W, at, at + 1, 1, 1, rx->nslot, budget, slots, &ms, &me);
+        e = me;
+    }
+    if (r == RTX_RX_BUDGET) {
+        s->budget_hits++;
+        rtx_rx_note_budget(1);
+        return RTX_RX_BUDGET;
+    }
+    if (r != RTX_RX_MATCH) return RTX_RX_NONE;
+    *end = e;
+    if (caps) {
+        for (g = 0; g < RTX_RX_CAPS; g++) {
+            if (g < rx->ncap) {
+                caps->s[g] = slots[2 * g];
+                caps->e[g] = slots[2 * g + 1];
+            } else {
+                caps->s[g] = caps->e[g] = RTX_RX_UNSET;
+            }
+        }
+        caps->s[0] = at;
+        caps->e[0] = e;
+    }
+    return RTX_RX_MATCH;
+}
+
+/* A literal search with no whole hit before `stop`, window not at eof:
+ * the leftmost start in [lo, stop) whose literal runs past n with every
+ * byte so far matching is a leftover (RTX_RX_PARTIAL). L (sets) or pre. */
+static int rx_lit_tail(const RxLit *L, const unsigned char *pre, size_t m,
+                       const unsigned char *t, size_t lo, size_t stop, size_t n, size_t *ms) {
+    size_t q, i;
+    if (L) m = L->m;
+    q = n >= m ? n - m + 1 : 0;
+    if (q < lo) q = lo;
+    for (; q < stop && q < n; q++) {
+        for (i = 0; q + i < n; i++) {
+            unsigned b = t[q + i];
+            if (L ? !(L->set[i * 32 + (b >> 3)] & (1u << (b & 7))) : b != pre[i]) break;
+        }
+        if (q + i == n) {
+            *ms = q;
+            return RTX_RX_PARTIAL;
+        }
+    }
+    return RTX_RX_NONE;
+}
+
+static int rx_search_bt(const RtxRx *rx, const RtxRxIn *in, RtxRxScratch *s, RxWork *W,
+                        size_t lo, size_t stop, int eof, size_t *ms, size_t *me) {
+    const unsigned char *t = (const unsigned char *)in->s;
+    size_t p = lo, e = 0, budget = in->budget ? in->budget : RTX_RX_BUDGET_DEFAULT;
+    while (p < stop) {
+        int r;
+        if (!rx->nullable) {
+            p = rx_skip(rx, W, t, p, in->n);
+            if (p >= stop || p >= in->n) break;
+        }
+        r = rx_bt_at(rx, in, s, W, p, budget, W->bt_caps, &e);
+        if (r == RTX_RX_MATCH) {
+            *ms = p;
+            *me = e;
+            if (!eof && e >= in->n) return RTX_RX_PARTIAL;
+            return RTX_RX_MATCH;
+        }
+        if (r == RTX_RX_BUDGET) {
+            s->budget_hits++;
+            rtx_rx_note_budget(1);
+        }
+        p++;
+    }
+    return RTX_RX_NONE;
+}
+
+int rtx_rx_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t stop, int eof,
+                  RtxRxScratch *s, size_t *ms, size_t *me) {
+    const unsigned char *t;
+    RxWork *W;
+    size_t n;
+    if (!rx || !in || !s || !ms || !me) return RTX_RX_NONE;
+    n = in->n;
+    t = (const unsigned char *)in->s;
+    if (stop > n) stop = n;
+    if (lo >= stop) return RTX_RX_NONE;
+    if (rx->pf_exact && !in->force) {
+        size_t h = rx_pf_find(&rx->pf, t, lo, n);
+        const RxLit *L = &rx->pf.lit[0];
+        if (h < n && h < stop) {
+            *ms = h;
+            *me = h + L->m;
+            return RTX_RX_MATCH;
+        }
+        return eof ? RTX_RX_NONE : rx_lit_tail(L, NULL, 0, t, lo, stop, n, ms);
+    }
+    if (rx->lit && !in->force) {
+        const void *h;
+        if (!rx->pren) return RTX_RX_NONE;
+        h = memmem(t + lo, n - lo, rx->pre, rx->pren);
+        if (h && (size_t)((const unsigned char *)h - t) < stop) {
+            *ms = (size_t)((const unsigned char *)h - t);
+            *me = *ms + rx->pren;
+            return RTX_RX_MATCH;
+        }
+        return eof ? RTX_RX_NONE
+                   : rx_lit_tail(NULL, (const unsigned char *)rx->pre, rx->pren, t, lo, stop, n, ms);
+    }
+    W = rx_work(s, rx);
+    if (!W) return RTX_RX_NONE;
+    W->pf_t = NULL; /* the prefilter memo lives for one call: a buffer may be refilled */
+    if (rx->dfa && (!in->force || in->force == 3)) {
+        size_t end = RTX_RX_UNSET, idle = lo, st = 0;
+        int r = rx_dfa_fwd(s, W, rx, in, lo, stop, eof, !in->force, 1, &end, &idle);
+        if (r == RX_DFA_VIOL) {
+            /* broken UTF-8 beside a \b: exact look-ahead from the text */
+            s->dfa_exact++;
+            idle = lo;
+            r = rx_dfa_fwd(s, W, rx, in, lo, stop, eof, !in->force, 0, &end, &idle);
+        }
+        if (r == RTX_RX_NONE) return RTX_RX_NONE;
+        if (r == 2) {
+            /* Undecided at the text end. The DFA spawns starts past `stop`
+             * and cannot name the earliest live one; the Pike VM can, from
+             * the last offset where no candidate was open. Window edges
+             * only, so this stays rare. */
+            size_t from = idle < lo ? lo : idle;
+            return rx_pike(rx, in, W, from, stop, 0, eof, 2, 0, W->bt_caps, ms, me);
+        }
+        if (r == RTX_RX_MATCH) {
+            int rr = rx_dfa_rev(s, W, rx, in, lo, end, &st);
+            if (rr > 0) {
+                if (st >= stop) return RTX_RX_NONE;
+                *ms = st;
+                *me = end;
+                return RTX_RX_MATCH;
+            }
+            /* reverse gave up: the Pike VM decides */
+        }
+    }
+    if (rx->mode == RTX_RX_BACKTRACK || in->force == 2)
+        return rx_search_bt(rx, in, s, W, lo, stop, eof, ms, me);
+    return rx_pike(rx, in, W, lo, stop, 0, eof, 2, 0, W->bt_caps, ms, me);
+}

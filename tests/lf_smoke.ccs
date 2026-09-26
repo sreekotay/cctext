@@ -1,0 +1,150 @@
+#!ccc ccs
+/*
+ * Line-feed counter (core/lf.ccs) against a byte loop: every path this CPU
+ * has (SWAR, SSE2 / NEON, AVX2), random buffers at random alignments,
+ * lengths 0..65 and up to a few MiB, sparse / dense / all-newline bytes
+ * and 0x8A (a newline with the high bit set) as a decoy.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/lf.cch"
+
+#define NONE ((size_t)-1)
+
+static int fails = 0;
+static unsigned long long rng = 0x9E3779B97F4A7C15ULL;
+
+static unsigned rnd(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return (unsigned)(rng >> 16);
+}
+
+static size_t ref_count(const char *p, size_t n) {
+    size_t c = 0, i;
+    for (i = 0; i < n; i++) c += p[i] == '\n';
+    return c;
+}
+
+static size_t ref_nth(const char *p, size_t n, size_t k, size_t *seen) {
+    size_t s = 0, i;
+    for (i = 0; i < n && k; i++) {
+        if (p[i] == '\n' && ++s == k) {
+            *seen = s;
+            return i;
+        }
+    }
+    *seen = s;
+    return NONE;
+}
+
+static size_t ref_last(const char *p, size_t n) {
+    while (n > 0) {
+        n--;
+        if (p[n] == '\n') return n;
+    }
+    return NONE;
+}
+
+static void fill(char *p, size_t n, int mode) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        unsigned r = rnd();
+        char c = (char)(r >> 5);
+        if (c == '\n') c = 'x';
+        switch (mode) {
+        case 0: /* all newlines */
+            c = '\n';
+            break;
+        case 1: /* dense */
+            if (r % 3 == 0) c = '\n';
+            break;
+        case 2: /* lines ~40 bytes, decoys */
+            if (r % 41 == 0) c = '\n';
+            else if (r % 43 == 0) c = (char)0x8A;
+            break;
+        case 3: /* sparse */
+            if (r % 4099 == 0) c = '\n';
+            break;
+        default: /* none */
+            break;
+        }
+        p[i] = c;
+    }
+}
+
+static void check(const char *p, size_t n, const char *impl) {
+    size_t c = ref_count(p, n), got, seen, rs, want, ks[6], j;
+    got = rtx_count_lf(p, n);
+    if (got != c) {
+        fprintf(stderr, "FAIL %s count n=%zu got %zu want %zu\n", impl, n, got, c);
+        fails++;
+    }
+    ks[0] = 0;
+    ks[1] = 1;
+    ks[2] = c;
+    ks[3] = c + 1;
+    ks[4] = c ? 1 + rnd() % c : 1;
+    ks[5] = c > 64 ? c - 63 : 64;
+    for (j = 0; j < 6; j++) {
+        got = rtx_nth_lf(p, n, ks[j], &seen);
+        want = ref_nth(p, n, ks[j], &rs);
+        if (ks[j] == 0) rs = 0;
+        if (got != want || seen != rs) {
+            fprintf(stderr, "FAIL %s nth n=%zu k=%zu got %zu/%zu want %zu/%zu\n",
+                    impl, n, ks[j], got, seen, want, rs);
+            fails++;
+        }
+    }
+    got = rtx_last_lf(p, n);
+    want = ref_last(p, n);
+    if (got != want) {
+        fprintf(stderr, "FAIL %s last n=%zu got %zu want %zu\n", impl, n, got, want);
+        fails++;
+    }
+}
+
+int main(void) {
+    size_t big = (size_t)3 << 20;
+    char *buf = (char *)malloc(big + 128);
+    int lv, it, levels = 0;
+    size_t n, a;
+    if (!buf) return 1;
+    if (rtx_count_lf(NULL, 5) != 0 || rtx_last_lf(buf, 0) != NONE) {
+        fprintf(stderr, "FAIL empty\n");
+        fails++;
+    }
+    for (lv = RTX_LF_SWAR; lv <= RTX_LF_WIDE; lv++) {
+        const char *impl;
+        if (!rtx_lf_force(lv)) continue;
+        levels++;
+        impl = rtx_lf_impl();
+        /* Every length 0..65 at every alignment 0..63, each fill mode. */
+        for (n = 0; n <= 65; n++) {
+            for (a = 0; a < 64; a++) {
+                fill(buf + a, n, (int)((n + a) % 5));
+                check(buf + a, n, impl);
+            }
+        }
+        for (it = 0; it < 3000; it++) {
+            size_t lim = it % 50 == 0 ? big : (it % 5 == 0 ? 70000 : 3000);
+            n = rnd() % lim;
+            a = rnd() % 64;
+            fill(buf + a, n, it % 5);
+            check(buf + a, n, impl);
+        }
+        /* Past 255 accumulator rounds with every byte a newline. */
+        fill(buf, big, 0);
+        check(buf, big, impl);
+        check(buf + 1, big - 1, impl);
+        printf("lf_smoke: %s ok\n", impl);
+    }
+    rtx_lf_force(RTX_LF_BEST);
+    printf("lf_smoke: best %s, %d paths, %s\n", rtx_lf_impl(), levels,
+           fails ? "FAILED" : "ok");
+    free(buf);
+    return fails ? 1 : 0;
+}

@@ -23,9 +23,9 @@ esac
 
 export RTX_TARGETS="${RTX_TARGETS:-256}"
 if [[ "$(uname -s)" == Darwin ]]; then
-    export ASAN_OPTIONS="${ASAN_OPTIONS:-abort_on_error=1:print_legend=0}"
+    export ASAN_OPTIONS="${ASAN_OPTIONS:-abort_on_error=1:print_legend=0:fast_unwind_on_fatal=1}"
 else
-    export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=1:abort_on_error=1:print_legend=0}"
+    export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=1:abort_on_error=1:print_legend=0:fast_unwind_on_fatal=1}"
 fi
 export TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=1}"
 

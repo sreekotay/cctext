@@ -5,6 +5,7 @@
 #include <ccc/std/prelude.cch>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include "../core/document.cch"
 #include "../core/nav.cch"
@@ -12,21 +13,40 @@
 #include "../core/workspace.cch"
 #include "../core/find.cch"
 #include "../core/ui.cch"
+#include "../core/ui_proj.cch"
 #include "../core/browse.cch"
 #include "cctext.cch"
 
-int cctext_cmd_letter(int c) {
-    int cmd;
+/* Preview fill metrics (same as cctext_draw). */
+static double cctext_input_prev_measure(void *ctx, char[:] bytes, RtxStyle style,
+                                       RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return (double)rtx_utf8_cols(bytes);
+}
+
+static double cctext_input_prev_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+int g_cmd_row = -1;
+
+int cctext_kind_of_row(int row) {
+    const RtxCmdDef *d = row >= 0 ? rtx_cmd_at((size_t)row) : NULL;
     int nav;
-    if (c == 'h' || c == 'H') return KEY_APPLY;
-    if (c == '.') return KEY_APPLY_MENU;
-    cmd = rtx_cmd_from_letter(c);
-    nav = rtx_nav_from_cmd(cmd);
+    g_cmd_row = row;
+    if (!d) return KEY_NONE;
+    if (d->run) return KEY_CMD;
+    nav = rtx_nav_from_cmd(d->cmd);
     if (nav) {
         g_nav = nav;
         return KEY_NAV;
     }
-    switch (cmd) {
+    switch (d->cmd) {
         case CMD_QUIT: return KEY_QUIT;
         case CMD_SAVE: return KEY_SAVE;
         case CMD_UNDO: return KEY_UNDO;
@@ -37,8 +57,27 @@ int cctext_cmd_letter(int c) {
         case CMD_PANE: return KEY_OTHER_PANE;
         case CMD_NEXT: return KEY_NEXT_BUF;
         case CMD_SPLIT: return KEY_SPLIT;
+        case CMD_SPLIT_RIGHT: return KEY_SPLIT;
+        case CMD_SPLIT_DOWN: return KEY_SPLIT_DOWN;
+        case CMD_CLOSE: return KEY_CLOSE_BUF;
+        case CMD_CLOSE_OTHERS: return KEY_CLOSE_OTHERS;
+        case CMD_CLOSE_ALL: return KEY_CLOSE_ALL;
+        case CMD_BUF_NEXT: return KEY_TAB_NEXT;
+        case CMD_PREV: return KEY_PREV_BUF;
+        case CMD_PANE_CLOSE: return KEY_PANE_CLOSE;
+        case CMD_PANE_PREV: return KEY_PANE_PREV;
+        case CMD_PANE_MOVE: return KEY_PANE_MOVE;
+        case CMD_TABS: return KEY_TABS;
+        case CMD_PANE_LEFT:
+        case CMD_PANE_RIGHT:
+        case CMD_PANE_UP:
+        case CMD_PANE_DOWN:
+            g_nav = d->cmd == CMD_PANE_LEFT ? 1 : d->cmd == CMD_PANE_RIGHT ? 2
+                  : d->cmd == CMD_PANE_UP ? 3 : 4;
+            return KEY_PANE_NUDGE;
         case CMD_JUMP: return KEY_JUMP;
         case CMD_FIND: return KEY_FIND;
+        case CMD_OPEN:
         case CMD_BROWSE: return KEY_OPEN;
         case CMD_SEL_ALL: return KEY_SEL_ALL;
         case CMD_VIEW: return KEY_VIEW;
@@ -46,51 +85,133 @@ int cctext_cmd_letter(int c) {
         case CMD_WRAP: return KEY_WRAP;
         case CMD_FOLLOW: return KEY_FOLLOW;
         case CMD_STATS: return KEY_STATS;
+        case CMD_HELP: return KEY_HELP;
         case CMD_APPLY: return KEY_APPLY;
-        case CMD_APPLY_NAMED: return KEY_NONE;
         case CMD_APPLY_MENU: return KEY_APPLY_MENU;
-        default: return KEY_NONE;
+        case CMD_QUICK_OPEN: return KEY_QUICK_OPEN;
+        case CMD_PROJ_SEARCH: return KEY_PROJ_SEARCH;
+        case CMD_PROJ_NEXT: return KEY_PROJ_NEXT;
+        case CMD_PROJ_PREV: return KEY_PROJ_PREV;
+        case CMD_PROJ_REWALK: return KEY_PROJ_REWALK;
+        default: return KEY_CMD;
     }
 }
 
-static void cctext_find_absorb(RtxUi *ui) {
-    for (;;) {
-        int p = cctext_pending();
-        uint32_t cp;
-        if (p < 0) return;
-        if (p < 32 || p == 127) {
-            ungetc(p, stdin);
-            return;
-        }
-        if (p < 0x80) cp = (uint32_t)p;
-        else if (!cctext_decode_utf8(p, &cp)) {
-            return;
-        }
-        if (!rtx_ui_find_char(ui, (int)cp)) {
-            return;
-        }
-    }
+/* Esc-overlay / Alt letter: the command table's letters column. */
+int cctext_cmd_letter(int c) {
+    int row = rtx_cmd_letter_row(c);
+    return row < 0 ? KEY_NONE : cctext_kind_of_row(row);
 }
 
+/* Payload of KEY_TEXT / KEY_PASTE_TEXT (host-owned until the event is
+ * handled) and the notch count of a coalesced wheel event. */
+const char *g_text;
+size_t g_text_n;
+int g_wheel_n = 1;
+int g_wheel_at = 1; /* 0: this wheel event has no pointer cell */
+
+static int cctext_wheel_n(void) {
+    return g_wheel_n > 0 ? g_wheel_n : 1;
+}
+
+static char[:] cctext_text(void) {
+    return cc_slice_from_buffer((char *)g_text, g_text ? g_text_n : 0);
+}
+
+/* Next scalar of g_text at *i. 0 at the end or at a control (a field is
+ * one line: a paste feeds it up to the first newline). */
+static int cctext_text_cp(size_t *i, uint32_t *cp) {
+    int n;
+    if (!g_text || *i >= g_text_n) return 0;
+    n = rtx_utf8_decode(g_text + *i, g_text_n - *i, cp);
+    if (n <= 0) {
+        *cp = RTX_UTF8_FFFD;
+        n = 1;
+    }
+    if (*cp < 0x20 || *cp == 0x7F) return 0;
+    *i += (size_t)n;
+    return 1;
+}
+
+/* One `type` of the whole run is the same edit as a key per scalar only
+ * where a key has no pane policy (Rich hints / tables, hex nibbles, grid,
+ * box columns). */
+static int cctext_run_plain(const RtxBuf *b) {
+    return b && !b->layout.rich && !rtx_layout_is_hex(&b->layout) &&
+           !rtx_layout_is_grid(&b->layout) && !b->doc.sel_box &&
+           !RtxBuf_autopair_live(b);
+}
+
+/* stderr goes nowhere: a missing tool must not print over the frame. */
 static const char *cctext_clip_cmd(int wr) {
 #if defined(__APPLE__)
-    (void)wr;
-    return wr ? "pbcopy" : "pbpaste";
+    return wr ? "pbcopy 2>/dev/null" : "pbpaste 2>/dev/null";
 #else
     if (getenv("WAYLAND_DISPLAY"))
-        return wr ? "wl-copy" : "wl-paste";
-    return wr ? "xclip -selection clipboard" : "xclip -selection clipboard -o";
+        return wr ? "wl-copy 2>/dev/null" : "wl-paste -n 2>/dev/null";
+    return wr ? "xclip -selection clipboard 2>/dev/null"
+              : "xclip -selection clipboard -o 2>/dev/null";
 #endif
+}
+
+/* The local clipboard tool writes the wrong host over SSH and cannot see
+ * the outer terminal from tmux; OSC 52 asks the terminal itself. */
+static int cctext_clip_remote(void) {
+    const char *t = getenv("TMUX");
+    const char *s1 = getenv("SSH_TTY");
+    const char *s2 = getenv("SSH_CONNECTION");
+    return (t && t[0]) || (s1 && s1[0]) || (s2 && s2[0]);
+}
+
+#define CCTEXT_OSC52_MAX 100000
+
+/* OSC 52 copy: ESC ] 52 ; c ; base64 BEL (inside tmux, a DCS passthrough).
+ * Streams the base64 so the clip is not copied again. */
+static int cctext_osc52(char[:] clip) {
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const unsigned char *p = (const unsigned char *)clip.ptr;
+    size_t n = clip.len, i;
+    const char *t = getenv("TMUX");
+    int tmux = t && t[0];
+    if (n > CCTEXT_OSC52_MAX) return 0;
+    fflush(stdout);
+    fputs(tmux ? "\x1bPtmux;\x1b\x1b]52;c;" : "\x1b]52;c;", stdout);
+    for (i = 0; i + 2 < n; i += 3) {
+        unsigned v = ((unsigned)p[i] << 16) | ((unsigned)p[i + 1] << 8) | p[i + 2];
+        fputc(b64[(v >> 18) & 63], stdout);
+        fputc(b64[(v >> 12) & 63], stdout);
+        fputc(b64[(v >> 6) & 63], stdout);
+        fputc(b64[v & 63], stdout);
+    }
+    if (i < n) {
+        unsigned v = (unsigned)p[i] << 16;
+        if (i + 1 < n) v |= (unsigned)p[i + 1] << 8;
+        fputc(b64[(v >> 18) & 63], stdout);
+        fputc(b64[(v >> 12) & 63], stdout);
+        fputc(i + 1 < n ? b64[(v >> 6) & 63] : '=', stdout);
+        fputc('=', stdout);
+    }
+    fputs(tmux ? "\x07\x1b\\" : "\x07", stdout);
+    fflush(stdout);
+    return 1;
 }
 
 static void cctext_sync_clip(RtxWs *w) {
     FILE *fp;
+    char[:] clip;
     if (!w) return;
-    fp = popen(cctext_clip_cmd(1), "w");
-    if (!fp) return;
-    if (w->clip.ptr && w->clip.len)
-        fwrite(w->clip.ptr, 1, w->clip.len, fp);
-    pclose(fp);
+    clip = w->clip.ptr ? w->clip : cc_slice_empty();
+    if (!cctext_clip_remote()) {
+        fp = popen(cctext_clip_cmd(1), "w");
+        if (fp) {
+            if (clip.len) fwrite(clip.ptr, 1, clip.len, fp);
+            if (pclose(fp) == 0) return;
+        }
+    }
+    /* No tool (pclose 127), a failed tool, or a remote session. */
+    if (!cctext_osc52(clip))
+        snprintf(g_status, sizeof(g_status), "copied here (too large for OSC 52)");
 }
 
 static void !>(CCError) cctext_from_os_clip(RtxWs *w) {
@@ -153,18 +274,33 @@ static void !>(CCError) cctext_from_os_clip(RtxWs *w) {
 }
 
 void !>(CCError) cctext_after_edit(RtxWs *w, RtxMeasure *m, int cols, int vis) {
-    int bufi, held;
+    int bufi, k;
     double w0, w1;
     if (!w || !m) return cc_err(CC_ERR_INVALID_ARG, "after edit");
+    if (!cctext_geo_rows()) cctext_geo_ensure(w, cols, vis);
     bufi = w->pane[w->focus];
-    held = w->hold_pane(0);
-    w0 = (double)cctext_text_cols(w->bufs[w->pane[0]], cctext_pane_cols(w, cols, 0), vis);
-    w->drop_pane(0, held);
+    /* Each camera on this buf at its own pane's text width (the gutter can
+     * widen with the edit). */
+    for (k = 0; k < w->npanes; k++) {
+        int p = w->order[k], held;
+        if (w->pane[p] != bufi || p == w->focus) continue;
+        held = w->hold_pane(p);
+        RtxWs_pane_geom(w, p,
+                        (double)cctext_text_cols(w->bufs[bufi], g_geo[p].cols,
+                                                 g_geo[p].vis),
+                        g_geo[p].vis);
+        w->drop_pane(p, held);
+    }
+    w0 = (double)cctext_text_cols(w->bufs[bufi], cctext_pane_cols(w, cols, w->focus), vis);
     w1 = w0;
-    if (w->npanes > 1) {
-        held = w->hold_pane(1);
-        w1 = (double)cctext_text_cols(w->bufs[w->pane[1]], cctext_pane_cols(w, cols, 1), vis);
-        w->drop_pane(1, held);
+    if (g_tr.on) {
+        long t0 = cctext_tr_us();
+        w->after_edit(bufi, m, w0, w1, vis) !>(e) {
+            g_tr.after_us += cctext_tr_us() - t0;
+            return cc_err(e);
+        };
+        g_tr.after_us += cctext_tr_us() - t0;
+        return cc_ok();
     }
     return w->after_edit(bufi, m, w0, w1, vis);
 }
@@ -183,6 +319,22 @@ static void cctext_sync_apply(const RtxBuf *act) {
     size_t n = cctext_apply_names(act ? &act->doc : NULL, ents, names,
                                   RTX_APPLY_MAX);
     rtx_help_bind_apply(names, n);
+}
+
+/* Table commands join the apply menu while the caret is in a table. */
+static void cctext_sync_table(const RtxBuf *act, int on) {
+    const char *names[RTX_TBL_OPS];
+    int keys[RTX_TBL_OPS];
+    int i;
+    if (!on || !act || !RtxBuf_in_table(act)) {
+        rtx_help_bind_table(NULL, NULL, 0);
+        return;
+    }
+    for (i = 0; i < RTX_TBL_OPS; i++) {
+        names[i] = rtx_table_op_name(i);
+        keys[i] = rtx_table_op_key(i);
+    }
+    rtx_help_bind_table(names, keys, RTX_TBL_OPS);
 }
 
 static void !>(CCError) cctext_apply_named_idx(RtxWs *w, RtxBuf *act, RtxMeasure *m,
@@ -227,10 +379,6 @@ void cctext_follow_caret(RtxBuf *b) {
     if (b) b->pin_view = 0;
 }
 
-static int cctext_pane_at_col(RtxWs *w, int cols, int col) {
-    if (w->npanes < 2) return 0;
-    return col > cols / 2 ? 1 : 0;
-}
 
 static int cctext_scroll_hit(int mx, int col0, int pcols, int rw) {
     int sc;
@@ -251,31 +399,101 @@ static int cctext_scroll_x_hit(RtxBuf *b, int mx, int my, int col0, int pcols,
     return mx >= col0 + g && mx < col0 + g + tcols;
 }
 
-static void !>(CCError) cctext_wheel(RtxWs *w, RtxBuf *act, RtxMeasure *m,
-                                    int kind, int vis, int cols) {
-    int pane, pcols, col0, horiz, dir;
-    double tw;
-    if (!w || !act) return cc_ok();
-    pane = w->focus;
-    pcols = cctext_pane_cols(w, cols, pane);
-    col0 = (pane == 0) ? 1 : (cols / 2 + 2);
-    tw = (double)cctext_text_cols(act, pcols, vis);
+static void !>(CCError) cctext_wheel_buf(RtxBuf *b, RtxMeasure *m, int kind,
+                                        int vis, int pcols, int col0) {
+    int horiz, dir, notch;
+    double tw = (double)cctext_text_cols(b, pcols, vis);
     horiz = (kind == KEY_WHEEL_LEFT || kind == KEY_WHEEL_RIGHT) ||
             g_shift || g_alt ||
             cctext_osx_shift_down() || cctext_osx_alt_down() ||
-            cctext_scroll_x_hit(act, g_mouse_col, g_mouse_row, col0,
-                                pcols, vis);
+            (g_wheel_at && cctext_scroll_x_hit(b, g_mouse_col, g_mouse_row, col0,
+                                               pcols, vis));
     dir = (kind == KEY_WHEEL_LEFT || kind == KEY_WHEEL_UP) ? -1 : 1;
-    if (horiz) {
-        double xw = tw;
-        if (kind == KEY_WHEEL_LEFT || kind == KEY_WHEEL_RIGHT)
-            xw = tw * 0.5;
-        act->scroll_x(xw, dir) !>(e) { return cc_err(e); };
-    } else {
-        act->scroll_vis(m, tw, dir) !>(e) { return cc_err(e); };
-        if (!rtx_layout_is_grid(&act->layout))
-            act->scroll_vis(m, tw, dir) !>(e) { return cc_err(e); };
+    for (notch = 0; notch < cctext_wheel_n(); notch++) {
+        if (horiz) {
+            double xw = tw;
+            if (kind == KEY_WHEEL_LEFT || kind == KEY_WHEEL_RIGHT)
+                xw = tw * 0.5;
+            b->scroll_x(xw, dir) !>(e) { return cc_err(e); };
+        } else {
+            b->scroll_vis(m, tw, dir) !>(e) { return cc_err(e); };
+            if (!rtx_layout_is_grid(&b->layout))
+                b->scroll_vis(m, tw, dir) !>(e) { return cc_err(e); };
+        }
     }
+    return cc_ok();
+}
+
+/* The wheel scrolls the pane under the pointer, not the focused one (a
+ * report without a position — the macOS tilt tap — means focus). Focus
+ * does not move. */
+static void !>(CCError) cctext_wheel_in(RtxWs *w, RtxBuf *act, RtxMeasure *m,
+                                       int kind, int pane) {
+    int pcols, col0, held, vis;
+    if (!w || !act) return cc_ok();
+    pcols = g_geo[pane].cols;
+    col0 = g_geo[pane].col0;
+    vis = g_geo[pane].vis;
+    if (w->nav[pane].on) {
+        int notch;
+        int list_w, prev_w, head, pvis;
+        int over_prev = 0;
+        if (kind != KEY_WHEEL_UP && kind != KEY_WHEEL_DOWN) return cc_ok();
+        list_w = rtx_browse_list_cols_at(pcols, w->browse_split[pane]);
+        prev_w = pcols - list_w;
+        head = rtx_browse_head(&w->nav[pane]);
+        pvis = vis > head ? vis - head : 0;
+        if (g_wheel_at && prev_w > 1 && w->prev[pane].live &&
+            g_mouse_col >= col0 + list_w + 1 &&
+            g_mouse_row > head) {
+            over_prev = 1;
+        }
+        if (over_prev) {
+            RtxBrowsePrev *pv = &w->prev[pane];
+            RtxMeasure pm;
+            int gap = prev_w > 1 ? 1 : 0;
+            int pc = prev_w - gap;
+            int text_c = pc > 1 ? pc - 1 : pc;
+            if (text_c < 1) text_c = 1;
+            pm.measure = cctext_input_prev_measure;
+            pm.line_height = cctext_input_prev_lh;
+            pm.ctx = NULL;
+            (void)m;
+            for (notch = 0; notch < cctext_wheel_n(); notch++)
+                rtx_browse_prev_scroll_vis(pv, &pm, (double)text_c, pvis,
+                                           kind == KEY_WHEEL_UP ? -1 : 1) !>(e) {
+                    return cc_err(e);
+                };
+            return cc_ok();
+        }
+        for (notch = 0; notch < cctext_wheel_n(); notch++)
+            rtx_browse_move(&w->nav[pane], kind == KEY_WHEEL_UP ? -1 : 1, vis);
+        return cc_ok();
+    }
+    held = w->hold_pane(pane);
+    cctext_wheel_buf(w->bufs[w->pane[pane]], m, kind, vis, pcols, col0) !>(e) {
+        w->drop_pane(pane, held);
+        return cc_err(e);
+    };
+    w->drop_pane(pane, held);
+    return cc_ok();
+}
+
+/* Pane-relative pointer row while a pane handles it (the tab bar and the
+ * panes above shift it); the caller puts it back. */
+static void !>(CCError) cctext_wheel(RtxWs *w, RtxBuf *act, RtxMeasure *m,
+                                    int kind, int vis, int cols) {
+    int pane, row = g_mouse_row;
+    if (!w || !act) return cc_ok();
+    cctext_geo_ensure(w, cols, vis);
+    pane = g_wheel_at ? cctext_pane_at(w, g_mouse_row, g_mouse_col) : w->focus;
+    if (!RtxWs_pane_live(w, pane)) pane = w->focus;
+    g_mouse_row -= g_geo[pane].row0;
+    cctext_wheel_in(w, act, m, kind, pane) !>(e) {
+        g_mouse_row = row;
+        return cc_err(e);
+    };
+    g_mouse_row = row;
     return cc_ok();
 }
 
@@ -320,8 +538,6 @@ static void cctext_scroll_x_bar(RtxBuf *b, RtxMeasure *m, int vis, int pcols,
                                                  lx - b->drag_grab)) !>;
     }
 }
-
-static int cctext_caret_cell(RtxBuf *b, int vis, int pcols, int col0, int *row, int *col);
 
 /* Hex pane: offset | 16 hex bytes | UTF-8 dump (geometry in core/hex). */
 static size_t cctext_hex_hit_byte(RtxBuf *b, int vis, int row, int col) {
@@ -383,16 +599,18 @@ static void cctext_scroll_bar(RtxBuf *b, RtxMeasure *m, int vis, int pcols, int 
 
 static int g_split_drag;
 static int g_split_pane;
+static int g_div_drag = -1; /* pane divider (split node) under a drag */
 static RtxClickSeq g_clicks;
 
 static void cctext_split_drag(RtxWs *w, int cols) {
     int pane, pcols, col0, at, lo, hi;
     if (!w) return;
+    (void)cols;
     pane = g_split_pane;
-    if (pane < 0 || pane > 1) return;
-    pcols = cctext_pane_cols(w, cols, pane);
+    if (!RtxWs_pane_live(w, pane)) return;
+    pcols = g_geo[pane].cols;
     if (pcols < RTX_BROWSE_PREV_MIN + RTX_BROWSE_LIST_MIN) return;
-    col0 = (pane == 0) ? 1 : (cols / 2 + 2);
+    col0 = g_geo[pane].col0;
     at = g_mouse_col - col0;
     lo = RTX_BROWSE_LIST_MIN;
     hi = pcols - RTX_BROWSE_PREV_MIN;
@@ -409,11 +627,11 @@ static int cctext_click_keeps_sel(RtxDoc *d, size_t at, int crossed) {
     return d->sel_covers(at) !>;
 }
 
-void cctext_hit(RtxWs *w, RtxMeasure *m, int cols, int vis, int drag) {
-    int pane = cctext_pane_at_col(w, cols, g_mouse_col);
+static void cctext_hit_pane(RtxWs *w, RtxMeasure *m, int cols, int pane, int drag) {
     int prev = w->focus;
-    int pcols = cctext_pane_cols(w, cols, pane);
-    int col0 = (pane == 0) ? 1 : (cols / 2 + 2);
+    int pcols = g_geo[pane].cols;
+    int col0 = g_geo[pane].col0;
+    int vis = g_geo[pane].vis;
     RtxBuf *b;
     double x, y;
     @errhandler(CCError e) {
@@ -453,9 +671,63 @@ void cctext_hit(RtxWs *w, RtxMeasure *m, int cols, int vis, int drag) {
                 g_split_pane = pane;
                 return;
             }
-            if (list_w < pcols && g_mouse_col - col0 >= list_w) {
-                if (!drag)
+            if (list_w < pcols && g_mouse_col - col0 > list_w) {
+                RtxBrowsePrev *pv = &w->prev[pane];
+                int prev_w = pcols - list_w;
+                int gap = prev_w > 1 ? 1 : 0;
+                int pc = prev_w - gap;
+                int head = rtx_browse_head(&w->nav[pane]);
+                int pvis = vis > head ? vis - head : 0;
+                int text_c = pc > 1 ? pc - 1 : pc;
+                int rail_col = col0 + list_w + gap + (pc > 0 ? pc - 1 : 0);
+                int over_rail = pc > 1 && g_mouse_col == rail_col;
+                RtxMeasure pm;
+                if (text_c < 1) text_c = 1;
+                pm.measure = cctext_input_prev_measure;
+                pm.line_height = cctext_input_prev_lh;
+                pm.ctx = NULL;
+                if (pv->live && (over_rail || (drag && pv->drag_len))) {
+                    RtxScrollRail rail;
+                    int ly, ty, th;
+                    ly = brow - head;
+                    if (ly < 0) ly = 0;
+                    @errhandler(CCError e) {
+                        snprintf(g_status, sizeof(g_status), "%s",
+                                 e.message ? e.message : "scroll");
+                        return;
+                    }
+                    if (!drag || !pv->drag_len) {
+                        rail = rtx_browse_prev_rail(pv, pvis);
+                        rtx_scroll_rail_thumb(&rail, pvis, 1, &ty, &th);
+                        pv->drag_vis = rail.vis ? rail.vis : 1;
+                        pv->drag_len = rail.len;
+                        if (ly >= ty && ly < ty + th) pv->drag_grab = ly - ty;
+                        else {
+                            pv->drag_grab = th / 2;
+                            rtx_browse_prev_scroll_to_off(
+                                pv, &pm, (double)text_c, pvis,
+                                rtx_scroll_rail_pos_at(&rail, pvis, 1,
+                                                      ly - pv->drag_grab)) !>;
+                        }
+                        return;
+                    }
+                    {
+                        RtxScrollRail map;
+                        map.pos = 0;
+                        map.vis = pv->drag_vis ? pv->drag_vis : 1;
+                        map.len = pv->drag_len ? pv->drag_len : 1;
+                        map.ready = 1;
+                        rtx_browse_prev_scroll_to_off(
+                            pv, &pm, (double)text_c, pvis,
+                            rtx_scroll_rail_pos_at(&map, pvis, 1,
+                                                  ly - pv->drag_grab)) !>;
+                    }
+                    return;
+                }
+                if (!drag) {
+                    rtx_browse_prev_drag_end(pv);
                     w->browse_enter() !>;
+                }
                 return;
             }
         }
@@ -647,6 +919,334 @@ void cctext_hit(RtxWs *w, RtxMeasure *m, int cols, int vis, int drag) {
     b->doc.break_coalesce();
 }
 
+int cctext_palette_vis(int rows) {
+    int v = rows - 8;
+    if (v > 14) v = 14;
+    return v < 1 ? 1 : v;
+}
+
+static int cctext_find_letter_of(int cmd) {
+    switch (cmd) {
+        case CMD_FIND_ICASE: return 'c';
+        case CMD_FIND_WORD: return 'w';
+        case CMD_FIND_REGEX: return 'r';
+        case CMD_FIND_REPL_ROW: return 'e';
+        case CMD_REPL_ALL: return 'a';
+        case CMD_REPL_SCOPE: return 'l';
+        default: return 0;
+    }
+}
+
+static void cctext_open_palette(RtxWs *w, RtxUi *ui) {
+    rtx_ui_open_palette(ui, rtx_ui_cmd_ctx(w, ui, 0));
+}
+
+/* Run a command-table row the way its key would (palette Enter). */
+static int cctext_run_row(RtxWs *w, RtxBuf *act, RtxMeasure *m, RtxUi *ui,
+                          int row, int vis, int cols, int *skip_reveal) {
+    const RtxCmdDef *d = row >= 0 ? rtx_cmd_at((size_t)row) : NULL;
+    int kind;
+    if (!d) return 0;
+    if (!rtx_cmd_available(d)) {
+        snprintf(g_status, sizeof(g_status), "%s (unavailable)", d->title);
+        return 0;
+    }
+    kind = cctext_kind_of_row(row);
+    /* A prompt would swallow the key: close it unless the command is its. */
+    if (ui->jump) rtx_ui_cancel_jump(ui, &act->doc);
+    if (ui->find && !(d->need & RTX_CTX_FIND) && d->cmd != CMD_FIND &&
+        d->cmd != CMD_REPLACE) {
+        act->doc.find.cancel = 1;
+        rtx_ui_clear_find(ui);
+    }
+    return cctext_handle_input(w, act, m, ui, kind, 0, vis, cols, skip_reveal);
+}
+
+/* KEY_CMD outside the find / jump prompts: rows with no key of their own. */
+static void !>(CCError) cctext_run_cmd(RtxWs *w, RtxBuf *act, RtxMeasure *m,
+                                       RtxUi *ui, int vis, int cols) {
+    const RtxCmdDef *d = g_cmd_row >= 0 ? rtx_cmd_at((size_t)g_cmd_row) : NULL;
+    int c;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (!d) return cc_ok();
+    if (!rtx_cmd_available(d)) {
+        snprintf(g_status, sizeof(g_status), "%s (unavailable)", d->title);
+        return cc_ok();
+    }
+    if (d->run) {
+        RtxCmdCtx cx;
+        memset(&cx, 0, sizeof cx);
+        cx.flags = rtx_ui_cmd_ctx(w, ui, 0);
+        cx.host = RTX_HOST_TUI;
+        cx.ws = w;
+        cx.ui = ui;
+        cx.act = act;
+        if (!rtx_cmd_enabled(d, &cx)) {
+            snprintf(g_status, sizeof(g_status), "%s: not here", d->title);
+            return cc_ok();
+        }
+        d->run(&cx);
+        if (cx.changed) cctext_after_edit(w, m, cols, vis) !>;
+        if (cx.status[0]) snprintf(g_status, sizeof(g_status), "%s", cx.status);
+        return cc_ok();
+    }
+    c = d->cmd;
+    if (c == CMD_PALETTE) {
+        cctext_open_palette(w, ui);
+        return cc_ok();
+    }
+    if (w->browsing()) {
+        snprintf(g_status, sizeof(g_status), "%s: not in browse", d->title);
+        return cc_ok();
+    }
+    if (c == CMD_REPLACE) {
+        rtx_ui_start_replace(ui, &act->doc);
+        rtx_ui_find_apply(ui, &act->doc) !>;
+        return cc_ok();
+    }
+    if (c == CMD_PRESENT) {
+        RtxPresent *p = rtx_present();
+        ui->help = ui->apply = ui->stats = 0;
+        rtx_ui_close_palette(ui);
+        if (ui->jump) rtx_ui_cancel_jump(ui, &act->doc);
+        if (!rtx_present_start(p, &act->doc, act->doc.caret, rtx_ui_now_ms()))
+            snprintf(g_status, sizeof(g_status), "%s", p->msg);
+        return cc_ok();
+    }
+    if (c == CMD_SLIDE_GOTO) {
+        if (!rtx_deck_for(&act->doc))
+            snprintf(g_status, sizeof(g_status), "not a Marp deck (front matter needs marp: true)");
+        else
+            rtx_ui_start_slide_jump(ui, &act->doc);
+        return cc_ok();
+    }
+    if (c >= CMD_TBL_ROW_ABOVE && c <= CMD_TBL_COL_MOVE_R) {
+        int op = c - CMD_TBL_ROW_ABOVE;
+        if (!RtxBuf_in_table(act)) {
+            snprintf(g_status, sizeof(g_status), "not in a table");
+            return cc_ok();
+        }
+        act->table_op(op) !>;
+        cctext_after_edit(w, m, cols, vis) !>;
+        snprintf(g_status, sizeof(g_status), "table: %s", rtx_table_op_name(op));
+        return cc_ok();
+    }
+    if (cctext_find_letter_of(c)) {
+        snprintf(g_status, sizeof(g_status), "%s: find is not open", d->title);
+        return cc_ok();
+    }
+    return cc_ok();
+}
+
+/* A press on a pane divider drags it; a press in a pane focuses and hits
+ * it (pane-relative rows); a drag stays with the pane it started in. The
+ * tab bar is cctext_handle_input's (it can ask). */
+void cctext_hit(RtxWs *w, RtxMeasure *m, int cols, int vis, int drag) {
+    int pane, row = g_mouse_row;
+    if (!w) return;
+    cctext_geo_ensure(w, cols, vis);
+    if (drag && g_div_drag >= 0) {
+        cctext_divider_drag(w, g_div_drag, g_mouse_row, g_mouse_col);
+        return;
+    }
+    if (!drag) {
+        g_div_drag = cctext_divider_at(w, g_mouse_row, g_mouse_col);
+        if (g_div_drag >= 0) return;
+    }
+    pane = drag ? w->focus : cctext_pane_at(w, g_mouse_row, g_mouse_col);
+    if (!RtxWs_pane_live(w, pane)) return;
+    g_mouse_row -= g_geo[pane].row0;
+    cctext_hit_pane(w, m, cols, pane, drag);
+    g_mouse_row = row;
+}
+
+/* Every pane changed shape: repaint the screen, relayout each camera. */
+static void cctext_panes_moved(RtxWs *w) {
+    int k;
+    fputs("\x1b[H\x1b[J", stdout);
+    cctext_draw_invalidate();
+    cctext_geo_again(w);
+    for (k = 0; k < w->npanes; k++) {
+        int p = w->order[k];
+        int held = w->hold_pane(p);
+        w->bufs[w->pane[p]]->layout.clear_rows();
+        w->drop_pane(p, held);
+    }
+}
+
+static void cctext_close_note(int closed, const char *what) {
+    if (closed) snprintf(g_status, sizeof(g_status), "%s", what);
+}
+
+/* Buffers, panes and the tab bar: the same keys in the editor and in
+ * browse. 1 = handled. */
+static int cctext_ws_keys(RtxWs *w, RtxUi *ui, int kind, int cols, int vis) {
+    int closed = 0;
+    @errhandler(CCError e) {
+        snprintf(g_status, sizeof(g_status), "%s", e.message ? e.message : "error");
+        return 1;
+    }
+    if ((kind == KEY_MOUSE || kind == KEY_MOUSE_MID) && cctext_tabs_shown(w) &&
+        g_mouse_row == 1) {
+        int close = 0;
+        int bi = cctext_tab_at(g_mouse_col, &close);
+        if (bi == -2) {
+            w->prev_buf();
+        } else if (bi == -3) {
+            w->next_buf();
+        } else if (bi >= 0 && (close || kind == KEY_MOUSE_MID)) {
+            /* Close that tab. An unsaved one is shown first, so the
+             * prompt is about what is on screen. */
+            if (RtxWs_buf_dirty(w, bi)) {
+                if (w->browsing()) (void)w->browse_close();
+                w->show_buf(bi);
+                closed = rtx_ui_offer_close(w, ui, RTX_CLOSE_ONE) !>;
+            } else {
+                w->close_buf(bi, 0) !>;
+                closed = 1;
+            }
+            cctext_close_note(closed, "closed");
+            cctext_panes_moved(w);
+        } else if (bi >= 0) {
+            if (w->browsing()) (void)w->browse_close();
+            w->show_buf(bi);
+        }
+        return 1;
+    }
+    if (kind == KEY_MOUSE_MID) return 1;
+    switch (kind) {
+    case KEY_CLOSE_BUF:
+        if (w->browsing()) {
+            (void)w->browse_close();
+            return 1;
+        }
+        closed = rtx_ui_offer_close(w, ui, RTX_CLOSE_ONE) !>;
+        cctext_close_note(closed, "closed");
+        cctext_panes_moved(w);
+        return 1;
+    case KEY_CLOSE_OTHERS:
+        closed = rtx_ui_offer_close(w, ui, RTX_CLOSE_OTHERS) !>;
+        cctext_close_note(closed, "closed the others");
+        cctext_panes_moved(w);
+        return 1;
+    case KEY_CLOSE_ALL:
+        closed = rtx_ui_offer_close(w, ui, RTX_CLOSE_ALL) !>;
+        cctext_close_note(closed, "closed all");
+        cctext_panes_moved(w);
+        return 1;
+    case KEY_TAB_NEXT:
+        w->next_buf();
+        return 1;
+    case KEY_PREV_BUF:
+        w->prev_buf();
+        return 1;
+    case KEY_SPLIT:
+    case KEY_SPLIT_DOWN:
+        if (RtxWs_split(w, kind == KEY_SPLIT ? RTX_SPLIT_COLS : RTX_SPLIT_ROWS) < 0)
+            snprintf(g_status, sizeof(g_status), "at most %d panes", RTX_PANES_MAX);
+        cctext_panes_moved(w);
+        return 1;
+    case KEY_PANE_CLOSE:
+        if (!RtxWs_close_pane(w, w->focus))
+            snprintf(g_status, sizeof(g_status), "last pane");
+        cctext_panes_moved(w);
+        return 1;
+    case KEY_OTHER_PANE:
+    case KEY_PANE_PREV:
+        RtxWs_focus_step(w, kind == KEY_OTHER_PANE ? 1 : -1);
+        return 1;
+    case KEY_PANE_MOVE:
+        RtxWs_move_to_pane(w, 1);
+        return 1;
+    case KEY_PANE_NUDGE: {
+        int axis = (g_nav == 1 || g_nav == 2) ? RTX_SPLIT_COLS : RTX_SPLIT_ROWS;
+        int delta = (g_nav == 1 || g_nav == 3) ? -50 : 50;
+        if (RtxWs_pane_nudge(w, axis, delta)) cctext_panes_moved(w);
+        return 1;
+    }
+    case KEY_TABS:
+        cctext_tabs_set(cctext_tabs_shown(w) ? CCTEXT_TABS_NEVER : CCTEXT_TABS_ALWAYS);
+        snprintf(g_status, sizeof(g_status), "tab bar %s",
+                 cctext_tabs_shown(w) ? "on" : "off");
+        cctext_panes_moved(w);
+        return 1;
+    default:
+        break;
+    }
+    (void)cols;
+    (void)vis;
+    return 0;
+}
+
+/* Presentation mode owns the keys (docs/slides.md): Right / Down / PgDn /
+ * Space / Enter next step, Left / Up / PgUp / Backspace back, Home / End,
+ * digits + Enter a slide, Esc (or the present chord again) leaves with
+ * the caret on the slide shown. A click or the wheel steps too. */
+static int cctext_present_key(RtxWs *w, RtxBuf *act, RtxUi *ui, int kind, int ch,
+                              int vis) {
+    RtxPresent *p = rtx_present();
+    long now = rtx_ui_now_ms();
+    int key = 0, r = RTX_PK_NONE;
+    (void)w;
+    switch (kind) {
+    case KEY_RIGHT: key = RTX_KEY_RIGHT; break;
+    case KEY_LEFT: key = RTX_KEY_LEFT; break;
+    case KEY_UP: key = RTX_KEY_UP; break;
+    case KEY_DOWN: key = RTX_KEY_DOWN; break;
+    case KEY_PAGE_UP: key = RTX_KEY_PGUP; break;
+    case KEY_PAGE_DOWN: key = RTX_KEY_PGDN; break;
+    case KEY_HOME:
+    case KEY_DOC_HOME: key = RTX_KEY_HOME; break;
+    case KEY_END:
+    case KEY_DOC_END: key = RTX_KEY_END; break;
+    case KEY_ENTER: key = RTX_KEY_ENTER; break;
+    case KEY_BACKSPACE: key = RTX_KEY_BACKSPACE; break;
+    case KEY_HELP:
+    case KEY_QUIT: key = RTX_KEY_ESC; break;
+    case KEY_MOUSE:
+    case KEY_WHEEL_DOWN: key = RTX_KEY_RIGHT; break;
+    case KEY_WHEEL_UP: key = RTX_KEY_LEFT; break;
+    case KEY_CMD: {
+        const RtxCmdDef *d = g_cmd_row >= 0 ? rtx_cmd_at((size_t)g_cmd_row) : NULL;
+        if (d && d->cmd == CMD_PRESENT) key = RTX_KEY_ESC;
+        else if (d && d->cmd == CMD_NEXT) key = RTX_KEY_RIGHT;
+        break;
+    }
+    case KEY_CHAR:
+        r = rtx_present_key(p, &act->doc, 0, ch, now);
+        break;
+    case KEY_TEXT:
+    case KEY_PASTE_TEXT: {
+        size_t i;
+        for (i = 0; g_text && i < g_text_n && r != RTX_PK_EXIT; i++) {
+            int one = rtx_present_key(p, &act->doc, 0, (unsigned char)g_text[i], now);
+            if (one > r) r = one;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    if (key) r = rtx_present_key(p, &act->doc, key, 0, now);
+    if (r == RTX_PK_EXIT) {
+        @errhandler(RtxIndexErr e) {
+            (void)e;
+            return 0;
+        }
+        size_t c = rtx_present_stop(p, &act->doc);
+        act->doc.caret = c;
+        act->doc.sel_anchor = c;
+        act->doc.break_coalesce();
+        cctext_draw_invalidate();
+        act->land(vis) !>;
+        (void)ui;
+        snprintf(g_status, sizeof(g_status), "left the presentation");
+    }
+    return 0;
+}
+
 int cctext_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, RtxUi *ui,
                         int kind, int ch, int vis, int cols, int *skip_reveal) {
     @errhandler(CCError e) {
@@ -660,6 +1260,7 @@ int cctext_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, RtxUi *ui,
     }
     if (!w || !act || !ui) return 0;
     cctext_sync_apply(act);
+    if (rtx_present()->on) return cctext_present_key(w, act, ui, kind, ch, vis);
 
 if (ui->ask_conflict) {
     int choice = -1;
@@ -685,6 +1286,14 @@ if (ui->ask_conflict) {
             act->doc.break_coalesce();
         }
     }
+    return 0;
+}
+if (ui->ask_xact) {
+    int choice = -1;
+    if (kind == KEY_HELP || kind == KEY_QUIT) choice = 0;
+    else if (kind == KEY_CHAR) choice = rtx_ui_xact_letter(ch);
+    if (choice >= 0 && rtx_ui_xact_answer(ui, w, choice) !>)
+        cctext_after_edit(w, m, cols, vis) !>;
     return 0;
 }
 if (ui->ask_quit) {
@@ -719,6 +1328,97 @@ if (ui->ask_quit) {
     }
     return 0;
 }
+if (ui->palette) {
+    RtxField pf = rtx_palette_field(&ui->pal);
+    int pvis = cctext_palette_vis(vis + 1);
+    int changed = 0;
+    int pcmd = (kind == KEY_CMD && g_cmd_row >= 0) ? rtx_cmd_at((size_t)g_cmd_row)->cmd
+                                                   : CMD_NONE;
+    if (kind == KEY_HELP || kind == KEY_QUIT || pcmd == CMD_PALETTE) {
+        rtx_ui_close_palette(ui);
+    } else if (kind == KEY_ENTER) {
+        int cur = ui->pal.cur;
+        int live = rtx_palette_row_live(&ui->pal, cur);
+        int row = rtx_palette_pick(&ui->pal);
+        int prow = rtx_palette_row(&ui->pal, cur);
+        rtx_ui_close_palette(ui);
+        if (row >= 0) return cctext_run_row(w, act, m, ui, row, vis, cols, skip_reveal);
+        if (!live && prow >= 0)
+            snprintf(g_status, sizeof(g_status), "%s (unavailable)",
+                     rtx_cmd_at((size_t)prow)->title);
+    } else if (kind == KEY_UP || kind == KEY_WHEEL_UP ||
+               (kind == KEY_NAV && g_nav == 2) || kind == KEY_QUICK_OPEN) {
+        rtx_palette_move(&ui->pal, -1, pvis);
+    } else if (kind == KEY_DOWN || kind == KEY_WHEEL_DOWN || kind == KEY_NEXT_BUF) {
+        rtx_palette_move(&ui->pal, 1, pvis);
+    } else if (kind == KEY_PAGE_UP) {
+        rtx_palette_move(&ui->pal, -pvis, pvis);
+    } else if (kind == KEY_PAGE_DOWN) {
+        rtx_palette_move(&ui->pal, pvis, pvis);
+    } else if (kind == KEY_DOC_HOME) {
+        rtx_palette_move(&ui->pal, -ui->pal.nrows, pvis);
+    } else if (kind == KEY_DOC_END) {
+        rtx_palette_move(&ui->pal, ui->pal.nrows, pvis);
+    } else if (kind == KEY_LEFT) {
+        rtx_field_move(pf, -1, g_shift);
+    } else if (kind == KEY_RIGHT) {
+        rtx_field_move(pf, 1, g_shift);
+    } else if (kind == KEY_HOME) {
+        rtx_field_edge(pf, 0, g_shift);
+    } else if (kind == KEY_END) {
+        rtx_field_edge(pf, 1, g_shift);
+    } else if (kind == KEY_SEL_ALL) {
+        rtx_field_cmd(w, pf, CMD_SEL_ALL) !>;
+    } else if (kind == KEY_COPY) {
+        if (rtx_field_cmd(w, pf, CMD_COPY) !>) cctext_sync_clip(w);
+    } else if (kind == KEY_CUT) {
+        rtx_field_cmd(w, pf, CMD_CUT) !>;
+        cctext_sync_clip(w);
+        changed = 1;
+    } else if (kind == KEY_PASTE) {
+        cctext_from_os_clip(w) !>;
+        rtx_field_cmd(w, pf, CMD_PASTE) !>;
+        changed = 1;
+    } else if (kind == KEY_BACKSPACE) {
+        rtx_field_backspace(pf);
+        changed = 1;
+    } else if (kind == KEY_DELETE) {
+        rtx_field_delete(pf);
+        changed = 1;
+    } else if (kind == KEY_CHAR) {
+        if (rtx_field_type_cp(pf, (uint32_t)ch)) changed = 1;
+    } else if (kind == KEY_TEXT || kind == KEY_PASTE_TEXT) {
+        size_t i = 0;
+        uint32_t cp;
+        while (cctext_text_cp(&i, &cp))
+            if (rtx_field_type_cp(pf, cp)) changed = 1;
+    }
+    if (changed) rtx_palette_refilter(&ui->pal);
+    return 0;
+}
+if (ui->ask_close) {
+    /* Close with unsaved buffers: s save, q don't save, Esc cancel. */
+    int choice = -1;
+    if (kind == KEY_HELP) choice = 0;
+    else if (kind == KEY_SAVE) choice = 1;
+    else if (kind == KEY_CHAR) choice = rtx_ui_quit_letter(ch);
+    if (choice >= 0) {
+        int closed = 0;
+        {
+            @errhandler(CCError e) {
+                snprintf(g_status, sizeof(g_status), "%s",
+                         e.message ? e.message : "close failed");
+                ui->ask_close = 0;
+            }
+            closed = rtx_ui_close_answer(ui, w, choice) !>;
+        }
+        if (closed) {
+            snprintf(g_status, sizeof(g_status), "closed");
+            cctext_panes_moved(w);
+        }
+    }
+    return 0;
+}
 if (ui->jump) {
     if (kind == KEY_HELP || kind == KEY_QUIT) {
         rtx_ui_cancel_jump(ui, &act->doc);
@@ -729,13 +1429,161 @@ if (ui->jump) {
         rtx_ui_jump_backspace(ui, &act->doc);
     } else if (kind == KEY_CHAR) {
         rtx_ui_jump_char(ui, &act->doc, ch);
+    } else if (kind == KEY_TEXT || kind == KEY_PASTE_TEXT) {
+        size_t i = 0;
+        uint32_t cp;
+        while (cctext_text_cp(&i, &cp)) rtx_ui_jump_char(ui, &act->doc, (int)cp);
     }
     return 0;
 }
-if (ui->find) {
-    RtxField ff = rtx_ui_find_field(ui);
+if (kind == KEY_QUICK_OPEN || kind == KEY_PROJ_SEARCH) {
+    /* Ctrl-P / Ctrl-Shift-F (Alt-Shift-F): "workspace.quick_open" /
+     * "workspace.search". */
+    rtx_ui_pick_start(ui, w, kind == KEY_QUICK_OPEN ? RTX_PICK_OPEN : RTX_PICK_SEARCH) !>;
+    if (!ui->pick && ui->pick_msg[0])
+        snprintf(g_status, sizeof(g_status), "%s", ui->pick_msg);
+    return 0;
+}
+if ((kind == KEY_PROJ_NEXT || kind == KEY_PROJ_PREV) && !ui->pick) {
+    /* F4 / Shift-F4: next / previous project search result. */
+    rtx_ui_psearch_step(ui, w, kind == KEY_PROJ_PREV ? -1 : 1, vis) !>;
+    snprintf(g_status, sizeof(g_status), "%s", ui->pick_msg);
+    return 0;
+}
+if (kind == KEY_PROJ_REWALK && !ui->pick) {
+    /* F5: re-walk the project index (no file watcher). */
+    rtx_ui_pick_rewalk(ui) !>;
+    snprintf(g_status, sizeof(g_status), "%s",
+             ui->pick_msg[0] ? ui->pick_msg : "no project yet (Ctrl-P)");
+    return 0;
+}
+if (ui->pick) {
+    RtxField pf = rtx_ui_pick_field(ui);
     int changed = 0;
-    if (kind == KEY_HELP || kind == KEY_QUIT) {
+    int alt = g_alt ? g_cmd_ch : 0;
+    int list = cctext_pick_list_rows(vis + 1);
+    if (alt >= 'A' && alt <= 'Z') alt = alt - 'A' + 'a';
+    if (alt && rtx_ui_pick_toggle(ui, alt) !>) {
+        /* Alt-C / Alt-W / Alt-R: search options. */
+    } else if (kind == KEY_HELP || kind == KEY_QUIT) {
+        rtx_ui_pick_close(ui);
+    } else if (kind == KEY_ENTER) {
+        if (rtx_ui_pick_accept(ui, w, g_alt || g_ctrl, vis) !>) {
+            if (ui->pick_msg[0]) snprintf(g_status, sizeof(g_status), "%s", ui->pick_msg);
+        }
+    } else if (kind == KEY_TAB) {
+        rtx_ui_pick_start(ui, w, ui->pick == RTX_PICK_OPEN ? RTX_PICK_SEARCH
+                                                          : RTX_PICK_OPEN) !>;
+    } else if (kind == KEY_UP || kind == KEY_WHEEL_UP) {
+        rtx_ui_pick_move(ui, kind == KEY_UP ? -1 : -3, list);
+    } else if (kind == KEY_DOWN || kind == KEY_WHEEL_DOWN) {
+        rtx_ui_pick_move(ui, kind == KEY_DOWN ? 1 : 3, list);
+    } else if (kind == KEY_PAGE_UP || kind == KEY_PAGE_DOWN) {
+        rtx_ui_pick_move(ui, (kind == KEY_PAGE_UP ? -1 : 1) * (long)(list > 1 ? list - 1 : 1),
+                         list);
+    } else if (kind == KEY_DOC_HOME || kind == KEY_DOC_END) {
+        rtx_ui_pick_move(ui, kind == KEY_DOC_HOME ? -(1L << 30) : (1L << 30), list);
+    } else if (kind == KEY_PROJ_REWALK) {
+        rtx_ui_pick_rewalk(ui) !>;
+    } else if (kind == KEY_PROJ_NEXT || kind == KEY_PROJ_PREV) {
+        rtx_ui_pick_move(ui, kind == KEY_PROJ_PREV ? -1 : 1, list);
+    } else if (kind == KEY_LEFT) {
+        rtx_field_move(pf, -1, g_shift);
+    } else if (kind == KEY_RIGHT) {
+        rtx_field_move(pf, 1, g_shift);
+    } else if (kind == KEY_HOME) {
+        rtx_field_edge(pf, 0, g_shift);
+    } else if (kind == KEY_END) {
+        rtx_field_edge(pf, 1, g_shift);
+    } else if (kind == KEY_SEL_ALL) {
+        rtx_field_cmd(w, pf, CMD_SEL_ALL) !>;
+    } else if (kind == KEY_COPY) {
+        if (rtx_field_cmd(w, pf, CMD_COPY) !>) cctext_sync_clip(w);
+    } else if (kind == KEY_CUT) {
+        rtx_field_cmd(w, pf, CMD_CUT) !>;
+        cctext_sync_clip(w);
+        changed = 1;
+    } else if (kind == KEY_PASTE) {
+        cctext_from_os_clip(w) !>;
+        rtx_field_cmd(w, pf, CMD_PASTE) !>;
+        changed = 1;
+    } else if (kind == KEY_BACKSPACE) {
+        rtx_field_backspace(pf);
+        changed = 1;
+    } else if (kind == KEY_DELETE) {
+        rtx_field_delete(pf);
+        changed = 1;
+    } else if (kind == KEY_CHAR) {
+        if (rtx_field_type_cp(pf, (uint32_t)ch)) changed = 1;
+    } else if (kind == KEY_TEXT || kind == KEY_PASTE_TEXT) {
+        size_t i = 0;
+        uint32_t cp;
+        while (cctext_text_cp(&i, &cp))
+            if (rtx_field_type_cp(pf, cp)) changed = 1;
+    } else if (kind == KEY_MOUSE) {
+        if (g_mouse_row == 1) {
+            rtx_field_click(pf, g_mouse_col - 4 - (int)strlen(rtx_ui_pick_label(ui)), g_shift, 0);
+        } else if (g_mouse_row >= 3 && g_mouse_row < 3 + list) {
+            /* A click picks the row; a second click on it opens it. */
+            size_t row = rtx_ui_pick_top(ui) + (size_t)(g_mouse_row - 3);
+            if (row == rtx_ui_pick_cur(ui)) {
+                rtx_ui_pick_accept(ui, w, g_alt || g_ctrl, vis) !>;
+            } else {
+                rtx_ui_pick_select(ui, row, list);
+            }
+        }
+    }
+    if (changed) rtx_ui_pick_changed(ui) !>;
+    return 0;
+}
+if (ui->find) {
+    RtxField ff = rtx_ui_focus_field(ui);
+    int on_repl = rtx_ui_repl_focused(ui);
+    int changed = 0; /* the find query changed: re-apply */
+    int alt = g_alt ? g_cmd_ch : 0;
+    if (alt >= 'A' && alt <= 'Z') alt = alt - 'A' + 'a';
+    if (kind == KEY_CMD) {
+        /* Palette / keymap: the find toggles are their Alt letters. */
+        int fc = g_cmd_row >= 0 ? rtx_cmd_at((size_t)g_cmd_row)->cmd : CMD_NONE;
+        if (fc == CMD_PALETTE) {
+            cctext_open_palette(w, ui);
+            return 0;
+        }
+        if (fc == CMD_REPLACE && !ui->repl) fc = CMD_FIND_REPL_ROW;
+        alt = cctext_find_letter_of(fc);
+        kind = KEY_NONE;
+    }
+    if (ui->rjob.state == RTX_REPL_READY || ui->rjob.state == RTX_REPL_FAIL) {
+        /* The scan is in: one edit group (or the refusal). */
+        if (rtx_ui_repl_poll(ui, &act->doc) !>) cctext_after_edit(w, m, cols, vis) !>;
+    }
+    if (ui->rjob.state == RTX_REPL_SCAN) {
+        /* Replace-all owns the panel until it lands; Esc cancels (nothing
+         * is edited before the whole scan is in). */
+        if (kind == KEY_HELP || kind == KEY_QUIT) rtx_ui_repl_cancel(ui);
+        return 0;
+    }
+    if (alt && rtx_ui_find_toggle(ui, alt)) {
+        /* Alt-C / Alt-W / Alt-R: ignore case, whole word, regex. */
+        changed = 1;
+    } else if (kind == KEY_FIND || alt == 'e') {
+        /* Ctrl-F again / Alt-E: the replace row. */
+        rtx_ui_toggle_repl(ui);
+    } else if (alt == 'a' && ui->repl) {
+        /* Alt-A: replace all (one edit group; a large file pumps). */
+        if (rtx_ui_replace_all(ui, &act->doc) !>) cctext_after_edit(w, m, cols, vis) !>;
+    } else if (alt == 'l' && ui->repl) {
+        rtx_ui_repl_toggle_scope(ui);
+    } else if (kind == KEY_TAB) {
+        rtx_ui_find_tab(ui);
+    } else if (kind == KEY_ENTER) {
+        if (on_repl) {
+            if (rtx_ui_replace_one(ui, &act->doc) !>) cctext_after_edit(w, m, cols, vis) !>;
+        } else {
+            act->doc.find_next();
+        }
+        act->land(vis) !>;
+    } else if (kind == KEY_HELP || kind == KEY_QUIT) {
         act->doc.find.cancel = 1;
         rtx_ui_clear_find(ui);
     } else if (kind == KEY_UP) {
@@ -759,22 +1607,31 @@ if (ui->find) {
     } else if (kind == KEY_CUT) {
         rtx_field_cmd(w, ff, CMD_CUT) !>;
         cctext_sync_clip(w);
-        changed = 1;
+        changed = !on_repl;
     } else if (kind == KEY_PASTE) {
         cctext_from_os_clip(w) !>;
         rtx_field_cmd(w, ff, CMD_PASTE) !>;
-        changed = 1;
+        changed = !on_repl;
     } else if (kind == KEY_BACKSPACE) {
-        rtx_ui_find_backspace(ui);
-        changed = 1;
+        rtx_field_backspace(ff);
+        changed = !on_repl;
     } else if (kind == KEY_DELETE) {
         rtx_field_delete(ff);
-        changed = 1;
+        changed = !on_repl;
     } else if (kind == KEY_CHAR) {
-        if (rtx_ui_find_char(ui, ch)) {
-            cctext_find_absorb(ui);
-            changed = 1;
+        if (rtx_field_type_cp(ff, (uint32_t)ch)) changed = !on_repl;
+    } else if (kind == KEY_TEXT || kind == KEY_PASTE_TEXT) {
+        size_t i = 0;
+        uint32_t cp;
+        while (cctext_text_cp(&i, &cp))
+            if (rtx_field_type_cp(ff, cp)) changed = !on_repl;
+    } else if (kind == KEY_PAGE_UP || kind == KEY_PAGE_DOWN) {
+        int k;
+        for (k = 0; k < (vis > 2 ? vis - 2 : 1); k++) {
+            if (kind == KEY_PAGE_UP) act->doc.find_prev();
+            else act->doc.find_next();
         }
+        act->land(vis) !>;
     } else if (kind == KEY_JUMP) {
         rtx_ui_start_jump(ui, &act->doc);
     } else if (kind == KEY_WHEEL_UP || kind == KEY_WHEEL_DOWN ||
@@ -783,15 +1640,22 @@ if (ui->find) {
         if (skip_reveal) *skip_reveal = 1;
     } else if (kind == KEY_MOUSE || kind == KEY_MOUSE_DRAG) {
         int header = vis + 1;
-        int idx = g_mouse_row - vis - 2;
+        int heads = rtx_ui_find_head_rows(ui);
+        int idx = g_mouse_row - vis - 1 - heads;
         int rail = act && act->drag_len;
-        if (!rail && (g_mouse_row == header || g_field_drag == 1)) {
-            if (!g_mouse_drag || kind == KEY_MOUSE) g_field_drag = 1;
+        if (!rail && (g_mouse_row == header || (heads > 1 && g_mouse_row == header + 1) ||
+                      g_field_drag == 1)) {
+            if (!g_mouse_drag || kind == KEY_MOUSE) {
+                g_field_drag = 1;
+                /* A click picks the field; a drag stays in it. */
+                if (ui->repl) ui->repl_focus = g_mouse_row != header;
+                ff = rtx_ui_focus_field(ui);
+            }
             rtx_field_click(ff, g_mouse_col - 8, g_shift,
                             kind == KEY_MOUSE_DRAG);
         } else if (!rail && idx >= 0) {
             size_t hit = ui->find_top + (size_t)idx;
-            if (hit < act->doc.find.hits.len) {
+            if (hit < rtx_find_hits_n(&act->doc.find)) {
                 act->doc.find_goto(hit);
                 act->land(vis) !>;
             }
@@ -820,6 +1684,14 @@ if (ui->apply) {
         cctext_apply_named_idx(w, act, m, cols, vis, ch - '1') !>;
         return 0;
     }
+    if (kind == KEY_CHAR && rtx_table_op_of_key(ch) >= 0 && RtxBuf_in_table(act)) {
+        int op = rtx_table_op_of_key(ch);
+        ui->apply = 0;
+        act->table_op(op) !>;
+        cctext_after_edit(w, m, cols, vis) !>;
+        snprintf(g_status, sizeof(g_status), "table: %s", rtx_table_op_name(op));
+        return 0;
+    }
     if (kind == KEY_MOUSE || kind == KEY_MOUSE_DRAG ||
         kind == KEY_WHEEL_UP || kind == KEY_WHEEL_DOWN ||
         kind == KEY_WHEEL_LEFT || kind == KEY_WHEEL_RIGHT ||
@@ -831,14 +1703,30 @@ if (ui->apply) {
     /* fall through so a command key still runs */
 }
 if (ui->help) {
+    int help_vis = vis > 4 ? vis - 2 : (vis > 0 ? vis : 1);
     if (kind == KEY_CHAR && ch >= '1' && ch <= '9') {
         ui->help = 0;
         cctext_apply_named_idx(w, act, m, cols, vis, ch - '1') !>;
         return 0;
     }
     if (kind == KEY_CHAR) kind = cctext_cmd_letter(ch);
+    if (kind == KEY_WHEEL_UP || kind == KEY_UP) {
+        rtx_ui_help_scroll(ui, -1, help_vis);
+        return 0;
+    }
+    if (kind == KEY_WHEEL_DOWN || kind == KEY_DOWN) {
+        rtx_ui_help_scroll(ui, 1, help_vis);
+        return 0;
+    }
+    if (kind == KEY_PAGE_UP) {
+        rtx_ui_help_scroll(ui, -help_vis, help_vis);
+        return 0;
+    }
+    if (kind == KEY_PAGE_DOWN) {
+        rtx_ui_help_scroll(ui, help_vis, help_vis);
+        return 0;
+    }
     if (kind == KEY_MOUSE || kind == KEY_MOUSE_DRAG ||
-        kind == KEY_WHEEL_UP || kind == KEY_WHEEL_DOWN ||
         kind == KEY_WHEEL_LEFT || kind == KEY_WHEEL_RIGHT ||
         kind == KEY_NONE) {
         return 0;
@@ -852,6 +1740,13 @@ if (kind == KEY_STATS) {
 }
 if (kind == KEY_APPLY_MENU) {
     rtx_ui_toggle_apply(ui);
+    cctext_sync_table(act, ui->apply);
+    return 0;
+}
+if (cctext_ws_keys(w, ui, kind, cols, vis)) return 0;
+if (kind == KEY_CMD) {
+    rtx_ui_cancel_jump(ui, &act->doc);
+    cctext_run_cmd(w, act, m, ui, vis, cols) !>;
     return 0;
 }
 if (kind == KEY_OPEN) {
@@ -870,10 +1765,23 @@ if (w->browsing()) {
         return 0;
     }
     if (ui->help) return 0;
-    if (kind == KEY_UP || kind == KEY_WHEEL_UP)
-        rtx_browse_move(br, -1, vis);
-    else if (kind == KEY_DOWN || kind == KEY_WHEEL_DOWN)
-        rtx_browse_move(br, 1, vis);
+    if (kind == KEY_WHEEL_UP || kind == KEY_WHEEL_DOWN ||
+        kind == KEY_WHEEL_LEFT || kind == KEY_WHEEL_RIGHT) {
+        cctext_wheel(w, act, m, kind, vis, cols) !>;
+        if (skip_reveal) *skip_reveal = 1;
+    } else if (kind == KEY_UP || kind == KEY_DOWN || kind == KEY_PAGE_UP ||
+               kind == KEY_PAGE_DOWN || kind == KEY_DOC_HOME ||
+               kind == KEY_DOC_END) {
+        int dir = (kind == KEY_UP || kind == KEY_PAGE_UP ||
+                   kind == KEY_DOC_HOME) ? -1 : 1;
+        size_t steps = 1, k;
+        if (kind == KEY_PAGE_UP || kind == KEY_PAGE_DOWN)
+            steps = vis > rtx_browse_head(br) + 2
+                        ? (size_t)(vis - rtx_browse_head(br) - 2) : 1;
+        else if (kind == KEY_DOC_HOME || kind == KEY_DOC_END)
+            steps = rtx_browse_view_len(br);
+        for (k = 0; k < steps; k++) rtx_browse_move(br, dir, vis);
+    }
     else if (kind == KEY_LEFT && (br->glob_focus || g_shift))
         rtx_field_move(gf, -1, g_shift);
     else if (kind == KEY_RIGHT && (br->glob_focus || g_shift))
@@ -901,16 +1809,16 @@ if (w->browsing()) {
     } else if (kind == KEY_BACKSPACE) w->browse_backspace() !>;
     else if (kind == KEY_MOUSE || kind == KEY_MOUSE_DRAG)
         cctext_hit(w, m, cols, vis, kind == KEY_MOUSE_DRAG);
-    else if (kind == KEY_NEXT_BUF) {
-        int ok = rtx_browse_spawn(br, 0);
-        snprintf(g_status, sizeof(g_status), "%s %s",
-                 ok ? "opened in" : "could not open in",
-                 rtx_host_peer_name(0));
-    } else if (kind == KEY_NAV && g_nav == 3) {
-        int ok = rtx_browse_spawn(br, 1);
-        snprintf(g_status, sizeof(g_status), "%s %s",
-                 ok ? "opened in" : "could not open in",
-                 rtx_host_peer_name(1));
+    else if (kind == KEY_NEXT_BUF || (kind == KEY_NAV && g_nav == 3)) {
+        int other = kind != KEY_NEXT_BUF;
+        int ok = rtx_browse_spawn(br, other);
+        const char *why = rtx_host_spawn_why();
+        if (!ok && why && why[0])
+            snprintf(g_status, sizeof(g_status), "%s", why);
+        else
+            snprintf(g_status, sizeof(g_status), "%s %s",
+                     ok ? "opened in" : "could not open in",
+                     rtx_host_peer_name(other));
     } else if (kind == KEY_VIEW) {
         w->browse_prev_cycle(w->focus);
         snprintf(g_status, sizeof(g_status), "view %s",
@@ -920,6 +1828,11 @@ if (w->browsing()) {
         snprintf(g_status, sizeof(g_status), "%s",
                  w->prev[w->focus].layout.wrap ? "wrap" : "unwrap");
     } else if (kind == KEY_CHAR) w->browse_type(ch) !>;
+    else if (kind == KEY_TEXT || kind == KEY_PASTE_TEXT) {
+        size_t i = 0;
+        uint32_t cp;
+        while (cctext_text_cp(&i, &cp)) w->browse_type((int)cp) !>;
+    }
     return 0;
 }
 if (kind == KEY_JUMP) {
@@ -1009,10 +1922,10 @@ if (kind == KEY_SAVE) {
     if (!act->doc.dirty()) snprintf(g_status, sizeof(g_status), "saved");
     act->doc.break_coalesce();
 } else if (kind == KEY_UNDO) {
-    act->doc.undo() !>;
-    cctext_after_edit(w, m, cols, vis) !>;
+    /* A split workspace transaction asks (ask_xact) instead. */
+    if (rtx_ui_undo(ui, w) !>) cctext_after_edit(w, m, cols, vis) !>;
 } else if (kind == KEY_REDO) {
-    act->doc.redo() !>;
+    w->redo(w->pane[w->focus]) !>;
     cctext_after_edit(w, m, cols, vis) !>;
 } else if (kind == KEY_COPY) {
     if (w->copy() !>) cctext_sync_clip(w);
@@ -1024,20 +1937,6 @@ if (kind == KEY_SAVE) {
     cctext_from_os_clip(w) !>;
     w->paste() !>;
     cctext_after_edit(w, m, cols, vis) !>;
-} else if (kind == KEY_SPLIT) {
-    w->toggle_split();
-    fputs("\x1b[H\x1b[J", stdout);
-    cctext_draw_invalidate();
-    {
-        int rp;
-        for (rp = 0; rp < w->npanes; rp++) {
-            int held = w->hold_pane(rp);
-            w->bufs[w->pane[rp]]->layout.clear_rows();
-            w->drop_pane(rp, held);
-        }
-    }
-} else if (kind == KEY_OTHER_PANE) {
-    w->focus_other();
 } else if (kind == KEY_NEXT_BUF) {
     w->next_buf();
 } else if (kind == KEY_WHEEL_UP || kind == KEY_WHEEL_DOWN ||
@@ -1081,21 +1980,13 @@ if (kind == KEY_SAVE) {
     cctext_after_edit(w, m, cols, vis) !>;
 } else if (kind == KEY_ENTER) {
     if (!rtx_layout_is_hex(&act->layout)) {
-        act->enter() !>;
+        /* Shift-Enter where the terminal reports it, else Alt-Enter. */
+        if (g_shift || g_alt) act->enter_soft() !>;
+        else act->enter() !>;
         cctext_after_edit(w, m, cols, vis) !>;
     }
 } else if (kind == KEY_TAB) {
-    if (rtx_layout_is_grid(&act->layout)) {
-        act->move_grid_col(g_shift ? -1 : 1) !>;
-    } else if (act->layout.rich &&
-               rtx_layout_md_index(&act->layout, act->doc.caret) >= 0) {
-        size_t n0 = act->len();
-        act->move_md_col(g_shift ? -1 : 1) !>;
-        if (act->len() != n0) cctext_after_edit(w, m, cols, vis) !>;
-    } else if (!rtx_layout_is_hex(&act->layout)) {
-        act->type_cp((uint32_t)'\t') !>;
-        cctext_after_edit(w, m, cols, vis) !>;
-    }
+    if (act->tab(g_shift ? -1 : 1) !>) cctext_after_edit(w, m, cols, vis) !>;
 } else if (kind == KEY_CHAR) {
     if (ch == ' ' && (act->activate() !>)) {
         cctext_after_edit(w, m, cols, vis) !>;
@@ -1103,6 +1994,43 @@ if (kind == KEY_SAVE) {
         act->type_cp((uint32_t)ch) !>;
         cctext_after_edit(w, m, cols, vis) !>;
     }
+} else if (kind == KEY_PASTE_TEXT) {
+    /* One replace, one hist record, one relayout. Bytes are text: a tab is
+     * a tab, a newline is not Enter (no table row), a space is not a task
+     * toggle. */
+    act->paste_text(cctext_text()) !>;
+    cctext_after_edit(w, m, cols, vis) !>;
+} else if (kind == KEY_TEXT) {
+    if (cctext_run_plain(act)) {
+        act->doc.type(cctext_text()) !>;
+    } else {
+        size_t i = 0;
+        uint32_t cp;
+        while (cctext_text_cp(&i, &cp)) {
+            if (cp == ' ' && (act->activate() !>)) {
+                cctext_after_edit(w, m, cols, vis) !>;
+                continue;
+            }
+            act->type_cp(cp) !>;
+            cctext_after_edit(w, m, cols, vis) !>;
+        }
+        return 0;
+    }
+    cctext_after_edit(w, m, cols, vis) !>;
+} else if (kind == KEY_PAGE_UP || kind == KEY_PAGE_DOWN) {
+    double tw = (double)cctext_text_cols(act, cctext_pane_cols(w, cols, w->focus), vis);
+    act->page_vert(m, tw, kind == KEY_PAGE_UP ? -1 : 1, (size_t)(vis > 1 ? vis - 1 : 1),
+                   g_shift) !>;
+} else if (kind == KEY_DOC_HOME || kind == KEY_DOC_END) {
+    size_t n = act->len();
+    size_t at = kind == KEY_DOC_HOME ? 0 : n;
+    if (rtx_layout_is_hex(&act->layout) && at == n && n) at = n - 1;
+    act->doc.caret = at;
+    if (!g_shift) act->doc.sel_anchor = at;
+    act->doc.sel_box = 0;
+    act->hex_nib = 0;
+    act->clear_pref();
+    act->doc.break_coalesce();
 }
 
     return 0;

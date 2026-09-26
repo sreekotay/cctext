@@ -1,0 +1,632 @@
+#!ccc ccs
+/*
+ * Buffer list and pane tree (DESIGN Interactive, Panes): tab order,
+ * close clean / dirty / last, split / close / resize / focus, the same
+ * file in three panes under random edits (every camera's rows equal a
+ * fresh fill), park / unpark with N panes, and the per-project RTXW
+ * snapshot (round trip, another project, migration of the old global one).
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/safe.cch"
+#include "../core/ui.cch"
+#include "../core/browse.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static unsigned long long rng_s = 0x2545f4914f6cdd1dull;
+
+static unsigned rnd(unsigned n) {
+    rng_s ^= rng_s << 13;
+    rng_s ^= rng_s >> 7;
+    rng_s ^= rng_s << 17;
+    return n ? (unsigned)(rng_s % n) : 0;
+}
+
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    double w = (double)rtx_utf8_cols(bytes);
+    (void)ctx;
+    (void)sec;
+    if (st.bold) w *= 1.5;
+    if (st.italic) w *= 1.25;
+    if (st.mono) w *= 1.125;
+    return w;
+}
+
+static double cell_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)sec;
+    return st.mono ? 1.5 : 1.0;
+}
+
+static int row_eq(const RtxVisRow *a, const RtxVisRow *b) {
+    return a->byte_start == b->byte_start && a->byte_len == b->byte_len &&
+           a->line == b->line && a->wrap_i == b->wrap_i && a->width == b->width &&
+           a->height == b->height && a->pad == b->pad && a->sec == b->sec;
+}
+
+/* relayout_smoke's comparator: a camera's rows vs a fresh fill of the
+ * same lines at the same reveal. */
+static void !>(CCError) check_fresh(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
+                                    double width, const char *tag, size_t step) {
+    RtxLayout F = {0} @destroy;
+    size_t i, n;
+    char msg[512];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    F.view = L->view;
+    F.wrap = L->wrap;
+    F.wrap_char = L->wrap_char;
+    F.rich = L->rich;
+    F.reveal_lo = L->reveal_lo;
+    F.reveal_hi = L->reveal_hi;
+    if (!L->rows.len) return cc_ok();
+    F.lines(d, m, width, L->from_line, L->nlines) !>;
+    n = F.rows.len < L->rows.len ? F.rows.len : L->rows.len;
+    if (F.rows.len != L->rows.len) {
+        snprintf(msg, sizeof msg, "%s step %zu: rows %zu fresh %zu", tag, step,
+                 L->rows.len, F.rows.len);
+        expect(0, msg);
+        return cc_ok();
+    }
+    for (i = 0; i < n; i++) {
+        if (!row_eq(&L->rows.data[i], &F.rows.data[i])) {
+            snprintf(msg, sizeof msg, "%s step %zu row %zu differs from a fresh fill",
+                     tag, step, i);
+            expect(0, msg);
+            return cc_ok();
+        }
+    }
+    return cc_ok();
+}
+
+static const char *pastes[] = {
+    "x", "hello world ", "line one\nline two\n", "**bold** and *it* `code`\n",
+    "| a | b |\n", "- item\n- [ ] task\n", "# Head\n", "\n\n", "日本語 é ",
+};
+static const char typeables[] = "abc  xyz*`_|#-[]()";
+
+static void !>(CCError) one_edit(RtxBuf *b) {
+    unsigned op = rnd(100);
+    size_t n = b->doc.len();
+    size_t at = n ? rnd((unsigned)(n + 1)) : 0;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (b->layout.rows.len && rnd(10) < 8) {
+        const RtxVisRow *r0 = &b->layout.rows.data[0];
+        const RtxVisRow *r1 = &b->layout.rows.data[b->layout.rows.len - 1];
+        size_t lo = r0->byte_start, hi = r1->byte_start + r1->byte_len;
+        if (hi > n) hi = n;
+        at = hi > lo ? lo + rnd((unsigned)(hi - lo + 1)) : lo;
+    }
+    if (at > n) at = n;
+    b->doc.caret = at;
+    b->doc.sel_anchor = at;
+    if (op < 45) {
+        b->type_cp((uint32_t)(unsigned char)typeables[rnd(sizeof typeables - 1)]) !>;
+    } else if (op < 55) {
+        b->enter() !>;
+    } else if (op < 65) {
+        b->backspace() !>;
+    } else if (op < 75) {
+        size_t k = 1 + rnd(120);
+        b->doc.sel_anchor = at + k > n ? n : at + k;
+        b->backspace() !>;
+    } else if (op < 88) {
+        const char *s = pastes[rnd(sizeof pastes / sizeof pastes[0])];
+        b->doc.insert(at, cc_slice_from_buffer((char *)s, strlen(s))) !>;
+    } else if (op < 95) {
+        if (b->doc.can_undo()) b->doc.undo() !>;
+    } else {
+        if (b->doc.can_redo()) b->doc.redo() !>;
+    }
+    return cc_ok();
+}
+
+static void write_file(const char *path, const char *text) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    fputs(text, fp);
+    fclose(fp);
+}
+
+static void safe_home(const char *dir) {
+    char cmd[512];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    (void)system(cmd);
+    setenv("RTX_SAFE_HOME", dir, 1);
+    rtx_safe_set_enabled(1);
+}
+
+static int close_ok(RtxWs *w, int bufi, int discard) {
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    w->close_buf(bufi, discard) !>;
+    return 1;
+}
+
+static int buf_named(const RtxWs *w, int bufi, const char *tail) {
+    const char *p = RtxWs_buf_path(w, bufi);
+    size_t n, t;
+    if (!p) return 0;
+    n = strlen(p);
+    t = strlen(tail);
+    return n >= t && strcmp(p + n - t, tail) == 0;
+}
+
+static int rects_ok(RtxWs *w, RtxPaneRect area, int gx, int gy) {
+    RtxPaneRect r[RTX_PANES_MAX];
+    long cover = 0, gaps;
+    int i, j;
+    RtxWs_pane_rects(w, area, gx, gy, r);
+    for (i = 0; i < w->npanes; i++) {
+        RtxPaneRect a = r[w->order[i]];
+        if (a.w < 1 || a.h < 1) return 0;
+        if (a.x < area.x || a.y < area.y || a.x + a.w > area.x + area.w ||
+            a.y + a.h > area.y + area.h)
+            return 0;
+        cover += (long)a.w * a.h;
+        for (j = i + 1; j < w->npanes; j++) {
+            RtxPaneRect b = r[w->order[j]];
+            if (a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h)
+                return 0;
+        }
+    }
+    gaps = (long)area.w * area.h - cover;
+    return gaps >= 0;
+}
+
+/* Hand-written pre-v4 global snapshot (RTXW v3). */
+static void write_legacy_ws(const char *home, const char *p0, const char *p1) {
+    char path[1024];
+    FILE *fp;
+    uint32_t u;
+    int32_t i;
+    snprintf(path, sizeof path, "%s/ws", home);
+    fp = fopen(path, "wb");
+    if (!fp) return;
+    u = 0x57585452u; fwrite(&u, 4, 1, fp);
+    u = 3; fwrite(&u, 4, 1, fp);
+    i = 2; fwrite(&i, 4, 1, fp); /* npanes */
+    i = 1; fwrite(&i, 4, 1, fp); /* focus */
+    i = 0; fwrite(&i, 4, 1, fp); /* pane0 */
+    i = 1; fwrite(&i, 4, 1, fp); /* pane1 */
+    u = 2; fwrite(&u, 4, 1, fp);
+    u = (uint32_t)strlen(p0); fwrite(&u, 4, 1, fp); fwrite(p0, 1, u, fp);
+    i = 0; fwrite(&i, 4, 1, fp); fwrite(&i, 4, 1, fp);
+    u = (uint32_t)strlen(p1); fwrite(&u, 4, 1, fp); fwrite(p1, 1, u, fp);
+    i = 0; fwrite(&i, 4, 1, fp); fwrite(&i, 4, 1, fp);
+    i = 300; fwrite(&i, 4, 1, fp);
+    i = 700; fwrite(&i, 4, 1, fp);
+    fclose(fp);
+}
+
+int main(void) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    @errhandler(RtxIndexErr ie) {
+        fprintf(stderr, "workspace_smoke: %s\n", ie.message ? ie.message : "index");
+        return 1;
+    }
+    const char *A = "testdata/generated/ws_a.txt";
+    const char *B = "testdata/generated/ws_b.txt";
+    const char *C = "testdata/generated/ws_c.txt";
+    const char *D = "testdata/generated/ws_d.txt";
+    const char *home = "testdata/generated/ws_safe";
+    RtxMeasure m = {0};
+    m.measure = cell_meas;
+    m.line_height = cell_lh;
+    mkdir("testdata/generated", 0755);
+    write_file(A, "alpha\n");
+    write_file(B, "bravo\nbravo 2\n");
+    write_file(C, "charlie\n");
+    write_file(D, "delta\n");
+    safe_home(home);
+    rtx_safe_ws_set_project("testdata/generated");
+
+    /* ---- buffer list: tab order, show, cycle ---- */
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)A;
+        w.open_files(1, paths) !>;
+        w.open_in_pane(cc_slice_cstr(B)) !>;
+        w.open_in_pane(cc_slice_cstr(C)) !>;
+        expect(w.len == 3, "three buffers");
+        expect(buf_named(&w, 0, "ws_a.txt") && buf_named(&w, 1, "ws_b.txt") &&
+                   buf_named(&w, 2, "ws_c.txt"),
+               "tab order is open order");
+        expect(w.pane[w.focus] == 2, "focused pane shows the last opened");
+        w.next_buf();
+        expect(w.pane[w.focus] == 0, "next wraps to the first tab");
+        w.prev_buf();
+        expect(w.pane[w.focus] == 2, "prev wraps back");
+        w.show_buf(1);
+        expect(w.pane[w.focus] == 1 && !w.bufs[1]->parked, "tab click shows b live");
+        expect(w.bufs[0]->parked && w.bufs[2]->parked, "tabs not shown are parked");
+
+        /* ---- close clean: the pane shows the next tab ---- */
+        expect(close_ok(&w, 1, 0), "close a clean buffer");
+        expect(w.len == 2 && buf_named(&w, 0, "ws_a.txt") && buf_named(&w, 1, "ws_c.txt"),
+               "closed tab leaves the list");
+        expect(w.pane[w.focus] == 1 && !w.bufs[1]->parked, "pane shows the next tab (c)");
+
+        /* ---- close dirty: refused without discard; discard drops the journal ---- */
+        w.active()->doc.type("zz") !>;
+        w.safe_flush_all();
+        expect(rtx_safe_peek_dirty(RtxWs_buf_path(&w, 1)), "dirty journal written");
+        expect(!close_ok(&w, 1, 0), "dirty close without discard is refused");
+        expect(w.len == 2, "refused close keeps the buffer");
+        {
+            char keep[1024];
+            snprintf(keep, sizeof keep, "%s", RtxWs_buf_path(&w, 1));
+            expect(close_ok(&w, 1, 1), "don't-save close");
+            expect(!rtx_safe_peek_dirty(keep), "don't-save drops the journal");
+        }
+        expect(w.len == 1 && buf_named(&w, 0, "ws_a.txt"), "one tab left");
+        expect(w.pane[w.focus] == 0 && !w.bufs[0]->parked, "pane falls back to a");
+
+        /* ---- close the last: an untitled buffer, the app keeps going ---- */
+        expect(close_ok(&w, 0, 0), "close the last buffer");
+        expect(w.len == 1 && RtxWs_untitled(&w), "last close leaves untitled");
+    }
+
+    /* ---- close others / all through the shared prompt (ask_close) ---- */
+    {
+        RtxWs w = {0} @destroy;
+        RtxUi ui = {0};
+        char *paths[1];
+        int r;
+        paths[0] = (char *)A;
+        w.open_files(1, paths) !>;
+        w.open_in_pane(cc_slice_cstr(B)) !>;
+        w.open_in_pane(cc_slice_cstr(C)) !>;
+        w.show_buf(1);
+        r = rtx_ui_offer_close(&w, &ui, RTX_CLOSE_OTHERS) !>;
+        expect(r == 1 && w.len == 1 && buf_named(&w, 0, "ws_b.txt"),
+               "close others (clean) closes at once");
+        w.open_in_pane(cc_slice_cstr(C)) !>;
+        w.active()->doc.type("q") !>;
+        r = rtx_ui_offer_close(&w, &ui, RTX_CLOSE_ALL) !>;
+        expect(r == 0 && ui.ask_close == RTX_CLOSE_ALL && w.len == 2,
+               "close all with an unsaved buffer asks first");
+        {
+            char what[128];
+            rtx_ui_close_label(&ui, &w, what, sizeof what);
+            expect(strstr(what, "ws_c.txt") != NULL, "the prompt names the unsaved file");
+        }
+        r = rtx_ui_close_answer(&ui, &w, 0) !>;
+        expect(r == 0 && w.len == 2 && !ui.ask_close, "cancel keeps everything");
+        r = rtx_ui_offer_close(&w, &ui, RTX_CLOSE_ALL) !>;
+        r = rtx_ui_close_answer(&ui, &w, 2) !>;
+        expect(r == 1 && w.len == 1 && RtxWs_untitled(&w), "don't save closes all");
+    }
+
+    /* ---- pane tree: split / focus / resize / dividers / close / cap ---- */
+    {
+        RtxWs w = {0} @destroy;
+        RtxPaneRect area = {0, 0, 120, 40};
+        RtxPaneRect r[RTX_PANES_MAX];
+        char *paths[2];
+        int s1, s2, i, node, f0;
+        paths[0] = (char *)A;
+        paths[1] = (char *)B;
+        w.open_files(1, paths) !>;
+        expect(w.npanes == 1, "one pane");
+        f0 = w.focus;
+        s1 = RtxWs_split(&w, RTX_SPLIT_COLS);
+        expect(s1 >= 0 && w.npanes == 2 && w.focus == s1, "split right focuses the new pane");
+        expect(w.pane[s1] == w.pane[f0] && RtxWs_same_split(&w), "new pane shows the same buffer");
+        s2 = RtxWs_split(&w, RTX_SPLIT_ROWS);
+        expect(s2 >= 0 && w.npanes == 3 && w.focus == s2, "split down");
+        expect(w.order[0] == f0 && w.order[1] == s1 && w.order[2] == s2,
+               "tree order: left, then the right column top to bottom");
+        expect(rects_ok(&w, area, 2, 1), "rects tile the area");
+        RtxWs_pane_rects(&w, area, 2, 1, r);
+        expect(r[f0].x == 0 && r[f0].h == 40, "left pane spans the height");
+        expect(r[s1].x == r[s2].x && r[s1].y < r[s2].y, "right column stacks");
+        expect(r[s1].h + r[s2].h + 1 == 40, "stacked heights + gap");
+        /* Keyboard resize moves the nearest divider on that axis. */
+        {
+            int w0 = r[s2].h;
+            expect(RtxWs_pane_nudge(&w, RTX_SPLIT_ROWS, 100), "nudge rows");
+            RtxWs_pane_rects(&w, area, 2, 1, r);
+            expect(r[s2].h < w0, "divider moved down: bottom pane shrinks");
+            w0 = r[f0].w;
+            expect(RtxWs_pane_nudge(&w, RTX_SPLIT_COLS, -100), "nudge cols");
+            RtxWs_pane_rects(&w, area, 2, 1, r);
+            expect(r[f0].w < w0, "divider moved left: left pane shrinks");
+        }
+        /* Mouse: divider hit + drag. */
+        node = RtxWs_divider_at(&w, area, 2, 1, r[f0].x + r[f0].w, 10, 0);
+        expect(node >= 0 && RtxWs_divider_dir(&w, node) == RTX_SPLIT_COLS, "vertical divider hit");
+        expect(RtxWs_divider_drag(&w, area, 2, 1, node, 60, 10), "drag the divider");
+        RtxWs_pane_rects(&w, area, 2, 1, r);
+        expect(r[f0].w == 60, "dragged divider lands at the pointer");
+        node = RtxWs_divider_at(&w, area, 2, 1, r[s1].x + 3, r[s1].y + r[s1].h, 0);
+        expect(node >= 0 && RtxWs_divider_dir(&w, node) == RTX_SPLIT_ROWS, "horizontal divider hit");
+        expect(RtxWs_divider_at(&w, area, 2, 1, 5, 5, 0) < 0, "no divider inside a pane");
+        /* Focus: step cycles in tree order; direction by geometry. */
+        RtxWs_focus_step(&w, 1);
+        expect(w.focus == f0, "focus_step wraps");
+        expect(RtxWs_focus_dir(&w, area, 2, 1, 1, 0) && w.focus == s1,
+               "focus right lands on the top-right pane");
+        expect(RtxWs_focus_dir(&w, area, 2, 1, 0, 1) && w.focus == s2, "focus down");
+        expect(!RtxWs_focus_dir(&w, area, 2, 1, 0, 1), "nothing below");
+        /* Move the buffer to another pane. */
+        w.open_in_pane(cc_slice_cstr(B)) !>;
+        {
+            int bb = w.pane[w.focus];
+            RtxWs_move_to_pane(&w, 1);
+            expect(w.focus == f0 && w.pane[f0] == bb, "move to pane: target shows it");
+            expect(w.pane[s2] != bb, "move to pane: source steps away");
+        }
+        /* Close the middle pane: its sibling takes the space. */
+        expect(RtxWs_close_pane(&w, s1), "close pane");
+        expect(w.npanes == 2 && !RtxWs_pane_live(&w, s1), "two panes left");
+        expect(rects_ok(&w, area, 2, 1), "rects after close");
+        RtxWs_pane_rects(&w, area, 2, 1, r);
+        expect(r[s2].h == 40, "the sibling fills the column");
+        expect(!RtxWs_close_pane(&w, 99), "bad slot");
+        /* Cap. */
+        for (i = 0; i < RTX_PANES_MAX + 2; i++) RtxWs_split(&w, i & 1);
+        expect(w.npanes == RTX_PANES_MAX, "pane cap");
+        expect(RtxWs_split(&w, RTX_SPLIT_COLS) < 0, "split past the cap refuses");
+        expect(rects_ok(&w, area, 2, 1), "rects at the cap");
+        while (w.npanes > 1) {
+            int before = w.npanes;
+            RtxWs_close_pane(&w, w.focus);
+            if (w.npanes == before) break;
+        }
+        expect(w.npanes == 1, "close back to one pane");
+        /* toggle_split: one -> two with the next buffer; many -> the first. */
+        w.toggle_split();
+        expect(w.npanes == 2 && !RtxWs_same_split(&w), "toggle splits with the next file");
+        RtxWs_split(&w, RTX_SPLIT_ROWS);
+        w.toggle_split();
+        expect(w.npanes == 1, "toggle collapses every split");
+    }
+
+    /* ---- same file in three panes: every camera stays exact ---- */
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        size_t step;
+        int k, p;
+        double width = 40.0;
+        int vis = 10;
+        paths[0] = (char *)"testdata/rich/md/mixed_doc.md";
+        w.open_files(1, paths) !>;
+        RtxWs_split(&w, RTX_SPLIT_COLS);
+        RtxWs_split(&w, RTX_SPLIT_ROWS);
+        expect(w.npanes == 3, "three panes on one file");
+        for (k = 0; k < w.npanes; k++) {
+            RtxBuf *act;
+            p = w.order[k];
+            w.set_focus(p);
+            act = w.active();
+            rtx_line_scan_to(&act->doc.tree, act->doc.len()) !>;
+            act->top = (size_t)(k * 7);
+            act->ensure_view(&m, width, vis) !>;
+            RtxWs_pane_geom(&w, p, width, vis);
+        }
+        for (k = 0; k < w.npanes; k++) {
+            p = w.order[k];
+            expect(w.bufs[w.pane[p]]->cam_pane == w.focus, "the buf camera is the focused pane's");
+            if (p != w.focus)
+                expect(w.cam[p].live && w.cam[p].of == w.bufs[0], "other panes keep their own camera");
+        }
+        {
+            int t0, t1;
+            int h = RtxWs_hold_pane(&w, w.order[0]);
+            t0 = (int)w.bufs[0]->top;
+            RtxWs_drop_pane(&w, w.order[0], h);
+            h = RtxWs_hold_pane(&w, w.order[1]);
+            t1 = (int)w.bufs[0]->top;
+            RtxWs_drop_pane(&w, w.order[1], h);
+            expect(t0 == 0 && t1 == 7, "each camera keeps its top");
+        }
+        for (step = 0; step < 150; step++) {
+            RtxBuf *act;
+            w.set_focus(w.order[rnd((unsigned)w.npanes)]);
+            act = w.active();
+            one_edit(act) !>;
+            w.after_edit(w.pane[w.focus], &m, width, width, vis) !>;
+            for (k = 0; k < w.npanes; k++) {
+                int held;
+                char tag[64];
+                p = w.order[k];
+                held = RtxWs_hold_pane(&w, p);
+                snprintf(tag, sizeof tag, "3-pane camera %d", k);
+                check_fresh(&w.bufs[0]->layout, &w.bufs[0]->doc, &m, width, tag, step) !>;
+                RtxWs_drop_pane(&w, p, held);
+            }
+            if (fails > 10) break;
+        }
+        /* Close the focused pane: another pane's camera takes the buf. */
+        {
+            int gone = w.focus;
+            RtxWs_close_pane(&w, gone);
+            expect(w.npanes == 2 && w.bufs[0]->cam_pane == w.focus,
+                   "closing the owner hands the buf camera to the new focus");
+            expect(!w.cam[w.focus].live, "the owner keeps no side camera");
+        }
+    }
+
+    /* ---- park / unpark with N panes ---- */
+    safe_home(home);
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        int s1, s2;
+        paths[0] = (char *)A;
+        w.open_files(1, paths) !>;
+        w.open_in_pane(cc_slice_cstr(B)) !>;
+        w.open_in_pane(cc_slice_cstr(C)) !>;
+        w.open_in_pane(cc_slice_cstr(D)) !>;
+        expect(w.len == 4, "four buffers");
+        w.show_buf(0);
+        s1 = RtxWs_split(&w, RTX_SPLIT_COLS);
+        w.show_buf(1);
+        s2 = RtxWs_split(&w, RTX_SPLIT_ROWS);
+        w.show_buf(2);
+        (void)s1;
+        (void)s2;
+        expect(!w.bufs[0]->parked && !w.bufs[1]->parked && !w.bufs[2]->parked,
+               "three shown buffers are live");
+        expect(w.bufs[3]->parked, "the fourth is parked");
+        w.active()->doc.type("edit ") !>;
+        w.show_buf(3);
+        expect(!w.bufs[3]->parked, "shown again: unparked");
+        expect(w.bufs[2]->parked && w.bufs[2]->park_dirty, "dirty tab parked with its journal");
+        w.show_buf(2);
+        expect(!w.bufs[2]->parked && w.bufs[2]->doc.dirty(), "unpark brings the edit back");
+        {
+            RtxDoc *d = &w.bufs[2]->doc;
+            char got[32];
+            size_t n = d->read_at(0, cc_slice_from_buffer(got, sizeof got - 1)) !>;
+            got[n] = 0;
+            expect(strcmp(got, "edit charlie\n") == 0, "unparked bytes");
+        }
+        w.active()->doc.undo() !>;
+        w.safe_flush_all();
+    }
+
+    /* ---- per-project snapshot: round trip ---- */
+    safe_home(home);
+    rtx_safe_ws_set_project("testdata/generated");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        int s1, s2;
+        paths[0] = (char *)A;
+        w.open_files(1, paths) !>;
+        w.open_in_pane(cc_slice_cstr(B)) !>;
+        w.open_in_pane(cc_slice_cstr(C)) !>;
+        w.show_buf(0);
+        s1 = RtxWs_split(&w, RTX_SPLIT_COLS);
+        w.show_buf(1);
+        s2 = RtxWs_split(&w, RTX_SPLIT_ROWS);
+        w.show_buf(2);
+        RtxWs_pane_nudge(&w, RTX_SPLIT_ROWS, 150);
+        RtxWs_set_focus(&w, s1);
+        (void)s2;
+        w.safe_flush_all();
+    }
+    {
+        RtxWs w = {0} @destroy;
+        RtxPaneRect area = {0, 0, 100, 50};
+        RtxPaneRect r[RTX_PANES_MAX];
+        w.open_files(0, NULL) !>;
+        expect(w.len == 3, "session buffers restored");
+        expect(w.npanes == 3, "session pane tree restored");
+        expect(buf_named(&w, w.pane[w.order[0]], "ws_a.txt") &&
+                   buf_named(&w, w.pane[w.order[1]], "ws_b.txt") &&
+                   buf_named(&w, w.pane[w.order[2]], "ws_c.txt"),
+               "each pane shows its file");
+        expect(w.focus == w.order[1], "focus restored");
+        RtxWs_pane_rects(&w, area, 2, 1, r);
+        expect(r[w.order[1]].x == r[w.order[2]].x && r[w.order[1]].h > r[w.order[2]].h,
+               "split directions and ratio restored");
+    }
+    /* Another project has its own (empty) session. */
+    rtx_safe_ws_set_project("testdata");
+    {
+        RtxWs w = {0} @destroy;
+        w.open_files(0, NULL) !>;
+        expect(w.len == 1 && RtxWs_untitled(&w) && w.npanes == 1,
+               "another project starts empty");
+    }
+    rtx_safe_ws_set_project("testdata/generated");
+    {
+        RtxWs w = {0} @destroy;
+        w.open_files(0, NULL) !>;
+        expect(w.npanes == 3, "first project's session is still there");
+    }
+
+    /* ---- migration: the old global RTXW v3 loads once ---- */
+    safe_home(home);
+    {
+        char ra[PATH_MAX], rb[PATH_MAX], legacy[PATH_MAX + 8];
+        struct stat st;
+        char *pa = realpath(A, ra);
+        char *pb = realpath(B, rb);
+        char dir[512];
+        expect(pa && pb, "realpaths");
+        expect(rtx_safe_dir(dir, sizeof dir), "safe dir");
+        write_legacy_ws(dir, ra, rb);
+        snprintf(legacy, sizeof legacy, "%s/ws", dir);
+        rtx_safe_ws_set_project("testdata/generated");
+        {
+            RtxWs w = {0} @destroy;
+            w.open_files(0, NULL) !>;
+            expect(w.len == 2 && w.npanes == 2, "legacy snapshot migrates");
+            expect(w.focus == w.order[1], "legacy focus");
+            expect(w.browse_split[w.order[0]] == 300 && w.browse_split[w.order[1]] == 700,
+                   "legacy browse splits");
+            w.safe_flush_all();
+        }
+        expect(stat(legacy, &st) != 0, "legacy leaf gone after migration");
+        rtx_safe_ws_set_project("testdata");
+        {
+            RtxWs w = {0} @destroy;
+            w.open_files(0, NULL) !>;
+            expect(RtxWs_untitled(&w), "migration happened once (not into a second project)");
+        }
+        rtx_safe_ws_set_project("testdata/generated");
+        {
+            RtxWs w = {0} @destroy;
+            w.open_files(0, NULL) !>;
+            expect(w.len == 2 && w.npanes == 2, "migrated session reloads as v4");
+        }
+    }
+
+    /* ---- project root: nearest .git above, else the directory ---- */
+    {
+        char root[PATH_MAX], want[PATH_MAX];
+        mkdir("testdata/generated/proj", 0755);
+        mkdir("testdata/generated/proj/.git", 0755);
+        mkdir("testdata/generated/proj/sub", 0755);
+        mkdir("testdata/generated/proj/sub/deep", 0755);
+        expect(rtx_project_root(root, sizeof root, "testdata/generated/proj/sub/deep"),
+               "project root");
+        expect(realpath("testdata/generated/proj", want) != NULL, "proj realpath");
+        expect(strcmp(root, want) == 0, "git root of a nested dir");
+        mkdir("testdata/generated/noproj_ws", 0755);
+        (void)rtx_project_root(root, sizeof root, "/");
+        expect(strcmp(root, "/") == 0, "root without .git is itself");
+    }
+
+    rtx_safe_ws_set_project(NULL);
+    if (fails) {
+        fprintf(stderr, "workspace_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("workspace_smoke ok\n");
+    return 0;
+}

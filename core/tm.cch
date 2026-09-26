@@ -5,9 +5,11 @@
  * Lowered TextMate runtime: classified matchers + a begin/end stack.
  * Grammars are *.tmLanguage.json loaded at first use. Directory is
  * RTX_GRAMMARS, else <exe>/grammars, else <exe>/../testdata/grammars.
- * Leftover match patterns use the tiny regex in tm_re.cch (not Onig).
- * Each rule stores a first-byte gate (-1 = any). Regex without captures
- * uses rtx_re_match, not match_caps. `\\.` is ESC_DOT; 1-byte spans
+ * Leftover match / begin / end patterns compile once at load with the
+ * regex engine (rx.cch) onto the TM store. Each rule stores a first-byte
+ * gate (-1 = any; regex rules also test the program's first-byte set).
+ * Regex rules see one line at a time (the line and its newline), the
+ * way TextMate feeds Oniguruma. `\\.` is ESC_DOT; 1-byte spans
  * memchr to the closer / backslash instead of walking every byte.
  * Rules / patterns are Vecs on a process TM store; match strings
  * intern there so bind pointers survive grow. Bodies in document.ccs.
@@ -20,13 +22,13 @@
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
-#include "tm_re.cch"
+#include "rx.cch"
 
 typedef enum {
     RTX_TM_SKIP = 0,
     RTX_TM_LIT_LINE,   /* literal, then to end of line */
     RTX_TM_LIT_SPAN,   /* begin literal … end literal (stack) */
-    RTX_TM_RE_SPAN,    /* begin/end via rtx_re_match; a/b are patterns */
+    RTX_TM_RE_SPAN,    /* begin/end regex (ra / rb); a/b are the patterns */
     RTX_TM_KEYWORDS,   /* identifier in a '|' list */
     RTX_TM_DIGITS,
     RTX_TM_REGEX,      /* leftover TM match */
@@ -42,6 +44,8 @@ typedef struct {
     const char *b;
     size_t alen;
     size_t blen;
+    const RtxRx *ra; /* REGEX match / RE_SPAN begin, on the TM store */
+    const RtxRx *rb; /* RE_SPAN end; \\1-\\9 read the begin captures */
     size_t inner0;
     size_t innern;
     RtxScope cap[RTX_TM_CAPS];
@@ -49,7 +53,11 @@ typedef struct {
     unsigned char has_cap;
     unsigned char bol; /* span: begin and end must sit at line start (`cctext.bol`) */
     unsigned char inl; /* span: unclosed at EOL → the opener is plain text (`cctext.inline`) */
-    unsigned char flank; /* span: opener not before, closer not after, whitespace (`cctext.flank`) */
+    unsigned char flank; /* span: RTX_FLANK_* delimiter-run rule (`cctext.flank`) */
+    unsigned char exact; /* span: begin / end are a whole run of their byte (`cctext.exact`) */
+    unsigned char abort; /* span: this byte (not a closer, not an inner) drops the frame */
+    unsigned char block; /* RTX_MDB_ROLE_*: planted by the Markdown block pass, never tried */
+    unsigned char self_in; /* span: inners include the grammar's own rules (`$self`) */
     unsigned char info; /* span: bytes after begin to EOL pick a guest grammar (`cctext.info`) */
     const char *embed_scope; /* interned `include: source.x` on a span; resolved at lex */
     /* Effective style bits, copied onto every run this rule plants: the
@@ -60,15 +68,20 @@ typedef struct {
     unsigned char sc_bold;
     unsigned char sc_italic;
     unsigned char sc_mono;
+    unsigned char sc_strike;
     unsigned char cap_bits[RTX_TM_CAPS]; /* RTX_SBIT_* */
     const char *sc_apply;
     const char *sc_insert; /* prefix unit, or wrap bookends (`<>` + wrap 1) */
     unsigned char sc_max;  /* stacked insert units; 0 → 1 */
     unsigned char mark; /* RTX_ARITY_* + RTX_MARK_DEST from cctext.arity / face */
     unsigned char sc_wrap; /* match: plant this many hint bytes on each end */
+    unsigned char sc_mark; /* pattern set a topology key (`arity` / `face` / `wrap`):
+                            * it plants hints even outside a markup grammar */
 } RtxTmRule;
 
 #define RTX_APPLY_MAX 16
+#define RTX_TM_PAIRS 12
+#define RTX_TM_PAIRS_BYTES 25 /* 2 * RTX_TM_PAIRS + 1 (a literal: claude.md) */
 enum {
     RTX_APPLY_PREFIX = 1,
     RTX_APPLY_PAIR = 2,
@@ -80,14 +93,56 @@ typedef struct {
     unsigned char kind; /* RTX_APPLY_* */
 } RtxApplyEnt;
 
+/* `cctext.flank`: CommonMark delimiter runs. STAR (`true`): the opener
+ * is left-flanking, the closer right-flanking. UNDER: `_` rules — also no
+ * intraword open / close. MATH: `$` — opener not before whitespace,
+ * closer not after it and not before a digit. An empty span never closes. */
+enum {
+    RTX_FLANK_NONE = 0,
+    RTX_FLANK_STAR = 1,
+    RTX_FLANK_UNDER = 2,
+    RTX_FLANK_MATH = 3
+};
+
+/* `cctext.block`: which Markdown block-pass role a rule plants (md_block.cch).
+ * The pass decides where; the rule gives scope, bits, arity, apply, tag. */
+enum {
+    RTX_MDB_ROLE_NONE = 0,
+    RTX_MDB_ROLE_FENCE,
+    RTX_MDB_ROLE_HEADING,
+    RTX_MDB_ROLE_HEADING_CLOSE,
+    RTX_MDB_ROLE_SETEXT,
+    RTX_MDB_ROLE_QUOTE,
+    RTX_MDB_ROLE_LIST,
+    RTX_MDB_ROLE_TASK,
+    RTX_MDB_ROLE_HR,
+    RTX_MDB_ROLE_CODE,
+    RTX_MDB_ROLE_HTML,
+    RTX_MDB_ROLE_MATH,
+    RTX_MDB_ROLE_FRONT,
+    RTX_MDB_ROLE_REF,
+    RTX_MDB_ROLE_REF_DEST,
+    RTX_MDB_ROLE_FOOT,
+    RTX_MDB_ROLE_N
+};
+
 typedef struct {
     Vec::[RtxTmRule] rules;
     Vec::[RtxTmRule] inners;
     char exts[16][16];
     size_t n_exts;
     int markup; /* grammar-level `"cctext": { "kind": "markup" }` → RTX_SEC_MARKUP */
+    int blocks; /* `"cctext": { "blocks": "commonmark" }`: the Markdown block pass
+                 * owns block structure; the grammar lexes inline content */
+    short blk[RTX_MDB_ROLE_N]; /* rules index per role, -1 = none */
     const char *scope; /* interned `scopeName`; NULL if the JSON omitted it */
     const char *title; /* interned display `name` */
+    /* Auto-close pairs, opener then closer, one byte each: grammar-level
+     * `"cctext": { "pairs": "()[]" }` or the VS Code style top-level
+     * `autoClosingPairs` (single-byte entries). pairs_set: the grammar
+     * named its own table (an empty one turns auto-pairs off). */
+    char pairs[RTX_TM_PAIRS_BYTES];
+    int pairs_set;
 } RtxTmRt;
 
 /* Begin/end stack. A frame is (rule tag, grammar index, opener off, embed).
@@ -96,10 +151,10 @@ typedef struct {
  * only while the host frame is open. The current closer is always tested
  * first: italic `*` must not steal bold `**`, and fence ``` / `</script>`
  * win over an unclosed guest. `cctext.flank` keeps `*outer **inner**`
- * from closing on the space before `**`. A RE_SPAN end with `\\1`–`\\7`
- * stores a per-frame literal closer (not on RtxTmCkpt). */
+ * from closing on the space before `**`. A RE_SPAN end reads `\\1`–`\\9` from the
+ * frame's begin captures (window offsets; not on RtxTmCkpt, so a resume
+ * mid-heredoc does not close). `\\G` is the end of the frame's begin. */
 #define RTX_TM_STACK 32
-#define RTX_TM_CLOSE 64 /* per-frame substituted closer (`\\1`–`\\7` at open) */
 #define RTX_TM_NO_LANG 0xffffu
 #define RTX_TM_INNER 0x8000u
 
@@ -116,7 +171,11 @@ typedef struct {
     unsigned char sc_has; /* `cctext` had a style key: sidecar wins over defaults */
     unsigned char sc_bol; /* `cctext.bol`: line-anchored literal begin / end */
     unsigned char sc_inl; /* `cctext.inline`: span may not cross a line end */
-    unsigned char sc_flank; /* `cctext.flank`: CommonMark-style flanking delimiters */
+    unsigned char sc_flank; /* `cctext.flank`: RTX_FLANK_* */
+    unsigned char sc_exact; /* `cctext.exact`: begin / end are a whole delimiter run */
+    unsigned char sc_abort; /* `cctext.abort`: byte that drops an open span */
+    unsigned char sc_block; /* `cctext.block`: RTX_MDB_ROLE_* */
+    unsigned char sc_strike;
     unsigned char sc_info; /* `cctext.info`: opener line after begin is an info string */
     unsigned char sc_bold;
     unsigned char sc_italic;
@@ -128,6 +187,7 @@ typedef struct {
     unsigned char sc_lit;   /* force LIT_SPAN when begin/end are regex meta */
     unsigned char sc_wrap;  /* match: hint_a = hint_b = N */
     unsigned char sc_max;   /* stacked insert units; 0 → 1 */
+    unsigned char sc_mark;  /* had `arity` / `face` / `wrap`: opts into hints */
 } RtxTmPat;
 
 typedef struct {
@@ -139,19 +199,39 @@ typedef struct {
     Vec::[RtxTmPat] pats;
     Vec::[RtxTmPat] kids;
     RtxTmRt rt;
+    /* Registered from metadata (name / scopeName / fileTypes: rt.title,
+     * rt.scope, rt.exts) at the dir scan; rules are loaded and compiled
+     * the first time a lookup hands this grammar out. `ready` / `failed`
+     * are read with acquire loads, set under the load lock. */
+    const char *src; /* interned grammar path */
+    int meta;        /* title / scope / exts came from the scan */
     int ready;
+    int failed;      /* full load failed: lookups skip it */
 } RtxTmLang;
 
-extern size_t rtx_tm_nlangs;
+extern size_t rtx_tm_nlangs;     /* grammars registered by the dir scan */
 extern char rtx_tm_load_dir[256];
-extern size_t rtx_tm_load_us;
-extern size_t rtx_tm_load_files;
+extern size_t rtx_tm_load_us;     /* scan + every full load so far */
+extern size_t rtx_tm_load_files;  /* files registered */
+extern size_t rtx_tm_nready;      /* grammars fully loaded (lazily) */
+/* Grammar patterns the regex engine refused (the rule is dropped). */
+extern size_t rtx_tm_rx_errors;
+extern char rtx_tm_rx_err[160];
 
 typedef struct {
     const char *s;
     size_t n;
     size_t i;
 } RtxJw;
+
+/* The grammar loader's JSON reader (document.ccs); keymap.ccs reads
+ * keys.json / settings.json with it. Each skips leading whitespace;
+ * 0 = not there / malformed (j->i is then unspecified). */
+void rtx_jw_ws(RtxJw *j);
+int rtx_jw_eat(RtxJw *j, char c);
+int rtx_jw_string(RtxJw *j, char *dst, size_t cap);
+int rtx_jw_skip(RtxJw *j);
+int rtx_jw_bool(RtxJw *j, int *out);
 
 RtxTmRt *rtx_tm_c_rt(void);
 RtxTmRt *rtx_tm_json_rt(void);

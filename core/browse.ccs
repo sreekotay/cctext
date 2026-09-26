@@ -67,10 +67,37 @@ typedef struct {
     int denied;
 } RtxBrowseDuHave;
 
+typedef struct {
+    CCArena arena;
+    RtxBrowseEnt *ents;
+    size_t n, cap;
+    RtxBrowseJob *kids;
+    size_t kn, kcap;
+    int denied;
+} RtxBrowseScratch;
+
+/* The query a walk runs: dir + glob + flat, copied at kick. Workers read
+ * this, never br->dir / br->glob — the host edits those (typing, enter,
+ * parent) before the kick that joins this walk. */
+typedef struct {
+    char dir[RTX_BROWSE_DIR];
+    char glob[RTX_BROWSE_GLOB];
+    size_t glob_len;
+    int flat;
+} RtxBrowseQ;
+
 typedef struct RtxBrowseWalk {
+    RtxBrowseQ q;
     CCArena arena;
     RtxBrowseJob *jobs;
     size_t jlen, jcap, jhead;
+    /* This wave's jobs, copied before the lanes start: a stage's job_push
+     * grows (moves) `jobs` while later bodies of the wave still read. */
+    RtxBrowseJob wave[RTX_BROWSE_WAVE];
+    /* Lane i's collect scratch. The arm frees every slot after the join:
+     * a lane whose stage wait fails leaves the body without running its
+     * locals' @destroy, so the scratch cannot be a body local. */
+    RtxBrowseScratch wslot[RTX_BROWSE_WAVE];
     char keep[RTX_BROWSE_NAME];
     char du_name[RTX_BROWSE_NAME];
     RtxBrowseDuFrame du_stk[RTX_BROWSE_WALK];
@@ -85,6 +112,7 @@ typedef struct RtxBrowseWalk {
     int du_defer;          /* 1: movement owns this turn; no du I/O */
     int deep_phase;        /* 1: local listing done, appending flatten */
     _Atomic unsigned char cancel; /* drop / kick asked the wave to leave */
+    _Atomic unsigned char wave_stop; /* a stage capped the walk; bodies leave */
     _Atomic unsigned char done;   /* 1: dest-live arm returned; host may wait */
     CCParallel h;
 } RtxBrowseWalk;
@@ -105,20 +133,18 @@ static inline void rtx_browse_store_done(RtxBrowseWalk *wk, unsigned char v) {
     if (wk) atomic_store_explicit(&wk->done, v, memory_order_release);
 }
 
-typedef struct {
-    CCArena arena;
-    RtxBrowseEnt *ents;
-    size_t n, cap;
-    RtxBrowseJob *kids;
-    size_t kn, kcap;
-    int denied;
-} RtxBrowseScratch;
+/* A stage capped the walk (br->truncated is the stage's; bodies read this). */
+static inline unsigned char rtx_browse_wave_stopped(const RtxBrowseWalk *wk) {
+    return wk ? atomic_load_explicit(&wk->wave_stop, memory_order_acquire) : 1;
+}
 
 static long rtx_browse_now_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
     return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
+
+static void rtx_browse_wave_scratch_free(RtxBrowseWalk *wk);
 
 static RtxBrowseWalk *rtx_br_wk(RtxBrowse *br) {
     return br ? (RtxBrowseWalk *)br->wk : NULL;
@@ -171,6 +197,8 @@ static void rtx_browse_publish(RtxBrowse *br) {
         p->cur = br->cur;
         p->top = br->top;
     }
+    p->truncated = br->truncated;
+    p->denied = br->denied;
     atomic_store_explicit(&br->pub, p, memory_order_release);
 }
 
@@ -224,25 +252,29 @@ static int rtx_browse_glob_meta(const char *pat) {
 }
 
 /* Text after `>`. Dots still here — they mean "show hidden", not a needle. */
-static const char *rtx_browse_raw_filter(const RtxBrowse *br) {
-    if (!br || !br->glob_len) return "";
-    return (br->glob[0] == '>') ? br->glob + 1 : br->glob;
+static const char *rtx_browse_raw_filter_g(const char *glob, size_t glob_len) {
+    if (!glob || !glob_len) return "";
+    return (glob[0] == '>') ? glob + 1 : glob;
 }
 
-static int rtx_browse_want_hidden(const RtxBrowse *br) {
-    const char *f = rtx_browse_raw_filter(br);
+static int rtx_browse_want_hidden_g(const char *glob, size_t glob_len) {
+    const char *f = rtx_browse_raw_filter_g(glob, glob_len);
     return f && f[0] == '.';
 }
 
 /* Name match. Leading dots stripped on a fragment; a real glob keeps them. */
-static const char *rtx_browse_filter(const RtxBrowse *br) {
-    const char *f = rtx_browse_raw_filter(br);
+static const char *rtx_browse_filter_g(const char *glob, size_t glob_len) {
+    const char *f = rtx_browse_raw_filter_g(glob, glob_len);
     if (rtx_browse_filter_blank(f)) return "";
     if (!rtx_browse_glob_meta(f)) {
         while (*f == '.') f++;
         if (rtx_browse_filter_blank(f)) return "";
     }
     return f;
+}
+
+static const char *rtx_browse_filter(const RtxBrowse *br) {
+    return br ? rtx_browse_filter_g(br->glob, br->glob_len) : "";
 }
 
 static const char *rtx_browse_rel_base(const char *name) {
@@ -256,12 +288,16 @@ static int rtx_browse_explicit_deep(const RtxBrowse *br) {
     return br && br->glob_len && br->glob[0] == '>';
 }
 
-static int rtx_browse_deep(const RtxBrowse *br) {
-    const RtxBrowseWalk *wk;
-    if (rtx_browse_explicit_deep(br)) return 1;
-    if (!br || !br->flat || !br->wk) return 0;
-    wk = (const RtxBrowseWalk *)br->wk;
-    return wk->deep_phase;
+static int rtx_browse_q_explicit_deep(const RtxBrowseQ *q) {
+    return q && q->glob_len && q->glob[0] == '>';
+}
+
+/* `deep_phase` is the wave's copy: a stage (begin_flat) writes the walk's
+ * field while other bodies of that wave still collect. */
+static int rtx_browse_q_deep(const RtxBrowseWalk *wk, int deep_phase) {
+    if (!wk) return 0;
+    if (rtx_browse_q_explicit_deep(&wk->q)) return 1;
+    return wk->q.flat && deep_phase;
 }
 
 /* Typed fragment (not empty, not `.`, not `*.txt`) flattens on kick. */
@@ -379,35 +415,36 @@ static int rtx_browse_glob_match(const char *pat, const char *name) {
     return rtx_browse_contains(name, pat);
 }
 
-static int rtx_browse_hidden(const RtxBrowse *br, const char *name) {
+static int rtx_browse_q_hidden(const RtxBrowseQ *q, const char *name) {
     const char *base = rtx_browse_rel_base(name);
     if (!base || base[0] != '.') return 0;
-    if (rtx_browse_want_hidden(br)) return 0;
+    if (q && rtx_browse_want_hidden_g(q->glob, q->glob_len)) return 0;
     return 1;
 }
 
-static int rtx_browse_show_name(const RtxBrowse *br, const char *name, int is_dir) {
+/* Worker side: the walk's own query. */
+static int rtx_browse_q_show(const RtxBrowseWalk *wk, int deep_phase,
+                             const char *name, int is_dir) {
     const char *filter;
-    if (!name || name[0] == 0) return 0;
+    int deep = rtx_browse_q_deep(wk, deep_phase);
+    if (!wk || !name || name[0] == 0) return 0;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
-    if (rtx_browse_hidden(br, name)) return 0;
-    filter = rtx_browse_filter(br);
+    if (rtx_browse_q_hidden(&wk->q, name)) return 0;
+    filter = rtx_browse_filter_g(wk->q.glob, wk->q.glob_len);
     if (!filter[0]) return 1;
-    if (is_dir && !rtx_browse_deep(br) && rtx_browse_glob_meta(filter)) return 1;
+    if (is_dir && !deep && rtx_browse_glob_meta(filter)) return 1;
     if (rtx_browse_glob_match(filter, name)) return 1;
-    if (rtx_browse_deep(br))
-        return rtx_browse_glob_match(filter, rtx_browse_rel_base(name));
+    if (deep) return rtx_browse_glob_match(filter, rtx_browse_rel_base(name));
     return 0;
 }
 
 static void rtx_browse_keep_cur(RtxBrowse *br, const char *keep) {
-    size_t i;
     if (!br || !keep || !keep[0] || br->ents.len == 0) {
         if (br) br->cur = 0;
         return;
     }
-    for (i = 0; i < br->ents.len; i++) {
-        if (strcmp(br->ents.data[i].name, keep) == 0) {
+    @for (i, e in br->ents) {
+        if (strcmp(e.name, keep) == 0) {
             br->cur = i;
             return;
         }
@@ -458,22 +495,36 @@ static void rtx_browse_hold_save(RtxBrowse *br) {
     br->hold_top = br->top;
 }
 
+/* Walk side (a stage or the arm's return). Freeing hold here would race a
+ * host still painting the old pub, and `wk->h` is the host's handle (the
+ * kick stores it after the arm may already run), so only mark it: the
+ * host frees after the join (pump / finish). */
 static void rtx_browse_hold_maybe_drop(RtxBrowse *br) {
-    RtxBrowseWalk *wk;
     if (!br || !br->hold_len) return;
     if (!rtx_browse_ents_ready(br)) return;
-    wk = rtx_br_wk(br);
-    /* Freeing hold here would race a host still painting the old pub. */
-    if (wk && wk->h.live()) {
-        br->hold_drop_later = 1;
-        return;
-    }
+    br->hold_drop_later = 1;
+}
+
+/* Host, arm joined. */
+static void rtx_browse_hold_drop_joined(RtxBrowse *br) {
+    if (!br || !br->hold_drop_later) return;
+    br->hold_drop_later = 0;
     rtx_browse_hold_drop(br);
 }
 
 void rtx_browse_keep_set(RtxBrowse *br, char[:0] name) {
     if (!br || !name.ptr) return;
     snprintf(br->keep, sizeof(br->keep), "%s", name.ptr);
+    /* The live walk reads its own keep (sort_keep). Follow the name the
+     * way a host move does: the join remaps by it. */
+    if (rtx_browse_listing_live(br)) {
+        RtxBrowsePub v = rtx_browse_view_snap(br);
+        br->host_cur = v.cur;
+        br->host_top = v.top;
+        br->host_nav = 1;
+        snprintf(br->host_name, sizeof(br->host_name), "%s", name.ptr);
+        return;
+    }
     if (rtx_br_wk(br))
         snprintf(rtx_br_wk(br)->keep, sizeof(rtx_br_wk(br)->keep), "%s", name.ptr);
     /* Dest-live may have finished inline; re-apply now. */
@@ -491,6 +542,7 @@ void rtx_browse_walk_stop(RtxBrowse *br) {
         wk->h.invalidate();
     }
     if (wk->du_dp) closedir(wk->du_dp);
+    rtx_browse_wave_scratch_free(wk);
     if (wk->arena.base) wk->arena.destroy();
     free(wk);
     br->wk = NULL;
@@ -525,7 +577,9 @@ static int rtx_browse_job_push(RtxBrowse *br, const RtxBrowseJob *job) {
     size_t c;
     if (!br || !br->wk || !job || !job->abs[0]) return -1;
     wk = br->wk;
-    if (wk->jlen >= (size_t)RTX_BROWSE_JOB_MAX) {
+    /* The cap is the queue still to walk, not every job ever queued: a deep
+     * search over more than JOB_MAX folders is not a truncation. */
+    if (wk->jlen - wk->jhead >= (size_t)RTX_BROWSE_JOB_MAX) {
         br->truncated = 1;
         return 0;
     }
@@ -551,6 +605,13 @@ static void rtx_browse_scratch_free(RtxBrowseScratch *s) {
     if (!s) return;
     if (s->arena.base) s->arena.destroy();
     *s = (RtxBrowseScratch){0};
+}
+
+static void rtx_browse_wave_scratch_free(RtxBrowseWalk *wk) {
+    size_t i;
+    if (!wk) return;
+    for (i = 0; i < (size_t)RTX_BROWSE_WAVE; i++)
+        rtx_browse_scratch_free(&wk->wslot[i]);
 }
 
 static int rtx_browse_scratch_arena(RtxBrowseScratch *s) {
@@ -644,15 +705,16 @@ static int rtx_browse_scratch_resume(RtxBrowseScratch *s, const RtxBrowseJob *jo
     return 0;
 }
 
-/* Ticket-local. Do not write br->ents / jobs. */
-static void rtx_browse_collect_shallow(const RtxBrowse *br, const RtxBrowseJob *job,
+/* Ticket-local. Do not write br->ents / jobs; read the walk's query. */
+static void rtx_browse_collect_shallow(const RtxBrowseWalk *wk, int deep_phase,
+                                      const RtxBrowseJob *job,
                                       RtxBrowseScratch *s) {
     DIR *dp;
-    if (!br || !job || !s) return;
+    if (!wk || !job || !s) return;
     dp = opendir(job->abs);
     if (!dp) {
         if ((errno == EACCES || errno == EPERM) &&
-            strcmp(job->abs, br->dir) == 0)
+            strcmp(job->abs, wk->q.dir) == 0)
             s->denied = 1;
         return;
     }
@@ -668,29 +730,28 @@ static void rtx_browse_collect_shallow(const RtxBrowse *br, const RtxBrowseJob *
         if (!name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
         rec = (RtxBrowseEnt){0};
         snprintf(rec.name, sizeof(rec.name), "%s", name);
-        rtx_browse_join(full, sizeof(full), cc_slice_cstr(br->dir), cc_slice_cstr(name));
+        rtx_browse_join(full, sizeof(full), cc_slice_cstr(job->abs), cc_slice_cstr(name));
 #ifdef DT_DIR
         hint_dir = (de->d_type == DT_DIR);
 #endif
         if (!rtx_browse_stat_path(full, &rec))
             rec.is_dir = hint_dir;
-        if (!rtx_browse_show_name(br, rec.name, rec.is_dir)) continue;
+        if (!rtx_browse_q_show(wk, deep_phase, rec.name, rec.is_dir)) continue;
         if (rtx_browse_scratch_ent(s, &rec) < 0) break;
     }
     closedir(dp);
 }
 
-static void rtx_browse_collect_deep(const RtxBrowse *br, const RtxBrowseJob *job,
+static void rtx_browse_collect_deep(const RtxBrowseWalk *wk, int deep_phase,
+                                   const RtxBrowseJob *job,
                                    RtxBrowseScratch *s) {
     DIR *dp;
-    RtxBrowseWalk *wk;
     int seen = 0;
     int work = 0;
-    if (!br || !job || !s) return;
-    wk = rtx_br_wk((RtxBrowse *)br);
+    if (!wk || !job || !s) return;
     dp = opendir(job->abs);
     if (!dp) {
-        if (strcmp(job->abs, br->dir) == 0 &&
+        if (strcmp(job->abs, wk->q.dir) == 0 &&
             (errno == EACCES || errno == EPERM))
             s->denied = 1;
         return;
@@ -711,7 +772,7 @@ static void rtx_browse_collect_deep(const RtxBrowse *br, const RtxBrowseJob *job
         name = de->d_name;
         if (!name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
             goto budget;
-        if (rtx_browse_hidden(br, name)) goto budget;
+        if (rtx_browse_q_hidden(&wk->q, name)) goto budget;
         if (rtx_browse_load_cancel(wk)) break;
 #ifdef DT_LNK
         if (de->d_type == DT_LNK) goto budget;
@@ -727,8 +788,8 @@ static void rtx_browse_collect_deep(const RtxBrowse *br, const RtxBrowseJob *job
             goto budget;
         }
 #endif
-        if (!rtx_browse_show_name(br, child, 0)) goto budget;
-        if (br->flat && !rtx_browse_explicit_deep(br) && !strchr(child, '/'))
+        if (!rtx_browse_q_show(wk, deep_phase, child, 0)) goto budget;
+        if (wk->q.flat && !rtx_browse_q_explicit_deep(&wk->q) && !strchr(child, '/'))
             goto budget;
         if (!rtx_browse_join(full, sizeof(full), cc_slice_cstr(job->abs), cc_slice_cstr(name))) goto budget;
         if (lstat(full, &st) != 0 || S_ISLNK(st.st_mode)) goto budget;
@@ -829,11 +890,20 @@ static int rtx_browse_du_have_get(const RtxBrowseWalk *wk, const char *abs,
     return 1;
 }
 
+/* The listing's own dir (the walk's query), not br->dir: du_reapply runs
+ * in a stage while the host may be editing br->dir for the next kick. */
+static const char *rtx_browse_list_dir(const RtxBrowse *br) {
+    const RtxBrowseWalk *wk = br ? (const RtxBrowseWalk *)br->wk : NULL;
+    if (wk && wk->q.dir[0]) return wk->q.dir;
+    return br ? br->dir : "";
+}
+
 static int rtx_browse_du_ent_abs(const RtxBrowse *br, const RtxBrowseEnt *e,
                                 char *dst, size_t n) {
     if (!br || !e || !dst || n == 0 || !e->is_dir || e->sep) return 0;
     if (strcmp(e->name, "..") == 0) return 0;
-    return rtx_browse_join(dst, n, cc_slice_cstr(br->dir), cc_slice_cstr(e->name));
+    return rtx_browse_join(dst, n, cc_slice_cstr(rtx_browse_list_dir(br)),
+                           cc_slice_cstr(e->name));
 }
 
 static void rtx_browse_du_stamp(RtxBrowseEnt *e, uint64_t size, int denied) {
@@ -1009,7 +1079,9 @@ static void rtx_browse_du_start(RtxBrowse *br, RtxBrowseEnt *ent) {
     RtxBrowseWalk *wk = rtx_br_wk(br);
     char full[RTX_BROWSE_DIR];
     if (!br || !wk || !ent) return;
-    if (!rtx_browse_join(full, sizeof(full), cc_slice_cstr(br->dir), cc_slice_cstr(ent->name))) return;
+    if (!rtx_browse_join(full, sizeof(full), cc_slice_cstr(rtx_browse_list_dir(br)),
+                         cc_slice_cstr(ent->name)))
+        return;
     snprintf(wk->du_name, sizeof(wk->du_name), "%s", ent->name);
     wk->du_stk[0] = (RtxBrowseDuFrame){0};
     snprintf(wk->du_stk[0].abs, sizeof(wk->du_stk[0].abs), "%s", full);
@@ -1164,20 +1236,18 @@ static size_t rtx_browse_pump_du(RtxBrowse *br) {
 }
 
 static size_t rtx_browse_sep_i(const RtxBrowse *br) {
-    size_t i;
     if (!br || !br->ents.data) return (size_t)-1;
-    for (i = 0; i < br->ents.len; i++) {
-        if (br->ents.data[i].sep) return i;
+    @for (i, e in br->ents) {
+        if (e.sep) return i;
     }
     return (size_t)-1;
 }
 
 static size_t rtx_browse_sep_last(const RtxBrowse *br) {
-    size_t i, last;
-    last = (size_t)-1;
+    size_t last = (size_t)-1;
     if (!br || !br->ents.data) return last;
-    for (i = 0; i < br->ents.len; i++) {
-        if (br->ents.data[i].sep) last = i;
+    @for (i, e in br->ents) {
+        if (e.sep) last = i;
     }
     return last;
 }
@@ -1200,7 +1270,7 @@ static void rtx_browse_sort_keep(RtxBrowse *br) {
         rtx_browse_du_reapply(br);
         return;
     }
-    from = rtx_browse_is_root(cc_slice_cstr(br->dir)) ? 0 : 1;
+    from = rtx_browse_is_root(cc_slice_cstr(wk ? wk->q.dir : br->dir)) ? 0 : 1;
     if (br->ents.len > from)
         qsort(br->ents.data + from, br->ents.len - from, sizeof(RtxBrowseEnt),
               rtx_browse_cmp);
@@ -1228,7 +1298,7 @@ static void rtx_browse_begin_flat(RtxBrowse *br) {
     if (rtx_browse_plant_flat_row(br) < 0) return;
     /* One deep job on this folder. Waves walk children; do not stat every
      * sibling on this write-stage turn (a /code-sized listing froze kick). */
-    snprintf(job.abs, sizeof(job.abs), "%s", br->dir);
+    snprintf(job.abs, sizeof(job.abs), "%s", wk->q.dir);
     job.depth = 1;
     wk->deep_phase = 1;
     if (rtx_browse_job_push(br, &job) < 0) return;
@@ -1236,8 +1306,9 @@ static void rtx_browse_begin_flat(RtxBrowse *br) {
 }
 
 static void rtx_browse_shallow_done(RtxBrowse *br) {
+    RtxBrowseWalk *wk = rtx_br_wk(br);
     rtx_browse_sort_keep(br);
-    if (br && br->flat) rtx_browse_begin_flat(br);
+    if (wk && wk->q.flat) rtx_browse_begin_flat(br);
 }
 
 static int rtx_browse_plant_dotdot(RtxBrowse *br) {
@@ -1273,6 +1344,7 @@ static void !>(CCError) rtx_browse_restart(RtxBrowse *br, int keep_list) {
     } else {
         rtx_browse_hold_drop(br);
     }
+    br->hold_drop_later = 0;
     rtx_browse_du_park(br);
     old = rtx_br_wk(br);
     if (old) {
@@ -1304,6 +1376,19 @@ static void !>(CCError) rtx_browse_restart(RtxBrowse *br, int keep_list) {
     snprintf(rtx_br_wk(br)->keep, sizeof(rtx_br_wk(br)->keep), "%s", keep);
     br->scanning = 1;
     br->flat = rtx_browse_auto_flat(br);
+    {
+        RtxBrowseQ *q = &rtx_br_wk(br)->q;
+        snprintf(q->dir, sizeof(q->dir), "%s", br->dir);
+        q->glob_len = br->glob_len < sizeof(q->glob) ? br->glob_len
+                                                     : sizeof(q->glob) - 1;
+        {
+            char[:] dst = cc_slice_from_buffer(q->glob, q->glob_len);
+            char[:] src = cc_slice_from_buffer(br->glob, q->glob_len);
+            dst.copy(src) !>(e) { return cc_err(e); };
+        }
+        q->glob[q->glob_len] = 0;
+        q->flat = br->flat;
+    }
     br->truncated = 0;
     br->denied = 0;
     /* `>` is flatten without the typed-fragment chrome. Start deep so the
@@ -1340,20 +1425,62 @@ void !>(CCError) rtx_browse_kick_keep(RtxBrowse *br) {
     return rtx_browse_restart(br, 1);
 }
 
+static _Atomic int g_browse_fail_waves;
+
+void rtx_browse_test_fail_waves(int n) {
+    atomic_store(&g_browse_fail_waves, n);
+}
+
+int rtx_browse_test_fail_left(void) {
+    return atomic_load(&g_browse_fail_waves);
+}
+
+/* A wave that cannot run (turnstile / wait error) gives up here and says
+ * so (`capped`). It is not pending: the pump must not restart it. */
+static void rtx_browse_wave_fail(RtxBrowse *br) {
+    RtxBrowseWalk *wk = rtx_br_wk(br);
+    if (!br) return;
+    br->truncated = 1;
+    br->scanning = 0;
+    rtx_browse_store_done(wk, 1);
+    rtx_browse_publish(br);
+}
+
+/* Jobs before jhead are walked. Slide the rest down between waves (no
+ * worker holds an index then) so a long walk does not grow the table. */
+static void rtx_browse_jobs_compact(RtxBrowseWalk *wk) {
+    size_t live;
+    if (!wk || !wk->jobs || wk->jhead == 0) return;
+    if (wk->jhead < wk->jlen - wk->jhead && wk->jhead < 64) return;
+    live = wk->jlen - wk->jhead;
+    if (live) {
+        char[:] dst = cc_slice_from_buffer(wk->jobs, live * sizeof(RtxBrowseJob));
+        char[:] src = cc_slice_from_buffer(wk->jobs + wk->jhead,
+                                           live * sizeof(RtxBrowseJob));
+        dst.copy_overlap(src) !>(e) { (void)e; return; };
+    }
+    wk->jlen = live;
+    wk->jhead = 0;
+}
+
 /* Wait-for tickets. Joined inside this arm so the dest-live kick returns. */
 static int rtx_browse_run(RtxBrowse *br) {
     RtxBrowseWalk *wk;
     @errhandler(CCError e) {
         (void)e;
-        if (br) {
-            rtx_browse_store_done(rtx_br_wk(br), 1);
-            rtx_browse_publish(br);
-        }
+        rtx_browse_wave_scratch_free(rtx_br_wk(br));
+        rtx_browse_wave_fail(br);
         return 0;
     }
     if (!br) return 0;
     wk = rtx_br_wk(br);
     if (!wk) return 0;
+    if (atomic_load(&g_browse_fail_waves) > 0) {
+        atomic_fetch_sub(&g_browse_fail_waves, 1);
+        rtx_browse_wave_fail(br);
+        return 0;
+    }
+    rtx_browse_jobs_compact(wk);
 
     if (!rtx_browse_load_cancel(wk) && !br->truncated && wk->jhead < wk->jlen) {
         size_t base = wk->jhead;
@@ -1361,28 +1488,43 @@ static int rtx_browse_run(RtxBrowse *br) {
         size_t n_sz;
         int n;
         int i;
+        int deep0;
         bool fin;
+        RtxBrowseJob *wave = wk->wave;
+        RtxBrowseScratch *wslot = wk->wslot;
         CCArena ta = cc_arena_heap(kilobytes(64)) @destroy;
         CCTurnstile ts@(RTX_BROWSE_CAP, 1, ta) !> @destroy;
 
         n_sz = remain;
         if (n_sz > (size_t)RTX_BROWSE_WAVE) n_sz = (size_t)RTX_BROWSE_WAVE;
         n = (int)n_sz;
+        /* Lanes read the wave's own copy of their jobs and of deep_phase:
+         * a stage's job_push grows (moves) wk->jobs and begin_flat sets
+         * deep_phase while later bodies of this wave still start. Stages
+         * own the walk; bodies see only this snapshot and the atomics. */
+        {
+            char[:] dst = cc_slice_from_buffer(wave, n_sz * sizeof(RtxBrowseJob));
+            char[:] src = cc_slice_from_buffer(wk->jobs + base,
+                                               n_sz * sizeof(RtxBrowseJob));
+            dst.copy(src) !>;
+        }
+        deep0 = wk->deep_phase;
+        atomic_store_explicit(&wk->wave_stop, 0, memory_order_relaxed);
 
+        rtx_browse_wave_scratch_free(wk);
         fin = @parallel wait (ts) for (i in 0..n) {
             RtxBrowseJob job;
-            RtxBrowseScratch slot = {0} @destroy {
-                rtx_browse_scratch_free(&slot);
-            };
+            RtxBrowseScratch *slot;
             int shallow;
 
-            job = wk->jobs[base + (size_t)i];
-            shallow = (job.depth == 0 && !wk->deep_phase);
-            if (!rtx_browse_load_cancel(wk) && !br->truncated) {
+            job = wave[i];
+            slot = &wslot[i];
+            shallow = (job.depth == 0 && !deep0);
+            if (!rtx_browse_load_cancel(wk) && !rtx_browse_wave_stopped(wk)) {
                 if (shallow)
-                    rtx_browse_collect_shallow(br, &job, &slot);
+                    rtx_browse_collect_shallow(wk, deep0, &job, slot);
                 else
-                    rtx_browse_collect_deep(br, &job, &slot);
+                    rtx_browse_collect_deep(wk, deep0, &job, slot);
             }
 
             @stage (ts, 0, i) {
@@ -1390,25 +1532,29 @@ static int rtx_browse_run(RtxBrowse *br) {
                 while (wk->h.paused && !rtx_browse_load_cancel(wk))
                     cc_yield();
                 if (!rtx_browse_load_cancel(wk) && !br->truncated) {
-                    if (slot.denied) br->denied = 1;
-                    for (k = 0; k < slot.n && !br->truncated; k++) {
-                        if (rtx_browse_push(br, &slot.ents[k]) < 0)
+                    if (slot->denied) br->denied = 1;
+                    for (k = 0; k < slot->n && !br->truncated; k++) {
+                        if (rtx_browse_push(br, &slot->ents[k]) < 0)
                             br->truncated = 1;
                     }
-                    for (k = 0; k < slot.kn && !br->truncated; k++) {
-                        if (rtx_browse_job_push(br, &slot.kids[k]) < 0)
+                    for (k = 0; k < slot->kn && !br->truncated; k++) {
+                        if (rtx_browse_job_push(br, &slot->kids[k]) < 0)
                             br->truncated = 1;
                     }
                     wk->jhead = base + (size_t)i + 1;
                     if (shallow && !br->truncated && !rtx_browse_load_cancel(wk))
                         rtx_browse_shallow_done(br);
                 }
+                if (br->truncated)
+                    atomic_store_explicit(&wk->wave_stop, 1, memory_order_release);
             }
 
-            if (rtx_browse_load_cancel(wk) || br->truncated)
+            rtx_browse_scratch_free(slot);
+            if (rtx_browse_load_cancel(wk) || rtx_browse_wave_stopped(wk))
                 break;
         } !>.wait()!>;
         (void)fin;
+        rtx_browse_wave_scratch_free(wk);
     }
 
     if (rtx_browse_load_cancel(wk) || br->truncated || wk->jhead >= wk->jlen) {
@@ -1464,6 +1610,42 @@ static int rtx_browse_listing_pending(RtxBrowse *br) {
     return wk->jhead < wk->jlen;
 }
 
+/* A move while the arm was live indexed the published view (a wave or the
+ * hold list). After the join the list is sorted / replaced: follow the
+ * name, not the index. */
+static void rtx_browse_host_apply(RtxBrowse *br) {
+    const RtxBrowseEnt *ents;
+    size_t len, i;
+    size_t *cur, *top;
+    if (!br || !br->host_nav) return;
+    br->host_nav = 0;
+    if (rtx_browse_hold_on(br)) {
+        ents = br->hold;
+        len = br->hold_len;
+        cur = &br->hold_cur;
+        top = &br->hold_top;
+    } else {
+        ents = br->ents.data;
+        len = br->ents.len;
+        cur = &br->cur;
+        top = &br->top;
+    }
+    *cur = br->host_cur;
+    *top = br->host_top;
+    if (br->host_name[0] && ents) {
+        for (i = 0; i < len; i++) {
+            if (!ents[i].sep && strcmp(ents[i].name, br->host_name) == 0) {
+                *cur = i;
+                break;
+            }
+        }
+    }
+    if (len == 0) *cur = 0;
+    else if (*cur >= len) *cur = len - 1;
+    if (*top > *cur) *top = *cur;
+    br->host_name[0] = 0;
+}
+
 /* Dest-live stays live() until wait, even after the wave body returns. */
 static void !>(CCError) rtx_browse_listing_join_done(RtxBrowse *br) {
     RtxBrowseWalk *wk = rtx_br_wk(br);
@@ -1478,6 +1660,7 @@ size_t !>(CCError) rtx_browse_pump(RtxBrowse *br) {
     size_t n = 0;
     RtxBrowseWalk *wk;
     if (!br) return cc_err(CC_ERR_INVALID_ARG, "browse");
+    rtx_host_reap();
     rtx_browse_listing_join_done(br) !>(e) { return cc_err(e); };
     wk = rtx_br_wk(br);
     /* One wave is the step. sched_yield does not run the fiber, and a
@@ -1492,29 +1675,22 @@ size_t !>(CCError) rtx_browse_pump(RtxBrowse *br) {
     }
     rtx_browse_listing_join_done(br) !>(e) { return cc_err(e); };
     wk = rtx_br_wk(br);
-    /* Retarget reads ents. Only after the arm is joined — a paused
-     * stage is still the writer. */
-    if (!wk || !wk->h.live()) {
-        if (br->host_nav) {
-            br->cur = br->host_cur;
-            br->top = br->host_top;
-            br->host_nav = 0;
-        }
-        if (br->hold_drop_later) {
-            br->hold_drop_later = 0;
-            rtx_browse_hold_drop(br);
-        }
-        rtx_browse_du_retarget(br);
-    }
+    /* Retarget and du read / stamp ents and the walk's du table. Only
+     * after the arm is joined (a paused stage is still the writer) and
+     * before the next wave is kicked — a live wave pushes (moves) ents
+     * and sort_keep re-stamps them from `have`. */
+    if (wk && wk->h.live()) return cc_ok(n);
+    rtx_browse_host_apply(br);
+    rtx_browse_hold_drop_joined(br);
+    rtx_browse_du_retarget(br);
     wk = rtx_br_wk(br);
-    if (wk && !wk->h.live() && rtx_browse_listing_pending(br))
-        rtx_browse_listing_start(br) !>(e) { return cc_err(e); };
-    wk = rtx_br_wk(br);
-    if (wk && wk->du_defer) {
+    if (wk && wk->du_defer)
         wk->du_defer = 0;
-        return cc_ok(n);
-    }
-    if (br->sizing) n += rtx_browse_pump_du(br);
+    else if (br->sizing)
+        n += rtx_browse_pump_du(br);
+    wk = rtx_br_wk(br);
+    if (wk && rtx_browse_listing_pending(br))
+        rtx_browse_listing_start(br) !>(e) { return cc_err(e); };
     return cc_ok(n);
 }
 
@@ -1538,6 +1714,8 @@ void !>(CCError) rtx_browse_finish(RtxBrowse *br) {
         break;
     }
     br->scanning = 0;
+    rtx_browse_host_apply(br);
+    rtx_browse_hold_drop_joined(br);
     /* Listing is joined. Start du for the current row if needed — the
      * while (sizing) loop used to skip when retarget had not run yet.
      * du_defer is a one-turn skip for a key; finish is not a key. */
@@ -1683,10 +1861,10 @@ RtxThemeColor rtx_browse_face(RtxBrowseFace face) {
 
 const char *rtx_browse_scan_msg(const RtxBrowse *br) {
     if (!br) return "";
-    if (br->scanning) return "  scanning...";
+    if (rtx_browse_scanning(br)) return "  scanning...";
     if (br->sizing) return "  sizing...";
-    if (br->denied) return "  denied";
-    if (br->truncated) return "  capped";
+    if (rtx_browse_denied(br)) return "  denied";
+    if (rtx_browse_truncated(br)) return "  capped";
     return "";
 }
 
@@ -1762,13 +1940,21 @@ void rtx_browse_fmt_row(char *dst, size_t n, int cols, const RtxBrowseEnt *e) {
     name_w = size_at - 2;
     if (name_w < 1) name_w = 1;
     {
-        size_t skip = 0;
+        size_t head_n = 0, tail_off = 0;
         int ellip = 0;
-        rtx_browse_name_window(name, name_w, &skip, &ellip);
+        rtx_browse_name_window(name, name_w, &head_n, &tail_off, &ellip);
         i = 0;
-        if (ellip) dst[1 + i++] = '~';
-        for (; name[skip] && i < name_w; skip++, i++)
-            dst[1 + i] = name[skip];
+        if (ellip) {
+            size_t k;
+            for (k = 0; k < head_n && i < name_w; k++, i++)
+                dst[1 + i] = name[k];
+            if (i < name_w) dst[1 + i++] = '~';
+            for (k = tail_off; name[k] && i < name_w; k++, i++)
+                dst[1 + i] = name[k];
+        } else {
+            for (; name[i] && i < name_w; i++)
+                dst[1 + i] = name[i];
+        }
     }
     if (!show) return;
     rtx_browse_fmt_size(size, sizeof(size), e);
@@ -1792,6 +1978,18 @@ int rtx_browse_head(const RtxBrowse *br) {
     return RTX_BROWSE_HEAD;
 }
 
+/* Host move on the live view: index for paint, name for after the join. */
+static void rtx_browse_host_pin(RtxBrowse *br, const RtxBrowsePub *v, size_t c,
+                                size_t t) {
+    br->host_cur = c;
+    br->host_top = t;
+    br->host_nav = 1;
+    if (v && v->ents && c < v->len && !v->ents[c].sep)
+        snprintf(br->host_name, sizeof(br->host_name), "%s", v->ents[c].name);
+    else
+        br->host_name[0] = 0;
+}
+
 void rtx_browse_scroll(RtxBrowse *br, int vis) {
     size_t list;
     size_t len;
@@ -1810,20 +2008,14 @@ void rtx_browse_scroll(RtxBrowse *br, int vis) {
         size_t base_c = p ? p->cur : 0;
         size_t base_t = p ? p->top : 0;
         if (v.len == 0) {
-            if (!br->host_nav) {
-                br->host_cur = 0;
-                br->host_top = 0;
-                br->host_nav = 1;
-            }
+            if (!br->host_nav) rtx_browse_host_pin(br, &v, 0, 0);
             return;
         }
         if (c >= v.len) c = v.len - 1;
         if (c < t) t = c;
         if (c >= t + list) t = c - list + 1;
         if (!br->host_nav && c == base_c && t == base_t) return;
-        br->host_cur = c;
-        br->host_top = t;
-        br->host_nav = 1;
+        rtx_browse_host_pin(br, &v, c, t);
         return;
     }
     if (rtx_browse_hold_on(br)) {
@@ -1878,8 +2070,7 @@ void rtx_browse_move(RtxBrowse *br, int dir, int vis) {
                 }
             }
         }
-        br->host_cur = c;
-        br->host_nav = 1;
+        rtx_browse_host_pin(br, &v, c, v.top);
         rtx_browse_scroll(br, vis);
         return;
     }
@@ -1936,8 +2127,7 @@ void rtx_browse_select(RtxBrowse *br, size_t idx, int vis) {
         RtxBrowsePub v = rtx_browse_view_snap(br);
         if (v.len == 0) return;
         if (idx >= v.len) idx = v.len - 1;
-        br->host_cur = idx;
-        br->host_nav = 1;
+        rtx_browse_host_pin(br, &v, idx, v.top);
         br->glob_focus = 0;
         rtx_browse_scroll(br, vis);
         return;
@@ -1984,9 +2174,8 @@ static const char *rtx_host_base(const char *exe) {
 
 int rtx_host_is_ray(const char *exe) {
     const char *b = rtx_host_base(exe);
-    /* Windowed hosts. Peer of either is the console editor. */
-    return strcmp(b, "cctext-gui") == 0 || strcmp(b, "cctext_gui") == 0 ||
-           strcmp(b, "cctext-ui") == 0 || strcmp(b, "cctext_ui") == 0;
+    /* Windowed host. Its peer is the console editor, and back. */
+    return strcmp(b, "cctext-ui") == 0 || strcmp(b, "cctext_ui") == 0;
 }
 
 int rtx_host_peer_path(const char *exe, int other, char *dst, size_t n) {
@@ -2001,7 +2190,7 @@ int rtx_host_peer_path(const char *exe, int other, char *dst, size_t n) {
         return dst[0] != 0;
     }
     rtx_browse_dirname(dir, sizeof(dir), cc_slice_cstr(exe));
-    peer = rtx_host_is_ray(exe) ? "cctext" : "cctext-gui";
+    peer = rtx_host_is_ray(exe) ? "cctext" : "cctext-ui";
     if (!strchr(exe, '/')) wr = snprintf(dst, n, "%s", peer);
     else if (strcmp(dir, "/") == 0) wr = snprintf(dst, n, "/%s", peer);
     else wr = snprintf(dst, n, "%s/%s", dir, peer);
@@ -2010,8 +2199,8 @@ int rtx_host_peer_path(const char *exe, int other, char *dst, size_t n) {
 
 const char *rtx_host_peer_name(int other) {
     int gui = rtx_host_is_ray(rtx_host_exe[0] ? rtx_host_exe : "cctext");
-    if (other) return gui ? "cctext" : "cctext-gui";
-    return gui ? "cctext-gui" : "cctext";
+    if (other) return gui ? "cctext" : "cctext-ui";
+    return gui ? "cctext-ui" : "cctext";
 }
 
 void rtx_host_set_exe(const char *argv0) {
@@ -2105,14 +2294,62 @@ static int rtx_host_pick_exe(int other, char *dst, size_t n) {
     return dst[0] != 0;
 }
 
+#ifndef __APPLE__
+extern char **environ;
+#endif
+
+/* The peer inherits this environment: PATH, and a GTK cctext-ui needs
+ * DISPLAY / WAYLAND_DISPLAY, a console cctext needs TERM. */
 static char **rtx_host_env(void) {
 #ifdef __APPLE__
     return *_NSGetEnviron();
 #else
-    static char *empty[1];
-    empty[0] = 0;
-    return empty;
+    return environ;
 #endif
+}
+
+/* Children we started and do not wait for. rtx_host_reap collects the ones
+ * that exited (WNOHANG, by pid — never waitpid(-1), which would steal a
+ * popen / osascript child). */
+enum { RTX_HOST_KIDS = 32 };
+static pid_t g_host_kids[RTX_HOST_KIDS];
+static char g_spawn_why[128];
+
+int rtx_host_reap(void) {
+    int i, live = 0;
+    for (i = 0; i < RTX_HOST_KIDS; i++) {
+        pid_t r;
+        int st;
+        if (g_host_kids[i] <= 0) continue;
+        r = waitpid(g_host_kids[i], &st, WNOHANG);
+        if (r == g_host_kids[i] || (r < 0 && errno == ECHILD)) g_host_kids[i] = 0;
+        else live++;
+    }
+    return live;
+}
+
+static void rtx_host_kid(pid_t pid) {
+    int i;
+    if (pid <= 0) return;
+    rtx_host_reap();
+    for (i = 0; i < RTX_HOST_KIDS; i++) {
+        if (g_host_kids[i] <= 0) {
+            g_host_kids[i] = pid;
+            return;
+        }
+    }
+}
+
+const char *rtx_host_spawn_why(void) {
+    return g_spawn_why;
+}
+
+/* stdin from /dev/null; stdout / stderr too, so a child's chatter never
+ * lands on the editor's screen. */
+static void rtx_host_quiet_fa(posix_spawn_file_actions_t *fa) {
+    posix_spawn_file_actions_addopen(fa, STDIN_FILENO, "/dev/null", O_RDWR, 0);
+    posix_spawn_file_actions_addopen(fa, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
 }
 
 static int rtx_host_spawn_direct(const char *exe, const char *path, int is_dir) {
@@ -2140,10 +2377,11 @@ static int rtx_host_spawn_direct(const char *exe, const char *path, int is_dir) 
         posix_spawn_file_actions_addchdir_np(&fa, path);
 #endif
     }
-    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDWR, 0);
+    rtx_host_quiet_fa(&fa);
     rc = posix_spawn(&pid, exe, &fa, &attr, argv, rtx_host_env());
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&attr);
+    if (rc == 0) rtx_host_kid(pid);
     return rc == 0;
 }
 
@@ -2165,10 +2403,11 @@ int rtx_open_url(const char *url) {
     argv[2] = NULL;
     posix_spawn_file_actions_init(&fa);
     posix_spawnattr_init(&attr);
-    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDWR, 0);
+    rtx_host_quiet_fa(&fa);
     rc = posix_spawn(&pid, exe, &fa, &attr, argv, rtx_host_env());
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&attr);
+    if (rc == 0) rtx_host_kid(pid);
     return rc == 0;
 }
 
@@ -2325,12 +2564,97 @@ static int rtx_host_spawn_tty(const char *exe, const char *path, int is_dir) {
 const char *rtx_host_tty_app(void) {
     return "Terminal";
 }
+
+/* `name` on PATH (or a path) that we may exec. */
+static int rtx_host_which(const char *name, char *dst, size_t n) {
+    const char *path, *p;
+    if (!name || !name[0] || !dst || n == 0) return 0;
+    if (strchr(name, '/')) {
+        if (access(name, X_OK) != 0) return 0;
+        snprintf(dst, n, "%s", name);
+        return 1;
+    }
+    path = getenv("PATH");
+    if (!path || !path[0]) path = "/usr/local/bin:/usr/bin:/bin";
+    for (p = path; *p;) {
+        const char *e = strchr(p, ':');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        int wr = snprintf(dst, n, "%.*s/%s", (int)len, len ? p : ".", name);
+        if (wr > 0 && (size_t)wr < n && access(dst, X_OK) == 0) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    dst[0] = 0;
+    return 0;
+}
+
+/* A console editor needs its own terminal. Starting it on this tty would
+ * put two editors on one screen. Use $TERMINAL or x-terminal-emulator in a
+ * graphical session; otherwise refuse and say why. */
+static int rtx_host_spawn_term(const char *exe, const char *path, int is_dir) {
+    char term[PATH_MAX];
+    const char *t = getenv("TERMINAL");
+    const char *dpy = getenv("DISPLAY");
+    const char *way = getenv("WAYLAND_DISPLAY");
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    pid_t pid;
+    char *argv[5];
+    int rc;
+    if (!(dpy && dpy[0]) && !(way && way[0])) {
+        snprintf(g_spawn_why, sizeof(g_spawn_why),
+                 "no terminal window here (no DISPLAY): not starting a second editor on this tty");
+        return 0;
+    }
+    /* $TERMINAL, the Debian alternative, then common emulators; each takes
+     * `-e prog args` except gnome-terminal (`--`). */
+    {
+        static const char *const cands[] = {"x-terminal-emulator", "gnome-terminal",
+                                            "konsole", "xfce4-terminal", "xterm"};
+        size_t i;
+        int got = t && t[0] && rtx_host_which(t, term, sizeof(term));
+        for (i = 0; !got && i < sizeof(cands) / sizeof(cands[0]); i++)
+            got = rtx_host_which(cands[i], term, sizeof(term));
+        if (!got) {
+            snprintf(g_spawn_why, sizeof(g_spawn_why),
+                     "set $TERMINAL (no terminal emulator found) to open a new window");
+            return 0;
+        }
+    }
+    argv[0] = term;
+    {
+        const char *base = strrchr(term, '/');
+        base = base ? base + 1 : term;
+        argv[1] = (char *)(strcmp(base, "gnome-terminal") == 0 ? "--" : "-e");
+    }
+    argv[2] = (char *)exe;
+    argv[3] = (!is_dir && path && path[0]) ? (char *)path : NULL;
+    argv[4] = NULL;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawnattr_init(&attr);
+#ifdef POSIX_SPAWN_SETSID
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+#endif
+    if (is_dir && path && path[0])
+        posix_spawn_file_actions_addchdir_np(&fa, path);
+    rtx_host_quiet_fa(&fa);
+    rc = posix_spawn(&pid, term, &fa, &attr, argv, rtx_host_env());
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    if (rc != 0) {
+        snprintf(g_spawn_why, sizeof(g_spawn_why), "could not start %s", term);
+        return 0;
+    }
+    rtx_host_kid(pid);
+    return 1;
+}
 #endif
 
 int rtx_browse_spawn(const RtxBrowse *br, int other) {
     char full[RTX_BROWSE_DIR];
     char exe[PATH_MAX];
     int is_dir = 0;
+    g_spawn_why[0] = 0;
     if (!rtx_browse_sel_path(br, full, sizeof(full), &is_dir)) return 0;
     if (!rtx_host_pick_exe(other, exe, sizeof(exe))) return 0;
     if (rtx_host_is_ray(exe))
@@ -2338,6 +2662,6 @@ int rtx_browse_spawn(const RtxBrowse *br, int other) {
 #ifdef __APPLE__
     return rtx_host_spawn_tty(exe, full, is_dir);
 #else
-    return rtx_host_spawn_direct(exe, full, is_dir);
+    return rtx_host_spawn_term(exe, full, is_dir);
 #endif
 }

@@ -50,12 +50,17 @@ static inline RtxIndexErr rtx_index_from_cc(CCError e) {
 /* Call-local stack copy (row / replace / copy). Not the page cache.
  * Not a record bound — that is RTX_GRID_REC_CAP / RTX_MARKUP_LOOKBACK. */
 #define RTX_FRAME_SCRATCH 8192
-/* Stride-index interval. Property smokes pin it; line_* hide the slots. */
+/* Stride-index interval. Property smokes pin it; line_* hide the slots.
+ * The #ifndef knobs below let a property smoke compile the tree TU small. */
+#ifndef RTX_LINE_STRIDE
 #define RTX_LINE_STRIDE 64
+#endif
 /* Above this, edits stay progressive (scan to the offset, no suffix rebuild).
  * Same ballpark as RTX_HL_FULL_MAX / RTX_MARKUP_SCAN_MAX — a 2MiB first
  * keystroke must not finish a full-file index. */
+#ifndef RTX_LINE_SOFT_MIN
 #define RTX_LINE_SOFT_MIN (256 * 1024)
+#endif
 /* In-place --backup pins original bytes in the dirty span before writing
  * through the same inode. Above this, save copies a full temp onto the path. */
 #define RTX_SAVE_PIN_MAX (16 * 1024 * 1024)
@@ -170,10 +175,23 @@ struct RtxPieceTree {
     size_t isle_to;
     size_t isle_floor;     /* prefix or pin.off; walk stops here */
     size_t isle_base_line; /* 0-based line at isle_floor */
-    size_t isle_before;    /* LFs in [isle_from, isle_anchor) when connected */
+    /* LFs in [isle_from, isle_anchor). The write stage stores this before
+     * isle_from; a reader that sees isle_from connected reads the final count. */
+    _Atomic size_t isle_before;
     size_t isle_after;
+    /* LFs in [pin target, isle_anchor) for the 1/32 slots the walk
+     * crossed (set[i]). The lane counts them with its block; the stage
+     * stores them before isle_from, so connect plants pins without a
+     * second pass over the span on the host. Kick clears set[]. */
+    size_t isle_pin_rel[RTX_LINE_MARK_MAX];
+    unsigned char isle_pin_set[RTX_LINE_MARK_MAX];
     _Atomic unsigned char isle_live;
     _Atomic unsigned char isle_cancel;
+    /* Hold the write stage (nothing publishes) across kicks. A handle pause
+     * only exists after the kick returns, and a small walk can publish before
+     * it; a hold set first cannot be outrun. finish releases it; a stop
+     * cancels past it. */
+    _Atomic unsigned char isle_hold;
     CCParallel isle_h;
     size_t want_line;      /* 1-based g L; 0 = none. Exact floor + count, not isle. */
     size_t want_off;       /* jump scan cursor (may sit ahead of the prefix) */
@@ -182,6 +200,7 @@ struct RtxPieceTree {
     RtxBusyFn busy_fn;
     void *busy_ctx;
     double busy_last_ms;
+    double busy_t0_ms;     /* first pulse of the running op (0 = none) */
 };
 
 static inline int RtxPieceTree_is_live(const RtxPieceTree *t) {
@@ -194,6 +213,7 @@ static inline void RtxPieceTree_busy_bind(RtxPieceTree *t, RtxBusyFn fn, void *c
     t->busy_fn = fn;
     t->busy_ctx = ctx;
     t->busy_last_ms = 0.0;
+    t->busy_t0_ms = 0.0;
 }
 
 /* Weights match the body. The `lf_ready` field is the latch; this
@@ -236,7 +256,9 @@ size_t !>(RtxIndexErr) RtxPieceTree_line_start(const RtxPieceTree *t, size_t lin
 size_t !>(RtxIndexErr) RtxPieceTree_line_of(const RtxPieceTree *t, size_t offset);
 void !>(RtxIndexErr) rtx_line_scan_to(RtxPieceTree *t, size_t want_off);
 
+#ifndef RTX_LINE_ISLE_BUDGET
 #define RTX_LINE_ISLE_BUDGET (256 * 1024)
+#endif
 #define RTX_LINE_ISLE_WORK_MS 48
 #define RTX_LINE_ISLE_PAINT_MS 50
 
@@ -246,6 +268,7 @@ size_t rtx_line_isle_step(RtxPieceTree *t, size_t budget);
 void !>(CCError) rtx_line_isle_finish(RtxPieceTree *t);
 void rtx_line_isle_pause(RtxPieceTree *t);
 void rtx_line_isle_resume(RtxPieceTree *t);
+void rtx_line_isle_hold(RtxPieceTree *t, int on);
 void rtx_line_want_kick(RtxPieceTree *t, size_t line1);
 void rtx_line_want_cancel(RtxPieceTree *t);
 size_t rtx_line_want_step(RtxPieceTree *t, size_t budget);
@@ -267,6 +290,14 @@ static inline void rtx_isle_store_cancel(RtxPieceTree *t, unsigned char v) {
     if (t) atomic_store_explicit(&t->isle_cancel, v, memory_order_release);
 }
 
+static inline unsigned char rtx_isle_load_hold(const RtxPieceTree *t) {
+    return t ? atomic_load_explicit(&t->isle_hold, memory_order_acquire) : 0;
+}
+
+static inline void rtx_isle_store_hold(RtxPieceTree *t, unsigned char v) {
+    if (t) atomic_store_explicit(&t->isle_hold, v, memory_order_release);
+}
+
 static inline int rtx_line_isle_live(const RtxPieceTree *t) {
     return t && rtx_isle_load_live(t) && !rtx_isle_load_cancel(t);
 }
@@ -277,6 +308,14 @@ static inline int rtx_line_isle_pumping(const RtxPieceTree *t) {
 
 static inline int rtx_line_isle_connected(const RtxPieceTree *t) {
     return rtx_line_isle_live(t) && t->isle_from <= t->isle_floor;
+}
+
+/* 0-based line at isle_anchor once connected: the floor's line plus the
+ * newlines the walk published. Not scan_line — the floor may be a pin. */
+static inline size_t rtx_line_isle_line(const RtxPieceTree *t) {
+    if (!t) return 0;
+    return t->isle_base_line +
+           atomic_load_explicit(&t->isle_before, memory_order_acquire);
 }
 
 void rtx_isle_handle_stop(RtxPieceTree *t);
@@ -472,12 +511,30 @@ static inline int rtx_line_prefix_pct(const RtxPieceTree *t) {
  * splice these back instead of copying the payload. */
 typedef struct {
     unsigned char buf;
+    unsigned char lf_ok; /* lf_count counted (weights were exact at capture) */
     size_t start;
     size_t len;
     size_t lf_count;
 } RtxPieceRef;
 
 void !>(CCError) RtxPieceTree_replace(RtxPieceTree *t, size_t off, size_t n, char[:] ins);
+/* Bulk edit group (DESIGN Edit groups, bulk). The add file's published end:
+ * staged bytes land at add_end + rel. */
+size_t RtxPieceTree_add_end(const RtxPieceTree *t);
+/* Write bytes at add_end + rel without publishing them (readers keep the
+ * old add_end). Nothing references them until bulk_swap. */
+void !>(CCError) RtxPieceTree_stage_add(RtxPieceTree *t, size_t rel, char[:] bytes);
+/* [lo, lo + old_n) becomes the concatenation of `refs` (which may point
+ * into the first `staged` staged add bytes; those are published first).
+ * One pass: the whole piece sequence is rebuilt as a balanced tree
+ * (O(pieces)), adjacent contiguous pieces merge. Line index: exact
+ * weights stay exact (suffix rebuilt from lo); progressive weights reset
+ * the prefix to lo. Pins at or after lo, the origin, the island and a
+ * jump are dropped. A failure before the rebuild leaves the bytes as they
+ * were. Callers join find first. */
+void !>(CCError) RtxPieceTree_bulk_swap(RtxPieceTree *t, size_t lo, size_t old_n,
+                                        const RtxPieceRef *refs, size_t nrefs,
+                                        size_t staged);
 void !>(CCError) RtxPieceTree_capture_range(const RtxPieceTree *t, size_t off, size_t n,
                                             CCArena a, RtxPieceRef **out, size_t *nout);
 void !>(CCError) RtxPieceTree_splice_refs(RtxPieceTree *t, size_t off,
@@ -509,6 +566,8 @@ RtxInsertProf RtxPieceTree_insert_prof(const RtxPieceTree *t);
 /* One-shot diagnostic: next replace does not mutate.
  * unrestorable != 0 → RTX_ERR_UNRESTORABLE (doc sets broken). */
 void RtxPieceTree_fail_next_replace(RtxPieceTree *t, int unrestorable);
+/* Same, after `skip` replaces succeed (a member mid-group). */
+void RtxPieceTree_fail_replace_after(RtxPieceTree *t, size_t skip, int unrestorable);
 
 @typehooks on RtxPieceTree {
     .destroy = RtxPieceTree_destroy,

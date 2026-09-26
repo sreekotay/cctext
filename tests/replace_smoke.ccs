@@ -1,0 +1,727 @@
+#!ccc ccs
+/*
+ * Find and replace (DESIGN Replace): literal / ignore-case / whole-word /
+ * regex with $N, ${name}, $$ and \n \t escapes; replace one (one record,
+ * then the next hit is selected); replace all as one edit group (undo
+ * restores the bytes, redo reapplies) — across 2 MiB block edges and
+ * 1 MiB job slices against a sequential reference, past RTX_FIND_MAX
+ * hits, inside a selection, cancelled mid-job (no edit), refused at a
+ * cap or a long match (no edit); zero-width matches once per position;
+ * leftmost non-overlapping matches.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static char *doc_text(RtxDoc *d, size_t *n) {
+    char *buf;
+    size_t got;
+    @errhandler(CCError e) {
+        (void)e;
+        return NULL;
+    }
+    *n = d->len();
+    buf = (char *)malloc(*n + 1);
+    if (!buf) return NULL;
+    got = d->read_at(0, cc_slice_from_buffer(buf, *n)) !>;
+    if (got != *n) {
+        free(buf);
+        return NULL;
+    }
+    buf[*n] = 0;
+    return buf;
+}
+
+static int doc_is(RtxDoc *d, const char *want) {
+    size_t n = 0;
+    char *t = doc_text(d, &n);
+    int ok = t && n == strlen(want) && !memcmp(t, want, n);
+    if (!ok) fprintf(stderr, "  doc: [%s]\n  want: [%s]\n", t ? t : "(null)", want);
+    free(t);
+    return ok;
+}
+
+/* Replace-all on a fresh buffer doc; 1 when the result is `want` and the
+ * count is `count` ((size_t)-1: any). */
+static int all_is(const char *text, const char *q, unsigned opts, const char *tpl,
+                  const char *want, size_t count) {
+    CCArena a = cc_arena_heap(kilobytes(4) + strlen(text)) @destroy;
+    RtxDoc d = {0} @destroy;
+    size_t n = 0;
+    @errhandler(CCError e) {
+        fprintf(stderr, "  /%s/ -> [%s]: %s\n", q, tpl, e.message ? e.message : "?");
+        return 0;
+    }
+    /* from_buffer keeps a tracked slice: the text lives on `a`. */
+    d.from_buffer(cc_slice_cstr(text).clone_into(a) !>) !>;
+    n = d.replace_all(cc_slice_cstr(q), opts, cc_slice_cstr(tpl), 0, (size_t)-1) !>;
+    if (count != (size_t)-1 && n != count) {
+        fprintf(stderr, "  /%s/ -> [%s]: %zu replaced, want %zu\n", q, tpl, n, count);
+        return 0;
+    }
+    return doc_is(&d, want);
+}
+
+/* A replace-all that must be refused, leaving the text alone. */
+static int all_refused(const char *text, const char *q, unsigned opts, const char *tpl) {
+    CCArena a = cc_arena_heap(kilobytes(4) + strlen(text)) @destroy;
+    RtxDoc d = {0} @destroy;
+    int refused = 0;
+    @errhandler(CCError e) {
+        fprintf(stderr, "  refused setup: %s\n", e.message ? e.message : "?");
+        return 0;
+    }
+    d.from_buffer(cc_slice_cstr(text).clone_into(a) !>) !>;
+    d.replace_all(cc_slice_cstr(q), opts, cc_slice_cstr(tpl), 0, (size_t)-1) !>(e) {
+        (void)e;
+        refused = 1;
+    };
+    return refused && doc_is(&d, text) && !d.can_undo();
+}
+
+static void semantics(void) {
+    /* literal: leftmost, non-overlapping (the find list overlaps) */
+    expect(all_is("cat dog cat", "cat", 0, "bird", "bird dog bird", 2), "literal");
+    expect(all_is("aaaa", "aa", 0, "b", "bb", 2), "literal: non-overlapping aa in aaaa");
+    expect(all_is("aaa", "aa", 0, "b", "ba", 1), "literal: aaa -> ba");
+    expect(all_is("Cat CAT cat", "cat", RTX_FIND_ICASE, "x", "x x x", 3), "icase");
+    expect(all_is("cat cats bobcat cat.", "cat", RTX_FIND_WORD, "X", "X cats bobcat X.", 2),
+           "whole word");
+    expect(all_is("x", "x", 0, "$1\\n$$", "$1\\n$$", 1), "literal mode: template is verbatim");
+    expect(all_is("a.b.c", ".", 0, "", "abc", 2), "literal: empty replacement deletes");
+    /* regex captures, named groups, escapes */
+    expect(all_is("john smith, jane doe", "(\\w+) (\\w+)", RTX_FIND_REGEX, "$2 $1",
+                  "smith john, doe jane", 2), "regex $1 $2");
+    expect(all_is("ann@home bob@work", "(?<who>\\w+)@(?<dom>\\w+)", RTX_FIND_REGEX,
+                  "${dom}:${who}", "home:ann work:bob", 2), "regex ${name}");
+    expect(all_is("k=v", "(\\w)=(\\w)", RTX_FIND_REGEX, "${2}${1}$0", "vkk=v", 1),
+           "regex ${N} and $0");
+    expect(all_is("x", "x", RTX_FIND_REGEX, "$$\\n\\t\\\\$", "$\n\t\\$", 1),
+           "regex $$ \\n \\t \\\\ and a trailing $");
+    expect(all_is("x", "x", RTX_FIND_REGEX, "\\d$a", "\\d$a", 1),
+           "regex: other \\ and $ stay themselves");
+    expect(all_is("ab", "(a)(b)", RTX_FIND_REGEX, "$10", "a0", 1), "$10 is $1 then 0");
+    expect(all_is("ab", "(a)|(b)", RTX_FIND_REGEX, "[$2]", "[][b]", 2),
+           "a group that did not take part is empty");
+    expect(all_refused("ab", "(a)(b)", RTX_FIND_REGEX, "$3"), "no group 3: refused");
+    expect(all_refused("ab", "(a)", RTX_FIND_REGEX, "${nope}"), "unknown name: refused");
+    expect(all_refused("ab", "(a)", RTX_FIND_REGEX, "${1"), "unclosed ${: refused");
+    expect(all_refused("ab", "a(", RTX_FIND_REGEX, "x"), "bad regex: refused");
+    /* zero-width: each position once, no loop; empty right after a
+     * non-empty match counts (as Python's re.sub). */
+    expect(all_is("a\nb\n", "^", RTX_FIND_REGEX, "> ", "> a\n> b\n> ", 3),
+           "^ quotes every line start (EOF after a newline is one)");
+    expect(all_is("ab cd", "\\b", RTX_FIND_REGEX, "|", "|ab| |cd|", 4), "\\b");
+    expect(all_is("abxd", "x*", RTX_FIND_REGEX, "-", "-a-b--d-", 5), "x* (Python re.sub)");
+    expect(all_is("", "x*", RTX_FIND_REGEX, "-", "-", 1), "empty doc: one empty match");
+    expect(all_refused("ab", "", RTX_FIND_REGEX, "x"), "empty query is refused");
+    expect(all_is("\xC3\xA9\xC3\xA9", "(?:)", RTX_FIND_REGEX, ".",
+                  ".\xC3\xA9.\xC3\xA9.", 3), "zero-width steps a whole scalar");
+    expect(all_is("a+b", "a|a\\+b", RTX_FIND_REGEX, "X", "X+b", 1),
+           "leftmost-first alternation");
+    expect(all_is("same same", "same", 0, "same", "same same", 0),
+           "a replacement equal to the match is no site");
+}
+
+/* Replace one: selects first, then replaces the selected hit and selects
+ * the next one. One record each. */
+static void one(void) {
+    RtxDoc d = {0} @destroy;
+    const char *why = NULL;
+    int r;
+    @errhandler(CCError e) {
+        fprintf(stderr, "one: %s\n", e.message ? e.message : "?");
+        fails++;
+        return;
+    }
+    d.from_buffer("cat cat cat") !>;
+    d.find_set_opt(cc_slice_cstr("cat"), 0) !>;
+    d.find_finish() !>;
+    r = d.replace_hit(cc_slice_cstr("dog"), &why) !>;
+    expect(r == 0 && d.find.pinned && d.sel_lo() == 0 && d.sel_hi() == 3,
+           "one: first press selects the hit");
+    expect(doc_is(&d, "cat cat cat"), "one: no edit yet");
+    r = d.replace_hit(cc_slice_cstr("dog"), &why) !>;
+    expect(r == 1 && doc_is(&d, "dog cat cat"), "one: replaced the selected hit");
+    expect(d.find.pinned && d.sel_lo() == 4 && d.sel_hi() == 7, "one: next hit selected");
+    r = d.replace_hit(cc_slice_cstr("dog"), &why) !>;
+    expect(r == 1 && doc_is(&d, "dog dog cat"), "one: second");
+    d.undo() !>;
+    expect(doc_is(&d, "dog cat cat"), "one: one undo = one replace");
+    d.undo() !>;
+    expect(doc_is(&d, "cat cat cat") && !d.can_undo(), "one: each replace one record");
+    /* A replacement that holds the query does not loop on itself. */
+    d.find_set_opt(cc_slice_cstr("cat"), 0) !>;
+    d.find_finish() !>;
+    d.find_goto(0);
+    r = d.replace_hit(cc_slice_cstr("catcat"), &why) !>;
+    expect(r == 1 && doc_is(&d, "catcat cat cat") && d.sel_lo() == 7,
+           "one: next hit is past the replacement");
+    /* regex one with captures */
+    d.destroy();
+    d.from_buffer("k1=v1 k2=v2") !>;
+    d.find_set_opt(cc_slice_cstr("(\\w+)=(\\w+)"), RTX_FIND_REGEX) !>;
+    d.find_finish() !>;
+    d.find_goto(1);
+    r = d.replace_hit(cc_slice_cstr("$2=$1"), &why) !>;
+    expect(r == 1 && doc_is(&d, "k1=v1 v2=k2"), "one: regex $2=$1 on hit 2");
+    expect(d.find.pinned && d.sel_lo() == 0 && d.sel_hi() == 5, "one: wraps to hit 1");
+    r = d.replace_hit(cc_slice_cstr("${9}"), &why) !>;
+    expect(r == 0 && why != NULL && doc_is(&d, "k1=v1 v2=k2"), "one: bad template, no edit");
+}
+
+/* ---------------------------------------------------------- reference */
+
+typedef struct {
+    char *p;
+    size_t n, cap;
+} Buf;
+
+static void buf_put(Buf *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        b->cap = (b->n + n + 1) * 2;
+        b->p = (char *)realloc(b->p, b->cap);
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+}
+
+static size_t ref_next_cp(const char *t, size_t n, size_t p) {
+    p++;
+    while (p < n && ((unsigned char)t[p] & 0xC0) == 0x80) p++;
+    return p;
+}
+
+/* The replace-all semantics over the whole text in one pass. Templates:
+ * literal bytes plus $1-$9 (enough for the scale checks). */
+static char *ref_replace(const char *t, size_t n, const char *q, unsigned opts,
+                         const char *tpl, size_t *outn, size_t *count) {
+    CCArena a = cc_arena_heap(kilobytes(64));
+    RtxRxScratch s = {0};
+    RtxRxIn in;
+    RtxRx *rx;
+    Buf o = {0};
+    size_t p = 0, copied = 0, cnt = 0;
+    unsigned fl = 0;
+    if (opts & RTX_FIND_ICASE) fl |= RTX_RX_ICASE;
+    if (!(opts & RTX_FIND_REGEX)) fl |= RTX_RX_LITERAL;
+    rx = rtx_rx_compile(cc_slice_cstr(q), fl, a) !>(e) {
+        (void)e;
+        a.destroy();
+        return NULL;
+    };
+    memset(&in, 0, sizeof(in));
+    in.s = t;
+    in.n = n;
+    in.gpos = RTX_RX_UNSET;
+    in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+    buf_put(&o, "", 0);
+    for (;;) {
+        size_t ms = 0, me = 0, end = 0, k;
+        RtxRxCaps caps;
+        int r;
+        if (p < n) {
+            r = rtx_rx_search(rx, &in, p, n, 1, &s, &ms, &me);
+            if (r != RTX_RX_MATCH) break;
+        } else {
+            if (p > n || rtx_rx_at(rx, &in, n, &s, &end, &caps) != RTX_RX_MATCH) break;
+            ms = me = n;
+        }
+        if ((opts & RTX_FIND_WORD) &&
+            ((rtx_rx_word_before(t, ms) && rtx_rx_word_after(t, ms, n)) ||
+             (rtx_rx_word_before(t, me) && rtx_rx_word_after(t, me, n)))) {
+            p = ref_next_cp(t, n, ms);
+            continue;
+        }
+        rtx_rx_at(rx, &in, ms, &s, &end, &caps);
+        buf_put(&o, t + copied, ms - copied);
+        for (k = 0; tpl[k]; k++) {
+            if ((opts & RTX_FIND_REGEX) && tpl[k] == '$' && tpl[k + 1] >= '1' &&
+                tpl[k + 1] <= '9') {
+                int g = tpl[k + 1] - '0';
+                if (caps.s[g] != RTX_RX_UNSET)
+                    buf_put(&o, t + caps.s[g], caps.e[g] - caps.s[g]);
+                k++;
+            } else {
+                buf_put(&o, tpl + k, 1);
+            }
+        }
+        copied = me;
+        cnt++;
+        if (me == n && ms == n) break;
+        p = me > ms ? me : ref_next_cp(t, n, ms);
+    }
+    buf_put(&o, t + copied, n - copied);
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+    *outn = o.n;
+    *count = cnt;
+    return o.p;
+}
+
+static const char *gen_path(const char *name, char *dst, size_t n) {
+    if (system("mkdir -p testdata/generated") != 0) return NULL;
+    snprintf(dst, n, "testdata/generated/%s", name);
+    return dst;
+}
+
+/* A file of `n` bytes: lines of words, a number pair on some, `key` every
+ * `every` lines. */
+static int write_big(const char *path, size_t n, const char *key, int every) {
+    FILE *f = fopen(path, "wb");
+    size_t w = 0;
+    unsigned line = 0;
+    char row[160];
+    if (!f) return 0;
+    while (w < n) {
+        int k;
+        if (every && line % (unsigned)every == 0)
+            k = snprintf(row, sizeof(row), "%s line %u 12-34 foo\n", key, line);
+        else
+            k = snprintf(row, sizeof(row), "text line %u %u-%u bar baz\n", line,
+                         line * 7u, line % 13u);
+        if (w + (size_t)k > n) k = (int)(n - w);
+        fwrite(row, 1, (size_t)k, f);
+        w += (size_t)k;
+        line++;
+    }
+    fclose(f);
+    return 1;
+}
+
+/* Replace-all on a file doc equals the reference; undo restores it byte
+ * for byte in one step; redo reapplies. */
+static void scale_case(const char *path, const char *q, unsigned opts, const char *tpl,
+                       const char *what) {
+    RtxDoc d = {0} @destroy;
+    size_t n0 = 0, n1 = 0, rn = 0, cnt = 0, got;
+    char *t0, *t1, *ref;
+    char msg[160];
+    @errhandler(CCError e) {
+        fprintf(stderr, "%s: %s\n", what, e.message ? e.message : "?");
+        fails++;
+        return;
+    }
+    d.from_path(cc_slice_cstr(path)) !>;
+    t0 = doc_text(&d, &n0);
+    ref = ref_replace(t0, n0, q, opts, tpl, &rn, &cnt);
+    got = d.replace_all(cc_slice_cstr(q), opts, cc_slice_cstr(tpl), 0, (size_t)-1) !>;
+    t1 = doc_text(&d, &n1);
+    snprintf(msg, sizeof(msg), "%s: %zu replaced (reference %zu)", what, got, cnt);
+    expect(got == cnt && cnt > 0, msg);
+    snprintf(msg, sizeof(msg), "%s: bytes equal the reference", what);
+    expect(ref && t1 && n1 == rn && !memcmp(t1, ref, rn), msg);
+    snprintf(msg, sizeof(msg), "%s: one undo step", what);
+    /* A bulk group (DESIGN Edit groups, bulk) is one record. */
+    expect(RtxDoc_undo_width(&d) == (got >= rtx_group_bulk_min() ? 1 : got) || got == 1,
+           msg);
+    snprintf(msg, sizeof(msg), "%s: bulk record iff past the threshold", what);
+    expect((d.hist.recs[d.hist.head - 1].bulk != NULL) == (got >= rtx_group_bulk_min()),
+           msg);
+    d.undo() !>;
+    free(t1);
+    t1 = doc_text(&d, &n1);
+    snprintf(msg, sizeof(msg), "%s: undo restores every byte", what);
+    expect(t1 && n1 == n0 && !memcmp(t1, t0, n0) && !d.can_undo() && !d.dirty(), msg);
+    d.redo() !>;
+    free(t1);
+    t1 = doc_text(&d, &n1);
+    snprintf(msg, sizeof(msg), "%s: redo reapplies", what);
+    expect(ref && t1 && n1 == rn && !memcmp(t1, ref, rn), msg);
+    free(t0);
+    free(t1);
+    free(ref);
+}
+
+/* Replace-all through the bulk path (streamed) and through per-site
+ * replaces: same bytes, caret / anchor, line starts, find hits; undo and
+ * redo agree too. `gap` sets RTX_BULK_GAP_REF (tiny: many refs; huge:
+ * every untouched span copied). */
+static int lines_same(RtxDoc *a, RtxDoc *b) {
+    size_t i, n;
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return 0;
+    }
+    rtx_line_scan_to(&a->tree, a->len()) !>;
+    rtx_line_scan_to(&b->tree, b->len()) !>;
+    n = a->line_count();
+    if (n != b->line_count()) return 0;
+    for (i = 0; i < n; i += 1 + i / 64) {
+        size_t x = a->line_start(i) !>;
+        size_t y = b->line_start(i) !>;
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
+static int hits_same(RtxDoc *a, RtxDoc *b, const char *q) {
+    size_t i, n;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    a->find_set(cc_slice_cstr(q)) !>;
+    b->find_set(cc_slice_cstr(q)) !>;
+    a->find_finish() !>;
+    b->find_finish() !>;
+    n = rtx_find_hits_n(&a->find);
+    if (n != rtx_find_hits_n(&b->find)) return 0;
+    for (i = 0; i < n; i++) {
+        if (a->find.hits.data[i].off != b->find.hits.data[i].off ||
+            a->find.hits.data[i].line != b->find.hits.data[i].line)
+            return 0;
+    }
+    return 1;
+}
+
+static int docs_same(RtxDoc *a, RtxDoc *b) {
+    size_t na = 0, nb = 0;
+    char *ta = doc_text(a, &na), *tb = doc_text(b, &nb);
+    int ok = ta && tb && na == nb && !memcmp(ta, tb, na);
+    free(ta);
+    free(tb);
+    return ok;
+}
+
+static void bulk_vs_site(const char *path, const char *q, unsigned opts, const char *tpl,
+                         size_t gap, const char *what) {
+    RtxDoc A = {0} @destroy;
+    RtxDoc B = {0} @destroy;
+    size_t ga, gb;
+    char msg[160];
+    @errhandler(CCError e) {
+        fprintf(stderr, "%s: %s\n", what, e.message ? e.message : "?");
+        fails++;
+        rtx_bulk_tune(0, 0);
+        return;
+    }
+    A.from_path(cc_slice_cstr(path)) !>;
+    B.from_path(cc_slice_cstr(path)) !>;
+    A.caret = B.caret = 5000;
+    A.sel_anchor = B.sel_anchor = 90000;
+    rtx_bulk_tune(0, gap);
+    ga = A.replace_all(cc_slice_cstr(q), opts, cc_slice_cstr(tpl), 0, (size_t)-1) !>;
+    rtx_bulk_tune((size_t)-1, 0);
+    gb = B.replace_all(cc_slice_cstr(q), opts, cc_slice_cstr(tpl), 0, (size_t)-1) !>;
+    rtx_bulk_tune(0, 0);
+    snprintf(msg, sizeof(msg), "%s: bulk record vs %zu per-site records", what, gb);
+    expect(ga == gb && ga >= rtx_group_bulk_min() && A.undo_width() == 1 &&
+               A.hist.recs[0].bulk && B.undo_width() == gb,
+           msg);
+    snprintf(msg, sizeof(msg), "%s: same bytes, caret, anchor, span", what);
+    expect(docs_same(&A, &B) && A.caret == B.caret && A.sel_anchor == B.sel_anchor &&
+               A.span.lo == B.span.lo && A.span.hi == B.span.hi &&
+               A.span.old_n == B.span.old_n && A.last_off == B.last_off,
+           msg);
+    snprintf(msg, sizeof(msg), "%s: tree invariants", what);
+    expect(RtxDoc_check(&A), msg);
+    snprintf(msg, sizeof(msg), "%s: same line starts", what);
+    expect(lines_same(&A, &B), msg);
+    snprintf(msg, sizeof(msg), "%s: same find hits", what);
+    expect(hits_same(&A, &B, "e"), msg);
+    A.undo() !>;
+    B.undo() !>;
+    snprintf(msg, sizeof(msg), "%s: undo agrees", what);
+    expect(docs_same(&A, &B) && A.caret == B.caret && A.sel_anchor == B.sel_anchor &&
+               lines_same(&A, &B) && hits_same(&A, &B, "e") && RtxDoc_check(&A),
+           msg);
+    A.redo() !>;
+    B.redo() !>;
+    snprintf(msg, sizeof(msg), "%s: redo agrees", what);
+    expect(docs_same(&A, &B) && A.caret == B.caret && lines_same(&A, &B) &&
+               RtxDoc_check(&A),
+           msg);
+}
+
+static void scale(void) {
+    char path[256];
+    /* 5 MiB: 2 MiB find blocks and 1 MiB job slices both cut matches. */
+    if (!gen_path("replace_big.txt", path, sizeof(path)) ||
+        !write_big(path, (size_t)5 * 1024 * 1024 + 777, "KEY", 3)) {
+        expect(0, "scale fixture");
+        return;
+    }
+    scale_case(path, "KEY", 0, "key-longer", "literal grows");
+    scale_case(path, "line", 0, "L", "literal shrinks");
+    scale_case(path, "BAR", RTX_FIND_ICASE, "Q", "icase");
+    scale_case(path, "(\\d+)-(\\d+)", RTX_FIND_REGEX, "$2:$1", "regex swap");
+    scale_case(path, "baz\\nt", RTX_FIND_REGEX, "Z|T", "regex across newlines");
+    bulk_vs_site(path, "KEY", 0, "key-longer", 0, "bulk vs per-site: literal");
+    bulk_vs_site(path, "line", 0, "L", 8, "bulk vs per-site: gap refs");
+    bulk_vs_site(path, "(\\d+)-(\\d+)", RTX_FIND_REGEX, "$2:$1", (size_t)1 << 40,
+                 "bulk vs per-site: regex, every span copied");
+    bulk_vs_site(path, "baz\\nt", RTX_FIND_REGEX, "Z|\\nT", 0,
+                 "bulk vs per-site: newlines");
+    unlink(path);
+}
+
+/* More hits than the find list keeps (RTX_FIND_MAX): replace-all is its
+ * own pass, not the list. */
+static void past_find_cap(void) {
+    char path[256];
+    RtxDoc d = {0} @destroy;
+    size_t n = 0, got, want = (size_t)RTX_FIND_MAX + 7000, i;
+    FILE *f;
+    char *t;
+    @errhandler(CCError e) {
+        fprintf(stderr, "past cap: %s\n", e.message ? e.message : "?");
+        fails++;
+        return;
+    }
+    if (!gen_path("replace_cap.txt", path, sizeof(path))) return;
+    f = fopen(path, "wb");
+    if (!f) {
+        expect(0, "cap fixture");
+        return;
+    }
+    for (i = 0; i < want; i++) fputs("ab cd ", f);
+    fclose(f);
+    d.from_path(cc_slice_cstr(path)) !>;
+    d.find_set_opt(cc_slice_cstr("cd"), 0) !>;
+    d.find_finish() !>;
+    expect(d.find.truncated && rtx_find_hits_n(&d.find) == (size_t)RTX_FIND_MAX,
+           "cap: the find list is capped");
+    got = d.replace_all(cc_slice_cstr("cd"), 0, cc_slice_cstr("XYZ"), 0, (size_t)-1) !>;
+    expect(got == want, "cap: every match replaced, past the list's cap");
+    t = doc_text(&d, &n);
+    expect(t && !strstr(t, "cd") && n == want * 7, "cap: no match left");
+    free(t);
+    d.find_finish() !>;
+    expect(rtx_find_hits_n(&d.find) == 0, "cap: find list refreshed after replace-all");
+    d.undo() !>;
+    expect(d.len() == want * 6 && !d.can_undo(), "cap: one undo step");
+    unlink(path);
+}
+
+static int yield_now(void) {
+    return 1;
+}
+
+static void jobs(void) {
+    char path[256];
+    RtxDoc d = {0} @destroy;
+    RtxReplace j = {0} @destroy { rtx_replace_drop(&j); };
+    size_t n0 = 0, n1 = 0, gen0;
+    char *t0, *t1;
+    int st;
+    @errhandler(CCError e) {
+        fprintf(stderr, "jobs: %s\n", e.message ? e.message : "?");
+        fails++;
+        return;
+    }
+    if (!gen_path("replace_job.txt", path, sizeof(path)) ||
+        !write_big(path, (size_t)4 * 1024 * 1024, "KEY", 5)) {
+        expect(0, "job fixture");
+        return;
+    }
+    d.from_path(cc_slice_cstr(path)) !>;
+    t0 = doc_text(&d, &n0);
+    gen0 = d.edit_gen;
+    /* Cancel mid-job: one slice in, then drop. Nothing moved. */
+    rtx_replace_kick(&j, &d, cc_slice_cstr("KEY"), 0, cc_slice_cstr("k"), 0, (size_t)-1) !>;
+    st = rtx_replace_step(&j, 1000, yield_now) !>;
+    expect(st == RTX_REPL_SCAN && j.n > 0, "cancel: the job has staged sites");
+    expect(rtx_replace_pct(&j) > 0 && rtx_replace_pct(&j) < 100, "cancel: progress is partial");
+    /* Past the threshold the sites stream into a bulk build that has
+     * already staged bytes past the add file's published end. */
+    expect(j.n >= rtx_group_bulk_min() && j.bulk && j.bulk->new_n > 0,
+           "cancel: the bulk build is streaming");
+    {
+        size_t add0 = RtxPieceTree_add_end(&d.tree);
+        rtx_replace_drop(&j);
+        expect(RtxPieceTree_add_end(&d.tree) == add0, "cancel: nothing published");
+    }
+    t1 = doc_text(&d, &n1);
+    expect(d.edit_gen == gen0 && !d.can_undo() && t1 && n1 == n0 && !memcmp(t0, t1, n0),
+           "cancel: the document is unchanged");
+    free(t1);
+    /* An edit between kick and commit refuses the job. */
+    rtx_replace_kick(&j, &d, cc_slice_cstr("KEY"), 0, cc_slice_cstr("k"), 0, (size_t)-1) !>;
+    st = rtx_replace_step(&j, 1000, yield_now) !>;
+    d.insert(0, cc_slice_cstr("#")) !>;
+    st = rtx_replace_step(&j, 0, NULL) !>;
+    expect(st == RTX_REPL_FAIL && j.err != NULL, "edit mid-job: refused");
+    d.undo() !>;
+    rtx_replace_drop(&j);
+    /* Site cap: refused whole, nothing edited. */
+    j.max_sites = 50;
+    rtx_replace_kick(&j, &d, cc_slice_cstr("KEY"), 0, cc_slice_cstr("k"), 0, (size_t)-1) !>;
+    st = rtx_replace_step(&j, 0, NULL) !>;
+    expect(st == RTX_REPL_FAIL && j.err && strstr(j.err, "too many"),
+           "cap: too many sites is refused");
+    rtx_replace_drop(&j);
+    j.max_sites = 0;
+    j.max_bytes = 1000;
+    rtx_replace_kick(&j, &d, cc_slice_cstr("KEY"), 0, cc_slice_cstr("k"), 0, (size_t)-1) !>;
+    st = rtx_replace_step(&j, 0, NULL) !>;
+    expect(st == RTX_REPL_FAIL && j.err && strstr(j.err, "bytes"),
+           "cap: too many bytes is refused");
+    j.max_bytes = 0;
+    rtx_replace_drop(&j);
+    t1 = doc_text(&d, &n1);
+    expect(!d.can_undo() && t1 && n1 == n0 && !memcmp(t0, t1, n0),
+           "refusals leave the document unchanged");
+    free(t1);
+    /* The real cap: RTX_GROUP_MAX sites in one group. */
+    expect(RTX_GROUP_MAX == ((size_t)1 << 22), "RTX_GROUP_MAX is 4M sites");
+    /* Pumped to the end in small steps, then committed: one group. */
+    rtx_replace_kick(&j, &d, cc_slice_cstr("KEY"), 0, cc_slice_cstr("k"), 0, (size_t)-1) !>;
+    {
+        int steps = 0;
+        for (;;) {
+            st = rtx_replace_step(&j, 1, yield_now) !>;
+            if (st != RTX_REPL_SCAN) break;
+            steps++;
+        }
+        expect(steps >= 3 && st == RTX_REPL_READY, "pumped job: several steps, then ready");
+    }
+    {
+        size_t staged = j.n;
+        size_t got = rtx_replace_commit(&j) !>;
+        expect(got == staged && got >= rtx_group_bulk_min() && RtxDoc_undo_width(&d) == 1 &&
+                   d.hist.recs[d.hist.head - 1].bulk != NULL,
+               "pumped job: one bulk record");
+    }
+    d.undo() !>;
+    t1 = doc_text(&d, &n1);
+    expect(t1 && n1 == n0 && !memcmp(t0, t1, n0), "pumped job: undo restores");
+    free(t1);
+    free(t0);
+    unlink(path);
+}
+
+static void long_match(void) {
+    RtxDoc d = {0} @destroy;
+    char *big;
+    size_t n = 100 * 1024;
+    int refused = 0;
+    @errhandler(CCError e) {
+        fprintf(stderr, "long: %s\n", e.message ? e.message : "?");
+        fails++;
+        return;
+    }
+    big = (char *)malloc(n + 3);
+    big[0] = 'a';
+    memset(big + 1, 'b', n);
+    big[n + 1] = 'z';
+    big[n + 2] = 0;
+    {
+        char path[256];
+        FILE *f;
+        if (!gen_path("replace_long.txt", path, sizeof(path))) return;
+        f = fopen(path, "wb");
+        fputs("x\n", f);
+        fwrite(big, 1, n + 2, f);
+        fputs("\nshort az\n", f);
+        fclose(f);
+        d.from_path(cc_slice_cstr(path)) !>;
+        d.replace_all(cc_slice_cstr("a[^z]*z"), RTX_FIND_REGEX, cc_slice_cstr("-"), 0,
+                      (size_t)-1) !>(e) {
+            refused = e.message && strstr(e.message, "64 KiB") != NULL;
+        };
+        expect(refused, "a match past 64 KiB is refused, not split");
+        expect(!d.can_undo() && d.len() == n + 14, "long: nothing replaced");
+        unlink(path);
+    }
+    free(big);
+}
+
+static void selection(void) {
+    RtxDoc d = {0} @destroy;
+    RtxUi ui = {0};
+    size_t lo = 0, hi = 0, got;
+    int landed;
+    @errhandler(CCError e) {
+        fprintf(stderr, "selection: %s\n", e.message ? e.message : "?");
+        fails++;
+        return;
+    }
+    d.from_buffer("a x\nb x\nc x\nd x\n") !>;
+    got = d.replace_all(cc_slice_cstr("x"), 0, cc_slice_cstr("Y"), 4, 12) !>;
+    expect(got == 2 && doc_is(&d, "a x\nb Y\nc Y\nd x\n"), "range: only inside [lo, hi)");
+    d.undo() !>;
+    got = d.replace_all(cc_slice_cstr("x\nc"), 0, cc_slice_cstr("-"), 4, 8) !>;
+    expect(got == 0, "range: a match must end inside it");
+    /* UI: a multi-line selection is the scope; a selected hit is not. */
+    d.sel_anchor = 4;
+    d.caret = 12;
+    ui.find = 1;
+    ui.repl = 1;
+    expect(rtx_ui_repl_scope(&ui, &d, &lo, &hi) && lo == 4 && hi == 12,
+           "ui: multi-line selection is the scope");
+    ui.repl_whole = 1;
+    expect(!rtx_ui_repl_scope(&ui, &d, &lo, &hi), "ui: Alt-L = whole file");
+    ui.repl_whole = 0;
+    ui.find_buf[0] = 'x';
+    ui.find_len = 1;
+    ui.repl_buf[0] = 'Z';
+    ui.repl_len = 1;
+    landed = rtx_ui_replace_all(&ui, &d) !>;
+    expect(landed == 1, "ui: replace all lands");
+    expect(doc_is(&d, "a x\nb Z\nc Z\nd x\n") && strstr(ui.repl_msg, "2 replaced"),
+           "ui: in selection, status says N replaced");
+    expect(d.sel_lo() == 4 && d.sel_hi() == 12, "ui: the selection maps through");
+    d.undo() !>;
+    d.sel_anchor = d.caret = 0;
+    landed = rtx_ui_replace_all(&ui, &d) !>;
+    expect(landed == 1 && doc_is(&d, "a Z\nb Z\nc Z\nd Z\n"),
+           "ui: no selection = whole file");
+    expect(d.caret == 0, "ui: caret stays");
+    rtx_replace_drop(&ui.rjob);
+}
+
+/* Rich pane bytes: hints are replaced as plain bytes (source of truth;
+ * the reparse re-reads the marks). */
+static void rich_bytes(void) {
+    RtxDoc d = {0} @destroy;
+    size_t got;
+    @errhandler(CCError e) {
+        fprintf(stderr, "rich: %s\n", e.message ? e.message : "?");
+        fails++;
+        return;
+    }
+    d.from_buffer("# T\n\nsome **bold** and **more**\n") !>;
+    got = d.replace_all(cc_slice_cstr("\\*\\*(\\w+)\\*\\*"), RTX_FIND_REGEX,
+                        cc_slice_cstr("_$1_"), 0, (size_t)-1) !>;
+    expect(got == 2 && doc_is(&d, "# T\n\nsome _bold_ and _more_\n"), "rich: raw bytes");
+    d.undo() !>;
+    expect(doc_is(&d, "# T\n\nsome **bold** and **more**\n"), "rich: undo");
+}
+
+int main(void) {
+    rtx_safe_test_isol();
+    rtx_safe_set_enabled(0);
+    semantics();
+    one();
+    scale();
+    past_find_cap();
+    jobs();
+    long_match();
+    selection();
+    rich_bytes();
+    if (fails) {
+        fprintf(stderr, "replace_smoke: %d fail(s)\n", fails);
+        return 1;
+    }
+    printf("replace_smoke ok\n");
+    return 0;
+}

@@ -1,0 +1,2467 @@
+#!ccc ccs
+/*
+ * Project index, quick-open scoring and project search (see proj.cch).
+ * Joins the rtx_find target as a second source (build.cc is at the
+ * 64-target cap). Scan model: DESIGN.md Scan, rows `proj` / `psearch`.
+ */
+#include <ccc/std/prelude.cch>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include "proj.cch"
+#include "lf.cch"
+#include "rtx_par.cch"
+
+/* Types first: the lowered @parallel thunks are hoisted above the
+ * functions, so every type a closure names is declared here. */
+
+enum { RTX_PICK_SHARD_MIN = 8192, RTX_PICK_SHARDS = 16 };
+
+typedef struct {
+    uint32_t dir;
+    uint32_t depth;
+    const RtxIgn *ign;
+} RtxProjJob;
+
+typedef struct {
+    const char *name;
+    uint16_t n;
+    uint8_t type;
+    uint8_t is_dir;
+    uint64_t dev, ino;
+} RtxProjEnt;
+
+typedef struct {
+    CCArena a;
+    RtxProjEnt *ents;
+    size_t n, cap;
+    RtxIgn local;
+    int denied;
+    size_t ignored, xdev;
+} RtxProjLane;
+
+typedef struct RtxProjWalk {
+    RtxProjIdx *idx;
+    char root[RTX_PROJ_PATH];
+    size_t root_n;
+    unsigned flags;
+    uint64_t root_dev;
+    CCArena arena;          /* jobs, kept ignore levels, visited set */
+    RtxProjJob *jobs;
+    size_t jlen, jcap, jhead;
+    RtxProjJob wave[RTX_PROJ_WAVE];
+    RtxProjLane lane[RTX_PROJ_WAVE];
+    uint64_t *vis;          /* (dev, ino + 1) pairs; 0 ino slot = empty */
+    size_t vis_n, vis_cap;
+    RtxIgn top;             /* .git/info/exclude */
+    _Atomic unsigned char cancel;
+    _Atomic unsigned char done;
+    CCParallel h;
+} RtxProjWalk;
+
+typedef struct {
+    const RtxProjIdx *x;
+    const RtxProj *p;
+    const char *q;
+    size_t qn;
+    const uint32_t *ids;   /* NULL: ids lo..hi */
+    size_t lo, hi;
+    uint32_t *cand;        /* out: matched ids, room for hi - lo */
+    size_t ncand;
+    RtxProjHit heap[RTX_PROJ_PICK_K];
+    size_t nheap;
+    uint64_t mru_h[RTX_PROJ_MRU_MAX];
+} RtxPickShard;
+
+/* One file of a chunk that has hits: hits [first, first + n) of the slot. */
+typedef struct {
+    uint32_t id;
+    uint32_t first, n;
+} RtxPsFileHits;
+
+/* Lane scratch for one chunk of files (the `cache` replica): the read
+ * buffer is reused across files and chunks; hits, previews and the
+ * per-file records live on hit_a until the lane's next chunk. */
+typedef struct {
+    CCArena buf_a;
+    char *buf;
+    size_t buf_cap;
+    CCArena hit_a;
+    RtxPsHit *hits;
+    size_t nh, hcap;
+    char *pv;
+    size_t npv, pvcap;
+    RtxPsFileHits *fh;
+    int dfd, dfd_ok;       /* the last directory read (openat base) */
+    uint32_t dfd_dir;
+    size_t nfh, fhcap;
+    RtxRxScratch rxs;
+    size_t bin, big, err;
+    uint64_t bytes;
+} RtxPsSlot;
+
+typedef struct RtxPsWalk {
+    RtxProjSearch *ps;
+    const RtxProjIdx *idx;
+    char root[RTX_PROJ_PATH];
+    size_t root_n;
+    size_t end;
+    _Atomic unsigned char done;
+    CCParallel h;
+} RtxPsWalk;
+
+_Static_assert(RTX_PROJ_HCH_MAX >= (int)(RTX_PROJ_HITS_MAX >> RTX_PROJ_HCH_BITS) + 1,
+               "hit chunk table covers RTX_PROJ_HITS_MAX");
+
+static long rtx_proj_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static long rtx_proj_now_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long)ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+}
+
+static _Atomic long g_proj_slow_us;
+
+void rtx_proj_test_slow(long us) {
+    atomic_store(&g_proj_slow_us, us);
+}
+
+static int rtx_proj_lanes(void) {
+    static int cached = 0;
+    long n;
+    if (cached) return cached;
+    n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 2) n = 2;
+    if (n > 8) n = 8;
+    cached = (int)n;
+    return cached;
+}
+
+/* ============================================================ gitignore */
+
+/* [...] at *pp (on '['). 1 / 0 = matched / not, and *pp moves past ']';
+ * -1 = not a class (unterminated): the caller takes '[' literally. */
+static int rtx_wm_class(const char **pp, const char *pe, unsigned char ch) {
+    const char *p = *pp + 1;
+    const char *start;
+    int neg = 0, hit = 0;
+    if (p < pe && (*p == '!' || *p == '^')) {
+        neg = 1;
+        p++;
+    }
+    start = p;
+    while (p < pe && (*p != ']' || p == start)) {
+        unsigned char lo, hi;
+        if (*p == '[' && p + 1 < pe && p[1] == ':') {
+            const char *q = p + 2;
+            while (q + 1 < pe && !(q[0] == ':' && q[1] == ']')) q++;
+            if (q + 1 < pe) {
+                size_t nn = (size_t)(q - (p + 2));
+                const char *nm = p + 2;
+                int m = 0;
+                if (nn == 5 && !memcmp(nm, "alpha", 5)) m = isalpha(ch);
+                else if (nn == 5 && !memcmp(nm, "digit", 5)) m = isdigit(ch);
+                else if (nn == 5 && !memcmp(nm, "alnum", 5)) m = isalnum(ch);
+                else if (nn == 5 && !memcmp(nm, "upper", 5)) m = isupper(ch);
+                else if (nn == 5 && !memcmp(nm, "lower", 5)) m = islower(ch);
+                else if (nn == 5 && !memcmp(nm, "space", 5)) m = isspace(ch);
+                else if (nn == 5 && !memcmp(nm, "punct", 5)) m = ispunct(ch);
+                else if (nn == 6 && !memcmp(nm, "xdigit", 6)) m = isxdigit(ch);
+                if (m) hit = 1;
+                p = q + 2;
+                continue;
+            }
+        }
+        lo = (unsigned char)*p;
+        if (lo == '\\' && p + 1 < pe) {
+            p++;
+            lo = (unsigned char)*p;
+        }
+        p++;
+        hi = lo;
+        if (p + 1 < pe && *p == '-' && p[1] != ']') {
+            p++;
+            hi = (unsigned char)*p;
+            if (hi == '\\' && p + 1 < pe) {
+                p++;
+                hi = (unsigned char)*p;
+            }
+            p++;
+        }
+        if (ch >= lo && ch <= hi) hit = 1;
+    }
+    if (p >= pe) return -1;
+    *pp = p + 1;
+    if (ch == '/') return 0;
+    return hit != neg;
+}
+
+static int rtx_wm(const char *p0, const char *p, const char *pe,
+                  const char *s, const char *se, int depth) {
+    if (depth > 48) return 0;
+    while (p < pe) {
+        char c = *p;
+        if (c == '*') {
+            const char *q = p;
+            const char *t;
+            while (q < pe && *q == '*') q++;
+            if (q - p >= 2 && (p == p0 || p[-1] == '/') && (q == pe || *q == '/')) {
+                if (q == pe) return 1; /* trailing "**": everything below */
+                q++;                   /* "**" "/": zero or more dirs */
+                t = s;
+                for (;;) {
+                    if (rtx_wm(p0, q, pe, t, se, depth + 1)) return 1;
+                    t = (const char *)memchr(t, '/', (size_t)(se - t));
+                    if (!t) return 0;
+                    t++;
+                }
+            }
+            p = q;
+            if (p == pe) return memchr(s, '/', (size_t)(se - s)) == NULL;
+            for (t = s; t <= se; t++) {
+                if (rtx_wm(p0, p, pe, t, se, depth + 1)) return 1;
+                if (t < se && *t == '/') return 0;
+            }
+            return 0;
+        }
+        if (s >= se) return 0;
+        if (c == '?') {
+            if (*s == '/') return 0;
+            p++;
+            s++;
+            continue;
+        }
+        if (c == '[') {
+            const char *q = p;
+            int r = rtx_wm_class(&q, pe, (unsigned char)*s);
+            if (r >= 0) {
+                if (!r) return 0;
+                p = q;
+                s++;
+                continue;
+            }
+        }
+        if (c == '\\' && p + 1 < pe) {
+            p++;
+            c = *p;
+        }
+        if (c != *s) return 0;
+        p++;
+        s++;
+    }
+    return s == se;
+}
+
+int rtx_glob_match(const char *pat, size_t pn, const char *s, size_t sn) {
+    if (!pat || !s) return 0;
+    return rtx_wm(pat, pat, pat + pn, s, s + sn, 0);
+}
+
+static int rtx_ign_push(RtxIgn *set, const RtxIgnRule *r, CCArena a) {
+    if (set->n >= set->cap) {
+        uint32_t c = set->cap ? set->cap * 2 : 16;
+        RtxIgnRule *nr = (RtxIgnRule *)cc_arena_alloc(a, c * sizeof(RtxIgnRule), 8);
+        if (!nr) return -1;
+        if (set->n) memcpy(nr, set->rules, set->n * sizeof(RtxIgnRule));
+        set->rules = nr;
+        set->cap = c;
+    }
+    set->rules[set->n++] = *r;
+    return 0;
+}
+
+static int rtx_ign_line(RtxIgn *set, const char *l, size_t n, CCArena a) {
+    RtxIgnRule r;
+    char *cp;
+    memset(&r, 0, sizeof r);
+    if (n == 0 || l[0] == '#') return 0;
+    /* Trailing spaces go unless escaped. */
+    while (n && l[n - 1] == ' ' && !(n >= 2 && l[n - 2] == '\\')) n--;
+    if (!n) return 0;
+    if (l[0] == '!') {
+        r.neg = 1;
+        l++;
+        n--;
+    } else if (l[0] == '\\' && n > 1 && (l[1] == '!' || l[1] == '#')) {
+        l++;
+        n--;
+    }
+    if (n && l[n - 1] == '/') {
+        r.dir_only = 1;
+        n--;
+    }
+    if (!n) return 0;
+    r.anchored = memchr(l, '/', n) != NULL;
+    if (l[0] == '/') {
+        l++;
+        n--;
+    }
+    if (!n || n > 0xFFFF) return 0;
+    cp = (char *)cc_arena_alloc(a, n + 1, 1);
+    if (!cp) return -1;
+    memcpy(cp, l, n);
+    cp[n] = 0;
+    r.pat = cp;
+    r.n = (uint16_t)n;
+    return rtx_ign_push(set, &r, a);
+}
+
+int rtx_ign_parse(RtxIgn *set, const char *text, size_t n, CCArena a) {
+    size_t i = 0;
+    if (!set || !text) return 0;
+    while (i < n) {
+        size_t j = i, e;
+        while (j < n && text[j] != '\n') j++;
+        e = j;
+        if (e > i && text[e - 1] == '\r') e--;
+        if (rtx_ign_line(set, text + i, e - i, a) < 0) return -1;
+        i = j + 1;
+    }
+    return 0;
+}
+
+size_t rtx_proj_base_off(const char *rel, size_t n) {
+    size_t i = n;
+    while (i > 0 && rel[i - 1] != '/') i--;
+    return i;
+}
+
+int rtx_ign_match(const RtxIgn *set, const char *rel, size_t rn, int is_dir) {
+    const RtxIgn *lv;
+    size_t bo;
+    if (!rel) return 0;
+    bo = rtx_proj_base_off(rel, rn);
+    for (lv = set; lv; lv = lv->up) {
+        const char *sub = rel;
+        size_t sn = rn;
+        uint32_t k;
+        if (!lv->n) continue;
+        if (lv->base_n) {
+            if (rn <= lv->base_n || memcmp(rel, lv->base, lv->base_n) != 0 ||
+                rel[lv->base_n] != '/')
+                continue;
+            sub = rel + lv->base_n + 1;
+            sn = rn - lv->base_n - 1;
+        }
+        for (k = lv->n; k-- > 0;) {
+            const RtxIgnRule *r = &lv->rules[k];
+            int m;
+            if (r->dir_only && !is_dir) continue;
+            if (r->anchored) m = rtx_glob_match(r->pat, r->n, sub, sn);
+            else m = rtx_glob_match(r->pat, r->n, rel + bo, rn - bo);
+            if (m) return !r->neg;
+        }
+    }
+    return 0;
+}
+
+/* ================================================================ fuzzy */
+
+enum {
+    FZ_MATCH = 16,
+    FZ_GAP_START = -3,
+    FZ_GAP_EXT = -1,
+    FZ_SEG = 12,    /* after '/' (or the path start) */
+    FZ_WORD = 9,    /* after _ - . space */
+    FZ_CAMEL = 8,   /* lower→Upper, letter→digit */
+    FZ_CONSEC = 5,
+    FZ_BASE = 2,    /* any char of the basename */
+    FZ_BASE0 = 8,   /* the basename's first char */
+    FZ_CASE = 1,    /* same case as typed */
+    FZ_FIRST = 2,   /* the first query char's boundary bonus counts twice */
+    FZ_SMAX = 512,  /* longer paths keep their tail */
+    FZ_BT_CELLS = 8192
+};
+#define FZ_NEG (-(1 << 28))
+
+static int fz_low(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+}
+
+static int fz_up(unsigned char c) { return c >= 'A' && c <= 'Z'; }
+static int fz_lo(unsigned char c) { return c >= 'a' && c <= 'z'; }
+static int fz_dig(unsigned char c) { return c >= '0' && c <= '9'; }
+
+static int fz_eq(unsigned char qc, unsigned char sc) {
+    if (qc == sc) return 1;
+    if (fz_up(qc)) return 0; /* smart case: typed uppercase is exact */
+    return fz_low(sc) == qc;
+}
+
+static int fz_bonus(const char *s, size_t j, size_t base) {
+    unsigned char c = (unsigned char)s[j];
+    unsigned char pc = j ? (unsigned char)s[j - 1] : '/';
+    int b = 0;
+    if (pc == '/') b = FZ_SEG;
+    else if (pc == '_' || pc == '-' || pc == '.' || pc == ' ') b = FZ_WORD;
+    else if ((fz_lo(pc) && fz_up(c)) || (!fz_dig(pc) && fz_dig(c))) b = FZ_CAMEL;
+    if (j >= base) {
+        b += FZ_BASE;
+        if (j == base) b += FZ_BASE0;
+    }
+    return b;
+}
+
+static int fz_max(int a, int b) { return a > b ? a : b; }
+
+/* Alignment with a traceback table (positions for highlight). Its own
+ * frame: shard lanes never pay for the table. */
+__attribute__((noinline)) static int fz_score_bt(const char *q, size_t qn, const char *s,
+                                                 size_t base, size_t first, size_t w,
+                                                 size_t cut, uint16_t *pos) {
+    int S[FZ_BT_CELLS];
+    int16_t from[FZ_BT_CELLS];
+    size_t i, j, bj = 0;
+    int best = FZ_NEG;
+    for (i = 0; i < qn; i++) {
+        int bg = FZ_NEG;
+        int bgk = -1;
+        unsigned char qc = (unsigned char)q[i];
+        for (j = 0; j < w; j++) {
+            unsigned char sc = (unsigned char)s[first + j];
+            int *cell = &S[i * w + j];
+            if (i > 0 && j >= 2) {
+                int cand = S[(i - 1) * w + j - 2];
+                int ext = bg > FZ_NEG / 2 ? bg + FZ_GAP_EXT : FZ_NEG;
+                cand = cand > FZ_NEG / 2 ? cand + FZ_GAP_START : FZ_NEG;
+                if (cand >= ext) {
+                    bg = cand;
+                    bgk = (int)j - 2;
+                } else {
+                    bg = ext;
+                }
+            }
+            from[i * w + j] = -1;
+            if (!fz_eq(qc, sc)) {
+                *cell = FZ_NEG;
+                continue;
+            }
+            {
+                int b = fz_bonus(s, first + j, base);
+                int cb = (qc == sc) ? FZ_CASE : 0;
+                if (i == 0) {
+                    *cell = FZ_MATCH + b * FZ_FIRST + cb;
+                } else {
+                    int diag = j >= 1 ? S[(i - 1) * w + j - 1] : FZ_NEG;
+                    diag = diag > FZ_NEG / 2 ? diag + FZ_CONSEC : FZ_NEG;
+                    if (diag <= FZ_NEG / 2 && bg <= FZ_NEG / 2) {
+                        *cell = FZ_NEG;
+                    } else if (diag >= bg) {
+                        *cell = diag + FZ_MATCH + b + cb;
+                        from[i * w + j] = (int16_t)(j - 1);
+                    } else {
+                        *cell = bg + FZ_MATCH + b + cb;
+                        from[i * w + j] = (int16_t)bgk;
+                    }
+                }
+            }
+        }
+    }
+    for (j = 0; j < w; j++) {
+        if (S[(qn - 1) * w + j] > best) {
+            best = S[(qn - 1) * w + j];
+            bj = j;
+        }
+    }
+    if (best <= FZ_NEG / 2) return RTX_FUZZY_NONE;
+    {
+        long jj = (long)bj;
+        for (i = qn; i-- > 0;) {
+            pos[i] = (uint16_t)(cut + first + (size_t)jj);
+            if (i == 0) break;
+            jj = from[i * w + (size_t)jj];
+            if (jj < 0) break;
+        }
+    }
+    return best;
+}
+
+/* Rolling rows: score only. */
+static int fz_score_rows(const char *q, size_t qn, const char *s, size_t base,
+                         size_t first, size_t w) {
+    int ra[FZ_SMAX], rb[FZ_SMAX];
+    int *prev = ra, *cur = rb, *t;
+    size_t i, j;
+    int best = FZ_NEG;
+    for (i = 0; i < qn; i++) {
+        int bg = FZ_NEG;
+        unsigned char qc = (unsigned char)q[i];
+        for (j = 0; j < w; j++) {
+            unsigned char sc = (unsigned char)s[first + j];
+            if (i > 0 && j >= 2) {
+                int cand = prev[j - 2];
+                int ext = bg > FZ_NEG / 2 ? bg + FZ_GAP_EXT : FZ_NEG;
+                cand = cand > FZ_NEG / 2 ? cand + FZ_GAP_START : FZ_NEG;
+                bg = fz_max(cand, ext);
+            }
+            if (!fz_eq(qc, sc)) {
+                cur[j] = FZ_NEG;
+                continue;
+            }
+            {
+                int b = fz_bonus(s, first + j, base);
+                int cb = (qc == sc) ? FZ_CASE : 0;
+                if (i == 0) {
+                    cur[j] = FZ_MATCH + b * FZ_FIRST + cb;
+                } else {
+                    int diag = j >= 1 ? prev[j - 1] : FZ_NEG;
+                    int m;
+                    diag = diag > FZ_NEG / 2 ? diag + FZ_CONSEC : FZ_NEG;
+                    m = fz_max(diag, bg);
+                    cur[j] = m > FZ_NEG / 2 ? m + FZ_MATCH + b + cb : FZ_NEG;
+                }
+            }
+        }
+        t = prev;
+        prev = cur;
+        cur = t;
+    }
+    for (j = 0; j < w; j++)
+        if (prev[j] > best) best = prev[j];
+    return best <= FZ_NEG / 2 ? RTX_FUZZY_NONE : best;
+}
+
+int rtx_fuzzy_path(const char *q, size_t qn, const char *s, size_t sn,
+                    size_t base, uint16_t *pos) {
+    size_t cut = 0;
+    size_t i, j, first, lastj, w;
+    int best;
+    if (!q || !s) return RTX_FUZZY_NONE;
+    if (qn == 0) return 0;
+    if (qn > RTX_FUZZY_QMAX) qn = RTX_FUZZY_QMAX;
+    if (sn > FZ_SMAX) {
+        cut = sn - FZ_SMAX;
+        s += cut;
+        sn = FZ_SMAX;
+        base = base >= cut ? base - cut : 0;
+    }
+    /* Subsequence (forward greedy): the earliest start. */
+    first = (size_t)-1;
+    for (i = 0, j = 0; j < sn && i < qn; j++) {
+        if (fz_eq((unsigned char)q[i], (unsigned char)s[j])) {
+            if (i == 0) first = j;
+            i++;
+        }
+    }
+    if (i < qn) return RTX_FUZZY_NONE;
+    /* Backward greedy: the latest end. */
+    lastj = sn - 1;
+    for (i = qn, j = sn; j-- > first && i > 0;) {
+        if (fz_eq((unsigned char)q[i - 1], (unsigned char)s[j])) {
+            if (i == qn) lastj = j;
+            i--;
+        }
+    }
+    w = lastj - first + 1;
+    if (pos && qn * w <= (size_t)FZ_BT_CELLS)
+        return fz_score_bt(q, qn, s, base, first, w, cut, pos);
+    best = fz_score_rows(q, qn, s, base, first, w);
+    if (best != RTX_FUZZY_NONE && pos) {
+        /* Too big for the traceback table: greedy positions. */
+        for (i = 0, j = first; i < qn && j < sn; j++) {
+            if (fz_eq((unsigned char)q[i], (unsigned char)s[j]))
+                pos[i++] = (uint16_t)(cut + j);
+        }
+    }
+    return best;
+}
+
+/* ======================================================== index storage */
+
+static char *rtx_idx_str(const RtxProjIdx *x, uint64_t off) {
+    return x->nch[off >> RTX_PROJ_NCH_BITS] + (off & ((1u << RTX_PROJ_NCH_BITS) - 1));
+}
+
+static const RtxProjFile *rtx_idx_file(const RtxProjIdx *x, size_t id) {
+    return &x->fch[id >> RTX_PROJ_FCH_BITS][id & ((1u << RTX_PROJ_FCH_BITS) - 1)];
+}
+
+static const RtxProjDir *rtx_idx_dir(const RtxProjIdx *x, size_t id) {
+    return &x->dch[id >> RTX_PROJ_DCH_BITS][id & ((1u << RTX_PROJ_DCH_BITS) - 1)];
+}
+
+/* Write stage only. (uint64_t)-1 on OOM / overflow. */
+static uint64_t rtx_idx_put(RtxProjIdx *x, const char *a, size_t an,
+                            const char *b, size_t bn) {
+    const uint64_t chsz = (uint64_t)1 << RTX_PROJ_NCH_BITS;
+    uint64_t off = x->npool;
+    size_t n = an + (an && bn ? 1 : 0) + bn;
+    size_t k;
+    char *d;
+    if (n + 1 > chsz) return (uint64_t)-1;
+    if ((off & (chsz - 1)) + n + 1 > chsz) off = (off | (chsz - 1)) + 1;
+    k = (size_t)(off >> RTX_PROJ_NCH_BITS);
+    if (k >= RTX_PROJ_CH_MAX || off + n + 1 > 0xFFFFFFFFull) return (uint64_t)-1;
+    if (!x->nch[k]) {
+        x->nch[k] = (char *)cc_arena_alloc(x->store, (size_t)chsz, 8);
+        if (!x->nch[k]) return (uint64_t)-1;
+    }
+    d = x->nch[k] + (off & (chsz - 1));
+    if (an) memcpy(d, a, an);
+    if (an && bn) d[an] = '/';
+    if (bn) memcpy(d + an + (an ? 1 : 0), b, bn);
+    d[n] = 0;
+    x->npool = off + n + 1;
+    return off;
+}
+
+static int rtx_idx_add_file(RtxProjIdx *x, uint32_t dir, const char *name, size_t n) {
+    size_t k = x->nf >> RTX_PROJ_FCH_BITS;
+    uint64_t off;
+    if (k >= RTX_PROJ_CH_MAX || x->nf >= 0xFFFFFFF0u) return -1;
+    if (!x->fch[k]) {
+        x->fch[k] = (RtxProjFile *)cc_arena_alloc(
+            x->store, sizeof(RtxProjFile) << RTX_PROJ_FCH_BITS, 8);
+        if (!x->fch[k]) return -1;
+    }
+    off = rtx_idx_put(x, name, n, NULL, 0);
+    if (off == (uint64_t)-1) return -1;
+    x->fch[k][x->nf & ((1u << RTX_PROJ_FCH_BITS) - 1)] =
+        (RtxProjFile){ .dir = dir, .name = (uint32_t)off };
+    x->nf++;
+    return 0;
+}
+
+/* -1 on failure, else the new dir id. */
+static long rtx_idx_add_dir(RtxProjIdx *x, uint32_t parent, const char *pp, size_t pn,
+                            const char *name, size_t n) {
+    size_t k = x->nd >> RTX_PROJ_DCH_BITS;
+    uint64_t off;
+    size_t len = pn + (pn && n ? 1 : 0) + n;
+    if (k >= RTX_PROJ_CH_MAX || len > 0xFFFF) return -1;
+    if (!x->dch[k]) {
+        x->dch[k] = (RtxProjDir *)cc_arena_alloc(
+            x->store, sizeof(RtxProjDir) << RTX_PROJ_DCH_BITS, 8);
+        if (!x->dch[k]) return -1;
+    }
+    off = rtx_idx_put(x, pp, pn, name, n);
+    if (off == (uint64_t)-1) return -1;
+    x->dch[k][x->nd & ((1u << RTX_PROJ_DCH_BITS) - 1)] =
+        (RtxProjDir){ .parent = parent, .path = (uint32_t)off, .path_n = (uint16_t)len };
+    return (long)x->nd++;
+}
+
+static size_t rtx_idx_path(const RtxProjIdx *x, size_t id, char *dst, size_t n,
+                           size_t *base) {
+    const RtxProjFile *f;
+    const RtxProjDir *d;
+    const char *nm;
+    size_t nn, dn, tot;
+    if (base) *base = 0;
+    if (!x || !dst || n == 0) return 0;
+    f = rtx_idx_file(x, id);
+    d = rtx_idx_dir(x, f->dir);
+    nm = rtx_idx_str(x, f->name);
+    nn = strlen(nm);
+    dn = d->path_n;
+    tot = dn + (dn ? 1 : 0) + nn;
+    if (tot + 1 > n) {
+        dst[0] = 0;
+        return 0;
+    }
+    if (dn) {
+        memcpy(dst, rtx_idx_str(x, d->path), dn);
+        dst[dn] = '/';
+        dn++;
+    }
+    memcpy(dst + dn, nm, nn);
+    dst[tot] = 0;
+    if (base) *base = dn;
+    return tot;
+}
+
+/* ================================================================= walk */
+
+static int rtx_pw_cancelled(const RtxProjWalk *wk) {
+    return atomic_load_explicit(&wk->cancel, memory_order_acquire) != 0;
+}
+
+static uint64_t rtx_pw_hash(uint64_t dev, uint64_t ino) {
+    uint64_t h = dev * 0x9E3779B97F4A7C15ull ^ (ino + 0x632BE59BD9B4E019ull);
+    h ^= h >> 31;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 29;
+    return h;
+}
+
+/* 1 = new, 0 = seen, -1 = OOM. Write stage only. */
+static int rtx_pw_visit(RtxProjWalk *wk, uint64_t dev, uint64_t ino) {
+    size_t i, mask;
+    if (wk->vis_n * 2 + 2 >= wk->vis_cap) {
+        size_t nc = wk->vis_cap ? wk->vis_cap * 2 : 1024;
+        uint64_t *nv = (uint64_t *)cc_arena_alloc(wk->arena, nc * 2 * sizeof(uint64_t), 8);
+        if (!nv) return -1;
+        memset(nv, 0, nc * 2 * sizeof(uint64_t));
+        for (i = 0; i < wk->vis_cap; i++) {
+            size_t k;
+            if (!wk->vis[2 * i + 1]) continue;
+            k = rtx_pw_hash(wk->vis[2 * i], wk->vis[2 * i + 1] - 1) & (nc - 1);
+            while (nv[2 * k + 1]) k = (k + 1) & (nc - 1);
+            nv[2 * k] = wk->vis[2 * i];
+            nv[2 * k + 1] = wk->vis[2 * i + 1];
+        }
+        wk->vis = nv;
+        wk->vis_cap = nc;
+    }
+    mask = wk->vis_cap - 1;
+    i = rtx_pw_hash(dev, ino) & mask;
+    while (wk->vis[2 * i + 1]) {
+        if (wk->vis[2 * i] == dev && wk->vis[2 * i + 1] == ino + 1) return 0;
+        i = (i + 1) & mask;
+    }
+    wk->vis[2 * i] = dev;
+    wk->vis[2 * i + 1] = ino + 1;
+    wk->vis_n++;
+    return 1;
+}
+
+/* Grows in place: indices stay put while a wave's stages run (the
+ * stage sets jhead = base + i + 1). Compaction is between waves. */
+static int rtx_pw_job_push(RtxProjWalk *wk, const RtxProjJob *job) {
+    if (wk->jlen >= wk->jcap) {
+        size_t c = wk->jcap ? wk->jcap * 2 : 256;
+        RtxProjJob *n = (RtxProjJob *)cc_arena_alloc(wk->arena, c * sizeof(RtxProjJob), 8);
+        if (!n) return -1;
+        if (wk->jlen) memcpy(n, wk->jobs, wk->jlen * sizeof(RtxProjJob));
+        wk->jobs = n;
+        wk->jcap = c;
+    }
+    wk->jobs[wk->jlen++] = *job;
+    return 0;
+}
+
+/* Between waves (no stage holds an index): slide the live jobs down. */
+static void rtx_pw_jobs_compact(RtxProjWalk *wk) {
+    size_t live;
+    if (!wk->jhead) return;
+    live = wk->jlen - wk->jhead;
+    if (live) memmove(wk->jobs, wk->jobs + wk->jhead, live * sizeof(RtxProjJob));
+    wk->jlen = live;
+    wk->jhead = 0;
+}
+
+/* Read an ignore file (up to 1 MiB) at dfd/name into set's rules on a. */
+static void rtx_pw_read_ign(int dfd, const char *name, RtxIgn *set, CCArena a) {
+    int fd = openat(dfd, name, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    char *buf;
+    size_t got = 0;
+    if (fd < 0) return;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size > (off_t)(1 << 20)) {
+        close(fd);
+        return;
+    }
+    buf = (char *)cc_arena_alloc(a, (size_t)st.st_size + 1, 1);
+    if (!buf) {
+        close(fd);
+        return;
+    }
+    while (got < (size_t)st.st_size) {
+        ssize_t r = read(fd, buf + got, (size_t)st.st_size - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    rtx_ign_parse(set, buf, got, a);
+}
+
+static int rtx_pw_lane_ent(RtxProjLane *L, const char *name, size_t n, uint8_t type) {
+    char *cp;
+    if (L->n >= L->cap) {
+        size_t c = L->cap ? L->cap * 2 : 64;
+        RtxProjEnt *ne = (RtxProjEnt *)cc_arena_alloc(L->a, c * sizeof(RtxProjEnt), 8);
+        if (!ne) return -1;
+        if (L->n) memcpy(ne, L->ents, L->n * sizeof(RtxProjEnt));
+        L->ents = ne;
+        L->cap = c;
+    }
+    cp = (char *)cc_arena_alloc(L->a, n + 1, 1);
+    if (!cp) return -1;
+    memcpy(cp, name, n);
+    cp[n] = 0;
+    L->ents[L->n] = (RtxProjEnt){ .name = cp, .n = (uint16_t)n, .type = type };
+    L->n++;
+    return 0;
+}
+
+/* Lane: read one directory, parse its ignore files, keep what the chain
+ * does not ignore. Reads only the job, the index entries below the
+ * published count, and the walk's constants. */
+static void rtx_pw_collect(const RtxProjWalk *wk, const RtxProjJob *job, RtxProjLane *L) {
+    const RtxProjIdx *x = wk->idx;
+    const RtxProjDir *d = rtx_idx_dir(x, job->dir);
+    const char *rel = rtx_idx_str(x, d->path);
+    size_t rn = d->path_n;
+    char abs[RTX_PROJ_PATH];
+    char child[RTX_PROJ_PATH];
+    const RtxIgn *chain;
+    DIR *dp;
+    int dfd;
+    size_t i, k;
+    int want_ign = !(wk->flags & RTX_PROJ_NO_IGNORE);
+    long slow = atomic_load(&g_proj_slow_us);
+    L->n = 0;
+    L->cap = 0;
+    L->ents = NULL;
+    L->denied = 0;
+    L->ignored = 0;
+    L->xdev = 0;
+    L->local = (RtxIgn){0};
+    if (L->a.base) L->a.reset();
+    else {
+        L->a = cc_arena_heap(kilobytes(64));
+        if (!L->a.base) return;
+    }
+    if (slow > 0) usleep((useconds_t)slow);
+    if (wk->root_n + 1 + rn + 1 > sizeof(abs)) return;
+    memcpy(abs, wk->root, wk->root_n);
+    if (rn) {
+        abs[wk->root_n] = '/';
+        memcpy(abs + wk->root_n + 1, rel, rn);
+        abs[wk->root_n + 1 + rn] = 0;
+    } else {
+        abs[wk->root_n] = 0;
+    }
+    dp = opendir(abs);
+    if (!dp) {
+        if (errno == EACCES || errno == EPERM) L->denied = 1;
+        return;
+    }
+    dfd = dirfd(dp);
+    for (;;) {
+        struct dirent *de = readdir(dp);
+        const char *nm;
+        size_t nn;
+        uint8_t ty = 0;
+        if (!de) break;
+        nm = de->d_name;
+        if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+        if (!strcmp(nm, ".git")) continue;
+        if ((wk->flags & RTX_PROJ_NO_HIDDEN) && nm[0] == '.') continue;
+        nn = strlen(nm);
+        if (nn > 255) continue;
+        ty = (uint8_t)de->d_type;
+        if (rtx_pw_lane_ent(L, nm, nn, ty) < 0) break;
+    }
+    /* Ignore files once every name is in: .gitignore, then .ignore
+     * (later rules win). */
+    if (want_ign) {
+        L->local.base = rel;
+        L->local.base_n = (uint16_t)rn;
+        L->local.up = job->ign;
+        for (i = 0; i < L->n; i++)
+            if (!strcmp(L->ents[i].name, ".gitignore"))
+                rtx_pw_read_ign(dfd, ".gitignore", &L->local, L->a);
+        for (i = 0; i < L->n; i++)
+            if (!strcmp(L->ents[i].name, ".ignore"))
+                rtx_pw_read_ign(dfd, ".ignore", &L->local, L->a);
+    }
+    chain = L->local.n ? &L->local : job->ign;
+    k = 0;
+    for (i = 0; i < L->n; i++) {
+        RtxProjEnt e = L->ents[i];
+        struct stat st;
+        int is_dir = -1;
+        size_t cn;
+        if (rtx_pw_cancelled(wk)) break;
+        if (e.type == DT_DIR) {
+            if (fstatat(dfd, e.name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
+            is_dir = S_ISDIR(st.st_mode) ? 1 : -1;
+        } else if (e.type == DT_REG) {
+            is_dir = 0;
+        } else if (e.type == DT_LNK || e.type == DT_UNKNOWN) {
+            if (fstatat(dfd, e.name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
+            if (S_ISLNK(st.st_mode)) {
+                if (fstatat(dfd, e.name, &st, 0) != 0) continue;
+                if (S_ISDIR(st.st_mode)) is_dir = (wk->flags & RTX_PROJ_FOLLOW) ? 1 : -1;
+                else if (S_ISREG(st.st_mode)) is_dir = 0;
+            } else if (S_ISDIR(st.st_mode)) {
+                is_dir = 1;
+            } else if (S_ISREG(st.st_mode)) {
+                is_dir = 0;
+            }
+        }
+        if (is_dir < 0) continue;
+        cn = rn + (rn ? 1 : 0) + e.n;
+        if (cn + 1 > sizeof(child) || wk->root_n + 1 + cn + 1 > RTX_PROJ_PATH) continue;
+        if (rn) {
+            memcpy(child, rel, rn);
+            child[rn] = '/';
+            memcpy(child + rn + 1, e.name, e.n);
+        } else {
+            memcpy(child, e.name, e.n);
+        }
+        child[cn] = 0;
+        if (want_ign && rtx_ign_match(chain, child, cn, is_dir)) {
+            L->ignored++;
+            continue;
+        }
+        if (is_dir && (uint64_t)st.st_dev != wk->root_dev) {
+            L->xdev++;
+            continue;
+        }
+        e.is_dir = (uint8_t)is_dir;
+        if (is_dir) {
+            e.dev = (uint64_t)st.st_dev;
+            e.ino = (uint64_t)st.st_ino;
+        }
+        L->ents[k++] = e;
+    }
+    L->n = k;
+    closedir(dp);
+}
+
+/* A level the children read after this lane's scratch resets. */
+static const RtxIgn *rtx_pw_keep_ign(RtxProjWalk *wk, const RtxIgn *src) {
+    RtxIgn *keep;
+    uint32_t r;
+    keep = (RtxIgn *)cc_arena_alloc(wk->arena, sizeof(RtxIgn), 8);
+    if (!keep) return NULL;
+    *keep = *src;
+    keep->rules = (RtxIgnRule *)cc_arena_alloc(wk->arena, src->n * sizeof(RtxIgnRule), 8);
+    if (!keep->rules) return NULL;
+    keep->cap = src->n;
+    for (r = 0; r < src->n; r++) {
+        char *cp = (char *)cc_arena_alloc(wk->arena, (size_t)src->rules[r].n + 1, 1);
+        if (!cp) return NULL;
+        memcpy(cp, src->rules[r].pat, src->rules[r].n);
+        cp[src->rules[r].n] = 0;
+        keep->rules[r] = src->rules[r];
+        keep->rules[r].pat = cp;
+    }
+    return keep;
+}
+
+/* Write stage (job order). 0 ok, -1 gave up (OOM / table full). */
+static int rtx_pw_stage(RtxProjWalk *wk, const RtxProjJob *job, RtxProjLane *L) {
+    RtxProjIdx *x = wk->idx;
+    const RtxIgn *chain = job->ign;
+    const RtxProjDir *d = rtx_idx_dir(x, job->dir);
+    const char *rel = rtx_idx_str(x, d->path);
+    size_t rn = d->path_n;
+    size_t i;
+    if (L->denied) x->n_denied++;
+    x->n_ignored += L->ignored;
+    x->n_xdev += L->xdev;
+    if (L->local.n) {
+        chain = rtx_pw_keep_ign(wk, &L->local);
+        if (!chain) return -1;
+    }
+    for (i = 0; i < L->n; i++) {
+        const RtxProjEnt *e = &L->ents[i];
+        if (e->is_dir) {
+            long id;
+            int v = rtx_pw_visit(wk, e->dev, e->ino);
+            RtxProjJob kid;
+            if (v < 0) return -1;
+            if (v == 0) {
+                x->n_loops++;
+                continue;
+            }
+            id = rtx_idx_add_dir(x, job->dir, rel, rn, e->name, e->n);
+            if (id < 0) continue; /* path too long for a dir record */
+            kid.dir = (uint32_t)id;
+            kid.depth = job->depth + 1;
+            kid.ign = chain;
+            if (rtx_pw_job_push(wk, &kid) < 0) return -1;
+        } else {
+            if (rtx_idx_add_file(x, job->dir, e->name, e->n) < 0) return -1;
+        }
+    }
+    atomic_store_explicit(&x->pub_nd, x->nd, memory_order_release);
+    atomic_store_explicit(&x->pub_nf, x->nf, memory_order_release);
+    atomic_fetch_add_explicit(&x->pub_dirs_walked, 1, memory_order_relaxed);
+    return 0;
+}
+
+static void rtx_pw_finish_flags(RtxProjWalk *wk) {
+    RtxProjIdx *x = wk->idx;
+    x->t_ms = rtx_proj_now_ms();
+    atomic_store_explicit(&x->pub_nd, x->nd, memory_order_release);
+    atomic_store_explicit(&x->pub_nf, x->nf, memory_order_release);
+    atomic_store_explicit(&x->pub_done, 1, memory_order_release);
+    atomic_store_explicit(&wk->done, 1, memory_order_release);
+}
+
+static int rtx_pw_run(RtxProjWalk *wk) {
+    @errhandler(CCError e) {
+        (void)e;
+        wk->idx->truncated = 1;
+        rtx_pw_finish_flags(wk);
+        return 0;
+    }
+    int lanes = rtx_proj_lanes();
+    while (!rtx_pw_cancelled(wk) && !wk->idx->truncated && wk->jhead < wk->jlen) {
+        size_t base;
+        rtx_pw_jobs_compact(wk);
+        base = wk->jhead;
+        size_t remain = wk->jlen - base;
+        int n = remain > (size_t)RTX_PROJ_WAVE ? RTX_PROJ_WAVE : (int)remain;
+        int i;
+        bool fin;
+        RtxProjJob *wave = wk->wave;
+        RtxProjLane *lane = wk->lane;
+        memcpy(wave, wk->jobs + base, (size_t)n * sizeof(RtxProjJob));
+        {
+            CCArena ta = cc_arena_heap(kilobytes(64)) @destroy;
+            /* Twice the lanes in flight: a big directory's stage does not
+             * idle the others. A job is one directory (~40 µs), so the
+             * hand-off is not what bounds the walk; the wave barrier and
+             * the depth were. */
+            CCTurnstile ts@(lanes * 2, 1, ta) !> @destroy;
+            fin = @parallel wait (ts) for (i in 0..n) {
+                RtxProjJob job;
+                RtxProjLane *L;
+                job = wave[i];
+                L = &lane[i];
+                if (!rtx_pw_cancelled(wk) && !wk->idx->truncated)
+                    rtx_pw_collect(wk, &job, L);
+                @stage (ts, 0, i) {
+                    while (wk->h.paused && !rtx_pw_cancelled(wk))
+                        cc_yield();
+                    if (!rtx_pw_cancelled(wk) && !wk->idx->truncated) {
+                        if (rtx_pw_stage(wk, &job, L) < 0) wk->idx->truncated = 1;
+                        wk->jhead = base + (size_t)i + 1;
+                    }
+                }
+                if (rtx_pw_cancelled(wk) || wk->idx->truncated)
+                    break;
+            } !>.wait()!>;
+            (void)fin;
+        }
+    }
+    rtx_pw_finish_flags(wk);
+    return rtx_pw_cancelled(wk) ? 0 : 1;
+}
+
+static void rtx_pw_free(RtxProjWalk *wk) {
+    int i;
+    if (!wk) return;
+    for (i = 0; i < RTX_PROJ_WAVE; i++)
+        if (wk->lane[i].a.base) wk->lane[i].a.destroy();
+    if (wk->arena.base) wk->arena.destroy();
+    free(wk);
+}
+
+/* Cancel + join (the walk is freed). */
+static void rtx_pw_drop(RtxProjIdx *x) {
+    RtxProjWalk *wk;
+    if (!x || !x->wk) return;
+    wk = (RtxProjWalk *)x->wk;
+    atomic_store_explicit(&wk->cancel, 1, memory_order_release);
+    if (wk->h.live()) {
+        if (wk->h.paused())
+            wk->h.resume() !>(e) { (void)e; };
+        wk->h.invalidate();
+    }
+    atomic_store_explicit(&x->pub_done, 1, memory_order_release);
+    rtx_pw_free(wk);
+    x->wk = NULL;
+}
+
+/* Join a finished arm; free the walk. 1 = joined now. */
+static int rtx_pw_join_done(RtxProjIdx *x) {
+    RtxProjWalk *wk;
+    if (!x || !x->wk) return 0;
+    wk = (RtxProjWalk *)x->wk;
+    if (!atomic_load_explicit(&wk->done, memory_order_acquire)) return 0;
+    if (wk->h.live()) {
+        if (wk->h.paused())
+            wk->h.resume() !>(e) { (void)e; };
+        wk->h.wait() !>(e) { (void)e; };
+    }
+    rtx_pw_free(wk);
+    x->wk = NULL;
+    return 1;
+}
+
+static void rtx_pw_exclude(RtxProjWalk *wk) {
+    char p[RTX_PROJ_PATH + 64];
+    char gd[RTX_PROJ_PATH];
+    struct stat st;
+    int dfd;
+    snprintf(p, sizeof p, "%s/.git", wk->root);
+    if (lstat(p, &st) != 0) return;
+    if (S_ISREG(st.st_mode)) {
+        /* worktree / submodule: "gitdir: PATH" */
+        FILE *f = fopen(p, "r");
+        size_t n;
+        if (!f) return;
+        n = fread(gd, 1, sizeof gd - 1, f);
+        fclose(f);
+        gd[n] = 0;
+        while (n && (gd[n - 1] == '\n' || gd[n - 1] == '\r' || gd[n - 1] == ' '))
+            gd[--n] = 0;
+        if (strncmp(gd, "gitdir: ", 8) != 0) return;
+        if (gd[8] == '/') snprintf(p, sizeof p, "%s/info", gd + 8);
+        else snprintf(p, sizeof p, "%s/%s/info", wk->root, gd + 8);
+    } else {
+        snprintf(p, sizeof p, "%s/.git/info", wk->root);
+    }
+    dfd = open(p, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return;
+    wk->top.base = "";
+    wk->top.base_n = 0;
+    rtx_pw_read_ign(dfd, "exclude", &wk->top, wk->arena);
+    close(dfd);
+}
+
+static void !>(CCError) rtx_pw_kick(RtxProjIdx *x, const char *root, size_t rn,
+                                    unsigned flags) {
+    RtxProjWalk *wk;
+    RtxProjWalk *scan;
+    RtxProjJob job;
+    struct stat st;
+    int noop = 0;
+    if (!x || !root) return cc_err(CC_ERR_INVALID_ARG, "proj walk");
+    if (rn + 1 > RTX_PROJ_PATH) return cc_err(CC_ERR_INVALID_ARG, "proj root too long");
+    if (stat(root, &st) != 0 || !S_ISDIR(st.st_mode))
+        return cc_err(CC_ERR_INVALID_ARG, "project root is not a directory");
+    wk = (RtxProjWalk *)calloc(1, sizeof(RtxProjWalk));
+    if (!wk) return cc_err(CC_ERR_OUT_OF_MEMORY, "proj walk");
+    wk->arena = cc_arena_heap(kilobytes(64));
+    if (!wk->arena.base) {
+        free(wk);
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "proj walk");
+    }
+    wk->idx = x;
+    memcpy(wk->root, root, rn);
+    wk->root[rn] = 0;
+    wk->root_n = rn;
+    wk->flags = flags;
+    wk->root_dev = (uint64_t)st.st_dev;
+    x->wk = wk;
+    rtx_par_pool_up();
+    x->t0_ms = rtx_proj_now_ms();
+    if (rtx_pw_visit(wk, (uint64_t)st.st_dev, (uint64_t)st.st_ino) < 0 ||
+        rtx_idx_add_dir(x, 0, "", 0, "", 0) != 0) {
+        rtx_pw_free(wk);
+        x->wk = NULL;
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "proj walk");
+    }
+    atomic_store_explicit(&x->pub_nd, x->nd, memory_order_release);
+    if (!(flags & RTX_PROJ_NO_IGNORE)) rtx_pw_exclude(wk);
+    job.dir = 0;
+    job.depth = 0;
+    job.ign = wk->top.n ? &wk->top : NULL;
+    if (rtx_pw_job_push(wk, &job) < 0) {
+        rtx_pw_free(wk);
+        x->wk = NULL;
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "proj walk");
+    }
+    if (rtx_parallel_inline()) {
+        rtx_pw_run(wk);
+        return cc_ok();
+    }
+    scan = wk;
+    wk->h = @parallel {
+        @serial { noop = 0; }
+        rtx_pw_run(scan);
+    } !>;
+    return cc_ok();
+}
+
+static RtxProjIdx *rtx_idx_new(void) {
+    RtxProjIdx *x = (RtxProjIdx *)calloc(1, sizeof(RtxProjIdx));
+    if (!x) return NULL;
+    x->store = cc_arena_heap(megabytes(1));
+    if (!x->store.base) {
+        free(x);
+        return NULL;
+    }
+    return x;
+}
+
+static void rtx_idx_free(RtxProjIdx *x) {
+    if (!x) return;
+    rtx_pw_drop(x);
+    if (x->store.base) x->store.destroy();
+    free(x);
+}
+
+static int rtx_idx_walking(const RtxProjIdx *x) {
+    return x && !atomic_load_explicit(&x->pub_done, memory_order_acquire);
+}
+
+static size_t rtx_idx_nf(const RtxProjIdx *x) {
+    return x ? atomic_load_explicit(&x->pub_nf, memory_order_acquire) : 0;
+}
+
+/* ============================================================== project */
+
+int rtx_proj_root_of(const char *start, char *dst, size_t n) {
+    char abs[PATH_MAX];
+    char probe[PATH_MAX + 8];
+    struct stat st;
+    size_t len;
+    if (!dst || n < 2) return -1;
+    dst[0] = 0;
+    if (!realpath(start && start[0] ? start : ".", abs)) return -1;
+    if (stat(abs, &st) == 0 && !S_ISDIR(st.st_mode)) {
+        char *sl = strrchr(abs, '/');
+        if (sl && sl != abs) *sl = 0;
+        else if (sl) abs[1] = 0;
+    }
+    len = strlen(abs);
+    for (;;) {
+        snprintf(probe, sizeof probe, "%s%s.git", abs, (len > 1) ? "/" : "");
+        if (lstat(probe, &st) == 0) {
+            snprintf(dst, n, "%s", abs);
+            return 1;
+        }
+        if (len <= 1) break;
+        while (len > 1 && abs[len - 1] != '/') len--;
+        if (len > 1) len--;
+        abs[len] = 0;
+    }
+    if (!realpath(start && start[0] ? start : ".", abs)) return -1;
+    if (stat(abs, &st) == 0 && !S_ISDIR(st.st_mode)) {
+        char *sl = strrchr(abs, '/');
+        if (sl && sl != abs) *sl = 0;
+        else if (sl) abs[1] = 0;
+    }
+    snprintf(dst, n, "%s", abs);
+    return 0;
+}
+
+static void rtx_ps_drop_arm(RtxProj *p);
+static void rtx_ps_free(RtxProj *p);
+static void !>(CCError) rtx_ps_restart(RtxProj *p);
+static void rtx_pick_free(RtxProjPick *k);
+
+void !>(CCError) rtx_proj_open(RtxProj *p, char[:0] root, unsigned flags) {
+    char abs[PATH_MAX];
+    size_t n;
+    if (!p || !root.ptr || !root.len) return cc_err(CC_ERR_INVALID_ARG, "project root");
+    rtx_proj_close(p);
+    if (!realpath(root.ptr, abs)) return cc_err(CC_ERR_NOT_FOUND, "project root");
+    n = strlen(abs);
+    while (n > 1 && abs[n - 1] == '/') abs[--n] = 0;
+    if (n + 1 > sizeof p->root) return cc_err(CC_ERR_INVALID_ARG, "project root too long");
+    memcpy(p->root, abs, n + 1);
+    p->root_n = n;
+    p->flags = flags;
+    p->cur = rtx_idx_new();
+    if (!p->cur) return cc_err(CC_ERR_OUT_OF_MEMORY, "project index");
+    p->gen++;
+    rtx_pw_kick(p->cur, p->root, p->root_n, flags)
+        !>(e) {
+        rtx_idx_free(p->cur);
+        p->cur = NULL;
+        return cc_err(e);
+    };
+    return cc_ok();
+}
+
+int rtx_proj_is_open(const RtxProj *p) {
+    return p && p->cur;
+}
+
+void rtx_proj_close(RtxProj *p) {
+    size_t i;
+    if (!p) return;
+    rtx_ps_free(p);
+    if (p->next) rtx_idx_free(p->next);
+    if (p->cur) rtx_idx_free(p->cur);
+    p->next = NULL;
+    p->cur = NULL;
+    rtx_pick_free(&p->pick);
+    if (p->mru_a.base) p->mru_a.destroy();
+    for (i = 0; i < RTX_PROJ_MRU_MAX; i++) p->mru[i] = NULL;
+    p->nmru = 0;
+    p->mru_file[0] = 0;
+}
+
+int rtx_proj_walking(const RtxProj *p) {
+    return p && (rtx_idx_walking(p->cur) || (p->next != NULL));
+}
+
+size_t rtx_proj_nfiles(const RtxProj *p) {
+    return p ? rtx_idx_nf(p->cur) : 0;
+}
+
+size_t rtx_proj_path(const RtxProj *p, uint32_t id, char *dst, size_t n) {
+    if (!p || !p->cur || id >= rtx_idx_nf(p->cur)) {
+        if (dst && n) dst[0] = 0;
+        return 0;
+    }
+    return rtx_idx_path(p->cur, id, dst, n, NULL);
+}
+
+size_t rtx_proj_abs(const RtxProj *p, const char *rel, char *dst, size_t n) {
+    int w;
+    if (!p || !rel || !dst || n == 0) return 0;
+    w = snprintf(dst, n, "%s/%s", p->root, rel);
+    if (w < 0 || (size_t)w >= n) {
+        dst[0] = 0;
+        return 0;
+    }
+    return (size_t)w;
+}
+
+size_t rtx_proj_rel_of(const RtxProj *p, const char *abs, char *dst, size_t n) {
+    char real[PATH_MAX];
+    size_t rn;
+    if (!p || !abs || !dst || n == 0) return 0;
+    dst[0] = 0;
+    if (!realpath(abs, real)) return 0;
+    rn = p->root_n;
+    if (rn == 1 && p->root[0] == '/') rn = 0; /* root "/" */
+    if (strncmp(real, p->root, rn) != 0 || real[rn] != '/') return 0;
+    snprintf(dst, n, "%s", real + rn + 1);
+    return strlen(dst);
+}
+
+void rtx_proj_pause(RtxProj *p) {
+    RtxProjIdx *xs[2];
+    int i;
+    if (!p) return;
+    xs[0] = p->cur;
+    xs[1] = p->next;
+    for (i = 0; i < 2; i++) {
+        RtxProjWalk *wk = xs[i] ? (RtxProjWalk *)xs[i]->wk : NULL;
+        if (wk && wk->h.live() && !atomic_load(&wk->done))
+            wk->h.pause() !>(e) { (void)e; };
+    }
+}
+
+void rtx_proj_resume(RtxProj *p) {
+    RtxProjIdx *xs[2];
+    int i;
+    if (!p) return;
+    xs[0] = p->cur;
+    xs[1] = p->next;
+    for (i = 0; i < 2; i++) {
+        RtxProjWalk *wk = xs[i] ? (RtxProjWalk *)xs[i]->wk : NULL;
+        if (wk && wk->h.live() && wk->h.paused())
+            wk->h.resume() !>(e) { (void)e; };
+    }
+}
+
+void !>(CCError) rtx_proj_rewalk(RtxProj *p) {
+    if (!p || !p->cur) return cc_err(CC_ERR_INVALID_ARG, "no project");
+    if (p->next) return cc_ok(); /* one is running */
+    if (rtx_idx_walking(p->cur)) {
+        /* The first walk is still going: start over. */
+        rtx_ps_drop_arm(p);
+        rtx_idx_free(p->cur);
+        p->cur = rtx_idx_new();
+        if (!p->cur) return cc_err(CC_ERR_OUT_OF_MEMORY, "project index");
+        p->gen++;
+        rtx_pw_kick(p->cur, p->root, p->root_n, p->flags)
+            !>(e) { return cc_err(e); };
+        return rtx_ps_restart(p);
+    }
+    p->next = rtx_idx_new();
+    if (!p->next) return cc_err(CC_ERR_OUT_OF_MEMORY, "project index");
+    rtx_pw_kick(p->next, p->root, p->root_n, p->flags)
+        !>(e) {
+        rtx_idx_free(p->next);
+        p->next = NULL;
+        return cc_err(e);
+    };
+    return cc_ok();
+}
+
+static int !>(CCError) rtx_ps_pump(RtxProj *p);
+
+int !>(CCError) rtx_proj_pump(RtxProj *p) {
+    int busy = 0;
+    if (!p || !p->cur) return cc_ok(0);
+    rtx_pw_join_done(p->cur);
+    if (p->next) {
+        rtx_pw_join_done(p->next);
+        if (!p->next->wk && !rtx_idx_walking(p->next)) {
+            /* Re-walk done: the search reads the old index; join it first. */
+            rtx_ps_drop_arm(p);
+            rtx_idx_free(p->cur);
+            p->cur = p->next;
+            p->next = NULL;
+            p->gen++;
+            rtx_ps_restart(p) !>(e) { return cc_err(e); };
+        }
+    }
+    if (rtx_ps_pump(p) !>(e) { return cc_err(e); })
+        busy = 1;
+    if (rtx_proj_walking(p)) busy = 1;
+    return cc_ok(busy);
+}
+
+void !>(CCError) rtx_proj_finish(RtxProj *p) {
+    RtxProjIdx *xs[2];
+    int i;
+    if (!p || !p->cur) return cc_ok();
+    xs[0] = p->cur;
+    xs[1] = p->next;
+    for (i = 0; i < 2; i++) {
+        RtxProjWalk *wk = xs[i] ? (RtxProjWalk *)xs[i]->wk : NULL;
+        if (!wk) continue;
+        if (wk->h.live()) {
+            if (wk->h.paused())
+                wk->h.resume() !>(e) { return cc_err(CC_ERR_IO, cc_io_error_str(e)); };
+            wk->h.wait() !>(e) { return cc_err(e); };
+        }
+    }
+    rtx_proj_pump(p) !>(e) { return cc_err(e); };
+    return cc_ok();
+}
+
+/* ================================================================== MRU */
+
+static uint64_t rtx_proj_fnv(const char *s, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void rtx_mru_put(RtxProj *p, const char *rel, size_t n, int front) {
+    char *cp;
+    size_t i;
+    if (!p->mru_a.base) {
+        p->mru_a = cc_arena_heap(kilobytes(16));
+        if (!p->mru_a.base) return;
+    }
+    for (i = 0; i < p->nmru; i++) {
+        if (strlen(p->mru[i]) == n && !memcmp(p->mru[i], rel, n)) {
+            if (front && i) {
+                char *hit = p->mru[i];
+                memmove(&p->mru[1], &p->mru[0], i * sizeof(char *));
+                p->mru[0] = hit;
+            }
+            return;
+        }
+    }
+    cp = (char *)cc_arena_alloc(p->mru_a, n + 1, 1);
+    if (!cp) return;
+    memcpy(cp, rel, n);
+    cp[n] = 0;
+    if (front) {
+        size_t keep = p->nmru < RTX_PROJ_MRU_MAX ? p->nmru : RTX_PROJ_MRU_MAX - 1;
+        memmove(&p->mru[1], &p->mru[0], keep * sizeof(char *));
+        p->mru[0] = cp;
+        p->nmru = keep + 1;
+    } else if (p->nmru < RTX_PROJ_MRU_MAX) {
+        p->mru[p->nmru++] = cp;
+    }
+}
+
+void rtx_proj_mru_load(RtxProj *p, const char *dir) {
+    FILE *f;
+    char line[RTX_PROJ_PATH];
+    if (!p || !dir || !dir[0] || !p->cur) return;
+    snprintf(p->mru_file, sizeof p->mru_file, "%s/mru-%016llx", dir,
+             (unsigned long long)rtx_proj_fnv(p->root, strlen(p->root)));
+    f = fopen(p->mru_file, "r");
+    if (!f) return;
+    if (!fgets(line, sizeof line, f) || strncmp(line, "RTXM 1", 6) != 0) {
+        fclose(f);
+        return;
+    }
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        if (n) rtx_mru_put(p, line, n, 0);
+    }
+    fclose(f);
+}
+
+static void rtx_mru_save(RtxProj *p) {
+    char tmp[RTX_PROJ_PATH + 16];
+    FILE *f;
+    size_t i;
+    if (!p->mru_file[0]) return;
+    snprintf(tmp, sizeof tmp, "%s.tmp", p->mru_file);
+    f = fopen(tmp, "w");
+    if (!f) return;
+    fputs("RTXM 1\n", f);
+    for (i = 0; i < p->nmru; i++) fprintf(f, "%s\n", p->mru[i]);
+    if (fclose(f) != 0) {
+        unlink(tmp);
+        return;
+    }
+    if (rename(tmp, p->mru_file) != 0) unlink(tmp);
+}
+
+void rtx_proj_mru_touch(RtxProj *p, const char *rel) {
+    if (!p || !rel || !rel[0]) return;
+    rtx_mru_put(p, rel, strlen(rel), 1);
+    rtx_mru_save(p);
+}
+
+int rtx_proj_mru_rank(const RtxProj *p, const char *rel, size_t n) {
+    size_t i;
+    if (!p || !rel) return -1;
+    for (i = 0; i < p->nmru; i++)
+        if (strlen(p->mru[i]) == n && !memcmp(p->mru[i], rel, n)) return (int)i;
+    return -1;
+}
+
+/* ================================================================= pick */
+
+/* Better first: score, then shorter path, then lower id. */
+static int rtx_hit_better(const RtxProjHit *a, const RtxProjHit *b) {
+    if (a->score != b->score) return a->score > b->score;
+    if (a->len != b->len) return a->len < b->len;
+    return a->id < b->id;
+}
+
+static int rtx_hit_cmp(const void *pa, const void *pb) {
+    const RtxProjHit *a = (const RtxProjHit *)pa, *b = (const RtxProjHit *)pb;
+    if (rtx_hit_better(a, b)) return -1;
+    if (rtx_hit_better(b, a)) return 1;
+    return 0;
+}
+
+/* Min-heap of the K best (root = the worst kept). */
+static void rtx_heap_push(RtxProjHit *h, size_t *n, size_t k, RtxProjHit v) {
+    size_t i, c;
+    if (*n < k) {
+        i = (*n)++;
+        while (i > 0) {
+            size_t pa = (i - 1) / 2;
+            if (!rtx_hit_better(&h[pa], &v)) break;
+            h[i] = h[pa];
+            i = pa;
+        }
+        h[i] = v;
+        return;
+    }
+    if (!rtx_hit_better(&v, &h[0])) return;
+    i = 0;
+    for (;;) {
+        c = 2 * i + 1;
+        if (c >= *n) break;
+        if (c + 1 < *n && rtx_hit_better(&h[c], &h[c + 1])) c++;
+        if (!rtx_hit_better(&v, &h[c])) break;
+        h[i] = h[c];
+        i = c;
+    }
+    h[i] = v;
+}
+
+static void rtx_pick_shard(RtxPickShard *sh) {
+    char path[RTX_PROJ_PATH];
+    size_t k;
+    size_t nmru = sh->p ? sh->p->nmru : 0;
+    for (k = sh->lo; k < sh->hi; k++) {
+        uint32_t id = sh->ids ? sh->ids[k] : (uint32_t)k;
+        size_t base = 0;
+        size_t n = rtx_idx_path(sh->x, id, path, sizeof path, &base);
+        int sc;
+        RtxProjHit hv;
+        if (!n) continue;
+        sc = rtx_fuzzy_path(sh->q, sh->qn, path, n, base, NULL);
+        if (sc == RTX_FUZZY_NONE) continue;
+        sh->cand[sh->ncand++] = id;
+        if (nmru) {
+            uint64_t hh = rtx_proj_fnv(path, n);
+            size_t r;
+            for (r = 0; r < nmru; r++) {
+                if (sh->mru_h[r] == hh) {
+                    /* Recent files float up: a strong nudge, not a
+                     * trump card over a much better match. */
+                    sc += 64 - (int)(r < 48 ? r : 48);
+                    break;
+                }
+            }
+        }
+        hv.id = id;
+        hv.score = sc;
+        hv.len = (uint32_t)n;
+        rtx_heap_push(sh->heap, &sh->nheap, RTX_PROJ_PICK_K, hv);
+    }
+}
+
+static int rtx_pick_run(RtxPickShard *sh, int ns) {
+    int s;
+    if (ns <= 1 || rtx_parallel_inline()) {
+        for (s = 0; s < ns; s++) rtx_pick_shard(&sh[s]);
+        return 0;
+    }
+    @parallel for (s in 0..ns) {
+        rtx_pick_shard(&sh[s]);
+    } !>.wait()!>;
+    return 0;
+}
+
+static void rtx_pick_free(RtxProjPick *k) {
+    if (!k) return;
+    if (k->a.base) k->a.destroy();
+    if (k->b.base) k->b.destroy();
+    *k = (RtxProjPick){0};
+}
+
+static int rtx_pick_arenas(RtxProjPick *k) {
+    if (!k->a.base) k->a = cc_arena_heap(kilobytes(256));
+    if (!k->b.base) k->b = cc_arena_heap(kilobytes(256));
+    return k->a.base && k->b.base;
+}
+
+/* Score ids (a list, or the range lo..hi) into the pick's top list and
+ * append matches to cand. `keep`: merge with the existing top. */
+static int !>(CCError) rtx_pick_score(RtxProj *p, const uint32_t *ids, size_t lo,
+                                      size_t hi, int keep) {
+    RtxProjPick *k = &p->pick;
+    size_t total = hi - lo;
+    int ns, s;
+    RtxPickShard *sh;
+    uint32_t *cand;
+    RtxProjHit *all;
+    size_t nall = 0, r;
+    CCArena tmp = cc_arena_heap(kilobytes(64)) @destroy;
+    long t0 = rtx_proj_now_us();
+    if (!tmp.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "pick");
+    ns = (int)(total / RTX_PICK_SHARD_MIN);
+    if (ns < 1) ns = 1;
+    if (ns > RTX_PICK_SHARDS) ns = RTX_PICK_SHARDS;
+    if (ns > 1 && ns < rtx_proj_lanes()) ns = rtx_proj_lanes() < RTX_PICK_SHARDS ? rtx_proj_lanes() : ns;
+    sh = (RtxPickShard *)cc_arena_alloc(tmp, (size_t)ns * sizeof(RtxPickShard), 8);
+    /* New matches go after the kept ones on k->a. */
+    cand = (uint32_t *)cc_arena_alloc(k->a, (k->ncand + total + 1) * sizeof(uint32_t), 8);
+    if (!sh || !cand) return cc_err(CC_ERR_OUT_OF_MEMORY, "pick");
+    if (k->ncand) memcpy(cand, k->cand, k->ncand * sizeof(uint32_t));
+    for (s = 0; s < ns; s++) {
+        size_t a = lo + total * (size_t)s / (size_t)ns;
+        size_t b = lo + total * (size_t)(s + 1) / (size_t)ns;
+        RtxPickShard *h = &sh[s];
+        size_t m;
+        h->x = p->cur;
+        h->p = p;
+        h->q = k->q;
+        h->qn = k->qn;
+        h->ids = ids;
+        h->lo = a;
+        h->hi = b;
+        h->cand = cand + k->ncand + (a - lo);
+        h->ncand = 0;
+        h->nheap = 0;
+        for (m = 0; m < p->nmru; m++) h->mru_h[m] = rtx_proj_fnv(p->mru[m], strlen(p->mru[m]));
+    }
+    if (rtx_pick_run(sh, ns) < 0) return cc_err(CC_ERR_IO, "pick shards");
+    /* Compact the per-shard candidate runs. */
+    {
+        size_t w = k->ncand;
+        for (s = 0; s < ns; s++) {
+            if (cand + w != sh[s].cand && sh[s].ncand)
+                memmove(cand + w, sh[s].cand, sh[s].ncand * sizeof(uint32_t));
+            w += sh[s].ncand;
+        }
+        k->cand = cand;
+        k->ncand = w;
+    }
+    all = (RtxProjHit *)cc_arena_alloc(
+        tmp, ((size_t)ns * RTX_PROJ_PICK_K + (keep ? k->ntop : 0) + 1) * sizeof(RtxProjHit), 8);
+    if (!all) return cc_err(CC_ERR_OUT_OF_MEMORY, "pick");
+    if (keep && k->ntop) {
+        memcpy(all, k->top, k->ntop * sizeof(RtxProjHit));
+        nall = k->ntop;
+    }
+    for (s = 0; s < ns; s++) {
+        memcpy(all + nall, sh[s].heap, sh[s].nheap * sizeof(RtxProjHit));
+        nall += sh[s].nheap;
+    }
+    qsort(all, nall, sizeof(RtxProjHit), rtx_hit_cmp);
+    if (nall > RTX_PROJ_PICK_K) nall = RTX_PROJ_PICK_K;
+    if (!k->top) {
+        k->top = (RtxProjHit *)cc_arena_alloc(k->a, RTX_PROJ_PICK_K * sizeof(RtxProjHit), 8);
+        if (!k->top) return cc_err(CC_ERR_OUT_OF_MEMORY, "pick");
+    }
+    for (r = 0; r < nall; r++) k->top[r] = all[r];
+    k->ntop = nall;
+    k->shards_last = (size_t)ns;
+    k->score_us = rtx_proj_now_us() - t0;
+    return cc_ok(0);
+}
+
+/* Empty query: most recent first, then index order (shorter first). */
+static void !>(CCError) rtx_pick_empty(RtxProj *p) {
+    RtxProjPick *k = &p->pick;
+    size_t nf = rtx_idx_nf(p->cur);
+    CCArena tmp = cc_arena_heap(kilobytes(64)) @destroy;
+    RtxProjHit *h = (RtxProjHit *)cc_arena_alloc(tmp, RTX_PROJ_PICK_K * sizeof(RtxProjHit), 8);
+    size_t nh = 0, id;
+    char path[RTX_PROJ_PATH];
+    if (!h) return cc_err(CC_ERR_OUT_OF_MEMORY, "pick");
+    if (!k->top) {
+        k->top = (RtxProjHit *)cc_arena_alloc(k->a, RTX_PROJ_PICK_K * sizeof(RtxProjHit), 8);
+        if (!k->top) return cc_err(CC_ERR_OUT_OF_MEMORY, "pick");
+    }
+    for (id = 0; id < nf; id++) {
+        size_t n = rtx_idx_path(p->cur, id, path, sizeof path, NULL);
+        int r;
+        RtxProjHit v;
+        if (!n) continue;
+        r = p->nmru ? rtx_proj_mru_rank(p, path, n) : -1;
+        v.id = (uint32_t)id;
+        v.score = r >= 0 ? 1000 - r : 0;
+        v.len = (uint32_t)n;
+        /* Without recency, keep index order: the id breaks ties. */
+        if (r < 0) v.len = 0;
+        rtx_heap_push(h, &nh, RTX_PROJ_PICK_K, v);
+    }
+    qsort(h, nh, sizeof(RtxProjHit), rtx_hit_cmp);
+    memcpy(k->top, h, nh * sizeof(RtxProjHit));
+    k->ntop = nh;
+    k->scored = nf;
+    k->cand = NULL;
+    k->ncand = 0;
+    k->cand_ok = 0;
+    return cc_ok();
+}
+
+/* force: rescore from scratch (the index was replaced). */
+static int !>(CCError) rtx_pick_query(RtxProj *p, const char *qp, size_t qlen, int force) {
+    RtxProjPick *k = &p->pick;
+    int extend;
+    size_t nf;
+    CCArena t;
+    char q[RTX_PROJ_QMAX];
+    if (!rtx_pick_arenas(k)) return cc_err(CC_ERR_OUT_OF_MEMORY, "pick");
+    if (qlen > sizeof q - 1) qlen = sizeof q - 1;
+    if (qlen) memcpy(q, qp, qlen);
+    extend = !force && k->cand_ok && k->gen == p->gen && qlen > k->qn && k->qn > 0 &&
+             memcmp(q, k->q, k->qn) == 0;
+    if (!force && k->gen == p->gen && k->top && qlen == k->qn &&
+        (qlen == 0 || memcmp(q, k->q, qlen) == 0))
+        return rtx_proj_pick_update(p);
+    /* Ping-pong: the last query's candidates stay readable on b. */
+    t = k->a;
+    k->a = k->b;
+    k->b = t;
+    k->a.reset();
+    k->top = NULL;
+    k->ntop = 0;
+    if (qlen) memcpy(k->q, q, qlen);
+    k->q[qlen] = 0;
+    k->qn = qlen;
+    k->gen = p->gen;
+    if (!p->cur) {
+        k->scored = 0;
+        k->cand = NULL;
+        k->ncand = 0;
+        k->cand_ok = 0;
+        return cc_ok(1);
+    }
+    nf = rtx_idx_nf(p->cur);
+    if (k->qn == 0) {
+        rtx_pick_empty(p) !>(e) { return cc_err(e); };
+        return cc_ok(1);
+    }
+    if (extend) {
+        const uint32_t *old = k->cand;
+        size_t nold = k->ncand;
+        size_t from = k->scored;
+        k->cand = NULL;
+        k->ncand = 0;
+        rtx_pick_score(p, old, 0, nold, 0) !>(e) { return cc_err(e); };
+        if (nf > from)
+            rtx_pick_score(p, NULL, from, nf, 1) !>(e) { return cc_err(e); };
+    } else {
+        k->cand = NULL;
+        k->ncand = 0;
+        rtx_pick_score(p, NULL, 0, nf, 0) !>(e) { return cc_err(e); };
+    }
+    k->scored = nf;
+    k->cand_ok = 1;
+    return cc_ok(1);
+}
+
+int !>(CCError) rtx_proj_pick_set(RtxProj *p, char[:] q) {
+    if (!p) return cc_err(CC_ERR_INVALID_ARG, "pick");
+    return rtx_pick_query(p, q.ptr, q.len, 0);
+}
+
+int !>(CCError) rtx_proj_pick_update(RtxProj *p) {
+    RtxProjPick *k;
+    size_t nf;
+    if (!p || !p->cur) return cc_ok(0);
+    k = &p->pick;
+    if (k->gen != p->gen) {
+        char q[RTX_PROJ_QMAX];
+        size_t qn = k->qn;
+        memcpy(q, k->q, qn);
+        return rtx_pick_query(p, q, qn, 1);
+    }
+    nf = rtx_idx_nf(p->cur);
+    if (nf <= k->scored) return cc_ok(0);
+    if (k->qn == 0) {
+        rtx_pick_empty(p) !>(e) { return cc_err(e); };
+        return cc_ok(1);
+    }
+    rtx_pick_score(p, NULL, k->scored, nf, 1) !>(e) { return cc_err(e); };
+    k->scored = nf;
+    return cc_ok(1);
+}
+
+size_t rtx_proj_pick_n(const RtxProj *p) {
+    return p ? p->pick.ntop : 0;
+}
+
+const RtxProjHit *rtx_proj_pick_at(const RtxProj *p, size_t i) {
+    if (!p || i >= p->pick.ntop || !p->pick.top) return NULL;
+    return &p->pick.top[i];
+}
+
+/* =============================================================== search */
+
+static int rtx_ps_cancelled(const RtxProjSearch *ps) {
+    return atomic_load_explicit(&ps->cancel, memory_order_acquire) != 0;
+}
+
+static size_t rtx_ps_next_cp(const char *t, size_t n, size_t p) {
+    p++;
+    while (p < n && ((unsigned char)t[p] & 0xC0) == 0x80) p++;
+    return p;
+}
+
+static int rtx_ps_word_ok(const char *t, size_t n, size_t s, size_t e) {
+    if (rtx_rx_word_before(t, s) && rtx_rx_word_after(t, s, n)) return 0;
+    if (rtx_rx_word_before(t, e) && rtx_rx_word_after(t, e, n)) return 0;
+    return 1;
+}
+
+static int rtx_ps_slot_hit(RtxPsSlot *s, const RtxPsHit *h, const char *pv, size_t pvn) {
+    if (s->nh >= s->hcap) {
+        size_t c = s->hcap ? s->hcap * 2 : 64;
+        RtxPsHit *nh = (RtxPsHit *)cc_arena_alloc(s->hit_a, c * sizeof(RtxPsHit), 8);
+        if (!nh) return -1;
+        if (s->nh) memcpy(nh, s->hits, s->nh * sizeof(RtxPsHit));
+        s->hits = nh;
+        s->hcap = c;
+    }
+    if (s->npv + pvn > s->pvcap) {
+        size_t c = s->pvcap ? s->pvcap * 2 : 4096;
+        char *np;
+        while (c < s->npv + pvn) c *= 2;
+        np = (char *)cc_arena_alloc(s->hit_a, c, 1);
+        if (!np) return -1;
+        if (s->npv) memcpy(np, s->pv, s->npv);
+        s->pv = np;
+        s->pvcap = c;
+    }
+    s->hits[s->nh] = *h;
+    s->hits[s->nh].pv = (uint32_t)s->npv;
+    s->hits[s->nh].pvn = (uint16_t)pvn;
+    memcpy(s->pv + s->npv, pv, pvn);
+    s->npv += pvn;
+    s->nh++;
+    return 0;
+}
+
+/* Lane: start a chunk (hits / previews / file records of the last chunk
+ * die here; the read buffer stays). -1 = no scratch. */
+static int rtx_ps_slot_reset(RtxPsSlot *s) {
+    s->nh = 0;
+    s->hcap = 0;
+    s->hits = NULL;
+    s->npv = 0;
+    s->pvcap = 0;
+    s->pv = NULL;
+    s->nfh = 0;
+    s->fhcap = 0;
+    s->fh = NULL;
+    s->bin = s->big = s->err = 0;
+    s->bytes = 0;
+    if (s->hit_a.base) s->hit_a.reset();
+    else {
+        s->hit_a = cc_arena_heap(kilobytes(64));
+        if (!s->hit_a.base) return -1;
+    }
+    return 0;
+}
+
+static int rtx_ps_slot_file(RtxPsSlot *s, uint32_t id, size_t first) {
+    if (s->nfh >= s->fhcap) {
+        size_t c = s->fhcap ? s->fhcap * 2 : 32;
+        RtxPsFileHits *nf = (RtxPsFileHits *)cc_arena_alloc(s->hit_a, c * sizeof(RtxPsFileHits), 8);
+        if (!nf) return -1;
+        if (s->nfh) memcpy(nf, s->fh, s->nfh * sizeof(RtxPsFileHits));
+        s->fh = nf;
+        s->fhcap = c;
+    }
+    s->fh[s->nfh++] = (RtxPsFileHits){ .id = id, .first = (uint32_t)first,
+                                       .n = (uint32_t)(s->nh - first) };
+    return 0;
+}
+
+/* Lane: read file `id` whole and append its hits to the chunk. Stops
+ * once the chunk holds more than RTX_PROJ_HITS_MAX hits: the stage then
+ * caps before that file, so no group is ever cut. */
+static void rtx_ps_scan(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s) {
+    const RtxProjSearch *ps = wk->ps;
+    const RtxProjFile *f;
+    char abs[RTX_PROJ_PATH];
+    size_t rn;
+    int fd;
+    struct stat st;
+    size_t size, got = 0;
+    RtxRxIn in;
+    size_t p = 0, lpos = 0, lstart = 0;
+    size_t first = s->nh;
+    uint32_t line = 1;
+    long slow = atomic_load(&g_proj_slow_us);
+    if (slow > 0) usleep((useconds_t)slow);
+    /* The lane keeps its last directory open: a chunk's files mostly
+     * share one, and openat(dir, name) skips resolving the root path
+     * for every file. */
+    f = rtx_idx_file(wk->idx, id);
+    if (!s->dfd_ok || s->dfd_dir != f->dir) {
+        const RtxProjDir *d = rtx_idx_dir(wk->idx, f->dir);
+        rn = d->path_n;
+        if (s->dfd_ok) close(s->dfd);
+        s->dfd_ok = 0;
+        if (wk->root_n + 1 + rn + 1 > sizeof abs) {
+            s->err++;
+            return;
+        }
+        memcpy(abs, wk->root, wk->root_n);
+        abs[wk->root_n] = '/';
+        memcpy(abs + wk->root_n + 1, rtx_idx_str(wk->idx, d->path), rn);
+        abs[wk->root_n + 1 + rn] = 0;
+        s->dfd = open(abs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (s->dfd < 0) {
+            s->err++;
+            return;
+        }
+        s->dfd_ok = 1;
+        s->dfd_dir = f->dir;
+    }
+    fd = openat(s->dfd, rtx_idx_str(wk->idx, f->name), O_RDONLY | O_CLOEXEC | O_NOCTTY);
+    if (fd < 0) {
+        s->err++;
+        return;
+    }
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        s->err++;
+        return;
+    }
+    size = (size_t)st.st_size;
+    if (size > ps->max_bytes) {
+        close(fd);
+        s->big++;
+        return;
+    }
+    if (size == 0) {
+        close(fd);
+        return;
+    }
+    if (s->buf_cap < size + 1) {
+        size_t cap = size + 1;
+        if (cap < ((size_t)1 << 20)) cap = (size_t)1 << 20;
+        if (s->buf_a.base) s->buf_a.destroy();
+        s->buf_a = cc_arena_heap(cap + kilobytes(4));
+        s->buf = s->buf_a.base ? (char *)cc_arena_alloc(s->buf_a, cap, 16) : NULL;
+        s->buf_cap = s->buf ? cap : 0;
+        if (!s->buf) {
+            close(fd);
+            s->err++;
+            return;
+        }
+    }
+    /* The binary test reads 8 KiB first: a binary costs one read. */
+    while (got < size) {
+        size_t want = size - got;
+        ssize_t r;
+        if (got == 0 && want > 8192) want = 8192;
+        r = read(fd, s->buf + got, want);
+        if (r <= 0) break;
+        got += (size_t)r;
+        if (got <= 8192 && memchr(s->buf, 0, got)) {
+            close(fd);
+            s->bin++;
+            return;
+        }
+    }
+    close(fd);
+    s->bytes += got;
+    if (memchr(s->buf, 0, got < 8192 ? got : 8192)) {
+        s->bin++;
+        return;
+    }
+    memset(&in, 0, sizeof in);
+    in.s = s->buf;
+    in.n = got;
+    in.gpos = RTX_RX_UNSET;
+    in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+    while (p < got && s->nh <= RTX_PROJ_HITS_MAX) {
+        size_t ms = 0, me = 0;
+        int r = rtx_rx_search(ps->rx, &in, p, got, 1, &s->rxs, &ms, &me);
+        size_t le, ws, we;
+        RtxPsHit h;
+        if (r != RTX_RX_MATCH) break;
+        if (me == ms || ((ps->opts & RTX_PS_WORD) && !rtx_ps_word_ok(s->buf, got, ms, me))) {
+            p = rtx_ps_next_cp(s->buf, got, ms);
+            continue;
+        }
+        if (lpos < ms) {
+            size_t c = rtx_count_lf(s->buf + lpos, ms - lpos);
+            if (c) {
+                line += c;
+                lstart = lpos + rtx_last_lf(s->buf + lpos, ms - lpos) + 1;
+            }
+            lpos = ms;
+        }
+        {
+            const char *nl = (const char *)memchr(s->buf + ms, '\n', got - ms);
+            le = nl ? (size_t)(nl - s->buf) : got;
+        }
+        if (le > lstart && s->buf[le - 1] == '\r') le--;
+        ws = lstart;
+        we = le;
+        if (we - ws > RTX_PROJ_PV_MAX) {
+            ws = ms > lstart + 40 ? ms - 40 : lstart;
+            while (ws > lstart && ((unsigned char)s->buf[ws] & 0xC0) == 0x80) ws--;
+            we = ws + RTX_PROJ_PV_MAX;
+            if (we > le) we = le;
+            while (we > ws && we < le && ((unsigned char)s->buf[we] & 0xC0) == 0x80) we--;
+        }
+        memset(&h, 0, sizeof h);
+        h.file = id;
+        h.line = line;
+        h.off = ms;
+        h.col = (uint32_t)(ms - lstart + 1);
+        h.mlen = (uint32_t)(me - ms);
+        h.pvhit = (uint16_t)(ms >= ws ? (ms - ws < we - ws ? ms - ws : we - ws) : 0);
+        if (rtx_ps_slot_hit(s, &h, s->buf + ws, we - ws) < 0) {
+            /* Out of lane scratch: drop this file's hits, never half. */
+            s->nh = first;
+            s->err++;
+            return;
+        }
+        p = me;
+    }
+    if (s->nh > first && rtx_ps_slot_file(s, id, first) < 0) {
+        s->nh = first;
+        s->err++;
+    }
+}
+
+static char *rtx_ps_pv_put(RtxProjSearch *ps, const char *src, size_t n, uint32_t *off) {
+    const uint64_t chsz = (uint64_t)1 << RTX_PROJ_PCH_BITS;
+    uint64_t o = ps->npv;
+    size_t k;
+    if ((o & (chsz - 1)) + n + 1 > chsz) o = (o | (chsz - 1)) + 1;
+    k = (size_t)(o >> RTX_PROJ_PCH_BITS);
+    if (k >= RTX_PROJ_PCH_MAX) return NULL;
+    if (!ps->pch[k]) {
+        ps->pch[k] = (char *)cc_arena_alloc(ps->store, (size_t)chsz, 8);
+        if (!ps->pch[k]) return NULL;
+    }
+    memcpy(ps->pch[k] + (o & (chsz - 1)), src, n);
+    ps->pch[k][(o & (chsz - 1)) + n] = 0;
+    *off = (uint32_t)o;
+    ps->npv = o + n + 1;
+    return ps->pch[k] + (o & (chsz - 1));
+}
+
+/* Write stage: one file's hits as one group. 0 ok, -1 capped (nothing of
+ * this file was appended; every earlier group stays whole). */
+static int rtx_ps_stage_file(RtxProjSearch *ps, const RtxPsSlot *s, const RtxPsFileHits *f) {
+    size_t i;
+    uint32_t first = (uint32_t)ps->nh;
+    size_t gk = ps->ng >> RTX_PROJ_HCH_BITS;
+    if (ps->nh + f->n > RTX_PROJ_HITS_MAX || gk >= RTX_PROJ_HCH_MAX) return -1;
+    if (!ps->gch[gk]) {
+        ps->gch[gk] = (RtxPsGroup *)cc_arena_alloc(
+            ps->store, sizeof(RtxPsGroup) << RTX_PROJ_HCH_BITS, 8);
+        if (!ps->gch[gk]) return -1;
+    }
+    /* Hit chunks first: a failed chunk alloc leaves no partial group. */
+    for (i = ps->nh >> RTX_PROJ_HCH_BITS; i <= (ps->nh + f->n - 1) >> RTX_PROJ_HCH_BITS; i++) {
+        if (ps->hch[i]) continue;
+        ps->hch[i] = (RtxPsHit *)cc_arena_alloc(ps->store,
+                                                sizeof(RtxPsHit) << RTX_PROJ_HCH_BITS, 8);
+        if (!ps->hch[i]) return -1;
+    }
+    for (i = 0; i < f->n; i++) {
+        RtxPsHit h = s->hits[f->first + i];
+        uint32_t off = 0;
+        if (!rtx_ps_pv_put(ps, s->pv + h.pv, h.pvn, &off)) {
+            h.pvn = 0;
+            h.pvhit = 0;
+        }
+        h.pv = off;
+        ps->hch[ps->nh >> RTX_PROJ_HCH_BITS][ps->nh & ((1u << RTX_PROJ_HCH_BITS) - 1)] = h;
+        ps->nh++;
+    }
+    ps->gch[gk][ps->ng & ((1u << RTX_PROJ_HCH_BITS) - 1)] =
+        (RtxPsGroup){ .file = f->id, .first = first, .n = f->n };
+    ps->ng++;
+    return 0;
+}
+
+/* Write stage: a chunk ending at file `hi` — one group per file with
+ * hits, in id order — then one publish. */
+static void rtx_ps_stage(RtxProjSearch *ps, size_t hi, const RtxPsSlot *s) {
+    size_t i;
+    ps->n_bin += s->bin;
+    ps->n_big += s->big;
+    ps->n_err += s->err;
+    ps->next = hi;
+    for (i = 0; i < s->nfh; i++) {
+        if (rtx_ps_stage_file(ps, s, &s->fh[i]) < 0) {
+            /* Capped: the search ends here (t_ms is read after the join). */
+            ps->truncated = 1;
+            ps->t_ms = rtx_proj_now_ms();
+            ps->next = (size_t)s->fh[i].id + 1;
+            break;
+        }
+    }
+    atomic_store_explicit(&ps->pub_nh, ps->nh, memory_order_release);
+    atomic_store_explicit(&ps->pub_ng, ps->ng, memory_order_release);
+    atomic_store_explicit(&ps->pub_files, ps->next, memory_order_release);
+    atomic_fetch_add_explicit(&ps->pub_bytes, s->bytes, memory_order_relaxed);
+}
+
+static void rtx_ps_slot_drop(RtxPsSlot *s) {
+    if (s->dfd_ok) close(s->dfd);
+    s->dfd_ok = 0;
+    rtx_rx_scratch_drop(&s->rxs);
+    if (s->buf_a.base) s->buf_a.destroy();
+    if (s->hit_a.base) s->hit_a.destroy();
+}
+
+static _Atomic int g_ps_chunk;
+
+void rtx_proj_test_chunk(int files) {
+    atomic_store(&g_ps_chunk, files);
+}
+
+/* One arm: files [next, end) in id order, one `@parallel wait` like the
+ * find block loop. A ticket is a chunk of RTX_PS_CHUNK files: the lane
+ * scans them into its cache replica and the stage appends their groups
+ * and publishes once. One ticket per file spent more on the hand-off
+ * (enter, stage handshake, fiber switch) than on a ~13 KB file. */
+static int rtx_ps_run(RtxPsWalk *wk) {
+    RtxProjSearch *ps = wk->ps;
+    size_t base = ps->next;
+    size_t end = wk->end;
+    size_t k = (size_t)atomic_load(&g_ps_chunk);
+    int lanes = rtx_proj_lanes();
+    int n, i;
+    bool fin;
+    if (k < 1) k = RTX_PS_CHUNK;
+    if (base >= end || (end - base) / k >= (size_t)INT_MAX) {
+        atomic_store_explicit(&wk->done, 1, memory_order_release);
+        return 1;
+    }
+    n = (int)((end - base + k - 1) / k);
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            ps->truncated = 1;
+            ps->t_ms = rtx_proj_now_ms();
+            atomic_store_explicit(&wk->done, 1, memory_order_release);
+            return 0;
+        }
+        RtxPsSlot slot = {0} @destroy { rtx_ps_slot_drop(&slot); };
+        CCArena ta = cc_arena_heap(kilobytes(64)) @destroy;
+        /* Twice the lanes in flight: a chunk that finished early waits in
+         * its stage while the next ones already run, so a slow file (or
+         * an 8 MiB one) does not idle the other workers. */
+        CCTurnstile ts@(lanes * 2, 1, ta) !> @destroy;
+        fin = @parallel wait (ts) cache (slot) for (i in 0..n) {
+            size_t lo, hi, id;
+            lo = base + (size_t)i * k;
+            hi = lo + k < end ? lo + k : end;
+            RtxPsSlot res;
+            if (rtx_ps_slot_reset(&slot) < 0) slot.err += hi - lo;
+            else {
+                for (id = lo; id < hi; id++) {
+                    if (rtx_ps_cancelled(ps) || ps->truncated || slot.nh > RTX_PROJ_HITS_MAX)
+                        break;
+                    rtx_ps_scan(wk, (uint32_t)id, &slot);
+                }
+            }
+            /* The stage reads this lane's result, not the cache replica:
+             * its hits stay on the lane arena until the lane's next chunk. */
+            res = slot;
+            @stage (ts, 0, i) {
+                while (wk->h.paused && !rtx_ps_cancelled(ps))
+                    cc_yield();
+                if (!rtx_ps_cancelled(ps) && !ps->truncated)
+                    rtx_ps_stage(ps, hi, &res);
+            }
+            if (rtx_ps_cancelled(ps) || ps->truncated)
+                break;
+        } !>.wait()!>;
+        (void)fin;
+    }
+    atomic_store_explicit(&wk->done, 1, memory_order_release);
+    return 1;
+}
+
+static void rtx_ps_drop_arm(RtxProj *p) {
+    RtxPsWalk *wk = p ? (RtxPsWalk *)p->ps.wk : NULL;
+    if (!wk) return;
+    atomic_store_explicit(&p->ps.cancel, 1, memory_order_release);
+    if (wk->h.live()) {
+        if (wk->h.paused())
+            wk->h.resume() !>(e) { (void)e; };
+        wk->h.invalidate();
+    }
+    free(wk);
+    p->ps.wk = NULL;
+}
+
+static int rtx_ps_join_done(RtxProj *p) {
+    RtxPsWalk *wk = p ? (RtxPsWalk *)p->ps.wk : NULL;
+    if (!wk) return 0;
+    if (!atomic_load_explicit(&wk->done, memory_order_acquire)) return 0;
+    if (wk->h.live()) {
+        if (wk->h.paused())
+            wk->h.resume() !>(e) { (void)e; };
+        wk->h.wait() !>(e) { (void)e; };
+    }
+    free(wk);
+    p->ps.wk = NULL;
+    return 1;
+}
+
+static void rtx_ps_free(RtxProj *p) {
+    RtxProjSearch *ps;
+    if (!p) return;
+    rtx_ps_drop_arm(p);
+    ps = &p->ps;
+    if (ps->store.base) ps->store.destroy();
+    *ps = (RtxProjSearch){0};
+}
+
+static void !>(CCError) rtx_ps_kick(RtxProj *p) {
+    RtxProjSearch *ps = &p->ps;
+    RtxPsWalk *wk;
+    RtxPsWalk *scan;
+    size_t end;
+    int noop = 0;
+    if (!ps->on || !ps->rx || ps->complete || ps->truncated || rtx_ps_cancelled(ps) || !p->cur)
+        return cc_ok();
+    if (ps->wk) return cc_ok();
+    end = rtx_idx_nf(p->cur);
+    if (ps->next >= end) {
+        if (!rtx_idx_walking(p->cur)) {
+            ps->complete = 1;
+            ps->t_ms = rtx_proj_now_ms();
+        }
+        return cc_ok();
+    }
+    wk = (RtxPsWalk *)calloc(1, sizeof(RtxPsWalk));
+    if (!wk) return cc_err(CC_ERR_OUT_OF_MEMORY, "search");
+    wk->ps = ps;
+    wk->idx = p->cur;
+    memcpy(wk->root, p->root, p->root_n);
+    wk->root[p->root_n] = 0;
+    wk->root_n = p->root_n;
+    wk->end = end;
+    ps->wk = wk;
+    rtx_par_pool_up();
+    if (rtx_parallel_inline()) {
+        rtx_ps_run(wk);
+        return cc_ok();
+    }
+    scan = wk;
+    wk->h = @parallel {
+        @serial { noop = 0; }
+        rtx_ps_run(scan);
+    } !>;
+    return cc_ok();
+}
+
+/* 1 = still searching. */
+static int !>(CCError) rtx_ps_pump(RtxProj *p) {
+    RtxProjSearch *ps = &p->ps;
+    rtx_ps_join_done(p);
+    if (!ps->on || ps->complete || ps->truncated || rtx_ps_cancelled(ps)) return cc_ok(0);
+    rtx_ps_kick(p) !>(e) { return cc_err(e); };
+    return cc_ok(!ps->complete);
+}
+
+void !>(CCError) rtx_proj_search_set(RtxProj *p, char[:] q, unsigned opts) {
+    RtxProjSearch *ps;
+    unsigned fl = 0;
+    size_t max_bytes;
+    RtxRx *rx;
+    if (!p) return cc_err(CC_ERR_INVALID_ARG, "search");
+    ps = &p->ps;
+    max_bytes = ps->max_bytes ? ps->max_bytes : RTX_PROJ_SEARCH_MAX;
+    rtx_ps_free(p);
+    ps->max_bytes = max_bytes;
+    ps->store = cc_arena_heap(megabytes(1));
+    if (!ps->store.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "search");
+    {
+        size_t qn = q.len > sizeof ps->q - 1 ? sizeof ps->q - 1 : q.len;
+        if (qn) memcpy(ps->q, q.ptr, qn);
+        ps->q[qn] = 0;
+        ps->qn = qn;
+    }
+    ps->opts = opts & (RTX_PS_ICASE | RTX_PS_WORD | RTX_PS_REGEX);
+    ps->on = ps->qn > 0;
+    ps->gen = p->gen;
+    ps->t0_ms = rtx_proj_now_ms();
+    if (!ps->on) return cc_ok();
+    if (ps->opts & RTX_PS_ICASE) fl |= RTX_RX_ICASE;
+    if (!(ps->opts & RTX_PS_REGEX)) fl |= RTX_RX_LITERAL;
+    rx = rtx_rx_compile(cc_slice_from_buffer(ps->q, ps->qn), fl, ps->store) !>(e) {
+        if (e.kind == CC_ERR_OUT_OF_MEMORY) return cc_err(e);
+        ps->err = e.message ? e.message : "bad pattern";
+        return cc_ok();
+    };
+    ps->rx = rx;
+    return rtx_ps_kick(p);
+}
+
+/* Same query over a new index (after a re-walk swap). */
+static void !>(CCError) rtx_ps_restart(RtxProj *p) {
+    char q[RTX_PROJ_QMAX];
+    size_t qn;
+    unsigned opts;
+    if (!p->ps.on) return cc_ok();
+    qn = p->ps.qn;
+    memcpy(q, p->ps.q, qn);
+    opts = p->ps.opts;
+    return rtx_proj_search_set(p, cc_slice_from_buffer(q, qn), opts);
+}
+
+void rtx_proj_search_cancel(RtxProj *p) {
+    if (!p) return;
+    rtx_ps_drop_arm(p);
+}
+
+void rtx_proj_search_clear(RtxProj *p) {
+    size_t mb;
+    if (!p) return;
+    mb = p->ps.max_bytes;
+    rtx_ps_free(p);
+    p->ps.max_bytes = mb;
+}
+
+void !>(CCError) rtx_proj_search_finish(RtxProj *p) {
+    int guard = 0;
+    size_t batch = (size_t)RTX_PS_CHUNK * (size_t)rtx_proj_lanes() * 2;
+    if (!p) return cc_ok();
+    /* A re-walk finishes first: its swap restarts the search. The first
+     * walk does not: arms chase its published count (search overlaps
+     * the walk), each over at least a pipeline's worth of files. */
+    if (p->next) rtx_proj_finish(p) !>(e) { return cc_err(e); };
+    while (guard++ < 1000000) {
+        RtxPsWalk *wk = (RtxPsWalk *)p->ps.wk;
+        if (wk) {
+            if (wk->h.live()) {
+                if (wk->h.paused())
+                    wk->h.resume() !>(e) { return cc_err(CC_ERR_IO, cc_io_error_str(e)); };
+                wk->h.wait() !>(e) { return cc_err(e); };
+            }
+            free(wk);
+            p->ps.wk = NULL;
+            continue;
+        }
+        if (!p->ps.on || p->ps.complete || p->ps.truncated || rtx_ps_cancelled(&p->ps)) break;
+        if (p->cur && rtx_idx_walking(p->cur) && rtx_idx_nf(p->cur) < p->ps.next + batch) {
+            struct timespec ts = { 0, 200000 };
+            RtxProjWalk *pw = (RtxProjWalk *)p->cur->wk;
+            if (!pw || (pw->h.live() && pw->h.paused())) {
+                /* Paused (or no arm): finish resumes and joins it. */
+                rtx_proj_finish(p) !>(e) { return cc_err(e); };
+                continue;
+            }
+            nanosleep(&ts, NULL);
+            guard--;
+            continue;
+        }
+        rtx_ps_kick(p) !>(e) { return cc_err(e); };
+        if (!p->ps.wk && !p->ps.complete) break;
+    }
+    rtx_proj_finish(p) !>(e) { return cc_err(e); };
+    return cc_ok();
+}
+
+int rtx_proj_searching(const RtxProj *p) {
+    if (!p || !p->ps.on) return 0;
+    if (p->ps.wk) return 1;
+    return !p->ps.complete && !p->ps.truncated && !rtx_ps_cancelled(&p->ps) && p->ps.rx;
+}
+
+size_t rtx_proj_search_nh(const RtxProj *p) {
+    return p ? atomic_load_explicit(&p->ps.pub_nh, memory_order_acquire) : 0;
+}
+
+size_t rtx_proj_search_ng(const RtxProj *p) {
+    return p ? atomic_load_explicit(&p->ps.pub_ng, memory_order_acquire) : 0;
+}
+
+const RtxPsHit *rtx_proj_search_hit(const RtxProj *p, size_t i) {
+    if (!p || i >= rtx_proj_search_nh(p)) return NULL;
+    return &p->ps.hch[i >> RTX_PROJ_HCH_BITS][i & ((1u << RTX_PROJ_HCH_BITS) - 1)];
+}
+
+const RtxPsGroup *rtx_proj_search_group(const RtxProj *p, size_t g) {
+    if (!p || g >= rtx_proj_search_ng(p)) return NULL;
+    return &p->ps.gch[g >> RTX_PROJ_HCH_BITS][g & ((1u << RTX_PROJ_HCH_BITS) - 1)];
+}
+
+const char *rtx_proj_search_pv(const RtxProj *p, const RtxPsHit *h) {
+    if (!p || !h || !h->pvn) return "";
+    return p->ps.pch[h->pv >> RTX_PROJ_PCH_BITS] + (h->pv & ((1u << RTX_PROJ_PCH_BITS) - 1));
+}
+
+size_t rtx_proj_search_group_of(const RtxProj *p, size_t hit) {
+    size_t lo = 0, hi = rtx_proj_search_ng(p);
+    while (hi - lo > 1) {
+        size_t mid = (lo + hi) / 2;
+        if (rtx_proj_search_group(p, mid)->first <= hit) lo = mid;
+        else hi = mid;
+    }
+    return lo;
+}
+
+size_t rtx_proj_search_rows(const RtxProj *p) {
+    size_t ng = rtx_proj_search_ng(p);
+    const RtxPsGroup *g;
+    if (!ng) return 0;
+    g = rtx_proj_search_group(p, ng - 1);
+    return ng + g->first + g->n;
+}
+
+void rtx_proj_search_row(const RtxProj *p, size_t row, size_t *gout, size_t *hout) {
+    size_t lo = 0, hi = rtx_proj_search_ng(p);
+    const RtxPsGroup *g;
+    size_t start;
+    if (gout) *gout = (size_t)-1;
+    if (hout) *hout = (size_t)-1;
+    if (!hi) return;
+    while (hi - lo > 1) {
+        size_t mid = (lo + hi) / 2;
+        const RtxPsGroup *m = rtx_proj_search_group(p, mid);
+        if (mid + m->first <= row) lo = mid;
+        else hi = mid;
+    }
+    g = rtx_proj_search_group(p, lo);
+    start = lo + g->first;
+    if (row < start || row > start + g->n) return;
+    if (gout) *gout = lo;
+    if (hout) *hout = row == start ? (size_t)-1 : g->first + (row - start - 1);
+}
+
+size_t rtx_proj_search_row_of_hit(const RtxProj *p, size_t hit) {
+    size_t g = rtx_proj_search_group_of(p, hit);
+    return g + hit + 1;
+}

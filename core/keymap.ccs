@@ -1,0 +1,734 @@
+#!ccc ccs
+/*
+ * Keymap + settings files (linked TU; see keymap.cch). JSON goes through
+ * the grammar loader's reader (rtx_jw_* in document.ccs); // and / * * /
+ * comments are blanked first so a hand-edited file may carry them.
+ */
+#include <ccc/std/prelude.cch>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "document.cch"
+#include "cmd.cch"
+#include "keymap.cch"
+
+enum {
+    KM_USER_MAX = 256,
+    KM_CHAIN = 4,
+    KM_POOL = 8192,
+    KM_FILE_MAX = 256 * 1024,
+    KM_HINT = 48
+};
+
+typedef struct {
+    uint32_t chord;
+    unsigned hostmask;          /* 1 << RTX_HOST_* */
+    int nids;                   /* 0 = unbound */
+    unsigned short id[KM_CHAIN]; /* offsets into pool */
+} KmUser;
+
+static struct {
+    int host;
+    KmUser user[KM_USER_MAX];
+    size_t nuser;
+    char pool[KM_POOL];
+    size_t pool_n;
+    unsigned gen;
+} g_km = {0, {{0}}, 0, {0}, 0, 1};
+
+int rtx_keymap_host(void) {
+    return g_km.host;
+}
+
+void rtx_keymap_defaults(int host) {
+    g_km.host = host == RTX_HOST_GUI ? RTX_HOST_GUI : RTX_HOST_TUI;
+    g_km.nuser = 0;
+    g_km.pool_n = 0;
+    g_km.gen++;
+}
+
+static const char *km_defaults_of(const RtxCmdDef *d) {
+    const char *s = g_km.host == RTX_HOST_GUI ? d->gui : d->tui;
+    return s ? s : "";
+}
+
+/* Next space-separated token of *p. 0 at the end. */
+static int km_token(const char **p, const char **t, size_t *tn) {
+    const char *s = *p;
+    while (*s == ' ') s++;
+    if (!*s) return 0;
+    *t = s;
+    while (*s && *s != ' ') s++;
+    *tn = (size_t)(s - *t);
+    *p = s;
+    return 1;
+}
+
+static const char *km_id(const KmUser *u, int k) {
+    return g_km.pool + u->id[k];
+}
+
+/* ---- resolved tables ---------------------------------------------------
+ * Built once per keymap generation (and row count): every default token is
+ * parsed once into g_kt.def (row order, token order), and each chord the
+ * keymap knows (table defaults + this host's user entries) gets one hash
+ * slot holding what a lookup returns for it — a chord with no slot is
+ * RTX_KM_NONE. Lookup is O(1); the hints are one pass over the same
+ * tables, built only when a hint is asked for (help, palette). */
+
+enum { KM_DEF_MAX = RTX_CMD_MAX * 8, KM_SLOTS = 2048, KM_SEEN = 16 };
+
+typedef struct {
+    uint32_t chord;
+    int row;
+    int pref; /* a '^' token: claims over older rows */
+} KmDef;
+
+typedef struct {
+    uint32_t chord; /* 0 = empty slot */
+    int res;        /* row, RTX_KM_NONE or RTX_KM_INERT */
+    int pref_row;   /* first live row with a '^' token for it */
+    int plain_row;  /* first live row with a plain token */
+    int user;       /* last user entry for it on this host, -1 none */
+} KmSlot;
+
+static struct {
+    int built, hint_built;
+    unsigned gen, hint_gen; /* g_km.gen they were built for */
+    size_t rows, hint_rows; /* rtx_cmd_n() then */
+    KmDef def[KM_DEF_MAX];
+    size_t ndef;
+    KmSlot slot[KM_SLOTS];
+    uint32_t first[RTX_CMD_MAX];
+    char hint[RTX_CMD_MAX][KM_HINT];
+    uint32_t seen[RTX_CMD_MAX][KM_SEEN];
+    unsigned char nseen[RTX_CMD_MAX];
+} g_kt;
+
+/* Distinct chords <= KM_DEF_MAX + KM_USER_MAX < KM_SLOTS: never full. */
+static KmSlot *km_slot(uint32_t chord, int make) {
+    size_t i = (size_t)((chord * 2654435761u) >> 21) & (KM_SLOTS - 1);
+    for (;;) {
+        KmSlot *s = &g_kt.slot[i];
+        if (s->chord == chord) return s;
+        if (!s->chord) {
+            if (!make) return NULL;
+            s->chord = chord;
+            s->res = RTX_KM_NONE;
+            s->pref_row = -1;
+            s->plain_row = -1;
+            s->user = -1;
+            return s;
+        }
+        i = (i + 1) & (KM_SLOTS - 1);
+    }
+}
+
+/* A row whose chords the keymap resolves to (LOCAL rows are a mode's own
+ * keys; a reserved row keeps none — the real row that shadows it does). */
+static int km_live(const RtxCmdDef *d) {
+    return !(d->flags & RTX_CMDF_LOCAL) && rtx_cmd_available(d);
+}
+
+static void km_tables_build(void) {
+    size_t i, n = rtx_cmd_n();
+    unsigned bit = 1u << g_km.host;
+    memset(g_kt.slot, 0, sizeof g_kt.slot);
+    g_kt.ndef = 0;
+    for (i = 0; i < n; i++) {
+        const RtxCmdDef *d = rtx_cmd_at(i);
+        const char *p = km_defaults_of(d);
+        const char *t;
+        size_t tn;
+        int live = km_live(d);
+        while (km_token(&p, &t, &tn)) {
+            uint32_t c = rtx_chord_parse(t, tn);
+            int pref = t[0] == '^';
+            KmSlot *s;
+            if (!c || g_kt.ndef >= KM_DEF_MAX) continue;
+            g_kt.def[g_kt.ndef].chord = c;
+            g_kt.def[g_kt.ndef].row = (int)i;
+            g_kt.def[g_kt.ndef].pref = pref;
+            g_kt.ndef++;
+            s = km_slot(c, 1);
+            if (!live) continue;
+            if (pref && s->pref_row < 0) s->pref_row = (int)i;
+            if (!pref && s->plain_row < 0) s->plain_row = (int)i;
+        }
+    }
+    for (i = 0; i < g_km.nuser; i++)
+        if (g_km.user[i].hostmask & bit)
+            km_slot(g_km.user[i].chord, 1)->user = (int)i;
+    for (i = 0; i < KM_SLOTS; i++) {
+        KmSlot *s = &g_kt.slot[i];
+        if (!s->chord) continue;
+        if (s->user >= 0) {
+            /* keys.json first: the first available id of the chain. */
+            const KmUser *e = &g_km.user[s->user];
+            int k;
+            s->res = RTX_KM_INERT;
+            for (k = 0; k < e->nids; k++) {
+                int r = rtx_cmd_find(km_id(e, k));
+                if (r >= 0 && rtx_cmd_available(rtx_cmd_at((size_t)r))) {
+                    s->res = r;
+                    break;
+                }
+            }
+        } else if (s->pref_row >= 0) {
+            s->res = s->pref_row;
+        } else if (s->plain_row >= 0) {
+            s->res = s->plain_row;
+        }
+    }
+    g_kt.gen = g_km.gen;
+    g_kt.rows = n;
+    g_kt.built = 1;
+}
+
+static void km_tables(void) {
+    if (!g_kt.built || g_kt.gen != g_km.gen || g_kt.rows != rtx_cmd_n())
+        km_tables_build();
+}
+
+static int km_lookup1(uint32_t chord) {
+    const KmSlot *s;
+    km_tables();
+    s = km_slot(chord, 0);
+    return s ? s->res : RTX_KM_NONE;
+}
+
+int rtx_keymap_lookup(uint32_t chord) {
+    int r;
+    if (!chord) return RTX_KM_NONE;
+    r = km_lookup1(chord);
+    /* Ctrl-Shift-S still saves (the hosts ignored Shift on a letter). Not
+     * for named keys: Ctrl-Shift-Tab is not Ctrl-Tab. */
+    if (r == RTX_KM_NONE && (chord & RTX_CHORD_SHIFT) &&
+        (chord & RTX_CHORD_KEY_MASK) < 0x80)
+        r = km_lookup1(chord & ~(uint32_t)RTX_CHORD_SHIFT);
+    return r;
+}
+
+unsigned rtx_keymap_gen(void) {
+    return g_km.gen;
+}
+
+/* ---- hints ------------------------------------------------------------ */
+
+static void km_hint_add(int r, uint32_t c) {
+    char lab[40];
+    char *dst = g_kt.hint[r];
+    size_t i, used, ln;
+    for (i = 0; i < g_kt.nseen[r]; i++)
+        if (g_kt.seen[r][i] == c) return;
+    if (g_kt.nseen[r] < KM_SEEN) g_kt.seen[r][g_kt.nseen[r]++] = c;
+    ln = rtx_chord_label(c, g_km.host, lab, sizeof lab);
+    used = strlen(dst);
+    if (used + ln + 2 >= KM_HINT) return;
+    if (used) dst[used++] = ' ';
+    memcpy(dst + used, lab, ln);
+    dst[used + ln] = 0;
+}
+
+/* One pass over the resolved tables, user entries (file order) then table
+ * defaults (row / token order):
+ *  - a live row lists every chord whose lookup lands on it — not through
+ *    the Shift fallback: Ctrl-Shift-F reaching Find is not Find's key;
+ *  - an unavailable / local row lists the chords that name it: user
+ *    entries still in force, then its own defaults the user did not
+ *    rebind;
+ *  - first[r] is the first chord (same order) whose lookup is r. */
+static void km_hints_build(void) {
+    size_t i, n = rtx_cmd_n();
+    unsigned bit = 1u << g_km.host;
+    km_tables();
+    for (i = 0; i < n; i++) {
+        g_kt.hint[i][0] = 0;
+        g_kt.nseen[i] = 0;
+        g_kt.first[i] = 0;
+    }
+    for (i = 0; i < g_km.nuser; i++) {
+        const KmUser *e = &g_km.user[i];
+        const KmSlot *s;
+        int r, k;
+        if (!(e->hostmask & bit)) continue;
+        s = km_slot(e->chord, 0);
+        r = s ? s->res : RTX_KM_NONE;
+        if (r >= 0 && (size_t)r < n) {
+            if (!g_kt.first[r]) g_kt.first[r] = e->chord;
+            if (km_live(rtx_cmd_at((size_t)r))) km_hint_add(r, e->chord);
+        }
+        if (!s || s->user != (int)i) continue; /* a later entry replaced it */
+        for (k = 0; k < e->nids; k++) {
+            const char *id = km_id(e, k);
+            size_t j;
+            for (j = 0; j < n; j++) {
+                const RtxCmdDef *d = rtx_cmd_at(j);
+                if (!km_live(d) && d->id && strcmp(id, d->id) == 0)
+                    km_hint_add((int)j, e->chord);
+            }
+        }
+    }
+    for (i = 0; i < g_kt.ndef; i++) {
+        const KmDef *f = &g_kt.def[i];
+        const KmSlot *s = km_slot(f->chord, 0);
+        const RtxCmdDef *own = rtx_cmd_at((size_t)f->row);
+        int r = s ? s->res : RTX_KM_NONE;
+        if (!(own->flags & RTX_CMDF_LOCAL) && r >= 0 && (size_t)r < n) {
+            if (!g_kt.first[r]) g_kt.first[r] = f->chord;
+            if (km_live(rtx_cmd_at((size_t)r))) km_hint_add(r, f->chord);
+        }
+        if (!km_live(own) && (!s || s->user < 0)) km_hint_add(f->row, f->chord);
+    }
+    g_kt.hint_gen = g_km.gen;
+    g_kt.hint_rows = n;
+    g_kt.hint_built = 1;
+}
+
+static void km_hints(void) {
+    if (!g_kt.hint_built || g_kt.hint_gen != g_km.gen ||
+        g_kt.hint_rows != rtx_cmd_n())
+        km_hints_build();
+}
+
+const char *rtx_keymap_hint(int row) {
+    if (row < 0 || (size_t)row >= rtx_cmd_n() || row >= RTX_CMD_MAX) return "";
+    km_hints();
+    return g_kt.hint[row];
+}
+
+uint32_t rtx_keymap_first(int row) {
+    if (row < 0 || (size_t)row >= rtx_cmd_n() || row >= RTX_CMD_MAX) return 0;
+    km_hints();
+    return g_kt.first[row];
+}
+
+/* ---- files ------------------------------------------------------------ */
+
+int rtx_config_path(const char *name, char *dst, size_t n) {
+    const char *x = getenv("XDG_CONFIG_HOME");
+    const char *h = getenv("HOME");
+    int w;
+    if (!dst || !n || !name) return 0;
+    dst[0] = 0;
+    if (x && x[0] == '/')
+        w = snprintf(dst, n, "%s/cctext/%s", x, name);
+    else if (h && h[0])
+        w = snprintf(dst, n, "%s/.config/cctext/%s", h, name);
+    else
+        return 0;
+    return w > 0 && (size_t)w < n;
+}
+
+/* Whole file into a heap block (NUL-terminated). NULL + *missing when it
+ * does not exist. */
+static char *km_read(const char *path, size_t *n, int *missing) {
+    FILE *fp;
+    char *buf;
+    long len;
+    *n = 0;
+    *missing = 0;
+    fp = fopen(path, "rb");
+    if (!fp) {
+        *missing = 1;
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0 || (len = ftell(fp)) < 0 ||
+        len > KM_FILE_MAX || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    buf = (char *)malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+    if (len && fread(buf, 1, (size_t)len, fp) != (size_t)len) {
+        free(buf);
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+    buf[len] = 0;
+    *n = (size_t)len;
+    return buf;
+}
+
+/* Blank // and / * * / comments outside strings (in place). */
+static void km_strip_comments(char *s, size_t n) {
+    size_t i = 0;
+    int in_str = 0;
+    while (i < n) {
+        char c = s[i];
+        if (in_str) {
+            if (c == '\\' && i + 1 < n) {
+                i += 2;
+                continue;
+            }
+            if (c == '"') in_str = 0;
+            i++;
+            continue;
+        }
+        if (c == '"') {
+            in_str = 1;
+            i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+            while (i < n && s[i] != '\n') s[i++] = ' ';
+            continue;
+        }
+        if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+            s[i++] = ' ';
+            s[i++] = ' ';
+            while (i < n && !(s[i] == '*' && i + 1 < n && s[i + 1] == '/')) {
+                if (s[i] != '\n') s[i] = ' ';
+                i++;
+            }
+            if (i < n) s[i++] = ' ';
+            if (i < n) s[i++] = ' ';
+            continue;
+        }
+        i++;
+    }
+}
+
+static int km_null(RtxJw *j) {
+    rtx_jw_ws(j);
+    if (j->i + 4 <= j->n && memcmp(j->s + j->i, "null", 4) == 0) {
+        j->i += 4;
+        return 1;
+    }
+    return 0;
+}
+
+static void km_note(char *err, size_t errn, int *nwarn, const char *msg) {
+    if (err && errn && !err[0]) snprintf(err, errn, "%s", msg);
+    (*nwarn)++;
+}
+
+static int km_pool_add(const char *s, unsigned short *off) {
+    size_t n = strlen(s) + 1;
+    if (g_km.pool_n + n > KM_POOL) return 0;
+    memcpy(g_km.pool + g_km.pool_n, s, n);
+    *off = (unsigned short)g_km.pool_n;
+    g_km.pool_n += n;
+    return 1;
+}
+
+static int km_is_unbind(const char *id) {
+    return !id[0] || (id[0] == '-' && !id[1]);
+}
+
+/* One "chord": value pair (the key is already read). */
+static int km_entry(RtxJw *j, const char *key, unsigned hostmask, char *err,
+                    size_t errn, int *nwarn) {
+    char msg[160];
+    char id[96];
+    KmUser e;
+    uint32_t chord = rtx_chord_parse(key, strlen(key));
+    memset(&e, 0, sizeof e);
+    e.chord = chord;
+    e.hostmask = hostmask;
+    rtx_jw_ws(j);
+    if (km_null(j)) {
+        /* unbind */
+    } else if (j->i < j->n && j->s[j->i] == '"') {
+        if (!rtx_jw_string(j, id, sizeof id)) return 0;
+        if (!km_is_unbind(id)) {
+            if (!km_pool_add(id, &e.id[0])) return 0;
+            e.nids = 1;
+        }
+    } else if (j->i < j->n && j->s[j->i] == '[') {
+        j->i++;
+        rtx_jw_ws(j);
+        if (!rtx_jw_eat(j, ']')) {
+            for (;;) {
+                if (!rtx_jw_string(j, id, sizeof id)) return 0;
+                if (!km_is_unbind(id) && e.nids < KM_CHAIN) {
+                    if (!km_pool_add(id, &e.id[e.nids])) return 0;
+                    e.nids++;
+                }
+                if (rtx_jw_eat(j, ']')) break;
+                if (!rtx_jw_eat(j, ',')) return 0;
+            }
+        }
+    } else {
+        snprintf(msg, sizeof msg, "keys: \"%s\" wants a command id, a list or null",
+                 key);
+        km_note(err, errn, nwarn, msg);
+        return rtx_jw_skip(j);
+    }
+    if (!chord) {
+        snprintf(msg, sizeof msg, "keys: not a key: \"%s\"", key);
+        km_note(err, errn, nwarn, msg);
+        return 1;
+    }
+    {
+        int k;
+        for (k = 0; k < e.nids; k++) {
+            if (rtx_cmd_find(km_id(&e, k)) < 0) {
+                snprintf(msg, sizeof msg, "keys: unknown command \"%s\"",
+                         km_id(&e, k));
+                km_note(err, errn, nwarn, msg);
+            }
+        }
+    }
+    if (g_km.nuser >= KM_USER_MAX) {
+        km_note(err, errn, nwarn, "keys: too many entries");
+        return 1;
+    }
+    g_km.user[g_km.nuser++] = e;
+    return 1;
+}
+
+static int km_object(RtxJw *j, unsigned hostmask, int depth, char *err,
+                     size_t errn, int *nwarn) {
+    if (!rtx_jw_eat(j, '{')) return 0;
+    rtx_jw_ws(j);
+    if (rtx_jw_eat(j, '}')) return 1;
+    for (;;) {
+        char key[64];
+        if (!rtx_jw_string(j, key, sizeof key) || !rtx_jw_eat(j, ':')) return 0;
+        rtx_jw_ws(j);
+        if (depth == 0 && j->i < j->n && j->s[j->i] == '{' &&
+            (strcmp(key, "tui") == 0 || strcmp(key, "gui") == 0)) {
+            unsigned m = strcmp(key, "tui") == 0 ? 1u << RTX_HOST_TUI
+                                                 : 1u << RTX_HOST_GUI;
+            if (!km_object(j, m, 1, err, errn, nwarn)) return 0;
+        } else if (!km_entry(j, key, hostmask, err, errn, nwarn)) {
+            return 0;
+        }
+        if (rtx_jw_eat(j, '}')) return 1;
+        if (!rtx_jw_eat(j, ',')) return 0;
+    }
+}
+
+int rtx_keymap_load_text(int host, const char *text, size_t n, char *err,
+                         size_t errn) {
+    RtxJw j;
+    char *copy;
+    int nwarn = 0;
+    int ok;
+    if (err && errn) err[0] = 0;
+    rtx_keymap_defaults(host);
+    if (!text || !n) return 0;
+    copy = (char *)malloc(n + 1);
+    if (!copy) {
+        if (err && errn) snprintf(err, errn, "keys: out of memory");
+        return -1;
+    }
+    memcpy(copy, text, n);
+    copy[n] = 0;
+    km_strip_comments(copy, n);
+    j.s = copy;
+    j.n = n;
+    j.i = 0;
+    rtx_jw_ws(&j);
+    if (j.i >= j.n) {
+        free(copy);
+        return 0;
+    }
+    ok = km_object(&j, (1u << RTX_HOST_TUI) | (1u << RTX_HOST_GUI), 0, err,
+                   errn, &nwarn);
+    if (ok) {
+        rtx_jw_ws(&j);
+        if (j.i < j.n) ok = 0;
+    }
+    if (!ok) {
+        size_t at = j.i;
+        rtx_keymap_defaults(host);
+        if (err && errn)
+            snprintf(err, errn, "keys: JSON error near byte %zu (defaults kept)",
+                     at);
+        free(copy);
+        return -1;
+    }
+    free(copy);
+    g_km.gen++;
+    return (int)g_km.nuser;
+}
+
+int rtx_keymap_setup(int host, const char *path, char *err, size_t errn) {
+    char def[1024];
+    char *text;
+    size_t n;
+    int missing, rc, explicit_path = 1;
+    if (err && errn) err[0] = 0;
+    if (!path || !path[0]) {
+        const char *env = getenv("RTX_KEYS");
+        if (env && env[0]) {
+            path = env;
+        } else {
+            explicit_path = 0;
+            if (!rtx_config_path("keys.json", def, sizeof def)) {
+                rtx_keymap_defaults(host);
+                return 0;
+            }
+            path = def;
+        }
+    }
+    text = km_read(path, &n, &missing);
+    if (!text) {
+        rtx_keymap_defaults(host);
+        if (missing && !explicit_path) return 0;
+        if (err && errn) snprintf(err, errn, "keys: cannot read %s", path);
+        return -1;
+    }
+    rc = rtx_keymap_load_text(host, text, n, err, errn);
+    free(text);
+    return rc;
+}
+
+/* ---- settings --------------------------------------------------------- */
+
+static int km_int(RtxJw *j, int *out) {
+    int v = 0, neg = 0, nd = 0;
+    rtx_jw_ws(j);
+    if (j->i < j->n && j->s[j->i] == '-') {
+        neg = 1;
+        j->i++;
+    }
+    while (j->i < j->n && j->s[j->i] >= '0' && j->s[j->i] <= '9') {
+        if (v < 100000) v = v * 10 + (j->s[j->i] - '0');
+        j->i++;
+        nd++;
+    }
+    if (!nd) return 0;
+    *out = neg ? -v : v;
+    return 1;
+}
+
+int rtx_settings_parse(const char *text, size_t n, RtxSettings *s, char *err,
+                       size_t errn) {
+    RtxJw j;
+    char *copy;
+    int nwarn = 0;
+    char msg[160];
+    int ok = 1;
+    if (err && errn) err[0] = 0;
+    if (!s) return -1;
+    if (!text || !n) return 0;
+    copy = (char *)malloc(n + 1);
+    if (!copy) return -1;
+    memcpy(copy, text, n);
+    copy[n] = 0;
+    km_strip_comments(copy, n);
+    j.s = copy;
+    j.n = n;
+    j.i = 0;
+    rtx_jw_ws(&j);
+    if (j.i >= j.n) {
+        free(copy);
+        return 0;
+    }
+    if (!rtx_jw_eat(&j, '{')) ok = 0;
+    rtx_jw_ws(&j);
+    if (ok && !rtx_jw_eat(&j, '}')) {
+        for (;;) {
+            char key[48];
+            int b = 0, v = 0;
+            if (!rtx_jw_string(&j, key, sizeof key) || !rtx_jw_eat(&j, ':')) {
+                ok = 0;
+                break;
+            }
+            if (strcmp(key, "tab_spaces") == 0) {
+                if (!km_int(&j, &v)) { ok = 0; break; }
+                if (v < 0 || v > 16) {
+                    km_note(err, errn, &nwarn, "settings: tab_spaces takes 0-16");
+                } else {
+                    s->tab_spaces = v;
+                    s->has_tab_spaces = 1;
+                }
+            } else if (strcmp(key, "esc_timeout_ms") == 0) {
+                if (!km_int(&j, &v)) { ok = 0; break; }
+                if (v < 1 || v > 1000) {
+                    km_note(err, errn, &nwarn, "settings: esc_timeout_ms takes 1-1000");
+                } else {
+                    s->esc_timeout_ms = v;
+                    s->has_esc_timeout_ms = 1;
+                }
+            } else if (strcmp(key, "autopair") == 0) {
+                if (!rtx_jw_bool(&j, &b)) { ok = 0; break; }
+                s->autopair = b;
+                s->has_autopair = 1;
+            } else if (strcmp(key, "blink") == 0) {
+                if (!rtx_jw_bool(&j, &b)) { ok = 0; break; }
+                s->blink = b;
+                s->has_blink = 1;
+            } else if (strcmp(key, "caret_fade") == 0) {
+                if (!rtx_jw_bool(&j, &b)) { ok = 0; break; }
+                s->caret_fade = b;
+                s->has_caret_fade = 1;
+            } else if (strcmp(key, "scroll_regions") == 0) {
+                if (!rtx_jw_bool(&j, &b)) { ok = 0; break; }
+                s->scroll_regions = b;
+                s->has_scroll_regions = 1;
+            } else if (strcmp(key, "rich") == 0) {
+                if (!rtx_jw_bool(&j, &b)) { ok = 0; break; }
+                s->rich = b;
+                s->has_rich = 1;
+            } else if (strcmp(key, "caret") == 0) {
+                char cv[16];
+                if (!rtx_jw_string(&j, cv, sizeof cv)) { ok = 0; break; }
+                if (strcmp(cv, "cell") == 0) {
+                    s->caret_cell = 1;
+                    s->has_caret = 1;
+                } else if (strcmp(cv, "cursor") == 0) {
+                    s->caret_cell = 0;
+                    s->has_caret = 1;
+                } else {
+                    km_note(err, errn, &nwarn, "settings: caret is cursor or cell");
+                }
+            } else {
+                snprintf(msg, sizeof msg, "settings: unknown key \"%s\"", key);
+                km_note(err, errn, &nwarn, msg);
+                if (!rtx_jw_skip(&j)) { ok = 0; break; }
+            }
+            if (rtx_jw_eat(&j, '}')) break;
+            if (!rtx_jw_eat(&j, ',')) { ok = 0; break; }
+        }
+    }
+    if (ok) {
+        rtx_jw_ws(&j);
+        if (j.i < j.n) ok = 0;
+    }
+    if (!ok) {
+        if (err && errn)
+            snprintf(err, errn, "settings: JSON error near byte %zu", j.i);
+        free(copy);
+        return -1;
+    }
+    free(copy);
+    return 0;
+}
+
+int rtx_settings_load(const char *path, RtxSettings *s, char *err, size_t errn) {
+    char def[1024];
+    char *text;
+    size_t n;
+    int missing, rc, explicit_path = 1;
+    if (err && errn) err[0] = 0;
+    if (!s) return -1;
+    if (!path || !path[0]) {
+        const char *env = getenv("RTX_SETTINGS");
+        if (env && env[0]) {
+            path = env;
+        } else {
+            explicit_path = 0;
+            if (!rtx_config_path("settings.json", def, sizeof def)) return 0;
+            path = def;
+        }
+    }
+    text = km_read(path, &n, &missing);
+    if (!text) {
+        if (missing && !explicit_path) return 0;
+        if (err && errn) snprintf(err, errn, "settings: cannot read %s", path);
+        return -1;
+    }
+    rc = rtx_settings_parse(text, n, s, err, errn);
+    free(text);
+    return rc;
+}

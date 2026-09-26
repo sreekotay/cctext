@@ -1,0 +1,290 @@
+#!ccc ccs
+/*
+ * Scan race smoke: type, undo, park, and destroy while the find arm and
+ * the island arm are live over a >4 MiB file. Always dest-live (the
+ * inline schedule is switched off here), so the lanes really run beside
+ * the edits. The tree must not move under a lane, and the find patch /
+ * island count must still match a naive model after the dust settles.
+ * `./make.shcc @smoke_tsan` runs this under ThreadSanitizer.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+#include "../core/browse.cch"
+
+#define RACE_PATH_A "testdata/generated/scan_race_a.txt"
+#define RACE_PATH_B "testdata/generated/scan_race_b.txt"
+#define RACE_LINES 150000
+#define RACE_NEEDLE "needle"
+
+static int fails = 0;
+static unsigned race_rng = 0x5eed1234u;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static unsigned race_next(void) {
+    race_rng = race_rng * 1103515245u + 12345u;
+    return race_rng >> 1;
+}
+
+/* ~6 MiB: 150k lines of ~42 bytes, a needle every 97th line. */
+static int race_write(const char *path, int salt) {
+    FILE *fp;
+    int i;
+    if (system("mkdir -p testdata/generated") != 0) return 0;
+    fp = fopen(path, "w");
+    if (!fp) return 0;
+    for (i = 0; i < RACE_LINES; i++) {
+        if ((i + salt) % 97 == 0)
+            fprintf(fp, "row %07d pad pad pad %s pad\n", i, RACE_NEEDLE);
+        else
+            fprintf(fp, "row %07d pad pad pad pad pad pad pad\n", i);
+    }
+    fclose(fp);
+    return 1;
+}
+
+static char *race_slurp(RtxDoc *d, CCArena a, size_t *n_out) {
+    size_t n = d->len();
+    char *buf;
+    size_t got;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return NULL;
+    }
+    buf = (char *)cc_arena_alloc(a, n + 1, 1);
+    if (!buf) return NULL;
+    got = d->read_at(0, cc_slice_from_buffer(buf, n)) !>;
+    if (got != n) return NULL;
+    *n_out = n;
+    return buf;
+}
+
+/* Find and the island after a settle must match the bytes. */
+static void race_verify(RtxDoc *d, const char *tag) {
+    CCArena a = cc_arena_heap(d->len() + megabytes(1)) @destroy;
+    size_t n = 0, qn = strlen(RACE_NEEDLE), i, h, nl, want_hits;
+    char *buf;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    @errhandler(RtxIndexErr e) {
+        fprintf(stderr, "%s: %s\n", tag, e.message ? e.message : "index");
+        fails++;
+        return;
+    }
+    d->find_finish() !>;
+    rtx_line_isle_finish(&d->tree) !>;
+    buf = race_slurp(d, a, &n);
+    expect(buf != NULL, "race slurp");
+    if (!buf) return;
+    expect(d->find.done && !d->find.truncated, "race find settles");
+    expect(rtx_find_hits_n(&d->find) == d->find.hits.len,
+           "published hit count is the list");
+    h = 0;
+    nl = 0;
+    want_hits = 0;
+    for (i = 0; i + qn <= n; i++) {
+        if (memcmp(buf + i, RACE_NEEDLE, qn) == 0) {
+            if (h < d->find.hits.len) {
+                if (d->find.hits.data[h].off != i ||
+                    d->find.hits.data[h].line != nl) {
+                    fprintf(stderr, "  %s hit %zu: off %zu line %zu want %zu / %zu\n",
+                            tag, h, d->find.hits.data[h].off,
+                            d->find.hits.data[h].line, i, nl);
+                    fails++;
+                    return;
+                }
+            }
+            h++;
+            want_hits++;
+        }
+        if (buf[i] == '\n') nl++;
+    }
+    if (want_hits != d->find.hits.len) {
+        fprintf(stderr, "  %s hits %zu want %zu\n", tag, d->find.hits.len, want_hits);
+        fails++;
+    }
+    if (rtx_line_isle_connected(&d->tree)) {
+        size_t at = d->tree.isle_anchor, lf = 0;
+        for (i = 0; i < at && i < n; i++)
+            if (buf[i] == '\n') lf++;
+        if (rtx_line_isle_line(&d->tree) != lf) {
+            fprintf(stderr, "  %s island line %zu want %zu\n", tag,
+                    rtx_line_isle_line(&d->tree), lf);
+            fails++;
+        }
+    }
+    rtx_line_scan_to(&d->tree, n) !>;
+    for (h = 0; h < 64; h++) {
+        size_t off = (size_t)race_next() % (n + 1);
+        size_t got = d->line_of(off) !>;
+        nl = 0;
+        for (i = 0; i < off; i++)
+            if (buf[i] == '\n') nl++;
+        if (got != nl) {
+            fprintf(stderr, "  %s line_of(%zu) %zu want %zu\n", tag, off, got, nl);
+            fails++;
+            break;
+        }
+    }
+    expect(d->tree.check(), "race tree weights");
+}
+
+/* Kick whatever an edit dropped: find resumes from scan_off, the island
+ * lands somewhere past the prefix. Sometimes park the write stages the
+ * way a frontend does while it paints. */
+static void race_kick(RtxDoc *d) {
+    size_t n = d->len();
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    if (!d->find.done && !d->find.h.live()) d->find_step() !>;
+    if (n) rtx_line_isle_kick(&d->tree, n / 4 + (size_t)race_next() % (n - n / 4));
+    if ((race_next() & 3u) == 0) {
+        rtx_find_pause(d);
+        rtx_line_isle_pause(&d->tree);
+    }
+    if (race_next() & 1u) usleep((useconds_t)(race_next() % 400));
+}
+
+static void !>(CCError) race_edit(RtxDoc *d) {
+    size_t n = d->len();
+    size_t off = n ? (size_t)race_next() % (n + 1) : 0;
+    unsigned k = race_next() % 8u;
+    @errhandler(CCError e) { return cc_err(e); }
+    switch (k) {
+    case 0:
+        d->replace(off, 0, "x needle\n") !>;
+        break;
+    case 1:
+        d->replace(off, 0, "ab") !>;
+        break;
+    case 2: {
+        size_t del = 1 + (size_t)race_next() % 60;
+        if (del > n - off) del = n - off;
+        if (del) d->replace(off, del, cc_slice_empty()) !>;
+        break;
+    }
+    case 3: {
+        /* Past RTX_HIST_INLINE_MAX: undo splices piece refs back. */
+        size_t del = (size_t)RTX_HIST_INLINE_MAX + 1 + (size_t)race_next() % 4096;
+        if (off > n / 2) off = n / 4;
+        if (del > n - off) del = n - off;
+        if (del) d->replace(off, del, cc_slice_empty()) !>;
+        break;
+    }
+    case 4:
+    case 5:
+        d->undo() !>;
+        break;
+    case 6:
+        d->redo() !>;
+        break;
+    default: {
+        size_t del = (size_t)race_next() % 12;
+        if (del > n - off) del = n - off;
+        d->replace(off, del, "needle\n\n") !>;
+        break;
+    }
+    }
+    return cc_ok();
+}
+
+int main(void) {
+    int i;
+    @errhandler(CCError e) { cc_error_log(e); return 1; }
+    /* This smoke is the dest-live schedule; @smoke_inline must not fold it. */
+    unsetenv("RTX_PARALLEL_INLINE");
+    rtx_safe_test_isol();
+    expect(race_write(RACE_PATH_A, 0), "race fixture a");
+    expect(race_write(RACE_PATH_B, 13), "race fixture b");
+
+    /* Type / undo / redo while both arms are live. */
+    {
+        RtxDoc d = {0} @destroy;
+        d.from_path(cc_slice_cstr(RACE_PATH_A)) !>;
+        expect(d.len() > (size_t)(4 * 1024 * 1024), "race file above 4 MiB");
+        d.find_set(RACE_NEEDLE) !>;
+        for (i = 0; i < 240; i++) {
+            race_kick(&d);
+            race_edit(&d) !>;
+            if (i % 60 == 59) race_verify(&d, "type");
+        }
+        race_kick(&d);
+        race_verify(&d, "type end");
+    }
+
+    /* Destroy with the arms live, running, or paused. */
+    for (i = 0; i < 24; i++) {
+        RtxDoc d = {0};
+        d.from_path(cc_slice_cstr((i & 1) ? RACE_PATH_B : RACE_PATH_A)) !>;
+        d.find_set(RACE_NEEDLE) !>;
+        rtx_line_isle_kick(&d.tree, d.len() - 1 - (size_t)race_next() % 4096);
+        if (i % 3 == 1) {
+            rtx_find_pause(&d);
+            rtx_line_isle_pause(&d.tree);
+        }
+        if (i % 4 == 2) d.replace(d.len() / 3, 0, "zz\n") !>;
+        if (i & 2) usleep((useconds_t)(race_next() % 3000));
+        d.destroy();
+    }
+
+    /* Park / unpark: next_buf evicts the hidden buffer's document epoch
+     * while its find and island arms are still walking. */
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[2] = {(char *)RACE_PATH_A, (char *)RACE_PATH_B};
+        w.open_files(2, paths) !>;
+        if (w.npanes > 1) w.toggle_split();
+        w.sync_live() !>;
+        for (i = 0; i < 16; i++) {
+            RtxBuf *b = w.active();
+            expect(b && !b->parked, "active buf is live");
+            if (!b || b->parked) break;
+            b->doc.find_set(RACE_NEEDLE) !>;
+            rtx_line_isle_kick(&b->doc.tree, b->doc.len() / 2);
+            if (i % 3 == 0) {
+                b->doc.replace(b->doc.len() / 5, 0, "q") !>;
+                b->doc.undo() !>;
+            }
+            if (i % 4 == 1) rtx_ws_scans_set(&w, 1);
+            if (i & 1) usleep((useconds_t)(race_next() % 2000));
+            w.next_buf();
+            if (i % 4 == 1) rtx_ws_scans_set(&w, 0);
+        }
+        {
+            RtxBuf *b = w.active();
+            if (b && !b->parked) {
+                b->doc.find_set(RACE_NEEDLE) !>;
+                race_verify(&b->doc, "park");
+            }
+        }
+    }
+
+    remove(RACE_PATH_A);
+    remove(RACE_PATH_B);
+    if (fails) {
+        fprintf(stderr, "%d failure(s)\n", fails);
+        return 1;
+    }
+    printf("scan_race_smoke ok\n");
+    return 0;
+}

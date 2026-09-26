@@ -78,6 +78,161 @@ static double lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
     return 1.0;
 }
 
+/* Rich edit round trip. `script` is steps split by " / "; each step is
+ * one expected hist record. Tokens: `@N` caret+anchor, `~N` caret only,
+ * `'abc` type, `<` backspace, `>` delete, `!name` apply, `%` cycle,
+ * `X` cut, `E` enter, `T` / `R` Tab / Shift-Tab. After each step the
+ * bytes are snapped; undo walks the snaps back to the original, redo
+ * walks them forward. */
+#define RT_SNAPS 8
+#define RT_CAP 512
+
+static int rt_read(RtxDoc *d, char *dst) {
+    size_t n = d->len(), got;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    if (n >= RT_CAP) return 0;
+    got = d->read_at(0, cc_slice_from_buffer(dst, n)) !>;
+    dst[got] = 0;
+    return got == n;
+}
+
+static void !>(CCError) rt_op(RtxWs *w, RtxBuf *b, RtxMeasure *m,
+                              const char *tok, size_t tn) {
+    char name[32];
+    size_t i;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    switch (tok[0]) {
+        case '@':
+            b->doc.caret = (size_t)atoi(tok + 1);
+            b->doc.sel_anchor = b->doc.caret;
+            return cc_ok();
+        case '~':
+            b->doc.caret = (size_t)atoi(tok + 1);
+            return cc_ok();
+        case '\'':
+            for (i = 1; i < tn; i++) {
+                b->type_cp((uint32_t)(unsigned char)tok[i]) !>;
+                b->after_edit(m, 800.0, 20) !>;
+            }
+            return cc_ok();
+        case '<': b->backspace() !>; break;
+        case '>': b->delete_forward() !>; break;
+        case '%': b->apply_cycle() !>; break;
+        case 'X': w->cut() !>; break;
+        case 'E': b->enter() !>; break;
+        case 'T': b->move_md_col(1) !>; break;
+        case 'R': b->move_md_col(-1) !>; break;
+        case '!':
+            if (tn - 1 >= sizeof name) return cc_err(CC_ERR_INVALID_ARG, "rt name");
+            memcpy(name, tok + 1, tn - 1);
+            name[tn - 1] = 0;
+            b->apply_named(cc_slice_cstr(name)) !>;
+            break;
+        default:
+            return cc_err(CC_ERR_INVALID_ARG, "rt token");
+    }
+    return b->after_edit(m, 800.0, 20);
+}
+
+static void rt_rich(const char *text, const char *script, const char *want,
+                    const char *tag) {
+    RtxWs w = {0} @destroy;
+    RtxBuf *b;
+    RtxMeasure m;
+    char *paths[1];
+    char path[] = "/tmp/rtx_rich_rt_XXXXXX";
+    char mdpath[64];
+    char snap[RT_SNAPS][RT_CAP];
+    char now[RT_CAP];
+    int ns = 0, k, fd;
+    const char *p;
+    @errhandler(CCError e) {
+        fprintf(stderr, "FAIL: %s: ", tag);
+        cc_error_log(e);
+        fails++;
+        remove(mdpath);
+        return;
+    }
+    m.measure = meas;
+    m.line_height = lh;
+    m.ctx = NULL;
+    mdpath[0] = 0;
+    fd = mkstemp(path);
+    if (fd < 0) {
+        expect(0, "rt: tmp file");
+        return;
+    }
+    (void)!write(fd, text, strlen(text));
+    close(fd);
+    snprintf(mdpath, sizeof mdpath, "%s.md", path);
+    rename(path, mdpath); /* grammar is chosen by extension */
+    paths[0] = mdpath;
+    w.open_files(1, paths) !>;
+    b = w.active();
+    b->layout.rich = 1;
+    b->layout.doc(&b->doc, &m, 800.0) !>;
+    expect(rt_read(&b->doc, snap[ns++]), tag);
+    p = script;
+    while (*p) {
+        const char *q;
+        while (*p == ' ') p++;
+        if (!*p) break;
+        if (*p == '/') {
+            if (ns < RT_SNAPS) expect(rt_read(&b->doc, snap[ns++]), tag);
+            p++;
+            continue;
+        }
+        q = p;
+        while (*q && *q != ' ') q++;
+        rt_op(&w, b, &m, p, (size_t)(q - p)) !>;
+        p = q;
+    }
+    if (ns < RT_SNAPS) expect(rt_read(&b->doc, snap[ns++]), tag);
+    if (want && strcmp(snap[ns - 1], want) != 0) {
+        fprintf(stderr, "FAIL: %s: script got '%s' want '%s'\n", tag,
+                snap[ns - 1], want);
+        fails++;
+    }
+    for (k = ns - 2; k >= 0; k--) {
+        b->doc.undo() !>;
+        b->after_edit(&m, 800.0, 20) !>;
+        rt_read(&b->doc, now);
+        if (strcmp(now, snap[k]) != 0) {
+            fprintf(stderr, "FAIL: %s: undo to step %d got '%s' want '%s'\n",
+                    tag, k, now, snap[k]);
+            fails++;
+            remove(mdpath);
+            return;
+        }
+    }
+    if (b->doc.can_undo()) {
+        fprintf(stderr, "FAIL: %s: extra undo record\n", tag);
+        fails++;
+    }
+    for (k = 1; k < ns; k++) {
+        if (!b->doc.can_redo()) {
+            fprintf(stderr, "FAIL: %s: redo stops at step %d\n", tag, k);
+            fails++;
+            break;
+        }
+        b->doc.redo() !>;
+        b->after_edit(&m, 800.0, 20) !>;
+        rt_read(&b->doc, now);
+        if (strcmp(now, snap[k]) != 0) {
+            fprintf(stderr, "FAIL: %s: redo to step %d got '%s' want '%s'\n",
+                    tag, k, now, snap[k]);
+            fails++;
+            break;
+        }
+    }
+    remove(mdpath);
+}
+
 static void !>(CCError) browse_wait(RtxBrowse *br) {
     if (!br) return cc_ok();
     return rtx_browse_finish(br);
@@ -87,10 +242,23 @@ static void !>(CCError) browse_wait(RtxBrowse *br) {
 static void !>(CCError) browse_pump_only(RtxBrowse *br, size_t max_pumps) {
     size_t n = 0;
     if (!br) return cc_ok();
-    while (br->scanning && n < max_pumps) {
+    while (rtx_browse_scanning(br) && n < max_pumps) {
         rtx_browse_pump(br) !>(e) { return cc_err(e); };
         n++;
     }
+    return cc_ok();
+}
+
+/* Preview open is off-main: kick, join, then fill. */
+static void !>(CCError) browse_prev_ready(RtxWs *w, RtxMeasure *m, double width,
+                                         int vis) {
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (!w) return cc_ok();
+    w->browse_prev_sync(0, m, width, vis) !>;
+    w->browse_prev_flush(0) !>;
+    w->browse_prev_sync(0, m, width, vis) !>;
     return cc_ok();
 }
 
@@ -869,6 +1037,78 @@ int main(void) {
         ui.blink_at = rtx_ui_now_ms() - (long)RTX_UI_BLINK_MS - 1;
         expect(rtx_ui_blink_step(&ui) == 0, "no-blink ignores timer");
         expect(rtx_ui_blink(&ui) == 1, "no-blink stays on");
+        expect(rtx_ui_blink_next_ms(&ui, rtx_ui_now_ms()) < 0,
+               "no-blink: host sleeps until input");
+    }
+
+    {
+        /* Blink stops (solid, no timer) after the idle timeout or on
+         * focus-out; input or focus-in starts it again. */
+        RtxUi ui = {0};
+        long now = rtx_ui_now_ms();
+        long next;
+        ui.blink_idle_ms = 1000;
+        rtx_ui_blink_show(&ui);
+        next = rtx_ui_blink_next_ms(&ui, now);
+        expect(next > 0 && next <= (long)RTX_UI_BLINK_MS, "blink: next toggle due");
+        ui.blink_at = now - (long)RTX_UI_BLINK_MS;
+        expect(rtx_ui_blink_step(&ui) == 1 && rtx_ui_blink(&ui) == 0,
+               "blink: toggles while live");
+        /* Idle past the timeout with the caret off: one last paint shows
+         * it, then nothing is due. */
+        ui.input_at = now - 2000;
+        ui.blink_at = now - (long)RTX_UI_BLINK_MS;
+        expect(!rtx_ui_blink_live(&ui, rtx_ui_now_ms()), "blink: idle stops the timer");
+        expect(rtx_ui_blink_next_ms(&ui, rtx_ui_now_ms()) == 0, "blink: idle owes a show");
+        expect(rtx_ui_blink_step(&ui) == 1 && rtx_ui_blink(&ui) == 1,
+               "blink: idle settles visible");
+        expect(rtx_ui_blink_next_ms(&ui, rtx_ui_now_ms()) < 0, "blink: idle sleeps");
+        expect(rtx_ui_blink_step(&ui) == 0, "blink: idle step is quiet");
+        rtx_ui_blink_show(&ui);
+        expect(rtx_ui_blink_live(&ui, rtx_ui_now_ms()) &&
+               rtx_ui_blink_next_ms(&ui, rtx_ui_now_ms()) > 0,
+               "blink: input restarts the timer");
+        /* Focus-out with the caret off: shown at once, no timer. */
+        ui.blink = 0;
+        expect(rtx_ui_blink_focus(&ui, 0) == 1 && rtx_ui_blink(&ui) == 1,
+               "blink: focus-out shows the caret");
+        expect(rtx_ui_blink_next_ms(&ui, rtx_ui_now_ms()) < 0, "blink: unfocused sleeps");
+        ui.blink_at = rtx_ui_now_ms() - 10 * (long)RTX_UI_BLINK_MS;
+        expect(rtx_ui_blink_step(&ui) == 0 && rtx_ui_blink(&ui) == 1,
+               "blink: unfocused does not toggle");
+        expect(rtx_ui_blink_focus(&ui, 1) == 0 &&
+               rtx_ui_blink_live(&ui, rtx_ui_now_ms()),
+               "blink: focus-in restarts the timer");
+        ui.blink_idle_ms = -1;
+        ui.input_at = rtx_ui_now_ms() - 3600L * 1000L;
+        expect(rtx_ui_blink_live(&ui, rtx_ui_now_ms()), "blink: idle < 0 never stops");
+    }
+
+    {
+        /* Soft blink (Cursor / VS Code): host caret, editor owns the timer. */
+        RtxUi ui = {0};
+        long now;
+        ui.caret_host = 1;
+        ui.host_blinks = 0;
+        ui.blink_idle_ms = 1000;
+        rtx_ui_blink_show(&ui);
+        now = rtx_ui_now_ms();
+        expect(rtx_ui_blink(&ui) == 1, "soft blink: starts visible");
+        expect(rtx_ui_blink_next_ms(&ui, now) > 0, "soft blink: timer armed");
+        ui.blink_at = now - (long)RTX_UI_BLINK_MS;
+        expect(rtx_ui_blink_step(&ui) == 1 && rtx_ui_blink(&ui) == 0,
+               "soft blink: toggles off");
+        ui.blink_at = rtx_ui_now_ms() - (long)RTX_UI_BLINK_MS;
+        expect(rtx_ui_blink_step(&ui) == 1 && rtx_ui_blink(&ui) == 1,
+               "soft blink: toggles on");
+        /* Terminal-owned blink: no wakeups. */
+        ui.host_blinks = 1;
+        ui.blink = 0;
+        ui.blink_at = rtx_ui_now_ms() - (long)RTX_UI_BLINK_MS;
+        expect(rtx_ui_blink_step(&ui) == 0 && rtx_ui_blink(&ui) == 1,
+               "host blinks: step is quiet, caret lit");
+        expect(rtx_ui_blink_next_ms(&ui, rtx_ui_now_ms()) < 0,
+               "host blinks: sleep until input");
     }
 
     {
@@ -939,7 +1179,7 @@ int main(void) {
         w.toggle_split();
         expect(w.npanes == 2 && RtxWs_same_split(&w), "same-file split has two cameras");
         w.bufs[0]->top = 0;
-        w.side.top = 0;
+        w.cam[0].top = 0;
         {
             RtxBuf *act = RtxWs_active(&w);
             act->top = 2;
@@ -948,7 +1188,7 @@ int main(void) {
             act = RtxWs_active(&w);
             expect(act->top == 0, "other pane kept its own top");
         }
-        expect(w.side.top == 2, "unfocused top is stashed");
+        expect(w.cam[1].top == 2, "unfocused top is stashed");
         w.toggle_split();
         expect(w.npanes == 1 && !RtxWs_same_split(&w), "unsplit drops the side camera");
     }
@@ -966,17 +1206,17 @@ int main(void) {
         w.focus_other();
         act = RtxWs_active(&w);
         act->ensure_view(&m, 40, 4) !>;
-        expect(w.side.live && w.side.layout.rows.len > 0, "unfocused camera has rows");
-        w.side.layout.rows.data[0].byte_start = 100000;
-        w.side.layout.rows.data[0].byte_len = 50;
+        expect(w.cam[1].live && w.cam[1].layout.rows.len > 0, "unfocused camera has rows");
+        w.cam[1].layout.rows.data[0].byte_start = 100000;
+        w.cam[1].layout.rows.data[0].byte_len = 50;
         act->doc.caret = 0;
         act->doc.sel_anchor = 0;
         act->doc.delete_forward() !>;
         w.after_edit(w.pane[w.focus], &m, 40, 40, 4) !>;
         n = act->len();
-        expect(w.side.layout.rows.len > 0, "unfocused camera rebuilt after edit");
-        for (i = 0; i < w.side.layout.rows.len; i++) {
-            expect(w.side.layout.rows.data[i].byte_start + w.side.layout.rows.data[i].byte_len <= n,
+        expect(w.cam[1].layout.rows.len > 0, "unfocused camera rebuilt after edit");
+        for (i = 0; i < w.cam[1].layout.rows.len; i++) {
+            expect(w.cam[1].layout.rows.data[i].byte_start + w.cam[1].layout.rows.data[i].byte_len <= n,
                    "unfocused row in range after edit");
         }
         for (i = 0; i < act->layout.rows.len; i++) {
@@ -995,7 +1235,7 @@ int main(void) {
         w.open_files(1, paths) !>;
         w.browse_start() !>;
         br = RtxWs_browse(&w);
-        expect(br && (br->scanning || br->ents.len > 1),
+        expect(br && (rtx_browse_scanning(br) || rtx_browse_view_len(br) > 1),
                "kick planted a listing");
         browse_wait(br) !>;
         expect(br && br->ents.len > 1, "listing lists more than ..");
@@ -1084,17 +1324,16 @@ int main(void) {
             char sel[RTX_BROWSE_DIR];
             int is_dir = 1;
             expect(!rtx_host_is_ray("cctext"), "cctext is not gui");
-            expect(rtx_host_is_ray("cctext-gui"), "cctext-gui is gui");
             expect(rtx_host_is_ray("cctext-ui"), "cctext-ui is gui");
-            expect(rtx_host_is_ray("/opt/bin/cctext_gui"), "cctext_gui is gui");
+            expect(rtx_host_is_ray("/opt/bin/cctext_ui"), "cctext_ui is gui");
             expect(rtx_host_peer_path("/opt/bin/cctext", 0, peer, sizeof(peer)) &&
                    strcmp(peer, "/opt/bin/cctext") == 0, "self keeps this exe");
             expect(rtx_host_peer_path("/opt/bin/cctext", 1, peer, sizeof(peer)) &&
-                   strcmp(peer, "/opt/bin/cctext-gui") == 0, "peer of cctext is gui");
-            expect(rtx_host_peer_path("/opt/bin/cctext-gui", 1, peer, sizeof(peer)) &&
+                   strcmp(peer, "/opt/bin/cctext-ui") == 0, "peer of cctext is gui");
+            expect(rtx_host_peer_path("/opt/bin/cctext-ui", 1, peer, sizeof(peer)) &&
                    strcmp(peer, "/opt/bin/cctext") == 0, "peer of gui is cctext");
             expect(rtx_host_peer_path("cctext", 1, peer, sizeof(peer)) &&
-                   strcmp(peer, "cctext-gui") == 0, "bare peer has no dir");
+                   strcmp(peer, "cctext-ui") == 0, "bare peer has no dir");
 #ifdef __APPLE__
             {
                 char *old_term = getenv("TERM_PROGRAM");
@@ -1495,11 +1734,11 @@ int main(void) {
         w.browse_start() !>;
         w.browse_glob_set("readme") !>;
         br = RtxWs_browse(&w);
-        expect(br->scanning || br->ents.len > 0, "flatten listing kicked");
+        expect(rtx_browse_scanning(br) || rtx_browse_view_len(br) > 0, "flatten listing kicked");
         w.browse_glob_set("zzz") !>;
         br = RtxWs_browse(&w);
         browse_wait(br) !>;
-        expect(!br->scanning, "cancel+kick then wait");
+        expect(!rtx_browse_scanning(br), "cancel+kick then wait");
         {
             int readme = 0;
             for (i = 0; i < br->ents.len; i++) {
@@ -1520,11 +1759,14 @@ int main(void) {
         w.browse_start() !>;
         w.browse_glob_set(">") !>;
         br = RtxWs_browse(&w);
-        expect(br->scanning || br->ents.len >= 1, "glob set kicks");
-        expect(br->ents.len >= 1 && strcmp(br->ents.data[0].name, "..") == 0,
-               ".. planted at kick");
+        expect(rtx_browse_scanning(br) || rtx_browse_view_len(br) >= 1, "glob set kicks");
+        {
+            RtxBrowsePub v = rtx_browse_view_snap(br);
+            expect(v.len >= 1 && strcmp(v.ents[0].name, "..") == 0,
+                   ".. planted at kick");
+        }
         browse_wait(br) !>;
-        expect(!br->scanning, "finish drains");
+        expect(!rtx_browse_scanning(br), "finish drains");
         {
             int saw_nested = 0, saw_small = 0, saw_dir = 0;
             for (i = 0; i < br->ents.len; i++) {
@@ -1826,7 +2068,7 @@ int main(void) {
         ms = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_usec - t0.tv_usec) / 1000L;
         br = RtxWs_browse(&w);
         expect(ms < 400, "wave kick returns before the fat dir is drained");
-        expect(br->scanning, "kick leaves later waves for the pump");
+        expect(rtx_browse_scanning(br), "kick leaves later waves for the pump");
         expect(browse_name_hits(br, "wide/needle") == 0,
                "first wave is the local listing, not wide/");
         expect(browse_name_hits(br, "proj/needle_hit") == 0,
@@ -1834,7 +2076,7 @@ int main(void) {
         expect(browse_name_hits(br, "node_modules") == 0,
                "vendor needle is not a local hit");
         browse_pump_only(br, 10000) !>;
-        expect(!br->scanning, "pump joins finished waves; flatten does not stall");
+        expect(!rtx_browse_scanning(br), "pump joins finished waves; flatten does not stall");
         expect(browse_name_hits(br, "wide/needle") == want,
                "pumps collect the split wide/ directory");
         expect(browse_name_hits(br, "proj/needle_hit") == 1,
@@ -1843,7 +2085,7 @@ int main(void) {
                "flatten does not descend node_modules");
         gettimeofday(&t0, NULL);
         w.browse_glob_set("needle") !>;
-        expect(RtxWs_browse(&w)->scanning, "retype starts another flatten");
+        expect(rtx_browse_scanning(RtxWs_browse(&w)), "retype starts another flatten");
         w.browse_glob_set("zzz") !>;
         gettimeofday(&t1, NULL);
         ms = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_usec - t0.tv_usec) / 1000L;
@@ -1890,11 +2132,11 @@ int main(void) {
         snprintf(br->dir, sizeof(br->dir), "%s", abs);
         w.browse_glob_set("8g") !>;
         br = RtxWs_browse(&w);
-        expect(br->scanning, "8g flatten is still scanning after kick");
+        expect(rtx_browse_scanning(br), "8g flatten is still scanning after kick");
         expect(browse_name_hits(br, "8g_hit") == 0,
                "first wave has not walked nest/");
         browse_pump_only(br, 10000) !>;
-        expect(!br->scanning, "pumps finish flatten without finish()");
+        expect(!rtx_browse_scanning(br), "pumps finish flatten without finish()");
         for (i = 0; i < br->ents.len; i++) {
             if (br->ents.data[i].sep && strstr(br->ents.data[i].name, "Flattened search"))
                 saw_div = 1;
@@ -1936,7 +2178,7 @@ int main(void) {
         expect(browse_name_hits(br, "nest/8g_hit") == 1, "hold smoke finds 8g");
         w.browse_glob_set("8gx") !>;
         br = RtxWs_browse(&w);
-        expect(br->scanning, "retype starts a new flatten");
+        expect(rtx_browse_scanning(br), "retype starts a new flatten");
         expect(rtx_browse_hold_on(br), "retype keeps the last list");
         expect(browse_name_hits(br, "nest/8g_hit") == 1,
                "paint still shows the last flatten rows");
@@ -1960,7 +2202,7 @@ int main(void) {
         browse_wait(br) !>;
         expect(br->ents.len && strcmp(br->ents.data[br->cur].name, "small.txt") == 0,
                "preview smoke starts on small.txt");
-        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        browse_prev_ready(&w, &m, 40.0, 8) !>;
         pv = &w.prev[0];
         expect(pv->live && pv->kind == RTX_BROWSE_PREV_FILE,
                "selected file opens a preview doc");
@@ -1975,9 +2217,31 @@ int main(void) {
             expect(rail.len == pv->doc.len(), "preview rail matches the doc");
             expect(rail.vis > 0, "preview rail has a window");
         }
+        {
+            size_t before = pv->cam.seek_valid ? pv->cam.seek_off
+                                              : (pv->layout.rows.len
+                                                     ? pv->layout.rows.data[0]
+                                                           .byte_start
+                                                     : 0);
+            size_t after;
+            size_t wrap0 = pv->cam.top_wrap;
+            rtx_browse_prev_scroll_vis(pv, &m, 40.0, 8, 1) !>;
+            after = pv->cam.seek_valid ? pv->cam.seek_off
+                                      : (pv->layout.rows.len
+                                             ? pv->layout.rows.data[pv->cam.top_wrap]
+                                                   .byte_start
+                                             : 0);
+            expect(after > before || pv->cam.top_wrap > wrap0,
+                   "preview scroll down advances the camera");
+            rtx_browse_prev_scroll_to_off(pv, &m, 40.0, 8, pv->doc.len() / 2) !>;
+            expect(pv->cam.seek_valid && pv->cam.top_wrap == 0,
+                   "preview rail jump seeks without opening");
+            expect(pv->live && pv->kind == RTX_BROWSE_PREV_FILE,
+                   "preview scroll does not open / drop the doc");
+        }
         w.browse_prev_cycle(0);
         expect(pv->layout.view == RTX_VIEW_HEX, "Ctrl-L preview -> hex");
-        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        browse_prev_ready(&w, &m, 40.0, 8) !>;
         expect(pv->live && pv->layout.view == RTX_VIEW_HEX,
                "hex refill keeps the same doc");
         w.browse_prev_cycle(0);
@@ -2009,6 +2273,63 @@ int main(void) {
     }
 
     {
+        /* Key-repeat through the listing must not open on the UI thread.
+         * sync kicks a dest-live arm; flush joins it. */
+        RtxWs w = {0} @destroy;
+        RtxBrowse *br;
+        RtxBrowsePrev *pv;
+        char *paths[1];
+        size_t i, a = (size_t)-1, b = (size_t)-1;
+        char path_a[RTX_BROWSE_DIR];
+        long t0, dt;
+        paths[0] = (char *)"testdata/small.txt";
+        w.open_files(1, paths) !>;
+        w.browse_start() !>;
+        br = RtxWs_browse(&w);
+        browse_wait(br) !>;
+        for (i = 0; i < br->ents.len; i++) {
+            if (br->ents.data[i].is_dir) continue;
+            if (a == (size_t)-1) a = i;
+            else if (b == (size_t)-1) {
+                b = i;
+                break;
+            }
+        }
+        expect(a != (size_t)-1 && b != (size_t)-1,
+               "browse async needs two files");
+        rtx_browse_select(br, a, 20);
+        browse_prev_ready(&w, &m, 40.0, 8) !>;
+        pv = &w.prev[0];
+        expect(pv->live && pv->warmed, "first preview adopts after flush");
+        snprintf(path_a, sizeof(path_a), "%s", pv->path);
+        rtx_browse_select(br, b, 20);
+        t0 = rtx_ui_now_ms();
+        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        dt = rtx_ui_now_ms() - t0;
+        expect(dt < 50, "sync after a move does not open on the UI thread");
+        /* Dest-live: the open is still in flight (a new want). Inline
+         * (RTX_PARALLEL_INLINE): it already ran and adopted the new file. */
+        expect((pv->want[0] && strcmp(pv->want, path_a) != 0) ||
+                   (!pv->want[0] && strstr(pv->path, br->ents.data[b].name) != NULL),
+               "move kicks a new want without waiting");
+        expect(pv->live && (strcmp(pv->path, path_a) == 0 ||
+                            strstr(pv->path, br->ents.data[b].name) != NULL),
+               "move keeps the painted preview until adopt");
+        /* Rapid moves: only the last selection should land. */
+        rtx_browse_select(br, a, 20);
+        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        rtx_browse_select(br, b, 20);
+        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        rtx_browse_select(br, a, 20);
+        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        w.browse_prev_flush(0) !>;
+        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        expect(pv->live && strstr(pv->path, br->ents.data[a].name) != NULL,
+               "flush adopts the settled selection");
+        expect(RtxWs_browse_prev_busy(&w) == 0, "flush leaves no open arm");
+    }
+
+    {
         /* A source line longer than the preview pane used to stop at the
          * space. The rest of that screen row was blank. */
         RtxWs w = {0} @destroy;
@@ -2037,7 +2358,7 @@ int main(void) {
         browse_wait(br) !>;
         expect(br->ents.len && strstr(br->ents.data[br->cur].name, "note.txt") != NULL,
                "preview ux starts on note.txt");
-        w.browse_prev_sync(0, &m, 20.0, 8) !>;
+        browse_prev_ready(&w, &m, 20.0, 8) !>;
         pv = &w.prev[0];
         expect(pv->live && pv->layout.wrap_char == 1,
                "preview fills the row instead of breaking at a space");
@@ -2056,21 +2377,21 @@ int main(void) {
             expect(n == 20 && strncmp(got, "line 00 abcdefghijkl", 20) == 0,
                    "preview paints past the space into the long word");
         }
-        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        browse_prev_ready(&w, &m, 40.0, 8) !>;
         expect(pv->layout.rows.data[0].byte_len == (size_t)strlen(line),
                "wider pane shows the whole source line");
         expect(pv->layout.rows.data[1].line == 1,
                "next source line starts its own row");
-        w.browse_prev_sync(0, &m, 20.0, 8) !>;
+        browse_prev_ready(&w, &m, 20.0, 8) !>;
         expect(pv->layout.rows.data[0].byte_len == 20,
                "narrowing the pane refills, it does not keep the wide rows");
         w.browse_prev_toggle_wrap(0);
-        w.browse_prev_sync(0, &m, 20.0, 8) !>;
+        browse_prev_ready(&w, &m, 20.0, 8) !>;
         expect(pv->layout.wrap == 0, "preview wrap toggle off");
         expect(pv->layout.rows.data[0].byte_len == (size_t)strlen(line),
                "wrap off keeps the source line in one row");
         w.browse_prev_toggle_wrap(0);
-        w.browse_prev_sync(0, &m, 20.0, 8) !>;
+        browse_prev_ready(&w, &m, 20.0, 8) !>;
         expect(pv->layout.wrap == 1 && pv->layout.rows.data[0].byte_len == 20,
                "wrap back on fills the pane again");
         {
@@ -2101,20 +2422,33 @@ int main(void) {
         browse_wait(br) !>;
         expect(br->ents.len && strcmp(br->ents.data[br->cur].name, "grid_rfc.csv") == 0,
                "grid preview smoke starts on grid_rfc.csv");
-        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        browse_prev_ready(&w, &m, 40.0, 8) !>;
         pv = &w.prev[0];
         expect(pv->live && pv->kind == RTX_BROWSE_PREV_FILE,
                "csv selection opens a preview doc");
         w.browse_prev_cycle(0);
         w.browse_prev_cycle(0);
         expect(pv->layout.view == RTX_VIEW_GRID, "Ctrl-L preview -> grid");
-        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        browse_prev_ready(&w, &m, 40.0, 8) !>;
         expect(pv->live && pv->layout.view == RTX_VIEW_GRID,
                "grid refill keeps the same doc");
         expect(pv->layout.grid.ncols >= 3,
                "preview grid builds columns, not a text dump");
         expect(pv->layout.grid_hdr_on && pv->layout.grid_hdr_end > 0,
                "preview grid keeps the header row");
+        /* Enter after a live preview of the same path: status must not
+         * walk a torn layout.rows (cctext-ui crash on open). */
+        w.browse_enter() !>;
+        expect(!w.browsing(), "enter leaves browse");
+        {
+            RtxBuf *act = w.active();
+            char pos[48];
+            expect(act && !act->parked, "enter opens the csv");
+            act->ensure_view(&m, 40.0, 8) !>;
+            rtx_status_line_pos(act, pos, sizeof(pos)) !>;
+            expect(pos[0] == 'L' || pos[0] == '+' || pos[0] == '-',
+                   "status line after preview→open");
+        }
         w.browse_close();
     }
 
@@ -2859,6 +3193,54 @@ int main(void) {
         unlink(path);
     }
 
+    /* The clip is not a workspace-session leak. Hosts set it from the OS
+     * clipboard before every paste; copy / cut replace it. None of that may
+     * grow w.session (which lives until close), and the same bytes again
+     * are not copied again. */
+    {
+        RtxWs w = {0} @destroy;
+        char big[4096];
+        const char *p0;
+        unsigned idx0;
+        size_t off0;
+        int k;
+        w.npanes = 1;
+        w.add_empty() !>;
+        memset(big, 'q', sizeof(big));
+        w.set_clip(cc_slice_from_buffer(big, sizeof(big))) !>;
+        p0 = w.clip.ptr;
+        w.set_clip(cc_slice_from_buffer(big, sizeof(big))) !>;
+        expect(w.clip.ptr == p0, "clip: same bytes are not copied again");
+        idx0 = cc_arena_slab_index(w.session.a);
+        off0 = cc_arena_slab_offset(w.session.a);
+        for (k = 0; k < 256; k++) {
+            big[0] = (char)('a' + (k % 26));
+            big[1] = (char)k;
+            w.set_clip(cc_slice_from_buffer(big, sizeof(big))) !>;
+        }
+        expect(w.clip.len == sizeof(big) && w.clip.ptr[1] == (char)255,
+               "clip: last set wins");
+        w.bufs[0]->doc.type("copy me and cut me") !>;
+        for (k = 0; k < 64; k++) {
+            w.bufs[0]->doc.sel_anchor = 0;
+            w.bufs[0]->doc.caret = 7;
+            {
+                int got = w.copy() !>;
+                expect(got == 1, "clip: copy");
+            }
+        }
+        expect(w.clip.len == 7 && memcmp(w.clip.ptr, "copy me", 7) == 0, "clip: copy bytes");
+        w.bufs[0]->doc.sel_anchor = 8;
+        w.bufs[0]->doc.caret = 11;
+        w.cut() !>;
+        expect(w.clip.len == 3 && memcmp(w.clip.ptr, "and", 3) == 0, "clip: cut bytes");
+        expect(cc_arena_slab_index(w.session.a) == idx0 &&
+                   cc_arena_slab_offset(w.session.a) == off0,
+               "clip: set / copy / cut do not grow w.session");
+        w.set_clip(cc_slice_empty()) !>;
+        expect(w.clip.len == 0 && !w.clip_a.base, "clip: empty is a real clear");
+    }
+
     /* Rich pane join rule (DESIGN Encoding, docs/md_view.md): a pair's hints
      * are one atom in two places. Motion never rests inside a hint;
      * backspace / delete on a hint unwraps the pair; a selection reaching
@@ -2999,6 +3381,29 @@ int main(void) {
         expect(d->caret == ob + 1, "source: → steps one byte into **");
         remove(mdpath);
     }
+
+    /* Every Rich edit path is its own hist record, interleaved with typing
+     * that would otherwise coalesce into it (a policy replace deletes and
+     * inserts; coalescing kept one side and undo lost bytes). */
+    rt_rich("a **bold** b\n", "@2 'xy / > / 'z", "a xyzbold b\n", "rt: join delete");
+    rt_rich("a **bold**zz\n", "@12 < < / < / 'q", "a boldq\n", "rt: backspace unwrap");
+    rt_rich("a **bold** b\n", "@2 'xy / ~8 'Q / 'r", "a xyQrld b\n", "rt: type-over");
+    rt_rich("a **bold** b\n", "@2 'xy / ~8 X / 'r", "a xyrld b\n", "rt: cut");
+    rt_rich("x abcd\n", "@6 < < / @3 !bold / @6 'z", "x **abz**\n", "rt: apply pair wrap");
+    /* The caret just after `**bold**` is outside it (exclusive end): the
+     * unwrap is from inside. */
+    rt_rich("a **bold**zz\n", "@12 < < / @6 !bold / @6 'q", "a boldq\n", "rt: apply pair unwrap");
+    rt_rich("## xTitle\n", "@4 < / < / 'z", "# zTitle\n", "rt: prefix apply");
+    rt_rich("# xT\n", "@3 < / % / 'z", "## zT\n", "rt: prefix cycle");
+    rt_rich("x abcd\n", "@6 < < / @3 !link / 'u", "x [ab](u)\n", "rt: path wrap");
+    rt_rich("[ab](u)cd\n", "@9 < < / !link / 'z", "abz\n", "rt: path unwrap");
+    rt_rich("- [ ]  t\n", "@5 > / !toggle / @7 'z", "- [x] tz\n", "rt: task toggle");
+    rt_rich("| A | B |\n|---|---|\n| x | y |\n", "@23 'Q / E / 'r", NULL,
+            "rt: table row add");
+    rt_rich("| A | B |\n|---|---|\n| x | y |\n", "@27 'Q / T / 'r", NULL,
+            "rt: table col add");
+    rt_rich("| A | B |\n|---|---|\n| x | y |\n", "@23 'Q / @22 < / 'r", NULL,
+            "rt: table row delete");
 
     if (fails) {
         fprintf(stderr, "%d failure(s)\n", fails);

@@ -1,0 +1,1133 @@
+#!ccc ccs
+/*
+ * Incremental work must equal the full answer.
+ *
+ * pair: the painter's brace pair (rtx_nav_pair_ends_vis) may stop at the
+ * visible rows. When the exact pair has an end on those rows it must return
+ * that pair; when it returns none, neither exact end may be visible. The
+ * exact windowed scan must match the whole-window byte walk it replaced.
+ *
+ * relex: an edit relexes a grammar section from a checkpoint before the
+ * edit and stops where its state meets the old lex (rtx_doc_relex_edit).
+ * After any run of edits the styles and hints must equal a fresh full lex
+ * of the same bytes, offset for offset.
+ *
+ * window: a section over RTX_HL_FULL_MAX lexes the camera window (plus a
+ * lookback lead-in); an edit inside that window relexes from the window
+ * lex's checkpoints and stops where it converges (d->hl_cov). With a
+ * moving window and edits at its edges and inside fences, the window's
+ * styles and hints must equal (a) that window lexed again from scratch —
+ * the lex every keystroke ran before, same anchor — and (b) while the
+ * window is in catch-up reach of BOF, a fresh document's full lex.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/find.cch"
+#include "../core/nav_pair.cch"
+
+static int fails = 0;
+static unsigned g_rng = 12345u; /* RELEX_SEED overrides */
+
+static unsigned rnd(unsigned n) {
+    g_rng = g_rng * 1103515245u + 12345u;
+    return n ? (g_rng >> 8) % n : 0;
+}
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static void write_c(const char *path, size_t want) {
+    FILE *fp = fopen(path, "w");
+    size_t n = 0, b = 0;
+    if (!fp) return;
+    fputs("#include <stdio.h>\n/* header comment\n * spans lines */\n", fp);
+    while (n < want) {
+        n += (size_t)fprintf(fp,
+                             "/* block %zu: a comment\n * with a second line */\n"
+                             "static int fn_%zu(int x) {\n"
+                             "    const char *s = \"str %zu \\\" esc\"; // tail\n"
+                             "    if (x > %zu) { return x * 2; } else { x++; }\n"
+                             "    return (int)(s[0] + '%c');\n}\n\n",
+                             b, b, b, b, (char)('a' + b % 26));
+        b++;
+    }
+    fclose(fp);
+}
+
+static void write_md(const char *path, size_t want) {
+    FILE *fp = fopen(path, "w");
+    size_t n = 0, b = 0;
+    if (!fp) return;
+    n += (size_t)fprintf(fp, "---\ntitle: relex\ncount: 3\n---\n\n");
+    while (n < want) {
+        n += (size_t)fprintf(fp,
+                             "# Heading %zu\n\nSome *em* and **strong** text with `code` "
+                             "and a [link](http://x.y/%zu).\n\n"
+                             "```c\nint f%zu(void) { return %zu; } /* c */\n```\n\n"
+                             "- item one\n- [ ] task %zu\n\n",
+                             b, b, b, b, b);
+        /* Block pass: setext, lists holding fences, lazy quotes, tables,
+         * tilde fences, HTML, math, multi-line emphasis. */
+        n += (size_t)fprintf(fp,
+                             "Setext %zu *title\nacross* lines\n=====\n\n"
+                             "1. first _em_\n   ~~~py\n   x = %zu  # c\n   ~~~\n"
+                             "2. second\n\n   more\n\n"
+                             "> quote **bold\nlazy** line\n> > nested ~~s~~\n\n"
+                             "| a | b |\n|---|:-:|\n| `%zu` | [l](u(v)) |\n\n"
+                             "<div>\n  **raw** %zu\n</div>\n\n"
+                             "$$\nx_%zu^2\n$$\n\n"
+                             "    indented %zu\n\n---\n\n",
+                             b, b, b, b, b, b);
+        b++;
+    }
+    fclose(fp);
+}
+
+static void write_json(const char *path, size_t want) {
+    FILE *fp = fopen(path, "w");
+    size_t n = 0, b = 0;
+    if (!fp) return;
+    n += (size_t)fprintf(fp, "[\n");
+    while (n < want) {
+        n += (size_t)fprintf(fp,
+                             "  {\"id\": %zu, \"name\": \"item %zu \\\" q\", \"ok\": %s, "
+                             "\"tags\": [\"a\", \"b%zu\"], \"nested\": {\"x\": %zu.5, "
+                             "\"s\": \"{[\"}},\n",
+                             b, b, b % 2 ? "true" : "null", b, b);
+        b++;
+    }
+    fprintf(fp, "  {\"id\": -1}\n]\n");
+    fclose(fp);
+}
+
+/* Fences, tables, inline marks; every block short enough that a 16 KiB
+ * lookback sees its opener. */
+static void write_md_big(const char *path, size_t want) {
+    FILE *fp = fopen(path, "w");
+    size_t n = 0, b = 0;
+    if (!fp) return;
+    while (n < want) {
+        n += (size_t)fprintf(fp,
+                             "## Part %zu\n\nText with *em*, **strong** and `code %zu`, "
+                             "[a link](http://x.y/%zu).\n\n"
+                             "| Name | Kind | Count |\n|---|:---:|--:|\n"
+                             "| a%zu | **b** | %zu |\n| `c` | d | 7 |\n\n"
+                             "```python\ndef f%zu():\n    s = \"\"\"doc\n    %zu\"\"\"\n"
+                             "    return '*'  # not *em*\n```\n\n"
+                             "> quote %zu with *em*\n\n- [ ] task %zu\n- item\n\n"
+                             "Setext %zu\n---\n\n1. one\n   ```js\n   let x = 1;\n   ```\n"
+                             "> a **b\nc** d\n\n",
+                             b, b, b, b, b, b, b, b, b, b);
+        b++;
+    }
+    fclose(fp);
+}
+
+static const char *snips[] = {
+    "x", "Q", " ", "\n", "/*", "*/", "\"", "'", "//", "{", "}", "(", ")",
+    "`", "```", "*", "**", "#", "[", "]", "\\", "int y = 3;\n", "/* c */",
+    "\"s\"", "\n\n",
+    /* Markdown blocks */
+    "~~~", "---", "===", "\n- ", "\n> ", "    ", "$$", "<div>", "|", "_", "~~",
+    "](", "\n1. ", "```py\n", "<!--", "-->", "  ", "\n---\n", "> ",
+};
+
+static void !>(CCError) same_as_full(RtxDoc *a, const char *tmp, const char *tag,
+                                     size_t step) {
+    RtxDoc b = {0} @destroy;
+    size_t n, off, bad = 0, first = 0;
+    char msg[256];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    a->save_as(cc_slice_cstr(tmp)) !>;
+    b.from_path(cc_slice_cstr(tmp)) !>;
+    b.reparse() !>;
+    n = a->len();
+    expect(n == b.len(), "relex: same length");
+    for (off = 0; off < n; off++) {
+        RtxStyle x = a->style_at(off);
+        RtxStyle y = b.style_at(off);
+        size_t hl1 = 0, hh1 = 0, hl2 = 0, hh2 = 0;
+        int h1 = RtxDoc_hint_at(a, off, &hl1, &hh1);
+        int h2 = RtxDoc_hint_at(&b, off, &hl2, &hh2);
+        if (x.scope != y.scope || x.bold != y.bold || x.italic != y.italic ||
+            x.mono != y.mono || x.strike != y.strike || h1 != h2 ||
+            (h1 && (hl1 != hl2 || hh1 != hh2))) {
+            if (!bad) first = off;
+            bad++;
+        }
+    }
+    if (bad) {
+        RtxDoc *dd[2] = {a, &b};
+        int q;
+        for (q = 0; q < 2; q++) {
+            size_t k;
+            char ctx[64];
+            size_t got = dd[q]->read_at(first > 24 ? first - 24 : 0, cc_slice_from_buffer(ctx, 48)) !>;
+            fprintf(stderr, "%s doc: text [%.*s]\n", q ? "full" : "incr", (int)got, ctx);
+            for (k = 0; k < dd[q]->runs.len; k++) {
+                const RtxRun *r = &dd[q]->runs.data[k];
+                if (r->start + r->len + 8 < first || r->start > first + 8) continue;
+                fprintf(stderr, "  run %zu [%zu,%zu) %s ha=%u hb=%u pl=%u\n", k, r->start, r->start + r->len,
+                        rtx_scope_name(r->style.scope), r->hint_a, r->hint_b, r->planter);
+            }
+        }
+    }
+    snprintf(msg, sizeof msg, "%s step %zu: %zu bytes differ from a full lex (first %zu)",
+             tag, step, bad, first);
+    expect(bad == 0, msg);
+    return cc_ok();
+}
+
+static void !>(CCError) run(const char *path, const char *tmp, const char *tag,
+                            size_t steps) {
+    RtxDoc d = {0} @destroy;
+    size_t i;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    d.from_path(cc_slice_cstr(path)) !>;
+    d.reparse() !>;
+    for (i = 0; i < steps; i++) {
+        size_t n = d.len();
+        /* Mostly near the middle (a checkpoint below and above), sometimes
+         * anywhere. */
+        size_t at = rnd(4) ? n / 3 + rnd((unsigned)(n / 3 + 1)) : rnd((unsigned)(n + 1));
+        if (at > n) at = n;
+        if (rnd(5) == 0 && at < n) {
+            size_t k = 1 + rnd(24);
+            if (at + k > n) k = n - at;
+            if (getenv("RELEX_DEBUG")) fprintf(stderr, "%s step %zu erase %zu+%zu\n", tag, i, at, k);
+            d.erase(at, k) !>;
+        } else {
+            const char *sn = snips[rnd(sizeof snips / sizeof snips[0])];
+            if (getenv("RELEX_DEBUG"))
+                fprintf(stderr, "%s step %zu insert %zu [%s]\n", tag, i, at, sn);
+            d.insert(at, cc_slice_from_buffer((char *)sn, strlen(sn))) !>;
+        }
+        d.reparse_edit(d.last_off, d.last_markup) !>;
+        d.span_reset();
+        if (getenv("RELEX_EVERY") || i % 4 == 3 || i + 1 == steps) same_as_full(&d, tmp, tag, i) !>;
+        if (fails > 5) break;
+    }
+    return cc_ok();
+}
+
+/* RtxDoc_hint_at over marks that open at or after `lo`. One lex may clip a
+ * mark open across `lo` at the window (no hints) while another lexed its
+ * whole section; marks that start inside must agree exactly. */
+static int hint_from(const RtxDoc *d, size_t off, size_t lo, size_t *hl, size_t *hh) {
+    size_t i;
+    int hit = 0;
+    for (i = 0; i < d->runs.len; i++) {
+        const RtxRun *r = &d->runs.data[i];
+        size_t end = r->start + r->len;
+        if (r->start < lo || r->start > off || off >= end || r->hint_a == 0) continue;
+        if (off < r->start + r->hint_a) {
+            *hl = r->start;
+            *hh = r->start + r->hint_a;
+            hit = 1;
+        } else if (r->hint_b && off >= end - r->hint_b) {
+            *hl = end - r->hint_b;
+            *hh = end;
+            hit = 1;
+        }
+    }
+    return hit;
+}
+
+/* The window [lo, hi) of `a` against a fresh document's lex of it: a full
+ * lex from BOF while hi is in catch-up reach (RTX_TM_CATCHUP_MAX). */
+static void !>(CCError) same_as_window(RtxDoc *a, const char *tmp, const char *tag,
+                                       size_t step, size_t lo, size_t hi) {
+    RtxDoc b = {0} @destroy;
+    size_t n, off, bad = 0, first = 0;
+    char msg[256];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    a->save_as(cc_slice_cstr(tmp)) !>;
+    b.from_path(cc_slice_cstr(tmp)) !>;
+    b.reparse() !>;
+    b.ensure_hl(rtx_hl_span(lo, hi)) !>;
+    n = a->len();
+    expect(n == b.len(), "window: same length");
+    if (hi > n) hi = n;
+    for (off = lo; off < hi; off++) {
+        RtxStyle x = a->style_at(off);
+        RtxStyle y = b.style_at(off);
+        size_t hl1 = 0, hh1 = 0, hl2 = 0, hh2 = 0;
+        int h1 = hint_from(a, off, lo, &hl1, &hh1);
+        int h2 = hint_from(&b, off, lo, &hl2, &hh2);
+        if (x.scope != y.scope || x.bold != y.bold || x.italic != y.italic ||
+            x.mono != y.mono || x.strike != y.strike || h1 != h2 ||
+            (h1 && (hl1 != hl2 || hh1 != hh2))) {
+            if (!bad) first = off;
+            bad++;
+        }
+    }
+    if (bad) {
+        RtxDoc *dd[2] = {a, &b};
+        int q;
+        for (q = 0; q < 2; q++) {
+            size_t k;
+            char ctx[64];
+            size_t got = dd[q]->read_at(first > 24 ? first - 24 : 0, cc_slice_from_buffer(ctx, 48)) !>;
+            fprintf(stderr, "%s doc: text [%.*s] scope %s hint %d\n", q ? "fresh" : "incr",
+                    (int)got, ctx, rtx_scope_name(dd[q]->style_at(first).scope),
+                    RtxDoc_hint_at(dd[q], first, NULL, NULL));
+            for (k = 0; k < dd[q]->runs.len; k++) {
+                const RtxRun *r = &dd[q]->runs.data[k];
+                if (r->start + r->len + 8 < first || r->start > first + 8) continue;
+                fprintf(stderr, "  run %zu [%zu,%zu) %s ha=%u hb=%u pl=%u\n", k, r->start,
+                        r->start + r->len, rtx_scope_name(r->style.scope), r->hint_a,
+                        r->hint_b, r->planter);
+            }
+        }
+    }
+    snprintf(msg, sizeof msg,
+             "%s step %zu window [%zu,%zu): %zu bytes differ from a fresh lex (first %zu)",
+             tag, step, lo, hi, bad, first);
+    expect(bad == 0, msg);
+    return cc_ok();
+}
+
+/* A fill window is whole lines: the start of the line holding `off`, or
+ * the start of the line after it. */
+static size_t !>(CCError) line_lo(RtxDoc *d, size_t off) {
+    char c = 0;
+    while (off > 0) {
+        size_t got = d->read_at(off - 1, cc_slice_from_buffer(&c, 1)) !>(e) {
+            return cc_err(e);
+        };
+        if (!got || c == '\n') break;
+        off--;
+    }
+    return cc_ok(off);
+}
+
+static size_t !>(CCError) line_hi(RtxDoc *d, size_t off) {
+    char c = 0;
+    size_t n = d->len();
+    while (off < n) {
+        size_t got = d->read_at(off, cc_slice_from_buffer(&c, 1)) !>(e) {
+            return cc_err(e);
+        };
+        off++;
+        if (!got || c == '\n') break;
+    }
+    return cc_ok(off);
+}
+
+/* Start of the last blank line in [lo, hi) (or hi when there is none). */
+static size_t para_cut(RtxDoc *d, size_t lo, size_t hi) {
+    char buf[4096];
+    size_t at = hi;
+    @errhandler(CCError e) {
+        (void)e;
+        return hi;
+    }
+    while (at > lo + 1) {
+        size_t n = at - lo > sizeof buf ? sizeof buf : at - lo, k;
+        size_t got = d->read_at(at - n, cc_slice_from_buffer(buf, n)) !>;
+        if (got != n) return hi;
+        for (k = n; k > 1; k--) {
+            if (buf[k - 1] == '\n' && buf[k - 2] == '\n') return at - n + k - 1;
+        }
+        at -= n - 1;
+    }
+    return hi;
+}
+
+typedef struct {
+    RtxStyle st;
+    int h;
+    size_t hl, hh;
+} WinCell;
+
+/* The window [lo, hi) of `a` against the same window relexed from scratch
+ * on `a` (coverage dropped: the lookback lex from the same anchor). */
+static void !>(CCError) same_as_relex(RtxDoc *a, const char *tag, size_t step, size_t lo,
+                                      size_t hi) {
+    WinCell *was;
+    size_t off, bad = 0, first = 0, L, H;
+    char msg[256];
+    if (!a->hl_cov.live || hi <= lo) return cc_ok();
+    L = a->hl_cov.lo;
+    H = a->hl_cov.hi;
+    was = malloc((hi - lo) * sizeof *was);
+    if (!was) return cc_ok();
+    for (off = lo; off < hi; off++) {
+        WinCell *c = &was[off - lo];
+        c->st = a->style_at(off);
+        c->hl = c->hh = 0;
+        c->h = RtxDoc_hint_at(a, off, &c->hl, &c->hh);
+    }
+    a->hl_cov.live = 0;
+    a->ensure_hl(rtx_hl_span(L, H)) !>(e) {
+        free(was);
+        return cc_err(e);
+    };
+    for (off = lo; off < hi; off++) {
+        const WinCell *c = &was[off - lo];
+        RtxStyle y = a->style_at(off);
+        size_t hl = 0, hh = 0;
+        int h = RtxDoc_hint_at(a, off, &hl, &hh);
+        if (c->st.scope != y.scope || c->st.bold != y.bold || c->st.italic != y.italic ||
+            c->st.mono != y.mono || c->st.strike != y.strike || c->h != h ||
+            (h && (c->hl != hl || c->hh != hh))) {
+            if (!bad) {
+                size_t k;
+                first = off;
+                fprintf(stderr, "%s: incr scope %s hint %d, relex scope %s hint %d\n", tag,
+                        rtx_scope_name(c->st.scope), c->h, rtx_scope_name(y.scope), h);
+                fprintf(stderr, "  relex cov [%zu,%zu,%zu) md_inl %zu flags %u\n",
+                        a->hl_cov.anchor, a->hl_cov.lo, a->hl_cov.hi, a->hl_cov.md_inl,
+                        (unsigned)a->hl_cov.md_flags);
+                for (k = 0; k < a->runs.len; k++) {
+                    const RtxRun *r = &a->runs.data[k];
+                    if (r->start + r->len + 40 < first || r->start > first + 40) continue;
+                    fprintf(stderr, "  relex run [%zu,%zu) %s ha=%u hb=%u\n", r->start,
+                            r->start + r->len, rtx_scope_name(r->style.scope), r->hint_a,
+                            r->hint_b);
+                }
+            }
+            bad++;
+        }
+    }
+    free(was);
+    snprintf(msg, sizeof msg,
+             "%s step %zu window [%zu,%zu): %zu bytes differ from its relex (first %zu)",
+             tag, step, lo, hi, bad, first);
+    expect(bad == 0, msg);
+    return cc_ok();
+}
+
+static size_t g_win_edits = 0;   /* edits inside a live window lex */
+static size_t g_win_relexed = 0; /* of those, relexed from its checkpoints */
+
+/* A camera window over a > RTX_HL_FULL_MAX section: mostly it stays (a
+ * typing run), sometimes it scrolls a little or jumps. Edits land inside
+ * it, on its edges, or just outside. `lead` is the Markdown lookback the
+ * fill lexes with the window. */
+static void !>(CCError) win_run(const char *path, const char *tmp, const char *tag,
+                                size_t steps, size_t lead) {
+    RtxDoc d = {0} @destroy;
+    size_t i, from, span = 6000;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    d.from_path(cc_slice_cstr(path)) !>;
+    d.reparse() !>;
+    expect(!d.hl_full, "window: file is over RTX_HL_FULL_MAX");
+    from = d.len() / 2;
+    for (i = 0; i < steps; i++) {
+        size_t n = d.len(), lo, hi, at, pick;
+        unsigned mv = rnd(10);
+        if (mv == 0) from = rnd((unsigned)(n - span));              /* jump */
+        else if (mv == 1) from += rnd(3000);                         /* scroll down */
+        else if (mv == 2) from = from > 3000 ? from - rnd(3000) : 0; /* up */
+        if (from + span > n) from = n - span;
+        from = line_lo(&d, from) !>;
+        lo = from > lead ? from - lead : 0;
+        lo = line_lo(&d, lo) !>;
+        hi = line_hi(&d, from + span) !>;
+        /* The fill, then (Markdown) its lookback pass: covered, no lex. */
+        d.ensure_hl(rtx_hl_span(lo, hi)) !>;
+        d.ensure_hl(rtx_hl_keep(lo, hi - lo)) !>;
+        pick = rnd(8);
+        if (pick == 0) at = from;
+        else if (pick == 1) at = from + rnd(3);
+        else if (pick == 2) at = hi - rnd(3);
+        else if (pick == 3) at = lo > 100 ? lo - 1 - rnd(100) : lo; /* above */
+        else if (pick == 4) at = hi + rnd(100);                        /* below */
+        else at = lo + rnd((unsigned)(hi - lo));
+        if (at > n) at = n;
+        if (rnd(5) == 0 && at < n) {
+            size_t k = 1 + rnd(24);
+            if (at + k > n) k = n - at;
+            d.erase(at, k) !>;
+        } else {
+            const char *sn = snips[rnd(sizeof snips / sizeof snips[0])];
+            d.insert(at, cc_slice_from_buffer((char *)sn, strlen(sn))) !>;
+        }
+        if (getenv("RELEX_DEBUG"))
+        {
+            size_t q;
+            fprintf(stderr, "step %zu win [%zu,%zu) cov %d [%zu,%zu,%zu) at %zu secs", i, lo, hi,
+                    d.hl_cov.live, d.hl_cov.anchor, d.hl_cov.lo, d.hl_cov.hi, at);
+            for (q = 0; q < d.secs.len; q++)
+                fprintf(stderr, " %zu:%d%s", d.secs.data[q].start, (int)d.secs.data[q].kind,
+                        d.secs.data[q].hl_done ? "*" : "");
+            fprintf(stderr, "\n");
+        }
+        {
+            int was = d.hl_cov.live;
+            d.reparse_edit(d.last_off, d.last_markup) !>;
+            d.span_reset();
+            if (was) g_win_edits++;
+            if (was && d.hl_cov.live) g_win_relexed++;
+        }
+        if (from > d.len()) from = d.len();
+        from = line_lo(&d, from) !>;
+        lo = from > lead ? from - lead : 0;
+        lo = line_lo(&d, lo) !>;
+        hi = line_hi(&d, from + span) !>;
+        d.ensure_hl(rtx_hl_span(lo, hi)) !>;
+        if (getenv("RELEX_EVERY") || i % 3 == 2 || i + 1 == steps) {
+            /* Markdown: the window's last paragraph may be a setext title
+             * or a table header whose underline / delimiter row is past
+             * `hi` — a lex that saw further knows it, a fresh window lex
+             * of [lo, hi) cannot. Compare up to its last blank line. */
+            if (hi <= (size_t)RTX_TM_CATCHUP_MAX)
+                same_as_window(&d, tmp, tag, i, lo, lead ? para_cut(&d, lo, hi) : hi) !>;
+            same_as_relex(&d, tag, i, lo, lead ? para_cut(&d, lo, hi) : hi) !>;
+        }
+        if (fails > 5) break;
+    }
+    return cc_ok();
+}
+
+/* testdata/gen_large.sh --bytes: `=== prose ===` / `=== code ===` blocks
+ * (grammarless: prose runs per window, small code sections lexed whole). */
+static void write_mixed(const char *path, size_t want) {
+    FILE *fp = fopen(path, "w");
+    size_t n = 0, b = 0;
+    if (!fp) return;
+    while (n < want) {
+        n += (size_t)fprintf(fp,
+                             "=== prose ===\nBlock %zu. A *bold* word and `mono` in a wrapping "
+                             "paragraph that keeps going.\n=== code ===\nint fn_%zu(void) {\n"
+                             "    /* block %zu */\n    int x = %zu;\n    return x;\n}\n",
+                             b, b, b, b);
+        b++;
+    }
+    fclose(fp);
+}
+
+/* Dense `===` text: a header every ~30 bytes, so one tall window holds
+ * hundreds of sections. */
+static void write_dense(const char *path, size_t want) {
+    FILE *fp = fopen(path, "w");
+    size_t n = 0, b = 0;
+    if (!fp) return;
+    while (n < want) {
+        if (b % 5 == 3)
+            n += (size_t)fprintf(fp, "=== code ===\nint d%zu = \"s\"; /* c %zu */\n", b, b);
+        else if (b % 5 == 4)
+            n += (size_t)fprintf(fp, "=== code ===\n/* open %zu\nspans */ x;\n", b);
+        else
+            n += (size_t)fprintf(fp, "=== prose ===\n*it %zu* `m`\n", b);
+        b++;
+    }
+    fclose(fp);
+}
+
+static size_t g_scroll_checks = 0;
+static size_t g_max_secs = 0; /* most `===` headers in one checked window */
+
+
+/* The camera window [lo, hi) of `a` against `ref`, the same file whose
+ * windows are always a catch-up from its true checkpoints (every block of
+ * these files is short, so any lookback start sees the state a lex from
+ * BOF has by `lo`): styles at every byte, hints of marks opening in it. */
+static void !>(CCError) same_as_ref(RtxDoc *a, RtxDoc *ref, const char *tag, size_t step,
+                                    size_t lo, size_t hi) {
+    size_t off, bad = 0, first = 0;
+    char msg[256];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    /* Always a fresh window lex on the reference (no resumed lex). */
+    ref->hl_cov.live = 0;
+    ref->ensure_hl(rtx_hl_span(lo, hi)) !>;
+    for (off = lo; off < hi; off++) {
+        RtxStyle x = a->style_at(off);
+        RtxStyle y = ref->style_at(off);
+        size_t hl1 = 0, hh1 = 0, hl2 = 0, hh2 = 0;
+        int h1 = hint_from(a, off, lo, &hl1, &hh1);
+        int h2 = hint_from(ref, off, lo, &hl2, &hh2);
+        if (x.scope != y.scope || x.bold != y.bold || x.italic != y.italic ||
+            x.mono != y.mono || x.strike != y.strike || h1 != h2 ||
+            (h1 && (hl1 != hl2 || hh1 != hh2))) {
+            if (!bad) {
+                first = off;
+                fprintf(stderr, "%s step %zu at %zu: walk scope %s hint %d, ref scope %s hint %d; cov %d [%zu,%zu,%zu)\n",
+                        tag, step, off, rtx_scope_name(x.scope), h1, rtx_scope_name(y.scope), h2,
+                        a->hl_cov.live, a->hl_cov.anchor, a->hl_cov.lo, a->hl_cov.hi);
+                if (getenv("RELEX_DEBUG")) {
+                    RtxDoc *dd[2] = {a, ref};
+                    int q;
+                    size_t k;
+                    for (q = 0; q < 2; q++)
+                        for (k = 0; k < dd[q]->secs.len; k++) {
+                            const RtxSection *sc = &dd[q]->secs.data[k];
+                            if (sc->start + 20000 < off || sc->start > off + 20000) continue;
+                            fprintf(stderr, "  %s sec %zu start %zu kind %d done %d\n",
+                                    q ? "ref" : "walk", k, sc->start, (int)sc->kind,
+                                    (int)sc->hl_done);
+                        }
+                    for (q = 0; q < 2; q++)
+                        for (k = 0; k < dd[q]->runs.len; k++) {
+                            const RtxRun *rr = &dd[q]->runs.data[k];
+                            if (rr->start > off + 4 || rr->start + rr->len + 4 < off) continue;
+                            fprintf(stderr, "  %s run %zu [%zu,%zu) %s ha=%u hb=%u pl=%u rule=%u\n",
+                                    q ? "ref" : "walk", k, rr->start, rr->start + rr->len,
+                                    rtx_scope_name(rr->style.scope), rr->hint_a, rr->hint_b,
+                                    rr->planter, rr->rule);
+                        }
+                }
+            }
+            bad++;
+        }
+    }
+    g_scroll_checks++;
+    snprintf(msg, sizeof msg, "%s step %zu window [%zu,%zu): %zu bytes differ from the reference (first %zu)",
+             tag, step, lo, hi, bad, first);
+    expect(bad == 0, msg);
+    return cc_ok();
+}
+
+/* hint_from over [lo, hi) of `d`: z[2i], z[2i+1] = the hint span of byte
+ * lo + i, shifted by `sh` (0, 0: none). Later runs win, as in hint_from. */
+static void hint_zones(const RtxDoc *d, size_t lo, size_t hi, size_t sh, size_t *z) {
+    size_t i, o;
+    for (i = 0; i < d->runs.len; i++) {
+        const RtxRun *r = &d->runs.data[i];
+        size_t end = r->start + r->len, head = r->start + r->hint_a;
+        if (r->hint_a == 0 || r->start < lo || r->start >= hi) continue;
+        if (r->hint_b && end - r->hint_b < end) {
+            size_t tl = end - r->hint_b > head ? end - r->hint_b : head;
+            for (o = tl; o < end && o < hi; o++) {
+                z[2 * (o - lo)] = end - r->hint_b + sh;
+                z[2 * (o - lo) + 1] = end + sh;
+            }
+        }
+        for (o = r->start; o < head && o < end && o < hi; o++) {
+            z[2 * (o - lo)] = r->start + sh;
+            z[2 * (o - lo) + 1] = head + sh;
+        }
+    }
+}
+
+/* The camera's [from, cut) against the same window lexed from scratch on
+ * the same document: its window lex and every lexed section it touches
+ * forgotten, then the fill again. Whatever the walk resumed, trimmed and
+ * re-lexed must equal that. */
+static void !>(CCError) same_as_fresh(RtxDoc *a, const char *tag, size_t step, size_t lo,
+                                      size_t hi, size_t lead, size_t from, size_t cut) {
+    WinCell *was;
+    size_t *z;
+    size_t off, s, bad = 0, first = 0, n = a->len();
+    char msg[256];
+    if (cut <= from) return cc_ok();
+    was = malloc((cut - from) * sizeof *was);
+    z = calloc(2 * (cut - from) + 2, sizeof(size_t));
+    if (!was || !z) {
+        free(was);
+        free(z);
+        return cc_ok();
+    }
+    hint_zones(a, from, cut, 0, z);
+    for (off = from; off < cut; off++) {
+        WinCell *c = &was[off - from];
+        c->st = a->style_at(off);
+        c->hl = z[2 * (off - from)];
+        c->hh = z[2 * (off - from) + 1];
+        c->h = c->hh != 0;
+    }
+    for (s = 0; s < a->secs.len; s++) {
+        size_t b = s + 1 < a->secs.len ? a->secs.data[s + 1].start : n;
+        if (b > lo && a->secs.data[s].start < hi) a->secs.data[s].hl_done = 0;
+    }
+    a->hl_cov.live = 0;
+    a->ensure_hl(rtx_hl_span(lo, hi)) !>(e) {
+        free(was);
+        free(z);
+        return cc_err(e);
+    };
+    if (lead) a->ensure_hl(rtx_hl_keep(lo, hi - lo)) !>(e) {
+        free(was);
+        free(z);
+        return cc_err(e);
+    };
+    memset(z, 0, (2 * (cut - from) + 2) * sizeof(size_t));
+    hint_zones(a, from, cut, 0, z);
+    for (off = from; off < cut; off++) {
+        const WinCell *c = &was[off - from];
+        RtxStyle y = a->style_at(off);
+        size_t hl = z[2 * (off - from)], hh = z[2 * (off - from) + 1];
+        int h = hh != 0;
+        if (c->st.scope != y.scope || c->st.bold != y.bold || c->st.italic != y.italic ||
+            c->st.mono != y.mono || c->st.strike != y.strike || c->h != h ||
+            (h && (c->hl != hl || c->hh != hh))) {
+            if (!bad) {
+                first = off;
+                fprintf(stderr, "%s step %zu at %zu: walk scope %s hint %d, fresh scope %s hint %d\n",
+                        tag, step, off, rtx_scope_name(c->st.scope), c->h, rtx_scope_name(y.scope),
+                        h);
+            }
+            bad++;
+        }
+    }
+    free(was);
+    free(z);
+    g_scroll_checks++;
+    snprintf(msg, sizeof msg, "%s step %zu window [%zu,%zu): %zu bytes differ from a fresh window lex (first %zu)",
+             tag, step, from, cut, bad, first);
+    expect(bad == 0, msg);
+    return cc_ok();
+}
+
+/* A `===` file's truth, independent of any window: each section lexes
+ * from its own header, so [h, e) — from the header at or above `lo` to the
+ * first header at or past `hi` — opened alone (small: scanned and lexed
+ * whole) holds every section of the window whole. Every byte of [lo, hi)
+ * must have that document's section kind, style and hints. */
+static void !>(CCError) same_as_secs(RtxDoc *a, const char *buf, size_t n, const char *tmp,
+                                     const char *tag, size_t step, size_t lo, size_t hi) {
+    RtxDoc t = {0} @destroy;
+    size_t h = lo, e = hi, off, bad = 0, first = 0, nsec = 0;
+    size_t *hz[2] = {NULL, NULL};
+    FILE *fp;
+    char msg[256];
+    @errhandler(CCError er) {
+        return cc_err(er);
+    }
+    while (h > 0 && !(buf[h - 1] == '\n' && n - h >= 12 && !memcmp(buf + h, "=== ", 4))) h--;
+    while (e < n && !(buf[e - 1] == '\n' && n - e >= 12 && !memcmp(buf + e, "=== ", 4))) e++;
+    fp = fopen(tmp, "wb");
+    if (!fp) return cc_err(CC_ERR_IO, "truth tmp");
+    fwrite(buf + h, 1, e - h, fp);
+    fclose(fp);
+    t.from_path(cc_slice_cstr(tmp)) !>;
+    t.reparse() !>;
+    /* hint_from for every byte at once (it walks every run per byte). */
+    hz[0] = calloc(2 * (hi - lo) + 2, sizeof(size_t));
+    hz[1] = calloc(2 * (hi - lo) + 2, sizeof(size_t));
+    if (!hz[0] || !hz[1]) {
+        free(hz[0]);
+        free(hz[1]);
+        return cc_ok();
+    }
+    hint_zones(a, lo, hi, 0, hz[0]);
+    hint_zones(&t, lo - h, hi - h, h, hz[1]);
+    for (off = lo; off < hi; off++) {
+        RtxSectionKind k1 = a->section_at(off), k2 = t.section_at(off - h);
+        RtxStyle x = a->style_at(off);
+        RtxStyle y = t.style_at(off - h);
+        size_t hl1 = hz[0][2 * (off - lo)], hh1 = hz[0][2 * (off - lo) + 1];
+        size_t hl2 = hz[1][2 * (off - lo)], hh2 = hz[1][2 * (off - lo) + 1];
+        int h1 = hh1 != 0, h2 = hh2 != 0;
+        if (off > lo && buf[off - 1] == '\n' && !memcmp(buf + off, "=== ", 4)) nsec++;
+        if (k1 != k2 || x.scope != y.scope || x.bold != y.bold || x.italic != y.italic ||
+            x.mono != y.mono || x.strike != y.strike || h1 != h2 ||
+            (h1 && (hl1 != hl2 || hh1 != hh2))) {
+            if (!bad) {
+                first = off;
+                fprintf(stderr, "%s step %zu at %zu: walk sec %d scope %s, truth sec %d scope %s\n",
+                        tag, step, off, (int)k1, rtx_scope_name(x.scope), (int)k2,
+                        rtx_scope_name(y.scope));
+                if (getenv("RELEX_DEBUG")) {
+                    size_t k;
+                    for (k = 0; k < a->secs.len; k++) {
+                        const RtxSection *sc = &a->secs.data[k];
+                        if (sc->start + 300 < off || sc->start > off + 300) continue;
+                        fprintf(stderr, "  sec %zu start %zu kind %d done %d\n", k, sc->start,
+                                (int)sc->kind, (int)sc->hl_done);
+                    }
+                    fprintf(stderr, "  style walk b%d i%d m%d s%d hint %d [%zu,%zu), truth b%d i%d m%d s%d hint %d [%zu,%zu)\n",
+                            x.bold, x.italic, x.mono, x.strike, h1, hl1, hh1, y.bold, y.italic,
+                            y.mono, y.strike, h2, hl2, hh2);
+                    for (k = 0; k < a->runs.len; k++) {
+                        const RtxRun *rr = &a->runs.data[k];
+                        if (rr->start > off + 4 || rr->start + rr->len + 4 < off) continue;
+                        fprintf(stderr, "  run %zu [%zu,%zu) %s b%d i%d m%d ha=%u hb=%u pl=%u\n", k,
+                                rr->start, rr->start + rr->len, rtx_scope_name(rr->style.scope),
+                                rr->style.bold, rr->style.italic, rr->style.mono, rr->hint_a,
+                                rr->hint_b, rr->planter);
+                    }
+                    for (k = 0; k < (size_t)RTX_MARKUP_CACHE_WINDOWS; k++) {
+                        const RtxMarkupWin *w = &a->hl_win[k];
+                        fprintf(stderr, "  win %zu live %d [%zu,%zu) anchor %zu known %d ready %d kind %d\n",
+                                k, (int)w->live, w->from, w->to, w->anchor, (int)w->known,
+                                (int)w->ready, (int)w->kind);
+                    }
+                }
+            }
+            bad++;
+        }
+    }
+    free(hz[0]);
+    free(hz[1]);
+    g_scroll_checks++;
+    if (nsec > g_max_secs) g_max_secs = nsec;
+    snprintf(msg, sizeof msg,
+             "%s step %zu window [%zu,%zu) (%zu headers): %zu bytes differ from its sections lexed whole (first %zu)",
+             tag, step, lo, hi, nsec, bad, first);
+    expect(bad == 0, msg);
+    return cc_ok();
+}
+
+/* A scroll walk: pages down (mostly), up, small scrolls, jumps anywhere and
+ * back to a place seen before, each step the frame's lexes — the page
+ * motion's scratch fill (keep), the camera window, the Markdown lookback
+ * pass (keep) — then the workspace's run trim for that camera. Every
+ * visible byte must match `ref`. No edits: the file is the reference. */
+static void !>(CCError) scroll_walk(const char *path, const char *tag, size_t steps,
+                                    size_t lead, int want_trim, size_t span) {
+    RtxDoc d = {0} @destroy;
+    RtxDoc ref = {0} @destroy;
+    size_t i, n, from = 0, page = span * 3 / 5, seen[32], nseen = 0;
+    /* A grammarless `===` file: every window is checked against its
+     * sections lexed whole (same_as_secs). */
+    char *all = NULL;
+    const char *truth_tmp = "testdata/generated/scroll_truth.txt";
+    @errhandler(CCError e) {
+        free(all);
+        return cc_err(e);
+    }
+    if (!rtx_tm_for_path(path)) {
+        FILE *fp = fopen(path, "rb");
+        long sz;
+        if (!fp) return cc_err(CC_ERR_IO, "scroll walk");
+        fseek(fp, 0, SEEK_END);
+        sz = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        all = malloc((size_t)sz + 1);
+        if (!all || fread(all, 1, (size_t)sz, fp) != (size_t)sz) {
+            fclose(fp);
+            free(all);
+            return cc_err(CC_ERR_IO, "scroll walk");
+        }
+        fclose(fp);
+    }
+    d.from_path(cc_slice_cstr(path)) !>;
+    d.reparse() !>;
+    ref.from_path(cc_slice_cstr(path)) !>;
+    ref.reparse() !>;
+    n = d.len();
+    expect(!d.hl_full, "scroll: file is over RTX_HL_FULL_MAX");
+    /* The reference plants true checkpoints to EOF: one catch-up chain. */
+    for (i = 0; i < n; i += 128 * 1024) ref.ensure_hl(rtx_hl_span(i, i + 128 * 1024)) !>;
+    for (i = 0; i < steps; i++) {
+        size_t lo, hi, cut;
+        unsigned mv = rnd(20);
+        if (mv < 12) from += page;                                    /* PageDown */
+        else if (mv < 15) from = from > page ? from - page : 0;       /* PageUp */
+        else if (mv < 16) from += 200 + rnd(400);                     /* wheel */
+        else if (mv < 18) from = rnd((unsigned)n);                    /* jump */
+        else if (nseen) from = seen[rnd((unsigned)nseen)];            /* back */
+        if (from + span > n) from = n > span ? n - span : 0;
+        from = line_lo(&d, from) !>;
+        if (i % 7 == 0) {
+            if (nseen < 32) seen[nseen++] = from;
+            else seen[rnd(32)] = from;
+        }
+        if (rnd(2)) {
+            /* page_vert's scratch fill: the caret's line and a page below. */
+            size_t s0 = from > lead ? from - lead : 0;
+            s0 = line_lo(&d, s0) !>;
+            d.ensure_hl(rtx_hl_keep(s0, (from + page < n ? from + page : n) - s0)) !>;
+        }
+        lo = from > lead ? from - lead : 0;
+        lo = line_lo(&d, lo) !>;
+        hi = line_hi(&d, from + span < n ? from + span : n) !>;
+        d.ensure_hl(rtx_hl_span(lo, hi)) !>;
+        if (lead) d.ensure_hl(rtx_hl_keep(lo, hi - lo)) !>;
+        RtxDoc_hl_trim(&d, &from, &hi, 1);
+        if (getenv("RELEX_DEBUG"))
+            fprintf(stderr, "%s step %zu from %zu win [%zu,%zu) runs %zu cov %d [%zu,%zu,%zu)\n",
+                    tag, i, from, lo, hi, d.runs.len, d.hl_cov.live, d.hl_cov.anchor,
+                    d.hl_cov.lo, d.hl_cov.hi);
+        /* Markdown: a lex that saw further may know the window's last
+         * paragraph is a setext title / table header (see win_run). */
+        cut = lead ? para_cut(&d, from, hi) : hi;
+        if (all) same_as_secs(&d, all, n, truth_tmp, tag, i, lo, hi) !>;
+        /* Window sections depend on the windows seen (a window's first
+         * section starts at it; one cut at the window's edge is lexed to
+         * that edge), so the reference is the same window lexed afresh on
+         * this document — every third step, so the walk's own resumed
+         * lexes carry between checks. Early on, while the window is in
+         * catch-up reach of BOF, a second document's lex of it too. */
+        if (i % 3 == 2) same_as_fresh(&d, tag, i, lo, hi, lead, from, cut) !>;
+        else if (i < 24 && rtx_tm_for_path(path) && hi <= (size_t)RTX_TM_CATCHUP_MAX)
+            same_as_ref(&d, &ref, tag, i, from, cut) !>;
+        if (fails > 5) break;
+    }
+    if (want_trim) expect(d.runs_trim > 0, "scroll: the walk trimmed its runs");
+    if (all) unlink(truth_tmp);
+    free(all);
+    return cc_ok();
+}
+
+/* Reference: the whole-window byte walk the windowed scan replaced. */
+static int r_open(char c) { return c == '{' || c == '[' || c == '('; }
+static int r_close(char c) { return c == '}' || c == ']' || c == ')'; }
+static char r_mate(char c) {
+    return c == '{' ? '}' : c == '[' ? ']' : c == '(' ? ')' :
+           c == '}' ? '{' : c == ']' ? '[' : c == ')' ? '(' : 0;
+}
+
+static int r_skip(const RtxDoc *d, size_t off) {
+    size_t i, a = 0, b = d->runs.len;
+    const RtxRun *r;
+    int k;
+    if (!b) return 0;
+    while (a + 1 < b) {
+        size_t m = a + (b - a) / 2;
+        if (d->runs.data[m].start <= off) a = m;
+        else b = m;
+    }
+    i = a;
+    /* nav_skip_at settles on the last run starting at or before off. */
+    while (i + 1 < d->runs.len && d->runs.data[i + 1].start <= off) i++;
+    r = &d->runs.data[i];
+    if (off < r->start || off >= r->start + r->len) return 0;
+    k = rtx_scope_kind(r->style.scope);
+    return k == RTX_HL_STRING || k == RTX_HL_COMMENT;
+}
+
+static int ref_pair(RtxDoc *d, size_t at, size_t *lo, size_t *hi) {
+    size_t from, to, off, opener = (size_t)-1, got;
+    char *buf;
+    char stk[64];
+    size_t sp;
+    int depth = 0;
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    if (!rtx_nav_brace_pages(at, d->len(), &from, &to)) return 0;
+    buf = malloc(to - from + 1);
+    got = d->read_at(from, cc_slice_from_buffer(buf, to - from)) !>;
+    to = from + got;
+    if (at < to && !r_skip(d, at) && r_open(buf[at - from])) {
+        opener = at;
+    } else if (at < to && !r_skip(d, at) && r_close(buf[at - from])) {
+        char want = r_mate(buf[at - from]);
+        for (off = at; off > from;) {
+            char b;
+            off--;
+            if (r_skip(d, off)) continue;
+            b = buf[off - from];
+            if (r_close(b)) { depth++; continue; }
+            if (!r_open(b)) continue;
+            if (depth) { depth--; continue; }
+            if (b == want) opener = off;
+            break;
+        }
+    } else if (at > 0) {
+        for (off = at < to ? at : to; off > from;) {
+            char b;
+            off--;
+            if (r_skip(d, off)) continue;
+            b = buf[off - from];
+            if (r_close(b)) { depth++; continue; }
+            if (!r_open(b)) continue;
+            if (depth) { depth--; continue; }
+            opener = off;
+            break;
+        }
+    }
+    if (opener == (size_t)-1) {
+        free(buf);
+        return 0;
+    }
+    stk[0] = buf[opener - from];
+    sp = 1;
+    for (off = opener + 1; off < to; off++) {
+        char c;
+        if (r_skip(d, off)) continue;
+        c = buf[off - from];
+        if (r_open(c)) {
+            if (sp >= 64) break;
+            stk[sp++] = c;
+            continue;
+        }
+        if (!r_close(c)) continue;
+        if (r_mate(stk[sp - 1]) != c) break;
+        if (--sp == 0) {
+            int task = off == opener + 2 && buf[opener - from] == '[' &&
+                       (buf[opener + 1 - from] == ' ' || buf[opener + 1 - from] == 'x' ||
+                        buf[opener + 1 - from] == 'X');
+            free(buf);
+            if (task) return 0;
+            *lo = opener;
+            *hi = off;
+            return 1;
+        }
+    }
+    free(buf);
+    return 0;
+}
+
+static const char *bits[] = {
+    "{", "}", "(", ")", "[", "]", "{\n", "}\n", "x", "y = 1;", " ", "\n",
+    "\"s{\"", "'('", "/* ] */", "// }\n", "int f(void) {\n", "return (a[i]);\n",
+};
+
+static void write_src(const char *path, size_t want) {
+    FILE *fp = fopen(path, "w");
+    size_t n = 0;
+    if (!fp) return;
+    while (n < want) {
+        const char *b = bits[rnd(sizeof bits / sizeof bits[0])];
+        fputs(b, fp);
+        n += strlen(b);
+    }
+    fclose(fp);
+}
+
+static void !>(CCError) pair_run(const char *path, size_t size, size_t probes) {
+    RtxDoc d = {0} @destroy;
+    size_t i, n, edit = 1;
+    char msg[200];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    write_src(path, size);
+    d.from_path(cc_slice_cstr(path)) !>;
+    d.reparse() !>;
+    n = d.len();
+    for (i = 0; i < probes; i++) {
+        size_t at = rnd((unsigned)(n + 1));
+        size_t span = 1 + rnd(4000);
+        size_t vlo = at > span / 2 ? at - rnd((unsigned)(span / 2 + 1)) : 0;
+        size_t vhi = vlo + span;
+        size_t elo = 0, ehi = 0, vl = 0, vh = 0;
+        int ex, vi, lo_in, hi_in;
+        if (vhi > n + 1) vhi = n + 1;
+        /* Distinct edit stamps: neither call answers from the other's cache. */
+        vi = rtx_nav_pair_ends_vis(&d.tree, d.runs.data, d.runs.len, at, edit++,
+                                   d.runs.len, vlo, vhi, &vl, &vh);
+        ex = rtx_nav_pair_ends(&d.tree, d.runs.data, d.runs.len, at, edit++,
+                               d.runs.len, &elo, &ehi);
+        {
+            size_t rlo = 0, rhi = 0;
+            int rf = ref_pair(&d, at, &rlo, &rhi);
+            snprintf(msg, sizeof msg, "%s at %zu: exact %d [%zu,%zu] ref %d [%zu,%zu]",
+                     path, at, ex, elo, ehi, rf, rlo, rhi);
+            expect(rf == ex && (!rf || (rlo == elo && rhi == ehi)), msg);
+        }
+        lo_in = ex && elo >= vlo && elo < vhi;
+        hi_in = ex && ehi >= vlo && ehi < vhi;
+        snprintf(msg, sizeof msg,
+                 "%s at %zu win [%zu,%zu): exact %d [%zu,%zu] vis %d [%zu,%zu]",
+                 path, at, vlo, vhi, ex, elo, ehi, vi, vl, vh);
+        if (vi) expect(ex && vl == elo && vh == ehi, msg);
+        else expect(!lo_in && !hi_in, msg);
+    }
+    unlink(path);
+    return cc_ok();
+}
+
+int main(void) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    const char *c_path = "testdata/generated/relex_smoke.c";
+    const char *md_path = "testdata/generated/relex_smoke.md";
+    const char *tmp_c = "testdata/generated/relex_smoke_out.c";
+    const char *tmp_md = "testdata/generated/relex_smoke_out.md";
+    if (getenv("RELEX_SEED")) g_rng = (unsigned)atol(getenv("RELEX_SEED"));
+    (void)!system("mkdir -p testdata/generated");
+    write_c(c_path, 96 * 1024);
+    write_md(md_path, 72 * 1024);
+    if (!getenv("RELEX_WIN_ONLY") && !getenv("SCROLL_ONLY")) {
+        if (!getenv("RELEX_MD_ONLY")) run(c_path, tmp_c, "c", 400) !>;
+        run(md_path, tmp_md, "md", 300) !>;
+    }
+    if (!getenv("SCROLL_ONLY")) {
+        const char *wj = "testdata/generated/relex_win.json";
+        const char *wc = "testdata/generated/relex_win.c";
+        const char *wm = "testdata/generated/relex_win.md";
+        const char *wo_j = "testdata/generated/relex_win_out.json";
+        const char *wo_c = "testdata/generated/relex_win_out.c";
+        const char *wo_m = "testdata/generated/relex_win_out.md";
+        size_t steps = getenv("RELEX_WIN_STEPS") ? (size_t)atol(getenv("RELEX_WIN_STEPS")) : 240;
+        write_json(wj, 600 * 1024);
+        write_c(wc, 600 * 1024);
+        write_md_big(wm, 600 * 1024);
+        const char *only = getenv("RELEX_WIN_ONLY");
+        if (!only || !strcmp(only, "json")) win_run(wj, wo_j, "win-json", steps, 0) !>;
+        if (!only || !strcmp(only, "c")) win_run(wc, wo_c, "win-c", steps, 0) !>;
+        if (!only || !strcmp(only, "md"))
+            win_run(wm, wo_m, "win-md", steps, (size_t)RTX_MARKUP_LOOKBACK) !>;
+        /* Most edits inside a window relex from it (the rest sit in the
+         * first 2 KiB after its anchor, or hit a `=` header). */
+        expect(g_win_relexed * 2 > g_win_edits, "window: edits relex from the window lex");
+        unlink(wj);
+        unlink(wc);
+        unlink(wm);
+        unlink(wo_j);
+        unlink(wo_c);
+        unlink(wo_m);
+    }
+    if (!getenv("RELEX_WIN_ONLY")) {
+        const char *sj = "testdata/generated/scroll_walk.json";
+        const char *sc = "testdata/generated/scroll_walk.c";
+        const char *sm = "testdata/generated/scroll_walk.md";
+        const char *st = "testdata/generated/scroll_walk.txt";
+        const char *sd = "testdata/generated/scroll_dense.txt";
+        size_t steps = getenv("SCROLL_STEPS") ? (size_t)atol(getenv("SCROLL_STEPS")) : 160;
+        const char *only = getenv("SCROLL_ONLY");
+        g_rng = getenv("SCROLL_SEED") ? (unsigned)atol(getenv("SCROLL_SEED")) : 4242u;
+        write_json(sj, 1400 * 1024);
+        write_c(sc, 1400 * 1024);
+        write_md_big(sm, 1400 * 1024);
+        write_mixed(st, 5 * 1024 * 1024);
+        write_dense(sd, 600 * 1024);
+        if (!only || !strcmp(only, "json")) scroll_walk(sj, "scroll-json", steps, 0, 0, 6000) !>;
+        if (!only || !strcmp(only, "c")) scroll_walk(sc, "scroll-c", steps, 0, 0, 6000) !>;
+        if (!only || !strcmp(only, "md"))
+            scroll_walk(sm, "scroll-md", steps, (size_t)RTX_MARKUP_LOOKBACK, 0, 6000) !>;
+        /* One tall window over dense `===` text: hundreds of headers. */
+        if (!only || !strcmp(only, "txt") || !strcmp(only, "dense")) {
+            g_max_secs = 0;
+            scroll_walk(sd, "scroll-dense", steps / 2, 0, 0, 24000) !>;
+            expect(g_max_secs > 256, "scroll-dense: a window held over 256 headers");
+        }
+        /* A small trim floor so the walk trims (and comes back to what it
+         * trimmed) on a test-sized file. */
+        rtx_hl_trim_floor(2048);
+        if (!only || !strcmp(only, "txt"))
+            scroll_walk(st, "scroll-txt", steps * 2, 0, 1, 6000) !>;
+        if (!only || !strcmp(only, "txt") || !strcmp(only, "dense"))
+            scroll_walk(sd, "scroll-dense-trim", steps, 0, 1, 12000) !>;
+        if (!only || !strcmp(only, "md"))
+            scroll_walk(sm, "scroll-md-trim", steps, (size_t)RTX_MARKUP_LOOKBACK, 0, 6000) !>;
+        rtx_hl_trim_floor(0);
+        unlink(sj);
+        unlink(sc);
+        unlink(sm);
+        unlink(st);
+        unlink(sd);
+    }
+    g_rng = 777u;
+    if (!getenv("SCROLL_ONLY")) {
+        pair_run("testdata/generated/pair_vis_small.c", 6000, 4000) !>;
+        pair_run("testdata/generated/pair_vis_big.c", 900 * 1024, 3000) !>;
+    }
+    unlink(c_path);
+    unlink(md_path);
+    unlink(tmp_c);
+    unlink(tmp_md);
+    if (fails) {
+        fprintf(stderr, "%d failure(s)\n", fails);
+        return 1;
+    }
+    printf("incr_smoke ok  window_edits=%zu relexed=%zu scroll_checks=%zu\n", g_win_edits,
+           g_win_relexed, g_scroll_checks);
+    return 0;
+}

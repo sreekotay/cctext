@@ -8,7 +8,8 @@
 # Env:
 #   CPUS=2                docker --cpus (TSAN benefits from >1 core)
 #   MEMORY=4g             docker --memory (sanitizer overhead; dup_scale @256 MiB)
-#   CCC_REF=              pin concurrent-c git ref at build time
+#   CCC_REF=              concurrent-c git ref at build time (default: the
+#                         Dockerfile's pinned commit)
 #   SKIP_BUILD=1          reuse existing image
 #   RTX_TARGETS=256       dup_scale checkpoint (default in @smoke_asan/@smoke_tsan)
 set -euo pipefail
@@ -60,14 +61,21 @@ echo "docker: $TASK @ ${CPUS} CPU, ${MEMORY} RAM → $LOG" >&2
     echo "# date=$(date -u +%Y-%m-%dT%H:%M:%SZ)  sanitizer=$SANITIZER  cpus=$CPUS  memory=$MEMORY"
     echo "# image=$IMAGE  task=$TASK"
     echo
+    # TSan re-execs with personality(ADDR_NO_RANDOMIZE); the default
+    # seccomp profile refuses it.
+    sec=()
+    if [[ "$SANITIZER" == thread ]]; then
+        sec=(--security-opt seccomp=unconfined)
+    fi
     docker run --rm \
+        ${sec[@]+"${sec[@]}"} \
         --cpus="$CPUS" \
         --memory="$MEMORY" \
         --memory-swap="$MEMORY" \
         --pids-limit=512 \
         -e RTX_TARGETS="${RTX_TARGETS:-256}" \
         -e RTX_DUP_ROUNDS="${RTX_DUP_ROUNDS:-}" \
-        -e ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=1:abort_on_error=1:print_legend=0}" \
+        -e ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=1:abort_on_error=1:print_legend=0:fast_unwind_on_fatal=1}" \
         -e TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=1}" \
         "$IMAGE" \
         /usr/bin/time -f 'elapsed_sec=%e max_rss_kb=%M' \

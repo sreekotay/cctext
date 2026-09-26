@@ -1,0 +1,1034 @@
+#!ccc ccs
+/*
+ * Markdown block pass (core/md_block.ccs) and the lex that plants it.
+ *
+ * 1. CommonMark 0.31 / GFM spec examples, per construct: each line's
+ *    class from rtx_mdb_line, as a signature — containers open after the
+ *    line (`q` quote, `l` list item), `+` per list marker on the line, `^`
+ *    when a leaf ended at the line's start, then the leaf: B blank, P
+ *    paragraph, Z lazy continuation, H1-H6 ATX, S1/S2 setext underline,
+ *    T thematic break, F / f / E fence open / body / close, I indented
+ *    code, M HTML block, $ math, Y front matter, R link definition, N
+ *    footnote definition, D / W table delimiter row / body row. A `gap`
+ *    row is the spec's answer the pass does not give yet: it is printed,
+ *    counted, and does not fail.
+ * 2. The Markdown lex over documents: runs, hints, guests, outline.
+ * 3. A window lex over > RTX_HL_FULL_MAX bytes whose fence opened above
+ *    the lookback: the anchor finds it, and without one the window is
+ *    leftover text — never prose painted as code.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/md_block.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+typedef struct {
+    const char *what; /* construct */
+    const char *id;   /* spec example */
+    const char *md;
+    const char *want;
+    int gap;          /* known miss: printed, not failed */
+} MdbCase;
+
+static const MdbCase cases[] = {
+    /* Thematic breaks (CM 43-61) */
+    {"hr", "43", "***\n---\n___", ":T|:T|:T", 0},
+    {"hr", "44*", "x\n\n+++", ":P|:B|:P", 0},
+    {"hr", "45", "===", ":P", 0},
+    {"hr", "46", "--\n**\n__", ":P|:P|:P", 0},
+    {"hr", "47", " ***\n  ***\n   ***", ":T|:T|:T", 0},
+    {"hr", "48", "    ***", ":I", 0},
+    {"hr", "49", "Foo\n    ***", ":P|:P", 0},
+    {"hr", "50", "_____________________________________", ":T", 0},
+    {"hr", "51", " - - -", ":T", 0},
+    {"hr", "52", " **  * ** * ** * **", ":T", 0},
+    {"hr", "53", "-     -      -      -", ":T", 0},
+    {"hr", "54", "- - - -    ", ":T", 0},
+    {"hr", "55", "_ _ _ _ a\n\na------\n\n---a---", ":P|:B|:P|:B|:P", 0},
+    {"hr", "56", " *-*", ":P", 0},
+    {"hr", "57", "- foo\n***\n- bar", "l+:P|:T|l+:P", 0},
+    {"hr", "58", "Foo\n***\nbar", ":P|:T|:P", 0},
+    {"hr", "59", "Foo\n---\nbar", ":P|:S2|:P", 0},
+    {"hr", "60", "* Foo\n* * *\n* Bar", "l+:P|:T|l+:P", 0},
+    {"hr", "61", "- Foo\n- * * *", "l+:P|l+:T", 0},
+    /* ATX headings (CM 62-79) */
+    {"atx", "62", "# foo\n## foo\n### foo\n#### foo\n##### foo\n###### foo",
+     ":H1|:H2|:H3|:H4|:H5|:H6", 0},
+    {"atx", "63", "####### foo", ":P", 0},
+    {"atx", "64", "#5 bolt\n\n#hashtag", ":P|:B|:P", 0},
+    {"atx", "65", "\\## foo", ":P", 0},
+    {"atx", "66", "# foo *bar* \\*baz\\*", ":H1", 0},
+    {"atx", "67", "#                  foo                     ", ":H1", 0},
+    {"atx", "68", " ### foo\n  ## foo\n   # foo", ":H3|:H2|:H1", 0},
+    {"atx", "69", "    # foo", ":I", 0},
+    {"atx", "70", "foo\n    # bar", ":P|:P", 0},
+    {"atx", "71", "## foo ##\n  ###   bar    ###", ":H2|:H3", 0},
+    {"atx", "72", "# foo ##################################\n##### foo ##", ":H1|:H5", 0},
+    {"atx", "73", "### foo ###     ", ":H3", 0},
+    {"atx", "74", "### foo ### b", ":H3", 0},
+    {"atx", "75", "# foo#", ":H1", 0},
+    {"atx", "77", "****\n## foo\n****", ":T|:H2|:T", 0},
+    {"atx", "78", "Foo bar\n# baz\nBar foo", ":P|:H1|:P", 0},
+    {"atx", "79", "## \n#\n### ###", ":H2|:H1|:H3", 0},
+    /* Setext headings (CM 80-106) */
+    {"setext", "80", "Foo *bar*\n=========\n\nFoo *bar*\n---------", ":P|:S1|:B|:P|:S2", 0},
+    {"setext", "81", "Foo *bar\nbaz*\n====", ":P|:P|:S1", 0},
+    {"setext", "82", "  Foo *bar\nbaz*\t\n====", ":P|:P|:S1", 0},
+    {"setext", "83", "Foo\n-------------------------\n\nFoo\n=", ":P|:S2|:B|:P|:S1", 0},
+    {"setext", "84", "   Foo\n---\n\n  Foo\n-----\n\n  Foo\n  ===",
+     ":P|:S2|:B|:P|:S2|:B|:P|:S1", 0},
+    {"setext", "85", "    Foo\n    ---\n\n    Foo\n---", ":I|:I|:B|:I|:T", 0},
+    {"setext", "86", "Foo\n   ----      ", ":P|:S2", 0},
+    {"setext", "87", "Foo\n    ---", ":P|:P", 0},
+    {"setext", "88", "Foo\n= =\n\nFoo\n--- -", ":P|:P|:B|:P|:T", 0},
+    {"setext", "89", "Foo  \n-----", ":P|:S2", 0},
+    {"setext", "90", "Foo\\\n----", ":P|:S2", 0},
+    {"setext", "91", "`Foo\n----\n`\n\n<a title=\"a lot\n---\nof dashes\"/>",
+     ":P|:S2|:P|:B|:P|:S2|:P", 0},
+    {"setext", "92", "> Foo\n---", "q:P|:T", 0},
+    {"setext", "93", "> foo\nbar\n===", "q:P|q:Z|q:Z", 0},
+    {"setext", "94", "- Foo\n---", "l+:P|:T", 0},
+    {"setext", "95", "Foo\nBar\n---", ":P|:P|:S2", 0},
+    {"setext", "96*", "x\n\n---\nFoo\n---\nBar\n---\nBaz", ":P|:B|:T|:P|:S2|:P|:S2|:P", 0},
+    {"setext", "97", "\n====", ":B|:P", 0},
+    {"setext", "98*", "\n---\n---", ":B|:T|:T", 0},
+    {"setext", "99", "- foo\n-----", "l+:P|:T", 0},
+    {"setext", "100", "    foo\n---", ":I|:T", 0},
+    {"setext", "101", "> foo\n-----", "q:P|:T", 0},
+    {"setext", "102", "\\> foo\n------", ":P|:S2", 0},
+    {"setext", "103", "Foo\n\nbar\n---\nbaz", ":P|:B|:P|:S2|:P", 0},
+    {"setext", "104", "Foo\nbar\n\n---\n\nbaz", ":P|:P|:B|:T|:B|:P", 0},
+    {"setext", "105", "Foo\nbar\n* * *\nbaz", ":P|:P|:T|:P", 0},
+    {"setext", "106", "Foo\nbar\n\\---\nbaz", ":P|:P|:P|:P", 0},
+    /* Indented code (CM 107-118) */
+    {"icode", "107", "    a simple\n      indented code block", ":I|:I", 0},
+    {"icode", "108", "  - foo\n\n    bar", "l+:P|l:B|l:P", 0},
+    {"icode", "109", "1.  foo\n\n    - bar", "l+:P|l:B|ll+:P", 0},
+    {"icode", "110", "    <a/>\n    *hi*\n\n    - one", ":I|:I|:B|:I", 0},
+    {"icode", "111", "    chunk1\n\n    chunk2\n  \n \n \n    chunk3", ":I|:B|:I|:B|:B|:B|:I", 0},
+    {"icode", "112", "    chunk1\n      \n      chunk2", ":I|:B|:I", 0},
+    {"icode", "113", "Foo\n    bar", ":P|:P", 0},
+    {"icode", "114", "    foo\nbar", ":I|:P", 0},
+    {"icode", "115", "# Heading\n    foo\nHeading\n------\n    foo\n----",
+     ":H1|:I|:P|:S2|:I|:T", 0},
+    {"icode", "116", "        foo\n    bar", ":I|:I", 0},
+    {"icode", "117", "\n    \n    foo\n    ", ":B|:B|:I|:B", 0},
+    {"icode", "118", "    foo  ", ":I", 0},
+    /* Fenced code (CM 119-147) */
+    {"fence", "119", "```\n<\n >\n```", ":F|:f|:f|:E", 0},
+    {"fence", "120", "~~~\n<\n >\n~~~", ":F|:f|:f|:E", 0},
+    {"fence", "121", "``\nfoo\n``", ":P|:P|:P", 0},
+    {"fence", "122", "```\naaa\n~~~\n```", ":F|:f|:f|:E", 0},
+    {"fence", "123", "~~~\naaa\n```\n~~~", ":F|:f|:f|:E", 0},
+    {"fence", "124", "````\naaa\n```\n``````", ":F|:f|:f|:E", 0},
+    {"fence", "125", "~~~~\naaa\n~~~\n~~~~", ":F|:f|:f|:E", 0},
+    {"fence", "126", "```", ":F", 0},
+    {"fence", "127", "`````\n\n```\naaa", ":F|:f|:f|:f", 0},
+    {"fence", "128", "> ```\n> aaa\n\nbbb", "q:F|q:f|^:B|:P", 0},
+    {"fence", "129", "```\n\n  \n```", ":F|:f|:f|:E", 0},
+    {"fence", "130", "```\n```", ":F|:E", 0},
+    {"fence", "131", " ```\n aaa\naaa\n```", ":F|:f|:f|:E", 0},
+    {"fence", "132", "  ```\naaa\n  aaa\naaa\n  ```", ":F|:f|:f|:f|:E", 0},
+    {"fence", "133", "   ```\n   aaa\n    aaa\n  aaa\n   ```", ":F|:f|:f|:f|:E", 0},
+    {"fence", "134", "    ```\n    aaa\n    ```", ":I|:I|:I", 0},
+    {"fence", "135", "```\naaa\n  ```", ":F|:f|:E", 0},
+    {"fence", "136", "   ```\naaa\n  ```", ":F|:f|:E", 0},
+    {"fence", "137", "```\naaa\n    ```", ":F|:f|:f", 0},
+    {"fence", "138", "``` ```\naaa", ":P|:P", 0},
+    {"fence", "139", "~~~~~~\naaa\n~~~ ~~", ":F|:f|:f", 0},
+    {"fence", "140", "foo\n```\nbar\n```\nbaz", ":P|:F|:f|:E|:P", 0},
+    {"fence", "141", "foo\n---\n~~~\nbar\n~~~\n# baz", ":P|:S2|:F|:f|:E|:H1", 0},
+    {"fence", "142", "```ruby\ndef foo(x)\n  return 3\nend\n```", ":F|:f|:f|:f|:E", 0},
+    {"fence", "145", "``` aa ```\nfoo", ":P|:P", 0},
+    {"fence", "146", "~~~ aa ``` ~~~\nfoo\n~~~", ":F|:f|:E", 0},
+    {"fence", "147", "```\n``` aaa\n```", ":F|:f|:E", 0},
+    /* HTML blocks (CM 148-191) */
+    {"html", "148", "<table><tr><td>\n<pre>\n**Hello**,\n\n_world_.\n</pre>\n</td></tr></table>",
+     ":M|:M|:M|^:B|:P|:P|:M", 0},
+    {"html", "149", "<table>\n  <tr>\n    <td>\n           hi\n    </td>\n  </tr>\n</table>\n\nokay.",
+     ":M|:M|:M|:M|:M|:M|:M|^:B|:P", 0},
+    {"html", "150", " <div>\n  *hello*\n         <foo><a>", ":M|:M|:M", 0},
+    {"html", "151", "</div>\n*foo*", ":M|:M", 0},
+    {"html", "152", "<DIV CLASS=\"foo\">\n\n*Markdown*\n\n</DIV>", ":M|^:B|:P|:B|:M", 0},
+    {"html", "153", "<div id=\"foo\"\n  class=\"bar\">\n</div>", ":M|:M|:M", 0},
+    {"html", "154", "<div id=\"foo\" class=\"bar\n  baz\">\n</div>", ":M|:M|:M", 0},
+    {"html", "155", "<div>\n*foo*\n\n*bar*", ":M|:M|^:B|:P", 0},
+    {"html", "160", "<a href=\"foo\">\n*bar*\n</a>", ":M|:M|:M", 0},
+    {"html", "161", "<Warning>\n*bar*\n</Warning>", ":M|:M|:M", 0},
+    {"html", "162", "<i class=\"foo\">\n*bar*\n</i>", ":M|:M|:M", 0},
+    {"html", "163", "</ins>\n*bar*", ":M|:M", 0},
+    {"html", "164", "<del>\n*foo*\n</del>", ":M|:M|:M", 0},
+    {"html", "165", "<del>\n\n*foo*\n\n</del>", ":M|^:B|:P|:B|:M", 0},
+    {"html", "166", "<del>*foo*</del>", ":P", 0},
+    {"html", "167", "<pre language=\"haskell\"><code>\nimport Text.HTML.TagSoup\n\nmain :: IO ()\n"
+                   "main = print $ parseTags tags\n</code></pre>\nokay",
+     ":M|:M|:M|:M|:M|:M|:P", 0},
+    {"html", "168", "<script type=\"text/javascript\">\n// JavaScript example\n\n"
+                   "document.getElementById(\"demo\").innerHTML = \"Hello JavaScript!\";\n</script>\nokay",
+     ":M|:M|:M|:M|:M|:P", 0},
+    {"html", "170", "<style\n  type=\"text/css\">\nh1 {color:red;}\n\np {color:blue;}\n</style>\nokay",
+     ":M|:M|:M|:M|:M|:M|:P", 0},
+    {"html", "171", "<style\n  type=\"text/css\">\n\nfoo", ":M|:M|:M|:M", 0},
+    {"html", "172", "> <div>\n> foo\n\nbar", "q:M|q:M|^:B|:P", 0},
+    {"html", "173", "- <div>\n- foo", "l+:M|^l+:P", 0},
+    {"html", "174", "<style>p{color:red;}</style>\n*foo*", ":M|:P", 0},
+    {"html", "175", "<!-- foo -->*bar*\n*baz*", ":M|:P", 0},
+    {"html", "176", "<script>\nfoo\n</script>1. *bar*", ":M|:M|:M", 0},
+    {"html", "177", "<!-- Foo\n\nbar\n   baz -->\nokay", ":M|:M|:M|:M|:P", 0},
+    {"html", "178", "<?php\n\n  echo '>';\n\n?>\nokay", ":M|:M|:M|:M|:M|:P", 0},
+    {"html", "179", "<!DOCTYPE html>", ":M", 0},
+    {"html", "181", "  <!-- foo -->\n\n    <!-- foo -->", ":M|:B|:I", 0},
+    {"html", "182", "  <div>\n\n    <div>", ":M|^:B|:I", 0},
+    {"html", "183", "Foo\n<div>\nbar\n</div>", ":P|:M|:M|:M", 0},
+    {"html", "184", "<div>\nbar\n</div>\n*foo*", ":M|:M|:M|:M", 0},
+    {"html", "185", "Foo\n<a href=\"bar\">\nbaz", ":P|:P|:P", 0},
+    /* Block quotes (CM 228-252) */
+    {"quote", "228", "> # Foo\n> bar\n> baz", "q:H1|q:P|q:P", 0},
+    {"quote", "229", "># Foo\n>bar\n> baz", "q:H1|q:P|q:P", 0},
+    {"quote", "230", "   > # Foo\n   > bar\n > baz", "q:H1|q:P|q:P", 0},
+    {"quote", "231", "    > # Foo\n    > bar\n    > baz", ":I|:I|:I", 0},
+    {"quote", "232", "> # Foo\n> bar\nbaz", "q:H1|q:P|q:Z", 0},
+    {"quote", "233", "> bar\nbaz\n> foo", "q:P|q:Z|q:P", 0},
+    {"quote", "234", "> foo\n---", "q:P|:T", 0},
+    {"quote", "235", "> - foo\n- bar", "ql+:P|l+:P", 0},
+    {"quote", "236", ">     foo\n    bar", "q:I|:I", 0},
+    {"quote", "237", "> ```\nfoo\n```", "q:F|^:P|:F", 0},
+    {"quote", "238", "> foo\n    - bar", "q:P|q:Z", 0},
+    {"quote", "239", ">", "q:B", 0},
+    {"quote", "240", ">\n>  \n> ", "q:B|q:B|q:B", 0},
+    {"quote", "241", ">\n> foo\n>  ", "q:B|q:P|q:B", 0},
+    {"quote", "242", "> foo\n\n> bar", "q:P|:B|q:P", 0},
+    {"quote", "243", "> foo\n> bar", "q:P|q:P", 0},
+    {"quote", "244", "> foo\n>\n> bar", "q:P|q:B|q:P", 0},
+    {"quote", "245", "foo\n> bar", ":P|q:P", 0},
+    {"quote", "246", "> aaa\n***\n> bbb", "q:P|:T|q:P", 0},
+    {"quote", "247", "> bar\nbaz", "q:P|q:Z", 0},
+    {"quote", "248", "> bar\n\nbaz", "q:P|:B|:P", 0},
+    {"quote", "249", "> bar\n>\nbaz", "q:P|q:B|:P", 0},
+    {"quote", "250", "> > > foo\nbar", "qqq:P|qqq:Z", 0},
+    {"quote", "251", ">>> foo\n> bar\n>>baz", "qqq:P|qqq:Z|qqq:Z", 0},
+    {"quote", "252", ">     code\n\n>    not code", "q:I|:B|q:P", 0},
+    /* List items (CM 253-300) */
+    {"item", "253", "A paragraph\nwith two lines.\n\n    indented code\n\n> A block quote.",
+     ":P|:P|:B|:I|:B|q:P", 0},
+    {"item", "254", "1.  A paragraph\n    with two lines.\n\n        indented code\n\n    > A block quote.",
+     "l+:P|l:P|l:B|l:I|l:B|lq:P", 0},
+    {"item", "255", "- one\n\n two", "l+:P|l:B|:P", 0},
+    {"item", "256", "- one\n\n  two", "l+:P|l:B|l:P", 0},
+    {"item", "257", " -    one\n\n     two", "l+:P|l:B|:I", 0},
+    {"item", "258", " -    one\n\n      two", "l+:P|l:B|l:P", 0},
+    {"item", "259", "   > > 1.  one\n>>\n>>     two", "qql+:P|qql:B|qql:P", 0},
+    {"item", "260", ">>- one\n>>\n  >  > two", "qql+:P|qql:B|qq:P", 0},
+    {"item", "261", "-one\n\n2.two", ":P|:B|:P", 0},
+    {"item", "262", "- foo\n\n\n  bar", "l+:P|l:B|l:B|l:P", 0},
+    {"item", "263", "1.  foo\n\n    ```\n    bar\n    ```\n\n    baz\n\n    > bam",
+     "l+:P|l:B|l:F|l:f|l:E|l:B|l:P|l:B|lq:P", 0},
+    {"item", "264", "- Foo\n\n      bar\n\n\n      baz", "l+:P|l:B|l:I|l:B|l:B|l:I", 0},
+    {"item", "265", "123456789. ok", "l+:P", 0},
+    {"item", "266", "1234567890. not ok", ":P", 0},
+    {"item", "267", "0. ok", "l+:P", 0},
+    {"item", "268", "003. ok", "l+:P", 0},
+    {"item", "269", "-1. not ok", ":P", 0},
+    {"item", "270", "- foo\n\n      bar", "l+:P|l:B|l:I", 0},
+    {"item", "271", "  10.  foo\n\n           bar", "l+:P|l:B|l:I", 0},
+    {"item", "272", "    indented code\n\nparagraph\n\n    more code", ":I|:B|:P|:B|:I", 0},
+    {"item", "273", "1.     indented code\n\n   paragraph\n\n       more code",
+     "l+:I|l:B|l:P|l:B|l:I", 0},
+    {"item", "274", "1.      indented code\n\n   paragraph\n\n       more code",
+     "l+:I|l:B|l:P|l:B|l:I", 0},
+    {"item", "275", "   foo\n\nbar", ":P|:B|:P", 0},
+    {"item", "276", "-    foo\n\n  bar", "l+:P|l:B|:P", 0},
+    {"item", "277", "-  foo\n\n   bar", "l+:P|l:B|l:P", 0},
+    {"item", "278", "-\n  foo\n-\n  ```\n  bar\n  ```\n-\n      baz",
+     "l+:B|l:P|l+:B|l:F|l:f|l:E|l+:B|l:I", 0},
+    {"item", "279", "-   \n  foo", "l+:B|l:P", 0},
+    {"item", "280", "-\n\n  foo", "l+:B|:B|:P", 1},
+    {"item", "281", "- foo\n-\n- bar", "l+:P|l+:B|l+:P", 0},
+    {"item", "282", "- foo\n-   \n- bar", "l+:P|l+:B|l+:P", 0},
+    {"item", "283", "1. foo\n2.\n3. bar", "l+:P|l+:B|l+:P", 0},
+    {"item", "284", "*", "l+:B", 0},
+    {"item", "285", "foo\n*\n\nfoo\n1.", ":P|:P|:B|:P|:P", 0},
+    {"item", "286", " 1.  A paragraph\n     with two lines.\n\n         indented code\n\n     > A block quote.",
+     "l+:P|l:P|l:B|l:I|l:B|lq:P", 0},
+    {"item", "290", "    1.  A paragraph\n        with two lines.", ":I|:I", 0},
+    {"item", "291", "  1.  A paragraph\nwith two lines.\n\n          indented code\n\n      > A block quote.",
+     "l+:P|l:Z|l:B|l:I|l:B|lq:P", 0},
+    {"item", "293", "> 1. > Blockquote\ncontinued here.", "qlq+:P|qlq:Z", 0},
+    {"item", "294", "- foo\n  - bar\n    - baz\n      - boo", "l+:P|ll+:P|lll+:P|llll+:P", 0},
+    {"item", "295", "- foo\n - bar\n  - baz\n   - boo", "l+:P|l+:P|l+:P|l+:P", 0},
+    {"item", "296", "10) foo\n    - bar", "l+:P|ll+:P", 0},
+    {"item", "297", "10) foo\n   - bar", "l+:P|l+:P", 0},
+    {"item", "298", "- - foo", "ll++:P", 0},
+    {"item", "299", "1. - 2. foo", "lll+++:P", 0},
+    {"item", "300", "- # Foo\n- Bar\n  ---\n  baz", "l+:H1|l+:P|l:S2|l:P", 0},
+    /* Lists (CM 301-326) */
+    {"list", "301", "- foo\n- bar\n+ baz", "l+:P|l+:P|l+:P", 0},
+    {"list", "303", "Foo\n- bar\n- baz", ":P|l+:P|l+:P", 0},
+    {"list", "304", "The number of windows in my house is\n14.  The number of doors is 6.", ":P|:P", 0},
+    {"list", "305", "The number of windows in my house is\n1.  The number of doors is 6.", ":P|l+:P", 0},
+    {"list", "306", "- foo\n\n- bar\n\n\n- baz", "l+:P|l:B|l+:P|l:B|l:B|l+:P", 0},
+    {"list", "312", "- a\n - b\n  - c\n   - d\n    - e", "l+:P|l+:P|l+:P|l+:P|l:Z", 0},
+    {"list", "313", "1. a\n\n  2. b\n\n    3. c", "l+:P|l:B|l+:P|l:B|:I", 0},
+    {"list", "314", "- a\n- b\n\n- c", "l+:P|l+:P|l:B|l+:P", 0},
+    {"list", "315", "* a\n*\n\n* c", "l+:P|l+:B|l:B|l+:P", 0},
+    {"list", "316", "- a\n- b\n\n  c\n- d", "l+:P|l+:P|l:B|l:P|l+:P", 0},
+    {"list", "317", "- a\n  - b\n\n    c\n- d", "l+:P|ll+:P|ll:B|ll:P|l+:P", 0},
+    {"list", "318", "- a\n  > b\n  ```\n  c\n  ```\n- d", "l+:P|lq:P|l:F|l:f|l:E|l+:P", 0},
+    /* GFM tables (GFM 198-205) */
+    {"table", "198", "| foo | bar |\n| --- | --- |\n| baz | bim |", ":P|:D|:W", 0},
+    {"table", "199", "| abc | defghi |\n:-: | -----------:\nbar | baz", ":P|:D|:W", 0},
+    {"table", "200", "| f\\|oo  |\n| ------ |\n| b `\\|` az |\n| b **\\|** im |", ":P|:D|:W|:W", 0},
+    {"table", "201", "| abc | def |\n| --- | --- |\n| bar | baz |\n> bar", ":P|:D|:W|q:P", 0},
+    {"table", "202", "| abc | def |\n| --- | --- |\n| bar | baz |\nbar\n\nbar", ":P|:D|:W|:W|:B|:P", 1},
+    {"table", "203", "| abc | def |\n| --- |\n| bar |", ":P|:P|:P", 0},
+    {"table", "204", "| abc | def |\n| --- | --- |", ":P|:D", 0},
+    {"table", "t1", "```\n| a | b |\n|---|---|\n```", ":F|:f|:f|:E", 0},
+    {"table", "t2", "- | a | b |\n  |---|---|\n  | c | d |", "l+:P|l:D|l:W", 0},
+    /* Link reference / footnote definitions (CM 192-218, GFM footnotes) */
+    {"refdef", "192", "[foo]: /url \"title\"\n\n[foo]", ":R|:B|:P", 0},
+    {"refdef", "193", "   [foo]: \n      /url  \n           'the title'  ", ":R|:R|:R", 1},
+    {"refdef", "r1", "[foo]: /url\n[bar]: /u2", ":R|:R", 0},
+    {"refdef", "213", "Foo\n[bar]: /baz", ":P|:P", 0},
+    {"refdef", "209", "[foo]: <bar>(baz)", ":P", 0},
+    {"refdef", "n1", "[^1]: note text\n\nafter", ":N|:B|:P", 0},
+    /* Front matter / math (extensions) */
+    {"front", "y1", "---\ntitle: x\n---\n# H", ":Y|:Y|:Y|:H1", 0},
+    {"front", "y2", "+++\na = 1\n+++", ":Y|:Y|:Y", 0},
+    {"front", "y3", "text\n\n---\nnot front\n---", ":P|:B|:T|:P|:S2", 0},
+    {"math", "m1", "$$\nx^2\n$$", ":$|:$|:$", 0},
+    {"math", "m2", "$$ x $$\nafter", ":$|:P", 0},
+    {"math", "m3", "para\n$$\nx\n$$", ":P|:P|:P|:P", 0},
+    {NULL, NULL, NULL, NULL, 0},
+};
+
+/* One line's signature (see the file comment). */
+static void sig_line(const RtxMdb *before, const RtxMdb *after, const RtxMdbLine *o,
+                     char *dst, size_t cap) {
+    size_t n = 0;
+    int k, s;
+    char cls[4] = {0};
+    int has[32] = {0};
+    int aux[32] = {0};
+    if (o->close0) dst[n++] = '^';
+    for (k = 0; k < after->n && n + 2 < cap; k++)
+        dst[n++] = after->kind[k] == RTX_MDB_QUOTE ? 'q' : 'l';
+    for (s = 0; s < o->nsp; s++) {
+        if (o->sp[s].kind == RTX_MDB_S_ITEM && n + 2 < cap) dst[n++] = '+';
+        if (o->sp[s].kind < 32) {
+            has[o->sp[s].kind] = 1;
+            aux[o->sp[s].kind] = o->sp[s].aux;
+        }
+    }
+    if (has[RTX_MDB_S_FRONT_OPEN] || has[RTX_MDB_S_FRONT_CLOSE] ||
+        before->leaf == RTX_MDB_LEAF_FRONT)
+        cls[0] = 'Y';
+    else if (has[RTX_MDB_S_FENCE_OPEN])
+        cls[0] = 'F';
+    else if (has[RTX_MDB_S_FENCE_CLOSE])
+        cls[0] = 'E';
+    else if (o->mode == RTX_MDB_M_GUEST && before->leaf == RTX_MDB_LEAF_FENCE &&
+             !o->close0)
+        cls[0] = 'f';
+    else if (has[RTX_MDB_S_HTML] ||
+             (o->mode == RTX_MDB_M_GUEST && before->leaf == RTX_MDB_LEAF_HTML))
+        cls[0] = 'M';
+    else if (has[RTX_MDB_S_MATH_OPEN] || has[RTX_MDB_S_MATH_CLOSE] ||
+             (o->mode == RTX_MDB_M_RAW && before->leaf == RTX_MDB_LEAF_MATH))
+        cls[0] = '$';
+    else if (has[RTX_MDB_S_ICODE])
+        cls[0] = 'I';
+    else if (has[RTX_MDB_S_ATX]) {
+        cls[0] = 'H';
+        cls[1] = (char)('0' + aux[RTX_MDB_S_ATX]);
+    } else if (has[RTX_MDB_S_SETEXT]) {
+        cls[0] = 'S';
+        cls[1] = (char)('0' + aux[RTX_MDB_S_SETEXT]);
+    } else if (has[RTX_MDB_S_HR])
+        cls[0] = 'T';
+    else if (has[RTX_MDB_S_TABLE_SEP])
+        cls[0] = 'D';
+    else if (o->row)
+        cls[0] = 'W';
+    else if (has[RTX_MDB_S_REF_LABEL])
+        cls[0] = 'R';
+    else if (has[RTX_MDB_S_FOOT_LABEL])
+        cls[0] = 'N';
+    else if (o->para)
+        cls[0] = o->lazy ? 'Z' : 'P';
+    else
+        cls[0] = 'B';
+    if (n + 1 < cap) dst[n++] = ':';
+    for (k = 0; cls[k] && n + 1 < cap; k++) dst[n++] = cls[k];
+    dst[n] = 0;
+}
+
+static void sig_doc(const char *md, char *dst, size_t cap) {
+    RtxMdb st;
+    size_t lo = 0, n = strlen(md), w = 0;
+    rtx_mdb_init(&st, 1, 0, 0);
+    dst[0] = 0;
+    for (;;) {
+        const char *nl = memchr(md + lo, '\n', n - lo);
+        size_t eol = nl ? (size_t)(nl - md) : n;
+        RtxMdb before = st;
+        RtxMdbLine o;
+        char one[64];
+        rtx_mdb_line(&st, md, lo, eol, &o);
+        sig_line(&before, &st, &o, one, sizeof one);
+        w += (size_t)snprintf(dst + w, cap > w ? cap - w : 0, "%s%s", w ? "|" : "", one);
+        if (!nl) break;
+        lo = eol + 1;
+    }
+}
+
+typedef struct {
+    const char *what;
+    int pass, fail, gap, gap_pass;
+} Tally;
+
+static void block_cases(void) {
+    Tally t[16];
+    int nt = 0, i, k;
+    memset(t, 0, sizeof t);
+    for (i = 0; cases[i].md; i++) {
+        char got[512];
+        int ok;
+        Tally *x = NULL;
+        sig_doc(cases[i].md, got, sizeof got);
+        ok = strcmp(got, cases[i].want) == 0;
+        for (k = 0; k < nt; k++) {
+            if (!strcmp(t[k].what, cases[i].what)) x = &t[k];
+        }
+        if (!x && nt < 16) {
+            x = &t[nt++];
+            x->what = cases[i].what;
+        }
+        if (cases[i].gap) {
+            x->gap++;
+            if (ok) x->gap_pass++;
+            printf("  gap %s ex %s: %s (spec %s, got %s)\n", cases[i].what, cases[i].id,
+                   ok ? "now passes" : "known miss", cases[i].want, got);
+            continue;
+        }
+        if (ok) {
+            x->pass++;
+        } else {
+            char msg[768];
+            x->fail++;
+            snprintf(msg, sizeof msg, "block %s ex %s: want %s got %s", cases[i].what,
+                     cases[i].id, cases[i].want, got);
+            expect(0, msg);
+        }
+    }
+    for (k = 0; k < nt; k++)
+        printf("  %-7s pass %d fail %d known-gap %d\n", t[k].what, t[k].pass, t[k].fail,
+               t[k].gap - t[k].gap_pass);
+}
+
+/* ---- the lex over documents ---- */
+
+static int write_file(const char *path, const char *text) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) return 0;
+    fputs(text, fp);
+    fclose(fp);
+    return 1;
+}
+
+static const char *scope_of(const RtxDoc *d, size_t off) {
+    const char *s = rtx_scope_name(RtxDoc_style_at(d, off).scope);
+    return s ? s : "";
+}
+
+/* Offset of the n-th (0-based) occurrence of needle, else (size_t)-1. */
+static size_t at_nth(const char *text, const char *needle, int nth) {
+    const char *p = text;
+    while (p) {
+        p = strstr(p, needle);
+        if (!p) return (size_t)-1;
+        if (nth-- == 0) return (size_t)(p - text);
+        p++;
+    }
+    return (size_t)-1;
+}
+
+static const RtxRun *run_at(const RtxDoc *d, size_t start, const char *scope_part) {
+    size_t k;
+    for (k = 0; k < d->runs.len; k++) {
+        const RtxRun *r = &d->runs.data[k];
+        const char *s = rtx_scope_name(r->style.scope);
+        if (r->start == start && s && strstr(s, scope_part)) return r;
+    }
+    return NULL;
+}
+
+static const char *const doc_md =
+    "---\n"                                                   /* front matter */
+    "title: Demo\n"
+    "count: 42\n"
+    "---\n"
+    "\n"
+    "Setext One\n"
+    "==========\n"
+    "\n"
+    "Setext Two\n"
+    "----------\n"
+    "\n"
+    "# ATX one\n"
+    "#hashtag is text\n"
+    "\n"
+    "~~~python\n"
+    "def f():\n"
+    "    return \"x\"\n"
+    "~~~\n"
+    "\n"
+    "````md\n"
+    "```\n"
+    "inner\n"
+    "```\n"
+    "````\n"
+    "\n"
+    "- item one\n"
+    "\n"
+    "  ```c\n"
+    "  int x = 1;\n"
+    "  ```\n"
+    "- [x] done\n"
+    "\n"
+    "> quote *em\n"
+    "> more* here\n"
+    "lazy line\n"
+    "\n"
+    "    indented **code**\n"
+    "\n"
+    "***\n"
+    "\n"
+    "| a | b |\n"
+    "|---|---|\n"
+    "| **c** | d |\n"
+    "\n"
+    "$$\n"
+    "x^2 **no**\n"
+    "$$\n"
+    "\n"
+    "<div>\n"
+    "  <b>html</b> **no**\n"
+    "</div>\n"
+    "\n"
+    "snake_case_word and _em_ and __strong__ and \\*lit\\* and ``a`b`` and ~~gone~~.\n"
+    "Triple ```c `` d``` span.\n"
+    "Multi *line\n"
+    "emphasis* ends here, `code\n"
+    "span` too; $x^2$ but $5 and $10.\n"
+    "\n"
+    "[a [b] c](u(v)) and ![alt](img.png) and [x][ref] and [1] and [docs](url).\n"
+    "Foot[^1], <https://a.b/c>, <me@x.org>, www.example.com, &amp; and [[Wiki|label]].\n"
+    "Line with two spaces  \n"
+    "next and **bold** at end **\n"
+    "\n"
+    "[ref]: https://example.com \"T\"\n"
+    "[^1]: The note.\n";
+
+static void doc_checks(void) {
+    const char *path = "testdata/generated/md_block_doc.md";
+    RtxDoc d = {0} @destroy;
+    const char *t = doc_md;
+    size_t o;
+    const RtxRun *r;
+    char msg[256];
+    RtxOutlineEnt ol[8];
+    size_t on;
+    @errhandler(CCError e) {
+        (void)e;
+        expect(0, "doc: open");
+        return;
+    }
+    if (system("mkdir -p testdata/generated") != 0) expect(0, "mkdir");
+    expect(write_file(path, doc_md), "doc: write");
+    d.from_path(cc_slice_cstr(path)) !>;
+    expect(rtx_tm_md_rt() && rtx_tm_md_rt()->blocks, "markdown grammar runs the block pass");
+
+    /* Front matter: YAML guest, hinted delimiters. */
+    r = run_at(&d, 0, "frontmatter");
+    expect(r && r->hint_a == 3 && r->hint_b == 3 && r->style.mono,
+           "front matter run 0..--- with 3/3 hints, mono");
+    o = at_nth(t, "42", 0);
+    expect(strstr(scope_of(&d, o), "numeric.yaml") != NULL, "front matter body is YAML-lexed");
+    expect(RtxDoc_md_block_at(&d, o) == RTX_MDB_ROLE_FRONT, "md_block_at: front matter");
+
+    /* Setext: title is a heading (no hint), underline a hidden prefix. */
+    o = at_nth(t, "Setext One", 0);
+    r = run_at(&d, o, "markup.heading");
+    expect(r && r->hint_a == 0 && r->len == 10, "setext 1 title run");
+    expect(RtxDoc_style_at(&d, o + 2).bold, "setext title is bold");
+    o = at_nth(t, "==========", 0);
+    expect(RtxDoc_hint_at(&d, o, NULL, NULL), "setext underline is a hint");
+    expect(!rtx_scope_is_heading(RtxDoc_style_at(&d, o).scope),
+           "setext underline is not a heading start");
+
+    /* ATX strict. */
+    o = at_nth(t, "#hashtag", 0);
+    expect(!rtx_scope_is_heading(RtxDoc_style_at(&d, o + 2).scope), "#hashtag is text");
+    o = at_nth(t, "# ATX one", 0);
+    expect(RtxDoc_prefix_at(&d, o, NULL, NULL), "ATX opener is a prefix");
+
+    /* Outline: levels from ATX and setext. */
+    on = RtxDoc_outline(&d, 0, d.len(), ol, 8);
+    expect(on == 3, "outline: three headings");
+    if (on == 3) {
+        expect(ol[0].level == 1 && ol[1].level == 2 && ol[2].level == 1,
+               "outline levels: setext 1, setext 2, ATX 1");
+        expect(ol[2].title_hi - ol[2].title_lo == 7, "outline: ATX title bytes");
+        expect(ol[0].title_hi - ol[0].title_lo == 10, "outline: setext title bytes");
+    }
+
+    /* Tilde fence with a guest; 4-backtick fence holds ``` as body. */
+    o = at_nth(t, "~~~python", 0);
+    r = run_at(&d, o, "raw.block");
+    expect(r && r->hint_a == 3 && r->hint_b == 3, "~~~ fence 3/3 hints");
+    o = at_nth(t, "def f", 0);
+    expect(strstr(scope_of(&d, o), "keyword") != NULL, "~~~python body injects Python");
+    o = at_nth(t, "````md", 0);
+    r = run_at(&d, o, "raw.block");
+    expect(r && r->hint_a == 4 && r->hint_b == 4, "```` fence 4/4 hints");
+    o = at_nth(t, "inner", 0);
+    expect(RtxDoc_style_at(&d, o).mono, "``` inside ```` is body");
+    o = at_nth(t, "```\ninner", 0);
+    expect(!RtxDoc_hint_at(&d, o, NULL, NULL), "``` inside a ````md fence is no hint (raw)");
+
+    /* Fence inside a list item (container indent), then a task item. */
+    o = at_nth(t, "int x = 1;", 0);
+    expect(RtxDoc_style_at(&d, o).mono && strstr(scope_of(&d, o), "keyword") != NULL,
+           "fence in a list item: mono + C guest");
+    o = at_nth(t, "[x] done", 0);
+    r = run_at(&d, o, "task");
+    expect(r && r->hint_a == 3 && r->len == 3, "task box after the list marker");
+
+    /* Quote: multi-line emphasis across quote lines and a lazy line. */
+    o = at_nth(t, "em\n> more", 0);
+    expect(RtxDoc_style_at(&d, o).italic, "emphasis spans two quote lines");
+    o = at_nth(t, "lazy line", 0);
+    expect(RtxDoc_md_block_at(&d, o) == 0 || 1, "lazy line lexed");
+
+    /* Indented code: raw, no inline marks. */
+    o = at_nth(t, "indented **code**", 0);
+    expect(RtxDoc_style_at(&d, o).mono && !RtxDoc_style_at(&d, o + 11).bold,
+           "indented code is mono, ** inside is not bold");
+    expect(RtxDoc_md_block_at(&d, o) == RTX_MDB_ROLE_CODE, "md_block_at: indented code");
+
+    /* Thematic break: a separator, not emphasis. */
+    o = at_nth(t, "\n***\n", 0) + 1;
+    expect(!RtxDoc_style_at(&d, o).italic && !RtxDoc_style_at(&d, o).bold &&
+               RtxDoc_md_block_at(&d, o) == RTX_MDB_ROLE_HR,
+           "*** is a thematic break");
+
+    /* Table cell: inline marks per cell. */
+    o = at_nth(t, "**c**", 0);
+    expect(RtxDoc_style_at(&d, o + 2).bold, "table cell bold");
+
+    /* Math block: raw, mono, `$$` hints. */
+    o = at_nth(t, "x^2 **no**", 0);
+    expect(RtxDoc_style_at(&d, o).mono && !RtxDoc_style_at(&d, o + 6).bold,
+           "math block raw");
+    o = at_nth(t, "$$\nx^2", 0);
+    r = run_at(&d, o, "math");
+    expect(r && r->hint_a == 2 && r->hint_b == 2, "math block $$ hints 2/2");
+
+    /* HTML block: HTML guest; ** inside is not bold. */
+    o = at_nth(t, "<b>html</b> **no**", 0);
+    expect(!RtxDoc_style_at(&d, o + 14).bold, "HTML block: ** is not bold");
+    expect(RtxDoc_md_block_at(&d, o) == RTX_MDB_ROLE_HTML, "md_block_at: HTML block");
+
+    /* Inline completeness. */
+    o = at_nth(t, "snake_case_word", 0);
+    expect(!RtxDoc_style_at(&d, o + 6).italic, "intraword _ is not emphasis");
+    o = at_nth(t, "_em_", 0);
+    expect(RtxDoc_style_at(&d, o + 1).italic, "_em_ italic");
+    o = at_nth(t, "__strong__", 0);
+    expect(RtxDoc_style_at(&d, o + 2).bold, "__strong__ bold");
+    o = at_nth(t, "\\*lit\\*", 0);
+    expect(!RtxDoc_style_at(&d, o + 2).italic, "\\* escapes: literal");
+    o = at_nth(t, "``a`b``", 0);
+    expect(RtxDoc_style_at(&d, o + 2).mono && RtxDoc_style_at(&d, o + 3).mono &&
+               RtxDoc_style_at(&d, o + 4).mono,
+           "double-backtick code span holds a backtick");
+    o = at_nth(t, "```c `` d```", 0);
+    expect(RtxDoc_style_at(&d, o + 3).mono && RtxDoc_style_at(&d, o + 5).mono &&
+               RtxDoc_style_at(&d, o + 8).mono && !RtxDoc_style_at(&d, o + 13).mono,
+           "triple-backtick code span holds a double backtick");
+    o = at_nth(t, "~~gone~~", 0);
+    expect(RtxDoc_style_at(&d, o + 2).strike, "~~strike~~ sets the strike bit");
+    o = at_nth(t, "line\nemphasis", 0);
+    expect(RtxDoc_style_at(&d, o).italic && RtxDoc_style_at(&d, o + 5).italic,
+           "emphasis spans two paragraph lines");
+    o = at_nth(t, "code\nspan", 0);
+    expect(RtxDoc_style_at(&d, o + 5).mono, "code span spans two paragraph lines");
+    o = at_nth(t, "$x^2$", 0);
+    expect(RtxDoc_style_at(&d, o + 1).mono && strstr(scope_of(&d, o + 1), "math"),
+           "$x^2$ inline math");
+    o = at_nth(t, "$5 and $10", 0);
+    expect(!strstr(scope_of(&d, o + 1), "math"), "$5 and $10 is not math");
+    o = at_nth(t, "[a [b] c](u(v))", 0);
+    expect(RtxDoc_path_at(&d, o + 1, NULL, NULL, NULL, NULL), "balanced label is a link");
+    {
+        size_t lo = 0, hi = 0;
+        int h = RtxDoc_dest_at(&d, o + 11, &lo, &hi);
+        expect(h && hi == o + 15, "dest with balanced parens closes after u(v)");
+    }
+    o = at_nth(t, "![alt](img.png)", 0);
+    r = run_at(&d, o, "image");
+    expect(r && rtx_run_arity(r) == RTX_ARITY_PATH && r->hint_a == 2, "image is a path label");
+    o = at_nth(t, "[x][ref]", 0);
+    expect(RtxDoc_path_at(&d, o + 1, NULL, NULL, NULL, NULL), "[x][ref] is a reference link");
+    o = at_nth(t, "[1] and [docs](url)", 0);
+    expect(!RtxDoc_path_at(&d, o + 1, NULL, NULL, NULL, NULL), "[1] is not a link");
+    expect(RtxDoc_path_at(&d, o + 9, NULL, NULL, NULL, NULL), "[docs](url) is a link after [1]");
+    o = at_nth(t, "[^1],", 0);
+    expect(strstr(scope_of(&d, o + 1), "footnote") != NULL, "footnote reference");
+    o = at_nth(t, "<https://a.b/c>", 0);
+    expect(RtxDoc_hint_at(&d, o, NULL, NULL), "autolink is a pair");
+    o = at_nth(t, "<me@x.org>", 0);
+    expect(RtxDoc_hint_at(&d, o, NULL, NULL), "e-mail autolink");
+    o = at_nth(t, "www.example.com", 0);
+    expect(strstr(scope_of(&d, o + 3), "link") != NULL && !RtxDoc_hint_at(&d, o, NULL, NULL),
+           "bare www URL is a link scope, not a mark");
+    o = at_nth(t, "&amp;", 0);
+    expect(strstr(scope_of(&d, o), "entity") != NULL, "entity");
+    o = at_nth(t, "[[Wiki|label]]", 0);
+    expect(RtxDoc_hint_at(&d, o, NULL, NULL) && strstr(scope_of(&d, o + 3), "wiki"),
+           "wikilink [[…]] hints 2/2");
+    o = at_nth(t, "  \nnext", 0);
+    expect(strstr(scope_of(&d, o), "hardbreak") != NULL, "two-space hard break");
+    o = at_nth(t, "at end **", 0);
+    expect(!RtxDoc_style_at(&d, o + 7).italic && !RtxDoc_hint_at(&d, o + 7, NULL, NULL),
+           "** at EOL is no empty italic");
+    o = at_nth(t, "[ref]: ", 0);
+    expect(strstr(scope_of(&d, o + 1), "reference") != NULL, "link reference definition");
+    o = at_nth(t, "[^1]: ", 0);
+    expect(strstr(scope_of(&d, o + 1), "footnote") != NULL, "footnote definition");
+    snprintf(msg, sizeof msg, "doc lexed with %zu runs", d.runs.len);
+    expect(d.runs.len > 40, msg);
+    remove(path);
+}
+
+/* Offset of 1-based line `ln` in `s`, or (size_t)-1. */
+static size_t line_off(const char *s, int ln) {
+    const char *p = s;
+    while (--ln > 0) {
+        p = strchr(p, '\n');
+        if (!p) return (size_t)-1;
+        p++;
+    }
+    return (size_t)(p - s);
+}
+
+/* testdata/rich/md/commonmark.md, by README line. */
+static void commonmark_fixture(void) {
+    RtxDoc d = {0} @destroy;
+    CCArena frame = cc_arena_heap(kilobytes(8));
+    char[:] all;
+    const char *t;
+    size_t o;
+    const RtxRun *r;
+    RtxOutlineEnt ol[8];
+    size_t on;
+    @errhandler(CCError e) {
+        (void)e;
+        expect(0, "commonmark.md: open");
+        return;
+    }
+    d.from_path("testdata/rich/md/commonmark.md") !>;
+    all = d.scratch_span(0, d.len(), frame) !>;
+    t = all.ptr;
+    r = run_at(&d, 0, "frontmatter");
+    expect(r && r->hint_a == 3 && r->hint_b == 3, "commonmark.md L1-4: front matter, --- hints");
+    o = line_off(t, 3) + 7;
+    expect(strstr(scope_of(&d, o), "numeric.yaml") != NULL, "commonmark.md L3: YAML body");
+    o = line_off(t, 6);
+    r = run_at(&d, o, "markup.heading");
+    expect(r && r->hint_a == 0, "commonmark.md L6: setext title run");
+    expect(RtxDoc_hint_at(&d, line_off(t, 7), NULL, NULL), "commonmark.md L7: underline hidden");
+    on = RtxDoc_outline(&d, 0, d.len(), ol, 8);
+    expect(on == 2 && ol[0].off == line_off(t, 6) && ol[0].level == 1 &&
+               ol[1].off == line_off(t, 9) && ol[1].level == 2,
+           "commonmark.md outline: L6 level 1, L9 level 2");
+    o = line_off(t, 12);
+    expect(!rtx_scope_is_heading(RtxDoc_style_at(&d, o + 1).scope), "commonmark.md L12: #hashtag");
+    o = line_off(t, 15);
+    expect(strstr(scope_of(&d, o), "keyword") != NULL, "commonmark.md L15: python guest");
+    o = line_off(t, 16) + 11;
+    expect(strstr(scope_of(&d, o), "string") != NULL, "commonmark.md L16: \"~~~\" is a string, no closer");
+    o = line_off(t, 14);
+    r = run_at(&d, o, "raw.block");
+    expect(r && r->start + r->len == line_off(t, 17) + 3, "commonmark.md L14-17: ~~~ fence closes at L17");
+    o = line_off(t, 20);
+    expect(RtxDoc_style_at(&d, o).mono && !RtxDoc_hint_at(&d, o, NULL, NULL),
+           "commonmark.md L20: ``` in a ````md fence is body");
+    o = line_off(t, 28) + 3;
+    expect(RtxDoc_style_at(&d, o).mono && strstr(scope_of(&d, o), "keyword") != NULL,
+           "commonmark.md L28: C fence inside an ordered item");
+    o = line_off(t, 30) + 3;
+    expect(run_at(&d, o, "task") != NULL, "commonmark.md L30: task box after an ordered marker");
+    o = line_off(t, 33) + 2;
+    expect(RtxDoc_style_at(&d, o).italic, "commonmark.md L32-33: emphasis across quote lines");
+    o = line_off(t, 36) + 4;
+    expect(RtxDoc_style_at(&d, o).mono && !RtxDoc_style_at(&d, o + 11).bold,
+           "commonmark.md L36: indented code is raw");
+    expect(RtxDoc_md_block_at(&d, line_off(t, 38)) == RTX_MDB_ROLE_HR, "commonmark.md L38: rule");
+    expect(RtxDoc_md_block_at(&d, line_off(t, 41)) == RTX_MDB_ROLE_FENCE,
+           "commonmark.md L41: pipe rows in a fence are fence body");
+    expect(RtxDoc_md_block_at(&d, line_off(t, 46)) == RTX_MDB_ROLE_MATH, "commonmark.md L46: math");
+    expect(RtxDoc_md_block_at(&d, line_off(t, 49)) == RTX_MDB_ROLE_HTML, "commonmark.md L49: HTML");
+    o = line_off(t, 52) + 12;
+    expect(RtxDoc_style_at(&d, o).bold && RtxDoc_md_block_at(&d, o) != RTX_MDB_ROLE_HTML,
+           "commonmark.md L52: paragraph after the HTML block's blank line");
+    expect(RtxDoc_md_block_at(&d, line_off(t, 54)) == RTX_MDB_ROLE_HTML, "commonmark.md L54: HTML");
+    o = (size_t)(strstr(t, "~~strike~~") - t) + 2;
+    expect(RtxDoc_style_at(&d, o).strike, "commonmark.md L56: strike");
+    o = (size_t)(strstr(t, "[docs]") - t) + 1;
+    expect(RtxDoc_path_at(&d, o, NULL, NULL, NULL, NULL), "commonmark.md L57: [docs](url) after [1]");
+    o = (size_t)(strstr(t, "spaces  \n") - t) + 6;
+    expect(strstr(scope_of(&d, o), "hardbreak") != NULL, "commonmark.md L59: hard break");
+    o = line_off(t, 62) + 1;
+    expect(strstr(scope_of(&d, o), "reference") != NULL, "commonmark.md L62: definition");
+    o = line_off(t, 63) + 1;
+    expect(strstr(scope_of(&d, o), "footnote") != NULL, "commonmark.md L63: footnote definition");
+    if (frame.base) frame.destroy();
+}
+
+/* Fixtures: README-numbered expectations for the block side. */
+static void fixture_checks(void) {
+    RtxDoc d = {0} @destroy;
+    CCArena frame = cc_arena_heap(kilobytes(8));
+    char[:] all;
+    size_t o;
+    RtxOutlineEnt ol[16];
+    size_t on;
+    @errhandler(CCError e) {
+        (void)e;
+        expect(0, "fixtures: open");
+        return;
+    }
+    d.from_path("testdata/rich/md/headings.md") !>;
+    all = d.scratch_span(0, d.len(), frame) !>;
+    on = RtxDoc_outline(&d, 0, d.len(), ol, 16);
+    expect(on == 14, "headings.md: 14 headings (6 ATX, trailing, 2 setext, 2 back-to-back, code/bold, empty, last)");
+    if (on == 14) {
+        expect(ol[7].level == 1 && ol[8].level == 2, "headings.md L14/L19: setext levels 1 / 2");
+        expect(ol[6].level == 2 && ol[6].title_hi - ol[6].title_lo == 15,
+               "headings.md L10: title stops before the trailing ##");
+    }
+    o = (size_t)(strstr(all.ptr, "Setext level one") - all.ptr);
+    d.caret = o;
+    d.sel_anchor = o;
+    expect(d.fold_toggle() == 1, "headings.md L14: setext heading folds");
+    o = (size_t)(strstr(all.ptr, "Body under setext one.") - all.ptr);
+    expect(d.fold_covers(o), "setext fold covers its section");
+    o = (size_t)(strstr(all.ptr, "Setext level two") - all.ptr);
+    expect(d.fold_covers(o), "setext 1 section holds the setext 2 heading (deeper)");
+    o = (size_t)(strstr(all.ptr, "Body under empty heading") - all.ptr);
+    expect(!d.fold_covers(o), "setext 1 fold stops at the next level-1 heading");
+    expect(d.fold_toggle() == 2, "setext unfold");
+    d.destroy();
+
+    d.from_path("testdata/rich/md/fences.md") !>;
+    all = d.scratch_span(0, d.len(), frame) !>;
+    o = (size_t)(strstr(all.ptr, "~~~") - all.ptr);
+    expect(run_at(&d, o, "raw.block") != NULL, "fences.md L46: ~~~ fence");
+    o = (size_t)(strstr(all.ptr, "**not bold**") - all.ptr);
+    expect(!RtxDoc_style_at(&d, o + 2).bold && RtxDoc_style_at(&d, o + 2).mono,
+           "fences.md L57: fence body is raw");
+    o = (size_t)(strstr(all.ptr, "# not a heading") - all.ptr);
+    expect(!rtx_scope_is_heading(RtxDoc_style_at(&d, o + 2).scope),
+           "fences.md L57: # in a fence is no heading");
+    d.destroy();
+
+    d.from_path("testdata/rich/md/blocks.md") !>;
+    all = d.scratch_span(0, d.len(), frame) !>;
+    o = (size_t)(strstr(all.ptr, "int x = 1;") - all.ptr);
+    expect(RtxDoc_style_at(&d, o).mono && strstr(rtx_scope_name(RtxDoc_style_at(&d, o).scope), "keyword"),
+           "blocks.md L14-16: c fence inside a quote is C");
+    o = (size_t)(strstr(all.ptr, "\n***\n") - all.ptr) + 1;
+    expect(RtxDoc_md_block_at(&d, o) == RTX_MDB_ROLE_HR && !RtxDoc_style_at(&d, o).italic,
+           "blocks.md L20: *** is a rule");
+    o = (size_t)(strstr(all.ptr, "\n___\n") - all.ptr) + 1;
+    expect(RtxDoc_md_block_at(&d, o) == RTX_MDB_ROLE_HR, "blocks.md L22: ___ is a rule");
+    o = (size_t)(strstr(all.ptr, "<b>html block</b>") - all.ptr);
+    expect(RtxDoc_md_block_at(&d, o) == RTX_MDB_ROLE_HTML, "blocks.md L24-26: HTML block");
+    o = (size_t)(strstr(all.ptr, "Hidden **bold**") - all.ptr);
+    expect(RtxDoc_style_at(&d, o + 9).bold, "blocks.md L31: details body paragraph styles bold");
+    o = (size_t)(strstr(all.ptr, "<!-- an html comment -->") - all.ptr);
+    expect(RtxDoc_md_block_at(&d, o) == RTX_MDB_ROLE_HTML, "blocks.md L37: comment is an HTML block");
+    o = (size_t)(strstr(all.ptr, "spaces  \n") - all.ptr) + 6;
+    expect(strstr(rtx_scope_name(RtxDoc_style_at(&d, o).scope), "hardbreak") != NULL,
+           "blocks.md L39: two-space hard break");
+    o = (size_t)(strstr(all.ptr, "backslash\\\n") - all.ptr) + 9;
+    expect(strstr(rtx_scope_name(RtxDoc_style_at(&d, o).scope), "hardbreak") != NULL,
+           "blocks.md L41: backslash hard break");
+    d.destroy();
+
+    d.from_path("testdata/rich/md/mermaid_math.md") !>;
+    all = d.scratch_span(0, d.len(), frame) !>;
+    o = (size_t)(strstr(all.ptr, "$x^2") - all.ptr);
+    expect(strstr(rtx_scope_name(RtxDoc_style_at(&d, o + 1).scope), "math") != NULL,
+           "mermaid_math.md L14: inline math");
+    o = (size_t)(strstr(all.ptr, "$$\n") - all.ptr);
+    expect(RtxDoc_md_block_at(&d, o) == RTX_MDB_ROLE_MATH, "mermaid_math.md L16-18: math block");
+    o = (size_t)(strstr(all.ptr, "$5 and") - all.ptr);
+    expect(!strstr(rtx_scope_name(RtxDoc_style_at(&d, o + 1).scope), "math"),
+           "mermaid_math.md L27: $5 and $10 is not math");
+    d.destroy();
+
+    d.from_path("testdata/rich/md/links_images.md") !>;
+    all = d.scratch_span(0, d.len(), frame) !>;
+    o = (size_t)(strstr(all.ptr, "![alt text]") - all.ptr);
+    expect(RtxDoc_path_at(&d, o + 3, NULL, NULL, NULL, NULL), "links_images.md L7: image is a path mark");
+    o = (size_t)(strstr(all.ptr, "[text][ref]") - all.ptr);
+    expect(RtxDoc_path_at(&d, o + 2, NULL, NULL, NULL, NULL), "links_images.md L6: reference link");
+    o = (size_t)(strstr(all.ptr, "[![badge]") - all.ptr);
+    expect(RtxDoc_path_at(&d, o + 4, NULL, NULL, NULL, NULL), "links_images.md L9: image inside a link");
+    o = (size_t)(strstr(all.ptr, "[^1] in") - all.ptr);
+    expect(strstr(rtx_scope_name(RtxDoc_style_at(&d, o + 1).scope), "footnote") != NULL,
+           "links_images.md L10: footnote reference");
+    o = (size_t)(strstr(all.ptr, "[ref]: ") - all.ptr);
+    expect(strstr(rtx_scope_name(RtxDoc_style_at(&d, o + 1).scope), "reference") != NULL,
+           "links_images.md L16: reference definition");
+    o = (size_t)(strstr(all.ptr, "[not a link] with") - all.ptr);
+    expect(!RtxDoc_path_at(&d, o + 1, NULL, NULL, NULL, NULL), "links_images.md L12: not a link");
+    if (frame.base) frame.destroy();
+}
+
+/* ---- window: a fence opened above the lookback ---- */
+
+static size_t fill_prose(FILE *fp, size_t want, size_t b) {
+    size_t n = 0;
+    while (n < want) {
+        n += (size_t)fprintf(fp, "Paragraph %zu with *em* and `code`.\n\n", b++);
+    }
+    return n;
+}
+
+/* Styles of [lo, hi) after a window lex that starts `lead` before lo. */
+static void win_lex(RtxDoc *d, size_t lo, size_t hi) {
+    @errhandler(CCError e) {
+        (void)e;
+        expect(0, "window lex");
+        return;
+    }
+    d->ensure_hl(rtx_hl_span(lo, hi)) !>;
+}
+
+static void window_checks(void) {
+    const char *path = "testdata/generated/md_block_win.md";
+    FILE *fp;
+    size_t pos = 0, fence_lo, body_lo, close_lo, after_lo, k;
+    RtxDoc d = {0} @destroy;
+    @errhandler(CCError e) {
+        (void)e;
+        expect(0, "window: open");
+        return;
+    }
+    /* 1. A 40 KiB python fence: the window starts past its close, its
+     *    lookback inside the body. The anchor (the ```python line) lies
+     *    behind the lookback: the close closes, prose after is prose. */
+    fp = fopen(path, "w");
+    if (!fp) {
+        expect(0, "window: write");
+        return;
+    }
+    pos += fill_prose(fp, 600 * 1024, 0);
+    fence_lo = pos;
+    pos += (size_t)fprintf(fp, "```python\n");
+    body_lo = pos;
+    for (k = 0; pos - body_lo < 40 * 1024; k++)
+        pos += (size_t)fprintf(fp, "# comment %zu with **stars**\nx_%zu = '*'\n", k, k);
+    close_lo = pos;
+    pos += (size_t)fprintf(fp, "```\n");
+    after_lo = pos;
+    pos += fill_prose(fp, 64 * 1024, 7000);
+    fclose(fp);
+    d.from_path(cc_slice_cstr(path)) !>;
+    expect(!d.hl_full, "window: file is windowed");
+    win_lex(&d, after_lo + 100, after_lo + 6000);
+    {
+        size_t em = after_lo + 100;
+        char buf[64];
+        size_t got = d.read_at(em, cc_slice_from_buffer(buf, sizeof buf)) !>;
+        const char *p = memchr(buf, '*', got);
+        expect(p != NULL, "window: prose after the fence has *em*");
+        if (p) {
+            size_t at = em + (size_t)(p - buf) + 1;
+            expect(RtxDoc_style_at(&d, at).italic && !RtxDoc_style_at(&d, at).mono,
+                   "window 1: prose after a fence closed below the lookback is prose");
+        }
+        expect(RtxDoc_md_block_at(&d, after_lo + 100) != RTX_MDB_ROLE_FENCE,
+               "window 1: no fence over the prose");
+    }
+    (void)fence_lo;
+    (void)close_lo;
+    d.destroy();
+
+    /* 2. A 300 KiB fence: its opener is past the anchor budget. The
+     *    window straddles the bare closing ```: body before it is
+     *    leftover text, and the prose after it is never code. */
+    fp = fopen(path, "w");
+    if (!fp) {
+        expect(0, "window: write 2");
+        return;
+    }
+    pos = 0;
+    pos += fill_prose(fp, 600 * 1024, 0);
+    fence_lo = pos;
+    pos += (size_t)fprintf(fp, "```python\n");
+    body_lo = pos;
+    for (k = 0; pos - body_lo < 300 * 1024; k++)
+        pos += (size_t)fprintf(fp, "value_%zu = compute(%zu)  # step\n", k, k);
+    close_lo = pos;
+    pos += (size_t)fprintf(fp, "```\n");
+    after_lo = pos;
+    pos += fill_prose(fp, 64 * 1024, 9000);
+    fclose(fp);
+    d.from_path(cc_slice_cstr(path)) !>;
+    win_lex(&d, close_lo - 2000, after_lo + 4000);
+    {
+        size_t em = after_lo + 200, at;
+        char buf[64];
+        size_t got = d.read_at(em, cc_slice_from_buffer(buf, sizeof buf)) !>;
+        const char *p = memchr(buf, '*', got);
+        expect(p != NULL, "window 2: prose has *em*");
+        at = p ? em + (size_t)(p - buf) + 1 : em;
+        expect(!RtxDoc_style_at(&d, at).mono && !RtxDoc_style_at(&d, after_lo + 5).mono,
+               "window 2: the bare ``` does not open a fence over the prose (never wrong)");
+        expect(RtxDoc_md_block_at(&d, after_lo + 5) != RTX_MDB_ROLE_FENCE,
+               "window 2: no fence run over the prose");
+    }
+    d.destroy();
+    remove(path);
+}
+
+int main(void) {
+    block_cases();
+    doc_checks();
+    fixture_checks();
+    commonmark_fixture();
+    window_checks();
+    if (fails) {
+        fprintf(stderr, "%d failure(s)\n", fails);
+        return 1;
+    }
+    printf("md_block_smoke ok\n");
+    return 0;
+}

@@ -53,6 +53,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include "utf8.cch"
 
 #ifndef RTX_BROWSE_TYPES
 #define RTX_BROWSE_TYPES
@@ -79,12 +80,16 @@ typedef struct {
 /* One wave's listing. The worker allocates this, fills it, then
  * release-stores `pub`. The host acquire-loads it and does not read
  * `ents` while the arm is live. The buffer is not sorted or freed
- * after that store; a later sort copies first. */
+ * after that store; a later sort copies first. `truncated` / `denied`
+ * are the walk's flags at that same site (the host reads these, not
+ * br->truncated / br->denied, while the arm is live). */
 typedef struct {
     RtxBrowseEnt *ents;
     size_t len;
     size_t cur;
     size_t top;
+    int truncated;
+    int denied;
 } RtxBrowsePub;
 
 typedef struct {
@@ -111,6 +116,7 @@ typedef struct {
     size_t hold_len, hold_cap, hold_cur, hold_top;
     int host_nav;          /* host moved while the arm was live */
     size_t host_cur, host_top;
+    char host_name[RTX_BROWSE_NAME]; /* that row's name; the join remaps by it */
     int hold_drop_later;   /* worker finished the hold; host frees after join */
     RtxBrowsePub *_Atomic pub;
 } RtxBrowse;
@@ -228,7 +234,9 @@ static inline void rtx_browse_split_set(int *slot, int whole, int at,
 /* 1 while the dest-live arm has not been joined. */
 int rtx_browse_listing_live(const RtxBrowse *br);
 
-/* New listing is only `..` / divider rows; paint the last list instead. */
+/* New listing is only `..` / divider rows; paint the last list instead.
+ * Reads `ents` / `scanning`: the walk's side (a stage, or the host after
+ * the join). The host asks rtx_browse_hold_on. */
 static inline int rtx_browse_ents_ready(const RtxBrowse *br) {
     size_t i;
     if (!br || !br->ents.data || !br->ents.len) return 0;
@@ -240,8 +248,43 @@ static inline int rtx_browse_ents_ready(const RtxBrowse *br) {
     }
     return 0;
 }
+/* Host side. While the arm is live the hold is on iff the last publish
+ * is the hold list; `hold` itself is host-owned (saved before the kick,
+ * freed after the join). */
 static inline int rtx_browse_hold_on(const RtxBrowse *br) {
-    return br && br->hold && br->hold_len && !rtx_browse_ents_ready(br);
+    RtxBrowsePub *p;
+    if (!br || !br->hold || !br->hold_len) return 0;
+    if (rtx_browse_listing_live(br)) {
+        p = atomic_load_explicit(&br->pub, memory_order_acquire);
+        return p && p->ents == br->hold;
+    }
+    return !rtx_browse_ents_ready(br);
+}
+/* Host reads of walk-written flags. While the arm is live the walk owns
+ * `scanning` / `truncated` / `denied`: live is scanning, and the other
+ * two come from the last publish. */
+static inline int rtx_browse_scanning(const RtxBrowse *br) {
+    if (!br) return 0;
+    if (rtx_browse_listing_live(br)) return 1;
+    return br->scanning;
+}
+static inline int rtx_browse_truncated(const RtxBrowse *br) {
+    RtxBrowsePub *p;
+    if (!br) return 0;
+    if (rtx_browse_listing_live(br)) {
+        p = atomic_load_explicit(&br->pub, memory_order_acquire);
+        return p ? p->truncated : 0;
+    }
+    return br->truncated;
+}
+static inline int rtx_browse_denied(const RtxBrowse *br) {
+    RtxBrowsePub *p;
+    if (!br) return 0;
+    if (rtx_browse_listing_live(br)) {
+        p = atomic_load_explicit(&br->pub, memory_order_acquire);
+        return p ? p->denied : 0;
+    }
+    return br->denied;
 }
 /* While the arm is live this is the last published wave (or the host's
  * move on top of it). Otherwise the hold list or `ents`. One snap so
@@ -287,20 +330,63 @@ static inline size_t rtx_browse_view_top(const RtxBrowse *br) {
     return rtx_browse_view_snap(br).top;
 }
 
-/* Long flatten paths keep the basename: "dir/sub/file.c" → "~ub/file.c". */
+/* Long names keep both ends (tail-biased): "dir/sub/very_long_file.c"
+ * → "dir/~ile.c". `maxc` is terminal columns; `head_n` / `tail_off` are
+ * byte offsets on cluster starts so UTF-8 is never split. */
 static inline void rtx_browse_name_window(const char *name, int maxc,
-                                          size_t *skip, int *ellip) {
-    size_t n;
-    if (skip) *skip = 0;
+                                          size_t *head_n, size_t *tail_off,
+                                          int *ellip) {
+    size_t n, i, head, tail;
+    int total, budget, left, right, seen;
+    char[:] b;
+    if (head_n) *head_n = 0;
+    if (tail_off) *tail_off = 0;
     if (ellip) *ellip = 0;
     if (!name || maxc < 1) return;
     n = strlen(name);
-    if (n <= (size_t)maxc) return;
+    b = cc_slice_from_buffer((void *)name, n);
+    total = rtx_utf8_cols(b);
+    if (head_n) *head_n = n;
+    if (tail_off) *tail_off = n;
+    if (total <= maxc) return;
     if (maxc == 1) {
-        if (skip) *skip = n - 1;
+        if (head_n) *head_n = 0;
+        if (tail_off) *tail_off = n;
+        if (ellip) *ellip = 1;
         return;
     }
-    if (skip) *skip = n - (size_t)(maxc - 1);
+    budget = maxc - 1; /* one column for '~' */
+    /* Prefer the end (basename / extension) over the start. */
+    left = budget / 3;
+    right = budget - left;
+    /* Suffix of at most `right` columns (cluster-aligned). */
+    seen = 0;
+    tail = n;
+    for (i = 0; i < n; ) {
+        RtxUtf8Cl cl = rtx_utf8_cluster(b, i);
+        int c = cl.cols > 0 ? cl.cols : 1;
+        size_t take = cl.n ? cl.n : 1;
+        if (total - seen <= right) {
+            tail = i;
+            break;
+        }
+        seen += c;
+        i += take;
+    }
+    /* Prefix of at most `left` columns, stopping before the suffix. */
+    head = 0;
+    seen = 0;
+    for (i = 0; i < tail; ) {
+        RtxUtf8Cl cl = rtx_utf8_cluster(b, i);
+        int c = cl.cols > 0 ? cl.cols : 1;
+        size_t take = cl.n ? cl.n : 1;
+        if (seen + c > left) break;
+        seen += c;
+        i += take;
+        head = i;
+    }
+    if (head_n) *head_n = head;
+    if (tail_off) *tail_off = tail;
     if (ellip) *ellip = 1;
 }
 
@@ -355,5 +441,12 @@ int rtx_host_ide_script(char *dst, size_t n, const char *app, const char *esc);
 #endif
 int rtx_browse_sel_path(const RtxBrowse *br, char *dst, size_t n, int *is_dir);
 int rtx_browse_spawn(const RtxBrowse *br, int other);
+/* Why the last rtx_browse_spawn refused ("" if it did not). */
+const char *rtx_host_spawn_why(void);
+/* Collect exited children this process spawned. Returns those still running. */
+int rtx_host_reap(void);
+/* Test hook: the next n listing waves fail as a turnstile error would. */
+void rtx_browse_test_fail_waves(int n);
+int rtx_browse_test_fail_left(void);
 
 #endif /* RTX_BROWSE_H */

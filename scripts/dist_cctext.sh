@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Pack a runnable cctext tree: binary + grammars/ next to it.
-# On macOS the tarball also includes cctext-gui and cctext-ui
-# (same folder so e / Ctrl-E works).
+# The tarball also includes cctext-ui (libui-ng; AppKit on macOS, GTK 3 on
+# Linux) in the same folder so e / Ctrl-E works. NO_UI=1 packs cctext only.
 #
 #   ./scripts/dist_cctext.sh          # builds if needed, writes dist/cctext-<os>-<arch>.tar.gz
 #
@@ -20,25 +20,15 @@ if [[ ! -x bin/cctext ]]; then
     exit 1
 fi
 
-have_gui=0
 have_ui=0
-if [[ "$(uname -s)" == Darwin ]]; then
-    if [[ ! -x bin/cctext-gui ]]; then
-        ./make.shcc @cctext_gui
-    fi
-    if [[ -x bin/cctext-gui ]]; then
-        have_gui=1
-    else
-        echo "dist_cctext: bin/cctext-gui missing (macOS dist includes it)" >&2
-        exit 1
-    fi
+if [[ "${NO_UI:-0}" == 0 ]]; then
     if [[ ! -x bin/cctext-ui ]]; then
         ./make.shcc @cctext_ui
     fi
     if [[ -x bin/cctext-ui ]]; then
         have_ui=1
     else
-        echo "dist_cctext: bin/cctext-ui missing (macOS dist includes it)" >&2
+        echo "dist_cctext: bin/cctext-ui missing (NO_UI=1 to pack cctext only)" >&2
         exit 1
     fi
 fi
@@ -61,10 +51,6 @@ rm -rf "$stage"
 mkdir -p "$stage/grammars"
 cp bin/cctext "$stage/cctext"
 chmod +x "$stage/cctext"
-if [[ "$have_gui" == 1 ]]; then
-    cp bin/cctext-gui "$stage/cctext-gui"
-    chmod +x "$stage/cctext-gui"
-fi
 if [[ "$have_ui" == 1 ]]; then
     cp bin/cctext-ui "$stage/cctext-ui"
     chmod +x "$stage/cctext-ui"
@@ -72,19 +58,16 @@ fi
 cp testdata/grammars/*.tmLanguage.json "$stage/grammars/"
 {
     echo "cctext — console frontend"
-    if [[ "$have_gui" == 1 ]]; then
-        echo "cctext-gui — Cocoa + Core Text (same folder; e / Ctrl-E swaps)"
-    fi
     if [[ "$have_ui" == 1 ]]; then
-        echo "cctext-ui — libui-ng window, Core Text text (same folder)"
+        echo "cctext-ui — libui-ng window (same folder; e / Ctrl-E swaps)"
+        if [[ "$os" == linux ]]; then
+            echo "  (needs GTK 3 at run time: apt install libgtk-3-0)"
+        fi
     fi
     echo "https://github.com/sreekotay/cctext"
     echo
     echo "  ./cctext file.txt"
     echo "  ./cctext --wrap file.txt"
-    if [[ "$have_gui" == 1 ]]; then
-        echo "  ./cctext-gui file.txt"
-    fi
     if [[ "$have_ui" == 1 ]]; then
         echo "  ./cctext-ui file.txt"
     fi

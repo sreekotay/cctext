@@ -1,28 +1,46 @@
 #!ccc ccs
 /*
- * Find refine (linked TU). Prefix-extend filters hits and keeps scan_off.
- * A cap resumes at the last accepted hit. Tests wait via finish.
+ * Find (linked TU). The query compiles once per find epoch onto
+ * find.store (core/rx.cch): a literal is RTX_RX_LITERAL (memmem when
+ * case-sensitive), a regex is the pattern. Options (RTX_FIND_ICASE /
+ * WORD / REGEX) are part of the query's identity.
  *
  * Scan: dest-live wrapper so the frame does not wait. The arm is the
- * sequential 2 MiB block loop with @parallel wait / cache / @stage.
- * Write stage appends hits in file order and polls h.paused.
+ * sequential 2 MiB block loop with @parallel wait / cache / @stage. Each
+ * lane has its own matcher scratch (the program is shared, immutable).
+ * A block reads RTX_FIND_CTX bytes before its start (\b, ^, lookbehind)
+ * and, for a regex, RTX_FIND_SPAN past its commit edge; a candidate still
+ * open there is a leftover (long_n / long_off), not a clipped hit.
+ * Literal hits may overlap (every occurrence); regex hits are the
+ * leftmost-first chain, so the write stage re-chains a block whose first
+ * hits sit inside the previous block's last hit.
+ *
+ * Refine: a longer literal query with the same options filters the hits
+ * and keeps scan_off. A cap resumes at the last accepted hit.
  *
  * The hit list covers [0, scan_off). An edit shifts that prefix and the
  * cursor. The unread tail is not reread. A splice inside the prefix
- * rereads only the seam. A stale list wipes. The arm is joined first.
+ * rereads only the seam (literal: the query length plus word context;
+ * regex: RTX_FIND_SPAN on a call-local heap arena, re-chained until the
+ * new chain meets an old hit). A stale list wipes. The arm is joined
+ * first.
  */
 #include <ccc/std/prelude.cch>
 #include <limits.h>
+#include <string.h>
+#include <time.h>
 #include "document.cch"
 #include "find.cch"
+#include "lf.cch"
 #include "rtx_par.cch"
 
-/* Lane scratch: each @parallel cache replica owns a heap arena (buf + hit
- * offs). `nl` is newlines in this block before `off`. Published hits stay
- * on find.store, with the absolute line. */
+/* Lane scratch: each @parallel cache replica owns a heap arena (window +
+ * hit offs) and a matcher scratch. `nl` is newlines in this block before
+ * `off`. Published hits stay on find.store, with the absolute line. */
 typedef struct {
     size_t off;
     size_t nl;
+    size_t len;
 } RtxFindRel;
 
 typedef struct {
@@ -31,7 +49,112 @@ typedef struct {
     RtxFindRel *hits;
     size_t hit_cap;
     size_t nl_commit;
+    RtxRxScratch rxs;
 } RtxFindScratch;
+
+/* ------------------------------------------------------------ matching */
+
+static int rtx_find_regex(const RtxDoc *d) {
+    return d && (d->find.opts & RTX_FIND_REGEX) != 0;
+}
+
+static int rtx_find_plain(const RtxDoc *d) {
+    return d && (d->find.opts & (RTX_FIND_ICASE | RTX_FIND_WORD | RTX_FIND_REGEX)) == 0;
+}
+
+/* Bytes of context a block keeps before its start. */
+static size_t rtx_find_head(const RtxDoc *d) {
+    if (rtx_find_regex(d)) return (size_t)RTX_FIND_CTX;
+    return (d->find.opts & RTX_FIND_WORD) ? 4 : 0;
+}
+
+/* Bytes a block reads past its commit edge. */
+static size_t rtx_find_tail(const RtxDoc *d) {
+    size_t qn = d->find.query.len;
+    if (rtx_find_regex(d)) return (size_t)RTX_FIND_SPAN + 1;
+    return (qn ? qn - 1 : 0) + ((d->find.opts & RTX_FIND_WORD) ? 4 : 0);
+}
+
+/* How far past a regex hit's start the scan looked to decide it. */
+static size_t rtx_find_horizon(const RtxDoc *d) {
+    size_t ml = d->find.rx ? rtx_rx_max_len(d->find.rx) : RTX_RX_UNSET;
+    if (ml != RTX_RX_UNSET && ml < (size_t)RTX_FIND_SPAN) return ml + 1;
+    return (size_t)RTX_FIND_SPAN + 1;
+}
+
+static size_t rtx_find_next_cp(const char *t, size_t n, size_t p) {
+    p++;
+    while (p < n && ((unsigned char)t[p] & 0xC0) == 0x80) p++;
+    return p;
+}
+
+/* Whole word: no word scalar touches either end from outside. */
+static int rtx_find_word_ok(const char *t, size_t n, size_t s, size_t e) {
+    if (rtx_rx_word_before(t, s) && rtx_rx_word_after(t, s, n)) return 0;
+    if (rtx_rx_word_before(t, e) && rtx_rx_word_after(t, e, n)) return 0;
+    return 1;
+}
+
+/* Hit iterator over a window t[0, n): starts in [p, stop). */
+typedef struct {
+    const RtxRx *rx;
+    unsigned opts;
+    RtxRxIn in;
+    int eof;
+    size_t p;
+    size_t stop;
+    RtxRxScratch *rxs;
+} RtxFindIt;
+
+/* `bot`: t[0] is document offset 0 (^ and \A hold there). */
+static void rtx_find_it(RtxFindIt *it, const RtxDoc *d, const char *t, size_t n,
+                        int bot, int eof, size_t from, size_t stop,
+                        RtxRxScratch *rxs) {
+    memset(it, 0, sizeof(*it));
+    it->rx = d->find.rx;
+    it->opts = d->find.opts;
+    it->in.s = t;
+    it->in.n = n;
+    it->in.gpos = RTX_RX_UNSET;
+    it->in.ctx = bot ? (RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0) : 0u;
+    it->eof = eof;
+    it->p = from;
+    it->stop = stop < n ? stop : n;
+    it->rxs = rxs;
+}
+
+/* 1 hit [*ms, *me); 2 leftover at *ms (undecided at the window end);
+ * 0 done. Window offsets. */
+static int rtx_find_it_next(RtxFindIt *it, size_t *ms, size_t *me) {
+    const char *t = it->in.s;
+    size_t n = it->in.n;
+    int plain = (it->opts & (RTX_FIND_ICASE | RTX_FIND_WORD | RTX_FIND_REGEX)) == 0;
+    while (it->rx && it->p < it->stop) {
+        size_t s = 0, e = 0;
+        int r = rtx_rx_search(it->rx, &it->in, it->p, it->stop, it->eof, it->rxs, &s, &e);
+        if (r == RTX_RX_NONE) {
+            it->p = it->stop;
+            return 0;
+        }
+        if (r == RTX_RX_PARTIAL) {
+            it->p = it->stop;
+            *ms = s;
+            return 2;
+        }
+        if (e == s || ((it->opts & RTX_FIND_WORD) && !rtx_find_word_ok(t, n, s, e))) {
+            it->p = plain ? s + 1 : rtx_find_next_cp(t, n, s);
+            continue;
+        }
+        *ms = s;
+        *me = e;
+        if (it->opts & RTX_FIND_REGEX) it->p = e;
+        else it->p = plain ? s + 1 : rtx_find_next_cp(t, n, s);
+        return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------- query / refine */
 
 int rtx_find_is_extend(const RtxDoc *d, char[:] q) {
     if (!d || d->find.query.len == 0 || q.len <= d->find.query.len)
@@ -40,10 +163,11 @@ int rtx_find_is_extend(const RtxDoc *d, char[:] q) {
     return q.starts_with(d->find.query);
 }
 
-/* Hits are in order. Refill a window when the next off falls out. */
+/* Hits are in order. Refill a window when the next off falls out. The
+ * literal (or its case-folded form) must still sit at `off`. */
 static int !>(CCError) rtx_find_hit_ok(RtxDoc *d, size_t off, const char *q,
                                        size_t qn, char *win, size_t winsz,
-                                       size_t *wlo, size_t *whi) {
+                                       size_t *wlo, size_t *whi, RtxRxScratch *rxs) {
     size_t n;
     size_t got;
     size_t want;
@@ -59,11 +183,40 @@ static int !>(CCError) rtx_find_hit_ok(RtxDoc *d, size_t off, const char *q,
         *whi = off + got;
         if (got < qn) return cc_ok(0);
     }
-    {
+    if (rtx_find_plain(d)) {
         char[:] win_slice = cc_slice_from_buffer(win + (off - *wlo), qn);
         char[:] q_slice = cc_slice_from_buffer((void *)q, qn);
         return cc_ok(win_slice.eq(q_slice));
     }
+    {
+        RtxRxIn in;
+        size_t end = 0;
+        memset(&in, 0, sizeof(in));
+        in.s = win;
+        in.n = *whi - *wlo;
+        in.gpos = RTX_RX_UNSET;
+        if (!d->find.rx) return cc_ok(0);
+        return cc_ok(rtx_rx_at(d->find.rx, &in, off - *wlo, rxs, &end, NULL) ==
+                         RTX_RX_MATCH &&
+                     end == off - *wlo + qn);
+    }
+}
+
+static void !>(CCError) rtx_find_compile(RtxDoc *d, char[:] q) {
+    unsigned fl = 0;
+    RtxRx *rx;
+    d->find.rx = NULL;
+    d->find.err = NULL;
+    if (!q.len) return cc_ok();
+    if (d->find.opts & RTX_FIND_ICASE) fl |= RTX_RX_ICASE;
+    if (!(d->find.opts & RTX_FIND_REGEX)) fl |= RTX_RX_LITERAL;
+    rx = rtx_rx_compile(q, fl, d->find.store) !>(e) {
+        if (e.kind == CC_ERR_OUT_OF_MEMORY) return cc_err(e);
+        d->find.err = e.message ? e.message : "bad pattern";
+        return cc_ok();
+    };
+    d->find.rx = rx;
+    return cc_ok();
 }
 
 void !>(CCError) rtx_find_refine(RtxDoc *d, char[:] q) {
@@ -80,6 +233,7 @@ void !>(CCError) rtx_find_refine(RtxDoc *d, char[:] q) {
     size_t whi;
     size_t n;
     int was_trunc;
+    RtxRxScratch rxs = {0};
     if (!d || !d->find.store.base) return cc_err(CC_ERR_INVALID_ARG, "find refine");
     qn = q.len;
     nq = q.clone_into(d->find.store) !>(e) { return cc_err(e); };
@@ -97,16 +251,26 @@ void !>(CCError) rtx_find_refine(RtxDoc *d, char[:] q) {
     was_trunc = d->find.truncated;
     keep = d->find.cur < d->find.hits.len ? d->find.hits.data[d->find.cur].off : (size_t)-1;
     d->find.query = nq;
+    rtx_find_compile(d, nq) !>(e) { return cc_err(e); };
     wlo = 1;
     whi = 0;
     o = 0;
     for (i = 0; i < d->find.hits.len; i++) {
         size_t off = d->find.hits.data[i].off;
-        int ok = rtx_find_hit_ok(d, off, nq.ptr, qn, win, sizeof(win), &wlo,
-                                 &whi) !>(e) { return cc_err(e); };
-        if (ok) d->find.hits.data[o++] = d->find.hits.data[i];
+        int ok = rtx_find_hit_ok(d, off, nq.ptr, qn, win, sizeof(win), &wlo, &whi,
+                                 &rxs) !>(e) {
+            rtx_rx_scratch_drop(&rxs);
+            return cc_err(e);
+        };
+        if (ok) {
+            d->find.hits.data[o] = d->find.hits.data[i];
+            d->find.hits.data[o].len = qn;
+            o++;
+        }
     }
+    rtx_rx_scratch_drop(&rxs);
     d->find.hits.truncate(o);
+    rtx_find_hits_publish(&d->find);
     if (keep != (size_t)-1 && o) {
         d->find.cur = 0;
         for (i = 0; i < o; i++) {
@@ -136,26 +300,39 @@ int RtxDoc_find_same_query(const RtxDoc *d, char[:] q) {
     return q.eq(d->find.query);
 }
 
+int RtxDoc_find_same(const RtxDoc *d, char[:] q, unsigned opts) {
+    if (!d) return 0;
+    return q.eq(d->find.query) && d->find.opts == opts;
+}
+
 static void !>(CCError) rtx_find_listing_start(RtxDoc *d);
 
-void !>(CCError) RtxDoc_find_set(RtxDoc *d, char[:] q) {
+void !>(CCError) RtxDoc_find_set_opt(RtxDoc *d, char[:] q, unsigned opts) {
     size_t qn;
     CCArena fresh;
     char[:] nq;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     qn = q.len;
+    opts &= (RTX_FIND_ICASE | RTX_FIND_WORD | RTX_FIND_REGEX);
     if (qn > RTX_FIND_QMAX) return cc_err(CC_ERR_INVALID_ARG, "find query too long");
     if (qn == 0) {
         rtx_find_handle_stop(&d->find);
         if (d->find.store.base) d->find.store.reset();
         d->find.query = cc_slice_empty();
+        d->find.opts = opts;
+        d->find.rx = NULL;
+        d->find.err = NULL;
         d->find.hits = (Vec::[RtxFindHit]){0};
         rtx_find_scan_wipe(d);
         return cc_ok();
     }
-    if (d->find_same_query(q)) return cc_ok();
+    if (d->find_same(q, opts)) return cc_ok();
     rtx_find_handle_stop(&d->find);
-    if (rtx_find_is_extend(d, q) && d->find.store.base) {
+    /* Refine only where a longer query's hits are a subset: a literal,
+     * same options, and not whole-word (`foo` whole-word hits are never
+     * `foob` whole-word hits). */
+    if (opts == d->find.opts && !(opts & (RTX_FIND_REGEX | RTX_FIND_WORD)) &&
+        !d->find.err && rtx_find_is_extend(d, q) && d->find.store.base) {
         rtx_find_refine(d, q) !>(e) { return cc_err(e); };
         return rtx_find_listing_start(d);
     }
@@ -168,20 +345,22 @@ void !>(CCError) RtxDoc_find_set(RtxDoc *d, char[:] q) {
     if (d->find.store.base) d->find.store.destroy();
     d->find.store = fresh;
     d->find.query = nq;
+    d->find.opts = opts;
+    rtx_find_compile(d, nq) !>(e) { return cc_err(e); };
     d->find.hits = vec_new::[RtxFindHit](d->find.store);
     if (!d->find.hits.data) return cc_err(CC_ERR_OUT_OF_MEMORY, "find hits");
     rtx_find_scan_wipe(d);
     return rtx_find_listing_start(d);
 }
 
-static size_t rtx_find_window_adv(size_t got, size_t qn, int last) {
-    size_t overlap = qn > 0 ? qn - 1 : 0;
-    if (last) return got;
-    return got > overlap ? got - overlap : got;
+void !>(CCError) RtxDoc_find_set(RtxDoc *d, char[:] q) {
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    return RtxDoc_find_set_opt(d, q, d->find.opts);
 }
 
-static int rtx_find_scratch_ensure(RtxFindScratch *s) {
-    size_t need;
+/* ------------------------------------------------------------ the scan */
+
+static int rtx_find_scratch_ensure(RtxFindScratch *s, size_t need) {
     if (!s) return 0;
     if (s->buf) return 1;
     if (!s->arena.base) {
@@ -189,12 +368,11 @@ static int rtx_find_scratch_ensure(RtxFindScratch *s) {
         s->arena = cc_arena_heap((size_t)RTX_FIND_BLOCK + megabytes(1));
         if (!s->arena.base) return 0;
     }
-    need = (size_t)RTX_FIND_BLOCK + (size_t)RTX_FIND_QMAX;
     s->buf = (char *)cc_arena_alloc(s->arena, need, 1);
     return s->buf != NULL;
 }
 
-static int rtx_find_scratch_hit(RtxFindScratch *s, size_t *n, size_t off) {
+static int rtx_find_scratch_hit(RtxFindScratch *s, size_t *n, size_t off, size_t len) {
     size_t c, elem;
     void *p;
     if (!s || !n || !s->arena.base) return 0;
@@ -211,14 +389,20 @@ static int rtx_find_scratch_hit(RtxFindScratch *s, size_t *n, size_t off) {
     }
     s->hits[*n].off = off;
     s->hits[*n].nl = 0;
+    s->hits[*n].len = len;
     (*n)++;
     return 1;
 }
 
 /* Newlines in the committed span. Hits are in order, so one walk fills
- * each hit's block-relative count and the span total the next block adds. */
+ * each hit's block-relative count (the bytes between successive hits) and
+ * the span total the next block adds. `buf` starts at `start`. `span_nl`
+ * is the span's total when the read already counted it (else
+ * RTX_FIND_NL_UNKNOWN): then only the bytes up to the last hit are walked. */
+#define RTX_FIND_NL_UNKNOWN ((size_t)-1)
 static void rtx_find_count_block(RtxFindScratch *s, char[:] buf,
-                                 size_t start, size_t commit, size_t hit_n) {
+                                 size_t start, size_t commit, size_t hit_n,
+                                 size_t span_nl) {
     size_t pos, nl, h, span;
     if (!s || !buf.ptr) return;
     span = commit < buf.len ? commit : buf.len;
@@ -228,16 +412,14 @@ static void rtx_find_count_block(RtxFindScratch *s, char[:] buf,
         size_t at = 0;
         if (s->hits[h].off >= start) at = s->hits[h].off - start;
         if (at > span) at = span;
-        while (pos < at) {
-            if (buf.ptr[pos] == '\n') nl++;
-            pos++;
+        if (at > pos) {
+            nl += rtx_count_lf(buf.ptr + pos, at - pos);
+            pos = at;
         }
         s->hits[h].nl = nl;
     }
-    while (pos < span) {
-        if (buf.ptr[pos] == '\n') nl++;
-        pos++;
-    }
+    if (span_nl != RTX_FIND_NL_UNKNOWN) nl = span_nl;
+    else if (span > pos) nl += rtx_count_lf(buf.ptr + pos, span - pos);
     s->nl_commit = nl;
 }
 
@@ -271,9 +453,12 @@ static void !>(CCError) rtx_find_append(RtxDoc *d, const RtxFindRel *hits,
     for (i = 0; i < take; i++) {
         d->find.hits.data[base + i].off = hits[i].off;
         d->find.hits.data[base + i].line = line_base + hits[i].nl;
+        d->find.hits.data[base + i].len = hits[i].len;
     }
     if (!d->find.hits.at_grow(base + take - 1))
         return cc_err(CC_ERR_OUT_OF_MEMORY, "find offs");
+    /* Rows are written; now the host may read them. */
+    rtx_find_hits_publish(&d->find);
     if (take < n)
         d->find.truncated = 1;
     return cc_ok();
@@ -290,6 +475,28 @@ static size_t rtx_find_read_block(RtxDoc *d, size_t start, char[:] dest) {
     return d->tree.read_uncached(start, dest) !>;
 }
 
+/* Read the lane's window in RTX_FIND_READ_STEP pieces and count the
+ * newlines of [c_lo, c_hi) (window-relative) in each piece while it is
+ * still in cache; *span_nl gets that count over the bytes read. A 2 MiB
+ * window counted after the search streamed it from L3 again. */
+#define RTX_FIND_READ_STEP (256 * 1024)
+static size_t rtx_find_read_count(RtxDoc *d, size_t start, char *buf, size_t want,
+                                  size_t c_lo, size_t c_hi, size_t *span_nl) {
+    size_t got = 0, nl = 0;
+    while (got < want) {
+        size_t step = want - got, g, a, b;
+        if (step > (size_t)RTX_FIND_READ_STEP) step = (size_t)RTX_FIND_READ_STEP;
+        g = rtx_find_read_block(d, start + got, cc_slice_from_buffer(buf + got, step));
+        a = got > c_lo ? got : c_lo;
+        b = got + g < c_hi ? got + g : c_hi;
+        if (b > a) nl += rtx_count_lf(buf + a, b - a);
+        got += g;
+        if (g < step) break;
+    }
+    *span_nl = nl;
+    return got;
+}
+
 static void rtx_find_append_soft(RtxDoc *d, const RtxFindRel *hits, size_t n,
                                  size_t line_base) {
     rtx_find_append(d, hits, n, line_base) !>(e) {
@@ -298,12 +505,95 @@ static void rtx_find_append_soft(RtxDoc *d, const RtxFindRel *hits, size_t n,
     };
 }
 
+/* Regex chain across a block edge (write stage — sequential, so it owns
+ * the stage scratch). The lane scanned from the block start; the chain
+ * resumes at `ce` (inside the previous block's last hit). Rescan from there
+ * until a hit equals one of the lane's hits — from that hit on both chains
+ * agree — or the commit edge. The result lands on `a`; *leftover may be
+ * set. Returns the hit count (0 with *out NULL on OOM: cancel). */
+static size_t rtx_find_rechain(RtxDoc *d, const RtxFindRel *old, size_t nold,
+                               const char *buf, size_t got, size_t wlo, size_t start,
+                               size_t ce, size_t cend, int eof, size_t *leftover,
+                               CCArena a, RtxRxScratch *rxs, RtxFindRel **out) {
+    RtxFindIt it;
+    RtxFindRel *nh;
+    size_t k = 0, i, ms = 0, me = 0, cap, cnt = 0, pos, nl;
+    int r = 0;
+    *out = NULL;
+    cap = nold + 64;
+    nh = (RtxFindRel *)cc_arena_alloc(a, sizeof(RtxFindRel) * cap, 8);
+    if (!nh) {
+        d->find.cancel = 1;
+        return 0;
+    }
+    if (ce > wlo && ce - wlo < got) {
+        rtx_find_it(&it, d, buf, got, wlo == 0, eof, ce - wlo, cend - wlo, rxs);
+        while ((r = rtx_find_it_next(&it, &ms, &me)) != 0) {
+            size_t off = wlo + ms;
+            if (r == 2) {
+                *leftover = off;
+                break;
+            }
+            while (k < nold && old[k].off < off) k++;
+            if (k < nold && old[k].off == off && old[k].len == me - ms) break; /* met */
+            if (cnt == cap) {
+                RtxFindRel *g = (RtxFindRel *)cc_arena_alloc(a, sizeof(RtxFindRel) * cap * 2, 8);
+                if (!g) {
+                    d->find.cancel = 1;
+                    return 0;
+                }
+                memcpy(g, nh, sizeof(RtxFindRel) * cnt);
+                nh = g;
+                cap *= 2;
+            }
+            nh[cnt].off = off;
+            nh[cnt].len = me - ms;
+            nh[cnt].nl = 0;
+            cnt++;
+        }
+        /* Edge reached (or a leftover): the lane's later hits are not in
+         * this chain. Met: the lane's hits from k on are. */
+        if (r != 1) k = nold;
+    } else {
+        k = 0;
+        while (k < nold && old[k].off < ce) k++;
+    }
+    for (i = k; i < nold; i++) {
+        if (cnt == cap) {
+            RtxFindRel *g = (RtxFindRel *)cc_arena_alloc(a, sizeof(RtxFindRel) * cap * 2, 8);
+            if (!g) {
+                d->find.cancel = 1;
+                return 0;
+            }
+            memcpy(g, nh, sizeof(RtxFindRel) * cnt);
+            nh = g;
+            cap *= 2;
+        }
+        nh[cnt++] = old[i];
+    }
+    /* Block-relative newline counts for the rewritten list. */
+    pos = start - wlo;
+    nl = 0;
+    for (i = 0; i < cnt; i++) {
+        size_t at = nh[i].off - wlo;
+        if (at > got) at = got;
+        if (at > pos) {
+            nl += rtx_count_lf(buf + pos, at - pos);
+            pos = at;
+        }
+        nh[i].nl = nl;
+    }
+    *out = nh;
+    return cnt;
+}
+
 /* Wait-for tickets. Joined inside this arm so the dest-live kick returns. */
 static int rtx_find_run(RtxDoc *d) {
     size_t nfile;
     size_t span_lo;
     size_t remain;
     size_t n_sz;
+    size_t head, tail;
     int n;
     int i;
     bool fin;
@@ -314,11 +604,19 @@ static int rtx_find_run(RtxDoc *d) {
     d->find.scan_base = span_lo;
     d->find.scan_bytes = span_lo;
     remain = nfile - span_lo;
-    if (remain == 0 || !d->find.query.len) {
+    if (remain == 0 || !d->find.query.len || !d->find.rx) {
         d->find.done = 1;
         d->find.scan_off = nfile;
         d->find.scan_bytes = nfile;
         return 1;
+    }
+    head = rtx_find_head(d);
+    tail = rtx_find_tail(d);
+    if (rtx_find_regex(d) && d->find.hits.len) {
+        const RtxFindHit *lh = &d->find.hits.data[d->find.hits.len - 1];
+        d->find.chain_end = lh->off + lh->len;
+    } else {
+        d->find.chain_end = 0;
     }
     n_sz = (remain + (size_t)RTX_FIND_BLOCK - 1) / (size_t)RTX_FIND_BLOCK;
     if (n_sz > (size_t)INT_MAX) return 0;
@@ -330,82 +628,73 @@ static int rtx_find_run(RtxDoc *d) {
             return 0;
         }
         RtxFindScratch slot = {0} @destroy {
+            rtx_rx_scratch_drop(&slot.rxs);
             if (slot.arena.base) slot.arena.destroy();
         };
+        /* Write-stage state: stages run one at a time, in block order. */
+        RtxRxScratch stage_rx = {0} @destroy { rtx_rx_scratch_drop(&stage_rx); };
+        CCArena stage_a = cc_arena_heap(kilobytes(64)) @destroy;
         CCArena ta = cc_arena_heap(kilobytes(64)) @destroy;
         CCTurnstile ts@(RTX_FIND_CAP, 1, ta) !> @destroy;
 
         fin = @parallel wait (ts) cache (slot) for (i in 0..n) {
-            size_t qn;
             size_t start;
             size_t commit;
             size_t want;
             size_t got;
-            size_t adv;
             size_t hit_n;
-            size_t lim;
-            size_t k;
             size_t nfile_i;
-            char q[RTX_FIND_QMAX];
+            size_t wlo;
+            size_t hd;
+            size_t leftover;
+            size_t span_nl;
             char *buf;
             RtxFindRel *rels;
             size_t nl_block;
             int counted;
+            int eof;
 
             nfile_i = nfile;
-            qn = d->find.query.len;
             start = span_lo + (size_t)i * (size_t)RTX_FIND_BLOCK;
             commit = (size_t)RTX_FIND_BLOCK;
             if (start >= nfile_i) commit = 0;
             else if (commit > nfile_i - start) commit = nfile_i - start;
-            want = commit;
-            if (qn > 1 && want > 0) want += qn - 1;
-            if (start < nfile_i && want > nfile_i - start)
-                want = nfile_i - start;
-            if (want < qn) want = 0;
-            if (qn && qn <= (size_t)RTX_FIND_QMAX && d->find.query.ptr) {
-                char[:] qd = cc_slice_from_buffer(q, qn);
-                qd.copy(d->find.query) !>(e) {
-                    (void)e;
-                    d->find.cancel = 1;
-                    want = 0;
-                };
-            }
+            hd = start < head ? start : head;
+            wlo = start - hd;
+            want = commit ? hd + commit + tail : 0;
+            if (want > nfile_i - wlo) want = nfile_i - wlo;
             hit_n = 0;
             got = 0;
             buf = NULL;
             counted = 0;
             nl_block = 0;
+            eof = 0;
+            leftover = RTX_RX_UNSET;
+            span_nl = 0;
             slot.nl_commit = 0;
             if (want && !d->find.cancel && !d->find.truncated
-                && rtx_find_scratch_ensure(&slot)) {
+                && rtx_find_scratch_ensure(&slot, (size_t)RTX_FIND_BLOCK +
+                                                      (size_t)RTX_FIND_CTX +
+                                                      (size_t)RTX_FIND_SPAN +
+                                                      (size_t)RTX_FIND_QMAX + 8)) {
+                RtxFindIt it;
+                size_t ms = 0, me = 0;
+                int r;
                 buf = slot.buf;
-                got = rtx_find_read_block(d, start, cc_slice_from_buffer(buf, want));
-                adv = rtx_find_window_adv(got, qn, start + got >= nfile_i);
-                if (adv > commit) adv = commit;
-                if (got >= qn && adv && qn) {
-                    lim = got - qn + 1;
-                    if (adv < lim) lim = adv;
-                    k = 0;
-                    while (k < lim && hit_n < (size_t)RTX_FIND_MAX) {
-                        bool found = false;
-                        CCSlice hay = cc_slice_from_buffer(buf + k, got - k);
-                        CCSlice nd = cc_slice_from_buffer(q, qn);
-                        size_t rel = cc_slice_index_of(hay, nd, &found);
-                        size_t at;
-                        size_t off;
-                        if (!found) break;
-                        at = k + rel;
-                        if (at >= lim) break;
-                        off = start + at;
-                        if (off >= start + commit) break;
-                        if (!rtx_find_scratch_hit(&slot, &hit_n, off))
-                            break;
-                        k = at + 1;
+                got = rtx_find_read_count(d, wlo, buf, want, hd, hd + commit, &span_nl);
+                eof = wlo + got >= nfile_i;
+                rtx_find_it(&it, d, buf, got, wlo == 0, eof, hd, hd + commit, &slot.rxs);
+                while (hit_n < (size_t)RTX_FIND_MAX && (r = rtx_find_it_next(&it, &ms, &me))) {
+                    if (r == 2) {
+                        leftover = wlo + ms;
+                        break;
                     }
+                    if (!rtx_find_scratch_hit(&slot, &hit_n, wlo + ms, me - ms))
+                        break;
                 }
-                if (got) {
-                    rtx_find_count_block(&slot, cc_slice_from_buffer(buf, got), start, commit, hit_n);
+                if (got > hd) {
+                    rtx_find_count_block(&slot, cc_slice_from_buffer(buf + hd, got - hd),
+                                         start, commit, hit_n, span_nl);
                     nl_block = slot.nl_commit;
                     counted = 1;
                 }
@@ -417,8 +706,24 @@ static int rtx_find_run(RtxDoc *d) {
                 while (d->find.h.paused && !d->find.cancel)
                     cc_yield();
                 if (!d->find.cancel && !d->find.truncated) {
+                    if (rtx_find_regex(d) && buf && d->find.chain_end > start) {
+                        RtxFindRel *re = NULL;
+                        stage_a.reset();
+                        hit_n = rtx_find_rechain(d, rels, hit_n, buf, got, wlo, start,
+                                                 d->find.chain_end, start + commit, eof,
+                                                 &leftover, stage_a, &stage_rx, &re);
+                        rels = re;
+                    }
                     line_base = d->find.scan_line;
-                    rtx_find_append_soft(d, rels, hit_n, line_base);
+                    if (rels) rtx_find_append_soft(d, rels, hit_n, line_base);
+                    if (rels && hit_n) {
+                        size_t le = rels[hit_n - 1].off + rels[hit_n - 1].len;
+                        if (le > d->find.chain_end) d->find.chain_end = le;
+                    }
+                    if (leftover != RTX_RX_UNSET) {
+                        if (d->find.long_n == 0) d->find.long_off = leftover;
+                        d->find.long_n = d->find.long_n + 1;
+                    }
                     d->find.scan_bytes = start + commit;
                     if (d->find.scan_bytes > nfile_i)
                         d->find.scan_bytes = nfile_i;
@@ -431,8 +736,8 @@ static int rtx_find_run(RtxDoc *d) {
                         /* Resume reads the next byte. A newline at the hit
                          * is that next line, not still this one. */
                         d->find.scan_line = d->find.hits.data[d->find.hits.len - 1].line;
-                        if (buf && off >= start && off < start + got
-                            && buf[off - start] == '\n')
+                        if (buf && off >= wlo && off < wlo + got
+                            && buf[off - wlo] == '\n')
                             d->find.scan_line++;
                     } else {
                         d->find.scan_off = start + commit;
@@ -464,12 +769,10 @@ static int rtx_find_run(RtxDoc *d) {
     return 1;
 }
 
+/* ------------------------------------------------------ edit patching */
+
 static size_t rtx_find_count_lf_bytes(char[:] p) {
-    size_t c = 0;
-    @for (ch in p) {
-        if (ch == '\n') c++;
-    }
-    return c;
+    return rtx_count_lf(p.ptr, p.len);
 }
 
 /* Newlines before `at`. Byte 0 is line 0. Uncovered offsets fail closed. */
@@ -488,62 +791,47 @@ static int rtx_find_line_at(const RtxDoc *d, size_t at, size_t *out) {
     return 1;
 }
 
-/* Matches starting in [lo, stop), using bytes [lo, lo+n).
+/* Literal matches starting in [lo, stop), using the window t[0, tn) whose
+ * byte `pre` is document offset lo (bytes before are word context).
  * `dst == NULL` counts. A seam line that would underflow sets *bad. */
-static size_t rtx_find_seam_collect(char[:] buf, size_t lo, size_t at,
-                                   size_t stop, char[:] q, size_t line_at,
-                                   RtxFindHit *dst, size_t dst_cap, int *bad) {
-    size_t k;
-    size_t count;
-    size_t at_local;
-    size_t n;
-    size_t qn;
-    char[:] nd;
+static size_t rtx_find_seam_collect(const RtxDoc *d, const char *t, size_t tn,
+                                    size_t pre, size_t lo, size_t at, size_t stop,
+                                    size_t line_at, RtxFindHit *dst, size_t dst_cap,
+                                    int *bad, RtxRxScratch *rxs) {
+    RtxFindIt it;
+    size_t count = 0, at_local, ms = 0, me = 0;
+    int r;
     if (bad) *bad = 0;
-    n = buf.len;
-    qn = q.len;
-    if (!buf.ptr || !q.ptr || !qn || n < qn || lo >= stop) return 0;
+    if (!t || lo >= stop || !d->find.rx) return 0;
     if (at < lo) at_local = 0;
-    else if (at - lo > n) at_local = n;
+    else if (at - lo > tn - pre) at_local = tn - pre;
     else at_local = at - lo;
-    nd = q;
-    k = 0;
-    count = 0;
-    while (k < n && k + qn <= n) {
-        bool found = false;
-        char[:] hay;
-        size_t rel;
+    rtx_find_it(&it, d, t, tn, lo == pre, 1, pre, pre + (stop - lo), rxs);
+    /* The window ends where the seam does: \b at its end is context the
+     * caller read (post), so treat it as the text end only past that. */
+    while ((r = rtx_find_it_next(&it, &ms, &me)) != 0) {
         size_t local;
         size_t start;
-        hay = buf.sub(k, n);
-        rel = cc_slice_index_of(hay, nd, &found);
-        if (!found) break;
-        local = k + rel;
-        if (local + qn > n) break;
+        if (r == 2) break;
+        local = ms - pre;
         start = lo + local;
         if (start >= stop) break;
         if (dst) {
             size_t line;
             size_t nl;
-            size_t i;
             if (count >= dst_cap) {
                 if (bad) *bad = 1;
                 return 0;
             }
-            nl = 0;
             if (local >= at_local) {
-                for (i = at_local; i < local; i++) {
-                    if (buf.ptr[i] == '\n') nl++;
-                }
+                nl = rtx_count_lf(t + pre + at_local, local - at_local);
                 if (nl && line_at > (size_t)-1 - nl) {
                     if (bad) *bad = 1;
                     return 0;
                 }
                 line = line_at + nl;
             } else {
-                for (i = local; i < at_local; i++) {
-                    if (buf.ptr[i] == '\n') nl++;
-                }
+                nl = rtx_count_lf(t + pre + local, at_local - local);
                 if (nl > line_at) {
                     if (bad) *bad = 1;
                     return 0;
@@ -552,9 +840,9 @@ static size_t rtx_find_seam_collect(char[:] buf, size_t lo, size_t at,
             }
             dst[count].off = start;
             dst[count].line = line;
+            dst[count].len = me - ms;
         }
         count++;
-        k = local + 1;
     }
     return count;
 }
@@ -593,7 +881,7 @@ static void rtx_find_publish_cover(RtxDoc *d, size_t cover, size_t line,
 
 /* Newlines in [from, to). Refuses a gap bigger than the seam budget. */
 static int rtx_find_count_gap(RtxDoc *d, size_t from, size_t to, size_t *nl_out) {
-    char tmp[512];
+    char tmp[4096];
     size_t off;
     size_t nl;
     @errhandler(CCError e) {
@@ -607,25 +895,25 @@ static int rtx_find_count_gap(RtxDoc *d, size_t from, size_t to, size_t *nl_out)
     while (off < to) {
         size_t want = to - off;
         size_t got;
-        size_t i;
         if (want > sizeof(tmp)) want = sizeof(tmp);
         got = d->read_at(off, cc_slice_from_buffer(tmp, want)) !>;
         if (got != want) return 0;
-        for (i = 0; i < got; i++) {
-            if (tmp[i] == '\n') nl++;
-        }
+        nl += rtx_count_lf(tmp, got);
         off += got;
     }
     *nl_out = nl;
     return 1;
 }
 
-/* 1 = list patched. 0 = caller wipes. */
+/* Literal list (every occurrence, fixed length qn). 1 = list patched.
+ * 0 = caller wipes. `ctx` is the word context a WORD hit reads on each
+ * side: a hit is kept or shifted only when the edit is outside it and
+ * its context. */
 static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
-                               char[:] inserted) {
-    char qbuf[RTX_FIND_QMAX];
-    char win[RTX_FRAME_SCRATCH];
+                               char[:] inserted, RtxRxScratch *rxs) {
+    char win[RTX_FRAME_SCRATCH + 16];
     size_t qn;
+    size_t ctx;
     size_t erased;
     size_t added;
     size_t nlen;
@@ -637,6 +925,8 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
     size_t stop;
     size_t hi;
     size_t span;
+    size_t pre;
+    size_t post;
     size_t nseam;
     size_t line_at;
     size_t sub;
@@ -650,6 +940,7 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
     size_t anchor_off;
     size_t anchor_line;
     size_t nl_in;
+    char *seam;
     int cur_kind;
     int sub_line;
     int bad;
@@ -658,11 +949,12 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
     int line_ready;
     if (!d) return 0;
     if (d->find.h.live()) return 0;
-    if (!d->find.query.len || !d->find.query.ptr) return 0;
+    if (!d->find.query.len || !d->find.query.ptr || !d->find.rx) return 0;
     if (!d->find.store.base) return 0;
     if (d->find.hits.len && !d->find.hits.data) return 0;
     qn = d->find.query.len;
     if (qn > (size_t)RTX_FIND_QMAX) return 0;
+    ctx = (d->find.opts & RTX_FIND_WORD) ? 4 : 0;
     erased = deleted.len;
     added = inserted.len;
     if (erased && !deleted.ptr) return 0;
@@ -694,17 +986,16 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
     {
         size_t prev = 0;
         int have = 0;
-        for (i = 0; i < d->find.hits.len; i++) {
-            RtxFindHit h = d->find.hits.data[i];
+        @for (h in d->find.hits) {
             if (h.off >= cover || h.off >= old_len || qn > old_len - h.off)
                 return 0;
             if (have && h.off <= prev) return 0;
-            if (qn <= at && h.off <= at - qn) {
+            if (qn + ctx <= at && h.off <= at - qn - ctx) {
                 anchor_off = h.off;
                 anchor_line = h.line;
                 have_anchor = 1;
             }
-            if (h.off >= at + erased) {
+            if (h.off >= at + erased + ctx) {
                 size_t base = h.off - erased;
                 if (added && base > (size_t)-1 - added) return 0;
                 if (sub_line && h.line < sub) return 0;
@@ -717,8 +1008,8 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
             have = 1;
         }
     }
-    back = qn - 1;
-    /* Edit sits entirely past the covered prefix, including the qn-1 overlap. */
+    back = qn - 1 + ctx;
+    /* Edit sits entirely past the covered prefix, including the overlap. */
     if (at >= cover && at - cover >= back) {
         rtx_find_publish_cover(d, cover, d->find.scan_line, nlen, was_trunc);
         return 1;
@@ -745,7 +1036,7 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
         line_ready = 1;
     }
     lo = at > back ? at - back : 0;
-    stop = at + added;
+    stop = at + added + ctx;
     if (stop > new_cover) stop = new_cover;
     if (back && stop > (size_t)-1 - back) return 0;
     hi = stop + back;
@@ -753,33 +1044,30 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
     if (hi < lo) return 0;
     span = hi - lo;
     if (span > (size_t)RTX_FRAME_SCRATCH) return 0;
+    pre = lo < ctx ? lo : ctx;
+    post = nlen - hi < ctx ? nlen - hi : ctx;
+    seam = win + pre;
     {
         @errhandler(CCError e) {
             (void)e;
             return 0;
         }
-        char[:] qd = cc_slice_from_buffer(qbuf, qn);
         size_t got;
-        qd.copy(d->find.query) !>;
         if (span && lo < stop && span >= qn) {
-            got = d->read_at(lo, cc_slice_from_buffer(win, span)) !>;
-            if (got != span) return 0;
+            got = d->read_at(lo - pre, cc_slice_from_buffer(win, pre + span + post)) !>;
+            if (got != pre + span + post) return 0;
         }
     }
     nseam = 0;
     if (span && lo < stop && span >= qn) {
-        nseam = rtx_find_seam_collect(cc_slice_from_buffer(win, span), lo, at,
-                                     stop, cc_slice_from_buffer(qbuf, qn), 0,
-                                     NULL, 0, NULL);
+        nseam = rtx_find_seam_collect(d, win, pre + span + post, pre, lo, at, stop, 0,
+                                      NULL, 0, NULL, rxs);
         if (nseam && !line_ready) {
             if (new_cover <= at && new_cover >= lo && at >= lo &&
                 at - lo <= span && new_cover - lo <= span) {
-                size_t nl = 0;
                 size_t b0 = new_cover - lo;
                 size_t b1 = at - lo;
-                for (i = b0; i < b1; i++) {
-                    if (win[i] == '\n') nl++;
-                }
+                size_t nl = b1 > b0 ? rtx_count_lf(seam + b0, b1 - b0) : 0;
                 if (nl && new_line > (size_t)-1 - nl) return 0;
                 line_at = new_line + nl;
                 line_ready = 1;
@@ -789,9 +1077,7 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
                 size_t b0 = at >= lo ? at - lo : 0;
                 size_t b1 = new_cover - lo;
                 if (b0 <= b1) {
-                    for (i = b0; i < b1; i++) {
-                        if (win[i] == '\n') nl++;
-                    }
+                    nl = rtx_count_lf(seam + b0, b1 - b0);
                     if (nl > new_line) return 0;
                     line_at = new_line - nl;
                     line_ready = 1;
@@ -824,18 +1110,18 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
     cur_kind = 0;
     if (d->find.cur < d->find.hits.len) {
         cur_off = d->find.hits.data[d->find.cur].off;
-        if (qn <= at && cur_off <= at - qn) cur_kind = 1;
-        else if (cur_off >= at + erased) cur_kind = 2;
+        if (qn + ctx <= at && cur_off <= at - qn - ctx) cur_kind = 1;
+        else if (cur_off >= at + erased + ctx) cur_kind = 2;
         else cur_kind = 3;
     }
     nk = 0;
     n_body = 0;
     for (i = 0; i < d->find.hits.len; i++) {
         RtxFindHit h = d->find.hits.data[i];
-        if (qn <= at && h.off <= at - qn) {
+        if (qn + ctx <= at && h.off <= at - qn - ctx) {
             d->find.hits.data[n_body++] = h;
             nk++;
-        } else if (h.off >= at + erased) {
+        } else if (h.off >= at + erased + ctx) {
             h.off = h.off - erased + added;
             if (sub_line) h.line -= sub;
             else h.line += nl_ins - nl_del;
@@ -854,26 +1140,30 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
     if (nseam) {
         size_t wrote;
         bad = 0;
-        wrote = rtx_find_seam_collect(cc_slice_from_buffer(win, span), lo, at,
-                                     stop, cc_slice_from_buffer(qbuf, qn),
-                                     line_at, d->find.hits.data + nk, nseam, &bad);
+        wrote = rtx_find_seam_collect(d, win, pre + span + post, pre, lo, at, stop,
+                                      line_at, d->find.hits.data + nk, nseam, &bad, rxs);
         if (bad || wrote != nseam) return 0;
     }
     if (n_body + nseam > n_body) {
         if (!d->find.hits.at_grow(n_body + nseam - 1)) return 0;
     }
-    for (i = 0; i < d->find.hits.len; i++) {
-        RtxFindHit h = d->find.hits.data[i];
-        if (h.off >= new_cover || h.off >= nlen || qn > nlen - h.off) return 0;
-        if (i && h.off <= d->find.hits.data[i - 1].off) return 0;
+    {
+        size_t prev = 0;
+        int have = 0;
+        @for (h in d->find.hits) {
+            if (h.off >= new_cover || h.off >= nlen || qn > nlen - h.off) return 0;
+            if (have && h.off <= prev) return 0;
+            prev = h.off;
+            have = 1;
+        }
     }
     if (d->find.hits.len == 0 || cur_kind == 0) {
         d->find.cur = 0;
     } else if (cur_kind == 1 || cur_kind == 2) {
         size_t target = cur_kind == 1 ? cur_off : cur_off - erased + added;
         int found = 0;
-        for (i = 0; i < d->find.hits.len; i++) {
-            if (d->find.hits.data[i].off == target) {
+        @for (i, h in d->find.hits) {
+            if (h.off == target) {
                 d->find.cur = i;
                 found = 1;
                 break;
@@ -882,25 +1172,291 @@ static int rtx_find_edit_apply(RtxDoc *d, size_t at, char[:] deleted,
         if (!found) return 0;
     } else {
         d->find.cur = d->find.hits.len - 1;
-        for (i = 0; i < d->find.hits.len; i++) {
-            if (d->find.hits.data[i].off >= at) {
+        @for (i, h in d->find.hits) {
+            if (h.off >= at) {
                 d->find.cur = i;
                 break;
             }
         }
     }
+    rtx_find_hits_publish(&d->find);
+    rtx_find_publish_cover(d, new_cover, new_line, nlen, was_trunc);
+    return 1;
+}
+
+/* Newlines in t[a, b). */
+static size_t rtx_find_nl(const char *t, size_t a, size_t b) {
+    if (b <= a) return 0;
+    return rtx_count_lf(t + a, b - a);
+}
+
+/* Regex list (leftmost-first chain, variable lengths). 1 = patched, 0 =
+ * caller wipes. A hit at s was decided by bytes [s - RTX_FIND_CTX,
+ * s + H); the edit rescans starts in [at - H + 1, …) from the last kept
+ * hit's end and re-chains until a new hit equals an old (shifted) hit —
+ * from there both chains agree — or the new cover. The window is a
+ * call-local heap arena of at most 4 * RTX_FIND_SPAN + the insert. */
+static int rtx_find_edit_apply_rx(RtxDoc *d, size_t at, char[:] deleted,
+                                  char[:] inserted, RtxRxScratch *rxs) {
+    size_t erased = deleted.len, added = inserted.len, nlen, old_len, cover;
+    size_t H = rtx_find_horizon(d), C = (size_t)RTX_FIND_CTX;
+    size_t nl_del, nl_ins, new_cover, new_line, p0, wlo, whi, i, nkeep, nshift;
+    size_t line_p0 = 0, budget, scan_stop, cur_off = (size_t)-1;
+    size_t keep_end = 0;
+    int was_trunc, have_line = 0, cur_kind = 0, eof, synced = 0, r;
+    CCArena wa;
+    char *win;
+    RtxFindHit *newh;
+    size_t nnew = 0, newcap;
+    RtxFindIt it;
+    size_t ms = 0, me = 0, j;
+    if (!d || d->find.h.live() || !d->find.rx || !d->find.store.base) return 0;
+    if (d->find.hits.len && !d->find.hits.data) return 0;
+    if (d->find.long_n) return 0; /* a leftover's reach is unknown: rescan */
+    if ((erased && !deleted.ptr) || (added && !inserted.ptr)) return 0;
+    nlen = d->len();
+    if (at > nlen || added > nlen || (added && at > nlen - added)) return 0;
+    old_len = nlen - added + erased;
+    cover = d->find.scan_off;
+    if (cover > old_len) return 0;
+    was_trunc = d->find.truncated ? 1 : 0;
+    nl_del = rtx_find_count_lf_bytes(deleted);
+    nl_ins = rtx_find_count_lf_bytes(inserted);
+    /* Old hits: kept before, shifted after, the rest re-found. */
+    nkeep = 0;
+    nshift = 0;
+    for (i = 0; i < d->find.hits.len; i++) {
+        RtxFindHit h = d->find.hits.data[i];
+        size_t reach = h.len + 1 > H ? h.len + 1 : H;
+        if (i && h.off < d->find.hits.data[i - 1].off + d->find.hits.data[i - 1].len)
+            return 0;
+        if (h.off + reach <= at) {
+            nkeep = i + 1;
+            keep_end = h.off + h.len;
+        } else if (h.off >= at + erased + C) {
+            nshift++;
+        }
+    }
+    if (d->find.cur < d->find.hits.len) {
+        RtxFindHit h = d->find.hits.data[d->find.cur];
+        cur_off = h.off;
+        if (d->find.cur < nkeep) cur_kind = 1;
+        else if (h.off >= at + erased + C) cur_kind = 2;
+        else cur_kind = 3;
+    }
+    /* New cover and its line. */
+    if (at >= cover) {
+        new_cover = cover;
+        new_line = d->find.scan_line;
+    } else if (cover >= at + erased) {
+        if (nl_del > d->find.scan_line) return 0;
+        new_cover = cover - erased + added;
+        new_line = d->find.scan_line - nl_del + nl_ins;
+    } else {
+        size_t nl_pre = rtx_find_count_lf_bytes(deleted.sub(0, cover - at));
+        if (nl_pre > d->find.scan_line) return 0;
+        new_cover = at + added;
+        new_line = d->find.scan_line - nl_pre + nl_ins;
+    }
+    p0 = at >= H ? at - H + 1 : 0;
+    if (keep_end > p0) p0 = keep_end;
+    if (p0 >= new_cover) {
+        /* Nothing to re-find: drop the unsettled hits, shift the rest. */
+        size_t o = nkeep;
+        for (i = nkeep; i < d->find.hits.len; i++) {
+            RtxFindHit h = d->find.hits.data[i];
+            if (h.off >= at + erased + C) {
+                h.off = h.off - erased + added;
+                h.line = h.line - nl_del + nl_ins;
+                if (h.off < new_cover) d->find.hits.data[o++] = h;
+            }
+        }
+        d->find.hits.truncate(o);
+        if (cur_kind != 1) d->find.cur = 0;
+        rtx_find_hits_publish(&d->find);
+        rtx_find_publish_cover(d, new_cover, new_line, nlen, was_trunc);
+        if (o) d->find.chain_end = d->find.hits.data[o - 1].off + d->find.hits.data[o - 1].len;
+        return 1;
+    }
+    budget = 4 * (size_t)RTX_FIND_SPAN + added;
+    wlo = p0 >= C ? p0 - C : 0;
+    whi = p0 + budget + H;
+    if (whi > nlen || whi < p0) whi = nlen;
+    eof = whi == nlen;
+    scan_stop = new_cover;
+    if (!eof && whi - H < scan_stop) scan_stop = whi - H;
+    wa = cc_arena_heap(whi - wlo + kilobytes(64));
+    if (!wa.base) return 0;
+    win = (char *)cc_arena_alloc(wa, whi - wlo + 1, 1);
+    newcap = 256;
+    newh = (RtxFindHit *)cc_arena_alloc(wa, sizeof(RtxFindHit) * newcap, 8);
+    if (!win || !newh) {
+        wa.destroy();
+        return 0;
+    }
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            wa.destroy();
+            return 0;
+        }
+        size_t got = d->read_at(wlo, cc_slice_from_buffer(win, whi - wlo)) !>;
+        if (got != whi - wlo) {
+            wa.destroy();
+            return 0;
+        }
+    }
+    /* Line at p0: index, a kept hit, or the cover line. */
+    if (rtx_find_line_at(d, p0, &line_p0)) have_line = 1;
+    if (!have_line && nkeep) {
+        RtxFindHit a = d->find.hits.data[nkeep - 1];
+        if (a.off >= wlo) {
+            line_p0 = a.line + rtx_find_nl(win, a.off - wlo, p0 - wlo);
+            have_line = 1;
+        } else {
+            size_t gap = 0;
+            if (rtx_find_count_gap(d, a.off, p0, &gap)) {
+                line_p0 = a.line + gap;
+                have_line = 1;
+            }
+        }
+    }
+    if (!have_line && new_cover >= p0 && new_cover <= whi) {
+        size_t nl = rtx_find_nl(win, p0 - wlo, new_cover - wlo);
+        if (nl <= new_line) {
+            line_p0 = new_line - nl;
+            have_line = 1;
+        }
+    }
+    if (!have_line) {
+        size_t gap = 0;
+        if (rtx_find_count_gap(d, 0, p0, &gap)) {
+            line_p0 = gap;
+            have_line = 1;
+        }
+    }
+    if (!have_line) {
+        wa.destroy();
+        return 0;
+    }
+    /* Re-chain. Shifted old hits (new offsets) are the sync targets. */
+    j = nkeep;
+    while (j < d->find.hits.len && d->find.hits.data[j].off < at + erased + C) j++;
+    rtx_find_it(&it, d, win, whi - wlo, wlo == 0, eof, p0 - wlo, scan_stop - wlo, rxs);
+    while ((r = rtx_find_it_next(&it, &ms, &me)) != 0) {
+        size_t off = wlo + ms;
+        if (r == 2) {
+            wa.destroy();
+            return 0; /* a leftover inside the seam: rescan the file */
+        }
+        while (j < d->find.hits.len &&
+               d->find.hits.data[j].off - erased + added < off)
+            j++;
+        if (j < d->find.hits.len && d->find.hits.data[j].off - erased + added == off &&
+            d->find.hits.data[j].len == me - ms && off >= at + added + C) {
+            synced = 1;
+            break;
+        }
+        if (nnew == newcap) {
+            RtxFindHit *g = (RtxFindHit *)cc_arena_alloc(wa, sizeof(RtxFindHit) * newcap * 2, 8);
+            if (!g) {
+                wa.destroy();
+                return 0;
+            }
+            memcpy(g, newh, sizeof(RtxFindHit) * nnew);
+            newh = g;
+            newcap *= 2;
+        }
+        newh[nnew].off = off;
+        newh[nnew].len = me - ms;
+        newh[nnew].line = line_p0 + rtx_find_nl(win, p0 - wlo, ms);
+        nnew++;
+        if (nkeep + nnew > (size_t)RTX_FIND_MAX) {
+            wa.destroy();
+            return 0;
+        }
+    }
+    if (!synced && scan_stop < new_cover) {
+        wa.destroy();
+        return 0; /* budget spent before the chains met */
+    }
+    if (!synced) j = d->find.hits.len;
+    {
+        size_t tail = d->find.hits.len - j, o;
+        size_t total = nkeep + nnew + tail;
+        @errhandler(CCError e) {
+            (void)e;
+            wa.destroy();
+            return 0;
+        }
+        if (total > (size_t)RTX_FIND_MAX) {
+            wa.destroy();
+            return 0;
+        }
+        rtx_find_fit_hits(d, total + 1) !>;
+        /* Shift the tail first (it may move right), then drop in the new. */
+        if (tail) {
+            memmove(d->find.hits.data + nkeep + nnew, d->find.hits.data + j,
+                    sizeof(RtxFindHit) * tail);
+            for (o = nkeep + nnew; o < total; o++) {
+                d->find.hits.data[o].off = d->find.hits.data[o].off - erased + added;
+                d->find.hits.data[o].line = d->find.hits.data[o].line - nl_del + nl_ins;
+            }
+        }
+        if (nnew) memcpy(d->find.hits.data + nkeep, newh, sizeof(RtxFindHit) * nnew);
+        if (total) {
+            if (!d->find.hits.at_grow(total - 1)) {
+                wa.destroy();
+                return 0;
+            }
+        }
+        d->find.hits.truncate(total);
+    }
+    wa.destroy();
+    for (i = 0; i < d->find.hits.len; i++) {
+        RtxFindHit h = d->find.hits.data[i];
+        if (h.off >= new_cover || h.off + h.len > nlen) return 0;
+        if (i && h.off < d->find.hits.data[i - 1].off + d->find.hits.data[i - 1].len)
+            return 0;
+    }
+    d->find.cur = 0;
+    if (d->find.hits.len && cur_kind) {
+        size_t target = cur_kind == 2 ? cur_off - erased + added : cur_kind == 1 ? cur_off : at;
+        d->find.cur = d->find.hits.len - 1;
+        for (i = 0; i < d->find.hits.len; i++) {
+            if (d->find.hits.data[i].off >= target) {
+                d->find.cur = i;
+                break;
+            }
+        }
+    }
+    (void)nshift;
+    d->find.chain_end = d->find.hits.len ? d->find.hits.data[d->find.hits.len - 1].off +
+                                               d->find.hits.data[d->find.hits.len - 1].len
+                                         : 0;
+    rtx_find_hits_publish(&d->find);
     rtx_find_publish_cover(d, new_cover, new_line, nlen, was_trunc);
     return 1;
 }
 
 void RtxDoc_find_after_edit(RtxDoc *d, size_t at, char[:] deleted,
                             char[:] inserted) {
+    RtxRxScratch rxs = {0};
+    int ok;
     if (!d) return;
     if (deleted.len == 0 && inserted.len == 0) return;
     rtx_find_handle_stop(&d->find);
-    if (!rtx_find_edit_apply(d, at, deleted, inserted))
+    if (!d->find.rx) {
         rtx_find_scan_wipe(d);
+        return;
+    }
+    if (rtx_find_regex(d)) ok = rtx_find_edit_apply_rx(d, at, deleted, inserted, &rxs);
+    else ok = rtx_find_edit_apply(d, at, deleted, inserted, &rxs);
+    rtx_rx_scratch_drop(&rxs);
+    if (!ok) rtx_find_scan_wipe(d);
 }
+
+/* ------------------------------------------------------ host surface */
 
 void !>(CCError) RtxDoc_find_step(RtxDoc *d) {
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
@@ -929,7 +1485,7 @@ static void !>(CCError) rtx_find_listing_start(RtxDoc *d) {
     RtxDoc *scan;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "find kick");
     scan = d;
-    if (d->find.done || !d->find.query.len) return cc_ok();
+    if (d->find.done || !d->find.query.len || !d->find.rx) return cc_ok();
     if (d->find.hits.cap() < (size_t)RTX_FIND_MAX) {
         rtx_find_fit_hits(d, (size_t)RTX_FIND_MAX) !>(e) { return cc_err(e); };
     }
@@ -955,23 +1511,26 @@ void rtx_find_resume(RtxDoc *d) {
 }
 
 static size_t rtx_find_near(const RtxDoc *d) {
-    size_t i;
-    if (!d || d->find.hits.len == 0) return (size_t)-1;
-    for (i = 0; i < d->find.hits.len; i++) {
-        if (d->find.hits.data[i].off >= d->find.origin) return i;
+    size_t n = d ? rtx_find_hits_n(&d->find) : 0;
+    if (n == 0) return (size_t)-1;
+    /* Published prefix only — not hits.len (may be ahead of hits_pub). */
+    @for (i, h in d->find.hits) {
+        if (i >= n) break;
+        if (h.off >= d->find.origin) return i;
     }
     if (d->find.done) return 0;
     return (size_t)-1;
 }
 
 static void rtx_find_place(RtxDoc *d, size_t i) {
-    size_t n;
-    if (!d || d->find.hits.len == 0) return;
-    if (i >= d->find.hits.len) i = d->find.hits.len - 1;
+    size_t n, hits;
+    hits = d ? rtx_find_hits_n(&d->find) : 0;
+    if (hits == 0) return;
+    if (i >= hits) i = hits - 1;
     d->find.cur = i;
     d->caret = d->find.hits.data[i].off;
     n = d->len();
-    d->sel_anchor = d->caret + d->find.query.len;
+    d->sel_anchor = d->caret + d->find.hits.data[i].len;
     if (d->sel_anchor > n) d->sel_anchor = n;
     d->break_coalesce();
 }
@@ -992,21 +1551,23 @@ void RtxDoc_find_goto(RtxDoc *d, size_t i) {
 }
 
 void RtxDoc_find_next(RtxDoc *d) {
-    if (!d || d->find.hits.len == 0) return;
+    size_t n = d ? rtx_find_hits_n(&d->find) : 0;
+    if (n == 0) return;
     if (!d->find.pinned) {
         d->find_goto(d->find.cur);
         return;
     }
-    d->find_goto((d->find.cur + 1) % d->find.hits.len);
+    d->find_goto((d->find.cur + 1) % n);
 }
 
 void RtxDoc_find_prev(RtxDoc *d) {
-    if (!d || d->find.hits.len == 0) return;
+    size_t n = d ? rtx_find_hits_n(&d->find) : 0;
+    if (n == 0) return;
     if (!d->find.pinned) {
         d->find_goto(d->find.cur);
         return;
     }
-    d->find_goto(d->find.cur == 0 ? d->find.hits.len - 1 : d->find.cur - 1);
+    d->find_goto(d->find.cur == 0 || d->find.cur > n ? n - 1 : d->find.cur - 1);
 }
 
 void !>(CCError) RtxDoc_find_hit_view(RtxDoc *d, size_t i, CCArena scratch,
@@ -1020,7 +1581,7 @@ void !>(CCError) RtxDoc_find_hit_view(RtxDoc *d, size_t i, CCArena scratch,
         return cc_err(e);
     }
     if (!d || !scratch.base || !out) return cc_err(CC_ERR_INVALID_ARG, "find hit");
-    if (i >= d->find.hits.len) return cc_err(CC_ERR_INVALID_ARG, "find hit");
+    if (i >= rtx_find_hits_n(&d->find)) return cc_err(CC_ERR_INVALID_ARG, "find hit");
     *out = (RtxFindHitView){0};
     off = d->find.hits.data[i].off;
     n = d->len();
@@ -1032,6 +1593,7 @@ void !>(CCError) RtxDoc_find_hit_view(RtxDoc *d, size_t i, CCArena scratch,
     out->off = off;
     out->line1 = d->find.hits.data[i].line + 1;
     out->col = (off >= a) ? off - a : 0;
+    out->len = d->find.hits.data[i].len;
     if (z <= a) {
         out->ctx = cc_slice_empty();
         return cc_ok();
@@ -1041,4 +1603,683 @@ void !>(CCError) RtxDoc_find_hit_view(RtxDoc *d, size_t i, CCArena scratch,
         out->ctx = bytes;
     }
     return cc_ok();
+}
+
+/* ------------------------------------------------------------ replace
+ * DESIGN Replace. Replace one is one `replace` on the pinned hit. Replace
+ * all is a job with its own compiled query and its own pass over the
+ * document (not the find list: that list may overlap, skips zero-width
+ * matches, and stops at RTX_FIND_MAX). The job reads RTX_REPL_SLICE of
+ * starts per window (plus RTX_FIND_CTX before and `tail` after), stages
+ * every site, and applies them as one edit group only at commit — a
+ * cancel or refusal edits nothing. */
+
+static long rtx_repl_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+}
+
+/* Template → parts (escapes resolved into `lit`). `lit` holds tpl.len
+ * bytes, `parts` tpl.len + 1. Returns the part count, or -1 with *err. */
+static long rtx_repl_parse(char[:] tpl, int regex, const RtxRx *rx, char *lit,
+                           RtxReplPart *parts, int *groups, const char **err) {
+    const char *t = tpl.ptr;
+    size_t n = tpl.len, i = 0, o = 0, run = 0;
+    long np = 0;
+    unsigned ng = rx ? rtx_rx_groups(rx) : 1;
+    *groups = 0;
+    *err = NULL;
+    if (!regex) {
+        if (n) {
+            memcpy(lit, t, n);
+            parts[0].grp = -1;
+            parts[0].off = 0;
+            parts[0].n = n;
+            return 1;
+        }
+        return 0;
+    }
+    while (i < n) {
+        char c = t[i];
+        int g = -1;
+        if (c == '$' && i + 1 < n) {
+            char c2 = t[i + 1];
+            if (c2 == '$') {
+                lit[o++] = '$';
+                i += 2;
+                continue;
+            }
+            if (c2 >= '0' && c2 <= '9') {
+                g = c2 - '0';
+                i += 2;
+            } else if (c2 == '{') {
+                size_t k = i + 2, close = i + 2;
+                while (close < n && t[close] != '}') close++;
+                if (close >= n || close == k) {
+                    *err = "replace: ${ needs a group and a closing }";
+                    return -1;
+                }
+                g = 0;
+                for (; k < close; k++) {
+                    if (t[k] < '0' || t[k] > '9') {
+                        g = -1;
+                        break;
+                    }
+                    if (g < 1000) g = g * 10 + (t[k] - '0');
+                }
+                if (g < 0) {
+                    g = rtx_rx_group_named(rx, t + i + 2, close - (i + 2));
+                    if (g < 0) {
+                        *err = "replace: no group by that name";
+                        return -1;
+                    }
+                }
+                i = close + 1;
+            }
+        } else if (c == '\\' && i + 1 < n) {
+            char c2 = t[i + 1];
+            if (c2 == 'n' || c2 == 't' || c2 == '\\') {
+                lit[o++] = c2 == 'n' ? '\n' : c2 == 't' ? '\t' : '\\';
+                i += 2;
+                continue;
+            }
+        }
+        if (g < 0) {
+            lit[o++] = c;
+            i++;
+            continue;
+        }
+        if (g >= RTX_RX_CAPS) {
+            *err = "replace: groups above $9 are not reported";
+            return -1;
+        }
+        if ((unsigned)g >= ng) {
+            *err = "replace: the pattern has no such group";
+            return -1;
+        }
+        if (o > run) {
+            parts[np].grp = -1;
+            parts[np].off = run;
+            parts[np].n = o - run;
+            np++;
+        }
+        run = o;
+        parts[np].grp = g;
+        parts[np].off = 0;
+        parts[np].n = 0;
+        np++;
+        if (g > 0) *groups = 2;
+        else if (*groups < 1) *groups = 1;
+    }
+    if (o > run) {
+        parts[np].grp = -1;
+        parts[np].off = run;
+        parts[np].n = o - run;
+        np++;
+    }
+    return np;
+}
+
+/* Bytes of a group in the window: [*s, *e) or empty. */
+static void rtx_repl_group(int g, size_t ms, size_t me, const RtxRxCaps *caps,
+                           size_t *s, size_t *e) {
+    *s = *e = 0;
+    if (g == 0) {
+        *s = ms;
+        *e = me;
+        return;
+    }
+    if (!caps || caps->s[g] == RTX_RX_UNSET || caps->e[g] == RTX_RX_UNSET ||
+        caps->e[g] < caps->s[g])
+        return;
+    *s = caps->s[g];
+    *e = caps->e[g];
+}
+
+static size_t rtx_repl_len(const RtxReplPart *parts, size_t np, size_t ms,
+                           size_t me, const RtxRxCaps *caps) {
+    size_t i, n = 0, s, e;
+    for (i = 0; i < np; i++) {
+        if (parts[i].grp < 0) {
+            n += parts[i].n;
+            continue;
+        }
+        rtx_repl_group(parts[i].grp, ms, me, caps, &s, &e);
+        n += e - s;
+    }
+    return n;
+}
+
+static void rtx_repl_write(char *dst, const char *lit, const RtxReplPart *parts,
+                           size_t np, const char *t, size_t ms, size_t me,
+                           const RtxRxCaps *caps) {
+    size_t i, o = 0, s, e;
+    for (i = 0; i < np; i++) {
+        if (parts[i].grp < 0) {
+            memcpy(dst + o, lit + parts[i].off, parts[i].n);
+            o += parts[i].n;
+            continue;
+        }
+        rtx_repl_group(parts[i].grp, ms, me, caps, &s, &e);
+        if (e > s) memcpy(dst + o, t + s, e - s);
+        o += e - s;
+    }
+}
+
+static RtxRx *!>(CCError) rtx_repl_compile(char[:] q, unsigned opts, CCArena a) {
+    unsigned fl = 0;
+    if (opts & RTX_FIND_ICASE) fl |= RTX_RX_ICASE;
+    if (!(opts & RTX_FIND_REGEX)) fl |= RTX_RX_LITERAL;
+    return rtx_rx_compile(q, fl, a);
+}
+
+/* Bytes a window must read past a start so a match starting there is
+ * decided (and whole-word context is there). */
+static size_t rtx_repl_tail(const RtxRx *rx) {
+    size_t ml = rx ? rtx_rx_max_len(rx) : RTX_RX_UNSET;
+    if (ml != RTX_RX_UNSET && ml < (size_t)RTX_FIND_SPAN) return ml + 8;
+    return (size_t)RTX_FIND_SPAN + 8;
+}
+
+static void rtx_repl_fail(RtxReplace *j, const char *why, size_t at) {
+    j->state = RTX_REPL_FAIL;
+    j->err = why;
+    j->err_off = at;
+    /* The build reads the sites' payloads: it goes first. */
+    if (j->bulk) rtx_bulk_drop(j->bulk);
+    j->bulk = NULL;
+    /* Staged sites die now; the message stays until drop. */
+    if (j->pa.base) j->pa.destroy();
+    if (j->ea.base) j->ea.destroy();
+    j->pa = (CCArena){0};
+    j->ea = (CCArena){0};
+    j->eds = NULL;
+    j->n = j->cap = 0;
+}
+
+void rtx_replace_drop(RtxReplace *j) {
+    size_t ms, mb;
+    if (!j) return;
+    ms = j->max_sites;
+    mb = j->max_bytes;
+    if (j->bulk) rtx_bulk_drop(j->bulk);
+    rtx_rx_scratch_drop(&j->rxs);
+    if (j->pa.base) j->pa.destroy();
+    if (j->ea.base) j->ea.destroy();
+    if (j->a.base) j->a.destroy();
+    *j = (RtxReplace){0};
+    j->max_sites = ms;
+    j->max_bytes = mb;
+}
+
+int rtx_replace_pct(const RtxReplace *j) {
+    if (!j || j->state != RTX_REPL_SCAN) return -1;
+    if (j->hi <= j->lo) return 100;
+    return (int)(((double)(j->pos - j->lo) * 100.0) / (double)(j->hi - j->lo));
+}
+
+void !>(CCError) rtx_replace_kick(RtxReplace *j, RtxDoc *d, char[:] q,
+                                  unsigned opts, char[:] tpl, size_t lo, size_t hi) {
+    size_t len;
+    long np;
+    const char *why = NULL;
+    RtxRx *rx;
+    if (!j || !d) return cc_err(CC_ERR_INVALID_ARG, "replace kick");
+    rtx_replace_drop(j);
+    if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
+    if (!q.len) return cc_err(CC_ERR_INVALID_ARG, "replace: nothing to find");
+    if (q.len > (size_t)RTX_FIND_QMAX)
+        return cc_err(CC_ERR_INVALID_ARG, "find query too long");
+    if (tpl.len > (size_t)RTX_REPL_QMAX)
+        return cc_err(CC_ERR_INVALID_ARG, "replacement too long");
+    opts &= (RTX_FIND_ICASE | RTX_FIND_WORD | RTX_FIND_REGEX);
+    len = d->len();
+    j->whole = hi == (size_t)-1;
+    if (j->whole) {
+        lo = 0;
+        hi = len;
+    }
+    if (lo > hi || hi > len) return cc_err(CC_ERR_INVALID_ARG, "replace range");
+    j->a = cc_arena_heap(kilobytes(64) + 2 * tpl.len);
+    if (!j->a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace job");
+    rx = rtx_repl_compile(q, opts, j->a) !>(e) {
+        rtx_replace_drop(j);
+        return cc_err(e);
+    };
+    j->rx = rx;
+    j->opts = opts;
+    j->lit = (char *)cc_arena_alloc(j->a, tpl.len + 1, 1);
+    j->parts = (RtxReplPart *)cc_arena_alloc(j->a, sizeof(RtxReplPart) * (tpl.len + 1), 8);
+    if (!j->lit || !j->parts) {
+        rtx_replace_drop(j);
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "replace template");
+    }
+    np = rtx_repl_parse(tpl, (opts & RTX_FIND_REGEX) != 0, rx, j->lit, j->parts,
+                        &j->groups, &why);
+    if (np < 0) {
+        rtx_replace_drop(j);
+        return cc_err(CC_ERR_INVALID_ARG, why);
+    }
+    j->nparts = (size_t)np;
+    if (!j->groups) {
+        /* No group: every part is literal and they are one run from 0. */
+        size_t n = rtx_repl_len(j->parts, j->nparts, 0, 0, NULL);
+        j->repl = n ? cc_slice_from_buffer(j->lit, n) : cc_slice_empty();
+    }
+    j->tail = rtx_repl_tail(rx);
+    j->wcap = (size_t)RTX_FIND_CTX + RTX_REPL_SLICE + j->tail + 8;
+    j->win = (char *)cc_arena_alloc(j->a, j->wcap, 16);
+    j->ea = cc_arena_heap(kilobytes(256));
+    if (!j->win || !j->ea.base) {
+        rtx_replace_drop(j);
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "replace window");
+    }
+    if (j->groups) {
+        j->pa = cc_arena_heap(megabytes(1));
+        if (!j->pa.base) {
+            rtx_replace_drop(j);
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "replace payload");
+        }
+    }
+    j->doc = d;
+    j->lo = lo;
+    j->hi = hi;
+    j->pos = lo;
+    j->gen = d->edit_gen;
+    j->map_x[0] = d->caret;
+    j->map_x[1] = d->sel_anchor;
+    j->state = RTX_REPL_SCAN;
+    return cc_ok();
+}
+
+/* Stage the site at window [ms, me) (document offset wlo + ms). */
+static void !>(CCError) rtx_replace_site(RtxReplace *j, const RtxRxIn *in,
+                                         size_t wlo, size_t ms, size_t me) {
+    char[:] ins;
+    RtxRxCaps caps;
+    const RtxRxCaps *cp = NULL;
+    size_t max_sites = j->max_sites ? j->max_sites : (size_t)RTX_GROUP_MAX;
+    size_t max_bytes = j->max_bytes ? j->max_bytes : (size_t)RTX_REPL_BYTES_MAX;
+    size_t add;
+    if (j->groups == 2) {
+        size_t end = 0;
+        int r = rtx_rx_at(j->rx, in, ms, &j->rxs, &end, &caps);
+        if (r != RTX_RX_MATCH || end != me) {
+            rtx_repl_fail(j, "replace: the regex gave up re-matching a site; nothing replaced",
+                          wlo + ms);
+            return cc_ok();
+        }
+        cp = &caps;
+    }
+    if (j->groups) {
+        size_t n = rtx_repl_len(j->parts, j->nparts, ms, me, cp);
+        char *dst = NULL;
+        if (n) {
+            dst = (char *)cc_arena_alloc(j->pa, n, 1);
+            if (!dst) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace payload");
+            rtx_repl_write(dst, j->lit, j->parts, j->nparts, in->s, ms, me, cp);
+        }
+        ins = n ? cc_slice_from_buffer(dst, n) : cc_slice_empty();
+    } else {
+        ins = j->repl;
+    }
+    if (ins.len == me - ms && (ins.len == 0 || !memcmp(in->s + ms, ins.ptr, ins.len))) {
+        j->same++;
+        return cc_ok();
+    }
+    if (j->n >= max_sites) {
+        rtx_repl_fail(j, "replace: too many matches for one undo step; nothing replaced",
+                      wlo + ms);
+        return cc_ok();
+    }
+    add = ins.len + (me - ms);
+    if (j->bytes + add > max_bytes || j->bytes + add < j->bytes) {
+        rtx_repl_fail(j, "replace: too many bytes to stage; nothing replaced", wlo + ms);
+        return cc_ok();
+    }
+    {
+        RtxEdit e;
+        size_t k;
+        e.off = wlo + ms;
+        e.n = me - ms;
+        e.ins = ins;
+        /* Caret / anchor at kick land where rtx_repl_map would put them. */
+        for (k = 0; k < 2; k++) {
+            if (j->map_set[k]) continue;
+            if (e.off + e.n <= j->map_x[k]) continue;
+            j->map_y[k] = (size_t)((ptrdiff_t)(e.off < j->map_x[k] ? e.off : j->map_x[k]) +
+                                   j->map_acc);
+            j->map_set[k] = 1;
+        }
+        j->map_acc += (ptrdiff_t)e.ins.len - (ptrdiff_t)e.n;
+        if (j->bulk) {
+            /* Streaming: the site goes straight into the group's build. */
+            rtx_bulk_feed(j->bulk, &e) !>(err) { return cc_err(err); };
+        } else {
+            if (j->n == j->cap) {
+                size_t nc = j->cap ? j->cap * 2 : 1024;
+                void *p;
+                if (nc > max_sites) nc = max_sites;
+                if (nc <= j->n) nc = j->n + 1;
+                p = cc_arena_realloc(j->ea, j->ea, j->eds, j->cap * sizeof(RtxEdit),
+                                     nc * sizeof(RtxEdit), 8);
+                if (!p) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace sites");
+                j->eds = (RtxEdit *)p;
+                j->cap = nc;
+            }
+            j->eds[j->n] = e;
+            if (j->n + 1 == rtx_group_bulk_min()) {
+                /* Bulk from here: the table stops growing; what it holds
+                 * is fed first. */
+                size_t i;
+                j->bulk = (RtxBulk *)cc_arena_alloc(j->a, sizeof(RtxBulk), 16);
+                if (!j->bulk) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace bulk");
+                *j->bulk = (RtxBulk){0};
+                rtx_bulk_open(j->bulk, j->doc, j->eds[0].off) !>(err) {
+                    j->bulk = NULL;
+                    return cc_err(err);
+                };
+                for (i = 0; i <= j->n; i++) {
+                    rtx_bulk_feed(j->bulk, &j->eds[i]) !>(err) { return cc_err(err); };
+                }
+            }
+        }
+    }
+    j->n++;
+    j->bytes += add;
+    return cc_ok();
+}
+
+/* Past the last start: a zero-width match at EOF (whole document only). */
+static void !>(CCError) rtx_replace_end(RtxReplace *j) {
+    RtxDoc *d = j->doc;
+    size_t len = d->len();
+    if (j->whole && j->pos == len) {
+        size_t head = len < (size_t)RTX_FIND_CTX ? len : (size_t)RTX_FIND_CTX;
+        size_t wlo = len - head, got = 0, end = 0;
+        RtxRxIn in;
+        RtxRxCaps caps;
+        if (head) {
+            got = d->read_at(wlo, cc_slice_from_buffer(j->win, head)) !>(e) {
+                return cc_err(e);
+            };
+        }
+        if (got != head) return cc_err(CC_ERR_IO, "replace: short read");
+        memset(&in, 0, sizeof(in));
+        in.s = j->win;
+        in.n = head;
+        in.gpos = RTX_RX_UNSET;
+        in.ctx = wlo == 0 ? (RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0) : 0u;
+        if (rtx_rx_at(j->rx, &in, head, &j->rxs, &end, &caps) == RTX_RX_MATCH &&
+            end == head &&
+            (!(j->opts & RTX_FIND_WORD) || rtx_find_word_ok(j->win, head, head, head))) {
+            rtx_replace_site(j, &in, wlo, head, head) !>(e) { return cc_err(e); };
+            if (j->state != RTX_REPL_SCAN) return cc_ok();
+        }
+    }
+    j->pos = j->hi;
+    j->state = RTX_REPL_READY;
+    return cc_ok();
+}
+
+/* One window: starts in [pos, pos + RTX_REPL_SLICE). */
+static void !>(CCError) rtx_replace_slice(RtxReplace *j) {
+    RtxDoc *d = j->doc;
+    size_t len = d->len(), sl_lo = j->pos, sl_hi, head, wlo, whi, got, p, stop;
+    int eof;
+    RtxRxIn in;
+    if (sl_lo >= j->hi) return rtx_replace_end(j);
+    sl_hi = j->hi - sl_lo > RTX_REPL_SLICE ? sl_lo + RTX_REPL_SLICE : j->hi;
+    head = sl_lo < (size_t)RTX_FIND_CTX ? sl_lo : (size_t)RTX_FIND_CTX;
+    wlo = sl_lo - head;
+    whi = sl_hi + j->tail;
+    if (whi > len || whi < sl_hi) whi = len;
+    got = d->read_at(wlo, cc_slice_from_buffer(j->win, whi - wlo)) !>(e) {
+        return cc_err(e);
+    };
+    if (got != whi - wlo) return cc_err(CC_ERR_IO, "replace: short read");
+    eof = whi == len;
+    memset(&in, 0, sizeof(in));
+    in.s = j->win;
+    in.n = got;
+    in.gpos = RTX_RX_UNSET;
+    in.ctx = wlo == 0 ? (RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0) : 0u;
+    p = head;
+    stop = sl_hi - wlo;
+    while (p < stop) {
+        size_t ms = 0, me = 0;
+        int r = rtx_rx_search(j->rx, &in, p, stop, eof, &j->rxs, &ms, &me);
+        if (r == RTX_RX_NONE) {
+            p = stop;
+            break;
+        }
+        if (r == RTX_RX_PARTIAL) {
+            rtx_repl_fail(j, "replace: a match runs past 64 KiB; nothing replaced",
+                          wlo + ms);
+            return cc_ok();
+        }
+        if (wlo + me > j->hi ||
+            ((j->opts & RTX_FIND_WORD) && !rtx_find_word_ok(j->win, got, ms, me))) {
+            p = rtx_find_next_cp(j->win, got, ms);
+            continue;
+        }
+        if (me - ms > (size_t)RTX_FIND_SPAN) {
+            /* Same bound wherever the window edge falls. */
+            rtx_repl_fail(j, "replace: a match runs past 64 KiB; nothing replaced",
+                          wlo + ms);
+            return cc_ok();
+        }
+        rtx_replace_site(j, &in, wlo, ms, me) !>(e) { return cc_err(e); };
+        if (j->state != RTX_REPL_SCAN) return cc_ok();
+        p = me > ms ? me : rtx_find_next_cp(j->win, got, ms);
+    }
+    j->pos = wlo + p;
+    if (j->pos >= j->hi) return rtx_replace_end(j);
+    return cc_ok();
+}
+
+int !>(CCError) rtx_replace_step(RtxReplace *j, long budget_ms, int (*yield)(void)) {
+    long t0;
+    if (!j) return cc_err(CC_ERR_INVALID_ARG, "replace step");
+    if (j->state != RTX_REPL_SCAN) return cc_ok(j->state);
+    if (!j->doc || j->doc->edit_gen != j->gen || j->doc->broken) {
+        rtx_repl_fail(j, "replace: the document changed; nothing replaced", j->pos);
+        return cc_ok(j->state);
+    }
+    t0 = rtx_repl_ms();
+    for (;;) {
+        rtx_replace_slice(j) !>(e) {
+            rtx_repl_fail(j, "replace: read or staging failed; nothing replaced", j->pos);
+            return cc_err(e);
+        };
+        if (j->state != RTX_REPL_SCAN) break;
+        if (budget_ms > 0 && rtx_repl_ms() - t0 >= budget_ms) break;
+        if (yield && yield()) break;
+    }
+    return cc_ok(j->state);
+}
+
+/* Where the caret (k 0) / anchor (k 1) at kick land once every staged
+ * site is applied (inside a site: its start). Mapped as the sites came,
+ * so a streaming job that keeps no table maps the same as a small one.
+ * The panel owns input while the job runs: they do not move meanwhile. */
+static size_t rtx_repl_map(const RtxReplace *j, int k) {
+    if (j->map_set[k]) return j->map_y[k];
+    return (size_t)((ptrdiff_t)j->map_x[k] + j->map_acc);
+}
+
+size_t !>(CCError) rtx_replace_commit(RtxReplace *j) {
+    RtxDoc *d;
+    size_t n, caret, anchor;
+    if (!j || j->state != RTX_REPL_READY || !j->doc)
+        return cc_err(CC_ERR_INVALID_ARG, "replace: nothing to commit");
+    d = j->doc;
+    if (d->edit_gen != j->gen) {
+        rtx_repl_fail(j, "replace: the document changed; nothing replaced", j->pos);
+        return cc_err(CC_ERR_INVALID_ARG, "replace: the document changed; nothing replaced");
+    }
+    n = j->n;
+    if (n == 0) {
+        rtx_replace_drop(j);
+        return cc_ok(0);
+    }
+    caret = rtx_repl_map(j, 0);
+    anchor = rtx_repl_map(j, 1);
+    if (j->bulk) {
+        rtx_bulk_close(j->bulk) !>(e) {
+            rtx_replace_drop(j);
+            return cc_err(e);
+        };
+        rtx_bulk_commit(j->bulk, 0) !>(e) {
+            rtx_replace_drop(j);
+            return cc_err(e);
+        };
+    } else {
+        rtx_doc_replace_group(d, j->eds, n, 0) !>(e) {
+            rtx_replace_drop(j);
+            return cc_err(e);
+        };
+    }
+    d->caret = caret;
+    d->sel_anchor = anchor;
+    d->sel_box = 0;
+    if (!d->hist.applying && d->hist.head > 0) {
+        RtxHistRec *last = &d->hist.recs[d->hist.head - 1];
+        last->caret_after = caret;
+        last->sel_after = anchor;
+    }
+    d->find.pinned = 0;
+    d->find.origin = caret;
+    rtx_replace_drop(j);
+    return cc_ok(n);
+}
+
+size_t !>(CCError) RtxDoc_replace_all(RtxDoc *d, char[:] q, unsigned opts,
+                                      char[:] tpl, size_t lo, size_t hi) {
+    RtxReplace j = {0} @destroy { rtx_replace_drop(&j); };
+    int st;
+    rtx_replace_kick(&j, d, q, opts, tpl, lo, hi) !>(e) { return cc_err(e); };
+    st = rtx_replace_step(&j, 0, NULL) !>(e) { return cc_err(e); };
+    if (st != RTX_REPL_READY)
+        return cc_err(CC_ERR_INVALID_ARG, j.err ? j.err : "replace refused");
+    return rtx_replace_commit(&j);
+}
+
+/* The replacement for the hit [off, off + n): the template expanded
+ * against a re-match there, onto `a`. *why set = no edit. */
+static char[:] !>(CCError) rtx_repl_one(RtxDoc *d, size_t off, size_t n, char[:] tpl,
+                                        CCArena a, const char **why) {
+    char *lit;
+    RtxReplPart *parts;
+    long np;
+    int groups = 0;
+    size_t len, head, wlo, whi, got, end = 0, outn;
+    char *win, *dst;
+    RtxRxIn in;
+    RtxRxCaps caps;
+    *why = NULL;
+    if (!(d->find.opts & RTX_FIND_REGEX)) return cc_ok(tpl);
+    lit = (char *)cc_arena_alloc(a, tpl.len + 1, 1);
+    parts = (RtxReplPart *)cc_arena_alloc(a, sizeof(RtxReplPart) * (tpl.len + 1), 8);
+    if (!lit || !parts) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace template");
+    np = rtx_repl_parse(tpl, 1, d->find.rx, lit, parts, &groups, why);
+    if (np < 0) return cc_ok(cc_slice_empty());
+    len = d->len();
+    head = off < (size_t)RTX_FIND_CTX ? off : (size_t)RTX_FIND_CTX;
+    wlo = off - head;
+    whi = off + n + rtx_repl_tail(d->find.rx);
+    if (whi > len || whi < off) whi = len;
+    win = (char *)cc_arena_alloc(a, whi - wlo + 1, 1);
+    if (!win) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace window");
+    got = d->read_at(wlo, cc_slice_from_buffer(win, whi - wlo)) !>(e) {
+        return cc_err(e);
+    };
+    if (got != whi - wlo) return cc_err(CC_ERR_IO, "replace: short read");
+    memset(&in, 0, sizeof(in));
+    in.s = win;
+    in.n = got;
+    in.gpos = RTX_RX_UNSET;
+    in.ctx = wlo == 0 ? (RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0) : 0u;
+    if (groups == 2) {
+        RtxRxScratch rxs = {0};
+        int r = rtx_rx_at(d->find.rx, &in, head, &rxs, &end, &caps);
+        rtx_rx_scratch_drop(&rxs);
+        if (r != RTX_RX_MATCH || end != head + n) {
+            *why = "replace: the hit no longer matches";
+            return cc_ok(cc_slice_empty());
+        }
+    }
+    outn = rtx_repl_len(parts, (size_t)np, head, head + n, groups == 2 ? &caps : NULL);
+    if (!outn) return cc_ok(cc_slice_empty());
+    dst = (char *)cc_arena_alloc(a, outn, 1);
+    if (!dst) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace payload");
+    rtx_repl_write(dst, lit, parts, (size_t)np, win, head, head + n,
+                   groups == 2 ? &caps : NULL);
+    return cc_ok(cc_slice_from_buffer(dst, outn));
+}
+
+int !>(CCError) RtxDoc_replace_hit(RtxDoc *d, char[:] tpl, const char **why) {
+    size_t nh, off, n, next, i;
+    RtxFindHit h;
+    char[:] ins;
+    const char *w = NULL;
+    if (why) *why = NULL;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    if (tpl.len > (size_t)RTX_REPL_QMAX)
+        return cc_err(CC_ERR_INVALID_ARG, "replacement too long");
+    if (!d->find.query.len || !d->find.rx) {
+        if (why) *why = d->find.err ? d->find.err : "replace: nothing to find";
+        return cc_ok(0);
+    }
+    nh = rtx_find_hits_n(&d->find);
+    if (nh == 0) {
+        if (why) *why = d->find.done ? "replace: no match" : "replace: still scanning";
+        return cc_ok(0);
+    }
+    if (!d->find.pinned || d->find.cur >= nh) {
+        d->find_next();
+        return cc_ok(0);
+    }
+    h = d->find.hits.data[d->find.cur];
+    if (!d->has_sel() || d->sel_lo() != h.off || d->sel_hi() != h.off + h.len) {
+        /* The selection is not the hit (the user moved): select it first. */
+        d->find_goto(d->find.cur);
+        return cc_ok(0);
+    }
+    off = h.off;
+    n = h.len;
+    {
+        CCArena a = cc_arena_heap(kilobytes(64) + 2 * tpl.len) @destroy;
+        if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "replace one");
+        ins = rtx_repl_one(d, off, n, tpl, a, &w) !>(e) { return cc_err(e); };
+        if (w) {
+            if (why) *why = w;
+            return cc_ok(0);
+        }
+        d->break_coalesce();
+        d->replace(off, n, ins) !>(e) { return cc_err(e); };
+        d->break_coalesce();
+        next = off + ins.len;
+    }
+    /* The list was patched (or wiped). A small document rescans now so
+     * the next hit is there to select; a large one lands in the pump. */
+    if (!d->find.done && d->len() <= (size_t)RTX_FIND_BLOCK)
+        d->find_finish() !>(e) { return cc_err(e); };
+    nh = rtx_find_hits_n(&d->find);
+    d->find.origin = next;
+    d->find.pinned = 0;
+    for (i = 0; i < nh; i++) {
+        if (d->find.hits.data[i].off >= next) {
+            d->find_goto(i);
+            return cc_ok(1);
+        }
+    }
+    if (nh && d->find.done) {
+        d->find_goto(0); /* wrap, as next does */
+    } else {
+        d->caret = next;
+        d->sel_anchor = next;
+    }
+    return cc_ok(1);
 }

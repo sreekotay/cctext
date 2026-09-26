@@ -14,7 +14,7 @@ git clone https://example.com/raytext.git
 cd raytext && ./make.shcc
 ```
 
-Run `cctext FILE` in a terminal, or `cctext-gui FILE` for the windowed host.
+Run `cctext FILE` in a terminal, or `cctext-ui FILE` for the windowed host.
 Both share one core: input, pump, layout, paint.
 
 ## Usage

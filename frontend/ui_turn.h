@@ -1,6 +1,7 @@
 /*
  * Nested OS turn. The callback runs on 0→1 and 1→0 only.
- * ui_plat.m is the AppKit caller; host_turn_smoke locks the depth.
+ * ui_plat.c is the caller (every toolkit step and paint flush); host_turn_smoke
+ * locks the depth.
  */
 #ifndef RTX_UI_TURN_H
 #define RTX_UI_TURN_H

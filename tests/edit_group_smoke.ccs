@@ -1,0 +1,1214 @@
+#!ccc ccs
+/*
+ * Edit groups (DESIGN Edit groups): one command, one undo step.
+ *   - randomized property: single edits, groups (incl. piece-ref large
+ *     deletes), undo / redo, journal write + reload, crash-cut journal
+ *     (unterminated group dropped), all against a model hash per step
+ *   - batch vs sequential: same bytes, runs, secs, span, line index, and
+ *     find hits after finish; one undo vs n
+ *   - rollback mid-group (unchanged) and unrestorable (broken)
+ *   - typing does not coalesce into a group; MD column insert is one step
+ *   - workspace transaction: undo all at head, ask when split
+ *   - perf: 10k-site batch vs 10k single replaces
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/safe.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static uint64_t rng = 88172645463325252ull;
+
+static uint64_t rnd(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+}
+
+static size_t rnd_n(size_t n) {
+    return n ? (size_t)(rnd() % n) : 0;
+}
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static uint64_t fnv(const char *p, size_t n, uint64_t h) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= (unsigned char)p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+/* Whole document into a malloc buffer (test model side). */
+static char *doc_bytes(RtxDoc *d, size_t *out_n) {
+    size_t n = d->len();
+    char *p = (char *)malloc(n + 1);
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        free(p);
+        *out_n = 0;
+        return NULL;
+    }
+    if (!p) return NULL;
+    if (n) {
+        size_t got = d->read_at(0, cc_slice_from_buffer(p, n)) !>;
+        if (got != n) {
+            free(p);
+            *out_n = 0;
+            return NULL;
+        }
+    }
+    *out_n = n;
+    return p;
+}
+
+static uint64_t doc_hash(RtxDoc *d) {
+    size_t n = 0;
+    char *p = doc_bytes(d, &n);
+    uint64_t h = fnv(p ? p : "", n, 1469598103934665603ull);
+    free(p);
+    return h ^ (uint64_t)n;
+}
+
+static uint64_t buf_hash(const char *p, size_t n) {
+    return fnv(p ? p : "", n, 1469598103934665603ull) ^ (uint64_t)n;
+}
+
+static int doc_is(RtxDoc *d, const char *want) {
+    size_t n = 0;
+    char *p = doc_bytes(d, &n);
+    int ok = p && n == strlen(want) && memcmp(p, want, n) == 0;
+    free(p);
+    return ok;
+}
+
+static void write_bytes(const char *path, const char *p, size_t n) {
+    FILE *f = fopen(path, "wb");
+    expect(f != NULL, "write file");
+    if (!f) return;
+    if (n) expect(fwrite(p, 1, n, f) == n, "write file bytes");
+    fclose(f);
+}
+
+/* Model: apply sorted non-overlapping edits to src. */
+static char *model_apply(const char *src, size_t n, const RtxEdit *e, size_t k,
+                         size_t *out_n) {
+    size_t i, cap = n, at = 0, o = 0;
+    char *dst;
+    for (i = 0; i < k; i++) cap += e[i].ins.len;
+    dst = (char *)malloc(cap + 1);
+    if (!dst) return NULL;
+    for (i = 0; i < k; i++) {
+        memcpy(dst + o, src + at, e[i].off - at);
+        o += e[i].off - at;
+        if (e[i].ins.len) memcpy(dst + o, e[i].ins.ptr, e[i].ins.len);
+        o += e[i].ins.len;
+        at = e[i].off + e[i].n;
+    }
+    memcpy(dst + o, src + at, n - at);
+    o += n - at;
+    *out_n = o;
+    return dst;
+}
+
+static const char rnd_alpha[] = "abcdefghij klmnop=\nqrstuv";
+
+/* Random bytes on `a` (the edit's ins). */
+static char[:] rnd_ins(char *pool, size_t *used, size_t cap, size_t maxn) {
+    size_t n = rnd_n(maxn + 1), i;
+    if (*used + n > cap) n = 0;
+    for (i = 0; i < n; i++) pool[*used + i] = rnd_alpha[rnd_n(sizeof(rnd_alpha) - 1)];
+    {
+        char[:] s = n ? cc_slice_from_buffer(pool + *used, n) : cc_slice_empty();
+        *used += n;
+        return s;
+    }
+}
+
+/* k sorted, non-overlapping sites over [0, len). Optional one big delete. */
+static size_t rnd_group(RtxEdit *e, size_t k, size_t len, char *pool, size_t *used,
+                        size_t cap, int big) {
+    size_t i, got = 0, last_end = 0;
+    size_t big_at = big ? rnd_n(k) : (size_t)-1;
+    size_t stride;
+    if (k == 0) return 0;
+    stride = len / k;
+    for (i = 0; i < k; i++) {
+        size_t lo = i * stride, hi = (i + 1 == k) ? len : (i + 1) * stride;
+        size_t off, n;
+        if (lo < last_end) lo = last_end;
+        if (got && lo <= e[got - 1].off) lo = e[got - 1].off + 1;
+        if (lo > hi || lo > len) continue;
+        if (i == big_at && hi - lo > (size_t)RTX_HIST_INLINE_MAX + 8192) {
+            /* Above INLINE_MAX: hist keeps piece refs, not bytes. */
+            n = (size_t)RTX_HIST_INLINE_MAX + 1 + rnd_n(4096);
+            off = lo + rnd_n(hi - lo - n);
+        } else {
+            off = lo + rnd_n(hi - lo + 1);
+            n = rnd_n(40);
+        }
+        if (off > len) off = len;
+        if (n > hi - off) n = hi - off;
+        if (n > len - off) n = len - off;
+        e[got].off = off;
+        e[got].n = n;
+        e[got].ins = rnd_ins(pool, used, cap, 12);
+        last_end = off + n;
+        got++;
+    }
+    return got;
+}
+
+typedef struct {
+    uint64_t h;
+    size_t len;
+} St;
+
+static int flush_reload(RtxDoc *from, RtxDoc *into, const char *path, int *rc) {
+    RtxSafeCam cam;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    rtx_safe_cam_clear(&cam);
+    if (!rtx_safe_flush(from, NULL)) return 0;
+    into->destroy();
+    into->from_path(cc_slice_cstr(path)) !>;
+    *rc = rtx_safe_load(into, &cam);
+    return 1;
+}
+
+static int try_batch(RtxDoc *d, const RtxEdit *e, size_t k, CCError *out) {
+    @errhandler(CCError err) {
+        if (out) *out = err;
+        return 1;
+    }
+    d->replace_batch(e, k) !>;
+    return 0;
+}
+
+static int try_xact(RtxWs *w, const RtxWsEdits *m, size_t n) {
+    uint64_t id;
+    @errhandler(CCError err) {
+        (void)err;
+        return 1;
+    }
+    id = w->replace_xact(m, n) !>;
+    (void)id;
+    return 0;
+}
+
+static int try_undo(RtxDoc *d, CCError *out) {
+    @errhandler(CCError err) {
+        if (out) *out = err;
+        return 1;
+    }
+    d->undo() !>;
+    return 0;
+}
+
+static int try_redo(RtxDoc *d, CCError *out) {
+    @errhandler(CCError err) {
+        if (out) *out = err;
+        return 1;
+    }
+    d->redo() !>;
+    return 0;
+}
+
+/* One seed of the property: OPS random steps, every step checked.
+ * bulk_min / gap tune the bulk path ((size_t)-1: every group per-site). */
+static void prop_seed(uint64_t seed, int ops, size_t bulk_min, size_t gap) {
+    const char *path = "testdata/generated/edit_group_prop.txt";
+    size_t base_n = 1536 * 1024, i, nst = 0, head = 0, cap_st = (size_t)ops + 4;
+    char *base = (char *)malloc(base_n);
+    St *st = (St *)malloc(cap_st * sizeof(St));
+    char pool[1 << 16];
+    RtxDoc da = {0} @destroy;
+    RtxDoc db = {0} @destroy;
+    RtxDoc *d = &da, *o = &db;
+    int op, reloads = 0, cuts = 0, tears = 0, groups = 0, bigs = 0, bulks = 0;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        expect(0, "prop: unexpected error");
+        rtx_bulk_tune((size_t)-1, 0);
+        free(base);
+        free(st);
+        return;
+    }
+    rng = seed;
+    rtx_bulk_tune(bulk_min, gap);
+    if (!base || !st) {
+        expect(0, "prop alloc");
+        free(base);
+        free(st);
+        return;
+    }
+    for (i = 0; i < base_n; i++) base[i] = rnd_alpha[rnd_n(sizeof(rnd_alpha) - 1)];
+    write_bytes(path, base, base_n);
+    rtx_safe_test_isol();
+    d->from_path(cc_slice_cstr(path)) !>;
+    st[nst].h = buf_hash(base, base_n);
+    st[nst].len = base_n;
+    nst++;
+    expect(doc_hash(d) == st[0].h, "prop: open matches base");
+    for (op = 0; op < ops; op++) {
+        size_t r = rnd_n(100);
+        size_t used = 0;
+        if (r < 60) {
+            /* An edit: single replace or a group (sometimes a big delete). */
+            RtxEdit e[48];
+            size_t k, cur_n = 0, nn = 0;
+            char *cur = doc_bytes(d, &cur_n);
+            char *next;
+            int big = r >= 50;
+            k = r < 25 ? 1 : big ? 1 + rnd_n(3) : 2 + rnd_n(40);
+            k = rnd_group(e, k, cur_n, pool, &used, sizeof(pool), big);
+            next = model_apply(cur, cur_n, e, k, &nn);
+            if (k == 1 && (r < 25 || big)) {
+                d->break_coalesce();
+                if (e[0].n || e[0].ins.len)
+                    d->replace(e[0].off, e[0].n, e[0].ins) !>;
+                d->break_coalesce();
+            } else {
+                d->replace_batch(e, k) !>;
+                groups++;
+                if (d->hist.head && d->hist.recs[d->hist.head - 1].bulk) bulks++;
+            }
+            for (i = 0; i < k; i++) {
+                if (e[i].n > (size_t)RTX_HIST_INLINE_MAX) bigs++;
+            }
+            {
+                size_t eff = 0;
+                for (i = 0; i < k; i++) {
+                    if (e[i].n || e[i].ins.len) eff++;
+                }
+                /* All-empty edits are no step at all. */
+                if (eff) {
+                    nst = head + 1;
+                    st[nst].h = buf_hash(next, nn);
+                    st[nst].len = nn;
+                    head = nst++;
+                }
+            }
+            free(cur);
+            free(next);
+        } else if (r < 72) {
+            size_t s = 1 + rnd_n(3);
+            while (s-- && head > 0) {
+                d->undo() !>;
+                head--;
+            }
+        } else if (r < 84) {
+            size_t s = 1 + rnd_n(3);
+            while (s-- && head + 1 < nst) {
+                d->redo() !>;
+                head++;
+            }
+        } else if (r < 94) {
+            int rc = -1;
+            RtxDoc *t;
+            expect(flush_reload(d, o, path, &rc), "prop: flush + reload");
+            expect(rc == (d->hist.len ? RTX_SAFE_LOAD_HIST : RTX_SAFE_LOAD_NONE),
+                   "prop: reload replays hist");
+            expect(o->hist.head == d->hist.head && o->hist.len == d->hist.len,
+                   "prop: reload keeps head and redo tail");
+            t = d;
+            d = o;
+            o = t;
+            reloads++;
+        } else if (head > 0 && head + 1 == nst && d->hist.head == d->hist.len &&
+                   d->hist.recs[d->hist.len - 1].bulk) {
+            /* Crash inside a bulk group: its one record lacks END. */
+            int rc = -1;
+            RtxDoc *t;
+            rtx_safe_test_tear_next();
+            expect(flush_reload(d, o, path, &rc), "prop: torn flush + reload");
+            expect(o->hist.head == d->hist.head - 1 && o->hist.len == d->hist.len - 1,
+                   "prop: torn bulk group dropped");
+            nst = head;
+            head--;
+            t = d;
+            d = o;
+            o = t;
+            tears++;
+        } else if (head > 0 && head + 1 == nst && d->hist.head == d->hist.len &&
+                   d->undo_width() >= 2) {
+            /* Crash mid-group: the leaf holds part of the last group. */
+            size_t w = d->undo_width();
+            size_t drop = 1 + rnd_n(w - 1);
+            int rc = -1;
+            RtxDoc *t;
+            rtx_safe_test_cut_next(drop);
+            expect(flush_reload(d, o, path, &rc), "prop: cut flush + reload");
+            expect(o->hist.head == d->hist.head - w &&
+                       o->hist.len == d->hist.len - w,
+                   "prop: unterminated group dropped whole");
+            nst = head;
+            head--;
+            t = d;
+            d = o;
+            o = t;
+            cuts++;
+        }
+        {
+            uint64_t h = doc_hash(d);
+            if (h != st[head].h || d->len() != st[head].len) {
+                fprintf(stderr, "prop seed %llu op %d r %zu: head %zu nst %zu\n",
+                        (unsigned long long)seed, op, r, head, nst);
+                expect(0, "prop: doc matches model");
+                break;
+            }
+            expect(d->can_undo() == (head > 0), "prop: can_undo matches model");
+            expect(d->can_redo() == (head + 1 < nst), "prop: can_redo matches model");
+            expect(!d->broken, "prop: not broken");
+        }
+    }
+    /* Walk the whole history both ways. */
+    while (head > 0) {
+        d->undo() !>;
+        head--;
+    }
+    expect(doc_hash(d) == st[0].h, "prop: undo to base");
+    while (head + 1 < nst) {
+        d->redo() !>;
+        head++;
+        if (doc_hash(d) != st[head].h) {
+            expect(0, "prop: redo walk matches model");
+            break;
+        }
+    }
+    printf("prop seed=%llu ops=%d steps=%zu groups=%d (bulk %d) big=%d reloads=%d cuts=%d "
+           "tears=%d\n",
+           (unsigned long long)seed, ops, nst, groups, bulks, bigs, reloads, cuts, tears);
+    rtx_bulk_tune((size_t)-1, 0);
+    free(base);
+    free(st);
+    unlink(path);
+}
+
+static int runs_eq(const RtxDoc *a, const RtxDoc *b) {
+    size_t i;
+    if (a->runs.len != b->runs.len || a->secs.len != b->secs.len) return 0;
+    for (i = 0; i < a->runs.len; i++) {
+        const RtxRun *x = &a->runs.data[i], *y = &b->runs.data[i];
+        if (x->start != y->start || x->len != y->len || x->hint_a != y->hint_a ||
+            x->hint_b != y->hint_b || x->planter != y->planter)
+            return 0;
+    }
+    for (i = 0; i < a->secs.len; i++) {
+        if (a->secs.data[i].start != b->secs.data[i].start) return 0;
+    }
+    return 1;
+}
+
+static int lines_eq(RtxDoc *a, RtxDoc *b) {
+    size_t i, n;
+    @errhandler(RtxIndexErr e) {
+        (void)e;
+        return 0;
+    }
+    rtx_line_scan_to(&a->tree, a->len()) !>;
+    rtx_line_scan_to(&b->tree, b->len()) !>;
+    n = a->line_count();
+    if (n != b->line_count()) return 0;
+    for (i = 0; i < n; i++) {
+        size_t x = a->line_start(i) !>;
+        size_t y = b->line_start(i) !>;
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
+static int hits_eq(RtxDoc *a, RtxDoc *b) {
+    size_t i, n;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    a->find_finish() !>;
+    b->find_finish() !>;
+    n = rtx_find_hits_n(&a->find);
+    if (n != rtx_find_hits_n(&b->find) || !a->find.done || !b->find.done) return 0;
+    for (i = 0; i < n; i++) {
+        if (a->find.hits.data[i].off != b->find.hits.data[i].off ||
+            a->find.hits.data[i].line != b->find.hits.data[i].line)
+            return 0;
+    }
+    return 1;
+}
+
+/* C source with `foo` at known sites (runs from the C grammar). */
+static size_t gen_c(char *buf, size_t cap, size_t lines, size_t *sites, size_t nsite_cap,
+                    size_t *nsite) {
+    size_t i, o = 0;
+    *nsite = 0;
+    for (i = 0; i < lines && o + 64 < cap; i++) {
+        int w = snprintf(buf + o, cap - o, "int foo%zu=%zu;/*c*/\n", i % 10, i % 7);
+        if (*nsite < nsite_cap) sites[(*nsite)++] = o + 4;
+        o += (size_t)w;
+    }
+    return o;
+}
+
+/* bulk: A's group takes the bulk path (one record, a sequence swap, a
+ * full reparse) instead of per-site replaces. */
+static void batch_vs_seq(size_t lines, size_t want, int bulk) {
+    const char *path = "testdata/generated/edit_group_eq.c";
+    size_t cap = lines * 32 + 64, n, nsite = 0, i, k;
+    char *src = (char *)malloc(cap);
+    size_t *sites = (size_t *)malloc(lines * sizeof(size_t) + 8);
+    RtxEdit *e = (RtxEdit *)malloc((want + 1) * sizeof(RtxEdit));
+    RtxDoc A = {0} @destroy;
+    RtxDoc B = {0} @destroy;
+    uint64_t h0;
+    @errhandler(CCError err) {
+        cc_error_log(err);
+        expect(0, "batch_vs_seq: unexpected error");
+        free(src);
+        free(sites);
+        free(e);
+        return;
+    }
+    if (!src || !sites || !e) {
+        expect(0, "batch_vs_seq alloc");
+        free(src);
+        free(sites);
+        free(e);
+        return;
+    }
+    n = gen_c(src, cap, lines, sites, lines, &nsite);
+    write_bytes(path, src, n);
+    A.from_path(cc_slice_cstr(path)) !>;
+    B.from_path(cc_slice_cstr(path)) !>;
+    A.find_set("foo") !>;
+    B.find_set("foo") !>;
+    A.find_finish() !>;
+    B.find_finish() !>;
+    expect(A.runs.len > 0, "batch_vs_seq: C runs planted");
+    h0 = doc_hash(&A);
+    k = 0;
+    /* Line: "int fooD=D;/" "*c*" "/\n" — site 4 is `foo`. Mix renames with
+     * edits inside the comment run, on its closer hint, and across its
+     * opener, so the one-pass run shift meets every case. */
+    for (i = 0; i < nsite && k < want; i += 1 + (nsite > want * 2 ? 1 : 0)) {
+        size_t ls = sites[i] - 4;
+        switch (k % 6) {
+        case 0:
+        case 3:
+            e[k].off = sites[i];
+            e[k].n = 3;
+            e[k].ins = k % 2 ? cc_slice_cstr("renamed_it") : cc_slice_cstr("f");
+            break;
+        case 1:
+            e[k].off = ls + 13;
+            e[k].n = 1;
+            e[k].ins = cc_slice_cstr("note");
+            break;
+        case 2:
+            e[k].off = ls + 14;
+            e[k].n = 1;
+            e[k].ins = cc_slice_empty();
+            break;
+        case 4:
+            e[k].off = ls + 8;
+            e[k].n = 5;
+            e[k].ins = cc_slice_cstr("=");
+            break;
+        default:
+            e[k].off = ls + 11;
+            e[k].n = 0;
+            e[k].ins = cc_slice_cstr("x");
+            break;
+        }
+        k++;
+    }
+    A.caret = B.caret = 17;
+    A.sel_anchor = B.sel_anchor = 17;
+    rtx_bulk_tune(bulk ? 1 : (size_t)-1, 0);
+    A.replace_batch(e, k) !>;
+    rtx_bulk_tune((size_t)-1, 0);
+    for (i = k; i-- > 0;) {
+        B.break_coalesce();
+        B.replace(e[i].off, e[i].n, e[i].ins) !>;
+    }
+    /* Sequential replaces leave the caret after the lowest site, a group
+     * after the highest: compare with the group's rule. */
+    {
+        size_t hi = 0;
+        ptrdiff_t acc = 0;
+        for (i = 0; i < k; i++) {
+            hi = (size_t)((ptrdiff_t)e[i].off + acc) + e[i].ins.len;
+            acc += (ptrdiff_t)e[i].ins.len - (ptrdiff_t)e[i].n;
+        }
+        expect(A.caret == hi && A.sel_anchor == hi, "batch caret after the highest site");
+    }
+    expect(doc_hash(&A) == doc_hash(&B), "batch == sequential bytes");
+    expect((A.hist.recs[A.hist.head - 1].bulk != NULL) == (bulk != 0),
+           "batch took the path asked for");
+    expect(RtxDoc_check(&A), "batch: tree invariants");
+    if (!bulk)
+        expect(runs_eq(&A, &B), "batch == sequential runs / secs (before reparse)");
+    expect(A.span.live == B.span.live && A.span.lo == B.span.lo &&
+               A.span.hi == B.span.hi && A.span.old_n == B.span.old_n,
+           "batch == sequential edit span");
+    expect(A.last_off == B.last_off, "batch == sequential last_off");
+    expect(lines_eq(&A, &B), "batch == sequential line index");
+    expect(hits_eq(&A, &B), "batch == sequential find hits after finish");
+    expect(A.undo_width() == (bulk ? 1 : k), "group is k records (bulk: one)");
+    expect(!bulk || A.last_markup, "bulk: the next reparse is full");
+    A.reparse_edit(A.last_off, A.last_markup) !>;
+    B.reparse_edit(B.last_off, B.last_markup) !>;
+    expect(runs_eq(&A, &B), "batch == sequential runs after reparse");
+    A.undo() !>;
+    expect(doc_hash(&A) == h0, "one undo restores the group");
+    expect(!A.can_undo(), "group was one step");
+    expect(A.caret == 17 && A.sel_anchor == 17, "undo restores the caret");
+    for (i = 0; i < k; i++) B.undo() !>;
+    expect(doc_hash(&B) == h0, "k undos restore sequential");
+    expect(lines_eq(&A, &B), "undo: line index equal");
+    expect(hits_eq(&A, &B), "undo: find hits equal");
+    A.reparse_edit(A.last_off, A.last_markup) !>;
+    B.reparse_edit(B.last_off, B.last_markup) !>;
+    expect(runs_eq(&A, &B), "undo: runs equal after reparse");
+    A.redo() !>;
+    for (i = 0; i < k; i++) B.redo() !>;
+    expect(doc_hash(&A) == doc_hash(&B), "redo group == k redos");
+    expect(hits_eq(&A, &B), "redo: find hits equal");
+    expect(lines_eq(&A, &B), "redo: line index equal");
+    printf("batch_vs_seq%s lines=%zu sites=%zu runs=%zu hits=%zu\n", bulk ? " (bulk)" : "",
+           lines, k, A.runs.len, rtx_find_hits_n(&A.find));
+    free(src);
+    free(sites);
+    free(e);
+    unlink(path);
+}
+
+/* Randomized large group: the bulk path (A) against the per-site path
+ * (B) on the same document — bytes, caret / anchor, edit span, tree
+ * invariants, line index after finish, find hits after finish, runs
+ * after reparse; undo and redo agree. Then (file docs) Safe: the bulk
+ * group journals as one v8 record, reloads and replays (redo rebuilds
+ * its sequences from the site list), undoes after reload, undoes from a
+ * saved base (the inverse rebuild), and a torn copy is dropped.
+ * kind: 0 small buffer (exact weights), 1 file past RTX_LINE_SOFT_MIN
+ * (progressive), 2 large buffer (exact weights that go progressive). */
+static void bulk_equiv(uint64_t seed, int kind, size_t sites, size_t gap) {
+    const char *path = "testdata/generated/edit_group_bulk.txt";
+    size_t base_n = kind == 0 ? 96 * 1024 : 1200 * 1024, i, k, used = 0, nn = 0;
+    size_t cap_pool = sites * 14 + 64;
+    char *base = (char *)malloc(base_n + 1);
+    char *pool = (char *)malloc(cap_pool);
+    RtxEdit *e = (RtxEdit *)malloc(sites * sizeof(RtxEdit));
+    char *next = NULL;
+    CCArena ba = {0} @destroy;
+    RtxDoc A = {0} @destroy;
+    RtxDoc B = {0} @destroy;
+    uint64_t h0, h1;
+    char what[96];
+    @errhandler(CCError err) {
+        cc_error_log(err);
+        expect(0, "bulk_equiv: unexpected error");
+        rtx_bulk_tune((size_t)-1, 0);
+        free(base);
+        free(pool);
+        free(e);
+        free(next);
+        return;
+    }
+    snprintf(what, sizeof(what), "bulk_equiv seed=%llu kind=%d gap=%zu",
+             (unsigned long long)seed, kind, gap);
+    if (!base || !pool || !e) {
+        expect(0, "bulk_equiv alloc");
+        free(base);
+        free(pool);
+        free(e);
+        return;
+    }
+    rng = seed;
+    for (i = 0; i < base_n; i++) base[i] = rnd_alpha[rnd_n(sizeof(rnd_alpha) - 1)];
+    if (kind == 1) {
+        write_bytes(path, base, base_n);
+        rtx_safe_test_isol();
+        A.from_path(cc_slice_cstr(path)) !>;
+        B.from_path(cc_slice_cstr(path)) !>;
+    } else {
+        ba = cc_arena_heap(base_n + 64);
+        {
+            char[:] src = cc_slice_from_buffer(base, base_n);
+            char[:] keep = src.clone_into(ba) !>;
+            A.from_buffer(keep) !>;
+            B.from_buffer(keep) !>;
+        }
+    }
+    h0 = buf_hash(base, base_n);
+    A.find_set("ab") !>;
+    B.find_set("ab") !>;
+    A.find_finish() !>;
+    B.find_finish() !>;
+    k = rnd_group(e, sites, base_n, pool, &used, cap_pool, 0);
+    next = model_apply(base, base_n, e, k, &nn);
+    A.caret = B.caret = base_n / 3;
+    A.sel_anchor = B.sel_anchor = base_n / 2;
+    rtx_bulk_tune(1, gap);
+    A.replace_batch(e, k) !>;
+    rtx_bulk_tune((size_t)-1, 0);
+    B.replace_batch(e, k) !>;
+    h1 = buf_hash(next, nn);
+    expect(A.undo_width() == 1 && A.hist.recs[0].bulk && B.undo_width() > 1,
+           "bulk_equiv: bulk vs per-site records");
+    if (doc_hash(&A) != h1 || doc_hash(&B) != h1) {
+        fprintf(stderr, "%s\n", what);
+        expect(0, "bulk_equiv: bytes equal the model");
+    }
+    expect(A.caret == B.caret && A.sel_anchor == B.sel_anchor, "bulk_equiv: caret");
+    expect(A.span.lo == B.span.lo && A.span.hi == B.span.hi &&
+               A.span.old_n == B.span.old_n && A.last_off == B.last_off,
+           "bulk_equiv: edit span");
+    expect(RtxDoc_check(&A), "bulk_equiv: tree invariants");
+    expect(lines_eq(&A, &B), "bulk_equiv: line index after finish");
+    expect(hits_eq(&A, &B), "bulk_equiv: find hits after finish");
+    A.reparse_edit(A.last_off, A.last_markup) !>;
+    B.reparse_edit(B.last_off, 1) !>;
+    expect(runs_eq(&A, &B), "bulk_equiv: runs after reparse");
+    A.undo() !>;
+    B.undo() !>;
+    expect(doc_hash(&A) == h0 && doc_hash(&B) == h0, "bulk_equiv: undo restores");
+    expect(A.caret == B.caret && A.sel_anchor == B.sel_anchor && A.caret == base_n / 3,
+           "bulk_equiv: undo caret");
+    expect(RtxDoc_check(&A) && lines_eq(&A, &B) && hits_eq(&A, &B),
+           "bulk_equiv: undo line index / hits");
+    A.redo() !>;
+    B.redo() !>;
+    expect(doc_hash(&A) == h1 && A.caret == B.caret, "bulk_equiv: redo");
+    expect(RtxDoc_check(&A) && lines_eq(&A, &B), "bulk_equiv: redo line index");
+    /* Round trips keep the tree small: the swap merges back. */
+    A.undo() !>;
+    A.redo() !>;
+    A.undo() !>;
+    expect(doc_hash(&A) == h0, "bulk_equiv: undo / redo / undo");
+    A.redo() !>;
+    if (kind == 1) {
+        RtxDoc C = {0} @destroy;
+        RtxSafeCam cam;
+        int rc;
+        struct stat sb;
+        char jpath[4096];
+        /* Journal at head: the group is one record; reload replays it. */
+        expect(rtx_safe_flush(&A, NULL), "bulk_equiv: flush");
+        expect(rtx_safe_file_path(jpath, sizeof(jpath), path) && stat(jpath, &sb) == 0 &&
+                   (size_t)sb.st_size < k * 64 + 4096,
+               "bulk_equiv: journal is compact");
+        rtx_safe_cam_clear(&cam);
+        C.from_path(cc_slice_cstr(path)) !>;
+        rc = rtx_safe_load(&C, &cam);
+        expect(rc == RTX_SAFE_LOAD_HIST && C.hist.len == 1 && C.hist.head == 1 &&
+                   C.hist.recs[0].bulk && doc_hash(&C) == h1,
+               "bulk_equiv: reload replays the bulk record");
+        C.undo() !>;
+        expect(doc_hash(&C) == h0 && RtxDoc_check(&C), "bulk_equiv: undo after reload");
+        C.redo() !>;
+        expect(doc_hash(&C) == h1 && RtxDoc_check(&C), "bulk_equiv: redo after reload");
+        C.destroy();
+        /* Torn: a writer that died inside the group leaves it without END. */
+        rtx_safe_test_tear_next();
+        expect(rtx_safe_flush(&A, NULL), "bulk_equiv: torn flush");
+        rtx_safe_cam_clear(&cam);
+        C.from_path(cc_slice_cstr(path)) !>;
+        rc = rtx_safe_load(&C, &cam);
+        expect(C.hist.len == 0 && doc_hash(&C) == h0, "bulk_equiv: torn group dropped");
+        C.destroy();
+        /* Saved at the group's edge: reload holds the edited bytes; its undo
+         * rebuilds the old sequence from the site list (inverse). */
+        A.save() !>;
+        expect(rtx_safe_flush(&A, NULL), "bulk_equiv: flush after save");
+        rtx_safe_cam_clear(&cam);
+        C.from_path(cc_slice_cstr(path)) !>;
+        rc = rtx_safe_load(&C, &cam);
+        expect(rc == RTX_SAFE_LOAD_HIST && doc_hash(&C) == h1 && C.hist.head == 1 &&
+                   !C.dirty(),
+               "bulk_equiv: reload of a saved group");
+        C.undo() !>;
+        expect(doc_hash(&C) == h0 && C.dirty() && RtxDoc_check(&C),
+               "bulk_equiv: undo past the save (inverse rebuild)");
+        C.redo() !>;
+        expect(doc_hash(&C) == h1 && !C.dirty(), "bulk_equiv: redo back to the save");
+        C.destroy();
+        rtx_safe_drop(path);
+        unlink(path);
+    }
+    printf("%s sites=%zu nodes-after=%s ok\n", what, k,
+           A.hist.recs[0].bulk && A.hist.recs[0].bulk->ready ? "ready" : "?");
+    free(base);
+    free(pool);
+    free(e);
+    free(next);
+}
+
+static void perf_probe(void) {
+    const char *path = "testdata/generated/edit_group_perf.c";
+    size_t lines = 10000, cap = lines * 32 + 64, n, nsite = 0, i;
+    char *src = (char *)malloc(cap);
+    size_t *sites = (size_t *)malloc(lines * sizeof(size_t));
+    RtxEdit *e = (RtxEdit *)malloc(lines * sizeof(RtxEdit));
+    RtxDoc A = {0} @destroy;
+    RtxDoc B = {0} @destroy;
+    double t0, t1, t2, t3, t4, t5;
+    uint64_t h0;
+    @errhandler(CCError err) {
+        cc_error_log(err);
+        expect(0, "perf: unexpected error");
+        free(src);
+        free(sites);
+        free(e);
+        return;
+    }
+    if (!src || !sites || !e) {
+        expect(0, "perf alloc");
+        free(src);
+        free(sites);
+        free(e);
+        return;
+    }
+    n = gen_c(src, cap, lines, sites, lines, &nsite);
+    write_bytes(path, src, n);
+    rtx_bulk_tune(0, 0); /* 10k sites: the default bulk path */
+    A.from_path(cc_slice_cstr(path)) !>;
+    B.from_path(cc_slice_cstr(path)) !>;
+    /* Rename use case: the find list is live on the old name. */
+    A.find_set("foo") !>;
+    B.find_set("foo") !>;
+    A.find_finish() !>;
+    B.find_finish() !>;
+    h0 = doc_hash(&A);
+    for (i = 0; i < nsite; i++) {
+        e[i].off = sites[i];
+        e[i].n = 3;
+        e[i].ins = cc_slice_cstr("barbaz");
+    }
+    t0 = now_ms();
+    A.replace_batch(e, nsite) !>;
+    t1 = now_ms();
+    t2 = now_ms();
+    for (i = nsite; i-- > 0;) {
+        B.break_coalesce();
+        B.replace(e[i].off, e[i].n, e[i].ins) !>;
+    }
+    t3 = now_ms();
+    expect(doc_hash(&A) == doc_hash(&B), "perf: batch == singles bytes");
+    t4 = now_ms();
+    A.undo() !>;
+    t5 = now_ms();
+    expect(doc_hash(&A) == h0, "perf: group undo restores");
+    printf("perf sites=%zu bytes=%zu runs=%zu hits=%zu  batch=%.2f ms  singles=%.2f ms  "
+           "(x%.1f)  group undo=%.2f ms\n",
+           nsite, n, B.runs.len, rtx_find_hits_n(&B.find), t1 - t0, t3 - t2,
+           (t1 - t0) > 0 ? (t3 - t2) / (t1 - t0) : 0.0, t5 - t4);
+    expect((t3 - t2) > 4.0 * (t1 - t0), "perf: 10k batch much faster than 10k singles");
+    /* The same group per-site (below the bulk threshold's path). */
+    {
+        double p0, p1, p2, p3;
+        int bulk = A.hist.recs[0].bulk != NULL;
+        A.redo() !>;
+        A.undo() !>;
+        rtx_bulk_tune((size_t)-1, 0);
+        p0 = now_ms();
+        A.replace_batch(e, nsite) !>;
+        p1 = now_ms();
+        A.undo() !>;
+        p2 = now_ms();
+        rtx_bulk_tune(0, 0);
+        A.redo() !>;
+        p3 = now_ms();
+        expect(doc_hash(&A) == doc_hash(&B) && bulk && !A.hist.recs[0].bulk,
+               "perf: per-site group lands the same bytes");
+        printf("perf per-site group=%.2f ms  undo=%.2f ms  redo=%.2f ms  (bulk %.2f / %.2f)\n",
+               p1 - p0, p2 - p1, p3 - p2, t1 - t0, t5 - t4);
+    }
+    free(src);
+    free(sites);
+    free(e);
+    unlink(path);
+}
+
+static double meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 8.0 * (double)bytes.len;
+}
+
+static double lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+int main(void) {
+    rtx_safe_test_isol();
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+
+    /* Typing never coalesces into a group; the group is one step. */
+    {
+        RtxDoc d = {0} @destroy;
+        RtxEdit e[2];
+        d.from_buffer("hello world") !>;
+        d.caret = 5;
+        d.sel_anchor = 5;
+        d.type("q") !>;
+        e[0].off = 0;
+        e[0].n = 0;
+        e[0].ins = cc_slice_cstr("A");
+        e[1].off = 7;
+        e[1].n = 0;
+        e[1].ins = cc_slice_cstr("B");
+        d.replace_batch(e, 2) !>;
+        expect(doc_is(&d, "Ahelloq Bworld"), "group applied");
+        expect(d.caret == 9, "caret after the highest site");
+        expect(d.undo_width() == 2, "group is two recs");
+        d.type("x") !>;
+        d.type("y") !>;
+        expect(doc_is(&d, "Ahelloq Bxyworld"), "typed after group");
+        expect(d.undo_width() == 1, "typing is its own record");
+        d.undo() !>;
+        expect(doc_is(&d, "Ahelloq Bworld"), "undo typing leaves the group");
+        d.undo() !>;
+        expect(doc_is(&d, "helloq world"), "undo group is one step");
+        expect(d.caret == 6, "undo restores caret before the group");
+        d.undo() !>;
+        expect(doc_is(&d, "hello world"), "undo q");
+        d.redo() !>;
+        d.redo() !>;
+        expect(doc_is(&d, "Ahelloq Bworld"), "redo group");
+        expect(d.caret == 9, "redo restores caret after the group");
+        expect(d.dirty(), "group is dirty");
+        d.saved_head = d.hist.head;
+        expect(!d.dirty(), "saved at group edge");
+        d.undo() !>;
+        expect(d.dirty() && d.hist.head == 1, "head never rests inside a group");
+        d.redo() !>;
+        expect(!d.dirty(), "redo back to saved edge");
+    }
+
+    /* Refused before any edit: overlap / order / range. */
+    {
+        RtxDoc d = {0} @destroy;
+        RtxEdit e[2];
+        CCError err = {0};
+        d.from_buffer("0123456789") !>;
+        e[0].off = 2;
+        e[0].n = 4;
+        e[0].ins = cc_slice_cstr("x");
+        e[1].off = 5;
+        e[1].n = 1;
+        e[1].ins = cc_slice_cstr("y");
+        expect(try_batch(&d, e, 2, &err), "overlap refused");
+        e[1].off = 2;
+        e[1].n = 0;
+        expect(try_batch(&d, e, 2, &err), "same offset refused");
+        e[1].off = 20;
+        expect(try_batch(&d, e, 2, &err), "range refused");
+        expect(doc_is(&d, "0123456789") && d.hist.len == 0 && !d.broken,
+               "refused group is unchanged");
+    }
+
+    /* A pure delete that touches the next site: undo puts both at one
+     * post-edit offset. */
+    {
+        RtxDoc d = {0} @destroy;
+        RtxEdit e[2];
+        d.from_buffer("0123456789") !>;
+        e[0].off = 2;
+        e[0].n = 3;
+        e[0].ins = cc_slice_empty();
+        e[1].off = 5;
+        e[1].n = 1;
+        e[1].ins = cc_slice_cstr("xy");
+        d.replace_batch(e, 2) !>;
+        expect(doc_is(&d, "01xy6789"), "adjacent: group applied");
+        d.undo() !>;
+        expect(doc_is(&d, "0123456789") && !d.can_undo(), "adjacent: undo restores");
+        d.redo() !>;
+        expect(doc_is(&d, "01xy6789"), "adjacent: redo");
+    }
+
+    /* A member that fails rolls back the members already applied. */
+    {
+        RtxDoc d = {0} @destroy;
+        RtxEdit e[5];
+        CCError err = {0};
+        size_t i;
+        d.from_buffer("0123456789abcdefghij") !>;
+        for (i = 0; i < 5; i++) {
+            e[i].off = i * 4;
+            e[i].n = 2;
+            e[i].ins = cc_slice_cstr("XYZ");
+        }
+        RtxPieceTree_fail_replace_after(&d.tree, 2, 0);
+        expect(try_batch(&d, e, 5, &err), "mid-group failure is an error");
+        expect(!rtx_err_is_unrestorable(err), "mid-group failure is not unrestorable");
+        expect(doc_is(&d, "0123456789abcdefghij"), "rolled back to the original bytes");
+        expect(d.hist.len == 0 && !d.can_undo(), "no half group recorded");
+        expect(!d.broken, "rollback leaves the doc usable");
+        d.replace_batch(e, 5) !>;
+        expect(doc_is(&d, "XYZ23XYZ67XYZabXYZefXYZij"), "same group then lands");
+        d.undo() !>;
+        expect(doc_is(&d, "0123456789abcdefghij"), "and undoes as one");
+        RtxPieceTree_fail_replace_after(&d.tree, 2, 0);
+        err = (CCError){0};
+        expect(try_redo(&d, &err), "redo mid-group failure is an error");
+        expect(doc_is(&d, "0123456789abcdefghij") && d.hist.head == 0 && !d.broken,
+               "redo rollback: unchanged, head stays");
+        d.redo() !>;
+        RtxPieceTree_fail_replace_after(&d.tree, 3, 0);
+        err = (CCError){0};
+        expect(try_undo(&d, &err) && doc_is(&d, "XYZ23XYZ67XYZabXYZefXYZij") &&
+                   d.hist.head == 5 && !d.broken,
+               "undo rollback: unchanged, head stays");
+        RtxPieceTree_fail_replace_after(&d.tree, 1, 1);
+        err = (CCError){0};
+        expect(try_undo(&d, &err) && rtx_err_is_unrestorable(err) && d.broken, "unrestorable member latches broken");
+    }
+
+    /* MD table: Tab on the last cell adds a column as one group. */
+    {
+        RtxBuf b = {0} @destroy;
+        RtxMeasure pm = {0};
+        pm.measure = meas;
+        pm.line_height = lh;
+        pm.ctx = NULL;
+        b.doc.from_buffer("| A | B |\n|---|---|\n| x | y |\n") !>;
+        b.layout.rich = 1;
+        b.layout.doc(&b.doc, &pm, 800.0) !>;
+        b.doc.caret = 6;
+        b.doc.sel_anchor = 6;
+        b.move_md_col(1) !>;
+        expect(doc_is(&b.doc, "| A | B |  |\n|---|---|---|\n| x | y |  |\n"),
+               "table: column added on every line");
+        expect(b.doc.undo_width() == 3, "table: one site per line, one group");
+        {
+            size_t c = b.doc.caret;
+            b.after_edit(&pm, 800.0, 20) !>;
+            b.doc.undo() !>;
+            expect(doc_is(&b.doc, "| A | B |\n|---|---|\n| x | y |\n"),
+                   "table: one undo removes the column");
+            expect(!b.doc.can_undo(), "table: column insert was one step");
+            b.doc.redo() !>;
+            expect(doc_is(&b.doc, "| A | B |  |\n|---|---|---|\n| x | y |  |\n"),
+                   "table: redo the column");
+            expect(b.doc.caret == c, "table: redo lands in the new cell");
+        }
+    }
+
+    /* Workspace transaction across two documents. */
+    {
+        const char *pa = "testdata/generated/edit_group_xa.txt";
+        const char *pb = "testdata/generated/edit_group_xb.txt";
+        RtxWs w = {0} @destroy;
+        RtxUi ui = {0};
+        RtxEdit ea[2], eb[1];
+        RtxWsEdits m[2];
+        uint64_t id;
+        int ran;
+        write_bytes(pa, "alpha beta alpha\n", 17);
+        write_bytes(pb, "name,alpha\n1,2\n", 15);
+        rtx_safe_test_isol();
+        w.add_path(cc_slice_cstr(pa)) !>;
+        w.add_path(cc_slice_cstr(pb)) !>;
+        w.npanes = 1;
+        w.pane[0] = 0;
+        w.focus = 0;
+        ea[0].off = 0;
+        ea[0].n = 5;
+        ea[0].ins = cc_slice_cstr("gamma");
+        ea[1].off = 11;
+        ea[1].n = 5;
+        ea[1].ins = cc_slice_cstr("gamma");
+        eb[0].off = 5;
+        eb[0].n = 5;
+        eb[0].ins = cc_slice_cstr("gamma");
+        m[0].bufi = 0;
+        m[0].edits = ea;
+        m[0].n = 2;
+        m[1].bufi = 1;
+        m[1].edits = eb;
+        m[1].n = 1;
+        id = w.replace_xact(m, 2) !>;
+        expect(id != 0, "xact id");
+        expect(doc_is(&w.bufs[0]->doc, "gamma beta gamma\n") &&
+                   doc_is(&w.bufs[1]->doc, "name,gamma\n1,2\n"),
+               "xact applied to both docs");
+        expect(RtxDoc_undo_xact(&w.bufs[1]->doc) == id, "one-site member carries the id");
+        expect(w.undo_scope(0) == RTX_UNDO_ALL, "both at head: undo all");
+        ran = rtx_ui_undo(&ui, &w) !>;
+        expect(ran, "ui undo runs");
+        expect(doc_is(&w.bufs[0]->doc, "alpha beta alpha\n") &&
+                   doc_is(&w.bufs[1]->doc, "name,alpha\n1,2\n"),
+               "undo in one member undoes all");
+        w.redo(1) !>;
+        expect(doc_is(&w.bufs[0]->doc, "gamma beta gamma\n") &&
+                   doc_is(&w.bufs[1]->doc, "name,gamma\n1,2\n"),
+               "redo in the other member redoes all");
+        /* The CSV moves on: undo in the workbook asks. */
+        w.bufs[1]->doc.caret = w.bufs[1]->doc.len();
+        w.bufs[1]->doc.sel_anchor = w.bufs[1]->doc.caret;
+        w.bufs[1]->doc.type("3,4\n") !>;
+        expect(w.undo_scope(0) == RTX_UNDO_ASK, "split transaction asks");
+        ran = rtx_ui_undo(&ui, &w) !>;
+        expect(!ran && ui.ask_xact, "ui opens ask_xact");
+        expect(rtx_ui_xact_letter('t') == 2 && rtx_ui_xact_letter('a') == 1 &&
+                   rtx_ui_xact_letter(27) == -1 && rtx_ui_xact_letter('c') == 0,
+               "ask_xact letters");
+        ran = rtx_ui_xact_answer(&ui, &w, 2) !>;
+        expect(ran, "this file");
+        expect(!ui.ask_xact, "answer closes the ask");
+        expect(doc_is(&w.bufs[0]->doc, "alpha beta alpha\n") &&
+                   doc_is(&w.bufs[1]->doc, "name,gamma\n1,2\n3,4\n"),
+               "this file: only the workbook undoes");
+        w.bufs[0]->doc.redo() !>;
+        ran = rtx_ui_undo(&ui, &w) !>;
+        expect(!ran && ui.ask_xact, "still split: asks again");
+        ran = rtx_ui_xact_answer(&ui, &w, 0) !>;
+        expect(!ran, "cancel does nothing");
+        expect(doc_is(&w.bufs[0]->doc, "gamma beta gamma\n"), "cancel keeps the workbook");
+        ran = rtx_ui_undo(&ui, &w) !>;
+        expect(!ran && ui.ask_xact, "asks once more");
+        ran = rtx_ui_xact_answer(&ui, &w, 1) !>;
+        expect(ran, "all files");
+        expect(doc_is(&w.bufs[0]->doc, "alpha beta alpha\n") &&
+                   doc_is(&w.bufs[1]->doc, "name,alpha\n1,2\n"),
+               "all: every member undoes back through the transaction");
+        /* All or nothing: a member that fails undoes the others. */
+        eb[0].off = 999;
+        expect(try_xact(&w, m, 2), "failing member refuses the transaction");
+        expect(doc_is(&w.bufs[0]->doc, "alpha beta alpha\n") &&
+                   doc_is(&w.bufs[1]->doc, "name,alpha\n1,2\n"),
+               "failed transaction leaves both docs");
+        expect(!w.bufs[0]->doc.can_redo(), "rolled-back member leaves no redo");
+        unlink(pa);
+        unlink(pb);
+    }
+
+    /* Journal: v6 (no group fields) still loads; a truncated leaf is ignored. */
+    {
+        const char *pa = "testdata/generated/edit_group_j.txt";
+        char jpath[4096];
+        unsigned char jb[8192];
+        ssize_t n;
+        int fd;
+        write_bytes(pa, "hello\n", 6);
+        rtx_safe_test_isol();
+        {
+            RtxDoc d = {0} @destroy;
+            d.from_path(cc_slice_cstr(pa)) !>;
+            d.type("Q") !>;
+            expect(rtx_safe_flush(&d, NULL), "v7 flush");
+        }
+        expect(rtx_safe_file_path(jpath, sizeof(jpath), pa), "journal path");
+        fd = open(jpath, O_RDONLY);
+        n = fd >= 0 ? read(fd, jb, sizeof(jb)) : -1;
+        if (fd >= 0) close(fd);
+        expect(n > 8 + 1 + 116, "v7 leaf readable");
+        if (n > 8 + 1 + 116) {
+            unsigned char v6[8192];
+            size_t m6 = 0, cut = (size_t)n - 8 - 1 - 20;
+            uint64_t h = 1469598103934665603ull;
+            size_t i;
+            /* One rec typed "Q": drop its 20 group bytes, ver 6, re-seal. */
+            memcpy(v6, jb, cut);
+            m6 = cut;
+            memcpy(v6 + m6, jb + cut + 20, 1);
+            m6 += 1;
+            v6[4] = 6;
+            for (i = 0; i < m6; i++) {
+                h ^= (uint64_t)v6[i];
+                h *= 1099511628211ull;
+            }
+            for (i = 0; i < 8; i++) v6[m6 + i] = (unsigned char)(h >> (8 * i));
+            m6 += 8;
+            fd = open(jpath, O_WRONLY | O_TRUNC);
+            expect(fd >= 0 && write(fd, v6, m6) == (ssize_t)m6, "write v6 leaf");
+            if (fd >= 0) close(fd);
+            {
+                RtxDoc d = {0} @destroy;
+                RtxSafeCam cam;
+                rtx_safe_cam_clear(&cam);
+                d.from_path(cc_slice_cstr(pa)) !>;
+                expect(rtx_safe_load(&d, &cam) == RTX_SAFE_LOAD_HIST, "v6 leaf loads");
+                expect(doc_is(&d, "Qhello\n") && d.hist.recs[0].group == 0,
+                       "v6 rec replays as its own record");
+            }
+            /* Truncated (crash before rename would never leave this; a
+             * damaged disk might): the sum fails, nothing replays. */
+            fd = open(jpath, O_WRONLY | O_TRUNC);
+            expect(fd >= 0 && write(fd, jb, (size_t)n - 12) == n - 12, "write truncated leaf");
+            if (fd >= 0) close(fd);
+            {
+                RtxDoc d = {0} @destroy;
+                RtxSafeCam cam;
+                rtx_safe_cam_clear(&cam);
+                d.from_path(cc_slice_cstr(pa)) !>;
+                expect(rtx_safe_load(&d, &cam) == RTX_SAFE_LOAD_NONE, "truncated leaf ignored");
+                expect(doc_is(&d, "hello\n") && !d.can_undo(), "truncated: file bytes, no hist");
+            }
+        }
+        unlink(pa);
+    }
+
+    batch_vs_seq(400, 5, 0);
+    batch_vs_seq(4000, 1500, 0);
+    batch_vs_seq(400, 5, 1);
+    batch_vs_seq(4000, 1500, 1);
+    prop_seed(1, 160, (size_t)-1, 0);
+    prop_seed(0x9e3779b97f4a7c15ull, 160, (size_t)-1, 0);
+    prop_seed(12345, 160, (size_t)-1, 0);
+    /* Same property with groups of 8+ sites on the bulk path. */
+    prop_seed(7, 200, 8, 16);
+    prop_seed(0xfeedfacecafebeefull, 200, 8, 1 << 20);
+    prop_seed(424242, 200, 3, 64);
+    bulk_equiv(11, 0, 3000, 0);
+    bulk_equiv(12, 0, 3000, 8);
+    bulk_equiv(13, 1, 20000, 0);
+    bulk_equiv(14, 1, 20000, 16);
+    bulk_equiv(15, 1, 5000, (size_t)1 << 30);
+    bulk_equiv(16, 2, 20000, 0);
+    bulk_equiv(17, 2, 20000, 32);
+    perf_probe();
+
+    if (fails) {
+        fprintf(stderr, "edit_group_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("edit_group_smoke ok\n");
+    return 0;
+}

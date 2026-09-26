@@ -40,6 +40,205 @@ void !>(CCError) RtxDoc_type_cp(RtxDoc *d, uint32_t cp);
 void !>(CCError) RtxDoc_backspace(RtxDoc *d);
 void !>(CCError) RtxDoc_delete_forward(RtxDoc *d);
 
+/* One site of an edit group: old bytes [off, off + n) become `ins`. */
+typedef struct {
+    size_t off;
+    size_t n;
+    char[:] ins;
+} RtxEdit;
+
+/* Sites per group. Above it a group is refused (honest error, no edit). */
+#ifndef RTX_GROUP_MAX
+#define RTX_GROUP_MAX ((size_t)1 << 22)
+#endif
+
+/* Bulk path (DESIGN Edit groups, bulk): a group of at least this many
+ * sites, none deleting more than RTX_HIST_INLINE_MAX, is built as one new
+ * piece sequence and lands as one swap and one hist record. */
+#ifndef RTX_GROUP_BULK_MIN
+#define RTX_GROUP_BULK_MIN 1024
+#endif
+/* An untouched span shorter than this between two sites is copied into
+ * the group's one add append instead of kept as a piece ref, so a dense
+ * group costs O(len / GAP_REF) pieces, not two per site. */
+#ifndef RTX_BULK_GAP_REF
+#define RTX_BULK_GAP_REF 1024
+#endif
+/* Test knobs (0 keeps the compiled default). bulk_min (size_t)-1 keeps
+ * every group per-site; 1 sends every multi-site group to the bulk path. */
+void rtx_bulk_tune(size_t bulk_min, size_t gap_ref);
+
+/* Where a bulk build reads its sites: the caller's table, or a record's
+ * `enc` (forward = redo, inverse = undo). */
+typedef struct {
+    const RtxEdit *eds;
+    size_t n;
+    size_t i;
+    const char *enc;
+    size_t enc_n;
+    size_t pos;
+    size_t left;
+    size_t old_at;
+    ptrdiff_t acc;
+    const char *pdel;
+    size_t pdel_n;
+    const char *pins;
+    size_t pins_n;
+    int inverse;
+} RtxSiteSrc;
+
+/* A bulk build in progress. Reads the tree (never writes it) and stages
+ * the new bytes past the add file's published end; nothing a reader sees
+ * moves until commit, which is one swap. Drop at any point before commit
+ * edits nothing. Scratch lives on the build's own heap arenas. */
+typedef struct {
+    RtxDoc *d;
+    size_t gen;            /* edit_gen at kick: another edit refuses */
+    RtxSiteSrc src;
+    size_t nsites;
+    size_t done;           /* sites consumed */
+    size_t lo;             /* old range [lo, lo + old_n) */
+    size_t old_n;
+    size_t cur;            /* old bytes consumed through */
+    size_t new_n;          /* new bytes emitted */
+    size_t caret;          /* new end of the last site */
+    size_t add_base;       /* tree add_end at kick */
+    size_t gap_ref;
+    int built;
+    int open;              /* streaming: the range ends at the last site fed */
+    int want_enc;
+    int count_lf;          /* the swap keeps exact weights (not a huge doc) */
+    CCArena a;             /* old capture, read window, blob buffer, prev del */
+    RtxPieceRef *olds;
+    size_t nold;
+    size_t oi;             /* olds cursor: olds[oi] starts at opos */
+    size_t opos;
+    char *win;
+    size_t wcap;
+    size_t w0, w1, wchunk;
+    char *blob;
+    size_t bcap, bn;
+    size_t staged;         /* blob bytes already staged to the add file */
+    int run_open;          /* news[nnew - 1] is the blob run being extended */
+    CCArena ra;            /* news */
+    RtxPieceRef *news;
+    size_t nnew, ncap;
+    CCArena ea;            /* enc */
+    char *enc;
+    size_t enc_n, enc_cap;
+    char *pdel;
+    size_t pdel_n;
+    const char *pins;
+    size_t pins_n;
+} RtxBulk;
+
+/* 1 if this group (validated, sorted) takes the bulk path. */
+int rtx_group_is_bulk(const RtxEdit *edits, size_t n);
+/* Sites from which a group goes bulk ((size_t)-1: never). */
+size_t rtx_group_bulk_min(void);
+/* Streaming build (a replace-all job): sites are fed in order as they are
+ * found; the range starts at `lo` (the first site) and ends where the
+ * last site fed ends (close). Every site deletes at most
+ * RTX_HIST_INLINE_MAX. */
+void !>(CCError) rtx_bulk_open(RtxBulk *b, RtxDoc *d, size_t lo);
+void !>(CCError) rtx_bulk_feed(RtxBulk *b, const RtxEdit *e);
+void !>(CCError) rtx_bulk_close(RtxBulk *b);
+/* Start a bulk build over `edits` (sorted, non-overlapping, pre-edit
+ * offsets; empty sites skipped). The table must outlive the build. */
+void !>(CCError) rtx_bulk_kick(RtxBulk *b, RtxDoc *d, const RtxEdit *edits, size_t n);
+/* Build for about `budget_ms` (<= 0: to the end), or until `yield()`.
+ * 1 = built (commit may land it), 0 = more to do. */
+int !>(CCError) rtx_bulk_step(RtxBulk *b, long budget_ms, int (*yield)(void));
+/* Land a built group: one swap, one hist record (group + xact), caret
+ * after the highest site. Unchanged on failure. Drops the build. */
+void !>(CCError) rtx_bulk_commit(RtxBulk *b, uint64_t xact);
+void rtx_bulk_drop(RtxBulk *b);
+/* 1 if a bulk record's `enc` decodes to its sites and lengths (a journal
+ * load checks this before the record replays). */
+int rtx_hist_bulk_enc_ok(const RtxHistBulk *hb);
+
+/* Replace-all (find.cch, DESIGN Replace): a job that walks the whole
+ * range with its own compiled query, collects every site, then applies
+ * them as one edit group. Nothing moves until commit. */
+enum {
+    RTX_REPL_IDLE = 0,
+    RTX_REPL_SCAN,  /* collecting sites (host pumps rtx_replace_step) */
+    RTX_REPL_READY, /* every site collected: commit applies one group */
+    RTX_REPL_FAIL   /* refused (err): nothing was or will be edited */
+};
+
+/* One part of a parsed replacement: bytes lit[off, off + n), or group
+ * `grp` (>= 0) of the match. */
+typedef struct {
+    int grp;
+    size_t off;
+    size_t n;
+} RtxReplPart;
+
+typedef struct {
+    int state;             /* RTX_REPL_* */
+    RtxDoc *doc;           /* the document the sites are in */
+    CCArena a;             /* job epoch: program, template, window */
+    CCArena ea;            /* the site table (grows in place) */
+    CCArena pa;            /* expanded replacements (regex templates) */
+    const RtxRx *rx;
+    unsigned opts;         /* RTX_FIND_* */
+    char *lit;             /* template literal bytes (escapes resolved) */
+    RtxReplPart *parts;
+    size_t nparts;
+    int groups;            /* 0: no group (one shared payload); 1: $0 only;
+                            * 2: a capture (re-match each site) */
+    char[:] repl;          /* the one payload when !groups (shared) */
+    size_t lo, hi;         /* sites lie in [lo, hi) */
+    int whole;             /* range is the document: an empty match at EOF counts */
+    size_t pos;            /* next search start (a monotonic cursor) */
+    size_t gen;            /* edit_gen at kick: another edit refuses */
+    RtxEdit *eds;
+    size_t n, cap;
+    size_t bytes;          /* staged ins + del bytes (hist cost) */
+    size_t same;           /* matches already equal to their replacement */
+    size_t max_sites;      /* 0 = RTX_GROUP_MAX (tests lower it) */
+    size_t max_bytes;      /* 0 = RTX_REPL_BYTES_MAX */
+    const char *err;       /* static refusal text (RTX_REPL_FAIL) */
+    size_t err_off;
+    char *win;
+    size_t wcap;
+    size_t tail;           /* bytes a window reads past its last start */
+    RtxRxScratch rxs;
+    /* Past the bulk threshold the job stops growing `eds` and feeds each
+     * site to a streaming bulk build instead (in the same pumped steps as
+     * the scan); commit is then one swap. On `a`; its scratch is its own. */
+    RtxBulk *bulk;
+    /* Caret / anchor at kick, mapped through the sites as they stream
+     * (a site's start when inside one). */
+    size_t map_x[2];
+    size_t map_y[2];
+    int map_set[2];
+    ptrdiff_t map_acc;
+} RtxReplace;
+
+/* Edit group (DESIGN Edit groups): one command, one undo step. `edits`
+ * are in pre-edit offsets, sorted by `off` and non-overlapping
+ * (off[k] + n[k] <= off[k+1], off strictly increasing); anything else is
+ * refused before the first byte moves. Members apply in descending offset
+ * order under one join of find / island, then intervals, find hits, the
+ * edit span and reparse hints are patched once. A member that fails rolls
+ * back the members already applied (unchanged), or latches `broken`.
+ * Caret lands after the highest site. Typing never coalesces into it. */
+void !>(CCError) RtxDoc_replace_batch(RtxDoc *d, const RtxEdit *edits, size_t n);
+/* Same group stamped with a workspace transaction id (0 = none). */
+void !>(CCError) rtx_doc_replace_group(RtxDoc *d, const RtxEdit *edits, size_t n,
+                                       uint64_t xact);
+/* Transaction id on the group undo / redo would move (0 = none). */
+uint64_t RtxDoc_undo_xact(const RtxDoc *d);
+uint64_t RtxDoc_redo_xact(const RtxDoc *d);
+/* Records undo / redo would move (a group is several). 0 at an end. */
+size_t RtxDoc_undo_width(const RtxDoc *d);
+/* 1 if some record in hist carries this transaction id. */
+int RtxDoc_hist_has_xact(const RtxDoc *d, uint64_t xact);
+/* Drop the redo tail (a rolled-back transaction member). */
+void rtx_hist_cut_tail(RtxDoc *d);
+
 int RtxDoc_can_undo(const RtxDoc *d);
 int RtxDoc_can_redo(const RtxDoc *d);
 
@@ -61,5 +260,17 @@ void rtx_hist_fail_next_coalesce_commit(void);
 void !>(CCError) rtx_doc_highlight_span(RtxDoc *d, size_t lo, size_t hi);
 void !>(CCError) RtxDoc_reparse_edit(RtxDoc *d, size_t off, int full_markup);
 void !>(CCError) RtxDoc_ensure_hl(RtxDoc *d, RtxHlWin w);
+/* Run working set (DESIGN Interactive): keep the runs within
+ * RTX_HL_KEEP_MARGIN of each camera window [lo[k], hi[k]) — a lexed
+ * section they touch whole — and drop the rest (the windows, sections and
+ * window lex that planted them forget they did; a camera that returns
+ * lexes them again from the checkpoints, which stay). Runs once the run
+ * count has doubled since the last trim; a whole-file lex keeps all. */
+#define RTX_HL_KEEP_MARGIN RTX_HL_WIN_MAX
+#define RTX_HL_TRIM_MIN 16384
+#define RTX_HL_TRIM_WINS 16
+void RtxDoc_hl_trim(RtxDoc *d, const size_t *lo, const size_t *hi, size_t n);
+/* Tests: trim above `n` runs instead of RTX_HL_TRIM_MIN (0 restores). */
+void rtx_hl_trim_floor(size_t n);
 
 #endif /* RTX_EDIT_H */

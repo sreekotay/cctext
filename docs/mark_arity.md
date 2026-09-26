@@ -21,26 +21,31 @@ Toggle is a transform (`apply: toggle`), not an arity. Children
 | **Path** | Two **faces**, two runs | Join **names a face** (the run). Never unions dest into label | Keep label, drop `[` `](dest)` — **apply**, not “caret was in the link” |
 
 Prefix clients: any `arity: prefix` + `insert` rule (MD: heading, quote,
-list). Path clients:
-inline link, later image. Autolink `<url>` stays a **pair** (dest ==
-label). Fold is a third axis (wedge 7). Reference links `[text][ref]`
-are leftover for v1.
+list). Path clients: inline link, image `![alt](src)` (label = alt), and
+reference link `[text][ref]` (dest face `][ref]`). Autolink `<url>` stays
+a **pair** (dest == label). Fold is a third axis (wedge 7). Markdown's
+block marks (heading, quote, list, task, setext underline) are planted by
+the block pass with these same rules ([md_view.md](md_view.md), Markdown
+block pass); the arity lock does not move.
 
 ## Plants
 
 | Construct | Today | Status |
 |---|---|---|
-| ATX heading | Prefix span `#{1,6}[ \\t]*` … `\\n`, `arity: prefix`; trailing `[ \\t]+#+$` is a second prefix | Landed. Title is ordinary / inner-able. `hint_b = 0`. Setext leftover. |
-| Quote | Prefix span `[ \\t]{0,3}>([ \\t]*>)*[ \\t]*` … `\\n` | Landed. `bol` is virtual after an open prefix. List / heading are quote inners. Fence across quote lines leftover (`while`). |
-| List | Prefix spans `[-*+]` / `[0-9]{1,9}[.]` / `[0-9]{1,9}[)]` … `\\n` | Landed. Indent is not in the hint. `***` / `---` do not plant. |
-| Task box | Match `\\[[ xX]\\]`, `apply: toggle`, `insert: "[ ]/[x]"` | Landed. 3-byte mark after the list prefix; trailing space required. `[X]` → `[ ]`. |
+| ATX heading | Prefix run `#{1,6}` + spaces … EOL (block pass, `heading` rule), `arity: prefix`; closing `#`s a second prefix (`heading_close`) | Landed. Title is ordinary / inner-able. `hint_b = 0`. `#hashtag` is text. |
+| Setext heading | Title lines: one `heading` run, no hint; underline `===` / `---`: a hidden prefix (`setext` rule, not a heading scope) | Landed (block pass). Level 1 / 2 read from the underline. |
+| Quote | Prefix run `>` markers … EOL (`quote`) | Landed. Nested quotes merge into one hint; lazy continuation lines keep the container; a fence inside a quote is a fence. |
+| List | Prefix run marker + spaces … EOL on the item's first line (`list`) | Landed. Indent is not in the hint; content indent is the container's (fences / code inside items). `***` / `---` / `* * *` do not plant. |
+| Task box | `[ ]` / `[x]` / `[X]` + space right after a list marker (`task`), `apply: toggle`, `insert: "[ ]/[x]"` | Landed. 3-byte mark; `[X]` → `[ ]`. |
 | Pair marks | `begin`/`end` + `rtx_tm_add_span` `hint_a`/`hint_b` | Honest. Do not break. |
-| `replace_join` | Pair-only: a replace that touches a pair hint removes both hints. Prefix / path refuse partner union. | Landed. Rich panes via `rtx_buf_pair_replace`; Source is plain `replace`. Always one `replace`. |
+| `replace_join` | Pair-only: a replace that touches a pair hint removes both hints. Prefix / path refuse partner union. | Landed. Rich panes via `rtx_buf_pair_replace`; Source is plain `replace`. One `replace`, or one edit group (one undo step) when a partner hint sits outside the touched range. |
 | Reveal / snap | `RtxDoc_mark_at` = that run; backspace on a pair hint → `replace_join`; prefix opener → apply | Landed. Per-run reveal is why path is two runs, not one run + face id. |
 | Inline link | Two spans: label `begin` `[` `end` `](`; dest `begin` `](` `end` `)` | Landed. Label `hint_a='['` `hint_b=0`; dest `hint_a=']('` `hint_b=')'`. Glue: label closer starts dest. Inners on the label. Wrap is `[sel]()`. |
 
 `rtx_tm_add` on `RTX_TM_REGEX` / `LIT_LINE` plants `hint_a=hint_b=0`.
-Captures get scope, not hints (`document.ccs` regex cap loop).
+Captures get scope, not hints, and rule tag `RTX_RUN_NO_RULE` (`document.ccs`
+regex cap loop). A rule tag indexes the planter's grammar: only a host
+`RTX_RUN_TM` run's tag names a path-grammar rule.
 
 ## Extend Encoding (do not replace the sentence)
 
@@ -78,10 +83,10 @@ four questions. A new key answers one of them.
 
 | Layer | Keys | Question |
 |---|---|---|
-| Recognition | `bol`, `inline`, `flank`, `lit`, `info` | Did this match happen, and with which guest? |
+| Recognition | `bol`, `inline`, `flank`, `exact`, `abort`, `lit`, `info`, `block` | Did this match happen, and with which guest? |
 | Topology | `arity`, `face`, `wrap` | How many parts, and which join? |
 | Transform | `apply`, `insert`, `max` | What is the named unit algebra? |
-| Paint | `bold`, `italic`, `mono` (else scope map) | How does Rich paint? |
+| Paint | `bold`, `italic`, `mono`, `strike` (else scope map) | How does Rich paint? |
 
 `apply` kind is derived (arity + insert/wrap/lit, or `off/on` in
 `insert`). Do not store it. `insert` is a prefix unit, pair bookends
@@ -97,6 +102,11 @@ client appears. Do not put `apply` on the run.
 | `apply` | toolbar name (`heading`, `bold`, …) | Does **not** plant. Grammar-local vocabulary. |
 | `insert` | literal unit (`#`, `>`, `- `), wrap bookends (`<>`), or `off/on` (`[ ]/[x]`) | Prefix apply / Backspace demote, pair wrap with `wrap`, or toggle. Not the begin regex. |
 | `max` | 1–255 (0 → 1) | How many `insert` units stack. |
+| `flank` | `true` / `"under"` / `"math"` | CommonMark delimiter runs: `*` rules, `_` rules (no intraword), `$` (not `$ 5`, not `$5 and $10`). An empty span never closes. |
+| `exact` | `true` | begin / end are a whole run of their byte (`` ` `` never inside ```` `` ````). |
+| `abort` | one byte (`"]"`) | That byte, when it is not the closer or an inner, drops the span (a Markdown label: rewound). |
+| `block` | `fence` `heading` `heading_close` `setext` `quote` `list` `task` `hr` `code` `html` `math` `front` `ref` `ref_dest` `foot` | The Markdown block pass plants this role with the rule (a pattern may be empty); the TM walk never tries it. |
+| `strike` | `true` | Paint bit (`markup.strikethrough` by default). |
 
 `hint_b==0` is **not** arity. An unclosed pair at the window end is still
 a pair (`hint_b=0` today). Prefix vs that leftover is the sidecar.
@@ -123,11 +133,11 @@ keep `markup.heading` (default bold).
 | Trailing ` ##` | **Second prefix** on the same line (`\\s+#+$`), `hint_a` only. Not a pair with the leading hashes (title type-over must not join them) |
 | Type-over | Title clusters; must not eat `# ` unless the selection actually covers the opener |
 
-**Setext** (`===` / `---`): **leftover this cut.** Title heading-scope
-needs the next line (lookaround or a two-line classifier like tables).
-`---` is also a thematic break (`blocks.md`). Do not plant a prefix.
-`headings.md` L14–15 stay a later smoke (fold / a later prefix client),
-not wedge 6b.
+**Setext** (`===` / `---`): the Markdown block pass decides it at the
+underline (it carries the paragraph start as a distance) and plants the
+title as a `heading` run with no hint and the underline as a hidden
+prefix of a non-heading scope. `---` under no paragraph is a thematic
+break. Folds and the outline read the level from the underline.
 
 ### Inline link — path, two spans
 
@@ -149,12 +159,16 @@ is a pair mark inside the label face.
 Titled dest `[text](url "title")`: title bytes are dest-face content
 (fixture: the whole `](url "…")` hidden until dest is entered).
 
-| Leftover v1 | Why |
+| Leftover | Why |
 |---|---|
-| `[text][ref]`, `[ref][]`, `[ref]` | Reference links |
-| `![alt](src)` | Opaque child, not a path mark this cut |
-| Bare URL | Not a mark (`links_images.md` L11) |
+| Shortcut `[ref]` | Needs the document's definitions (no index); `[text][ref]` / `[ref][]` are path marks |
+| Image render | `![alt](src)` is a path mark (label = alt); the picture is an opaque child |
+| Bare URL | Link scope, not a mark (`links_images.md` L11) |
 | `[text] (` space | Not a link (L13) |
+
+Label end is `\\](?=[(\\[])` and a `]` with neither after it aborts the
+label (`cctext.abort`, rewound): `[1] and [docs](url)` links `docs`.
+Brackets / parens balance (`[a [b] c](u(v))`).
 
 Autolink `<https://…>`: **pair** via `match` + `wrap: 1` (`hint_a` /
 `hint_b` = 1) and `insert: "<>"` so apply wrap/unwrap is grammar-driven.
@@ -240,13 +254,13 @@ arity / face / dest walk.
 
 | Out | Why |
 |---|---|
-| Lookaround | Setext / “title is heading because next line is `===`” |
-| `while` | Quote / list continuation |
+| Lookaround | Setext / “title is heading because next line is `===`” (the block pass decides at the underline) |
+| `while` | Quote / list continuation (the block pass carries containers) |
 | Onig | Engine lock |
 | Dest in label `hint_b` | Join would delete the URL as a hint |
 | Face id on `RtxRun` | Two runs + rule sidecar are cheaper |
-| Reference links | v1 leftover |
-| Images as path / opaque this cut | Child / later; `![]()` is not 6b |
+| Shortcut reference links | No definition index |
+| Images as opaque | The render is a child / later; `![]()` is a path mark |
 | Steal wedge 5 | Table paint / hit is already queued |
 | Second document / HTML store | Lens lock |
 | Infer prefix from `hint_b==0` | Collides with unclosed pairs |
@@ -261,11 +275,11 @@ From `testdata/rich/md/README.md`:
 
 - `headings.md` L1–6: each `#… ` prefix is one hidden atom; L29: inner
   mono + bold; L33: empty heading; trailing ` ##` hidden (second prefix).
-  Setext L14–15: **not** asserted this cut.
+  Setext L14–15 / L19–20: heading runs, levels 1 / 2, hidden underline.
 - `links_images.md` L3: label `text` shown, dest hidden; L5: autolink
   pair; L11–13: not links; L14: empty dest / empty label still path
   plants. `` [`file`](path) ``: inner code pair on the label; dest hidden.
-  L6–10 reference / image / footnote: leftover.
+  L6 `[text][ref]` / L7–9 images: path marks; L10 footnote: scope.
 - Table cell link (`tables.md` L9): same path shape inside a cell; not a
   new arity.
 

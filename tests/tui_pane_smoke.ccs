@@ -1,0 +1,305 @@
+/*
+ * TUI pane behavior, headless (cctext_handle_input + cctext_draw into a
+ * capture): the wheel scrolls the pane under the pointer; a hex pane in a
+ * split stays inside its columns; a caret on a soft-wrap break is one
+ * cell, not two; the help copy names real keys.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+#include "../core/browse.cch"
+#include "../frontend/cctext.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+int g_mouse_col;
+int g_mouse_row;
+int g_mouse_press;
+int g_mouse_drag;
+int g_drag_edge;
+int g_field_drag;
+int g_shift;
+int g_alt;
+int g_cmd_ch;
+int g_ctrl;
+int g_nav;
+char g_status[160];
+
+int cctext_osx_shift_down(void) { return 0; }
+int cctext_osx_alt_down(void) { return 0; }
+
+const char *rtx_help_line(size_t i);
+
+static double meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return (double)rtx_utf8_cols(bytes);
+}
+
+static double lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+static void write_file(const char *path, const char *prefix, int lines, int width) {
+    FILE *f = fopen(path, "w");
+    int i, k;
+    if (!f) return;
+    for (i = 0; i < lines; i++) {
+        fprintf(f, "%s %d", prefix, i);
+        for (k = 0; k < width; k++) fputc('x', f);
+        fputc('\n', f);
+    }
+    fclose(f);
+}
+
+static void !>(CCError) lay_all(RtxWs *w, RtxMeasure *m, int rows, int cols) {
+    int p, vis = rows - 1;
+    @errhandler(CCError e) { return cc_err(e); }
+    for (p = 0; p < w->npanes; p++) {
+        int held = w->hold_pane(p);
+        RtxBuf *b = w->bufs[w->pane[p]];
+        int pc = cctext_pane_cols(w, cols, p);
+        b->ensure_view(m, (double)cctext_text_cols(b, pc, vis), vis) !>;
+        w->drop_pane(p, held);
+    }
+    return cc_ok();
+}
+
+static size_t pane_off(RtxWs *w, int p) {
+    int held = w->hold_pane(p);
+    size_t off = RtxBuf_view_off(w->bufs[w->pane[p]]);
+    w->drop_pane(p, held);
+    return off;
+}
+
+static char *capture(RtxWs *w, RtxUi *ui, int rows, int cols, size_t *n) {
+    FILE *saved;
+    FILE *cap;
+    char *buf = NULL;
+    *n = 0;
+    fflush(stdout);
+    cctext_draw_invalidate();
+    cap = open_memstream(&buf, n);
+    if (!cap) return NULL;
+    saved = stdout;
+    stdout = cap;
+    cctext_draw(w, ui, rows, cols);
+    fflush(stdout);
+    stdout = saved;
+    fclose(cap);
+    return buf;
+}
+
+/* Replay CUP + printable cells on the pane rows (not the status row). A
+ * run that starts inside [1, lim] must not reach past column `lim` before
+ * the next CUP. Returns the worst column. */
+static int max_col_from_left(const char *s, size_t n, int lim, int rows) {
+    size_t i = 0;
+    int col = 1, start = 1, worst = 0, row = 1;
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 0x1b && i + 1 < n && s[i + 1] == '[') {
+            size_t j = i + 2;
+            int a = 0, b = 0, which = 0;
+            while (j < n && ((s[j] >= '0' && s[j] <= '9') || s[j] == ';' || s[j] == '?')) {
+                if (s[j] == ';') which = 1;
+                else if (s[j] >= '0' && s[j] <= '9') {
+                    if (which) b = b * 10 + (s[j] - '0');
+                    else a = a * 10 + (s[j] - '0');
+                }
+                j++;
+            }
+            if (j < n && s[j] == 'H') {
+                col = b ? b : 1;
+                start = col;
+                row = a ? a : 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        if (c >= 0x20 && (c & 0xC0) != 0x80) {
+            if (row < rows && start <= lim && col > worst) worst = col;
+            col++;
+        }
+        i++;
+    }
+    return worst;
+}
+
+/* Reverse-video caret cells on the text rows (the status row is excluded). */
+static int caret_cells(const char *s, size_t n, int rows) {
+    size_t i = 0;
+    int row = 1, count = 0;
+    while (i < n) {
+        if (s[i] == 0x1b && i + 1 < n && s[i + 1] == '[') {
+            size_t j = i + 2;
+            int a = 0;
+            int semi = 0;
+            while (j < n && ((s[j] >= '0' && s[j] <= '9') || s[j] == ';')) {
+                if (s[j] == ';') semi = 1;
+                else if (!semi) a = a * 10 + (s[j] - '0');
+                j++;
+            }
+            if (j < n && s[j] == 'H') row = a ? a : 1;
+            if (j < n && s[j] == 'm' && j == i + 3 && s[i + 2] == '7' && row < rows)
+                count++;
+            i = j + 1;
+            continue;
+        }
+        i++;
+    }
+    return count;
+}
+
+int main(void) {
+    const int rows = 24, cols = 80;
+    const char *pa = "testdata/generated/pane_a.txt";
+    const char *pb = "testdata/generated/pane_b.txt";
+    const char *pw = "testdata/generated/pane_wrap.txt";
+    RtxMeasure m;
+    rtx_safe_test_isol();
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    m.measure = meas;
+    m.line_height = lh;
+    m.ctx = NULL;
+    write_file(pa, "alpha", 300, 4);
+    write_file(pb, "beta", 300, 4);
+    {
+        FILE *f = fopen(pw, "w");
+        int k;
+        if (f) {
+            /* Words: the wrap breaks after a space, short of the edge. */
+            for (k = 0; k < 30; k++) fputs("abcdefghijklm ", f);
+            fputc('\n', f);
+            fclose(f);
+        }
+    }
+
+    /* 1. Wheel over the right pane scrolls it; the focused left pane stays. */
+    {
+        RtxWs w = {0} @destroy;
+        RtxUi ui = {0};
+        char *paths[2];
+        size_t a0, b0, a1, b1;
+        int skip = 0;
+        paths[0] = (char *)pa;
+        paths[1] = (char *)pb;
+        w.open_files(2, paths) !>;
+        if (w.npanes == 1) w.toggle_split();
+        w.set_focus(0);
+        lay_all(&w, &m, rows, cols) !>;
+        a0 = pane_off(&w, 0);
+        b0 = pane_off(&w, 1);
+        g_mouse_col = cols - 10;
+        g_mouse_row = 5;
+        g_wheel_n = 3;
+        g_wheel_at = 1;
+        cctext_handle_input(&w, w.active(), &m, &ui, KEY_WHEEL_DOWN, 0, rows - 1,
+                            cols, &skip);
+        g_wheel_n = 1;
+        lay_all(&w, &m, rows, cols) !>;
+        a1 = pane_off(&w, 0);
+        b1 = pane_off(&w, 1);
+        expect(b1 > b0, "wheel over the right pane scrolls it");
+        expect(a1 == a0, "the focused left pane does not scroll");
+        expect(w.npanes == 2 && w.pane[0] != w.pane[1], "two files side by side");
+        expect(w.focus == 0, "the wheel does not move focus");
+    }
+
+    /* 2. Hex in the left half of a split stays left of the divider. */
+    {
+        RtxWs w = {0} @destroy;
+        RtxUi ui = {0};
+        char *paths[2];
+        char *buf;
+        size_t n = 0;
+        int pc, worst;
+        paths[0] = (char *)pa;
+        paths[1] = (char *)pb;
+        w.open_files(2, paths) !>;
+        if (w.npanes == 1) w.toggle_split();
+        w.set_focus(0);
+        rtx_layout_set_view(&w.bufs[w.pane[0]]->layout, RTX_VIEW_HEX);
+        lay_all(&w, &m, rows, cols) !>;
+        pc = cctext_pane_cols(&w, cols, 0);
+        buf = capture(&w, &ui, rows, cols, &n);
+        worst = max_col_from_left(buf, n, pc, rows);
+        if (worst > pc)
+            fprintf(stderr, "hex pane reached column %d of %d\n", worst, pc);
+        expect(worst <= pc, "hex pane in a split clips to its columns");
+        free(buf);
+    }
+
+    /* 3. Caret on a soft-wrap break: one inverted cell. */
+    {
+        RtxWs w = {0} @destroy;
+        RtxUi ui = {0};
+        char *paths[1];
+        char *buf;
+        size_t n = 0;
+        RtxBuf *b;
+        paths[0] = (char *)pw;
+        w.open_files(1, paths) !>;
+        b = w.active();
+        b->layout.wrap = 1;
+        lay_all(&w, &m, rows, cols) !>;
+        expect(b->layout.rows.len > 2 && b->layout.rows.data[1].byte_start ==
+                                             b->layout.rows.data[0].byte_len,
+               "long line wraps");
+        expect(b->layout.rows.data[0].width + 1.0 < (double)cctext_text_cols(b, cols, rows - 1),
+               "first wrap row ends short of the edge");
+        b->doc.caret = b->layout.rows.data[0].byte_len;
+        b->doc.sel_anchor = b->doc.caret;
+        buf = capture(&w, &ui, rows, cols, &n);
+        expect(caret_cells(buf, n, rows) == 1, "one caret cell at a soft-wrap break");
+        free(buf);
+        /* Line end (before the newline) still paints the end cell. */
+        b->doc.caret = 30 * 14;
+        b->doc.sel_anchor = 30 * 14;
+        buf = capture(&w, &ui, rows, cols, &n);
+        expect(caret_cells(buf, n, rows) == 1, "caret at a hard line end is painted");
+        free(buf);
+    }
+
+    /* 4. Help copy: no stale host name; Ctrl-J is LF on a TTY. */
+    {
+        size_t i;
+        for (i = 0; rtx_help_line(i); i++) {
+            const char *l = rtx_help_line(i);
+            expect(!strstr(l, "ray)"), "help names cctext-ui, not ray");
+            expect(!strstr(l, "Ctrl-G/J") && !strstr(l, "Ctrl-J"),
+                   "help does not offer Ctrl-J");
+        }
+    }
+    unlink(pa);
+    unlink(pb);
+    unlink(pw);
+    if (fails) {
+        fprintf(stderr, "tui_pane_smoke: %d failed\n", fails);
+        return 1;
+    }
+    printf("tui_pane_smoke: ok\n");
+    return 0;
+}

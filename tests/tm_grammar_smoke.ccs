@@ -8,11 +8,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 #include <ccc/std/json.cch>
 #include "../core/document.cch"
 #include "../core/nav.cch"
 #include "../core/find.cch"
 #include "../core/nav_pair.cch"
+#include "rx_compat.cch"
 
 @grammar(rules) Json {~~~~
     include JsonKeep
@@ -78,6 +81,57 @@ static int write_file(const char *path, const char *text) {
     return 1;
 }
 
+/* Scope name at the first occurrence of `needle` (+ skip) in `text`. */
+static const char *scope_at_text(RtxDoc *d, const char *text, const char *needle,
+                                 size_t skip) {
+    const char *hit = strstr(text, needle);
+    if (!hit) return "(missing)";
+    {
+        const char *s = rtx_scope_name(d->style_at((size_t)(hit - text) + skip).scope);
+        return s ? s : "";
+    }
+}
+
+/* Shell heredocs: RE_SPAN begin captures the terminator; the end regex
+ * `^\t*\3$` reads it back (engine EXTREF), so the body is one string and
+ * the code after the terminator is code again. `<<<` is not a heredoc. */
+static void heredoc_check(void) {
+    RtxDoc d = {0} @destroy;
+    FILE *fp;
+    char text[4096];
+    size_t n;
+    @errhandler(CCError e) {
+        (void)e;
+        expect(0, "heredoc: open embeds.sh");
+        return;
+    }
+    fp = fopen("testdata/rich/code/embeds.sh", "rb");
+    if (!fp) {
+        expect(0, "heredoc: read embeds.sh");
+        return;
+    }
+    n = fread(text, 1, sizeof(text) - 1, fp);
+    fclose(fp);
+    text[n] = 0;
+    d.from_path(cc_slice_cstr("testdata/rich/code/embeds.sh")) !>;
+    expect(!strcmp(scope_at_text(&d, text, "Hello ${NAME}", 0), "string.unquoted.heredoc.shell"),
+           "heredoc: <<EOF body");
+    expect(!strcmp(scope_at_text(&d, text, "Quoted heredoc", 0), "string.unquoted.heredoc.shell"),
+           "heredoc: <<'EOF' body");
+    expect(!strcmp(scope_at_text(&d, text, "Indented heredoc", 0), "string.unquoted.heredoc.shell"),
+           "heredoc: <<-EOF body");
+    expect(!strcmp(scope_at_text(&d, text, "\nfi\n", 1), "keyword.control.shell"),
+           "heredoc: tab-indented EOF closes <<-EOF");
+    expect(!strcmp(scope_at_text(&d, text, "import sys", 0), "string.unquoted.heredoc.shell"),
+           "heredoc: <<PY body");
+    expect(!strcmp(scope_at_text(&d, text, "case \"$1\"", 0), "keyword.control.shell"),
+           "heredoc: PY terminator closes");
+    expect(!strcmp(scope_at_text(&d, text, "\"one two three\"", 1), "string.quoted.double.shell"),
+           "heredoc: <<< is a here-string, not a heredoc");
+    expect(rtx_tm_rx_errors == 0, "grammar patterns all compile");
+    if (rtx_tm_rx_errors) fprintf(stderr, "rx error: %s\n", rtx_tm_rx_err);
+}
+
 static const RtxRun *smoke_path_run(const RtxDoc *d, size_t start, int dest) {
     size_t k;
     if (!d) return NULL;
@@ -88,6 +142,197 @@ static const RtxRun *smoke_path_run(const RtxDoc *d, size_t start, int dest) {
         if (dest ? rtx_run_dest(r) : !rtx_run_dest(r)) return r;
     }
     return NULL;
+}
+
+/* --- run lookup reference ------------------------------------------------
+ * The walk-back lookup the run index replaced, kept verbatim so the indexed
+ * style_at / style_next / hint_at / mark_at / dest_at / path_at / hint_next
+ * must agree with it byte for byte (nesting, shared starts, CSV `""`). */
+static size_t ref_run_first(const RtxDoc *d, size_t off) {
+    size_t lo = 0, hi = d->runs.len, i, j;
+    while (lo + 1 < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (d->runs.data[mid].start <= off) lo = mid;
+        else hi = mid;
+    }
+    i = lo;
+    j = lo;
+    while (j > 0) {
+        j--;
+        if (d->runs.data[j].start <= off &&
+            d->runs.data[j].start + d->runs.data[j].len > off) {
+            i = j;
+        }
+    }
+    return i;
+}
+
+static RtxStyle ref_style_at(const RtxDoc *d, size_t off) {
+    RtxStyle z = {0};
+    RtxSectionKind k;
+    size_t i;
+    if (d->runs.len == 0) return z;
+    i = ref_run_first(d, off);
+    for (; i < d->runs.len && d->runs.data[i].start <= off; i++) {
+        if (off < d->runs.data[i].start + d->runs.data[i].len) {
+            if (d->runs.data[i].style.bold) z.bold = 1;
+            if (d->runs.data[i].style.italic) z.italic = 1;
+            if (d->runs.data[i].style.mono) z.mono = 1;
+            if (d->runs.data[i].style.scope != RTX_SCOPE_NONE)
+                z.scope = d->runs.data[i].style.scope;
+        }
+    }
+    k = RtxDoc_section_at(d, off);
+    if (z.scope != RTX_SCOPE_NONE && k != RTX_SEC_CODE && k != RTX_SEC_MARKUP)
+        z.scope = RTX_SCOPE_NONE;
+    return z;
+}
+
+static size_t ref_style_next(const RtxDoc *d, size_t off, size_t hi) {
+    size_t lo, up, j, next = hi;
+    if (d->runs.len == 0 || off >= hi) return hi;
+    lo = 0;
+    up = d->runs.len;
+    while (lo + 1 < up) {
+        size_t mid = lo + (up - lo) / 2;
+        if (d->runs.data[mid].start <= off) lo = mid;
+        else up = mid;
+    }
+    for (j = lo; j < d->runs.len; j++) {
+        if (d->runs.data[j].start > off) {
+            if (d->runs.data[j].start < next) next = d->runs.data[j].start;
+            break;
+        }
+    }
+    j = lo + 1;
+    while (j > 0) {
+        size_t e;
+        j--;
+        if (d->runs.data[j].start > off) continue;
+        e = d->runs.data[j].start + d->runs.data[j].len;
+        if (e > off && e < next) next = e;
+    }
+    return next;
+}
+
+static int ref_hint_at(const RtxDoc *d, size_t off, size_t *lo, size_t *hi) {
+    size_t i;
+    int hit = 0;
+    if (d->runs.len == 0) return 0;
+    i = ref_run_first(d, off);
+    for (; i < d->runs.len && d->runs.data[i].start <= off; i++) {
+        const RtxRun *r = &d->runs.data[i];
+        size_t end = r->start + r->len;
+        if (off >= end || r->hint_a == 0) continue;
+        if (off < r->start + r->hint_a) {
+            *lo = r->start;
+            *hi = r->start + r->hint_a;
+            hit = 1;
+        } else if (r->hint_b && off >= end - r->hint_b) {
+            *lo = end - r->hint_b;
+            *hi = end;
+            hit = 1;
+        }
+    }
+    return hit;
+}
+
+static int ref_mark_at(const RtxDoc *d, size_t off, size_t *lo, size_t *hi) {
+    size_t i;
+    int hit = 0;
+    if (d->runs.len == 0) return 0;
+    i = ref_run_first(d, off);
+    for (; i < d->runs.len && d->runs.data[i].start <= off; i++) {
+        const RtxRun *r = &d->runs.data[i];
+        if (r->hint_a == 0 || off > r->start + r->len) continue;
+        *lo = r->start;
+        *hi = r->start + r->len;
+        hit = 1;
+    }
+    return hit;
+}
+
+static int ref_dest_at(const RtxDoc *d, size_t off, size_t *lo, size_t *hi) {
+    size_t i;
+    int hit = 0;
+    if (d->runs.len == 0) return 0;
+    i = ref_run_first(d, off);
+    for (; i < d->runs.len && d->runs.data[i].start <= off; i++) {
+        const RtxRun *r = &d->runs.data[i];
+        if (!rtx_run_dest(r) || off >= r->start + r->len) continue;
+        *lo = r->start;
+        *hi = r->start + r->len;
+        hit = 1;
+    }
+    return hit;
+}
+
+/* path_at's first loop: the label / dest pair that holds `off`. */
+static void ref_path_pair(const RtxDoc *d, size_t off, const RtxRun **lab,
+                          const RtxRun **dest) {
+    size_t i;
+    *lab = NULL;
+    *dest = NULL;
+    if (d->runs.len == 0) return;
+    i = ref_run_first(d, off);
+    for (; i < d->runs.len && d->runs.data[i].start <= off; i++) {
+        const RtxRun *r = &d->runs.data[i];
+        if (rtx_run_arity(r) != RTX_ARITY_PATH) continue;
+        if (off > r->start + r->len) continue;
+        if (rtx_run_dest(r)) *dest = r;
+        else *lab = r;
+    }
+}
+
+static size_t ref_hint_next(const RtxDoc *d, size_t off, size_t hi) {
+    size_t i, next = hi;
+    if (d->runs.len == 0 || off >= hi) return hi;
+    i = ref_run_first(d, off);
+    for (; i < d->runs.len && d->runs.data[i].start < next; i++) {
+        const RtxRun *r = &d->runs.data[i];
+        size_t end = r->start + r->len;
+        if (r->hint_a == 0) continue;
+        if (r->start > off && r->start < next) next = r->start;
+        if (r->hint_b && end - r->hint_b > off && end - r->hint_b < next)
+            next = end - r->hint_b;
+    }
+    return next;
+}
+
+/* 1 when every run query at `off` matches the reference walk. */
+static int runs_agree(const RtxDoc *d, size_t off) {
+    RtxStyle a = RtxDoc_style_at(d, off), b = ref_style_at(d, off);
+    size_t n = RtxDoc_len(d);
+    size_t hi = off + 4096 < n ? off + 4096 : n;
+    size_t l1 = 0, h1 = 0, l2 = 0, h2 = 0;
+    const RtxRun *lab = NULL, *dest = NULL;
+    int x, y;
+    if (a.bold != b.bold || a.italic != b.italic || a.mono != b.mono ||
+        a.scope != b.scope)
+        return 0;
+    if (off < hi && RtxDoc_style_next(d, off, hi) != ref_style_next(d, off, hi))
+        return 0;
+    if (off < hi && RtxDoc_hint_next(d, off, hi) != ref_hint_next(d, off, hi))
+        return 0;
+    x = RtxDoc_hint_at(d, off, &l1, &h1);
+    y = ref_hint_at(d, off, &l2, &h2);
+    if (x != y || (x && (l1 != l2 || h1 != h2))) return 0;
+    x = RtxDoc_mark_at(d, off, &l1, &h1);
+    y = ref_mark_at(d, off, &l2, &h2);
+    if (x != y || (x && (l1 != l2 || h1 != h2))) return 0;
+    x = RtxDoc_dest_at(d, off, &l1, &h1);
+    y = ref_dest_at(d, off, &l2, &h2);
+    if (x != y || (x && (l1 != l2 || h1 != h2))) return 0;
+    ref_path_pair(d, off, &lab, &dest);
+    x = RtxDoc_path_at(d, off, &l1, &h1, NULL, NULL);
+    if (!lab && !dest && x) return 0;
+    return 1;
+}
+
+static double runs_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 
 #define MK_GRAMMAR_DIR "testdata/generated/markup_grammars"
@@ -445,8 +690,9 @@ int main(int argc, char **argv) {
         }
         {
             const char *bad = "a{x}";
-            expect(!rtx_re_match(bad, 4, "a{x}", 0, 4, &end),
-                   "re bare { is not literal");
+            /* Onig: a `{` that is not an interval is a literal brace. */
+            expect(rtx_re_match(bad, 4, "a{x}", 0, 4, &end) && end == 4,
+                   "re non-interval { is a literal");
             expect(rtx_re_match("\\{[0-9]", 7, "{3", 0, 2, &end) && end == 2,
                    "re \\{ is a brace");
         }
@@ -816,7 +1062,7 @@ int main(int argc, char **argv) {
             expect(slice_eq(mg.name, "Markdown"), "name Markdown");
             expect(slice_eq(mg.scopeName, "text.markdown"),
                    "scopeName text.markdown");
-            expect(mg.patterns_n == 12, "twelve top-level Markdown patterns");
+            expect(mg.patterns_n == 41, "41 top-level Markdown patterns (blocks + inline)");
             mrt = rtx_tm_md_rt();
             expect(mrt && mrt->rules.len >= 6, "flattened Markdown rules");
             {
@@ -851,7 +1097,7 @@ int main(int argc, char **argv) {
                 expect(saw_b && saw_i && saw_c && saw_a,
                        "pair apply tags from sidecar");
                 an = rtx_tm_apply_list(mrt, ents, RTX_APPLY_MAX);
-                expect(an == 9, "md apply table is 9 unique names");
+                expect(an == 10, "md apply table is 10 unique names");
                 for (ai = 0; ai < an; ai++) {
                     if (!ents[ai].name) continue;
                     if (strcmp(ents[ai].name, "heading") == 0 &&
@@ -890,7 +1136,7 @@ int main(int argc, char **argv) {
                     RtxDoc md = {0} @destroy;
                     RtxDoc raw = {0} @destroy;
                     md.from_path("testdata/rich/md/headings.md") !>;
-                    expect(RtxDoc_apply_list(&md, ents, RTX_APPLY_MAX) == 9,
+                    expect(RtxDoc_apply_list(&md, ents, RTX_APPLY_MAX) == 10,
                            "doc apply list is the path grammar");
                     raw.from_buffer("# scratch\n") !>;
                     expect(RtxDoc_apply_list(&raw, ents, RTX_APPLY_MAX) == 0,
@@ -1386,8 +1632,9 @@ int main(int argc, char **argv) {
                 RtxRun r = d.runs.data[k];
                 const char *s = rtx_scope_name(r.style.scope);
                 if (s && strstr(s, "embedded.block.css") && r.start == so) {
-                    span_ok = (r.start + r.len == eo && r.hint_a == 7 &&
-                               r.hint_b == 8);
+                    /* HTML is CODE: the span is paint, not a mark. */
+                    span_ok = (r.start + r.len == eo && r.hint_a == 0 &&
+                               r.hint_b == 0);
                 }
             }
             expect(span_ok, "<style>…</style> is one RE_SPAN");
@@ -1452,8 +1699,8 @@ int main(int argc, char **argv) {
                 RtxRun r = d.runs.data[k];
                 const char *s = rtx_scope_name(r.style.scope);
                 if (s && strstr(s, "embedded.block.js") && r.start == so) {
-                    span_ok = (r.start + r.len == eo && r.hint_a == 8 &&
-                               r.hint_b == 9);
+                    span_ok = (r.start + r.len == eo && r.hint_a == 0 &&
+                               r.hint_b == 0);
                 }
             }
             expect(span_ok, "<script>…</script> is one RE_SPAN");
@@ -1572,6 +1819,62 @@ int main(int argc, char **argv) {
         expect(!d.fold_covers(b), "next heading visible");
         expect(d.fold_toggle() == 2, "unfold");
         expect(d.fold_n == 0, "fold cleared");
+        remove(mpath);
+    }
+
+    {
+        /* A level-N heading folds to the next heading of level <= N; deeper
+         * headings are inside its section. */
+        char mpath[512];
+        FILE *mf;
+        RtxDoc d = {0} @destroy;
+        const char *md = "# One\n\nintro\n\n## Sub A\n\na body\n\n### Deep\n\ndeep body\n\n"
+                         "## Sub B\n\nb body\n\n# Two\n\ntail\n";
+        size_t one, suba, deep, subb, two;
+        expect(join2(mpath, sizeof mpath, "testdata/generated", "nav_lvl.md"),
+               "nav_lvl.md path");
+        mf = fopen(mpath, "w");
+        expect(mf != NULL, "nav_lvl.md write");
+        if (mf) {
+            fputs(md, mf);
+            fclose(mf);
+        }
+        d.from_path(cc_slice_cstr(mpath)) !>;
+        one = 0;
+        suba = (size_t)(strstr(md, "## Sub A") - md);
+        deep = (size_t)(strstr(md, "### Deep") - md);
+        subb = (size_t)(strstr(md, "## Sub B") - md);
+        two = (size_t)(strstr(md, "# Two") - md);
+        d.caret = one;
+        d.sel_anchor = one;
+        expect(d.fold_toggle() == 1, "fold h1");
+        expect(d.fold_n == 1 && d.folds[0].lo == one && d.folds[0].hi == two,
+               "h1 folds over its h2 / h3 to the next h1");
+        expect(d.fold_covers(deep) && d.fold_covers(subb), "subsections inside h1");
+        expect(!d.fold_covers(two), "next h1 visible");
+        expect(d.fold_toggle() == 2, "unfold h1");
+        d.caret = suba + 3;
+        d.sel_anchor = d.caret;
+        expect(d.fold_toggle() == 1, "fold h2");
+        expect(d.fold_n == 1 && d.folds[0].lo == suba && d.folds[0].hi == subb,
+               "h2 folds over its h3 to the next h2");
+        expect(d.fold_toggle() == 2, "unfold h2");
+        d.caret = subb;
+        d.sel_anchor = subb;
+        expect(d.fold_toggle() == 1, "fold last h2");
+        expect(d.fold_n == 1 && d.folds[0].hi == two, "h2 ends at a higher h1");
+        expect(d.fold_toggle() == 2, "unfold last h2");
+        d.caret = deep;
+        d.sel_anchor = deep;
+        expect(d.fold_toggle() == 1, "fold h3");
+        expect(d.fold_n == 1 && d.folds[0].lo == deep && d.folds[0].hi == subb,
+               "h3 ends at the next h2");
+        expect(d.fold_toggle() == 2, "unfold h3");
+        d.caret = two;
+        d.sel_anchor = two;
+        expect(d.fold_toggle() == 1, "fold last h1 to EOF");
+        expect(d.fold_n == 1 && d.folds[0].hi == d.len(), "last h1 ends at EOF");
+        expect(d.fold_toggle() == 2, "unfold last h1");
         remove(mpath);
     }
 
@@ -2219,8 +2522,10 @@ int main(int argc, char **argv) {
         if (frame.base) frame.destroy();
     }
     {
-        /* Inner `#bold` is a different rule tag than the root include.
-         * Toggle-off looks up the tag and compares `cctext.apply`. */
+        /* A heading's bold is lexed by the block pass's inline rules (a
+         * root tag); inside a link label it is an inner `#bold` copy.
+         * Toggle-off looks up the tag and compares `cctext.apply`, so
+         * either unwraps. */
         RtxDoc d = {0} @destroy;
         CCArena frame = cc_arena_heap(kilobytes(8));
         char[:] all;
@@ -2241,9 +2546,8 @@ int main(int argc, char **argv) {
             planted = r->planter == RTX_RUN_TM && r->rule != 0 && r->style.bold;
             tag = r->rule;
         }
-        expect(planted, "rule id: inner bold run stores a tag");
-        expect((tag & (unsigned short)RTX_TM_INNER) != 0,
-               "rule id: inner #bold is an inner tag");
+        expect(planted, "rule id: heading bold run stores a tag");
+        (void)tag;
         d.caret = at;
         d.sel_anchor = at;
         RtxDoc_apply_named(&d, "bold") !>;
@@ -2632,6 +2936,202 @@ int main(int argc, char **argv) {
     }
     /* --- end heading fold EOF fallback ---------------------------------- */
 
+    /* --- run lookup: agreement + many-run cost ----------------------------
+     * Every query must match the reference walk on nested runs (MD fences
+     * with guest lex, marks, links), CSV `""` escapes, and a JSON body with
+     * tens of thousands of runs. The indexed sweep must beat the walk-back,
+     * which paid O(#runs) per call. */
+    {
+        char rpath[512];
+        FILE *rf;
+        int k, bad;
+        size_t off;
+        {
+            RtxDoc d = {0} @destroy;
+            expect(join2(rpath, sizeof rpath, "testdata/generated", "runs_nest.md"),
+                   "runs_nest path");
+            rf = fopen(rpath, "w");
+            expect(rf != NULL, "runs_nest write");
+            for (k = 0; rf && k < 60; k++) {
+                fprintf(rf, "## Part %d\n\nSome **bold *mix* here** and `code %d` "
+                            "with [link %d](http://x/%d) and ~~gone~~.\n\n", k, k, k, k);
+                fprintf(rf, "```json\n{\"a\": [1, 2, \"s%d\"], \"b\": true,\n"
+                            " \"c\": {\"d\": null, \"e\": \"q\\\"x\"}}\n```\n\n", k);
+                fprintf(rf, "- [ ] task **%d**\n> quote *%d*\n\n", k, k);
+            }
+            if (rf) fclose(rf);
+            d.from_path(cc_slice_cstr(rpath)) !>;
+            expect(d.runs.len > 600, "runs_nest plants nested runs");
+            bad = 0;
+            for (off = 0; off <= d.len(); off++) {
+                if (!runs_agree(&d, off)) bad++;
+            }
+            expect(bad == 0, "md runs agree with the reference walk");
+            if (bad) fprintf(stderr, "  md disagreements: %d\n", bad);
+            remove(rpath);
+        }
+        {
+            RtxDoc d = {0} @destroy;
+            expect(join2(rpath, sizeof rpath, "testdata/generated", "runs_quote.csv"),
+                   "runs_quote path");
+            rf = fopen(rpath, "w");
+            expect(rf != NULL, "runs_quote write");
+            if (rf) fputs("id,note,n\n", rf);
+            for (k = 0; rf && k < 400; k++)
+                fprintf(rf, "%d,\"say \"\"hi %d\"\" really\nnext\",%d\n", k, k, k * 3);
+            if (rf) fclose(rf);
+            d.from_path(cc_slice_cstr(rpath)) !>;
+            expect(d.runs.len > 400, "runs_quote plants string runs");
+            bad = 0;
+            for (off = 0; off <= d.len(); off++) {
+                if (!runs_agree(&d, off)) bad++;
+            }
+            expect(bad == 0, "csv runs agree with the reference walk");
+            if (bad) fprintf(stderr, "  csv disagreements: %d\n", bad);
+            remove(rpath);
+        }
+        {
+            RtxDoc d = {0} @destroy;
+            double t0, t_ref, t_new;
+            size_t acc_ref = 0, acc_new = 0, calls = 0, stride = 7;
+            expect(join2(rpath, sizeof rpath, "testdata/generated", "runs_many.json"),
+                   "runs_many path");
+            rf = fopen(rpath, "w");
+            expect(rf != NULL, "runs_many write");
+            if (rf) fputs("[\n", rf);
+            for (k = 0; rf && k < 3000; k++)
+                fprintf(rf, "  {\"id\": %d, \"name\": \"item %d\", \"ok\": true, "
+                            "\"v\": [1, 2.5, null]},\n", k, k);
+            if (rf) {
+                fputs("  {}\n]\n", rf);
+                fclose(rf);
+            }
+            d.from_path(cc_slice_cstr(rpath)) !>;
+            expect(d.hl_full, "runs_many is fully lexed");
+            expect(d.runs.len > 20000, "runs_many plants many runs");
+            bad = 0;
+            for (off = 0; off <= d.len(); off += 61) {
+                if (!runs_agree(&d, off)) bad++;
+            }
+            expect(bad == 0, "json runs agree with the reference walk");
+            t0 = runs_ms();
+            for (off = 0; off < d.len(); off += stride) {
+                acc_ref += (size_t)ref_style_at(&d, off).scope;
+                calls++;
+            }
+            t_ref = runs_ms() - t0;
+            t0 = runs_ms();
+            for (off = 0; off < d.len(); off += stride)
+                acc_new += (size_t)d.style_at(off).scope;
+            t_new = runs_ms() - t0;
+            expect(acc_ref == acc_new, "json sweep agrees");
+            printf("  run lookup: runs=%zu calls=%zu walk-back=%.2f ms indexed=%.2f ms\n",
+                   d.runs.len, calls, t_ref, t_new);
+            expect(t_new * 4.0 < t_ref, "indexed style_at beats the walk-back");
+            remove(rpath);
+        }
+    }
+    /* --- end run lookup -------------------------------------------------- */
+
+    /* Scope intern is by whole name: a shorter name after a longer one
+     * that it prefixes is a new id, and the longer one is found again. */
+    {
+        RtxScope lng = RTX_SCOPE_NONE, sht = RTX_SCOPE_NONE, lng2 = RTX_SCOPE_NONE;
+        RtxScope sht2 = RTX_SCOPE_NONE;
+        expect(rtx_scope_put(&lng, "zz.review.long.name"), "scope: put long");
+        expect(rtx_scope_put(&sht, "zz.review"), "scope: put short");
+        expect(rtx_scope_put(&lng2, "zz.review.long.name"), "scope: put long again");
+        expect(rtx_scope_put(&sht2, "zz.review"), "scope: put short again");
+        expect(sht != lng, "scope: prefix name is its own id");
+        expect(lng2 == lng && sht2 == sht, "scope: intern is stable");
+        expect(strcmp(rtx_scope_name(sht), "zz.review") == 0,
+               "scope: short name round-trips");
+    }
+
+    /* Hints are the markup lens: host MARKUP rules only. A CODE grammar
+     * (strings, comments, <script>) and a guest lex inside a fence plant
+     * paint, not marks. Rule tag "none" is not rule 0. */
+    {
+        static const char *code[] = {
+            "testdata/rich/code/embeds.c",
+            "testdata/rich/code/embeds.py",
+            "testdata/rich/code/embeds.html",
+        };
+        size_t f;
+        for (f = 0; f < sizeof code / sizeof code[0]; f++) {
+            RtxDoc d = {0} @destroy;
+            char msg[128];
+            d.from_path(cc_slice_cstr(code[f])) !>;
+            snprintf(msg, sizeof msg, "hints: %s has no marks", code[f]);
+            expect(d.runs.len > 0 && !RtxDoc_has_marks(&d), msg);
+        }
+    }
+    {
+        RtxDoc d = {0} @destroy;
+        CCArena frame = cc_arena_heap(kilobytes(16));
+        char[:] all;
+        const char *p;
+        size_t k, fence = 0, at;
+        int inj = 0, inj_hint = 0, cap_none = 0, fence_rule0 = 0;
+        expect(frame.base != NULL, "hints: frame");
+        d.from_path("testdata/rich/md/fences.md") !>;
+        all = d.scratch_span(0, d.len(), frame) !>;
+        p = strstr(all.ptr, "{\"k\": \"v\"");
+        expect(p != NULL, "hints: json fence body");
+        at = p ? (size_t)(p - all.ptr) + 1 : 0;
+        expect(p && !RtxDoc_hint_at(&d, at, NULL, NULL),
+               "hints: guest json quote is not a hint");
+        expect(p && !RtxDoc_mark_apply(&d, at), "hints: guest quote has no apply");
+        p = strstr(all.ptr, "class=\"a\"");
+        expect(p && !RtxDoc_hint_at(&d, (size_t)(p - all.ptr) + 6, NULL, NULL),
+               "hints: guest html quote is not a hint");
+        p = strstr(all.ptr, "echo \"$HOME\"");
+        expect(p && !RtxDoc_hint_at(&d, (size_t)(p - all.ptr) + 5, NULL, NULL),
+               "hints: guest sh quote is not a hint");
+        p = strstr(all.ptr, "```json");
+        fence = p ? (size_t)(p - all.ptr) : 0;
+        for (k = 0; k < d.runs.len; k++) {
+            const RtxRun *r = &d.runs.data[k];
+            if (r->planter == (unsigned char)RTX_RUN_INJECT) {
+                inj = 1;
+                if (r->hint_a || r->hint_b) inj_hint = 1;
+            }
+            if (r->planter == (unsigned char)RTX_RUN_TM && r->start == fence &&
+                r->hint_a == 3 && r->hint_b == 3 && r->rule == 0)
+                fence_rule0 = 1;
+        }
+        expect(inj && !inj_hint, "hints: injected runs carry no hints");
+        expect(fence_rule0, "hints: host fence keeps ``` hints (rule 0)");
+        {
+            /* JSON key: the match rule plants a run, its capture another. */
+            char jpath[] = "/tmp/rtx_hint_tag_XXXXXX";
+            char jname[64];
+            int fd = mkstemp(jpath);
+            RtxDoc j = {0} @destroy;
+            RtxStyle st = {0};
+            if (fd >= 0) {
+                (void)!write(fd, "{\"key\": 1}\n", 11);
+                close(fd);
+            }
+            snprintf(jname, sizeof jname, "%s.json", jpath);
+            rename(jpath, jname);
+            j.from_path(cc_slice_cstr(jname)) !>;
+            for (k = 0; k < j.runs.len; k++) {
+                const char *s = rtx_scope_name(j.runs.data[k].style.scope);
+                if (s && strstr(s, "property") &&
+                    j.runs.data[k].rule == (unsigned short)RTX_RUN_NO_RULE)
+                    cap_none = 1;
+            }
+            expect(cap_none, "hints: a capture run's rule tag is RTX_RUN_NO_RULE");
+            expect(rtx_doc_add_run(&j, 0, 1, st, RTX_RUN_PROSE), "hints: add run");
+            expect(j.runs.data[j.runs.len - 1].rule == (unsigned short)RTX_RUN_NO_RULE,
+                   "hints: a planted run without a rule is RTX_RUN_NO_RULE");
+            remove(jname);
+        }
+        if (frame.base) frame.destroy();
+    }
+
+    heredoc_check();
     free(buf);
     if (arena.base) arena.destroy();
     if (fails) {

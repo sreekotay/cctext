@@ -1,0 +1,558 @@
+#!ccc ccs
+/*
+ * PageDown cost must not grow with the pages already visited.
+ *
+ * One pane (100 cells x 50 rows, Rich, soft wrap), a seeking camera from
+ * BOF, and the TUI's PageDown frame: the page motion, reveal, ensure_view,
+ * then the workspace's run trim for that camera. Per page wall time and
+ * the run count are sampled; page ~200 must cost at most twice page ~5
+ * (medians over ten pages, plus a small absolute slack for timer noise),
+ * and the runs held must stay bounded by the working set.
+ *
+ * Table walks (Rich, wrap and not): Up / Down with the pane following the
+ * caret never stall, never land on a separator line, step a wrapped cell
+ * one line at a time, Up retraces Down, and PageUp / PageDown of n land n
+ * steps on; page_vert equals vis-1 move_vert calls with no skipped pages.
+ *
+ *   ./bin/scroll_smoke                  generated mixed text / md / json
+ *   ./bin/scroll_smoke PATH [pages]     one file, prints per-page ms
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+
+#define SC_W 100.0
+#define SC_VIS 50
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return (double)rtx_utf8_cols(bytes);
+}
+
+static double cell_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 1.0;
+}
+
+static double mono_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static int dcmp(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+static double median(const double *v, size_t lo, size_t hi) {
+    double t[64];
+    size_t n = 0, i;
+    for (i = lo; i < hi && n < 64; i++) t[n++] = v[i];
+    if (!n) return 0;
+    qsort(t, n, sizeof(double), dcmp);
+    return t[n / 2];
+}
+
+/* testdata/gen_large.sh --bytes: `=== prose ===` / `=== code ===` blocks. */
+static void write_mixed(const char *path, size_t want) {
+    FILE *fp = fopen(path, "w");
+    size_t n = 0, b = 0;
+    if (!fp) return;
+    while (n < want) {
+        n += (size_t)fprintf(fp,
+                             "=== prose ===\nBlock %zu. A *bold* word and `mono` in a wrapping "
+                             "paragraph that keeps going so an eighty-column pane actually "
+                             "splits this line into more than one visual row.\n=== code ===\n"
+                             "int fn_%zu(void) {\n    /* block %zu */\n    int x = %zu;\n"
+                             "    return x;\n}\n",
+                             b, b, b, b);
+        b++;
+    }
+    fclose(fp);
+}
+
+static void write_md(const char *path, size_t want) {
+    FILE *fp = fopen(path, "w");
+    size_t n = 0, b = 0;
+    if (!fp) return;
+    while (n < want) {
+        n += (size_t)fprintf(fp,
+                             "## Part %zu\n\nText with *em*, **strong** and `code %zu`, "
+                             "[a link](http://x.y/%zu) that runs on long enough to wrap "
+                             "in a hundred-column pane at least once.\n\n"
+                             "| Name | Kind | Count |\n|---|:---:|--:|\n"
+                             "| a%zu | **b** | %zu |\n| `c` | d | 7 |\n\n"
+                             "```python\ndef f%zu():\n    return '*'  # not *em*\n```\n\n"
+                             "> quote %zu with *em*\n\n- [ ] task %zu\n- item\n\n",
+                             b, b, b, b, b, b, b, b);
+        b++;
+    }
+    fclose(fp);
+}
+
+static void write_json(const char *path, size_t want) {
+    FILE *fp = fopen(path, "w");
+    size_t n = 0, b = 0;
+    if (!fp) return;
+    n += (size_t)fprintf(fp, "[");
+    while (n < want) {
+        n += (size_t)fprintf(fp,
+                             "\n  {\"id\": %zu, \"name\": \"item_%zu\", \"ok\": %s, "
+                             "\"n\": -2.5, \"s\": \"a\\nb\"},",
+                             b, b, b % 2 ? "true" : "false");
+        b++;
+    }
+    fprintf(fp, "\n  {\"id\": -1}\n]\n");
+    fclose(fp);
+}
+
+/* The TUI PageDown frame (cctext_input.ccs KEY_PAGE_DOWN, then the dirty
+ * pass: reveal + ensure_view), then the frame's trim of this camera. */
+static void !>(CCError) page(RtxBuf *b, RtxMeasure *m, int dir) {
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    b->page_vert(m, SC_W, dir, SC_VIS - 1, 0) !>;
+    b->reveal(SC_VIS) !>(ie) { return cc_err(CC_ERR_IO, "reveal"); };
+    b->ensure_view(m, SC_W, SC_VIS) !>;
+    RtxBuf_hl_trim(b);
+    return cc_ok();
+}
+
+/* page_vert lands where vis-1 move_vert calls land (caret, anchor, goal x),
+ * down and up, soft wrap or not, with and without Shift. */
+static void !>(CCError) same_as_steps(const char *path, int wrap, int rich, size_t pages) {
+    RtxBuf a = {0} @destroy;
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    size_t p, bad = 0, skipped = 0;
+    char msg[256];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    m.measure = cell_meas;
+    m.line_height = cell_lh;
+    a.doc.from_path(cc_slice_cstr(path)) !>;
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    a.layout.wrap = b.layout.wrap = wrap;
+    a.layout.rich = b.layout.rich = rich;
+    rtx_buf_seek_set(&a, 0);
+    rtx_buf_seek_set(&b, 0);
+    a.ensure_view(&m, SC_W, SC_VIS) !>;
+    b.ensure_view(&m, SC_W, SC_VIS) !>;
+    for (p = 0; p < pages; p++) {
+        int dir = (p % 10) < 7 ? 1 : -1;
+        int shift = (p % 13) == 5;
+        int k;
+        if (p % 17 == 3) {
+            /* A goal column off the row start. */
+            a.doc.caret += 7;
+            b.doc.caret = a.doc.caret;
+            a.doc.sel_anchor = b.doc.sel_anchor = a.doc.caret;
+            a.clear_pref();
+            b.clear_pref();
+        }
+        size_t c0 = a.doc.caret;
+        int stuck = 0;
+        a.page_vert(&m, SC_W, dir, SC_VIS - 1, shift) !>;
+        for (k = 0; k < SC_VIS - 1; k++) {
+            size_t was = b.doc.caret;
+            b.move_vert(&m, SC_W, dir, shift) !>;
+            /* Off the first / last line, up / down always moves (a Rich
+             * table's header or separator used to stall it). */
+            if (!stuck && b.doc.caret == was) {
+                size_t ls = rtx_doc_line_floor(&b.doc, was) !>(ie) {
+                    return cc_err(CC_ERR_IO, "line floor");
+                };
+                size_t nx = 0;
+                int more = rtx_doc_next_line_start(&b.doc, ls, &nx) !>(ie) {
+                    return cc_err(CC_ERR_IO, "next line");
+                };
+                if (dir < 0 ? ls > 0 : more) {
+                    fprintf(stderr, "%s wrap %d rich %d page %zu: move_vert %d stalled at %zu\n",
+                            path, wrap, rich, p, dir, was);
+                    stuck = 1;
+                }
+            }
+        }
+        if (a.doc.caret != b.doc.caret || a.doc.sel_anchor != b.doc.sel_anchor ||
+            a.pref.x != b.pref.x) {
+            if (!bad)
+                fprintf(stderr, "%s wrap %d rich %d page %zu dir %d from %zu: caret %zu / %zu anchor %zu / %zu x %.1f / %.1f\n",
+                        path, wrap, rich, p, dir, c0, a.doc.caret, b.doc.caret, a.doc.sel_anchor,
+                        b.doc.sel_anchor, a.pref.x, b.pref.x);
+            bad++;
+        }
+        if (stuck) skipped++;
+        b.doc.caret = a.doc.caret;
+        b.doc.sel_anchor = a.doc.sel_anchor;
+        b.pref = a.pref;
+        a.reveal(SC_VIS) !>(ie) { return cc_err(CC_ERR_IO, "reveal"); };
+        b.reveal(SC_VIS) !>(ie) { return cc_err(CC_ERR_IO, "reveal"); };
+        a.ensure_view(&m, SC_W, SC_VIS) !>;
+        b.ensure_view(&m, SC_W, SC_VIS) !>;
+    }
+    snprintf(msg, sizeof msg, "%s wrap %d rich %d: page_vert differs from move_vert on %zu pages",
+             path, wrap, rich, bad);
+    expect(bad == 0, msg);
+    snprintf(msg, sizeof msg, "%s wrap %d rich %d: move_vert stalled on %zu of %zu pages",
+             path, wrap, rich, skipped, pages);
+    expect(skipped == 0, msg);
+    return cc_ok();
+}
+
+/* Markdown whose tables have cells that wrap in a 100-column pane (rows of
+ * different widths: a table is measured whole, not by the rows a fill
+ * holds), a header-only table, and text between. */
+static void write_tables(const char *path, size_t blocks) {
+    FILE *fp = fopen(path, "w");
+    size_t b;
+    const char *lng = "a long description that keeps going well past the width a fitted "
+                      "column gets in a hundred-column pane, so the cell wraps to several "
+                      "lines of its own record, and then some more words so that it takes "
+                      "at least three or four of them at the width the fit leaves it";
+    if (!fp) return;
+    for (b = 0; b < blocks; b++) {
+        fprintf(fp, "## Part %zu\n\nIntro %zu with *em* and a line that is long enough to "
+                    "wrap once in a hundred-column pane when soft wrap is on.\n\n",
+                b, b);
+        fprintf(fp, "| Key | Description | N |\n|---|---|--:|\n| k%zua | %s | 1 |\n"
+                    "| k%zub | short | 22 |\n| k%zuc | %s and a tail %zu | 333 |\n\n",
+                b, lng, b, b, lng, b);
+        if (b % 3 == 1) fprintf(fp, "| Only | Header |\n|---|---|\n\n");
+        fprintf(fp, "Between %zu.\n\n| A | B |\n|:-:|---|\n| x%zu | y |\n\n", b, b);
+    }
+    fclose(fp);
+}
+
+/* A table's separator line (by its text): `|`, `-`, `:` and blanks only,
+ * under a line that starts with `|`. */
+static int on_sep_line(const char *t, size_t n, size_t off) {
+    size_t ls = off, pl, i;
+    int dash = 0;
+    while (ls > 0 && t[ls - 1] != '\n') ls--;
+    if (ls == 0 || t[ls] != '|') return 0;
+    pl = ls - 1;
+    while (pl > 0 && t[pl - 1] != '\n') pl--;
+    if (t[pl] != '|') return 0;
+    for (i = ls; i < n && t[i] != '\n'; i++) {
+        if (t[i] == '-') dash = 1;
+        else if (t[i] != '|' && t[i] != ':' && t[i] != ' ') return 0;
+    }
+    return dash;
+}
+
+/* The TUI's Up / Down frame: the motion, then reveal + ensure_view. */
+static void !>(CCError) key_vert(RtxBuf *b, RtxMeasure *m, int dir) {
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    b->move_vert(m, SC_W, dir, 0) !>;
+    b->reveal(SC_VIS) !>(ie) { return cc_err(CC_ERR_IO, "reveal"); };
+    b->ensure_view(m, SC_W, SC_VIS) !>;
+    return cc_ok();
+}
+
+/* Down from BOF to EOF with a fixed goal x, as the TUI steps (the pane
+ * follows the caret), then Up back: every step moves (no stall short of
+ * the last / first line), never lands on a separator line, steps a wrapped
+ * cell line by line (soft wrap), and Up retraces Down exactly. PageDown /
+ * PageUp of n from any landing land n landings on. */
+static void !>(CCError) table_walk(const char *path, int wrap, double gx) {
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    RtxPref goal = {0};
+    size_t *seq = NULL, ns = 0, cap = 0, i, n, bad = 0, nsep = 0, maxli = 0, badli = 0;
+    size_t pages = 0, pbad = 0;
+    char *text = NULL;
+    FILE *fp;
+    long sz;
+    char msg[256];
+    const size_t steps_n[2] = {SC_VIS - 1, 5};
+    int q, prev_li = 0, cur_li = 0;
+    @errhandler(CCError e) {
+        free(seq);
+        free(text);
+        return cc_err(e);
+    }
+    fp = fopen(path, "rb");
+    if (!fp) return cc_err(CC_ERR_IO, "table walk");
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    text = malloc((size_t)sz + 1);
+    if (!text || fread(text, 1, (size_t)sz, fp) != (size_t)sz) {
+        fclose(fp);
+        free(text);
+        return cc_err(CC_ERR_IO, "table walk");
+    }
+    fclose(fp);
+    m.measure = cell_meas;
+    m.line_height = cell_lh;
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    n = b.len();
+    b.layout.wrap = wrap;
+    b.layout.rich = 1;
+    rtx_buf_seek_set(&b, 0);
+    b.ensure_view(&m, SC_W, SC_VIS) !>;
+    goal.ok = 1;
+    goal.x = gx;
+    b.pref = goal;
+    /* Down. */
+    for (;;) {
+        size_t was = b.doc.caret;
+        int li = 0;
+        prev_li = cur_li;
+        if (ns == cap) {
+            size_t *g = realloc(seq, (cap = cap ? 2 * cap : 1024) * sizeof *seq);
+            if (!g) return cc_err(CC_ERR_OUT_OF_MEMORY, "table walk");
+            seq = g;
+        }
+        seq[ns++] = was;
+        key_vert(&b, &m, 1) !>;
+        if (b.doc.caret == was) break;
+        if (b.doc.caret < was) {
+            if (!bad)
+                fprintf(stderr, "%s wrap %d x %.0f: Down went back %zu -> %zu\n", path, wrap, gx,
+                        was, b.doc.caret);
+            bad++;
+            break;
+        }
+        if (on_sep_line(text, n, b.doc.caret)) {
+            if (!nsep)
+                fprintf(stderr, "%s wrap %d x %.0f: Down landed on a separator at %zu\n", path,
+                        wrap, gx, b.doc.caret);
+            nsep++;
+        }
+        li = rtx_layout_md_wrap_li(&b.layout, &b.doc, &m, b.doc.caret);
+        cur_li = li;
+        if ((size_t)li > maxli) maxli = (size_t)li;
+        {
+            /* Same physical line as the last landing: the next wrap line. */
+            size_t a0 = was, a1 = b.doc.caret, k;
+            int same = ns > 1;
+            for (k = a0; k < a1 && same; k++)
+                if (text[k] == '\n') same = 0;
+            if (same && wrap && rtx_layout_md_index(&b.layout, b.doc.caret) >= 0 &&
+                li != prev_li + 1) {
+                if (!badli)
+                    fprintf(stderr, "%s wrap %d x %.0f: Down in a record went from wrap line %d to %d (%zu)\n",
+                            path, wrap, gx, prev_li, li, b.doc.caret);
+                badli++;
+            }
+            if (!same && li != 0 && wrap) {
+                if (!badli)
+                    fprintf(stderr, "%s wrap %d x %.0f: Down entered a record at wrap line %d (%zu)\n",
+                            path, wrap, gx, li, b.doc.caret);
+                badli++;
+            }
+        }
+    }
+    {
+        /* Stopped on the last line only. */
+        size_t ls = rtx_doc_line_floor(&b.doc, b.doc.caret) !>(ie) {
+            return cc_err(CC_ERR_IO, "line floor");
+        };
+        size_t nx = 0;
+        int more = rtx_doc_next_line_start(&b.doc, ls, &nx) !>(ie) {
+            return cc_err(CC_ERR_IO, "next line");
+        };
+        if (more) {
+            fprintf(stderr, "%s wrap %d x %.0f: Down stalled at %zu (line %zu)\n", path, wrap, gx,
+                    b.doc.caret, ls);
+            bad++;
+        }
+    }
+    /* Up retraces every landing. */
+    for (i = ns - 1; i > 1 && !bad; i--) {
+        key_vert(&b, &m, -1) !>;
+        if (b.doc.caret != seq[i - 1]) {
+            fprintf(stderr, "%s wrap %d x %.0f: Up from %zu landed %zu, Down had %zu\n", path,
+                    wrap, gx, seq[i], b.doc.caret, seq[i - 1]);
+            bad++;
+        }
+    }
+    snprintf(msg, sizeof msg, "%s wrap %d x %.0f: Up / Down across tables (%zu landings)", path,
+             wrap, gx, ns);
+    expect(bad == 0, msg);
+    snprintf(msg, sizeof msg, "%s wrap %d x %.0f: %zu landings on a separator line", path, wrap,
+             gx, nsep);
+    expect(nsep == 0, msg);
+    snprintf(msg, sizeof msg, "%s wrap %d x %.0f: %zu records entered past their first wrap line",
+             path, wrap, gx, badli);
+    expect(badli == 0, msg);
+    if (wrap && gx > 10 && gx < 80) {
+        snprintf(msg, sizeof msg, "%s wrap %d x %.0f: a wrapped cell stepped line by line (max line %zu)",
+                 path, wrap, gx, maxli);
+        expect(maxli >= 2, msg);
+    }
+    /* Pages: from landing i, n landings on (down) and back (up), the pane
+     * where the TUI has it (the caret revealed). */
+    for (q = 0; q < 2 && !bad; q++) {
+        size_t pn = steps_n[q];
+        for (i = 1; i + pn < ns; i += 3) {
+            int dir;
+            for (dir = -1; dir <= 1; dir += 2) {
+                size_t from = dir > 0 ? seq[i] : seq[i + pn];
+                size_t want = dir > 0 ? seq[i + pn] : seq[i];
+                b.doc.caret = b.doc.sel_anchor = from;
+                b.pref = goal;
+                b.reveal(SC_VIS) !>(ie) { return cc_err(CC_ERR_IO, "reveal"); };
+                b.ensure_view(&m, SC_W, SC_VIS) !>;
+                b.page_vert(&m, SC_W, dir, pn, 0) !>;
+                pages++;
+                if (b.doc.caret != want) {
+                    if (!pbad)
+                        fprintf(stderr, "%s wrap %d x %.0f: page %d of %zu from %zu landed %zu, steps %zu\n",
+                                path, wrap, gx, dir, pn, from, b.doc.caret, want);
+                    pbad++;
+                }
+            }
+        }
+    }
+    snprintf(msg, sizeof msg, "%s wrap %d x %.0f: %zu of %zu pages differ from the steps", path,
+             wrap, gx, pbad, pages);
+    expect(pbad == 0, msg);
+    free(seq);
+    free(text);
+    return cc_ok();
+}
+
+static void !>(CCError) run(const char *path, size_t pages, int check, int verbose) {
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    double *ms;
+    size_t *runs;
+    size_t p, max_runs = 0;
+    char msg[256];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    m.measure = cell_meas;
+    m.line_height = cell_lh;
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.wrap = 1;
+    b.layout.rich = 1;
+    rtx_buf_seek_set(&b, 0);
+    b.ensure_view(&m, SC_W, SC_VIS) !>;
+    ms = calloc(pages + 1, sizeof *ms);
+    runs = calloc(pages + 1, sizeof *runs);
+    if (!ms || !runs) {
+        free(ms);
+        free(runs);
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "scroll smoke");
+    }
+    for (p = 0; p < pages; p++) {
+        double t0 = mono_ms();
+        page(&b, &m, 1) !>(e) {
+            free(ms);
+            free(runs);
+            return cc_err(e);
+        };
+        ms[p] = mono_ms() - t0;
+        runs[p] = b.doc.runs.len;
+        if (runs[p] > max_runs) max_runs = runs[p];
+        if (verbose)
+            printf("page %zu off %zu caret %zu ms %.3f runs %zu [%zu..] ckpt %zu cov %d [%zu,%zu,%zu)\n",
+                   p + 1, b.seek_off, b.doc.caret, ms[p], runs[p],
+                   b.doc.runs.len ? b.doc.runs.data[0].start : 0, b.doc.tm_ckpt.len,
+                   b.doc.hl_cov.live, b.doc.hl_cov.anchor, b.doc.hl_cov.lo, b.doc.hl_cov.hi);
+    }
+    {
+        double early = median(ms, 4, 14), late = median(ms, pages - 10, pages), mx = 0;
+        size_t q;
+        for (q = 0; q < pages; q++)
+            if (ms[q] > mx) mx = ms[q];
+        printf("RESULT file=%s pages=%zu p1_ms=%.3f p5_ms=%.3f p50_ms=%.3f p%zu_ms=%.3f "
+               "early_med=%.3f late_med=%.3f max_ms=%.3f runs_max=%zu runs_end=%zu\n",
+               path, pages, ms[0], ms[4], ms[pages > 50 ? 49 : pages - 1], pages,
+               ms[pages - 1], early, late, mx, max_runs, runs[pages - 1]);
+        if (check) {
+            snprintf(msg, sizeof msg,
+                     "%s: PageDown grows with pages visited (pages 5-14 %.3f ms, last ten %.3f ms)",
+                     path, early, late);
+            expect(late <= 2.0 * early + 1.0, msg);
+            snprintf(msg, sizeof msg, "%s: runs grow with pages visited (page 20 %zu, max %zu)",
+                     path, runs[19], max_runs);
+            expect(max_runs <= 2 * (size_t)RTX_HL_TRIM_MIN + 4 * runs[19], msg);
+        }
+    }
+    free(ms);
+    free(runs);
+    return cc_ok();
+}
+
+int main(int argc, char **argv) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    if (argc > 1) {
+        size_t pages = argc > 2 ? (size_t)atol(argv[2]) : 200;
+        if (pages < 20) pages = 20;
+        run(argv[1], pages, 0, getenv("SCROLL_VERBOSE") != NULL) !>;
+        return fails ? 1 : 0;
+    }
+    (void)!system("mkdir -p testdata/generated");
+    {
+        const char *tx = "testdata/generated/scroll_smoke.txt";
+        const char *md = "testdata/generated/scroll_smoke.md";
+        const char *js = "testdata/generated/scroll_smoke.json";
+        const char *tb = "testdata/generated/scroll_tables.md";
+        write_mixed(tx, 3u << 20);
+        write_md(md, 2u << 20);
+        write_json(js, 2u << 20);
+        write_tables(tb, 24);
+        {
+            int wr;
+            for (wr = 0; wr < 2; wr++) {
+                table_walk(tb, wr, 2.0) !>;
+                table_walk(tb, wr, 30.0) !>;
+                table_walk(tb, wr, 95.0) !>;
+                same_as_steps(tb, wr, 1, 60) !>;
+            }
+        }
+        {
+            int wr, ri;
+            for (wr = 0; wr < 2; wr++)
+                for (ri = 0; ri < 2; ri++) {
+                    same_as_steps(tx, wr, ri, 60) !>;
+                    same_as_steps(md, wr, ri, 60) !>;
+                }
+        }
+        run(tx, 200, 1, 0) !>;
+        run(md, 200, 1, 0) !>;
+        run(js, 200, 1, 0) !>;
+        unlink(tx);
+        unlink(md);
+        unlink(js);
+        unlink(tb);
+    }
+    if (fails) {
+        fprintf(stderr, "%d failure(s)\n", fails);
+        return 1;
+    }
+    printf("scroll_smoke ok\n");
+    return 0;
+}

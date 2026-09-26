@@ -1,0 +1,428 @@
+#!ccc ccs
+/*
+ * Command table, keymap, help, palette and fuzzy scorer (core/cmd.cch,
+ * core/keymap.cch, core/ui_help.ccs, core/palette.cch, core/fuzzy.cch).
+ *
+ * 1. Table integrity: ids unique and well formed, every CMD_* has a row,
+ *    default chords parse, Esc letters are unique.
+ * 2. Chords: parse / label / name.
+ * 3. Keymap: table defaults, keys.json overrides, unbinding, chains,
+ *    per-host objects, unknown ids, comments, a JSON error keeps the
+ *    defaults, reserved ids go live when a row registers.
+ * 4. Help lines come from the table and follow the keymap.
+ * 5. Palette: context filter, recent first, fuzzy order, reserved last.
+ * 6. Fuzzy scorer ranking.
+ * 7. settings.json.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/cmd.cch"
+#include "../core/keymap.cch"
+#include "../core/palette.cch"
+#include "../core/fuzzy.cch"
+
+const char *rtx_help_line(size_t i);
+size_t rtx_help_n(void);
+void rtx_help_rebuild(void);
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static int row_of(const char *id) {
+    int r = rtx_cmd_find(id);
+    if (r < 0) fprintf(stderr, "no row %s\n", id);
+    return r;
+}
+
+static uint32_t ch(const char *s) {
+    return rtx_chord_parse(s, strlen(s));
+}
+
+static int look(const char *chord) {
+    return rtx_keymap_lookup(ch(chord));
+}
+
+static int id_ok(const char *id) {
+    size_t i;
+    if (!id || !id[0] || id[0] == '.') return 0;
+    for (i = 0; id[i]; i++) {
+        char c = id[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
+              c == '.'))
+            return 0;
+    }
+    return id[i - 1] != '.';
+}
+
+static int chords_parse(const char *s) {
+    const char *p = s ? s : "";
+    while (*p) {
+        const char *t;
+        size_t n;
+        while (*p == ' ') p++;
+        if (!*p) break;
+        t = p;
+        while (*p && *p != ' ') p++;
+        n = (size_t)(p - t);
+        if (!rtx_chord_parse(t, n)) {
+            fprintf(stderr, "bad chord '%.*s'\n", (int)n, t);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void t_table(void) {
+    size_t i, j, n = rtx_cmd_n();
+    int c;
+    char seen[256];
+    expect(n > 40, "table has the commands");
+    for (i = 0; i < n; i++) {
+        const RtxCmdDef *d = rtx_cmd_at(i);
+        char msg[160];
+        snprintf(msg, sizeof msg, "row %zu id well formed (%s)", i, d->id ? d->id : "?");
+        expect(id_ok(d->id), msg);
+        snprintf(msg, sizeof msg, "row %s has a title and category", d->id);
+        expect(d->title && d->title[0] && d->cat && d->cat[0], msg);
+        for (j = 0; j < i; j++) {
+            snprintf(msg, sizeof msg, "id %s unique", d->id);
+            expect(strcmp(rtx_cmd_at(j)->id, d->id) != 0, msg);
+        }
+        snprintf(msg, sizeof msg, "%s default chords parse", d->id);
+        expect(chords_parse(d->tui) && chords_parse(d->gui), msg);
+        snprintf(msg, sizeof msg, "%s runs something or is reserved", d->id);
+        expect((d->flags & RTX_CMDF_RESERVED) || d->cmd != CMD_NONE || d->run, msg);
+    }
+    for (c = CMD_NONE + 1; c < CMD__END; c++) {
+        char msg[64];
+        if (c == CMD_ROW) continue;
+        snprintf(msg, sizeof msg, "CMD_* %d has a table row", c);
+        expect(rtx_cmd_of(c) >= 0, msg);
+    }
+    memset(seen, 0, sizeof seen);
+    for (i = 0; i < n; i++) {
+        const char *l = rtx_cmd_at(i)->letters;
+        for (; l && *l; l++) {
+            char msg[64];
+            snprintf(msg, sizeof msg, "letter '%c' is one command's", *l);
+            expect(!seen[(unsigned char)*l], msg);
+            seen[(unsigned char)*l] = 1;
+        }
+    }
+    expect(rtx_cmd_letter('s') == CMD_SAVE, "letter s saves");
+    expect(rtx_cmd_letter('S') == CMD_SAVE, "letter S saves");
+    expect(rtx_cmd_letter('o') == CMD_BROWSE, "letter o browses");
+    expect(rtx_cmd_letter(':') == CMD_PALETTE, "letter : opens the palette");
+    expect(rtx_cmd_letter('h') == CMD_APPLY, "letter h cycles the prefix");
+    expect(rtx_cmd_letter('.') == CMD_APPLY_MENU, "letter . is the apply menu");
+    expect(rtx_cmd_letter('j') == CMD_NONE, "letter j is free");
+    expect(rtx_cmd_find("workspace.quick_open") >= 0 &&
+               rtx_cmd_available(rtx_cmd_at((size_t)rtx_cmd_find("workspace.quick_open"))),
+           "quick open is a real row");
+    expect(rtx_cmd_find("test.reserved") >= 0, "test id reserved");
+    expect(!rtx_cmd_available(rtx_cmd_at((size_t)rtx_cmd_find("test.reserved"))),
+           "reserved id is unavailable");
+    {
+        int rows[RTX_CMD_MAX];
+        size_t k = rtx_cmd_menu_rows("Edit", rows, RTX_CMD_MAX);
+        expect(k >= 6 && rtx_cmd_at((size_t)rows[0])->cmd == CMD_UNDO,
+               "Edit menu starts with Undo");
+    }
+}
+
+static void t_chords(void) {
+    char b[48];
+    expect(ch("ctrl+shift+p") == (RTX_CHORD_CTRL | RTX_CHORD_SHIFT | 'p'),
+           "ctrl+shift+p");
+    expect(ch("Ctrl-Shift-P") == ch("ctrl+shift+p"), "Ctrl-Shift-P spelling");
+    expect(ch("cmd+s") == ch("ctrl+s") && ch("mod+s") == ch("ctrl+s"),
+           "cmd / mod fold into ctrl");
+    expect(ch("f12") == RTX_KEY_F1 + 11, "f12");
+    expect(ch("ctrl+-") == (RTX_CHORD_CTRL | '-'), "ctrl+-");
+    expect(ch("ctrl+\\") == (RTX_CHORD_CTRL | '\\'), "ctrl+backslash");
+    expect(ch("alt+m") == (RTX_CHORD_ALT | 'm'), "alt+m");
+    expect(ch("ctrl+pgdn") == (RTX_CHORD_CTRL | RTX_KEY_PGDN), "ctrl+pgdn");
+    expect(ch("^ctrl+tab") == (RTX_CHORD_CTRL | RTX_KEY_TAB), "claim mark skipped");
+    expect(ch("hyper+x") == 0, "unknown modifier");
+    expect(ch("ctrl+") == 0, "missing key");
+    expect(ch("ctrl+nokey") == 0, "unknown key");
+    rtx_chord_label(ch("ctrl+shift+p"), RTX_HOST_TUI, b, sizeof b);
+    expect(strcmp(b, "Ctrl-Shift-P") == 0, "label Ctrl-Shift-P");
+    rtx_chord_label(ch("f1"), RTX_HOST_TUI, b, sizeof b);
+    expect(strcmp(b, "F1") == 0, "label F1");
+    rtx_chord_name(ch("Ctrl-PgUp"), b, sizeof b);
+    expect(strcmp(b, "ctrl+pgup") == 0, "name ctrl+pgup");
+    expect(ch(b) == ch("ctrl+pgup"), "name round-trips");
+}
+
+static int load_str(int host, const char *s, char *err, size_t errn) {
+    return rtx_keymap_load_text(host, s, strlen(s), err, errn);
+}
+
+static void t_keymap(void) {
+    char err[200];
+    int save = row_of("file.save");
+    int wrap = row_of("view.wrap");
+    int jump = row_of("go.line");
+    int prev = row_of("nav.prev_mark");
+    int pal = row_of("palette.open");
+    int next = row_of("buffer.next");
+    const char *keys =
+        "// my keys\n"
+        "{\n"
+        "  \"ctrl+s\": null,          /* unbind */\n"
+        "  \"ctrl+t\": \"file.save\",\n"
+        "  \"f2\": [\"test.reserved\", \"view.wrap\"],\n"
+        "  \"f6\": \"no.such.command\",\n"
+        "  \"tui\": { \"f3\": \"go.line\" },\n"
+        "  \"gui\": { \"f4\": \"go.line\" }\n"
+        "}\n";
+    int rc;
+
+    rtx_keymap_defaults(RTX_HOST_TUI);
+    expect(look("ctrl+s") == save, "default ctrl+s saves");
+    expect(look("ctrl+p") == row_of("workspace.quick_open"), "ctrl+p is quick open");
+    expect(strstr(rtx_keymap_hint(prev), "Ctrl-P") == NULL, "prev mark lost Ctrl-P");
+    expect(look("f9") == RTX_KM_NONE, "a reserved claim does not take its chord");
+    expect(look("ctrl+shift+s") == save, "ctrl+shift+s falls back to ctrl+s");
+    expect(look("ctrl+shift+f") == row_of("workspace.search"),
+           "ctrl+shift+f is project search");
+    expect(look("alt+shift+f") == row_of("workspace.search"),
+           "tui alt+shift+f is project search too");
+    expect(look("f4") == row_of("workspace.search_next") &&
+               look("shift+f4") == row_of("workspace.search_prev") &&
+               look("f5") == row_of("workspace.reindex"),
+           "f4 / shift+f4 / f5: search results, re-index");
+    expect(look("ctrl+tab") == next && look("ctrl+pgdn") == next,
+           "ctrl+tab / ctrl+pgdn: next buffer");
+    expect(look("ctrl+shift+tab") == row_of("buffer.prev") &&
+               look("ctrl+pgup") == row_of("buffer.prev"),
+           "ctrl+shift+tab / ctrl+pgup: previous buffer");
+    expect(look("ctrl+n") == row_of("file.next"), "ctrl+n: next file");
+    expect(look("ctrl+w") == row_of("pane.focus_next") &&
+               look("f6") == row_of("pane.focus_next"),
+           "tui ctrl+w / f6: next pane");
+    expect(look("alt+w") == row_of("buffer.close"), "tui alt+w closes the buffer");
+    expect(look("ctrl+\\") == row_of("pane.split_right") &&
+               look("ctrl+-") == row_of("pane.split_down") &&
+               look("ctrl+]") == row_of("pane.close"),
+           "tui split / close pane chords");
+    expect(look("ctrl+alt+left") == row_of("pane.resize_left"), "resize chord");
+    expect(row_of("pane.other") >= 0 && row_of("pane.split") >= 0,
+           "older pane ids still resolve");
+    expect(look("f1") == pal && look("ctrl+shift+p") == pal, "palette chords");
+    expect(look("alt+m") == wrap, "tui alt+m wraps");
+    expect(look("ctrl+j") == RTX_KM_NONE, "tui ctrl+j is not jump");
+    expect(look("alt+c") == RTX_KM_NONE, "find-field keys stay out of the keymap");
+    expect(strcmp(rtx_keymap_hint(save), "Ctrl-S") == 0, "save hint");
+    expect(strcmp(rtx_keymap_hint(row_of("find.open")), "Ctrl-F") == 0,
+           "find hint has no Shift fallback chord");
+    expect(strstr(rtx_keymap_hint(row_of("workspace.quick_open")), "Ctrl-P") != NULL,
+           "quick open shows Ctrl-P");
+    expect(strstr(rtx_keymap_hint(row_of("test.reserved")), "F9") != NULL,
+           "reserved row shows the chord it claims");
+
+    rtx_keymap_defaults(RTX_HOST_GUI);
+    expect(look("ctrl+j") == jump, "gui ctrl+j jumps");
+    expect(look("ctrl+shift+m") == wrap, "gui ctrl+shift+m wraps");
+    expect(look("ctrl+shift+z") == row_of("edit.redo"), "gui ctrl+shift+z redoes");
+    expect(look("ctrl+m") == RTX_KM_NONE, "gui ctrl+m (minimize) unbound");
+    expect(look("ctrl+w") == row_of("buffer.close"), "gui ctrl+w closes the buffer");
+    expect(strstr(rtx_keymap_hint(row_of("buffer.close")), "W") != NULL,
+           "gui Close Buffer claims Ctrl/Cmd-W");
+
+    rc = rtx_keymap_load_text(RTX_HOST_TUI, keys, strlen(keys), err, sizeof err);
+    expect(rc == 6, "six user entries");
+    expect(strstr(err, "no.such.command") != NULL, "unknown id reported");
+    expect(look("ctrl+s") == RTX_KM_INERT, "null unbinds ctrl+s");
+    expect(look("ctrl+t") == save, "ctrl+t rebound to save");
+    expect(look("f2") == wrap, "chain skips the reserved id");
+    expect(look("f6") == RTX_KM_INERT, "unknown id is inert");
+    expect(look("f3") == jump, "tui object applies to the terminal");
+    expect(look("f4") == row_of("workspace.search_next"), "gui object does not");
+    expect(strstr(rtx_keymap_hint(save), "Ctrl-T") != NULL &&
+           strstr(rtx_keymap_hint(save), "Ctrl-S") == NULL, "hint follows the keymap");
+    rtx_help_rebuild();
+    {
+        size_t i, n = rtx_help_n();
+        int found = 0;
+        for (i = 0; i < n; i++) {
+            const char *l = rtx_help_line(i);
+            if (strstr(l, "Save") && strstr(l, "Ctrl-T")) found = 1;
+        }
+        expect(found, "help shows the rebound key");
+    }
+
+    rc = rtx_keymap_load_text(RTX_HOST_GUI, keys, strlen(keys), err, sizeof err);
+    expect(look("f4") == jump && look("f3") == RTX_KM_NONE, "gui host objects");
+
+    rc = load_str(RTX_HOST_TUI, "{\"ctrl+t\": \"file.save\",", err, sizeof err);
+    expect(rc == -1 && strstr(err, "JSON") != NULL, "JSON error reported");
+    expect(look("ctrl+s") == save && look("ctrl+t") == row_of("nav.fold"),
+           "JSON error keeps the defaults");
+    rc = load_str(RTX_HOST_TUI, "{\"bogus+x\": \"file.save\"}", err, sizeof err);
+    expect(rc == 0 && strstr(err, "not a key") != NULL, "bad chord reported");
+    rc = rtx_keymap_setup(RTX_HOST_TUI, "/nonexistent/keys.json", err, sizeof err);
+    expect(rc == -1 && strstr(err, "cannot read") != NULL, "missing --keys file reported");
+    expect(look("ctrl+s") == save, "missing file keeps the defaults");
+}
+
+static int g_ran;
+static int run_quick(RtxCmdCtx *c) {
+    (void)c;
+    g_ran++;
+    return 1;
+}
+
+static void t_register(void) {
+    RtxCmdDef d;
+    int r;
+    memset(&d, 0, sizeof d);
+    d.id = "test.reserved";
+    d.title = "Reserved Test";
+    d.cat = "Test";
+    d.tui = "^f9";
+    d.gui = "^f9";
+    d.run = run_quick;
+    r = rtx_cmd_register(&d);
+    expect(r >= 0, "register a row");
+    expect(rtx_cmd_find("test.reserved") == r, "the real row shadows the reserved one");
+    rtx_keymap_defaults(RTX_HOST_TUI);
+    expect(look("f9") == r, "f9 goes to the row once it lands");
+    expect(strstr(rtx_keymap_hint(r), "F9") != NULL, "the row shows F9");
+    rtx_cmd_at((size_t)r)->run(NULL);
+    expect(g_ran == 1, "run hook");
+}
+
+static void t_palette(void) {
+    RtxPalette p;
+    int wrap = row_of("view.wrap");
+    int tbl = row_of("md.table.delete_column");
+    int i, has_tbl = 0;
+    RtxField f;
+    rtx_cmd_recent_clear();
+    rtx_palette_open(&p, RTX_CTX_DOC);
+    expect(p.nrows > 20 && p.navail > 20, "palette lists commands");
+    for (i = 0; i < p.nrows; i++) if (p.rows[i] == tbl) has_tbl = 1;
+    expect(!has_tbl, "table commands need a table");
+    expect(rtx_palette_row(&p, 0) == row_of("palette.open"), "empty query: table order");
+    for (i = 0; i < p.nrows; i++) {
+        if (i < p.navail) expect(rtx_palette_row_live(&p, i), "live rows first");
+        else expect(!rtx_palette_row_live(&p, i), "reserved rows last");
+    }
+    rtx_palette_open(&p, RTX_CTX_DOC | RTX_CTX_TABLE);
+    for (i = 0; i < p.nrows; i++) if (p.rows[i] == tbl) has_tbl = 1;
+    expect(has_tbl, "table commands in a table");
+    rtx_cmd_note_run(wrap);
+    rtx_palette_open(&p, RTX_CTX_DOC);
+    expect(rtx_palette_row(&p, 0) == wrap, "recent first");
+    f = rtx_palette_field(&p);
+    rtx_field_insert(f, "save", 4);
+    rtx_palette_refilter(&p);
+    expect(p.nrows >= 1 && rtx_palette_row(&p, 0) == row_of("file.save"), "save ranks Save first");
+    *f.len = 0;
+    *f.caret = *f.sel = 0;
+    rtx_field_insert(f, "rich", 4);
+    rtx_palette_refilter(&p);
+    expect(rtx_palette_row(&p, 0) == row_of("view.rich"), "rich ranks Rich / Source");
+    rtx_palette_open(&p, RTX_CTX_DOC | RTX_CTX_TABLE);
+    f = rtx_palette_field(&p);
+    rtx_field_insert(f, "delcol", 6);
+    rtx_palette_refilter(&p);
+    expect(rtx_palette_row(&p, 0) == tbl, "delcol finds Table: Delete Column");
+    rtx_palette_open(&p, RTX_CTX_DOC);
+    f = rtx_palette_field(&p);
+    rtx_field_insert(f, "reserved", 8);
+    rtx_palette_refilter(&p);
+    expect(p.nrows >= 1, "reserved rows listed");
+    for (i = 0; i < p.nrows; i++)
+        if (rtx_cmd_at((size_t)p.rows[i])->flags & RTX_CMDF_RESERVED) {
+            p.cur = i;
+            expect(rtx_palette_pick(&p) == -1, "unavailable row does not run");
+            break;
+        }
+    rtx_palette_open(&p, RTX_CTX_DOC);
+    rtx_palette_move(&p, 3, 2);
+    expect(p.cur == 3 && p.top == 2, "move keeps the selection in view");
+    rtx_palette_move(&p, -100, 2);
+    expect(p.cur == 0 && p.top == 0, "move clamps at the top");
+}
+
+static void t_fuzzy(void) {
+#define S(p, s) rtx_fuzzy_score_cstr(p, s)
+    expect(S("", "anything") == 0, "empty pattern matches");
+    expect(S("xyz", "Save") == -1, "no match");
+    expect(S("sva", "Save") == -1, "order matters");
+    expect(S("SAVE", "save") >= 0, "case folds");
+    expect(S("sav", "Save") > S("sav", "Resave"), "prefix beats middle");
+    expect(S("gl", "Go to Line") > S("gl", "Toggle"), "word starts beat a mid-word run");
+    expect(S("qo", "quickOpen") > S("qo", "quota"), "camel hump counts");
+    expect(S("save", "Save") > S("save", "sXaXvXe"), "contiguous beats scattered");
+    expect(S("ab", "ab") > S("ab", "abcdefghij"), "shorter wins a tie");
+    expect(S("fb", "foo/bar.c") > S("fb", "fooxbar.c"), "path separator is a word start");
+    expect(S("main", "src/main.c") > S("main", "domain_list.c"), "basename word wins");
+    expect(rtx_fuzzy_score("ab", 2, "xaxb", 4) >= 0, "explicit lengths");
+#undef S
+}
+
+static void t_settings(void) {
+    RtxSettings s;
+    char err[200];
+    const char *js = "{ \"tab_spaces\": 4, \"autopair\": false, // two\n"
+                     "  \"caret\": \"cell\", \"rich\": false, \"blink\": true,"
+                     "  \"bogus\": [1, 2] }";
+    memset(&s, 0, sizeof s);
+    expect(rtx_settings_parse(js, strlen(js), &s, err, sizeof err) == 0, "settings parse");
+    expect(s.has_tab_spaces && s.tab_spaces == 4, "tab_spaces");
+    expect(s.has_autopair && !s.autopair, "autopair");
+    expect(s.has_caret && s.caret_cell, "caret cell");
+    expect(s.has_rich && !s.rich, "rich");
+    expect(s.has_blink && s.blink, "blink");
+    expect(strstr(err, "bogus") != NULL, "unknown key reported");
+    memset(&s, 0, sizeof s);
+    expect(rtx_settings_parse("{\"tab_spaces\": }", strlen("{\"tab_spaces\": }"), &s, err,
+                              sizeof err) == -1, "settings JSON error");
+    memset(&s, 0, sizeof s);
+    expect(rtx_settings_parse("{\"tab_spaces\": 99}", strlen("{\"tab_spaces\": 99}"), &s,
+                              err, sizeof err) == 0 &&
+           !s.has_tab_spaces && strstr(err, "0-16"), "tab_spaces range");
+}
+
+/* The table has no reserved row left (quick open, search and buffers
+ * landed); the reservation mechanics run on a test row. */
+static void reserve_test_row(void) {
+    RtxCmdDef d;
+    memset(&d, 0, sizeof d);
+    d.id = "test.reserved";
+    d.title = "Reserved Test";
+    d.cat = "Test";
+    d.tui = "^f9";
+    d.gui = "^f9";
+    d.flags = RTX_CMDF_RESERVED | RTX_CMDF_NOHELP;
+    expect(rtx_cmd_register(&d) >= 0, "register a reserved test row");
+}
+
+int main(void) {
+    reserve_test_row();
+    t_table();
+    t_chords();
+    t_keymap();
+    t_palette();
+    t_register();
+    t_fuzzy();
+    t_settings();
+    if (fails) {
+        fprintf(stderr, "cmd_table_smoke: %d failed\n", fails);
+        return 1;
+    }
+    printf("cmd_table_smoke: ok\n");
+    return 0;
+}

@@ -18,6 +18,10 @@
 
 static int fails = 0;
 
+/* Fixed part of one RTXS v7 hist rec: 11 u64 + 2 i32, then group (u64),
+ * xact (u64), flags (u32). */
+#define REC_FIXED (96 + 20)
+
 static double meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
     (void)ctx;
     (void)style;
@@ -107,6 +111,89 @@ static int journal_header(const char *doc_path, uint32_t *magic, uint32_t *ver) 
              ((uint32_t)b[3] << 24);
     *ver = (uint32_t)b[4] | ((uint32_t)b[5] << 8) | ((uint32_t)b[6] << 16) |
            ((uint32_t)b[7] << 24);
+    return 1;
+}
+
+/* Whole RTXS leaf into buf (cap). Returns its size, 0 on a miss. */
+static size_t journal_read(const char *doc_path, unsigned char *buf, size_t cap) {
+    char path[4096];
+    ssize_t n;
+    int fd;
+    if (!rtx_safe_file_path(path, sizeof(path), doc_path)) return 0;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    n = read(fd, buf, cap);
+    close(fd);
+    return n > 0 ? (size_t)n : 0;
+}
+
+static int journal_write(const char *doc_path, const unsigned char *buf, size_t n) {
+    char path[4096];
+    int fd;
+    if (!rtx_safe_file_path(path, sizeof(path), doc_path)) return 0;
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return 0;
+    if (write(fd, buf, n) != (ssize_t)n) {
+        close(fd);
+        return 0;
+    }
+    close(fd);
+    return 1;
+}
+
+/* Re-seal a hand-edited leaf: FNV-1a 64 over all but the 8-byte trailer. */
+static void journal_resum(unsigned char *buf, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    size_t i;
+    if (n < 8) return;
+    for (i = 0; i + 8 < n; i++) {
+        h ^= (uint64_t)buf[i];
+        h *= 1099511628211ull;
+    }
+    for (i = 0; i < 8; i++) buf[n - 8 + i] = (unsigned char)(h >> (8 * i));
+}
+
+static void put_le64(unsigned char *p, uint64_t v) {
+    int i;
+    for (i = 0; i < 8; i++) p[i] = (unsigned char)(v >> (8 * i));
+}
+
+/* Offset of hlen in an RTXS leaf: magic, ver, path len + path, mtime,
+ * size, ino, saved, head. */
+static size_t journal_hlen_at(const unsigned char *buf) {
+    uint32_t pn = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) |
+                  ((uint32_t)buf[10] << 16) | ((uint32_t)buf[11] << 24);
+    return 12 + (size_t)pn + 8 * 5;
+}
+
+static int file_is(const char *path, const char *want) {
+    char buf[4096];
+    size_t n;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return strcmp(buf, want) == 0;
+}
+
+/* 1 = RtxWs_save_dirty succeeded. */
+static int save_ok(RtxWs *w) {
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    w->save_dirty() !>;
+    return 1;
+}
+
+/* 1 = RtxWs_sync_live succeeded. */
+static int sync_ok(RtxWs *w) {
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    w->sync_live() !>;
     return 1;
 }
 
@@ -205,7 +292,7 @@ int main(void) {
             sver = (uint32_t)sb[4] | ((uint32_t)sb[5] << 8) |
                    ((uint32_t)sb[6] << 16) | ((uint32_t)sb[7] << 24);
             expect(smagic == RTX_SAFE_STATE_MAGIC, "state magic is RTXC");
-            expect(sver == RTX_SAFE_STATE_VER, "state ver is 1");
+            expect(sver == RTX_SAFE_STATE_VER, "state ver is current");
         }
     }
     {
@@ -350,7 +437,44 @@ int main(void) {
         expect_text(&w.bufs[0]->doc, "zhello\n", "idle miss keeps the edit");
     }
 
-    /* External edit tosses hist. */
+    /* A failed idle hist write backs off; it does not retry every frame. */
+    isol_reset();
+    write_file(a, "hello\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        size_t att;
+        int k;
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        w.bufs[0]->doc.type("z") !>;
+        w.safe_pump();
+        w.bufs[0]->safe_due_ms = 1;
+        rtx_safe_fail_next_write();
+        w.safe_pump();
+        expect(w.bufs[0]->safe_fault, "backoff: first idle write missed");
+        att = rtx_safe_write_attempts();
+        for (k = 0; k < 5; k++) w.safe_pump();
+        expect(rtx_safe_write_attempts() == att, "failed idle flush does not retry every frame");
+        w.bufs[0]->doc.type("y") !>;
+        w.safe_pump();
+        expect(rtx_safe_write_attempts() == att, "a new edit does not jump the backoff");
+        w.bufs[0]->safe_due_ms = 1;
+        w.bufs[0]->safe_retry_ms = 1;
+        rtx_safe_fail_next_write();
+        w.safe_pump();
+        expect(rtx_safe_write_attempts() == att + 1, "backoff elapsed: one retry");
+        expect(w.bufs[0]->safe_backoff_ms > (long)RTX_SAFE_DEBOUNCE_MS,
+               "second miss doubles the backoff");
+        w.bufs[0]->safe_due_ms = 1;
+        w.bufs[0]->safe_retry_ms = 1;
+        w.safe_pump();
+        expect(!w.bufs[0]->safe_fault && w.bufs[0]->safe_backoff_ms == 0,
+               "a landed write clears the fault and the backoff");
+        expect(rtx_safe_peek_dirty(a), "retried journal landed");
+    }
+
+    /* External edit, clean journal: only undo history is lost. */
     isol_reset();
     write_file(a, "hello\n");
     {
@@ -361,9 +485,11 @@ int main(void) {
         {
             RtxDoc *d = &w.bufs[0]->doc;
             d->type("x") !>;
+            d->undo() !>;
         }
         w.safe_flush_all();
     }
+    usleep(30000);
     write_file(a, "changed\n");
     {
         RtxWs w = {0} @destroy;
@@ -373,9 +499,342 @@ int main(void) {
         {
             RtxDoc *d = &w.bufs[0]->doc;
             expect_text(d, "changed\n", "identity miss uses disk");
-            expect(!d->can_undo(), "hist tossed");
+            expect(!d->can_undo() && !d->can_redo(), "clean hist tossed");
             expect(!d->dirty(), "not dirty after toss");
+            expect(w.bufs[0]->safe_hold == RTX_SAFE_HOLD_NONE, "clean toss holds nothing");
+            expect(!w.any_dirty(), "clean toss is not unsaved work");
         }
+    }
+
+    /* External edit, dirty journal: the edits come back on the bytes they
+     * were made against (the pinned base), dirty, and Save asks. */
+    isol_reset();
+    write_file(a, "hello\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        char pin[4096];
+        struct stat pst;
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        w.bufs[0]->doc.type("x") !>;
+        w.safe_flush_all();
+        expect(rtx_safe_base_path(pin, sizeof(pin), a) && stat(pin, &pst) == 0,
+               "dirty flush pins the base");
+    }
+    usleep(30000);
+    write_file(a, "changed\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        char msg[512];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        {
+            RtxDoc *d = &w.bufs[0]->doc;
+            expect_text(d, "xhello\n", "drifted dirty journal replays onto its pin");
+            expect(d->dirty() && d->can_undo(), "recovered edits are dirty with undo");
+            expect(d->disk_changed(), "recovered onto the old base: Save sees the drift");
+            expect(w.bufs[0]->safe_rebased, "buffer knows it was rebased");
+            expect(rtx_ws_safe_fault_msg(&w, msg, sizeof(msg)), "rebase is on the status bar");
+            expect(!save_ok(&w), "save-all does not overwrite the drifted file");
+            expect(file_is(a, "changed\n"), "drifted file untouched");
+        }
+    }
+
+    /* The reported scenario: edit, switch away (parks dirty), the file
+     * changes on disk, quit -> Save. The edits must not vanish. */
+    isol_reset();
+    write_file(a, "hello\n");
+    write_file(b, "other\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        char pin[4096];
+        struct stat pst;
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        w.bufs[0]->doc.type("z") !>;
+        w.add_path(cc_slice_cstr(b)) !>;
+        w.npanes = 1;
+        w.pane[0] = 1;
+        w.pane[1] = 1;
+        w.sync_live() !>;
+        expect(w.bufs[0]->parked && w.bufs[0]->park_dirty, "a parked dirty");
+        usleep(30000);
+        write_file(a, "external\n");
+        expect(w.any_disk_changed(), "quit sees a parked dirty buffer's drift");
+        expect(!save_ok(&w), "save-all refuses instead of dropping the edits");
+        expect(file_is(a, "external\n"), "save-all left the drifted file alone");
+        expect(!w.bufs[0]->parked, "save-all unparked a");
+        expect_text(&w.bufs[0]->doc, "zhello\n", "parked edits recovered onto the pin");
+        expect(w.bufs[0]->doc.dirty(), "recovered parked edits are dirty");
+        expect(w.bufs[0]->doc.disk_changed(), "recovered parked buffer sees the drift");
+        w.bufs[0]->doc.save_overwrite();
+        w.bufs[0]->doc.save() !>;
+        expect(file_is(a, "zhello\n"), "overwrite writes the recovered edits");
+        w.safe_flush_all();
+        expect(rtx_safe_base_path(pin, sizeof(pin), a) && stat(pin, &pst) != 0,
+               "clean journal drops the pin");
+        expect(!w.any_disk_changed(), "no drift after overwrite");
+    }
+
+    /* No pin (the path drifted before the first dirty flush, or the base is
+     * past RTX_SAFE_BASE_MAX): the dirty journal is held, never tossed. */
+    {
+        unsigned char j0[8192], j1[8192];
+        size_t n0, n1;
+        char pin[4096];
+        struct stat pst;
+        isol_reset();
+        write_file(a, "hello\n");
+        write_file(b, "other\n");
+        {
+            RtxWs w = {0} @destroy;
+            char *paths[1];
+            paths[0] = (char *)a;
+            w.open_files(1, paths) !>;
+            w.bufs[0]->doc.type("x") !>;
+            usleep(30000);
+            write_file(a, "changed!\n");
+            w.safe_flush_all();
+        }
+        expect(rtx_safe_base_path(pin, sizeof(pin), a) && stat(pin, &pst) != 0,
+               "no pin from a path that already drifted");
+        expect(rtx_safe_peek_dirty(a), "held test journal is dirty");
+        n0 = journal_read(a, j0, sizeof(j0));
+        {
+            RtxWs w = {0} @destroy;
+            char *paths[1];
+            char msg[512];
+            paths[0] = (char *)a;
+            w.open_files(1, paths) !>;
+            expect_text(&w.bufs[0]->doc, "changed!\n", "held: shows the file");
+            expect(w.bufs[0]->safe_hold == RTX_SAFE_HOLD_CONFLICT, "held: conflict");
+            expect(w.any_dirty(), "held: counts as unsaved (quit asks)");
+            expect(rtx_ws_safe_fault_msg(&w, msg, sizeof(msg)) && strstr(msg, "held"),
+                   "held: status bar says so");
+            expect(!save_ok(&w), "held: save-all refuses");
+            w.bufs[0]->doc.type("Y") !>;
+            w.safe_flush_all();
+            w.safe_pump();
+            n1 = journal_read(a, j1, sizeof(j1));
+            expect(n1 == n0 && memcmp(j0, j1, n0) == 0, "held journal stays untouched");
+            w.add_path(cc_slice_cstr(b)) !>;
+            w.npanes = 1;
+            w.pane[0] = 1;
+            w.pane[1] = 1;
+            w.sync_live() !>;
+            expect(!w.bufs[0]->parked, "held + new edits: cannot park");
+            w.safe_discard_dirty();
+            expect(w.bufs[0]->safe_hold == RTX_SAFE_HOLD_NONE, "quit q releases the hold");
+            expect(!rtx_safe_peek_dirty(a), "quit q drops the held journal");
+        }
+        /* Held journal in a parked buffer (snapshot restore): save-all still
+         * refuses, quit still counts it. */
+        isol_reset();
+        write_file(a, "hello\n");
+        {
+            RtxWs w = {0} @destroy;
+            char *paths[1];
+            paths[0] = (char *)a;
+            w.open_files(1, paths) !>;
+            w.bufs[0]->doc.type("x") !>;
+            usleep(30000);
+            write_file(a, "changed!\n");
+            w.safe_flush_all();
+        }
+        {
+            RtxWs w = {0} @destroy;
+            w.open_files(0, NULL) !>;
+            expect(w.len == 1 && !w.untitled(), "restore has the held file");
+            expect(w.bufs[0]->safe_hold == RTX_SAFE_HOLD_CONFLICT, "restore holds it");
+            expect(w.any_dirty(), "restored hold is unsaved");
+            expect(!save_ok(&w), "restored hold: save-all refuses");
+            expect(rtx_safe_peek_dirty(a), "restored hold keeps the journal");
+        }
+    }
+
+    /* Journal identity is the base hist is relative to (the document's
+     * open/save stamp), not a stat of the path at flush time. A file that
+     * drifted under a live dirty buffer must not re-key the journal onto
+     * the new bytes. */
+    isol_reset();
+    write_file(a, "hello\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        w.bufs[0]->doc.type("x") !>;
+        write_file(a, "changed!\n");
+        w.safe_flush_all();
+    }
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        expect_text(&w.bufs[0]->doc, "changed!\n",
+                    "flush-time drift does not replay onto new bytes");
+        expect(!w.bufs[0]->doc.can_undo(), "drifted base: no replay");
+    }
+
+    /* RTXS validation. A flipped payload byte fails the trailer sum; a
+     * length that does not fit the file is refused before it sizes an
+     * allocation; a leaf written for another path is not replayed even
+     * when the identity (a hard link) matches. */
+    {
+        const char *a2 = "testdata/generated/safe_a_link.txt";
+        unsigned char jb[8192], orig[8192];
+        size_t n = 0, p;
+        isol_reset();
+        write_file(a, "hello\n");
+        {
+            RtxWs w = {0} @destroy;
+            char *paths[1];
+            paths[0] = (char *)a;
+            w.open_files(1, paths) !>;
+            w.bufs[0]->doc.type("Q") !>;
+            w.safe_flush_all();
+        }
+        n = journal_read(a, orig, sizeof(orig));
+        expect(n > 16, "validation journal readable");
+        for (p = n; p > 0 && n; p--) {
+            if (orig[p - 1] == 'Q') break;
+        }
+        expect(p > 0, "validation journal holds the typed byte");
+        if (n && p > 0) {
+            memcpy(jb, orig, n);
+            jb[p - 1] = 'R';
+            expect(journal_write(a, jb, n), "flip payload byte");
+            {
+                RtxWs w = {0} @destroy;
+                char *paths[1];
+                paths[0] = (char *)a;
+                w.open_files(1, paths) !>;
+                expect_text(&w.bufs[0]->doc, "hello\n", "sum mismatch is not replayed");
+                expect(!w.bufs[0]->doc.dirty(), "sum mismatch leaves disk text");
+            }
+            /* One rec: REC_FIXED-byte fixed part, 1 ins byte, 8-byte trailer. */
+            memcpy(jb, orig, n);
+            put_le64(jb + (n - 8 - 1 - REC_FIXED) + 16, (uint64_t)1 << 62);
+            journal_resum(jb, n);
+            expect(journal_write(a, jb, n), "patch ins_n");
+            {
+                RtxWs w = {0} @destroy;
+                char *paths[1];
+                paths[0] = (char *)a;
+                w.open_files(1, paths) !>;
+                expect_text(&w.bufs[0]->doc, "hello\n", "oversized ins_n refused");
+                expect(!w.bufs[0]->doc.can_undo(), "oversized ins_n: no hist");
+            }
+            memcpy(jb, orig, n);
+            put_le64(jb + journal_hlen_at(jb), UINT64_MAX / 2);
+            journal_resum(jb, n);
+            expect(journal_write(a, jb, n), "patch hlen");
+            {
+                RtxWs w = {0} @destroy;
+                char *paths[1];
+                paths[0] = (char *)a;
+                w.open_files(1, paths) !>;
+                expect_text(&w.bufs[0]->doc, "hello\n", "oversized hlen refused");
+                expect(!w.bufs[0]->doc.can_undo(), "oversized hlen: no hist");
+            }
+            unlink(a2);
+            expect(link(a, a2) == 0, "hard link for the path check");
+            expect(journal_write(a2, orig, n), "plant a's leaf under a2's key");
+            {
+                RtxWs w = {0} @destroy;
+                char *paths[1];
+                paths[0] = (char *)a2;
+                w.open_files(1, paths) !>;
+                expect_text(&w.bufs[0]->doc, "hello\n",
+                            "leaf for another path is not replayed");
+                expect(!w.bufs[0]->doc.dirty(), "foreign leaf: not dirty");
+            }
+            unlink(a2);
+        }
+    }
+
+    /* A replay that fails midway must not leave the recs it did apply on
+     * screen as a clean document. Reopen the file, hold the journal (it is
+     * the only copy of those edits), and say so. */
+    {
+        unsigned char jb[8192], again[8192];
+        size_t n, n2;
+        isol_reset();
+        write_file(a, "hello\n");
+        {
+            RtxWs w = {0} @destroy;
+            char *paths[1];
+            paths[0] = (char *)a;
+            w.open_files(1, paths) !>;
+            w.bufs[0]->doc.type("Q") !>;
+            w.bufs[0]->doc.break_coalesce();
+            w.bufs[0]->doc.caret = w.bufs[0]->doc.len();
+            w.bufs[0]->doc.sel_anchor = w.bufs[0]->doc.caret;
+            w.bufs[0]->doc.type("W") !>;
+            expect_text(&w.bufs[0]->doc, "Qhello\nW", "two recs typed");
+            w.safe_flush_all();
+        }
+        n = journal_read(a, jb, sizeof(jb));
+        expect(n > 8 + 1 + REC_FIXED, "two-rec journal readable");
+        if (n > 8 + 1 + REC_FIXED) {
+            /* Last rec: REC_FIXED-byte fixed part, 1 ins byte, 8-byte trailer. Its
+             * offset now lies past EOF, so redo fails after rec 0 applied. */
+            put_le64(jb + (n - 8 - 1 - REC_FIXED), (uint64_t)1 << 40);
+            journal_resum(jb, n);
+            expect(journal_write(a, jb, n), "patch last rec off");
+        }
+        {
+            RtxWs w = {0} @destroy;
+            char *paths[1];
+            char msg[512];
+            paths[0] = (char *)a;
+            w.open_files(1, paths) !>;
+            expect_text(&w.bufs[0]->doc, "hello\n", "partial replay rolls back to the file");
+            expect(!w.bufs[0]->doc.can_undo(), "partial replay: no hist");
+            expect(w.bufs[0]->safe_hold == RTX_SAFE_HOLD_REPLAY, "partial replay holds the journal");
+            expect(rtx_ws_safe_fault_msg(&w, msg, sizeof(msg)), "partial replay is a visible fault");
+            expect(w.any_dirty(), "held journal counts as unsaved");
+            w.bufs[0]->doc.type("Z") !>;
+            w.safe_flush_all();
+            n2 = journal_read(a, again, sizeof(again));
+            expect(n2 == n && memcmp(again, jb, n) == 0, "held journal is not overwritten");
+            expect(!save_ok(&w), "save_dirty refuses while a journal is held");
+            w.safe_discard_dirty();
+            expect(w.bufs[0]->safe_hold == RTX_SAFE_HOLD_NONE, "discard releases the hold");
+            expect(journal_read(a, again, sizeof(again)) == 0, "discard drops the held journal");
+        }
+    }
+
+    /* Identity mtime is nanoseconds: a same-size rewrite inside one second
+     * still drifts, for the journal and for Save's conflict check. */
+    isol_reset();
+    write_file(a, "hello\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        w.bufs[0]->doc.type("Q") !>;
+        w.safe_flush_all();
+    }
+    usleep(30000);
+    write_file(a, "HELLO\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[1];
+        paths[0] = (char *)a;
+        w.open_files(1, paths) !>;
+        /* Seconds identity would replay onto HELLO ("QHELLO"). A drift
+         * replays onto the pinned base instead. */
+        expect_text(&w.bufs[0]->doc, "Qhello\n", "same-size rewrite drifts the journal");
+        expect(w.bufs[0]->safe_rebased, "same-size rewrite: rebased onto the pin");
+        usleep(30000);
+        write_file(a, "hullo\n");
+        expect(w.bufs[0]->doc.disk_changed(), "same-size rewrite is a save conflict");
     }
 
     /* Untitled cannot park. */
@@ -713,6 +1172,8 @@ int main(void) {
         br = RtxWs_browse(&w);
         rtx_browse_finish(br) !>;
         w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        w.browse_prev_flush(0) !>;
+        w.browse_prev_sync(0, &m, 40.0, 8) !>;
         pv = &w.prev[0];
         expect(pv->live && pv->kind == RTX_BROWSE_PREV_FILE,
                "preview opened the journaled file");
@@ -757,6 +1218,8 @@ int main(void) {
         br = RtxWs_browse(&w);
         rtx_browse_finish(br) !>;
         w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        w.browse_prev_flush(0) !>;
+        w.browse_prev_sync(0, &m, 40.0, 8) !>;
         pv = &w.prev[0];
         expect(pv->live && pv->kind == RTX_BROWSE_PREV_FILE,
                "mid-line preview opened");
@@ -777,6 +1240,8 @@ int main(void) {
         pv->doc.sel_anchor = 18;
         pv->doc.caret = 20;
         pv->fill_view = -1;
+        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        w.browse_prev_flush(0) !>;
         w.browse_prev_sync(0, &m, 40.0, 8) !>;
         expect(pv->layout.rows.len > 0, "caret-only preview has a row");
         if (pv->layout.rows.len) {
@@ -813,7 +1278,7 @@ int main(void) {
         /* Same-buf split snapshot carries the bit. */
         w.toggle_split();
         expect(RtxWs_same_split(&w), "rich split is same-buf");
-        expect(w.side.layout.rich == 1, "pane snapshot copies rich");
+        expect(w.cam[0].layout.rich == 1, "pane snapshot copies rich");
         w.toggle_split();
         w.safe_flush_all();
         expect(rtx_safe_state_path(spath, sizeof(spath), a), "rich state path");
@@ -825,7 +1290,7 @@ int main(void) {
             close(sfd);
             sver = (uint32_t)sb[4] | ((uint32_t)sb[5] << 8) |
                    ((uint32_t)sb[6] << 16) | ((uint32_t)sb[7] << 24);
-            expect(sver == 3 && sver == RTX_SAFE_STATE_VER, "state ver is 3");
+            expect(sver == 4 && sver == RTX_SAFE_STATE_VER, "state ver is 4");
         }
     }
     {
@@ -850,6 +1315,8 @@ int main(void) {
         w.browse_start() !>;
         br = RtxWs_browse(&w);
         rtx_browse_finish(br) !>;
+        w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        w.browse_prev_flush(0) !>;
         w.browse_prev_sync(0, &m, 40.0, 8) !>;
         pv = &w.prev[0];
         expect(pv->live && pv->kind == RTX_BROWSE_PREV_FILE,
@@ -919,6 +1386,8 @@ int main(void) {
         br = RtxWs_browse(&w);
         rtx_browse_finish(br) !>;
         w.browse_prev_sync(0, &m, 40.0, 8) !>;
+        w.browse_prev_flush(0) !>;
+        w.browse_prev_sync(0, &m, 40.0, 8) !>;
         pv = &w.prev[0];
         expect(pv->live && pv->kind == RTX_BROWSE_PREV_FILE,
                "default-rich preview opened");
@@ -956,6 +1425,176 @@ int main(void) {
         w.open_files(0, NULL) !>;
         expect(w.browse_split[0] == 420, "split pane 0 restored with no argv");
         expect(w.browse_split[1] == 610, "split pane 1 restored with no argv");
+    }
+
+    /* next_buf onto the other pane's buffer is a same-file split: the
+     * panes get separate cameras, not one shared camera. */
+    isol_reset();
+    write_file(a, "hello\n");
+    write_file(b, "other\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[2];
+        paths[0] = (char *)a;
+        paths[1] = (char *)b;
+        w.open_files(2, paths) !>;
+        expect(w.npanes == 2 && w.pane[0] == 0 && w.pane[1] == 1, "two panes, two files");
+        w.set_focus(0);
+        w.next_buf();
+        expect(w.pane[0] == 1 && w.pane[1] == 1, "next_buf lands on the other pane's buffer");
+        expect(RtxWs_same_split(&w), "next_buf onto the other pane seeds the split camera");
+        w.bufs[1]->top_byte = 3;
+        w.focus_other();
+        expect(w.bufs[1]->top_byte == 0, "other pane keeps its own camera");
+        w.focus_other();
+        expect(w.bufs[1]->top_byte == 3, "focused pane camera comes back");
+        w.prev_buf();
+        w.prev_buf();
+        expect(w.pane[0] == 1 && RtxWs_same_split(&w), "prev_buf round trip reseeds");
+    }
+
+    /* Snapshot panes restore by path. An entry that does not come back
+     * (deleted) must not shift the other panes onto the wrong files. */
+    {
+        const char *c = "testdata/generated/safe_c.txt";
+        isol_reset();
+        write_file(a, "hello\n");
+        write_file(b, "other\n");
+        write_file(c, "third\n");
+        {
+            RtxWs w = {0} @destroy;
+            char *paths[3];
+            paths[0] = (char *)a;
+            paths[1] = (char *)b;
+            paths[2] = (char *)c;
+            w.open_files(3, paths) !>;
+            w.pane[0] = 2;
+            w.pane[1] = 1;
+            w.sync_live() !>;
+        }
+        unlink(a);
+        {
+            RtxWs w = {0} @destroy;
+            w.open_files(0, NULL) !>;
+            expect(w.len == 2 && w.npanes == 2, "restore without the deleted file");
+            expect(w.bufs[w.pane[0]]->doc.path.ptr &&
+                       strstr(w.bufs[w.pane[0]]->doc.path.ptr, "safe_c.txt"),
+                   "pane 0 restores its own file by path");
+            expect(w.bufs[w.pane[1]]->doc.path.ptr &&
+                       strstr(w.bufs[w.pane[1]]->doc.path.ptr, "safe_b.txt"),
+                   "pane 1 restores its own file by path");
+        }
+        /* An untitled buffer is not written, so it cannot shift the slots. */
+        isol_reset();
+        write_file(a, "hello\n");
+        {
+            RtxWs w = {0} @destroy;
+            char *paths[2];
+            paths[0] = (char *)b;
+            paths[1] = (char *)c;
+            w.open_files(0, NULL) !>;
+            expect(w.untitled(), "untitled boot for the slot test");
+            w.add_path(cc_slice_cstr(paths[0])) !>;
+            w.add_path(cc_slice_cstr(paths[1])) !>;
+            w.npanes = 2;
+            w.pane[0] = 2;
+            w.pane[1] = 0;
+            w.sync_live() !>;
+        }
+        {
+            RtxWs w = {0} @destroy;
+            w.open_files(0, NULL) !>;
+            expect(w.len == 2, "restore lists the two named files");
+            expect(w.bufs[w.pane[0]]->doc.path.ptr &&
+                       strstr(w.bufs[w.pane[0]]->doc.path.ptr, "safe_c.txt"),
+                   "untitled before it does not shift pane 0");
+        }
+        write_file(a, "hello\n");
+        unlink(c);
+    }
+
+    /* Two spellings of one file open one document (one journal). */
+    isol_reset();
+    write_file(a, "hello\n");
+    {
+        RtxWs w = {0} @destroy;
+        char *paths[3];
+        char dot[256];
+        char abs_a[4096];
+        snprintf(dot, sizeof(dot), "./%s", a);
+        expect(realpath(a, abs_a) != NULL, "realpath a");
+        paths[0] = (char *)a;
+        paths[1] = dot;
+        paths[2] = abs_a;
+        w.open_files(3, paths) !>;
+        expect(w.len == 1, "a.txt ./a.txt /abs/a.txt is one buffer");
+        expect(w.npanes == 1, "deduped open is one pane");
+    }
+
+    /* A parked file that was deleted / renamed: its pane must not show a
+     * zeroed doc, the fault is visible, and the other pane still comes back. */
+    {
+        const char *c = "testdata/generated/safe_c.txt";
+        isol_reset();
+        write_file(a, "hello\n");
+        write_file(b, "other\n");
+        write_file(c, "third\n");
+        {
+            RtxWs w = {0} @destroy;
+            char *paths[3];
+            char msg[512];
+            paths[0] = (char *)a;
+            paths[1] = (char *)b;
+            paths[2] = (char *)c;
+            w.open_files(3, paths) !>;
+            w.npanes = 1;
+            w.pane[0] = 1;
+            w.sync_live() !>;
+            expect(w.bufs[0]->parked && w.bufs[2]->parked, "a and c parked");
+            unlink(a);
+            w.npanes = 2;
+            w.pane[0] = 0;
+            w.pane[1] = 2;
+            expect(sync_ok(&w), "sync_live keeps going past a missing file");
+            expect(w.pane[1] == 2 && !w.bufs[2]->parked, "the other pane still unparks");
+            expect(w.pane[0] != 0 && !w.bufs[w.pane[0]]->parked,
+                   "the missing file's pane moves to a live buffer");
+            expect(w.bufs[0]->parked && w.bufs[0]->park_fault, "missing file stays parked, marked");
+            expect(rtx_ws_safe_fault_msg(&w, msg, sizeof(msg)) &&
+                       strstr(msg, "could not be reopened"),
+                   "missing file is on the status bar");
+            write_file(a, "back\n");
+            w.pane[0] = 0;
+            expect(sync_ok(&w) && w.pane[0] == 0 && !w.bufs[0]->parked &&
+                       !w.bufs[0]->park_fault,
+                   "file back: the buffer unparks and the fault clears");
+        }
+        /* Dirty + deleted, with a pinned base: the edits come back and Save
+         * recreates the file. */
+        isol_reset();
+        write_file(a, "hello\n");
+        write_file(b, "other\n");
+        {
+            RtxWs w = {0} @destroy;
+            char *paths[1];
+            paths[0] = (char *)a;
+            w.open_files(1, paths) !>;
+            w.bufs[0]->doc.type("z") !>;
+            w.add_path(cc_slice_cstr(b)) !>;
+            w.npanes = 1;
+            w.pane[0] = 1;
+            w.sync_live() !>;
+            expect(w.bufs[0]->parked, "dirty a parked before delete");
+            unlink(a);
+            w.pane[0] = 0;
+            expect(sync_ok(&w), "dirty deleted file: sync ok");
+            expect(w.pane[0] == 0 && !w.bufs[0]->parked, "dirty deleted file comes back from its pin");
+            expect_text(&w.bufs[0]->doc, "zhello\n", "deleted file's edits recovered");
+            expect(w.bufs[0]->doc.dirty(), "deleted file's edits are dirty");
+            w.bufs[0]->doc.save() !>;
+            expect(file_is(a, "zhello\n"), "save recreates the deleted file");
+        }
+        unlink(c);
     }
 
     if (fails) {

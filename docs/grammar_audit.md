@@ -33,7 +33,17 @@ match through `rtx_re_match` / `rtx_re_match_caps`. A per-frame literal
 closer substitutes `\\1`–`\\7` from the begin captures at open
 (`stk_close` / `stk_closen`); not stored on `RtxTmCkpt`, so a window
 resume mid-heredoc is leftover. `while` and `injections` are still out.
-The engine still has no lookaround, no backrefs, no `\\G`, no `(?i:)`.
+**Update 2026‑09‑23 (regex engine):** `tm_re.cch` is retired for
+`core/rx.ccs` (Onig syntax: anchors, `\\G`, lookaround, backrefs, atomic,
+lazy / possessive, `(?i)`, UTF-8 classes). Patterns compile once at load
+onto the TM store (`RtxTmRule.ra` / `rb`); a refused pattern drops its
+rule and counts in `rtx_tm_rx_errors` (stats-json `rx_errors`). A regex
+sees the current line plus its newline. A RE_SPAN end reads `\\1`–`\\9`
+from the frame's begin captures (engine EXTREF), so the shell heredoc
+rule (`^\\t*\\3$`) landed; `\\G` is the end of the frame's begin. The
+captures are window offsets, not on `RtxTmCkpt` — a resume mid-heredoc
+still does not close. `tests/tm_rx_diff_smoke` diffs the old and new
+engines on every grammar pattern at every fixture offset.
 At grammar level
 (`rtx_tm_load_json`, `:2089`) `fileTypes`, `patterns`, `repository`,
 `scopeName`, and `name` are read.
@@ -45,12 +55,12 @@ At grammar level
 |---|---|---|
 | `include` non-empty, no begin/end | `RTX_TM_SKIP` | `#repo` expands in flatten / `rtx_tm_add_inner_resolved`; a span's `include: source.x` is `embed_scope` (wedge 4) |
 | `begin` + `end` non-empty, no regex metachar | `RTX_TM_LIT_SPAN` | byte literals via `rtx_tm_starts`; `**` / `*` / ``` / `"""` / `<!--` stay here |
-| `begin` + `end` with a regex metachar (`\\` / class / group / `^$`; not a lone `*`) | `RTX_TM_RE_SPAN` | `rtx_re_match_caps` at open, `rtx_re_match` (or a substituted literal closer) at close; `a`/`alen` and `b`/`blen` are pattern lengths |
+| `begin` + `end` with a regex metachar (`\\` / class / group / `^$`; not a lone `*`) | `RTX_TM_RE_SPAN` | `ra` (begin) at open, `rb` (end, `\\1`–`\\9` from the begin captures) at close, both `rtx_rx_at` on the line; `a`/`alen` and `b`/`blen` are the pattern strings |
 | `match` = `X.*` with no metachar in `X` | `RTX_TM_LIT_LINE` | |
 | `match` ∈ {`\b[0-9]+\b`, `[0-9]+`, `\d+`, `\b\d+\b`} | `RTX_TM_DIGITS` | |
 | `match` = `\b(a\|b\|…)\b` | `RTX_TM_KEYWORDS` | |
 | `match` = `\\.` | `RTX_TM_ESC_DOT` | |
-| anything else | `RTX_TM_REGEX` | `tm_re.cch` engine; `captures` → `cap[1..7]` scopes |
+| anything else | `RTX_TM_REGEX` | `rx.ccs` program `ra`; `captures` → `cap[1..7]` scopes |
 
 Span nesting: `rtx_tm_try_rule` opens a `LIT_SPAN` when `allow_span` is
 set. **Wedge 4:** `allow_span = 1` for inners and for guest top‑level
@@ -84,7 +94,7 @@ records what each would need to express its real-world embeds.
 | `html` | `text.html.basic` | html htm | `<!-- -->` span, `"` span, `<style>`/`<script>` RE_SPAN with `source.css`/`source.js` guest, tag regex `</?[A-Za-z][^>]*>` | LIT_SPAN×2, RE_SPAN×2, REGEX | self-closing `<script … />` (needs lookaround), `style="…"`→CSS (R, E, CN), `<code class=language-x>` (R, E, CN, I), entities regex, `'` attribute strings (a) |
 | `javascript` | `source.js` | js mjs ts | `//`, `/* */`, `"` span + `\\.` inner, `'` span, digits, keywords | LIT_LINE, LIT_SPAN×3, ESC_DOT, DIGITS, KEYWORDS | template literal `` ` `` (a for the outer span; `${…}` islands need depth 2 + host re-entry), tagged templates `sql`/`html`/`css`/`gql` (R, BC, CN, E), regex literal vs division (R with lookbehind), JSX/TSX (R, depth) |
 | `json` | `source.json` | json | key regex with `captures.1`, `"` span + `\\.` inner, number regex, `true/false/null` | REGEX(has_cap), LIT_SPAN, ESC_DOT, REGEX, KEYWORDS | nothing embed-related (JSON is only ever a *guest*: YAML `>` scalars, md fences) |
-| `markdown` | `text.markdown` | md markdown | ```` ``` ```` span, heading regex, `>` quote LIT_LINE, `**`/`*`/`` ` `` spans, link regex | LIT_SPAN×4, REGEX×2, LIT_LINE | fence info string → grammar (R, BC, CN, E), line-anchored fence close with backreference to the opener (R), blockquote continuation (W), list-item indentation (W), HTML blocks (E `text.html`), fence inside quote/list (depth 2) |
+| `markdown` | `text.markdown` | md markdown | **Block pass** (`"blocks": "commonmark"`, core/md_block.ccs) plants fences (``` / ~~~, n-length closer, info → guest), headings (ATX / setext), quotes / lists with containers (lazy continuation, content indent), HTML blocks (`text.html.basic` guest), math, front matter (`source.yaml`), tables, definitions; the grammar lexes inline content: CommonMark-flanking `*` / `_` spans, exact code spans, strike, math, links / images / refs, autolinks, URLs, entities | LIT_SPAN, RE_SPAN (labels), REGEX, `$self` inners | the W / R / BC items below are done natively by the block pass, not by lowering `while` / backrefs; `injections` still out |
 | `python` | `source.python` | py | `#` comment, `"` span, `'` span, digits, keywords | LIT_LINE, LIT_SPAN×2, DIGITS, KEYWORDS | `"""`/`'''` docstrings as a 3-byte span (a; today works by the `""`+`"…"`+`""` accident), SQL/regex/HTML in strings (E, CN, I), f-string `{…}` islands (depth 2 + host re-entry), `r"…"` prefix (BC) |
 | `shell` | `source.shell` | sh bash | `#` comment, `"` span, `'` span, keywords | LIT_LINE, LIT_SPAN×2, KEYWORDS | heredoc `<<EOF` (R begin, R end with `\3` backreference), quoted vs unquoted heredoc (BC decides whether `$…` islands exist), `<<PYTHON`→`source.python` (CN, E), `$(…)`/`${…}` islands (depth 2), `<<<` must not match (R lookahead) |
 | `yaml` | `source.yaml` | yml yaml | `#` comment, `"` span, number regex, `yes/no/true/…` keywords, `^key:` regex | LIT_LINE, LIT_SPAN, REGEX×2, KEYWORDS | block scalars `\|`/`>` (W: body is indentation-delimited, no closer), `'` strings (a), flow `{}`/`[]` (a), anchors/aliases/`---` (REGEX, cheap), embeds by key name `run: \|`→shell (I) |

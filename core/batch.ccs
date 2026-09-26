@@ -9,7 +9,12 @@
 #include "document.cch"
 #include "workspace.cch"
 #include "nav_pair.cch"
+#include "find.cch"
+#include "proj.cch"
 #include "batch.cch"
+#include "slides.cch"
+#include "lf.cch"
+#include <stdatomic.h>
 
 enum { RTX_BATCH_PRINT_DEFAULT = 40 };
 
@@ -173,8 +178,7 @@ static int rtx_batch_print(RtxWs *w, const char *arg, FILE *out, FILE *err) {
         from = rtx_doc_line_floor_local(d, d->caret) !>;
     }
     while (lines < (size_t)nlines && from < d->len()) {
-        size_t got;
-        size_t i;
+        size_t got, at, put, seen = 0;
         size_t take = sizeof(buf);
         if (take > d->len() - from) take = d->len() - from;
         {
@@ -184,14 +188,11 @@ static int rtx_batch_print(RtxWs *w, const char *arg, FILE *out, FILE *err) {
             got = d->read_at(from, cc_slice_from_buffer(buf, take)) !>;
         }
         if (!got) break;
-        for (i = 0; i < got; i++) {
-            fputc(buf[i], out);
-            from++;
-            if (buf[i] == '\n') {
-                lines++;
-                if (lines >= (size_t)nlines) break;
-            }
-        }
+        at = rtx_nth_lf(buf, got, (size_t)nlines - lines, &seen);
+        put = at == (size_t)-1 ? got : at + 1;
+        fwrite(buf, 1, put, out);
+        from += put;
+        lines += seen;
     }
     if (lines == 0 || (from > 0 && lines < (size_t)nlines)) {
         /* unterminated last line */
@@ -260,6 +261,394 @@ static int rtx_batch_insert(RtxWs *w, const char *arg, FILE *err) {
             return rtx_batch_fail(err, e.message ? e.message : "insert");
         }
         d->type(bytes) !>;
+    }
+    return RTX_BATCH_OK;
+}
+
+/* One argument of `replace`. Unquoted: bytes up to white space. '...':
+ * bytes up to the next ' (no escapes). "...": up to an unescaped ", where
+ * \" is a quote and every other backslash stays (so regex \d and the
+ * template's \n pass through). 0 = none / malformed (*bad). */
+static int rtx_batch_arg(const char *s, char *dst, size_t cap, size_t *outn,
+                         const char **rest, int *bad) {
+    size_t n = 0;
+    *bad = 0;
+    s = rtx_batch_skip_ws(s);
+    if (!*s || *s == '\n') return 0;
+    if (*s == '\'' || *s == '"') {
+        char qc = *s++;
+        while (*s && *s != qc) {
+            char c = *s++;
+            if (qc == '"' && c == '\\' && *s == '"') c = *s++;
+            if (n + 1 >= cap) {
+                *bad = 1;
+                return 0;
+            }
+            dst[n++] = c;
+        }
+        if (*s != qc) {
+            *bad = 1;
+            return 0;
+        }
+        s++;
+        if (*s && *s != ' ' && *s != '\t' && *s != '\r' && *s != '\n') {
+            *bad = 1;
+            return 0;
+        }
+    } else {
+        while (*s && *s != ' ' && *s != '\t' && *s != '\r' && *s != '\n') {
+            if (n + 1 >= cap) {
+                *bad = 1;
+                return 0;
+            }
+            dst[n++] = *s++;
+        }
+    }
+    dst[n] = 0;
+    *outn = n;
+    if (rest) *rest = rtx_batch_skip_ws(s);
+    return 1;
+}
+
+/* `--name` then white space or the end. */
+static int rtx_batch_flag(const char *s, const char *name) {
+    size_t n = strlen(name);
+    return !strncmp(s, name, n) && (!s[n] || s[n] == ' ' || s[n] == '\t' || s[n] == '\r');
+}
+
+/* replace [--all] [--regex] [--icase] [--word] [--] FIND REPL
+ * One: the first match at or after the caret (one undo step); the next
+ * match is then selected. --all: every match as one edit group. */
+static int rtx_batch_replace(RtxWs *w, const char *arg, FILE *out, FILE *err) {
+    RtxBuf *b = rtx_batch_buf(w);
+    RtxDoc *d;
+    char q[RTX_FIND_QMAX + 1];
+    char r[RTX_REPL_QMAX + 1];
+    size_t qn = 0, rn = 0;
+    unsigned opts = 0;
+    int all = 0, bad = 0;
+    const char *rest = arg;
+    if (!b) return rtx_batch_fail(err, "no buffer");
+    d = &b->doc;
+    for (;;) {
+        const char *s = rtx_batch_skip_ws(rest);
+        if (rtx_batch_flag(s, "--all")) {
+            all = 1;
+            rest = s + 5;
+        } else if (rtx_batch_flag(s, "--regex")) {
+            opts |= RTX_FIND_REGEX;
+            rest = s + 7;
+        } else if (rtx_batch_flag(s, "--icase")) {
+            opts |= RTX_FIND_ICASE;
+            rest = s + 7;
+        } else if (rtx_batch_flag(s, "--word")) {
+            opts |= RTX_FIND_WORD;
+            rest = s + 6;
+        } else if (rtx_batch_flag(s, "--")) {
+            rest = s + 2;
+            break;
+        } else {
+            break;
+        }
+    }
+    if (!rtx_batch_arg(rest, q, sizeof(q), &qn, &rest, &bad) || qn == 0 || bad)
+        return rtx_batch_fail(err, "replace [--all] [--regex] [--icase] [--word] FIND REPL");
+    if (!rtx_batch_arg(rest, r, sizeof(r), &rn, &rest, &bad) || bad)
+        return rtx_batch_fail(err, "replace: REPL missing (\"\" is empty)");
+    if (rest && rest[0]) return rtx_batch_fail(err, "replace: extra args (quote them)");
+    {
+        @errhandler(CCError e) {
+            return rtx_batch_fail(err, e.message ? e.message : "replace");
+        }
+        char[:] qs = cc_slice_from_buffer(q, qn);
+        char[:] rs = rn ? cc_slice_from_buffer(r, rn) : cc_slice_empty();
+        const char *why = NULL;
+        size_t i, nh, n;
+        int hit;
+        if (all) {
+            n = d->replace_all(qs, opts, rs, 0, (size_t)-1) !>;
+            if (out) {
+                fprintf(out, "replaced %zu\n", n);
+                fflush(out);
+            }
+            return RTX_BATCH_OK;
+        }
+        d->find_set_opt(qs, opts) !>;
+        d->find_finish() !>;
+        if (d->find.err) return rtx_batch_fail(err, d->find.err);
+        nh = rtx_find_hits_n(&d->find);
+        for (i = 0; i < nh; i++)
+            if (d->find.hits.data[i].off >= d->caret) break;
+        if (i == nh) return rtx_batch_fail(err, "replace: no match at or after the caret");
+        d->find_goto(i);
+        hit = d->replace_hit(rs, &why) !>;
+        if (!hit) return rtx_batch_fail(err, why ? why : "replace: no match");
+        if (out) {
+            fprintf(out, "replaced 1\n");
+            fflush(out);
+        }
+    }
+    return RTX_BATCH_OK;
+}
+
+/* ------------------------------------------------------------ project
+ * project-files / project-search run on one process-level project (the
+ * batch host has no UI to own it). Root: --project DIR, else the git root
+ * above the active buffer's path, else the cwd. */
+static RtxProj *g_bproj;
+static char g_bproj_dir[RTX_PROJ_PATH];
+
+void rtx_batch_set_project(const char *dir) {
+    snprintf(g_bproj_dir, sizeof g_bproj_dir, "%s", dir ? dir : "");
+}
+
+void rtx_batch_project_close(void) {
+    if (!g_bproj) return;
+    rtx_proj_close(g_bproj);
+    free(g_bproj);
+    g_bproj = NULL;
+}
+
+static RtxProj *rtx_batch_proj(RtxWs *w, unsigned flags, int rewalk, int wait_walk, FILE *err) {
+    char root[RTX_PROJ_PATH];
+    @errhandler(CCError e) {
+        rtx_batch_fail(err, e.message ? e.message : "project");
+        return NULL;
+    }
+    if (g_bproj && g_bproj->flags == flags && !rewalk) return g_bproj;
+    if (g_bproj_dir[0]) {
+        snprintf(root, sizeof root, "%s", g_bproj_dir);
+    } else {
+        RtxBuf *b = rtx_batch_buf(w);
+        const char *start = (b && b->doc.path.ptr && b->doc.path.len) ? b->doc.path.ptr : ".";
+        if (rtx_proj_root_of(start, root, sizeof root) < 0 &&
+            rtx_proj_root_of(".", root, sizeof root) < 0) {
+            rtx_batch_fail(err, "project: no root");
+            return NULL;
+        }
+    }
+    if (!g_bproj) {
+        g_bproj = (RtxProj *)calloc(1, sizeof(RtxProj));
+        if (!g_bproj) {
+            rtx_batch_fail(err, "project: out of memory");
+            return NULL;
+        }
+    }
+    rtx_proj_open(g_bproj, cc_slice_cstr(root), flags) !>;
+    /* project-search does not wait: its arms chase the walk. */
+    if (wait_walk) rtx_proj_finish(g_bproj) !>;
+    return g_bproj;
+}
+
+static int rtx_batch_path_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* project-files [--rewalk] [--follow] [--no-ignore] [--stats] [QUERY]
+ * No QUERY: every indexed path, sorted. QUERY: the quick-open ranking,
+ * best first (at most RTX_PROJ_PICK_K). */
+static int rtx_batch_project_files(RtxWs *w, const char *arg, FILE *out, FILE *err) {
+    unsigned flags = 0;
+    int rewalk = 0, stats = 0, bad = 0;
+    const char *rest = arg;
+    char q[RTX_PROJ_QMAX];
+    size_t qn = 0, i, n;
+    RtxProj *p;
+    for (;;) {
+        const char *s = rtx_batch_skip_ws(rest);
+        if (rtx_batch_flag(s, "--rewalk")) {
+            rewalk = 1;
+            rest = s + 8;
+        } else if (rtx_batch_flag(s, "--follow")) {
+            flags |= RTX_PROJ_FOLLOW;
+            rest = s + 8;
+        } else if (rtx_batch_flag(s, "--no-ignore")) {
+            flags |= RTX_PROJ_NO_IGNORE;
+            rest = s + 11;
+        } else if (rtx_batch_flag(s, "--stats")) {
+            stats = 1;
+            rest = s + 7;
+        } else if (rtx_batch_flag(s, "--")) {
+            rest = s + 2;
+            break;
+        } else {
+            break;
+        }
+    }
+    if (rtx_batch_arg(rest, q, sizeof q, &qn, &rest, &bad) && bad)
+        return rtx_batch_fail(err, "project-files [--rewalk] [--follow] [--no-ignore] [QUERY]");
+    if (rest && rest[0]) return rtx_batch_fail(err, "project-files: extra args (quote them)");
+    p = rtx_batch_proj(w, flags, rewalk, 1, err);
+    if (!p) return RTX_BATCH_ERR;
+    n = rtx_proj_nfiles(p);
+    if (stats) {
+        const RtxProjIdx *x = p->cur;
+        size_t nd = x ? (size_t)atomic_load(&x->pub_nd) : 0;
+        /* Store bytes: file records, dir records, name / path pool. */
+        size_t bytes = n * sizeof(RtxProjFile) + nd * sizeof(RtxProjDir) +
+                       (x ? (size_t)x->npool : 0);
+        fprintf(out, "# files %zu dirs %zu ignored %zu loops %zu walk_ms %ld store %zu B"
+                     " (%.1f B/file)\n",
+                n, nd, x ? x->n_ignored : 0, x ? x->n_loops : 0,
+                x ? x->t_ms - x->t0_ms : 0, bytes, n ? (double)bytes / (double)n : 0.0);
+    }
+    if (qn == 0) {
+        CCArena a = cc_arena_heap(megabytes(1)) @destroy;
+        char **v = (char **)cc_arena_alloc(a, (n + 1) * sizeof(char *), 8);
+        char path[RTX_PROJ_PATH];
+        if (!v) return rtx_batch_fail(err, "project-files: out of memory");
+        for (i = 0; i < n; i++) {
+            size_t len = rtx_proj_path(p, (uint32_t)i, path, sizeof path);
+            v[i] = (char *)cc_arena_alloc(a, len + 1, 1);
+            if (!v[i]) return rtx_batch_fail(err, "project-files: out of memory");
+            memcpy(v[i], path, len + 1);
+        }
+        qsort(v, n, sizeof(char *), rtx_batch_path_cmp);
+        for (i = 0; i < n; i++) fprintf(out, "%s\n", v[i]);
+    } else {
+        @errhandler(CCError e) {
+            return rtx_batch_fail(err, e.message ? e.message : "project-files");
+        }
+        char path[RTX_PROJ_PATH];
+        if (stats) {
+            /* Keystroke latency: each prefix of QUERY as typed (the
+             * candidate list narrows), then the whole query cold. */
+            size_t k;
+            for (k = 1; k <= qn; k++) {
+                rtx_proj_pick_set(p, cc_slice_from_buffer(q, k)) !>;
+                fprintf(out, "# type %.*s: %zu rows, %ld us (%zu shards, %zu candidates)\n",
+                        (int)k, q, rtx_proj_pick_n(p), p->pick.score_us,
+                        p->pick.shards_last, p->pick.ncand);
+            }
+            rtx_proj_pick_set(p, cc_slice_from_buffer("\x01", 1)) !>;
+        }
+        rtx_proj_pick_set(p, cc_slice_from_buffer(q, qn)) !>;
+        if (stats)
+            fprintf(out, "# cold %s: %ld us (%zu shards)\n", q, p->pick.score_us,
+                    p->pick.shards_last);
+        for (i = 0; i < rtx_proj_pick_n(p); i++) {
+            const RtxProjHit *h = rtx_proj_pick_at(p, i);
+            if (!h) break;
+            rtx_proj_path(p, h->id, path, sizeof path);
+            if (stats) fprintf(out, "%d\t%s\n", h->score, path);
+            else fprintf(out, "%s\n", path);
+        }
+    }
+    fflush(out);
+    return RTX_BATCH_OK;
+}
+
+/* project-search [--regex] [--icase] [--word] [--no-ignore] [--max-size N] [--] QUERY
+ * One line per match: path:line:col: preview. Then `# N matches in F
+ * files` (and the binary / big files skipped). */
+static int rtx_batch_project_search(RtxWs *w, const char *arg, FILE *out, FILE *err) {
+    unsigned opts = 0;
+    int bad = 0;
+    unsigned long long maxb = 0;
+    unsigned wflags = 0;
+    const char *rest = arg;
+    char q[RTX_PROJ_QMAX];
+    size_t qn = 0, i, nh, ng;
+    RtxProj *p;
+    @errhandler(CCError e) {
+        return rtx_batch_fail(err, e.message ? e.message : "project-search");
+    }
+    for (;;) {
+        const char *s = rtx_batch_skip_ws(rest);
+        if (rtx_batch_flag(s, "--regex")) {
+            opts |= RTX_PS_REGEX;
+            rest = s + 7;
+        } else if (rtx_batch_flag(s, "--icase")) {
+            opts |= RTX_PS_ICASE;
+            rest = s + 7;
+        } else if (rtx_batch_flag(s, "--word")) {
+            opts |= RTX_PS_WORD;
+            rest = s + 6;
+        } else if (rtx_batch_flag(s, "--no-ignore")) {
+            wflags |= RTX_PROJ_NO_IGNORE;
+            rest = s + 11;
+        } else if (rtx_batch_flag(s, "--max-size")) {
+            char num[32];
+            size_t nn = 0;
+            if (!rtx_batch_arg(s + 10, num, sizeof num, &nn, &rest, &bad) || bad ||
+                !rtx_batch_parse_u64(num, &maxb))
+                return rtx_batch_fail(err, "project-search: --max-size BYTES");
+        } else if (rtx_batch_flag(s, "--")) {
+            rest = s + 2;
+            break;
+        } else {
+            break;
+        }
+    }
+    if (!rtx_batch_arg(rest, q, sizeof q, &qn, &rest, &bad) || qn == 0 || bad)
+        return rtx_batch_fail(err, "project-search [--regex] [--icase] [--word] QUERY");
+    if (rest && rest[0]) return rtx_batch_fail(err, "project-search: extra args (quote them)");
+    p = rtx_batch_proj(w, wflags, 0, 0, err);
+    if (!p) return RTX_BATCH_ERR;
+    rtx_proj_search_clear(p);
+    if (maxb) p->ps.max_bytes = (size_t)maxb;
+    rtx_proj_search_set(p, cc_slice_from_buffer(q, qn), opts) !>;
+    if (p->ps.err) return rtx_batch_fail(err, p->ps.err);
+    rtx_proj_search_finish(p) !>;
+    nh = rtx_proj_search_nh(p);
+    ng = rtx_proj_search_ng(p);
+    {
+        /* One path per group; lines are built in a buffer and written in
+         * blocks (a per-byte fputc took ~270 ms for 262k hits). */
+        enum { OUT_CAP = 64 * 1024 };
+        CCArena oa = cc_arena_heap(OUT_CAP + 4096) @destroy;
+        char *ob = (char *)cc_arena_alloc(oa, OUT_CAP, 1);
+        char path[RTX_PROJ_PATH];
+        size_t on = 0, g;
+        if (!ob) return rtx_batch_fail(err, "project-search: out of memory");
+        for (g = 0; g < ng; g++) {
+            const RtxPsGroup *gr = rtx_proj_search_group(p, g);
+            size_t pn = rtx_proj_path(p, gr->file, path, sizeof path);
+            for (i = gr->first; i < (size_t)gr->first + gr->n; i++) {
+                const RtxPsHit *h = rtx_proj_search_hit(p, i);
+                const char *pv = rtx_proj_search_pv(p, h);
+                size_t k;
+                int m;
+                if (on + pn + 32 + h->pvn + 1 > OUT_CAP) {
+                    fwrite(ob, 1, on, out);
+                    on = 0;
+                }
+                memcpy(ob + on, path, pn);
+                on += pn;
+                m = snprintf(ob + on, OUT_CAP - on, ":%u:%u: ", h->line, h->col);
+                on += m > 0 ? (size_t)m : 0;
+                for (k = 0; k < h->pvn; k++) {
+                    unsigned char c = (unsigned char)pv[k];
+                    ob[on++] = (char)(c == '\t' || c >= 0x20 ? c : '?');
+                }
+                ob[on++] = '\n';
+            }
+        }
+        if (on) fwrite(ob, 1, on, out);
+    }
+    fprintf(out, "# %zu matches in %zu files (%zu binary, %zu over size skipped)%s;"
+                 " %zu files, %llu bytes in %ld ms\n",
+            nh, ng, p->ps.n_bin, p->ps.n_big, p->ps.truncated ? " capped" : "",
+            (size_t)atomic_load(&p->ps.pub_files),
+            (unsigned long long)atomic_load(&p->ps.pub_bytes), p->ps.t_ms - p->ps.t0_ms);
+    fflush(out);
+    return RTX_BATCH_OK;
+}
+
+static int rtx_batch_undo(RtxWs *w, int redo, FILE *err) {
+    RtxBuf *b = rtx_batch_buf(w);
+    if (!b) return rtx_batch_fail(err, "no buffer");
+    {
+        @errhandler(CCError e) {
+            return rtx_batch_fail(err, e.message ? e.message : "undo");
+        }
+        if (redo) {
+            if (!b->doc.can_redo()) return rtx_batch_fail(err, "nothing to redo");
+            b->doc.redo() !>;
+        } else {
+            if (!b->doc.can_undo()) return rtx_batch_fail(err, "nothing to undo");
+            b->doc.undo() !>;
+        }
     }
     return RTX_BATCH_OK;
 }
@@ -338,10 +727,16 @@ void rtx_batch_write_stats_json(FILE *fp, const RtxBuf *b) {
     fputs("},\"grammar\":{", fp);
     fprintf(fp,
             "\"runs\":%zu,\"secs\":%zu,\"folds\":%zu,\"windows_live\":%zu,"
-            "\"windows_cap\":%d,\"windows_walk\":%zu,\"hl_full\":%s,\"tm_ckpt\":%zu",
+            "\"windows_cap\":%d,\"windows_walk\":%zu,\"hl_full\":%s,\"tm_ckpt\":%zu,"
+            "\"rx_budget\":%zu,\"rx_errors\":%zu",
             d ? d->runs.len : (size_t)0, d ? d->secs.len : (size_t)0,
             d ? d->fold_n : (size_t)0, livew, RTX_MARKUP_CACHE_WINDOWS, walk,
-            d && d->hl_full ? "true" : "false", d ? d->tm_ckpt.len : (size_t)0);
+            d && d->hl_full ? "true" : "false", d ? d->tm_ckpt.len : (size_t)0,
+            rtx_rx_budget_hits(), rtx_tm_rx_errors);
+    /* Registry: grammars listed by the dir scan, how many a document has
+     * needed so far (loaded + compiled lazily), and the time both took. */
+    fprintf(fp, ",\"langs\":%zu,\"langs_loaded\":%zu,\"load_us\":%zu", rtx_tm_nlangs,
+            rtx_tm_nready, rtx_tm_load_us);
     if (last) {
         if (last->kind == RTX_SEC_CODE) kindn = "code";
         else if (last->kind == RTX_SEC_PROSE) kindn = "prose";
@@ -358,9 +753,12 @@ void rtx_batch_write_stats_json(FILE *fp, const RtxBuf *b) {
         if (d->find.done) findst = d->find.truncated ? "trunc" : "done";
         fprintf(fp,
                 ",\"find\":{\"hits\":%zu,\"scan_off\":%zu,\"done\":%s,"
-                "\"truncated\":%s,\"state\":\"%s\"}",
-                d->find.hits.len, d->find.scan_off, d->find.done ? "true" : "false",
-                d->find.truncated ? "true" : "false", findst);
+                "\"truncated\":%s,\"state\":\"%s\",\"opts\":%u,\"long\":%zu,"
+                "\"long_off\":%zu,\"err\":%s}",
+                rtx_find_hits_n(&d->find), d->find.scan_off, d->find.done ? "true" : "false",
+                d->find.truncated ? "true" : "false", findst, d->find.opts,
+                (size_t)d->find.long_n, (size_t)d->find.long_off,
+                d->find.err ? "true" : "false");
     } else {
         fputs(",\"find\":null", fp);
     }
@@ -372,6 +770,60 @@ void rtx_batch_write_stats_json(FILE *fp, const RtxBuf *b) {
         fputs("\"match\":null", fp);
     fputs("}}\n", fp);
     fflush(fp);
+}
+
+/* `slides`: the deck outline, one line per slide — number, 1-based line
+ * of its first byte, build steps, transition into it, title
+ * (docs/slides.md). */
+static int rtx_batch_slides(RtxWs *w, FILE *out, FILE *err) {
+    static const char *const trn[] = {"none", "fade", "fade-out", "slide", "push",
+                                      "cover", "reveal", "wipe", "zoom", "morph", "frag"};
+    RtxBuf *b = rtx_batch_buf(w);
+    const RtxDeck *k;
+    size_t i;
+    if (!b || !out) return rtx_batch_fail(err, "slides: no buffer");
+    k = rtx_deck_for(&b->doc);
+    if (!k) return rtx_batch_fail(err, "slides: not a Marp deck (front matter needs marp: true)");
+    size_t at = 0, lines = 0;
+    fprintf(out, "# %zu slides%s  theme %s  %dx%d\n", k->n, k->complete ? "" : " (prefix)",
+            k->theme, k->w, k->h);
+    for (i = 0; i < k->n; i++) {
+        const RtxSlide *s = &k->s[i];
+        char title[160];
+        size_t tn = s->title_hi > s->title_lo ? s->title_hi - s->title_lo : 0, got = 0, line;
+        int tr = s->dir.trans < (int)(sizeof trn / sizeof trn[0]) ? s->dir.trans : 0;
+        if (tn >= sizeof title) tn = sizeof title - 1;
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                got = 0;
+            }
+            if (tn) got = b->doc.read_at(s->title_lo, cc_slice_from_buffer(title, tn)) !>;
+        }
+        title[got] = 0;
+        {
+            /* Newlines since the last slide (the deck is a bounded prefix;
+             * no line index needed). */
+            char chunk[8192];
+            while (at < s->sep) {
+                size_t take = s->sep - at > sizeof chunk ? sizeof chunk : s->sep - at, q;
+                size_t n = 0;
+                {
+                    @errhandler(CCError e) {
+                        return rtx_batch_fail(err, e.message ? e.message : "slides");
+                    }
+                    n = b->doc.read_at(at, cc_slice_from_buffer(chunk, take)) !>;
+                }
+                if (!n) break;
+                for (q = 0; q < n; q++) lines += chunk[q] == '\n';
+                at += n;
+            }
+            line = lines;
+        }
+        fprintf(out, "%zu\t%zu\t%d\t%s\t%s\n", i + 1, line + 1, s->nfrag, trn[tr], title);
+    }
+    fflush(out);
+    return RTX_BATCH_OK;
 }
 
 int rtx_batch_exec(RtxWs *w, const char *line, FILE *out, FILE *err) {
@@ -390,9 +842,15 @@ int rtx_batch_exec(RtxWs *w, const char *line, FILE *out, FILE *err) {
         if (c.eq_cstr("goto")) return rtx_batch_goto(w, rest, err);
         if (c.eq_cstr("await")) return rtx_batch_await(w, rest, err);
         if (c.eq_cstr("print")) return rtx_batch_print(w, rest, out, err);
+        if (c.eq_cstr("slides")) return rtx_batch_slides(w, out, err);
         if (c.eq_cstr("read")) return rtx_batch_read(w, rest, out, err);
         if (c.eq_cstr("insert")) return rtx_batch_insert(w, rest, err);
         if (c.eq_cstr("save")) return rtx_batch_save(w, err);
+        if (c.eq_cstr("replace")) return rtx_batch_replace(w, rest, out, err);
+        if (c.eq_cstr("undo")) return rtx_batch_undo(w, 0, err);
+        if (c.eq_cstr("redo")) return rtx_batch_undo(w, 1, err);
+        if (c.eq_cstr("project-files")) return rtx_batch_project_files(w, rest, out, err);
+        if (c.eq_cstr("project-search")) return rtx_batch_project_search(w, rest, out, err);
         if (c.eq_cstr("stats-json") || c.eq_cstr("stats_json")) {
             rtx_batch_write_stats_json(out, rtx_batch_buf(w));
             return RTX_BATCH_OK;
@@ -408,9 +866,13 @@ int rtx_batch_run(RtxWs *w, char **cmds, int n, FILE *out, FILE *err) {
     if (!w) return 1;
     for (i = 0; i < n; i++) {
         int rc = rtx_batch_exec(w, cmds[i], out, err);
-        if (rc == RTX_BATCH_QUIT) return 0;
-        if (rc == RTX_BATCH_ERR) return 1;
+        if (rc == RTX_BATCH_QUIT) break;
+        if (rc == RTX_BATCH_ERR) {
+            rtx_batch_project_close();
+            return 1;
+        }
     }
+    rtx_batch_project_close();
     return 0;
 }
 
@@ -423,9 +885,13 @@ int rtx_batch_run_fp(RtxWs *w, FILE *fp, FILE *out, FILE *err) {
             line[--n] = 0;
         {
             int rc = rtx_batch_exec(w, line, out, err);
-            if (rc == RTX_BATCH_QUIT) return 0;
-            if (rc == RTX_BATCH_ERR) return 1;
+            if (rc == RTX_BATCH_QUIT) break;
+            if (rc == RTX_BATCH_ERR) {
+                rtx_batch_project_close();
+                return 1;
+            }
         }
     }
+    rtx_batch_project_close();
     return 0;
 }

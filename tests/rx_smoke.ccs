@@ -1,0 +1,927 @@
+#!ccc ccs
+/*
+ * Regex engine smoke: a pattern / subject / expected table (search and
+ * anchored), the old engine's defects, UTF-8, Onig syntax, compile
+ * errors, pathological patterns (must finish inside the budget), and a
+ * randomized three-way differential (lazy DFA vs Pike VM vs backtracker).
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "../core/rx.cch"
+
+static int fails = 0;
+static int checks = 0;
+
+static void expect(int cond, const char *what, const char *pat, const char *subj) {
+    checks++;
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s  pat=/%s/ subj=\"%s\"\n", what, pat, subj ? subj : "");
+        fails++;
+    }
+}
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static RtxRx *try_compile(const char *p, unsigned fl, CCArena a, const char **err) {
+    RtxRx *rx = rtx_rx_compile(cc_slice_cstr(p), fl, a) !>(e) {
+        if (err) *err = e.message;
+        return NULL;
+    };
+    return rx;
+}
+
+/* Search cases: first match in the whole subject (eof). ms = -1: none.
+ * g1: expected text of group 1 (NULL = not checked, "" = unset/empty). */
+typedef struct {
+    const char *pat;
+    unsigned fl;
+    const char *subj;
+    int ms;
+    int me;
+    const char *g1;
+} RxCase;
+
+static const RxCase cases[] = {
+    /* anchors ^ $ (old engine treated ^ as a literal) */
+    {"^key", 0, "a\nkey", 2, 5, NULL},
+    {"^key", 0, "akey", -1, 0, NULL},
+    {"^[ \\t]*[A-Za-z0-9_.-]+\\s*:", 0, "x\n  name: v", 2, 9, NULL},
+    {"a$", 0, "ab a\nb", 3, 4, NULL},
+    {"^$", 0, "a\n\nb", 2, 2, NULL},
+    {"\\Aab", 0, "ab", 0, 2, NULL},
+    {"\\Aab", 0, "xab", -1, 0, NULL},
+    {"b\\z", 0, "ab\n", -1, 0, NULL},
+    {"b\\Z", 0, "ab\n", 1, 2, NULL},
+    {"b\\z", 0, "ab", 1, 2, NULL},
+    /* unbounded repeats (old engine capped at 63) */
+    {"a+b", 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", 0, 101, NULL},
+    {"\"([^\"]+)\"\\s*:", 0, "{\"a_really_long_json_key_that_goes_on_and_on_well_past_sixty_three_bytes_of_text\": 1}", 1, 82,
+     "a_really_long_json_key_that_goes_on_and_on_well_past_sixty_three_bytes_of_text"},
+    {"<https?://[^>]+>", 0, "see <https://example.com/a/very/long/path/that/keeps/going/and/going/past/the/old/limit/of/sixty/three.html> ok", 4, 108, NULL},
+    {"<script\\b[^>]*>", 0, "<script type=\"text/javascript\" src=\"https://cdn.example.com/lib/library-with-a-long-name.min.js\" defer>", 0, 103, NULL},
+    {"a{100}", 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0, 100, NULL},
+    {"a{2,3}", 0, "aaaa", 0, 3, NULL},
+    {"a{2,}", 0, "a aaaa", 2, 6, NULL},
+    {"x{,2}", 0, "xxx", 0, 2, NULL},
+    {"a{2}", 0, "a{2}", -1, 0, NULL},
+    {"a\\{2", 0, "a{2", 0, 3, NULL},
+    {"{", 0, "a{", 1, 2, NULL},
+    /* groups backtrack; first-match alternation */
+    {"(ab|a)bc", 0, "abc", 0, 3, "a"},
+    {"a|ab", 0, "ab", 0, 1, NULL},
+    {"(?:a|ab)c", 0, "abc", 0, 3, NULL},
+    {"(a|ab)(c|bcd)", 0, "abcd", 0, 4, "a"},
+    {"(?:ab)+", 0, "ababx", 0, 4, NULL},
+    {"(a*)*b", 0, "aab", 0, 3, NULL},
+    {"(a|)*b", 0, "b", 0, 1, NULL},
+    {"a|", 0, "b", 0, 0, NULL},
+    {"(a)|b", 0, "b", 0, 1, ""},
+    /* lazy */
+    {"a.*?b", 0, "aXbYb", 0, 3, NULL},
+    {"a.*b", 0, "aXbYb", 0, 5, NULL},
+    {"a+?", 0, "aaa", 0, 1, NULL},
+    {"a??b", 0, "ab", 0, 2, NULL},
+    {"<.+?>", 0, "<a><b>", 0, 3, NULL},
+    /* escapes that used to match the letter */
+    {"\\S+", 0, "  foo bar", 2, 5, NULL},
+    {"\\S", 0, "S", 0, 1, NULL},
+    {"\\S", 0, " ", -1, 0, NULL},
+    {"\\W+", 0, "ab, cd", 2, 4, NULL},
+    {"\\D+", 0, "12ab3", 2, 4, NULL},
+    {"\\h+", 0, "xyz0fA9g", 3, 7, NULL},
+    {"\\H", 0, "0f", -1, 0, NULL},
+    {"\\d+", 0, "ab 123 c", 3, 6, NULL},
+    {"\\bfoo\\b", 0, "afoo foo", 5, 8, NULL},
+    {"\\b2\\b", 0, "2\xE2\x80\x93" "3", 0, 1, NULL},
+    {"\\b\xC3\xA9", 0, "x \xC3\xA9", 2, 4, NULL},
+    {"x\\b", 0, "x\xC3\xA9 x", 4, 5, NULL},
+    {"\\B\xC3\xA9", 0, "x\xC3\xA9", 1, 3, NULL},
+    {"a\\b", 0, "a\xFF", 0, 1, NULL},
+    {"\\Boo\\B", 0, "foo moon", 5, 7, NULL},
+    {"\\.", 0, "a.b", 1, 2, NULL},
+    {"\\x41\\x{263A}\\u00e9\\t", 0, "zA\xE2\x98\xBA\xC3\xA9\t", 1, 8, NULL},
+    {"\\011", 0, "a\tb", 1, 2, NULL},
+    {"\\cA", 0, "x\x01", 1, 2, NULL},
+    {"\\e\\a", 0, "\x1b\x07", 0, 2, NULL},
+    {"\\R", 0, "a\r\nb", 1, 3, NULL},
+    /* classes */
+    {"[[:alpha:]]+", 0, "12ab3", 2, 4, NULL},
+    {"[[:^digit:]]+", 0, "12ab3", 2, 4, NULL},
+    {"[[:space:][:punct:]]+", 0, "ab ,; c", 2, 6, NULL},
+    {"[[:upper:]][[:lower:]]+", 0, "xx Hello", 3, 8, NULL},
+    {"[[:xdigit:]]+", 0, "zz0aFq", 2, 5, NULL},
+    {"[a-z&&[^aeiou]]+", 0, "aabcd", 2, 5, NULL},
+    {"[a[0-9]]+", 0, "xa1b", 1, 3, NULL},
+    {"[]a]+", 0, "x]a]", 1, 4, NULL},
+    {"[^]a]+", 0, "]]bc", 2, 4, NULL},
+    {"[a-]+", 0, "x-a-", 1, 4, NULL},
+    {"[\\w.-]+", 0, " a.b-c ", 1, 6, NULL},
+    {"[^\\s]+", 0, "  xy ", 2, 4, NULL},
+    {"[\\d\\s]+", 0, "a1 2b", 1, 4, NULL},
+    {"[\\]]", 0, "a]", 1, 2, NULL},
+    /* UTF-8 scalars */
+    {".", 0, "\xC3\xA9", 0, 2, NULL},
+    {"[\xC3\xA9]", 0, "x\xC3\xA9", 1, 3, NULL},
+    {"[^a]", 0, "\xC3\xA9", 0, 2, NULL},
+    {"[^\xC3\xA9]", 0, "\xC3\xA9x", 2, 3, NULL},
+    {"[\xC3\xA0-\xC3\xBF]+", 0, "a\xC3\xA0\xC3\xA9\xC3\xBFz", 1, 7, NULL},
+    {"\\w+", 0, "h\xC3\xA9llo w", 0, 6, NULL},
+    {"\\w+", 0, "a\xE2\x80\x94" "b", 0, 1, NULL},
+    {"\\s", 0, "a\xC2\xA0" "b", 1, 3, NULL},
+    {"\xE2\x98\xBA+", 0, "x\xE2\x98\xBA\xE2\x98\xBA", 1, 7, NULL},
+    {"...", 0, "\xF0\x9F\x98\x80" "ab", 0, 6, NULL},
+    {".+", 0, "a\xFF" "b\n", 0, 3, NULL},
+    {"[^\"]+", 0, "a\xE9" "b\"", 0, 3, NULL},
+    /* case folding */
+    {"(?i)hello", 0, "say HeLLo", 4, 9, NULL},
+    {"hello", RTX_RX_ICASE, "HELLO", 0, 5, NULL},
+    {"(?i:a)b", 0, "Ab", 0, 2, NULL},
+    {"(?i:a)b", 0, "AB", -1, 0, NULL},
+    {"a(?i)b|c", 0, "C", 0, 1, NULL},
+    {"(?i)x(?-i)y", 0, "XY Xy", 3, 5, NULL},
+    {"(?i)\xC3\x89t\xC3\xA9", 0, "\xC3\xA9T\xC3\x89", 0, 5, NULL},
+    {"(?i)\xD0\x96", 0, "\xD0\xB6", 0, 2, NULL},
+    {"(?i)[a-c]+", 0, "xAbC", 1, 4, NULL},
+    {"(?i)[^a]", 0, "Ab", 1, 2, NULL},
+    /* flags */
+    {"a.b", 0, "a\nb", -1, 0, NULL},
+    {"(?m)a.b", 0, "a\nb", 0, 3, NULL},
+    {"a.b", RTX_RX_DOTALL, "a\nb", 0, 3, NULL},
+    {"(?x) a b # comment\n c", 0, "abc", 0, 3, NULL},
+    {"(?x)a\\ b", 0, "a b", 0, 3, NULL},
+    {"(?#note)ab", 0, "ab", 0, 2, NULL},
+    /* groups, names */
+    {"(?<y>\\d{4})-(\\d\\d)", 0, "on 2026-09 ok", 3, 10, "2026"},
+    {"(?'k'x)\\k'k'", 0, "axxb", 1, 3, "x"},
+    {"(?P<k>x)y", 0, "xy", 0, 2, "x"},
+    {"(a)(b)?", 0, "ac", 0, 1, "a"},
+    /* lookaround */
+    {"foo(?=bar)", 0, "foobaz foobar", 7, 10, NULL},
+    {"foo(?!bar)", 0, "foobar foobaz", 7, 10, NULL},
+    {"(?<=\\$)\\d+", 0, "a 5 $42", 5, 7, NULL},
+    {"(?<!\\$)\\b\\d+", 0, "$42 17", 4, 6, NULL},
+    {"(?<=ab|b)c", 0, "xbc", 2, 3, NULL},
+    {"(?<=a.)c", 0, "a\xC3\xA9" "c", 3, 4, NULL},
+    {"(?=(\\w+))\\1:", 0, "ab abc:", 3, 7, "abc"},
+    {"<\\w+(?![^>]*/>)[^>]*>", 0, "<br/> <p a=1>", 6, 13, NULL},
+    /* backrefs */
+    {"(\\w)\\1", 0, "abccd", 2, 4, "c"},
+    {"(?<q>['\"]).*?\\k<q>", 0, "x 'a\"b' y", 2, 7, "'"},
+    {"(a)\\1\\1", 0, "aaa", 0, 3, NULL},
+    {"(?i)(a)\\1", 0, "aA", 0, 2, NULL},
+    {"(a)|\\1b", 0, "b", -1, 0, NULL},
+    /* atomic / possessive */
+    {"(?>a+)b", 0, "aaab", 0, 4, NULL},
+    {"(?>a+)a", 0, "aaaa", -1, 0, NULL},
+    {"a++a", 0, "aaa", -1, 0, NULL},
+    {"a*+b", 0, "aab", 0, 3, NULL},
+    {"a?+a", 0, "a", -1, 0, NULL},
+    {"\"(?:[^\"\\\\]++|\\\\.)*+\"", 0, "x \"a\\\"b\" y", 2, 8, NULL},
+    /* heredoc-shaped begin */
+    {"(<<)-?\\s*([\"'])?\\s*([^;&<\\s]+)\\s*\\2", 0, "cat <<'EOF'", 4, 11, "<<"},
+    {"(<<)-?\\s*([\"'])?\\s*([^;&<\\s]+)", 0, "cat <<-EOF", 4, 10, "<<"},
+    /* empty pattern */
+    {"", 0, "abc", 0, 0, NULL},
+    /* prefilter shapes: ignore-case literal, inner literal (line / back
+     * bound), literal sets, a literal crossing a newline */
+    {"EXIT_failure", RTX_RX_ICASE, "x exit_FAILURE y", 2, 14, NULL},
+    {"EXIT_failure", RTX_RX_ICASE | RTX_RX_LITERAL, "EXIT_FAILUR exit_failure", 12, 24, NULL},
+    {"(?i)alpha|bravo|charlie", 0, "xxBRAVO alpha", 2, 7, NULL},
+    {"alpha|bravo|charlie", 0, "xxbravalphcharlie", 10, 17, NULL},
+    {"[a-z]+_send\\(", 0, "cc_chan_send(x)", 3, 13, NULL},
+    {"[a-z]+_send\\(", 0, "ab\ncd_send(", 3, 11, NULL},
+    {"[a-z]+_send\\(", 0, "ab\n_send(cd_send(", 9, 17, NULL},
+    {"\\d{2}ab", 0, "x1ab12ab", 4, 8, NULL},
+    {"(?s).{0,3}ab", 0, "\n\nxab", 0, 5, NULL},
+    {"a[\\s\\S]*zq", 0, "a\nb zq", 0, 6, NULL},
+    {"(?:foo|bar)[0-9]+", 0, "foo bar12", 4, 9, NULL},
+    {"\\bxylo\\w*|\\d{12}", 0, "axylo 123456789012", 6, 18, NULL},
+    {"\\bxylo\\w*|\\d{12}", 0, "a xylophone", 2, 11, NULL},
+    /* \b beside non-ASCII on the DFA path */
+    {"\\bxy", 0, "\xC3\xA9xy \xC2\xABxy", 7, 9, NULL},
+    {"xy\\b", 0, "xy\xC3\xA9 xy\xC2\xBB", 5, 7, NULL},
+    {"\\b\\w+\\b", 0, "\xC2\xAB\xC3\xA9t\xC3\xA9\xC2\xBB", 2, 7, NULL},
+    {"(?i)\xC3\x89t\xC3\xA9", 0, "x \xC3\xA9T\xC3\x89", 2, 7, NULL},
+};
+
+static void run_cases(void) {
+    CCArena a = cc_arena_heap(megabytes(4));
+    RtxRxScratch s = {0};
+    size_t i;
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const RxCase *c = &cases[i];
+        RtxRx *rx;
+        RtxRxIn in = {0};
+        size_t ms = 0, me = 0, n = strlen(c->subj);
+        int force, r;
+        const char *err = NULL;
+        rx = try_compile(c->pat, c->fl, a, &err);
+        if (!rx) {
+            fprintf(stderr, "compile error: %s\n", err ? err : "?");
+            expect(0, "compiles", c->pat, c->subj);
+            continue;
+        }
+        in.s = c->subj;
+        in.n = n;
+        in.gpos = RTX_RX_UNSET;
+        in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+        for (force = 0; force <= 2; force++) {
+            char what[96];
+            if (force == 1 && rtx_rx_mode(rx) == RTX_RX_BACKTRACK) continue;
+            in.force = (unsigned)force;
+            ms = me = 0;
+            r = rtx_rx_search(rx, &in, 0, n + 1, 1, &s, &ms, &me);
+            snprintf(what, sizeof(what), "search case %zu force %d (got %d [%zu,%zu))", i,
+                     force, r, ms, me);
+            if (c->ms < 0) {
+                /* an empty match at the very end counts as none here */
+                expect(r == RTX_RX_NONE, what, c->pat, c->subj);
+            } else {
+                expect(r == RTX_RX_MATCH && ms == (size_t)c->ms && me == (size_t)c->me,
+                       what, c->pat, c->subj);
+            }
+        }
+        if (c->ms >= 0) {
+            RtxRxCaps caps;
+            size_t end = 0;
+            for (force = 0; force <= 2; force++) {
+                char what[96];
+                if (force == 1 && rtx_rx_mode(rx) == RTX_RX_BACKTRACK) continue;
+                in.force = (unsigned)force;
+                r = rtx_rx_at(rx, &in, (size_t)c->ms, &s, &end, &caps);
+                snprintf(what, sizeof(what), "anchored case %zu force %d (got %d end %zu)", i,
+                         force, r, end);
+                expect(r == RTX_RX_MATCH && end == (size_t)c->me, what, c->pat, c->subj);
+                if (r == RTX_RX_MATCH && c->g1) {
+                    size_t gs = caps.s[1], ge = caps.e[1];
+                    int ok;
+                    if (!c->g1[0]) ok = gs == RTX_RX_UNSET || gs == ge;
+                    else
+                        ok = gs != RTX_RX_UNSET && ge - gs == strlen(c->g1) &&
+                             !memcmp(c->subj + gs, c->g1, ge - gs);
+                    snprintf(what, sizeof(what), "group 1 case %zu force %d", i, force);
+                    expect(ok, what, c->pat, c->subj);
+                }
+            }
+        }
+    }
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
+static const char *bad[] = {
+    "\\q", "\\p{L}", "(", ")", "a)", "a{3,2}", "(?<=a+)b", "*a", "+", "[a", "[z-a]",
+    "(?z)", "\\k<nope>", "(a)\\2", "a{100001}", "[[:bogus:]]", "\\K", "(?<=\\1)a",
+    "\\x{110000}", "\\u12", "x{2}{", NULL,
+};
+
+static void run_errors(void) {
+    CCArena a = cc_arena_heap(megabytes(1));
+    size_t i;
+    for (i = 0; bad[i]; i++) {
+        int failed = try_compile(bad[i], 0, a, NULL) == NULL;
+        /* x{2}{ : the trailing `{` is a literal — that one compiles. */
+        if (!strcmp(bad[i], "x{2}{")) expect(!failed, "literal brace after interval", bad[i], "");
+        else expect(failed, "compile error expected", bad[i], "");
+    }
+    a.destroy();
+}
+
+/* Pathological patterns finish: linear engines stay linear; the
+ * backtracker stops at its budget with RTX_RX_BUDGET. */
+static void run_patho(void) {
+    CCArena a = cc_arena_heap(megabytes(4));
+    RtxRxScratch s = {0};
+    char *sp = (char *)malloc(200001);
+    size_t i, ms = 0, me = 0, end = 0;
+    RtxRxIn in = {0};
+    RtxRx *rx;
+    double t0, t1;
+    int r;
+    for (i = 0; i < 200000; i++) sp[i] = ' ';
+    sp[200000] = 0;
+    in.s = sp;
+    in.n = 200000;
+    in.gpos = RTX_RX_UNSET;
+    in.ctx = RTX_RX_CTX_BOL0;
+    rx = try_compile("\\s*\\s*\\s*x", 0, a, NULL);
+    if (!rx) {
+        expect(0, "compile", "\\s*\\s*\\s*x", "");
+        return;
+    }
+    t0 = now_ms();
+    r = rtx_rx_search(rx, &in, 0, in.n, 1, &s, &ms, &me);
+    t1 = now_ms();
+    expect(r == RTX_RX_NONE, "\\s*\\s*\\s*x on 200k spaces: none", "\\s*\\s*\\s*x", "");
+    expect(t1 - t0 < 2000.0, "\\s*\\s*\\s*x is linear (DFA)", "\\s*\\s*\\s*x", "");
+    printf("patho: \\s*\\s*\\s*x over 200000 spaces: %.2f ms\n", t1 - t0);
+    in.force = 1;
+    in.n = 20000;
+    t0 = now_ms();
+    r = rtx_rx_search(rx, &in, 0, in.n, 1, &s, &ms, &me);
+    t1 = now_ms();
+    expect(r == RTX_RX_NONE, "pike: none", "\\s*\\s*\\s*x", "");
+    printf("patho: pike \\s*\\s*\\s*x over 20000 spaces: %.2f ms\n", t1 - t0);
+    in.force = 0;
+
+    /* Exponential for a naive backtracker. */
+    {
+        static const char *pp[] = {"(a|a)*b", "(x+x+)+y", "(a*)*c", "(\\w+\\s?)*$!", NULL};
+        static const char *ss[] = {"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                   "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                                   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                   "word word word word word word word word word word word word!x",
+                                   NULL};
+        size_t k;
+        for (k = 0; pp[k]; k++) {
+            RtxRxIn in2 = {0};
+            size_t hits0 = s.budget_hits;
+            rx = try_compile(pp[k], 0, a, NULL);
+            if (!rx) {
+                expect(0, "compile", pp[k], "");
+                continue;
+            }
+            in2.s = ss[k];
+            in2.n = strlen(ss[k]);
+            in2.gpos = RTX_RX_UNSET;
+            in2.budget = 100000;
+            /* linear engines: correct answer (none) */
+            r = rtx_rx_at(rx, &in2, 0, &s, &end, NULL);
+            expect(r == RTX_RX_NONE, "linear: pathological → none", pp[k], ss[k]);
+            /* backtracker: stops at the budget, honestly */
+            in2.force = 2;
+            t0 = now_ms();
+            r = rtx_rx_at(rx, &in2, 0, &s, &end, NULL);
+            t1 = now_ms();
+            expect(r == RTX_RX_BUDGET || r == RTX_RX_NONE, "bt: budget or none", pp[k], ss[k]);
+            expect(t1 - t0 < 1000.0, "bt: finishes quickly", pp[k], ss[k]);
+            printf("patho: bt /%s/ r=%d budget_hits+=%zu %.2f ms\n", pp[k], r,
+                   s.budget_hits - hits0, t1 - t0);
+        }
+    }
+    expect(rtx_rx_budget_hits() > 0, "budget counter surfaced", "", "");
+    free(sp);
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
+/* Anchored API details: \G, EXTREF (TM end after begin), context flags,
+ * lookbehind into the text before `at`, partial search. */
+static void run_misc(void) {
+    CCArena a = cc_arena_heap(megabytes(1));
+    RtxRxScratch s = {0};
+    RtxRxIn in = {0};
+    RtxRxCaps caps;
+    size_t end = 0, ms = 0, me = 0;
+    RtxRx *rx;
+    int r;
+    in.gpos = RTX_RX_UNSET;
+    rx = try_compile("\\Gfoo", 0, a, NULL);
+    if (!rx) { expect(0, "compile", "\\Gfoo", ""); return; }
+    in.s = "xx foo";
+    in.n = 6;
+    in.gpos = 3;
+    expect(rtx_rx_at(rx, &in, 3, &s, &end, NULL) == RTX_RX_MATCH && end == 6, "\\G at gpos", "\\Gfoo", in.s);
+    in.gpos = 2;
+    expect(rtx_rx_at(rx, &in, 3, &s, &end, NULL) == RTX_RX_NONE, "\\G elsewhere", "\\Gfoo", in.s);
+    in.gpos = RTX_RX_UNSET;
+
+    rx = try_compile("^\\s*\\3\\s*$", RTX_RX_EXTREF, a, NULL);
+    if (!rx) { expect(0, "compile", "^\\s*\\3\\s*$", ""); return; }
+    {
+        static const char *begin_line = "cat <<-EOF";
+        size_t xs[4] = {RTX_RX_UNSET, RTX_RX_UNSET, RTX_RX_UNSET, 7};
+        size_t xe[4] = {RTX_RX_UNSET, RTX_RX_UNSET, RTX_RX_UNSET, 10};
+        in.ext = begin_line;
+        in.ext_s = xs;
+        in.ext_e = xe;
+        in.ext_n = 4;
+        in.s = "  EOF  \n";
+        in.n = 8;
+        in.ctx = RTX_RX_CTX_BOL0;
+        expect(rtx_rx_at(rx, &in, 0, &s, &end, NULL) == RTX_RX_MATCH && end == 8,
+               "extref heredoc end", "^\\s*\\3\\s*$", in.s);
+        in.s = "  EOFX \n";
+        expect(rtx_rx_at(rx, &in, 0, &s, &end, NULL) == RTX_RX_NONE,
+               "extref heredoc end: other word", "^\\s*\\3\\s*$", in.s);
+        in.ext = NULL;
+        in.ext_s = in.ext_e = NULL;
+        in.ext_n = 0;
+    }
+    /* ^ at offset 0 follows the context flag (window lex mid-line). */
+    rx = try_compile("^a", 0, a, NULL);
+    if (!rx) { expect(0, "compile", "^a", ""); return; }
+    in.s = "ab";
+    in.n = 2;
+    in.ctx = 0;
+    expect(rtx_rx_at(rx, &in, 0, &s, &end, NULL) == RTX_RX_NONE, "^ without BOL0", "^a", "ab");
+    in.ctx = RTX_RX_CTX_BOL0;
+    expect(rtx_rx_at(rx, &in, 0, &s, &end, NULL) == RTX_RX_MATCH, "^ with BOL0", "^a", "ab");
+    /* lookbehind reads bytes before `at` */
+    rx = try_compile("(?<=x)y", 0, a, NULL);
+    if (!rx) { expect(0, "compile", "(?<=x)y", ""); return; }
+    in.s = "xy";
+    in.n = 2;
+    expect(rtx_rx_at(rx, &in, 1, &s, &end, &caps) == RTX_RX_MATCH && end == 2, "lookbehind before at", "(?<=x)y", "xy");
+    /* search window: stop, partial */
+    rx = try_compile("a[^z]*z", 0, a, NULL);
+    if (!rx) { expect(0, "compile", "a[^z]*z", ""); return; }
+    in.s = "abbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    in.n = strlen(in.s);
+    r = rtx_rx_search(rx, &in, 0, 10, 0, &s, &ms, &me);
+    expect(r == RTX_RX_PARTIAL && ms == 0, "partial: undecided candidate", "a[^z]*z", in.s);
+    r = rtx_rx_search(rx, &in, 0, 10, 1, &s, &ms, &me);
+    expect(r == RTX_RX_NONE, "eof: no partial", "a[^z]*z", in.s);
+    in.force = 1;
+    r = rtx_rx_search(rx, &in, 0, 10, 0, &s, &ms, &me);
+    expect(r == RTX_RX_PARTIAL && ms == 0, "pike partial", "a[^z]*z", in.s);
+    in.force = 0;
+    rx = try_compile("a.*", 0, a, NULL);
+    if (!rx) { expect(0, "compile", "a.*", ""); return; }
+    r = rtx_rx_search(rx, &in, 0, 10, 0, &s, &ms, &me);
+    expect(r == RTX_RX_PARTIAL && ms == 0, "partial: match may extend", "a.*", in.s);
+    in.s = "abbb\nc";
+    in.n = 6;
+    r = rtx_rx_search(rx, &in, 0, 3, 0, &s, &ms, &me);
+    expect(r == RTX_RX_MATCH && ms == 0 && me == 4, "decided before the end", "a.*", in.s);
+    rx = try_compile("ab", 0, a, NULL);
+    if (!rx) { expect(0, "compile", "ab", ""); return; }
+    in.s = "xxab";
+    in.n = 4;
+    r = rtx_rx_search(rx, &in, 0, 2, 1, &s, &ms, &me);
+    expect(r == RTX_RX_NONE, "start at stop is the next block's", "ab", in.s);
+    expect(rtx_rx_is_literal(rx), "literal detected", "ab", "");
+    rx = try_compile("a.c", RTX_RX_LITERAL, a, NULL);
+    if (!rx) { expect(0, "compile", "a.c", ""); return; }
+    in.s = "abc a.c";
+    in.n = 7;
+    r = rtx_rx_search(rx, &in, 0, 7, 1, &s, &ms, &me);
+    expect(r == RTX_RX_MATCH && ms == 4 && me == 7, "RTX_RX_LITERAL", "a.c", in.s);
+    rx = try_compile("A.C", RTX_RX_LITERAL | RTX_RX_ICASE, a, NULL);
+    if (!rx) { expect(0, "compile", "A.C", ""); return; }
+    r = rtx_rx_search(rx, &in, 0, 7, 1, &s, &ms, &me);
+    expect(r == RTX_RX_MATCH && ms == 4 && me == 7, "RTX_RX_LITERAL icase", "A.C", in.s);
+    expect(rtx_rx_max_len(rx) == 3, "max_len literal", "A.C", "");
+    /* one buffer refilled between calls (project search reads every file
+     * into the same buffer): nothing of the last text may carry over */
+    rx = try_compile("[a-c]+_send\\(", 0, a, NULL);
+    if (!rx) { expect(0, "compile", "[a-c]+_send\\(", ""); return; }
+    {
+        static char buf[300];
+        size_t i;
+        memset(buf, 'z', sizeof(buf));
+        for (i = 19; i < sizeof(buf); i += 20) buf[i] = '\n';
+        in.s = buf;
+        in.n = sizeof(buf);
+        r = rtx_rx_search(rx, &in, 0, 100, 1, &s, &ms, &me);
+        expect(r == RTX_RX_NONE, "refilled buffer: none", "[a-c]+_send\\(", "");
+        memcpy(buf + 10, "ab_send(", 8);
+        r = rtx_rx_search(rx, &in, 0, 100, 1, &s, &ms, &me);
+        expect(r == RTX_RX_MATCH && ms == 10 && me == 18, "refilled buffer: hit", "[a-c]+_send\\(", "");
+    }
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
+static const char *esc(const char *in, char *buf, size_t cap) {
+    size_t o = 0;
+    for (; *in && o + 4 < cap; in++) {
+        if (*in == '\n') {
+            buf[o++] = '\\';
+            buf[o++] = 'n';
+        } else {
+            buf[o++] = *in;
+        }
+    }
+    buf[o] = 0;
+    return buf;
+}
+
+/* Random patterns over a small alphabet; DFA / Pike / backtracker must
+ * agree on every search (the engines share one program). */
+static uint32_t rng = 12345;
+static uint32_t rnd(uint32_t n) {
+    rng = rng * 1103515245u + 12345u;
+    return (rng >> 16) % n;
+}
+
+static void gen_pat(char *out, size_t cap, int depth) {
+    static const char *atoms[] = {"a", "b", "c", ".", "[ab]", "[^a]", "\\n", "\xC3\xA9",
+                                  "\\w", "\\s", "^", "$", "\\b", "\\B", "[a-c\xC3\xA9]", "x",
+                                  "ab", "xa", "\\d", "[0-9]", "A", "\\A", "\\z", "\xC3\x89"};
+    size_t len = strlen(out);
+    int parts = 1 + (int)rnd(3), p;
+    for (p = 0; p < parts && len + 24 < cap; p++) {
+        int k = (int)rnd(10);
+        if (k < 6 || depth > 2) {
+            strcat(out, atoms[rnd(sizeof(atoms) / sizeof(atoms[0]))]);
+        } else if (k < 8) {
+            strcat(out, "(");
+            gen_pat(out, cap, depth + 1);
+            strcat(out, rnd(2) ? "|" : ")");
+            if (out[strlen(out) - 1] == '|') {
+                gen_pat(out, cap, depth + 1);
+                strcat(out, ")");
+            }
+        } else {
+            strcat(out, "(?:");
+            gen_pat(out, cap, depth + 1);
+            strcat(out, ")");
+        }
+        len = strlen(out);
+        if (rnd(3) == 0 && out[len - 1] != '^' && out[len - 1] != '$') {
+            static const char *q[] = {"*", "+", "?", "*?", "+?", "{1,2}", "{2}", "??"};
+            strcat(out, q[rnd(8)]);
+        }
+        len = strlen(out);
+    }
+}
+
+static void run_fuzz(void) {
+    CCArena a = cc_arena_heap(megabytes(8));
+    RtxRxScratch s = {0};
+    int it, bad = 0, skipped = 0, budgeted = 0, iters = 3000, maxlen = 24;
+    const char *ev = getenv("RX_FUZZ_N");
+    /* ASCII, Latin-1 (mixed-class leads), Cyrillic / CJK (all-word leads),
+     * an emoji, and broken UTF-8: a lone lead, a truncated scalar, a
+     * stray continuation (the DFA's valid-UTF-8 assumption must rerun) */
+    static const char *alpha[] = {"a", "b", "c", "\n", " ", "\xC3\xA9", "x", "_",
+                                  "A", "1", "\xC3\x89", "\xC2\xAB", "\xD0\xB6",
+                                  "\xE4\xB8\xAD", "\xF0\x9F\x98\x80", "\xE4",
+                                  "\xE4\xB8", "\x80", "\xD0", "\xE2\x80\x94"};
+    if (ev && ev[0]) iters = atoi(ev);
+    ev = getenv("RX_FUZZ_SEED");
+    if (ev && ev[0]) rng = (uint32_t)atoi(ev);
+    ev = getenv("RX_FUZZ_LEN");
+    if (ev && ev[0]) maxlen = atoi(ev);
+    if (maxlen < 1) maxlen = 1;
+    if (maxlen > 200) maxlen = 200;
+    for (it = 0; it < iters; it++) {
+        char pat[256] = {0};
+        char subj[512] = {0};
+        RtxRxIn in = {0};
+        RtxRx *rx;
+        size_t n, lo;
+        int slen = (int)rnd((uint32_t)maxlen), k, f;
+        size_t ms[4] = {0, 0, 0, 0}, me[4] = {0, 0, 0, 0};
+        int r[4];
+        gen_pat(pat, sizeof(pat), 0);
+        for (k = 0; k < slen; k++) strcat(subj, alpha[rnd(rnd(3) ? 12 : 20)]);
+        rx = try_compile(pat, rnd(4) == 0 ? RTX_RX_ICASE : 0, a, NULL);
+        if (!rx) {
+            skipped++;
+            continue;
+        }
+        n = strlen(subj);
+        in.s = subj;
+        in.n = n;
+        in.gpos = RTX_RX_UNSET;
+        in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+        in.budget = 1000000;
+        lo = n ? rnd((uint32_t)n) : 0;
+        /* 0 auto (DFA + prefilter), 1 Pike, 2 backtracker, 3 DFA alone */
+        for (f = 0; f < 4; f++) {
+            size_t h0 = s.budget_hits;
+            in.force = (unsigned)f;
+            r[f] = rtx_rx_search(rx, &in, lo, n + 1, 1, &s, &ms[f], &me[f]);
+            if (s.budget_hits != h0) r[f] = -1; /* inconclusive: budget spent */
+        }
+        if (r[0] < 0 || r[2] < 0) budgeted++;
+        for (f = 1; f < 4; f++) {
+            if (r[f] < 0 || r[0] < 0) continue;
+            if (r[f] != r[0] || (r[0] == RTX_RX_MATCH && (ms[f] != ms[0] || me[f] != me[0]))) {
+                char eb[1200];
+                if (bad < 12)
+                    fprintf(stderr, "FUZZ MISMATCH /%s/ on \"%s\" lo=%zu: dfa %d [%zu,%zu) %s %d [%zu,%zu)\n",
+                            pat, esc(subj, eb, sizeof(eb)), lo, r[0], ms[0], me[0],
+                            f == 1 ? "pike" : f == 2 ? "bt" : "dfa-nopf", r[f],
+                            ms[f], me[f]);
+                bad++;
+                break;
+            }
+        }
+        /* anchored at the found start: same end, same group 1 (Pike vs BT) */
+        if (r[0] == RTX_RX_MATCH && r[2] == RTX_RX_MATCH) {
+            RtxRxCaps c1, c2;
+            size_t e1 = 0, e2 = 0;
+            int a1, a2;
+            in.force = 2;
+            a2 = rtx_rx_at(rx, &in, ms[0], &s, &e2, &c2);
+            if (rtx_rx_mode(rx) == RTX_RX_LINEAR) {
+                /* auto: Pike, or the backtracker when captures sit in a
+                 * nullable loop (Onig keeps the empty last iteration) */
+                in.force = 0;
+                a1 = rtx_rx_at(rx, &in, ms[0], &s, &e1, &c1);
+                if (a2 != RTX_RX_BUDGET &&
+                    (a1 != a2 || e1 != e2 ||
+                     (a1 == RTX_RX_MATCH && rtx_rx_groups(rx) > 1 &&
+                      (c1.s[1] != c2.s[1] || c1.e[1] != c2.e[1])))) {
+                    char eb[1200];
+                    if (bad < 12)
+                        fprintf(stderr, "FUZZ ANCHORED MISMATCH /%s/ on \"%s\" at=%zu: auto %d %zu g1[%zu,%zu) bt %d %zu g1[%zu,%zu)\n",
+                                pat, esc(subj, eb, sizeof(eb)), ms[0], a1, e1, c1.s[1], c1.e[1],
+                                a2, e2, c2.s[1], c2.e[1]);
+                    bad++;
+                }
+            }
+            if (a2 == RTX_RX_MATCH && e2 != me[0]) {
+                char eb[1200];
+                if (bad < 12)
+                    fprintf(stderr, "FUZZ SEARCH/ANCHOR MISMATCH /%s/ on \"%s\" at=%zu: search end %zu anchored %zu\n",
+                            pat, esc(subj, eb, sizeof(eb)), ms[0], me[0], e2);
+                bad++;
+            }
+            in.force = 0;
+        }
+        /* partial windows: DFA and Pike agree when the text is cut short */
+        if (n > 4) {
+            size_t cut = n - 2;
+            in.n = cut;
+            for (f = 0; f < 4; f++) {
+                if (f == 2) continue;
+                in.force = (unsigned)f;
+                r[f] = rtx_rx_search(rx, &in, lo < cut ? lo : 0, cut / 2 + 1, 0, &s, &ms[f], &me[f]);
+            }
+            r[2] = r[0];
+            ms[2] = ms[0];
+            me[2] = me[0];
+            if (r[1] != r[0] || (r[0] != RTX_RX_NONE && (ms[1] != ms[0] ||
+                                                         (r[0] == RTX_RX_MATCH && me[1] != me[0]))) ||
+                r[3] != r[0] || (r[0] != RTX_RX_NONE && (ms[3] != ms[0] ||
+                                                         (r[0] == RTX_RX_MATCH && me[3] != me[0])))) {
+                char eb[1200];
+                subj[cut] = 0;
+                if (bad < 12)
+                    fprintf(stderr, "FUZZ PARTIAL MISMATCH /%s/ on \"%s\" lo=%zu stop=%zu: dfa %d [%zu,%zu) pike %d [%zu,%zu) dfa-nopf %d [%zu,%zu)\n",
+                            pat, esc(subj, eb, sizeof(eb)), lo < cut ? lo : 0, cut / 2 + 1, r[0], ms[0], me[0], r[1], ms[1], me[1],
+                            r[3], ms[3], me[3]);
+                bad++;
+            }
+        }
+    }
+    checks++;
+    if (bad) fails++;
+    printf("fuzz: %d patterns, %d mismatches, %d compile-skips, %d budgeted, dfa resets %zu giveups %zu exact reruns %zu\n",
+           iters, bad, skipped, budgeted, s.dfa_resets, s.dfa_giveups, s.dfa_exact);
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
+/* Prefilter differential: literal-shaped patterns (ignore case, inner
+ * literals under a line or offset bound, literal sets) on long random
+ * haystacks with planted hits, long enough for the vector filter. Every
+ * hit list must equal the plain DFA scan (force 3) and the Pike VM; cut
+ * windows (partial) must agree too. */
+static void rand_lit(char *out, size_t cap, int maxn) {
+    static const char *ch[] = {"a", "b", "c", "x", "y", "z", "_", "(", "E", "\xC3\xA9", "q", "Q"};
+    int n = 1 + (int)rnd((uint32_t)maxn), k;
+    out[0] = 0;
+    for (k = 0; k < n && strlen(out) + 4 < cap; k++) {
+        const char *c = ch[rnd(12)];
+        if (!strcmp(c, "(")) strcat(out, "\\(");
+        else strcat(out, c);
+    }
+}
+
+/* The literal text of rand_lit's pattern (unescape \( ), case-flipped
+ * at random when icase. */
+static void lit_text(const char *pat, char *out, int flip) {
+    size_t o = 0;
+    for (; *pat; pat++) {
+        char c = *pat;
+        if (c == '\\' && pat[1]) c = *++pat;
+        if (flip && rnd(2)) {
+            if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+            else if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        }
+        out[o++] = c;
+    }
+    out[o] = 0;
+}
+
+static void run_pf_fuzz(void) {
+    CCArena a = cc_arena_heap(megabytes(8));
+    RtxRxScratch s = {0};
+    int it, bad = 0, iters = 1500, withpf = 0;
+    static const char *alpha[] = {"a", "b", "c", "x", "y", "z", "_", "(", "\n", " ", "A",
+                                  "X", "E", "e", "\xC3\xA9", "\xC3\x89", "0", "1", "q",
+                                  "\xD0\xB6", "\xE4\xB8\xAD", "\xE4", "\x80"};
+    const char *ev = getenv("RX_PF_N");
+    static char subj[4096];
+    if (ev && ev[0]) iters = atoi(ev);
+    for (it = 0; it < iters; it++) {
+        char l1[64], l2[64], l3[64], pat[512], t1[64], t2[64];
+        RtxRxIn in = {0};
+        RtxRx *rx;
+        unsigned fl = rnd(3) == 0 ? RTX_RX_ICASE : 0;
+        int kind = (int)rnd(12), k, f, plants;
+        size_t n, len = 40 + rnd(900), lo, pos[3];
+        uint32_t hsh[3];
+        int cnt[3];
+        rand_lit(l1, sizeof(l1), 6);
+        rand_lit(l2, sizeof(l2), 4);
+        rand_lit(l3, sizeof(l3), 3);
+        switch (kind) {
+        case 0: snprintf(pat, sizeof(pat), "%s", l1); break;
+        case 1: snprintf(pat, sizeof(pat), "\\b%s\\w*", l1); break;
+        case 2: snprintf(pat, sizeof(pat), "[a-c]+%s", l1); break;
+        case 3: snprintf(pat, sizeof(pat), "(?s).{0,3}%s", l1); break;
+        case 4: snprintf(pat, sizeof(pat), "%s|%s|%s", l1, l2, l3); break;
+        case 5: snprintf(pat, sizeof(pat), "(?:%s|%s)[0-9]+", l1, l2); break;
+        case 6: snprintf(pat, sizeof(pat), "%s\\s+%s", l1, l2); break;
+        case 7: snprintf(pat, sizeof(pat), "[^x]*%s", l1); break;
+        case 8: snprintf(pat, sizeof(pat), "\\d{2}%s(%s)?", l1, l2); break;
+        case 9: snprintf(pat, sizeof(pat), "^%s|%s$", l1, l2); break;
+        case 10: snprintf(pat, sizeof(pat), "\\b\\w+%s\\b", l1); break;
+        default: snprintf(pat, sizeof(pat), "%s\\B.|\\b.%s", l1, l2); break;
+        }
+        rx = try_compile(pat, fl, a, NULL);
+        if (!rx) continue;
+        subj[0] = 0;
+        n = 0;
+        while (n < len) {
+            const char *c = alpha[rnd(23)];
+            strcat(subj, c);
+            n += strlen(c);
+        }
+        /* plant literal hits */
+        plants = (int)rnd(4);
+        for (k = 0; k < plants; k++) {
+            size_t at = rnd((uint32_t)n), ln;
+            lit_text(k & 1 ? l2 : l1, t1, fl != 0);
+            ln = strlen(t1);
+            if (at + ln < n) memcpy(subj + at, t1, ln);
+        }
+        n = strlen(subj);
+        in.s = subj;
+        in.n = n;
+        in.gpos = RTX_RX_UNSET;
+        in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+        in.budget = 1000000;
+        lo = rnd(8) ? 0 : rnd((uint32_t)n);
+        /* every hit from lo: 0 = auto, 1 = Pike, 2 = DFA without prefilter */
+        for (f = 0; f < 3; f++) {
+            size_t p = lo;
+            in.force = f == 2 ? 3u : (unsigned)f;
+            cnt[f] = 0;
+            hsh[f] = 2166136261u;
+            while (p <= n && cnt[f] < 4000) {
+                size_t ms = 0, me = 0;
+                int r = rtx_rx_search(rx, &in, p, n + 1, 1, &s, &ms, &me);
+                if (r != RTX_RX_MATCH) break;
+                cnt[f]++;
+                hsh[f] = (hsh[f] ^ (uint32_t)ms) * 16777619u;
+                hsh[f] = (hsh[f] ^ (uint32_t)me) * 16777619u;
+                p = me > ms ? me : ms + 1;
+            }
+            pos[f] = p;
+        }
+        if (rtx_rx_has_prefilter(rx)) withpf++;
+        if (cnt[1] != cnt[0] || hsh[1] != hsh[0] || cnt[2] != cnt[0] || hsh[2] != hsh[0]) {
+            if (bad < 12)
+                fprintf(stderr, "PF MISMATCH /%s/%s n=%zu lo=%zu: auto %d pike %d dfa-nopf %d hits\n",
+                        pat, fl ? "i" : "", n, lo, cnt[0], cnt[1], cnt[2]);
+            bad++;
+            continue;
+        }
+        /* cut windows: partial answers agree */
+        for (k = 0; k < 4; k++) {
+            size_t cut = rnd((uint32_t)n + 1), stop, l0, ms[3] = {0, 0, 0}, me[3] = {0, 0, 0};
+            int r[3];
+            if (cut == 0) continue;
+            stop = 1 + rnd((uint32_t)cut);
+            l0 = rnd((uint32_t)stop);
+            in.n = cut;
+            for (f = 0; f < 3; f++) {
+                in.force = f == 2 ? 3u : (unsigned)f;
+                r[f] = rtx_rx_search(rx, &in, l0, stop, 0, &s, &ms[f], &me[f]);
+            }
+            in.n = n;
+            for (f = 1; f < 3; f++) {
+                if (r[f] != r[0] || (r[0] != RTX_RX_NONE && ms[f] != ms[0]) ||
+                    (r[0] == RTX_RX_MATCH && me[f] != me[0])) {
+                    if (bad < 12)
+                        fprintf(stderr, "PF PARTIAL MISMATCH /%s/%s cut=%zu lo=%zu stop=%zu: auto %d [%zu,%zu) %s %d [%zu,%zu)\n",
+                                pat, fl ? "i" : "", cut, l0, stop, r[0], ms[0], me[0],
+                                f == 1 ? "pike" : "dfa-nopf", r[f], ms[f], me[f]);
+                    bad++;
+                    break;
+                }
+            }
+        }
+        (void)t2;
+        (void)pos;
+    }
+    checks++;
+    if (bad) fails++;
+    printf("pf fuzz: %d patterns (%d with a prefilter), %d mismatches\n", iters, withpf, bad);
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
+/* A DFA whose states outgrow the cache: it clears and goes on (or hands
+ * the search to the Pike VM when it thrashes); answers stay the Pike VM's. */
+static void run_dfa_cache(void) {
+    CCArena a = cc_arena_heap(megabytes(1));
+    RtxRxScratch s = {0};
+    RtxRxIn in = {0};
+    static const char *pats[] = {"[ab]*a[ab]{15}c", "(?:a|b)*a(?:a|b){17}c", "\\ba[ab]{14}\\b", NULL};
+    size_t n = 300000, k, i;
+    char *t = (char *)malloc(n + 1);
+    uint32_t seed = 99;
+    if (!t) return;
+    for (i = 0; i < n; i++) {
+        seed = seed * 1103515245u + 12345u;
+        t[i] = (seed >> 16) & 1 ? 'a' : 'b';
+    }
+    t[n - 5] = 'c';
+    t[n] = 0;
+    in.s = t;
+    in.n = n;
+    in.gpos = RTX_RX_UNSET;
+    in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+    for (k = 0; pats[k]; k++) {
+        RtxRx *rx = try_compile(pats[k], 0, a, NULL);
+        size_t ms[2] = {0, 0}, me[2] = {0, 0}, r0 = s.dfa_resets, g0 = s.dfa_giveups;
+        int r[2], f;
+        double t0 = now_ms();
+        if (!rx) {
+            expect(0, "compile", pats[k], "");
+            continue;
+        }
+        for (f = 0; f < 2; f++) {
+            in.force = (unsigned)f;
+            r[f] = rtx_rx_search(rx, &in, 0, n, 1, &s, &ms[f], &me[f]);
+        }
+        in.force = 0;
+        printf("dfa cache: /%s/ r=%d [%zu,%zu) resets+=%zu giveups+=%zu %.1f ms\n", pats[k], r[0],
+               ms[0], me[0], s.dfa_resets - r0, s.dfa_giveups - g0, now_ms() - t0);
+        expect(r[0] == r[1] && (r[0] != RTX_RX_MATCH || (ms[0] == ms[1] && me[0] == me[1])),
+               "dfa cache overflow: same answer as Pike", pats[k], "");
+    }
+    free(t);
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
+/* rx_smoke --one PATTERN SUBJECT LO [EOFCUT]: print each engine's answer
+ * (a hook for shrinking a fuzz mismatch by hand). */
+static int run_one(int argc, char **argv) {
+    CCArena a = cc_arena_heap(megabytes(1));
+    RtxRxScratch s = {0};
+    RtxRxIn in = {0};
+    RtxRx *rx;
+    size_t lo, ms, me, stop;
+    int f, r, eof = 1;
+    if (argc < 5) return 2;
+    rx = try_compile(argv[2], getenv("RX_ICASE") ? RTX_RX_ICASE : 0, a, NULL);
+    if (!rx) {
+        printf("compile error\n");
+        return 0;
+    }
+    in.s = argv[3];
+    in.n = strlen(argv[3]);
+    in.gpos = RTX_RX_UNSET;
+    in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+    in.budget = 1000000;
+    lo = (size_t)atoi(argv[4]);
+    stop = in.n + 1;
+    if (argc > 5) {
+        eof = 0;
+        stop = (size_t)atoi(argv[5]);
+    }
+    for (f = 0; f < 4; f++) {
+        in.force = (unsigned)f;
+        ms = me = 0;
+        r = rtx_rx_search(rx, &in, lo, stop, eof, &s, &ms, &me);
+        printf("%d %zu %zu\n", r, r ? ms : 0, r == 1 ? me : 0);
+    }
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--one")) return run_one(argc, argv);
+    run_cases();
+    run_errors();
+    run_misc();
+    run_patho();
+    run_fuzz();
+    run_pf_fuzz();
+    run_dfa_cache();
+    if (fails) {
+        fprintf(stderr, "rx_smoke: %d of %d checks failed\n", fails, checks);
+        return 1;
+    }
+    printf("rx_smoke ok  checks=%d cases=%zu\n", checks, sizeof(cases) / sizeof(cases[0]));
+    return 0;
+}

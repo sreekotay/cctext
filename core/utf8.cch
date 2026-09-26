@@ -301,30 +301,88 @@ RtxUtf8Cl rtx_utf8_cluster(char[:] bytes, size_t i) {
     return z;
 }
 
-/* Text pane: never emit C0. CR homes a TTY, then [K wipes the row (hex
- * view is fine because it already substitutes). LF should not be in a
- * row; skip it too. Other C0/DEL become '.' like the hex dump. */
+/* Terminal boundary. C0, DEL and C1 (U+0080..U+009F: CSI, OSC, ST in an
+ * 8-bit terminal) never reach the TTY; each is a one-column '.' like the
+ * hex dump. An invalid byte is U+FFFD. A row never holds CR / LF (CR would
+ * home the cursor, then [K wipes the row): term_put drops them;
+ * term_fit, for names and paths, shows them as '.'. */
+int rtx_utf8_term_ctl(uint32_t cp) {
+    return cp < 0x20 || cp == 0x7F || (cp >= 0x80 && cp < 0xA0);
+}
+
 int rtx_utf8_term_put(uint32_t cp, const char *raw, size_t raw_n,
                              char *out, size_t cap) {
+    size_t k;
     if (cp == '\r' || cp == '\n') return 0;
-    if (cp < 0x20 || cp == 0x7F) {
-        if (!out || cap < 1) return 0;
+    if (!out || cap < 1) return 0;
+    if (rtx_utf8_term_ctl(cp)) {
         out[0] = '.';
         return 1;
     }
-    if (!raw || !out || raw_n == 0 || raw_n > cap) return 0;
-    {
-        char[:] dst = cc_slice_from_buffer(out, raw_n);
-        char[:] src = cc_slice_from_buffer((void *)raw, raw_n);
-        dst.copy(src) !>(e) { (void)e; return 0; };
+    if (!raw || raw_n == 0) return 0;
+    if (cp == RTX_UTF8_FFFD && ((unsigned char)raw[0] >= 0x80) &&
+        rtx_utf8_decode(raw, raw_n, NULL) <= 0) {
+        if (cap < 3) return 0;
+        out[0] = (char)0xEF;
+        out[1] = (char)0xBF;
+        out[2] = (char)0xBD;
+        return 3;
     }
+    if (raw_n > cap) {
+        /* A cluster past the look buffer: its first scalar, never a cut. */
+        int one = rtx_utf8_decode(raw, raw_n, NULL);
+        if (one <= 0 || (size_t)one > cap) return 0;
+        raw_n = (size_t)one;
+    }
+    for (k = 0; k < raw_n; k++) out[k] = raw[k];
     return (int)raw_n;
 }
 
 int rtx_utf8_term_cols(uint32_t cp, int raw_cols) {
     if (cp == '\r' || cp == '\n') return 0;
-    if (cp < 0x20 || cp == 0x7F) return 1;
+    if (rtx_utf8_term_ctl(cp)) return 1;
     return raw_cols;
+}
+
+/* Sanitized copy of s[0..n) for one terminal cell run: whole clusters
+ * only, controls (CR / LF too) as stand-ins, at most `maxc` columns and
+ * cap - 1 bytes, NUL-terminated. `out` NULL only measures. Returns bytes
+ * written; *used = source bytes taken, *cols = columns. */
+size_t rtx_utf8_term_fit(const char *s, size_t n, int maxc, char *out,
+                         size_t cap, size_t *used, int *cols) {
+    size_t i = 0, o = 0;
+    int c = 0;
+    char[:] bytes = cc_slice_from_buffer((void *)s, s ? n : 0);
+    if (out && cap) out[0] = 0;
+    while (s && i < n) {
+        RtxUtf8Cl cl = rtx_utf8_cluster(bytes, i);
+        size_t step = cl.n ? cl.n : 1;
+        char put[RTX_UTF8_LOOK];
+        int pn, pc;
+        if (cl.cp == '\r' || cl.cp == '\n') {
+            put[0] = '.';
+            pn = 1;
+            pc = 1;
+        } else {
+            pn = rtx_utf8_term_put(cl.cp, s + i, step, put, sizeof(put));
+            pc = rtx_utf8_term_cols(cl.cp, cl.cols);
+        }
+        if (pn < 0) pn = 0;
+        if (pc < 0) pc = 0;
+        if (c + pc > maxc) break;
+        if (out) {
+            int k;
+            if (o + (size_t)pn + 1 > cap) break;
+            for (k = 0; k < pn; k++) out[o + (size_t)k] = put[k];
+            out[o + (size_t)pn] = 0;
+        }
+        o += (size_t)pn;
+        c += pc;
+        i += step;
+    }
+    if (used) *used = i;
+    if (cols) *cols = c;
+    return o;
 }
 
 size_t rtx_utf8_align(char[:] bytes, size_t i) {

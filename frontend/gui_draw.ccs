@@ -1,6 +1,6 @@
 #!ccc ccs
 /*
- * cctext-gui paint (linked TU; see gui.cch).
+ * cctext-ui paint (linked TU; see gui.cch).
  */
 #include <ccc/std/prelude.cch>
 #include <stdio.h>
@@ -13,6 +13,7 @@
 #include "../core/workspace.cch"
 #include "../core/find.cch"
 #include "../core/ui.cch"
+#include "../core/ui_proj.cch"
 #include "../core/browse.cch"
 #include "gui.cch"
 
@@ -127,6 +128,14 @@ static void gui_draw_link_ul(const RtxLayout *L, RtxDocLayout d, size_t off,
     DrawLine((int)pos.x, y, (int)(pos.x + gw), y, c);
 }
 
+/* `~~strike~~` (RtxStyle.strike): a line through the glyph's middle. */
+static void gui_draw_strike(RtxStyle st, Vector2 pos, double gw, double sz, Color c) {
+    int y;
+    if (!st.strike || gw < 1.0) return;
+    y = (int)(pos.y + sz * 0.55);
+    DrawLine((int)pos.x, y, (int)(pos.x + gw), y, c);
+}
+
 static Color gui_pair_color(void) {
     RtxThemeColor c = rtx_theme_pair();
     return (Color){c.r, c.g, c.b, 255};
@@ -136,13 +145,293 @@ static Color gui_face(RtxBrowseFace face) {
     RtxThemeColor c = rtx_browse_face(face);
     return (Color){c.r, c.g, c.b, 255};
 }
+/* Horizontal extent of the pane (or bar) being painted. A blink rect is
+ * the caret's row across it, not a caret-sized box: a glyph cut by the
+ * clip's edge rasterizes differently from the same glyph drawn whole
+ * (cairo takes another compositing path), so the clip's side edges sit
+ * where nothing is drawn but background. */
+static double g_band_x, g_band_w;
+
+static void gui_band_note(double y, double h) {
+    gui_blink_note(g_band_x, y, g_band_w, h);
+}
+
+static const Color GUI_CARET_C = {255, 200, 80, 255};
+
+/* A caret bar at (x, y, 2, h). With the caret layer (ui->caret_host) the
+ * bar goes on the layer, whatever the blink phase, and the text paint
+ * draws nothing: a blink repaints no text. Without it (--caret=cell, a
+ * toolkit with no layer) it is painted when lit, and its row band noted so
+ * a blink repaints just that band. */
+static void gui_caret_bar_at(const RtxUi *ui, double x, double y, double h) {
+    if (ui && ui->caret_host) {
+        gui_caret_bar((double)(int)x, (double)(int)y, 2, (double)(int)h,
+                      GUI_CARET_C);
+        return;
+    }
+    gui_band_note(y, h);
+    if (rtx_ui_blink(ui))
+        DrawRectangle((int)x, (int)y, 2, (int)h, GUI_CARET_C);
+}
+
+/* The document caret, when `at` is its position in the focused pane. */
+static void gui_caret_put(const RtxUi *ui, int focused, int at, double x,
+                          double y, double h) {
+    if (!ui || !rtx_ui_caret_at(ui, focused, at)) return;
+    gui_caret_bar_at(ui, x, y, h);
+}
+
+/* --- pane geometry and the tab strip (cctext-ui) ---
+ *
+ * The window is: the tab strip (when shown), the pane tree inside the
+ * left pad, the find panel, the status bar. Panes are split by a
+ * GUI_GAP-pixel gap with a 1-pixel rule in it; a drag on the gap moves it. */
+
+GuiGeo g_gg[RTX_PANES_MAX];
+static int g_gg_ww, g_gg_hh, g_gg_pad, g_gg_top, g_gg_find, g_gg_ok;
+static int g_gui_tabs = 1; /* CCTEXT-style: 0 never, 1 auto, 2 always */
+static GuiTab g_gtab[GUI_TAB_HITS];
+static int g_gtab_n;
+
+void gui_tabs_set(int mode) {
+    g_gui_tabs = mode;
+}
+
+int gui_tabs_shown(const RtxWs *w) {
+    if (!w || g_gui_tabs == 0) return 0;
+    if (g_gui_tabs == 2) return 1;
+    return w->len >= 2;
+}
+
+RtxPaneRect gui_pane_area(const RtxWs *w, int ww, int hh, int pad, int top,
+                          int find_on) {
+    RtxPaneRect a;
+    int inner = ww - pad;
+    if (inner < 40) inner = 40;
+    a.x = pad;
+    a.y = top + (gui_tabs_shown(w) ? GUI_TABS_H : 0);
+    a.w = inner;
+    a.h = gui_text_ph(hh, a.y, find_on);
+    if (a.h < GUI_ROW_H) a.h = GUI_ROW_H;
+    return a;
+}
+
+void gui_geo(RtxWs *w, int ww, int hh, int pad, int top, int find_on) {
+    RtxPaneRect r[RTX_PANES_MAX];
+    int p;
+    if (!w) return;
+    g_gg_ww = ww;
+    g_gg_hh = hh;
+    g_gg_pad = pad;
+    g_gg_top = top;
+    g_gg_find = find_on;
+    g_gg_ok = 1;
+    RtxWs_pane_rects(w, gui_pane_area(w, ww, hh, pad, top, find_on), GUI_GAP,
+                     GUI_GAP, r);
+    for (p = 0; p < RTX_PANES_MAX; p++) {
+        g_gg[p].x0 = r[p].x;
+        g_gg[p].y0 = r[p].y;
+        g_gg[p].w = r[p].w > 0 ? r[p].w : 1;
+        g_gg[p].h = r[p].h > 0 ? r[p].h : 1;
+        g_gg[p].vis = r[p].h / GUI_ROW_H;
+        if (g_gg[p].vis < 1) g_gg[p].vis = 1;
+    }
+}
+
+void gui_geo_again(RtxWs *w) {
+    if (g_gg_ok) gui_geo(w, g_gg_ww, g_gg_hh, g_gg_pad, g_gg_top, g_gg_find);
+}
+
+int gui_pane_at_xy(RtxWs *w, int x, int y) {
+    int k;
+    if (!w) return -1;
+    for (k = 0; k < w->npanes; k++) {
+        int p = w->order[k];
+        const GuiGeo *g = &g_gg[p];
+        if (x >= g->x0 && x < g->x0 + g->w && y >= g->y0 && y < g->y0 + g->h)
+            return p;
+    }
+    return -1;
+}
+
 int gui_pane_at(RtxWs *w, int x, int pad, int inner) {
-    if (w->npanes < 2) return 0;
-    return x >= pad + inner / 2 ? 1 : 0;
+    int k;
+    (void)pad;
+    (void)inner;
+    if (!w) return 0;
+    for (k = 0; k < w->npanes; k++) {
+        int p = w->order[k];
+        if (x >= g_gg[p].x0 && x < g_gg[p].x0 + g_gg[p].w) return p;
+    }
+    return w->focus;
 }
 
 int gui_pane_x0(RtxWs *w, int pane, int pad, int inner) {
-    return pad + (pane == 1 && w && w->npanes == 2 ? inner / 2 : 0);
+    (void)w;
+    (void)inner;
+    if (!g_gg_ok || pane < 0 || pane >= RTX_PANES_MAX) return pad;
+    return g_gg[pane].x0;
+}
+
+int gui_divider_at(RtxWs *w, int x, int y) {
+    if (!w || !g_gg_ok || w->npanes < 2) return -1;
+    return RtxWs_divider_at(w, gui_pane_area(w, g_gg_ww, g_gg_hh, g_gg_pad, g_gg_top,
+                                             g_gg_find),
+                            GUI_GAP, GUI_GAP, x, y, 2);
+}
+
+int gui_divider_drag(RtxWs *w, int node, int x, int y) {
+    if (!w || !g_gg_ok) return 0;
+    if (!RtxWs_divider_drag(w, gui_pane_area(w, g_gg_ww, g_gg_hh, g_gg_pad, g_gg_top,
+                                             g_gg_find),
+                            GUI_GAP, GUI_GAP, node, x - GUI_GAP / 2,
+                            y - GUI_GAP / 2))
+        return 0;
+    gui_geo_again(w);
+    return 1;
+}
+
+int gui_focus_dir(RtxWs *w, int dx, int dy) {
+    if (!w || !g_gg_ok) return 0;
+    return RtxWs_focus_dir(w, gui_pane_area(w, g_gg_ww, g_gg_hh, g_gg_pad, g_gg_top,
+                                            g_gg_find),
+                           GUI_GAP, GUI_GAP, dx, dy);
+}
+
+static void gui_draw_dividers(RtxWs *w) {
+    RtxPaneRect gap[RTX_PANES_MAX];
+    int node[RTX_PANES_MAX];
+    int n, i;
+    if (!w || !g_gg_ok || w->npanes < 2) return;
+    n = RtxWs_dividers(w, gui_pane_area(w, g_gg_ww, g_gg_hh, g_gg_pad, g_gg_top,
+                                        g_gg_find),
+                       GUI_GAP, GUI_GAP, node, gap, RTX_PANES_MAX);
+    for (i = 0; i < n; i++) {
+        DrawRectangle(gap[i].x, gap[i].y, gap[i].w, gap[i].h, (Color){24, 24, 28, 255});
+        if (RtxWs_divider_dir(w, node[i]) == RTX_SPLIT_COLS)
+            DrawRectangle(gap[i].x + gap[i].w / 2, gap[i].y, 1, gap[i].h,
+                          (Color){80, 80, 90, 255});
+        else
+            DrawRectangle(gap[i].x, gap[i].y + gap[i].h / 2, gap[i].w, 1,
+                          (Color){80, 80, 90, 255});
+    }
+    /* The focused pane: a thin accent along its top edge. */
+    if (RtxWs_pane_live(w, w->focus)) {
+        const GuiGeo *g = &g_gg[w->focus];
+        DrawRectangle(g->x0, g->y0, g->w, 2, (Color){60, 110, 190, 255});
+    }
+}
+
+static const char *gui_tab_name(const RtxWs *w, int i) {
+    const char *p = RtxWs_buf_path(w, i);
+    const char *s;
+    if (!p) {
+        const RtxBuf *b = w->bufs[i];
+        if (!b->parked && b->doc.path.ptr && b->doc.path.len) p = b->doc.path.ptr;
+    }
+    if (!p) return "untitled";
+    s = strrchr(p, '/');
+    return s && s[1] ? s + 1 : p;
+}
+
+/* The buffers in tab order: the focused pane's is lit, one another pane
+ * shows is brighter, ● is unsaved and × closes. When they do not fit, the
+ * lit one stays in view and ‹ / › mark the rest. */
+static void gui_draw_tabs(RtxWs *w, GuiFonts *fonts, int x, int y, int ww) {
+    int n = (int)w->len, act = w->pane[w->focus], i, first, last;
+    float tw[256];
+    float used = 0, room = (float)(ww - x - 8), cx;
+    const float fs = 13.0f, padx = 10.0f, box = 16.0f, arrow = 16.0f;
+    g_gtab_n = 0;
+    if (n > 256) n = 256;
+    DrawRectangle(0, y, ww, GUI_TABS_H, (Color){30, 31, 38, 255});
+    for (i = 0; i < n; i++) {
+        float nw = gui_mono_w(fonts, fs, gui_tab_name(w, i));
+        if (nw > 220.0f) nw = 220.0f;
+        tw[i] = padx + nw + 6.0f + box + padx * 0.5f;
+        used += tw[i];
+    }
+    if (act < 0 || act >= n) act = 0;
+    first = 0;
+    last = n - 1;
+    if (used > room) {
+        int grow = 1;
+        float fit = room - 2 * arrow;
+        first = last = act;
+        used = tw[act];
+        while (grow) {
+            grow = 0;
+            if (last + 1 < n && used + tw[last + 1] <= fit) {
+                used += tw[++last];
+                grow = 1;
+            }
+            if (first > 0 && used + tw[first - 1] <= fit) {
+                used += tw[--first];
+                grow = 1;
+            }
+        }
+    }
+    cx = (float)x;
+    if (first > 0) {
+        Vector2 ap = {cx + 3.0f, (float)y + 5.0f};
+        DrawTextEx(fonts->mono, "‹", ap, fs, 0, (Color){170, 174, 186, 255});
+        if (g_gtab_n < GUI_TAB_HITS)
+            g_gtab[g_gtab_n++] = (GuiTab){(int)cx, (int)(cx + arrow), -1, -2};
+        cx += arrow;
+    }
+    for (i = first; i <= last; i++) {
+        int lit = i == act;
+        int shown = !lit && RtxWs_buf_shown(w, i);
+        int dirty = RtxWs_buf_dirty(w, i);
+        Color bg = lit ? (Color){46, 84, 140, 255}
+                       : shown ? (Color){52, 55, 66, 255} : (Color){40, 42, 50, 255};
+        Color fg = lit ? (Color){240, 244, 252, 255}
+                       : shown ? (Color){214, 218, 228, 255} : (Color){160, 164, 176, 255};
+        char name[256];
+        Vector2 tp;
+        snprintf(name, sizeof name, "%s", gui_tab_name(w, i));
+        DrawRectangle((int)cx, y + 2, (int)tw[i] - 2, GUI_TABS_H - 2, bg);
+        tp.x = cx + padx;
+        tp.y = (float)y + 6.0f;
+        BeginScissorMode((int)cx, y, (int)(tw[i] - box - padx), GUI_TABS_H);
+        DrawTextEx(fonts->mono, name, tp, fs, 0, fg);
+        EndScissorMode();
+        tp.x = cx + tw[i] - box - padx * 0.5f;
+        DrawTextEx(fonts->mono, dirty ? "●" : "×", tp, fs, 0,
+                   dirty ? (Color){230, 190, 90, 255} : (Color){150, 156, 170, 255});
+        if (g_gtab_n < GUI_TAB_HITS)
+            g_gtab[g_gtab_n++] = (GuiTab){(int)cx, (int)(cx + tw[i]),
+                                          (int)(cx + tw[i] - box - padx * 0.5f) - 3, i};
+        cx += tw[i];
+    }
+    if (last < n - 1) {
+        Vector2 ap = {(float)(ww - arrow - 4), (float)y + 5.0f};
+        DrawTextEx(fonts->mono, "›", ap, fs, 0, (Color){170, 174, 186, 255});
+        if (g_gtab_n < GUI_TAB_HITS)
+            g_gtab[g_gtab_n++] = (GuiTab){(int)ap.x, ww, -1, -3};
+    }
+}
+
+/* Tab strip hit: buffer (close = on its ●/× box), -2 ‹, -3 ›, -1 none.
+ * y must be inside the strip (the caller checks). */
+int gui_tab_at(int x, int *close) {
+    int i;
+    if (close) *close = 0;
+    for (i = 0; i < g_gtab_n; i++) {
+        if (x < g_gtab[i].x0 || x >= g_gtab[i].x1) continue;
+        if (close && g_gtab[i].close_x >= 0 && x >= g_gtab[i].close_x) *close = 1;
+        return g_gtab[i].buf;
+    }
+    return -1;
+}
+
+int gui_tabs_y(void) {
+    return g_gg_top;
+}
+
+int gui_pane_h(int pane) {
+    if (pane < 0 || pane >= RTX_PANES_MAX) return 1;
+    return g_gg[pane].h;
 }
 
 static int gui_rail_w(RtxBuf *b, int vis_rows) {
@@ -344,8 +633,8 @@ void gui_draw_stats(GuiFonts *fonts, RtxBuf *b, int ww, int hh) {
         snprintf(one, sizeof one, "#FIND");
         used = gui_stat_push(text, sizeof text, used, one);
         n++;
-        snprintf(a, sizeof a, "%zu", d->find.hits.len);
-        rtx_ui_fmt_pct(c, sizeof c, d->find.scan_off, d->len());
+        snprintf(a, sizeof a, "%zu", rtx_find_hits_n(&d->find));
+        rtx_ui_fmt_pct(c, sizeof c, d->find.scan_bytes, d->len());
         snprintf(one, sizeof one, "%c%-8s %-16s %-8s %s", fkind, "hits", a,
                  "scan", c);
         used = gui_stat_push(text, sizeof text, used, one);
@@ -413,7 +702,13 @@ static void gui_draw_jump(GuiFonts *fonts, RtxUi *ui, RtxDoc *d, int ww, int hh)
     else
         snprintf(line, sizeof(line), "> %s%s", ui->jump_buf, rtx_ui_prompt_caret(ui));
     pos.y = (float)(y + 48);
+    if (pct < 0 && !ui->caret_host) gui_blink_note(x + 1, pos.y - 2, box_w - 2, 30);
     DrawTextEx(fonts->mono, line, pos, 22, 0, (Color){255, 220, 100, 255});
+    if (pct < 0 && ui->caret_host) {
+        /* The layer caret after the typed digits (no "_" in the text). */
+        Vector2 m = MeasureTextEx(fonts->mono, line, 22, 0);
+        gui_caret_bar(pos.x + m.x + 1, pos.y, 2, 24, GUI_CARET_C);
+    }
 }
 
 float gui_mono_w(GuiFonts *fonts, float sz, const char *s) {
@@ -457,44 +752,146 @@ static void gui_draw_field(GuiFonts *fonts, float sz, Vector2 pos, RtxField f,
     }
     tmp[n] = 0;
     DrawTextEx(fonts->mono, tmp, pos, sz, 0, fg);
-    if (ui && rtx_ui_blink(ui) && f.caret) {
+    if (ui && f.caret) {
         float cx = pos.x + cw * (float)rtx_utf8_prefix_cols(rtx_field_bytes(f),
                                                             *f.caret);
-        DrawRectangle((int)cx, (int)pos.y, 2, (int)sz + 2,
-                      (Color){255, 200, 80, 255});
+        if (ui->caret_host) {
+            gui_caret_bar((double)(int)cx, (double)(int)pos.y, 2,
+                          (double)((int)sz + 2), GUI_CARET_C);
+        } else {
+            /* The field's line across its bar or pane. */
+            gui_band_note(pos.y - 2.0, sz + 6.0);
+            if (rtx_ui_blink(ui))
+                DrawRectangle((int)cx, (int)pos.y, 2, (int)sz + 2, GUI_CARET_C);
+        }
     }
 }
-static void gui_draw_find(GuiFonts *fonts, RtxUi *ui, RtxDoc *d, int ww, int hh) {
-    int y0 = hh - 26 - GUI_FIND_H;
-    int vis_hits = RTX_UI_FIND_ROWS - 1;
-    int i;
-    char stats[96];
+enum { GUI_PAL_ROW_H = 22, GUI_PAL_TOP = 40 };
+
+int gui_palette_vis(int hh) {
+    int v = (hh - GUI_PAL_TOP - 120) / GUI_PAL_ROW_H;
+    if (v > 14) v = 14;
+    return v < 1 ? 1 : v;
+}
+
+/* Command palette: query row, then the ranked commands (title, category,
+ * key hint); the selection is a band. Unavailable ids are dimmed. */
+void gui_draw_palette(GuiFonts *fonts, RtxUi *ui, int ww, int hh) {
+    RtxPalette *p;
+    int box_w, x, y, i, pvis, box_h;
     Vector2 pos;
-    float lab;
-    float sw;
-    float sx;
-    if (y0 < GUI_MENU_H) y0 = GUI_MENU_H;
-    rtx_ui_find_scroll(ui, d, (size_t)vis_hits);
-    rtx_ui_find_stats(d, stats, sizeof(stats));
-    DrawRectangle(0, y0, ww, GUI_FIND_H, (Color){28, 32, 44, 255});
-    DrawLine(0, y0, ww, y0, (Color){80, 90, 110, 255});
+    char head[48];
+    if (!fonts || !ui || !ui->palette) return;
+    p = &ui->pal;
+    pvis = gui_palette_vis(hh);
+    rtx_palette_scroll_to(p, pvis);
+    box_w = ww - 80;
+    if (box_w > 640) box_w = 640;
+    if (box_w < 200) box_w = ww - 16;
+    x = (ww - box_w) / 2;
+    y = GUI_PAL_TOP;
+    box_h = 16 + 30 + pvis * GUI_PAL_ROW_H + 8;
+    DrawRectangle(0, 0, ww, hh, (Color){0, 0, 0, 90});
+    DrawRectangle(x, y, box_w, box_h, (Color){28, 30, 36, 250});
+    DrawRectangleLines(x, y, box_w, box_h, (Color){255, 220, 100, 180});
+    pos.x = (float)(x + 12);
+    pos.y = (float)(y + 12);
+    DrawTextEx(fonts->mono, ">", pos, 16, 0, (Color){255, 220, 100, 255});
+    pos.x += gui_mono_w(fonts, 16, "> ");
+    gui_draw_field(fonts, 16, pos, rtx_palette_field(p), ui,
+                   (Color){235, 235, 240, 255});
+    snprintf(head, sizeof head, "%d command%s", p->navail, p->navail == 1 ? "" : "s");
+    pos.x = (float)(x + box_w - 12) - gui_mono_w(fonts, 13, head);
+    pos.y = (float)(y + 14);
+    DrawTextEx(fonts->mono, head, pos, 13, 0, (Color){150, 150, 160, 255});
+    y += 16 + 30;
+    for (i = 0; i < pvis; i++) {
+        int li = p->top + i;
+        int row = rtx_palette_row(p, li);
+        const RtxCmdDef *d;
+        const char *hint;
+        int live;
+        char title[96];
+        float tx;
+        if (row < 0) {
+            if (i == 0 && p->nrows == 0) {
+                pos.x = (float)(x + 14);
+                pos.y = (float)(y + 3);
+                DrawTextEx(fonts->mono, "no matching command", pos, 15, 0,
+                           (Color){150, 150, 160, 255});
+            }
+            break;
+        }
+        d = rtx_cmd_at((size_t)row);
+        live = rtx_palette_row_live(p, li);
+        hint = rtx_keymap_hint(row);
+        if (li == p->cur)
+            DrawRectangle(x + 4, y, box_w - 8, GUI_PAL_ROW_H,
+                          (Color){52, 70, 120, 255});
+        snprintf(title, sizeof title, "%s%s", d->title, live ? "" : " (unavailable)");
+        pos.x = (float)(x + 14);
+        pos.y = (float)(y + 3);
+        DrawTextEx(fonts->mono, title, pos, 15, 0,
+                   live ? (Color){230, 230, 235, 255} : (Color){130, 130, 140, 255});
+        tx = pos.x + gui_mono_w(fonts, 15, title) + 12.0f;
+        if (d->cat) {
+            pos.x = tx;
+            pos.y = (float)(y + 5);
+            DrawTextEx(fonts->mono, d->cat, pos, 12, 0, (Color){120, 160, 200, 255});
+        }
+        if (hint && hint[0]) {
+            pos.x = (float)(x + box_w - 14) - gui_mono_w(fonts, 13, hint);
+            pos.y = (float)(y + 4);
+            DrawTextEx(fonts->mono, hint, pos, 13, 0, (Color){255, 220, 100, 220});
+        }
+        y += GUI_PAL_ROW_H;
+    }
+}
+
+/* One field row of the find panel: label, field (caret only with focus),
+ * then `tail` at the right. */
+static void gui_draw_find_row(GuiFonts *fonts, RtxUi *ui, RtxField f, int focus,
+                              const char *label, const char *tail, int y, int ww) {
+    Vector2 pos;
+    float lab, sw, sx;
     pos.x = 12;
-    pos.y = (float)(y0 + 4);
-    DrawTextEx(fonts->mono, "find: ", pos, 15, 0, (Color){255, 220, 100, 255});
+    pos.y = (float)y;
+    DrawTextEx(fonts->mono, label, pos, 15, 0, (Color){255, 220, 100, 255});
     lab = gui_mono_w(fonts, 15, "find: ");
     pos.x = 12 + lab;
-    gui_draw_field(fonts, 15, pos, rtx_ui_find_field(ui), ui,
-                   (Color){255, 220, 100, 255});
-    sw = gui_mono_w(fonts, 15, stats);
+    gui_draw_field(fonts, 15, pos, f, focus ? ui : NULL, (Color){255, 220, 100, 255});
+    sw = gui_mono_w(fonts, 15, tail);
     sx = (float)ww - 12.0f - sw;
     if (sx < 12.0f + lab + 80.0f) sx = 12.0f + lab + 80.0f;
     pos.x = sx;
-    DrawTextEx(fonts->mono, stats, pos, 15, 0, (Color){255, 220, 100, 255});
+    DrawTextEx(fonts->mono, tail, pos, 15, 0, (Color){255, 220, 100, 255});
+}
+
+static void gui_draw_find(GuiFonts *fonts, RtxUi *ui, RtxDoc *d, int ww, int hh) {
+    int y0 = hh - 26 - GUI_FIND_H;
+    int heads = rtx_ui_find_head_rows(ui);
+    int vis_hits = RTX_UI_FIND_ROWS - heads;
+    int i;
+    char stats[192];
+    Vector2 pos;
+    if (y0 < GUI_MENU_H) y0 = GUI_MENU_H;
+    rtx_ui_find_scroll(ui, d, (size_t)vis_hits);
+    rtx_ui_find_head(ui, d, stats, sizeof(stats));
+    DrawRectangle(0, y0, ww, GUI_FIND_H, (Color){28, 32, 44, 255});
+    DrawLine(0, y0, ww, y0, (Color){80, 90, 110, 255});
+    gui_draw_find_row(fonts, ui, rtx_ui_find_field(ui), !rtx_ui_repl_focused(ui),
+                      "find: ", stats, y0 + 4, ww);
+    if (ui->repl) {
+        rtx_ui_repl_tags(ui, d, stats, sizeof(stats));
+        gui_draw_find_row(fonts, ui, rtx_ui_repl_field(ui), rtx_ui_repl_focused(ui),
+                          "repl: ", stats, y0 + 4 + GUI_FIND_ROW_H, ww);
+    }
     for (i = 0; i < vis_hits; i++) {
         size_t hit = ui->find_top + (size_t)i;
-        int y = y0 + 8 + (i + 1) * GUI_FIND_ROW_H;
+        int y = y0 + 8 + (i + heads) * GUI_FIND_ROW_H;
         int cur = d && d->find.pinned && hit == d->find.cur;
-        if (!d || hit >= d->find.hits.len) continue;
+        if (!d || hit >= rtx_find_hits_n(&d->find)) continue;
+        if (!gui_clip_hit(0, y - 2, ww, GUI_FIND_ROW_H + 4)) continue;
         if (cur) {
             DrawRectangle(0, y - 2, ww, GUI_FIND_ROW_H, (Color){60, 70, 100, 255});
         }
@@ -503,7 +900,7 @@ static void gui_draw_find(GuiFonts *fonts, RtxUi *ui, RtxDoc *d, int ww, int hh)
             char line[256];
             size_t line1 = 0;
             int ok = 1;
-            rtx_ui_find_row_text(d, hit, 80, ctx, sizeof(ctx), &line1) !>(e) {
+            rtx_ui_find_row_text(d, hit, 80, ctx, sizeof(ctx), &line1, NULL, NULL) !>(e) {
                 ok = 0;
             };
             if (ok) snprintf(line, sizeof(line), "%5zu  %s", line1, ctx);
@@ -516,6 +913,114 @@ static void gui_draw_find(GuiFonts *fonts, RtxUi *ui, RtxDoc *d, int ww, int hh)
         }
     }
 }
+/* Project picker overlay (core/ui_proj.cch): a box under the menu bar,
+ * the field, a header line, then the list. Input reads the same geometry. */
+GuiPickGeom gui_pick_geom(int ww, int hh, size_t nrows) {
+    GuiPickGeom g;
+    int avail;
+    g.w = ww - 80;
+    if (g.w > 960) g.w = 960;
+    if (g.w < 280) g.w = ww - 8 > 40 ? ww - 8 : 40;
+    g.x = (ww - g.w) / 2;
+    g.y = GUI_MENU_H + 12;
+    g.field_y = g.y + 8;
+    g.head_y = g.field_y + GUI_PICK_FIELD_H;
+    g.list_y = g.head_y + GUI_PICK_ROW_H + 4;
+    avail = hh - 26 - 12 - g.list_y;
+    g.rows = avail / GUI_PICK_ROW_H;
+    if (g.rows > 24) g.rows = 24;
+    if (g.rows < 1) g.rows = 1;
+    /* The box fits the list (at least one row). */
+    g.shown = nrows < (size_t)g.rows ? (nrows ? (int)nrows : 1) : g.rows;
+    g.h = g.list_y - g.y + g.shown * GUI_PICK_ROW_H + 8;
+    return g;
+}
+
+static Color gui_pick_color(int mark, int kind, int cur) {
+    if (mark == 1) return (Color){255, 200, 80, 255};
+    if (mark == 2) return (Color){130, 136, 150, 255};
+    if (kind == RTX_PICK_ROW_GROUP) return (Color){120, 200, 230, 255};
+    return cur ? (Color){250, 250, 255, 255} : (Color){206, 210, 222, 255};
+}
+
+static void gui_draw_pick_row(GuiFonts *fonts, const RtxPickRow *r, int cur, float x,
+                              float y, float xmax) {
+    char tmp[RTX_PICK_ROW_TEXT + 4];
+    size_t at = 0, i;
+    float cw = gui_field_cw(fonts, 14);
+    Vector2 pos;
+    pos.x = x;
+    pos.y = y;
+    if (r->kind == RTX_PICK_ROW_FILE) {
+        /* A path wider than the box keeps its tail (the basename). */
+        char[:] b = cc_slice_from_buffer((void *)r->text, r->n);
+        int total = rtx_utf8_cols(b);
+        int room = (int)((xmax - x) / cw);
+        if (total > room && room > 4) {
+            int seen = 0;
+            while (at < r->n && total - seen > room - 1) {
+                RtxUtf8Cl cl = rtx_utf8_cluster(b, at);
+                seen += cl.cols > 0 ? cl.cols : 1;
+                at += cl.n ? cl.n : 1;
+            }
+            DrawTextEx(fonts->mono, "~", pos, 14, 0, gui_pick_color(2, r->kind, cur));
+            pos.x += cw;
+        }
+    }
+    while (at < r->n && pos.x < xmax) {
+        size_t n;
+        i = at;
+        while (i < r->n && r->mark[i] == r->mark[at]) i++;
+        n = i - at;
+        memcpy(tmp, r->text + at, n);
+        tmp[n] = 0;
+        DrawTextEx(fonts->mono, tmp, pos, 14, 0, gui_pick_color(r->mark[at], r->kind, cur));
+        pos.x += gui_mono_w(fonts, 14, tmp);
+        at = i;
+    }
+}
+
+static void gui_draw_pick(GuiFonts *fonts, RtxUi *ui, int ww, int hh) {
+    GuiPickGeom g = gui_pick_geom(ww, hh, rtx_ui_pick_nrows(ui));
+    char head[256];
+    const char *label = rtx_ui_pick_label(ui);
+    char lab[32];
+    Vector2 pos;
+    float lw;
+    size_t n = rtx_ui_pick_nrows(ui), top, cur;
+    int i;
+    RtxPickRow r;
+    rtx_ui_pick_move(ui, 0, g.rows);
+    top = rtx_ui_pick_top(ui);
+    cur = rtx_ui_pick_cur(ui);
+    DrawRectangle(0, 0, ww, hh, (Color){0, 0, 0, 110});
+    DrawRectangle(g.x, g.y, g.w, g.h, (Color){30, 34, 46, 255});
+    DrawRectangleLines(g.x, g.y, g.w, g.h, (Color){90, 110, 150, 255});
+    snprintf(lab, sizeof lab, "%s: ", label);
+    pos.x = (float)(g.x + 12);
+    pos.y = (float)g.field_y;
+    DrawTextEx(fonts->mono, lab, pos, 15, 0, (Color){255, 220, 100, 255});
+    lw = gui_mono_w(fonts, 15, lab);
+    pos.x += lw;
+    gui_draw_field(fonts, 15, pos, rtx_ui_pick_field(ui), ui, (Color){255, 240, 200, 255});
+    rtx_ui_pick_head(ui, head, sizeof head);
+    pos.x = (float)(g.x + 12);
+    pos.y = (float)g.head_y;
+    DrawTextEx(fonts->mono, head, pos, 13, 0, (Color){150, 156, 172, 255});
+    BeginScissorMode(g.x + 1, g.list_y - 2, g.w - 2, g.rows * GUI_PICK_ROW_H + 4);
+    for (i = 0; i < g.rows; i++) {
+        size_t row = top + (size_t)i;
+        int y = g.list_y + i * GUI_PICK_ROW_H;
+        if (row >= n) break;
+        if (row == cur)
+            DrawRectangle(g.x + 2, y - 2, g.w - 4, GUI_PICK_ROW_H, (Color){56, 68, 104, 255});
+        if (rtx_ui_pick_row(ui, row, &r))
+            gui_draw_pick_row(fonts, &r, row == cur, (float)(g.x + 12), (float)y,
+                              (float)(g.x + g.w - 12));
+    }
+    EndScissorMode();
+}
+
 static void gui_draw_hex_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focused,
                              int x0, int y0, int pw, int ph) {
     size_t r;
@@ -528,7 +1033,7 @@ static void gui_draw_hex_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int fo
     int vis;
     static const char *hexd = "0123456789ABCDEF";
     Vector2 m0;
-    (void)pw;
+    if (pw < 1) pw = 1 << 20;
     @errhandler(RtxIndexErr e) {
         (void)e;
         return; /* fault already set by line_* on err */
@@ -556,6 +1061,7 @@ static void gui_draw_hex_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int fo
         char off_s[16];
         Vector2 pos;
         if (y > (float)(y0 + ph)) break;
+        if (!gui_clip_hit(x0, y, pw, row_h)) continue;
         if (off >= n && !(n == 0 && r == 0)) {
             pos.x = (float)x0;
             pos.y = y;
@@ -591,9 +1097,7 @@ static void gui_draw_hex_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int fo
             size_t at = off + k;
             char hex2[4];
             int sel = has && at < n && (b->doc.sel_covers(at) !>);
-            int here = rtx_ui_here(ui, focused, b->doc.caret == at);
             int match = phave && at < n && (at == plo || at == phi);
-            int nib = here && b->hex_nib;
             if (k < got) {
                 hex2[0] = hexd[(row[k] >> 4) & 0xF];
                 hex2[1] = hexd[row[k] & 0xF];
@@ -609,10 +1113,8 @@ static void gui_draw_hex_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int fo
                 DrawRectangle((int)x, (int)y, (int)(cw * 2.5f), (int)row_h,
                               gui_pair_color());
             }
-            if (here) {
-                DrawRectangle((int)(x + (nib ? cw : 0.0f)), (int)y, 2, (int)row_h,
-                              (Color){255, 200, 80, 255});
-            }
+            gui_caret_put(ui, focused, b->doc.caret == at,
+                          (double)(int)(x + (b->hex_nib ? cw : 0.0f)), y, row_h);
             pos.x = x;
             pos.y = y;
             DrawTextEx(fonts->mono, hex2, pos, 14, 0, (Color){220, 220, 230, 255});
@@ -624,7 +1126,6 @@ static void gui_draw_hex_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int fo
             const char *chs;
             Color fg;
             int sel = has && at < n && (b->doc.sel_covers(at) !>);
-            int here = rtx_ui_here(ui, focused, b->doc.caret == at);
             int match = phave && at < n && (at == plo || at == phi);
             if (k >= got || dump[k].kind == RTX_HEX_DUMP_EMPTY) chs = " ";
             else chs = dump[k].utf8;
@@ -637,9 +1138,8 @@ static void gui_draw_hex_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int fo
                 DrawRectangle((int)x, (int)y, (int)cw + 1, (int)row_h,
                               gui_pair_color());
             }
-            if (here) {
-                DrawRectangle((int)x, (int)y, 2, (int)row_h, (Color){255, 200, 80, 255});
-            }
+            gui_caret_put(ui, focused, b->doc.caret == at, (double)(int)x, y,
+                          row_h);
             pos.x = x;
             pos.y = y;
             DrawTextEx(fonts->mono, chs, pos, 14, 0, fg);
@@ -695,6 +1195,7 @@ static void gui_draw_browse_prev_hex(RtxBrowsePrev *pv, GuiFonts *fonts,
         char off_s[16];
         Vector2 pos;
         if (y > (float)(y0 + ph)) break;
+        if (!gui_clip_hit(x0, y, pw, row_h)) continue;
         if (off >= n && !(n == 0 && r == 0)) {
             pos.x = (float)x0 + 8;
             pos.y = y;
@@ -879,6 +1380,8 @@ static void gui_draw_browse_prev_text(RtxBrowsePrev *pv, GuiFonts *fonts,
                        gui_hl_color(st.scope));
             gui_draw_link_ul(&pv->layout, &pv->doc, off, (Vector2){x, y + 2},
                              (double)sz.x, (double)row_h, gui_hl_color(st.scope));
+            gui_draw_strike(st, (Vector2){x, y + 2}, (double)sz.x, 14.0,
+                            gui_hl_color(st.scope));
             x += sz.x;
             virt += (size_t)pc;
             k += cl.n ? cl.n : 1;
@@ -1173,6 +1676,7 @@ static void gui_draw_browse(RtxWs *w, int pane, const RtxUi *ui, GuiFonts *fonts
             float y = (float)y0 + (float)(head + i) * row_h;
             if (y > (float)(y0 + ph)) break;
             if (!ents || idx >= vlen) continue;
+            if (!gui_clip_hit(x0, y, list_pw, row_h)) continue;
             if (focused && idx == vcur) {
                 DrawRectangle(x0, (int)y, list_pw, (int)row_h,
                               (Color){40, 70, 120, 255});
@@ -1181,16 +1685,22 @@ static void gui_draw_browse(RtxWs *w, int pane, const RtxUi *ui, GuiFonts *fonts
                      (ents[idx].is_dir && !ents[idx].sep) ? "/" : "");
             {
                 int name_max;
-                size_t skip = 0;
+                size_t head_n = 0, tail_off = 0;
                 int ellip = 0;
                 int show_meta = !ents[idx].sep && cols >= 10 + meta_w;
                 name_max = show_meta ? cols - meta_w - 2 : cols - 2;
                 if (name_max < 1) name_max = 1;
-                rtx_browse_name_window(name, name_max, &skip, &ellip);
-                if (skip) {
-                    char fit[RTX_BROWSE_NAME + 2];
-                    snprintf(fit, sizeof(fit), "%s%s", ellip ? "~" : "",
-                             name + skip);
+                rtx_browse_name_window(name, name_max, &head_n, &tail_off, &ellip);
+                if (ellip) {
+                    char fit[RTX_BROWSE_NAME + 4];
+                    size_t k = 0;
+                    size_t o = 0;
+                    for (k = 0; k < head_n && o + 1 < sizeof(fit); k++)
+                        fit[o++] = name[k];
+                    if (o + 1 < sizeof(fit)) fit[o++] = '~';
+                    for (k = tail_off; name[k] && o + 1 < sizeof(fit); k++)
+                        fit[o++] = name[k];
+                    fit[o] = 0;
                     snprintf(name, sizeof(name), "%s", fit);
                 }
             }
@@ -1260,7 +1770,7 @@ static void gui_draw_browse(RtxWs *w, int pane, const RtxUi *ui, GuiFonts *fonts
         if (prev_px > 8) {
             int by = y0 + (int)((float)head * row_h);
             int bh = ph - (by - y0);
-            if (bh > 0)
+            if (bh > 0 && gui_clip_hit(x0 + list_pw + 1, by, prev_px - 1, bh))
                 gui_draw_browse_prev(w, pane, fonts, focused,
                                      x0 + list_pw + 1, by, prev_px - 1, bh);
         }
@@ -1311,8 +1821,7 @@ static void gui_grid_caret_geom(RtxBuf *b, int *on_hdr, size_t *col_x,
 
 static void gui_grid_caret_bar(const RtxUi *ui, int focused, float x, float y,
                               float h) {
-    if (!rtx_ui_here(ui, focused, 1)) return;
-    DrawRectangle((int)x, (int)y, 2, (int)h, (Color){255, 200, 80, 255});
+    gui_caret_put(ui, focused, 1, (double)(int)x, y, h);
 }
 
 static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focused,
@@ -1333,7 +1842,9 @@ static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int f
     m0 = MeasureTextEx(fonts->mono, "0", 14, 0);
     cw = m0.x > 1.0f ? m0.x : 8.0f;
     gui_grid_caret_geom(b, &caret_hdr, &caret_x, &caret_ri);
-    if (b->layout.grid_hdr_on) {
+    if (b->layout.grid_hdr_on && !gui_clip_hit(x0, y0, pw, GUI_ROW_H))
+        acc += (double)GUI_ROW_H; /* header outside a partial Draw's clip */
+    else if (b->layout.grid_hdr_on) {
         RtxVisRow head;
         double y = (double)y0;
         int span_ok = 1;
@@ -1447,6 +1958,7 @@ static void gui_draw_grid_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int f
         acc += (double)GUI_ROW_H;
         if (y + (double)GUI_ROW_H < (double)y0) continue;
         if (y > (double)(y0 + ph)) break;
+        if (!gui_clip_hit(x0, y, pw, GUI_ROW_H)) continue;
         {
             size_t c;
             double x = (double)x0 + (double)gpx - (double)b->left_col * (double)cw;
@@ -1666,8 +2178,8 @@ static void gui_md_refit(RtxBuf *b, GuiFonts *fonts, int ti) {
     if (ncols > RTX_MD_TABLE_COLS) ncols = RTX_MD_TABLE_COLS;
     for (i = 0; i < b->layout.rows.len; i++) {
         RtxVisRow *row = &b->layout.rows.data[i];
-        RtxMdCell cells[RTX_MD_TABLE_COLS];
-        size_t nc;
+        RtxMdRecTmp tmp;
+        RtxMdRecView v;
         CCArena scratch = {0};
         char[:] bytes;
         int role;
@@ -1682,11 +2194,17 @@ static void gui_md_refit(RtxBuf *b, GuiFonts *fonts, int ti) {
             scratch.destroy();
             continue;
         };
-        nc = rtx_md_row_split(bytes.ptr, bytes.len, cells, RTX_MD_TABLE_COLS);
-        for (c = 0; c < ncols && (size_t)c < nc; c++) {
-            size_t lo = cells[c].lo, hi = cells[c].hi;
+        if (!rtx_layout_md_view(&b->layout, &b->doc, NULL, row, bytes, &tmp, &v)) {
+            scratch.destroy();
+            continue;
+        }
+        for (c = 0; c < ncols && (size_t)c < v.rec->nc; c++) {
+            const RtxMdRecCell *rc = rtx_md_view_cell(&v, c, NULL);
+            size_t lo, hi;
             int ipx;
-            rtx_md_span_trim(bytes.ptr, &lo, &hi);
+            if (!rc) break;
+            lo = rc->trim.lo;
+            hi = rc->trim.hi;
             ipx = (int)(gui_md_cell_px(b, fonts, row, bytes, lo, hi) + 0.999);
             if (ipx < 1 && hi > lo) ipx = 1;
             if (ipx > b->layout.md_colpx[ti][c])
@@ -1710,7 +2228,8 @@ static void gui_draw_md_row(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts,
     int ti, c, ncols, role, last, left_on;
     const RtxMdTable *t;
     const int *cpx;
-    RtxMdCell cells[RTX_MD_TABLE_COLS];
+    RtxMdRecTmp tmp;
+    RtxMdRecView v = {0};
     size_t nc;
     double xbase, left;
     RtxMeasure gm;
@@ -1731,13 +2250,22 @@ static void gui_draw_md_row(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts,
     }
     t = &b->layout.md_tab[ti];
     ncols = t->ncols;
-    nc = rtx_md_row_split(bytes.ptr, bytes.len, cells, RTX_MD_TABLE_COLS);
+    gm.measure = gui_measure;
+    gm.line_height = gui_lh;
+    gm.ctx = fonts;
+    /* The fill's record: split, trimmed spans, wrap lines (one oracle). */
+    nc = rtx_layout_md_view(&b->layout, &b->doc, &gm, row, bytes, &tmp, &v)
+             ? v.rec->nc
+             : 0;
     if (!b->layout.wrap) {
         int gc;
         for (gc = 0; gc < ncols && (size_t)gc < nc; gc++) {
-            size_t lo = cells[gc].lo, hi = cells[gc].hi;
+            const RtxMdRecCell *rc = rtx_md_view_cell(&v, gc, NULL);
+            size_t lo, hi;
             int ipx;
-            rtx_md_span_trim(bytes.ptr, &lo, &hi);
+            if (!rc) break;
+            lo = rc->trim.lo;
+            hi = rc->trim.hi;
             ipx = (int)(gui_md_cell_px(b, fonts, row, bytes, lo, hi) + 0.999);
             if (ipx < 1 && hi > lo) ipx = 1;
             if (ipx > b->layout.md_colpx[ti][gc])
@@ -1750,9 +2278,6 @@ static void gui_draw_md_row(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts,
     xbase = x0 + gpx;
     role = rtx_md_table_role(t, row->byte_start);
     last = row->byte_start + row->byte_len + 1 >= t->hi;
-    gm.measure = gui_measure;
-    gm.line_height = gui_lh;
-    gm.ctx = fonts;
     {
         int tw = rtx_md_px_width(cpx, ncols);
         Color fill = role == RTX_MD_ROLE_HDR ? (Color){42, 46, 60, 255}
@@ -1765,23 +2290,23 @@ static void gui_draw_md_row(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts,
         if (lh < 1.0) lh = 1.0;
         for (c = 0; c < ncols; c++) {
             size_t lo = 0, hi = 0;
-            RtxMdCell lines[RTX_MD_WRAP_MAX];
+            RtxMdCell one;
+            const RtxMdCell *lines = NULL;
+            const RtxMdRecCell *rc = rtx_md_view_cell(&v, c, &lines);
             size_t nl = 1;
             size_t li;
             int cr;
             double x_right;
-            if ((size_t)c < nc) {
-                lo = cells[c].lo;
-                hi = cells[c].hi;
-                rtx_md_span_trim(bytes.ptr, &lo, &hi);
+            if ((size_t)c < nc && rc) {
+                lo = rc->trim.lo;
+                hi = rc->trim.hi;
             }
-            if (b->layout.wrap && hi > lo)
-                nl = rtx_layout_md_cell_wrap(&b->layout, &b->doc, &gm,
-                                             row->byte_start, bytes, lo, hi, ti,
-                                             c, row->sec, lines, RTX_MD_WRAP_MAX);
-            else {
-                lines[0].lo = 0;
-                lines[0].hi = hi > lo ? hi - lo : 0;
+            if (b->layout.wrap && hi > lo && lines && rc->nl) {
+                nl = rc->nl;
+            } else {
+                one.lo = 0;
+                one.hi = hi > lo ? hi - lo : 0;
+                lines = &one;
                 nl = 1;
             }
             if (nl < 1) nl = 1;
@@ -1875,6 +2400,8 @@ static void gui_draw_md_row(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts,
                                        gui_hl_color(st.scope));
                             gui_draw_link_ul(&b->layout, &b->doc, off, pos, gw,
                                              lh, gui_hl_color(st.scope));
+                            gui_draw_strike(st, pos, gw, gui_size(fonts, st, row->sec),
+                                            gui_hl_color(st.scope));
                             x += gw;
                         }
                         i += clu.n ? clu.n : 1;
@@ -1891,7 +2418,7 @@ static void gui_draw_md_row(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts,
         gui_md_stroke(xbase, y, row->height, left, cpx, ncols, role, last,
                       skip_top);
     }
-    if (role != RTX_MD_ROLE_SEP && rtx_ui_here(ui, focused, 1) &&
+    if (role != RTX_MD_ROLE_SEP && ui && focused && !rtx_ui_prompting(ui) &&
         b->doc.caret >= row->byte_start &&
         b->doc.caret <= row->byte_start + row->byte_len) {
         double cx = b->layout.x_of(&b->doc, &gm, b->doc.caret) !>;
@@ -1903,8 +2430,8 @@ static void gui_draw_md_row(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts,
         cy = y + (double)li * lh;
         if (cy + lh > y + row->height) cy = y + row->height - lh;
         if (cy < y) cy = y;
-        DrawRectangle((int)(xbase + cx - left), (int)cy, 2, (int)lh,
-                      (Color){255, 200, 80, 255});
+        gui_caret_bar_at(ui, (double)(int)(xbase + cx - left), (double)(int)cy,
+                         (double)(int)lh);
     }
 }
 
@@ -1960,8 +2487,14 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
     int phave;
     int vis_rows = ph > 0 ? (int)((float)ph / 18.0f) : 32;
     float gpx = gui_gutter_px(fonts, b, vis_rows);
+    /* One scratch for every row's bytes, one cursor each over the runs and
+     * the hidden hints (rows ascend). */
+    CCArena pscr = {0};
+    RtxStyleCur sc = {0};
+    RtxHideCur hc = {0};
     @errhandler(RtxIndexErr e) {
         (void)e;
+        if (pscr.base) pscr.destroy();
         return; /* fault already set by line_* on err */
     }
     (void)pad;
@@ -1991,13 +2524,22 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
     {
         int md_fit[RTX_MD_TABLE_FILL];
         int tfi;
+        size_t most = 0;
         for (tfi = 0; tfi < RTX_MD_TABLE_FILL; tfi++) md_fit[tfi] = 0;
+        for (i = b->top_wrap; i < b->layout.rows.len; i++) {
+            if (b->layout.rows.data[i].byte_len > most)
+                most = b->layout.rows.data[i].byte_len;
+        }
+        if (most) pscr = cc_arena_heap(most + 64);
     for (i = b->top_wrap; i < b->layout.rows.len; i++) {
         RtxVisRow *row = &b->layout.rows.data[i];
         double y = (double)y0 + acc;
         acc += row->height;
         if (y + row->height < (double)y0) continue;
         if (y > (double)(y0 + ph)) break;
+        /* A partial Draw (caret blink) lays out and measures only the rows
+         * its clip meets. */
+        if (!gui_clip_hit(x0, y, pw, row->height)) continue;
         {
             size_t k;
             double x = (double)x0 + (double)gpx + row->pad;
@@ -2012,10 +2554,10 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
             }
             if (b->doc.sel_box)
                 box_row = b->doc.box_caret_at(line_off, &box_at) !>;
-            CCArena scratch = {0};
+            CCArena scratch = pscr;
             if (row->byte_len) {
-                scratch = cc_arena_heap(row->byte_len + 64);
                 if (!scratch.base) continue;
+                scratch.reset();
             }
             {
                 int span_ok = 1;
@@ -2029,7 +2571,6 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                                         scratch) !>;
             }
             if (!span_ok) {
-                if (scratch.base) scratch.destroy();
                 continue;
             }
             {
@@ -2043,10 +2584,10 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                 size_t off = row->byte_start + k;
                 {
                     RtxHintVis hv;
-                    if (rtx_layout_hint_vis(&b->layout, &b->doc, off, bytes.ptr, k,
+                    if (rtx_layout_hint_vis_cur(&b->layout, &b->doc, &hc, off, bytes.ptr, k,
                                             bytes.len, &hv)) {
                         if (hv.gn) {
-                            RtxStyle st = b->doc.style_at(off);
+                            RtxStyle st = b->doc.style_cur(&sc, off);
                             double gw = gui_standin_w(fonts, &hv, st, row->sec);
                             Vector2 pos;
                             if (b->left_col && rtx_layout_uses_left(&b->layout)) {
@@ -2074,7 +2615,7 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                         continue;
                     }
                 }
-                RtxStyle st = b->doc.style_at(off);
+                RtxStyle st = b->doc.style_cur(&sc, off);
                 char tmp[RTX_UTF8_LOOK + 1];
                 Vector2 pos;
                 double gw;
@@ -2105,6 +2646,14 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                     pos.x = (float)x;
                 }
                 pos.y = (float)y;
+                /* Before the glyph: a painted caret sits under it. */
+                gui_caret_put(ui, focused, b->doc.caret == off ||
+                              (box_row && box_at == off),
+                              (double)(int)pos.x, (double)(int)y,
+                              (double)(int)row->height);
+                /* Clusters well clear of a partial clip are measured (x
+                 * advances) but not drawn; the margin keeps overhangs. */
+                if (gui_clip_hit(pos.x - 16.0, y, gw + 32.0, row->height)) {
                 if (has && (b->doc.sel_covers(off) !>)) {
                     DrawRectangle((int)pos.x, (int)y, (int)gw + 1, (int)row->height,
                                   (Color){40, 70, 120, 255});
@@ -2112,25 +2661,23 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                     DrawRectangle((int)pos.x, (int)y, (int)gw + 1, (int)row->height,
                                   gui_pair_color());
                 }
-                if (rtx_ui_here(ui, focused, b->doc.caret == off ||
-                    (box_row && box_at == off))) {
-                    DrawRectangle((int)pos.x, (int)y, 2, (int)row->height,
-                                  (Color){255, 200, 80, 255});
-                }
                 DrawTextEx(gui_font(fonts, st, row->sec), tmp, pos,
                            gui_size(fonts, st, row->sec), 0, gui_hl_color(st.scope));
                 gui_draw_link_ul(&b->layout, &b->doc, off, pos, gw, row->height,
                                  gui_hl_color(st.scope));
+                gui_draw_strike(st, pos, gw, gui_size(fonts, st, row->sec),
+                                gui_hl_color(st.scope));
+                }
                 x += gw;
                 k += cl.n ? cl.n : 1;
             }
-            if (rtx_ui_here(ui, focused, b->doc.caret == row->byte_start + row->byte_len ||
-                (box_row && box_at == row->byte_start + row->byte_len))) {
-                DrawRectangle((int)(x - (b->left_col &&
-                                         rtx_layout_uses_left(&b->layout)
-                                             ? (double)b->left_col : 0)),
-                              (int)y, 2, (int)row->height,
-                              (Color){255, 200, 80, 255});
+            {
+                int at_end = b->doc.caret == row->byte_start + row->byte_len ||
+                             (box_row && box_at == row->byte_start + row->byte_len);
+                int ex = (int)(x - (b->left_col && rtx_layout_uses_left(&b->layout)
+                                        ? (double)b->left_col : 0));
+                gui_caret_put(ui, focused, at_end, (double)ex, (double)(int)y,
+                              (double)(int)row->height);
             }
             }
             if (md_row) {
@@ -2142,11 +2689,12 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                                     : NULL);
             }
             }
-            if (scratch.base) scratch.destroy();
             }
         }
     }
     }
+        if (pscr.base) pscr.destroy();
+        pscr = (CCArena){0};
         if (clip_w > 0 && ph > 0) EndScissorMode();
         /* Cover table chrome that slid under the gutter, then numbers. */
         gui_gutter_band(x0, y0, gx, ph, focused);
@@ -2159,6 +2707,7 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
             acc += row->height;
             if (y + row->height < (double)y0) continue;
             if (y > (double)(y0 + ph)) break;
+            if (!gui_clip_hit(x0, y, gx, row->height)) continue;
             line = row->line;
             show_ln = (i == 0 || b->layout.rows.data[i - 1].line != line);
             if (!show_ln) continue;
@@ -2302,61 +2851,82 @@ static void gui_draw_scroll(RtxBuf *b, int focused, int x0, int y0, int pane_w,
 /* Draw contents only. Caller owns BeginDrawing / EndDrawing or flush+swap. */
 void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner,
                           int vis_rows) {
-    int p;
+    int k;
     RtxBuf *act;
-    int ph;
+    RtxWs *w = g_live.w;
     @errhandler(RtxIndexErr e) {
         (void)e;
         return; /* fault already set by line_* on err */
     }
     if (!g_live.w || !g_live.fonts || !g_live.ui) return;
+    (void)pane_w;
+    (void)inner;
     act = RtxWs_active(g_live.w);
-    ph = gui_text_ph(hh, top, g_live.ui->find);
+    if (rtx_present()->on) {
+        /* Presentation owns the window: no panes, chrome or caret. */
+        gui_draw_present(g_live.fonts, g_live.ui, act, ww, hh);
+        return;
+    }
+    gui_geo(w, ww, hh, pad, top, g_live.ui->find);
     ClearBackground((Color){24, 24, 28, 255});
-    for (p = 0; p < g_live.w->npanes; p++) {
-        RtxBuf *b = g_live.w->bufs[g_live.w->pane[p]];
-        int x0 = gui_pane_x0(g_live.w, p, pad, inner);
-        if (g_live.w->npanes == 2 && p == 1) {
-            DrawLine(pad + inner / 2, top, pad + inner / 2,
-                     hh - 28 - (g_live.ui->find ? GUI_FIND_H : 0),
-                     (Color){80, 80, 90, 255});
-        }
+    if (gui_tabs_shown(w) && gui_clip_hit(0, top, ww, GUI_TABS_H))
+        gui_draw_tabs(w, g_live.fonts, pad, top, ww);
+    for (k = 0; k < w->npanes; k++) {
+        int p = w->order[k];
+        RtxBuf *b = w->bufs[w->pane[p]];
+        const GuiGeo *g = &g_gg[p];
+        int x0 = g->x0, y0 = g->y0, pw = g->w, ph = g->h;
+        int vis = p == w->focus ? vis_rows : g->vis;
+        if (!gui_clip_hit(x0, y0, pw, ph)) continue;
+        g_band_x = x0;
+        g_band_w = pw;
         {
-            RtxBrowse *br = &g_live.w->nav[p];
-            int held = RtxWs_hold_pane(g_live.w, p);
+            RtxBrowse *br = &w->nav[p];
+            int held = RtxWs_hold_pane(w, p);
             if (br && br->on) {
-                gui_draw_browse(g_live.w, p, g_live.ui, g_live.fonts,
-                                p == g_live.w->focus, x0, top, pane_w, ph,
-                                vis_rows);
+                gui_draw_browse(w, p, g_live.ui, g_live.fonts, p == w->focus, x0, y0,
+                                pw, ph, vis);
             } else {
-                {
-                    int hx = gui_scroll_x_h(b);
-                    int tph = ph > hx ? ph - hx : ph;
-                    int rw = gui_rail_w(b, vis_rows);
-                    int tw = pane_w > rw ? pane_w - rw : pane_w;
-                    if (tw > 0 && tph > 0)
-                        BeginScissorMode(x0, top, tw, tph);
-                    gui_draw_buf(b, g_live.ui, g_live.fonts, p == g_live.w->focus,
-                                 x0, top, pane_w, tph, pad);
-                    if (tw > 0 && tph > 0) EndScissorMode();
-                    gui_draw_scroll(b, p == g_live.w->focus, x0, top, pane_w, ph,
-                                    vis_rows);
-                }
+                int hx = gui_scroll_x_h(b);
+                int tph = ph > hx ? ph - hx : ph;
+                int rw = gui_rail_w(b, vis);
+                int tw = pw > rw ? pw - rw : pw;
+                if (tw > 0 && tph > 0) BeginScissorMode(x0, y0, tw, tph);
+                gui_draw_buf(b, g_live.ui, g_live.fonts, p == w->focus, x0, y0, pw, tph,
+                             pad);
+                if (tw > 0 && tph > 0) EndScissorMode();
+                if (gui_clip_hit(x0 + pw - GUI_SCROLL_W, y0, GUI_SCROLL_W, ph) ||
+                    gui_clip_hit(x0, y0 + ph - GUI_SCROLL_W, pw, GUI_SCROLL_W))
+                    gui_draw_scroll(b, p == w->focus, x0, y0, pw, ph, vis);
             }
-            RtxWs_drop_pane(g_live.w, p, held);
+            RtxWs_drop_pane(w, p, held);
         }
     }
-    if (g_live.ui->help) gui_draw_help(g_live.fonts, ww, hh);
+    g_band_x = 0;
+    g_band_w = ww;
+    gui_draw_dividers(w);
+    if (g_live.ui->help) gui_draw_help(g_live.fonts, g_live.ui->help_top, ww, hh);
     if (g_live.ui->apply) gui_draw_apply(g_live.fonts, ww, hh);
     if (g_live.ui->stats) gui_draw_stats(g_live.fonts, act, ww, hh);
     if (g_live.ui->jump) gui_draw_jump(g_live.fonts, g_live.ui,
                                       act ? &act->doc : NULL, ww, hh);
-    if (g_live.ui->find && act) gui_draw_find(g_live.fonts, g_live.ui, &act->doc, ww, hh);
-    {
+    if (g_live.ui->pick) gui_draw_pick(g_live.fonts, g_live.ui, ww, hh);
+    g_band_x = 0;
+    g_band_w = ww;
+    if (g_live.ui->find && act &&
+        gui_clip_hit(0, hh - 26 - GUI_FIND_H, ww, GUI_FIND_H))
+        gui_draw_find(g_live.fonts, g_live.ui, &act->doc, ww, hh);
+    if (g_live.ui->palette) gui_draw_palette(g_live.fonts, g_live.ui, ww, hh);
+    /* The jump prompt's caret also blinks in the status bar (painted
+     * caret only: with the layer the dialog's caret is the one). */
+    if (g_live.ui->jump && !g_live.ui->caret_host)
+        gui_blink_note(0, hh - 26, ww, 26);
+    if (gui_clip_hit(0, hh - 26, ww, 26)) {
         const char *path = (act && act->doc.path.ptr) ? act->doc.path.ptr : "(untitled)";
         const char *star = (act && act->doc.dirty()) ? "*" : "";
         const char *status = g_live.status ? g_live.status : "";
-        char bar[256];
+        char bar[768];
+        char safe_msg[512];
         Vector2 bp;
         if (g_live.ui->ask_conflict) {
             snprintf(bar, sizeof(bar),
@@ -2365,21 +2935,37 @@ void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner,
         } else if (g_live.ui->ask_quit) {
             snprintf(bar, sizeof(bar), "unsaved  S save  Q don't save  Esc cancel  %s",
                      status);
-        } else if (rtx_ws_safe_fault(g_live.w)) {
+        } else if (g_live.ui->ask_close) {
+            char what[300];
+            rtx_ui_close_label(g_live.ui, g_live.w, what, sizeof(what));
+            snprintf(bar, sizeof(bar), "%s: unsaved  %s", what, status);
+        } else if (rtx_ws_safe_fault_msg(g_live.w, safe_msg, sizeof(safe_msg))) {
+            snprintf(bar, sizeof(bar), "%s  %s", safe_msg, status);
+        } else if (g_live.ui->pick == RTX_PICK_OPEN) {
             snprintf(bar, sizeof(bar),
-                     "Safe journal write failed — unsaved edits kept in memory  %s",
+                     "quick-open  Enter open  Cmd-Enter other pane  Tab search  F5 re-walk  Esc close  %s",
+                     status);
+        } else if (g_live.ui->pick == RTX_PICK_SEARCH) {
+            snprintf(bar, sizeof(bar),
+                     "search  Alt-C case  Alt-W word  Alt-R regex  Enter open  F4 next  Tab files  Esc close  %s",
                      status);
         } else if (g_live.ui->jump) {
             rtx_ui_jump_header(g_live.ui, act ? &act->doc : NULL, bar, sizeof(bar));
+        } else if (g_live.ui->find && g_live.ui->repl) {
+            snprintf(bar, sizeof(bar),
+                     "replace  Tab field  Enter one  Alt-A all  Alt-L scope  Esc %s  %s",
+                     rtx_ui_repl_busy(g_live.ui) ? "cancel" : "close", status);
         } else if (g_live.ui->find) {
-            snprintf(bar, sizeof(bar), "find  up/down hits  Esc close  %s", status);
+            snprintf(bar, sizeof(bar),
+                     "find  up/down hits  Alt-C case  Alt-W word  Alt-R regex  Cmd-F replace  Esc close  %s",
+                     status);
         } else if (RtxWs_browsing(g_live.w)) {
             RtxBrowse *br = RtxWs_browse(g_live.w);
             snprintf(bar, sizeof(bar),
                      "browse  %zu/%zu%s  enter open  ^O this  ^E other  Esc help  %s",
                      br && rtx_browse_view_len(br) ? rtx_browse_view_cur(br) + 1 : 0,
                      br ? rtx_browse_view_len(br) : 0,
-                     (br && br->denied) ? "" : rtx_browse_scan_msg(br),
+                     (br && rtx_browse_denied(br)) ? "" : rtx_browse_scan_msg(br),
                      status);
         } else if (act && rtx_layout_is_hex(&act->layout)) {
             snprintf(bar, sizeof(bar), "%s%s  @%zX  hex %s%s  %s",
@@ -2397,9 +2983,17 @@ void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner,
                      act->unlock ? "  unlock" : "", status);
         } else {
             char pos[48];
+            char slide[40];
             rtx_status_line_pos(act, pos, sizeof(pos)) !>;
-            snprintf(bar, sizeof(bar), "%s%s  %s%s%s%s  %s",
-                     star, path, pos,
+            /* Marp deck: "  slide 3/12" (docs/slides.md). */
+            slide[0] = 0;
+            if (act && rtx_slides_status(&act->doc, act->doc.caret, slide + 2,
+                                         sizeof(slide) - 2)) {
+                slide[0] = ' ';
+                slide[1] = ' ';
+            }
+            snprintf(bar, sizeof(bar), "%s%s  %s%s%s%s%s  %s",
+                     star, path, pos, slide,
                      (act && act->layout.rich) ? "  rich" : "",
                      (act && act->layout.wrap) ? "  wrap" : "",
                      (act && act->unlock) ? "  unlock" : "", status);
@@ -2408,7 +3002,7 @@ void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner,
         bp.x = 12;
         bp.y = (float)(hh - 22);
         if (RtxWs_browsing(g_live.w) && RtxWs_browse(g_live.w) &&
-            RtxWs_browse(g_live.w)->denied) {
+            rtx_browse_denied(RtxWs_browse(g_live.w))) {
             RtxBrowse *br = RtxWs_browse(g_live.w);
             char left[64];
             char right[192];

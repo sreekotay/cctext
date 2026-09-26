@@ -1,0 +1,344 @@
+#!ccc cch
+/*
+ * Project: index, quick-open, project-wide search (bodies in proj.ccs,
+ * which joins the rtx_find target as a second source — no new target).
+ *
+ * Root. The git root above the opened path / cwd (a `.git` dir or file),
+ * else that directory; `--project DIR` overrides (rtx_proj_root_of).
+ *
+ * Index (RtxProjIdx). A dest-live walk (DESIGN Scan: `proj` row) lists
+ * every file under the root into a compact interned store: a file is
+ * {dir id, name offset} (8 B) plus its NUL-terminated name in a chunked
+ * pool; a dir keeps its full relative path once. Tables are fixed-size
+ * chunks on the index arena that never move, so the host reads ids below
+ * the published count (`pub_nf`, release-stored by the write stage)
+ * while the walk still appends. ~30 B / file on a source tree.
+ *
+ * The walk is one arm: waves of RTX_PROJ_WAVE directory jobs under a
+ * `@parallel wait` turnstile. A lane reads its directory (readdir +
+ * d_type; one fstatat per sub-directory for st_dev / st_ino), parses
+ * that directory's `.gitignore` and `.ignore` onto its scratch, and
+ * filters its entries against the chain; the write stage (in job order)
+ * copies the rules the children need, appends dirs / files and child
+ * jobs, and publishes the counts. `.git` is skipped; `.git/info/exclude`
+ * is the lowest level of the chain. A sub-directory on another st_dev is
+ * not entered. Symlinked files are listed; symlinked directories are
+ * walked only with RTX_PROJ_FOLLOW, and every walked directory's
+ * (dev, ino) goes into a visited set so a loop is walked once.
+ * Cancel / pause: the stage honors `h.paused`; drop cancels + joins.
+ *
+ * Re-walk (rtx_proj_rewalk) builds a second index while the first stays
+ * readable, then swaps on the pump (search joins first). There is no
+ * file watcher: a re-walk is on demand (F5 in the picker,
+ * `project-files --rewalk`).
+ *
+ * Quick-open (RtxProjPick). Fuzzy subsequence score over the relative
+ * path (rtx_fuzzy_path: path-segment / word / camel starts, basename,
+ * contiguous runs, affine gaps; smart case) plus an MRU boost, kept as a
+ * top-K heap — the index has no cap. Parallel shards over large indexes;
+ * a query that extends the last one rescores only its candidates; files
+ * the walk published since are scored on the next pump.
+ *
+ * Search (RtxProjSearch). Its own epoch arena (query, program, hits,
+ * previews). A dest-live arm walks index files in id order, one ticket
+ * per chunk of RTX_PS_CHUNK files; the lane reads each file whole into
+ * its reused buffer (skips > max bytes, and binaries: a NUL in the first
+ * 8 KiB), runs the find engine's program (core/rx.cch: literal memmem /
+ * DFA prefilter) over it and keeps the chunk's hits on its scratch; the
+ * write stage appends one group per file, in id order, and publishes
+ * once per chunk. A cancel leaves every published group whole. The arm
+ * stops at the index count it saw; the pump starts the next arm while
+ * the index grows (search overlaps the walk).
+ */
+#ifndef RTX_PROJ_H
+#define RTX_PROJ_H
+
+#include <ccc/std/prelude.cch>
+#include <limits.h>
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "rx.cch"
+
+#ifndef RTX_PROJ_PATH
+#define RTX_PROJ_PATH 4096
+#endif
+#ifndef RTX_PROJ_WAVE
+#define RTX_PROJ_WAVE 256     /* directory jobs per @parallel wait */
+#endif
+#ifndef RTX_PS_CHUNK
+#define RTX_PS_CHUNK 32       /* files per search ticket (one @stage) */
+#endif
+#ifndef RTX_PROJ_PICK_K
+#define RTX_PROJ_PICK_K 512   /* quick-open rows kept (top-K heap) */
+#endif
+#ifndef RTX_PROJ_HITS_MAX
+#define RTX_PROJ_HITS_MAX (1u << 18) /* search hits kept; then "capped" */
+#endif
+#ifndef RTX_PROJ_SEARCH_MAX
+#define RTX_PROJ_SEARCH_MAX ((size_t)8 << 20) /* skip files bigger (option) */
+#endif
+#ifndef RTX_PROJ_MRU_MAX
+#define RTX_PROJ_MRU_MAX 64
+#endif
+
+enum {
+    RTX_PROJ_FCH_BITS = 16, /* files per chunk: 65536 (512 KiB) */
+    RTX_PROJ_DCH_BITS = 13, /* dirs per chunk: 8192 */
+    RTX_PROJ_NCH_BITS = 20, /* name pool chunk: 1 MiB */
+    RTX_PROJ_CH_MAX = 4096,
+    RTX_PROJ_HCH_BITS = 13, /* search hits / groups per chunk */
+    RTX_PROJ_HCH_MAX = 64,  /* >= HITS_MAX >> HCH_BITS (proj.ccs asserts) */
+    RTX_PROJ_PCH_BITS = 20, /* preview pool chunk */
+    RTX_PROJ_PCH_MAX = 64,
+    RTX_PROJ_PV_MAX = 160,  /* preview bytes per hit */
+    RTX_PROJ_QMAX = 256
+};
+
+/* Walk flags. */
+enum {
+    RTX_PROJ_FOLLOW = 1u,    /* walk symlinked directories (loop-safe) */
+    RTX_PROJ_NO_IGNORE = 2u, /* ignore .gitignore / .ignore / exclude */
+    RTX_PROJ_NO_HIDDEN = 4u  /* skip dot names (default: listed) */
+};
+
+/* Search options: the same bits as RTX_FIND_ICASE / WORD / REGEX. */
+enum {
+    RTX_PS_ICASE = 1u,
+    RTX_PS_WORD = 2u,
+    RTX_PS_REGEX = 4u
+};
+
+/* ------------------------------------------------------------ gitignore */
+
+typedef struct {
+    const char *pat;   /* pattern bytes (no leading '/', no trailing '/') */
+    uint16_t n;
+    uint8_t neg;       /* '!' */
+    uint8_t dir_only;  /* trailing '/' */
+    uint8_t anchored;  /* a '/' at the start or in the middle */
+} RtxIgnRule;
+
+/* One ignore file's level. Deeper levels win; inside a level the last
+ * matching rule wins. `base` is the level's directory, relative to the
+ * root ("" at the root), without a trailing '/'. */
+typedef struct RtxIgn {
+    const struct RtxIgn *up;
+    const char *base;
+    uint16_t base_n;
+    RtxIgnRule *rules;
+    uint32_t n, cap;
+} RtxIgn;
+
+/* Append the rules of one ignore file to `set` (rules and pattern bytes
+ * on `a`). -1 on OOM. */
+int rtx_ign_parse(RtxIgn *set, const char *text, size_t n, CCArena a);
+/* 1 = `rel` (relative to the root) is ignored by the chain from `set`
+ * up; 0 = not. is_dir: dir-only rules apply. */
+int rtx_ign_match(const RtxIgn *set, const char *rel, size_t rel_n, int is_dir);
+/* gitignore glob (wildmatch with FNM_PATHNAME): `*` `?` `[...]` stop at
+ * '/'; `**` between slashes (or at an end) spans directories. */
+int rtx_glob_match(const char *pat, size_t pn, const char *s, size_t sn);
+
+/* ---------------------------------------------------------------- fuzzy */
+
+#define RTX_FUZZY_NONE INT_MIN
+#define RTX_FUZZY_QMAX 64
+/* The path scorer (quick-open). core/fuzzy.cch's rtx_fuzzy_score ranks
+ * the command palette: same subsequence model, but this one knows the
+ * basename, reports the alignment for highlight and is smart-case; they
+ * are two scorers until the palette needs positions too.
+ * Score `q` against `s` (a relative path; `base` = offset of its
+ * basename). RTX_FUZZY_NONE when q is not a subsequence. Smart case:
+ * an uppercase letter in q matches only itself. `pos` (may be NULL)
+ * receives qn byte offsets of the chosen alignment. */
+int rtx_fuzzy_path(const char *q, size_t qn, const char *s, size_t sn,
+                    size_t base, uint16_t *pos);
+
+/* ---------------------------------------------------------------- index */
+
+typedef struct {
+    uint32_t dir;
+    uint32_t name; /* name pool offset */
+} RtxProjFile;
+
+typedef struct {
+    uint32_t parent;
+    uint32_t path;   /* pool offset of the full relative path ("" = root) */
+    uint16_t path_n;
+    uint16_t pad;
+} RtxProjDir;
+
+typedef struct RtxProjIdx {
+    CCArena store;          /* index epoch: chunks + pool */
+    RtxProjFile *fch[RTX_PROJ_CH_MAX];
+    RtxProjDir *dch[RTX_PROJ_CH_MAX];
+    char *nch[RTX_PROJ_CH_MAX];
+    size_t nf, nd;          /* write stage */
+    uint64_t npool;
+    _Atomic size_t pub_nf;  /* host: ids below are complete */
+    _Atomic size_t pub_nd;
+    _Atomic int pub_done;   /* walk finished (or gave up) */
+    _Atomic size_t pub_dirs_walked;
+    size_t n_ignored, n_denied, n_loops, n_xdev;
+    int truncated;
+    long t0_ms, t_ms;       /* kick / finish (monotonic ms) */
+    void *wk;               /* RtxProjWalk: calloc (embeds CCParallel) */
+} RtxProjIdx;
+
+/* ----------------------------------------------------------- quick-open */
+
+typedef struct {
+    uint32_t id;
+    int32_t score;
+    uint32_t len;   /* path bytes (tie-break: shorter first) */
+} RtxProjHit;
+
+typedef struct {
+    char q[RTX_PROJ_QMAX];
+    size_t qn;
+    RtxProjHit *top;        /* sorted best first; on `a` */
+    size_t ntop;
+    size_t scored;          /* index files scored for this query */
+    uint64_t gen;           /* index generation scored */
+    /* Every file that matched the query (a longer query rescores these). */
+    uint32_t *cand;
+    size_t ncand;
+    int cand_ok;
+    CCArena a, b;           /* ping-pong: this query / the last one */
+    size_t shards_last;     /* stats: shards the last score used */
+    long score_us;          /* stats: last score wall time */
+} RtxProjPick;
+
+/* -------------------------------------------------------------- search */
+
+typedef struct {
+    uint32_t file;
+    uint32_t line;   /* 1-based */
+    uint64_t off;    /* byte offset in the file */
+    uint32_t col;    /* 1-based byte column */
+    uint32_t mlen;   /* match bytes */
+    uint32_t pv;     /* preview pool offset */
+    uint16_t pvn;
+    uint16_t pvhit;  /* match start inside the preview */
+} RtxPsHit;
+
+typedef struct {
+    uint32_t file;
+    uint32_t first;  /* first hit index */
+    uint32_t n;
+} RtxPsGroup;
+
+typedef struct {
+    CCArena store;          /* search epoch: query, program, results */
+    char q[RTX_PROJ_QMAX];
+    size_t qn;
+    unsigned opts;
+    RtxRx *rx;
+    const char *err;        /* static: a regex that does not compile */
+    size_t max_bytes;
+    RtxPsHit *hch[RTX_PROJ_HCH_MAX];
+    RtxPsGroup *gch[RTX_PROJ_HCH_MAX];
+    char *pch[RTX_PROJ_PCH_MAX];
+    size_t nh, ng;          /* write stage */
+    uint64_t npv;
+    _Atomic size_t pub_nh, pub_ng, pub_files;
+    _Atomic uint64_t pub_bytes;
+    size_t next;            /* next file id; host reads after the join */
+    size_t n_bin, n_big, n_err;
+    int truncated;
+    int on;                 /* a query is set */
+    int complete;           /* every index file searched, index done */
+    _Atomic unsigned char cancel;
+    uint64_t gen;           /* index generation searched */
+    long t0_ms, t_ms;
+    void *wk;               /* RtxPsWalk: calloc (embeds CCParallel) */
+} RtxProjSearch;
+
+/* -------------------------------------------------------------- project */
+
+typedef struct RtxProj {
+    char root[RTX_PROJ_PATH];
+    size_t root_n;
+    unsigned flags;
+    RtxProjIdx *cur;        /* readers */
+    RtxProjIdx *next;       /* re-walk in progress */
+    uint64_t gen;           /* bumps when cur is replaced */
+    RtxProjPick pick;
+    RtxProjSearch ps;
+    char mru_file[RTX_PROJ_PATH]; /* "" = not persisted */
+    char *mru[RTX_PROJ_MRU_MAX];  /* relative paths, most recent first */
+    size_t nmru;
+    CCArena mru_a;
+} RtxProj;
+
+/* Git root of `start` (a file or a directory; "" = cwd) into dst
+ * (absolute). 1 = found a `.git`, 0 = dst is start's directory, -1 =
+ * start does not resolve. */
+int rtx_proj_root_of(const char *start, char *dst, size_t n);
+
+/* Kick the index walk of `root` (absolute or relative). */
+void !>(CCError) rtx_proj_open(RtxProj *p, char[:0] root, unsigned flags);
+/* Cancel + join everything, free both indexes and the search epoch. */
+void rtx_proj_close(RtxProj *p);
+int rtx_proj_is_open(const RtxProj *p);
+/* Join finished arms; swap a finished re-walk in; start the next search
+ * arm. Never waits on a live arm. 1 = something new was published. */
+int !>(CCError) rtx_proj_pump(RtxProj *p);
+/* Wait for the walk (and a re-walk) to finish. */
+void !>(CCError) rtx_proj_finish(RtxProj *p);
+void !>(CCError) rtx_proj_rewalk(RtxProj *p);
+void rtx_proj_pause(RtxProj *p);
+void rtx_proj_resume(RtxProj *p);
+/* The walk still publishes. */
+int rtx_proj_walking(const RtxProj *p);
+size_t rtx_proj_nfiles(const RtxProj *p);
+/* Relative path of file `id` into dst; bytes written (0 = bad id). */
+size_t rtx_proj_path(const RtxProj *p, uint32_t id, char *dst, size_t n);
+/* Offset of the basename in that path. */
+size_t rtx_proj_base_off(const char *rel, size_t n);
+/* root + "/" + rel */
+size_t rtx_proj_abs(const RtxProj *p, const char *rel, char *dst, size_t n);
+/* rel of an absolute path under the root, or 0 if outside. */
+size_t rtx_proj_rel_of(const RtxProj *p, const char *abs, char *dst, size_t n);
+/* Test hook: each walk lane sleeps this many µs per directory (and each
+ * search lane per file). */
+void rtx_proj_test_slow(long us);
+/* Test hook: files per search ticket (0 = RTX_PS_CHUNK). */
+void rtx_proj_test_chunk(int files);
+
+/* MRU (recency boost). `dir` is the cache directory (the Safe dir); the
+ * list is per root. touch moves `rel` to the front and saves. */
+void rtx_proj_mru_load(RtxProj *p, const char *dir);
+void rtx_proj_mru_touch(RtxProj *p, const char *rel);
+int rtx_proj_mru_rank(const RtxProj *p, const char *rel, size_t n);
+
+/* Quick-open. set scores the query now; update scores files published
+ * since (and rescans after a swap). 1 = the list changed. */
+int !>(CCError) rtx_proj_pick_set(RtxProj *p, char[:] q);
+int !>(CCError) rtx_proj_pick_update(RtxProj *p);
+size_t rtx_proj_pick_n(const RtxProj *p);
+const RtxProjHit *rtx_proj_pick_at(const RtxProj *p, size_t i);
+
+/* Search. A regex that does not compile sets ps.err and scans nothing. */
+void !>(CCError) rtx_proj_search_set(RtxProj *p, char[:] q, unsigned opts);
+void rtx_proj_search_cancel(RtxProj *p);
+void rtx_proj_search_clear(RtxProj *p);
+/* Wait for the search to cover every file (the walk is finished first). */
+void !>(CCError) rtx_proj_search_finish(RtxProj *p);
+int rtx_proj_searching(const RtxProj *p);
+size_t rtx_proj_search_nh(const RtxProj *p);
+size_t rtx_proj_search_ng(const RtxProj *p);
+const RtxPsHit *rtx_proj_search_hit(const RtxProj *p, size_t i);
+const RtxPsGroup *rtx_proj_search_group(const RtxProj *p, size_t g);
+/* Preview bytes of a hit (a view on the search epoch). */
+const char *rtx_proj_search_pv(const RtxProj *p, const RtxPsHit *h);
+/* Group of hit i (binary search over published groups). */
+size_t rtx_proj_search_group_of(const RtxProj *p, size_t hit);
+/* Flattened rows: each group is a header row then its hits. */
+size_t rtx_proj_search_rows(const RtxProj *p);
+/* Row → group, and hit (or (size_t)-1 on the header row). */
+void rtx_proj_search_row(const RtxProj *p, size_t row, size_t *g, size_t *hit);
+size_t rtx_proj_search_row_of_hit(const RtxProj *p, size_t hit);
+
+#endif /* RTX_PROJ_H */

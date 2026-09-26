@@ -1,0 +1,256 @@
+#!ccc ccs
+/*
+ * Replace-all at scale (not in @smoke; `./make.shcc @replace_perf`):
+ * a generated file (RTX_PERF_MB, default 100) with `fox` about every
+ * 88 bytes, `fox` -> `FOXES` over the whole file. Prints wall time and
+ * peak RSS (VmHWM, reset per phase through /proc/self/clear_refs) for
+ * scan, apply, undo, redo and a journal flush, then checks the bytes.
+ * The fixture is deleted at exit.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/safe.cch"
+#include "../core/find.cch"
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static long proc_kb(const char *key) {
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    long v = -1;
+    size_t kn = strlen(key);
+    if (!f) return -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, key, kn)) {
+            v = atol(line + kn);
+            break;
+        }
+    }
+    fclose(f);
+    return v;
+}
+
+static void hwm_reset(void) {
+    FILE *f = fopen("/proc/self/clear_refs", "w");
+    if (!f) return;
+    fputs("5", f);
+    fclose(f);
+}
+
+static uint64_t rng = 0x243f6a8885a308d3ull;
+
+static uint64_t rnd(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+}
+
+static const char *words[] = {"the",   "quick", "brown", "fox",   "jumps", "over",
+                              "lazy",  "dog",   "and",   "then",  "some",  "more",
+                              "words", "for",   "text",  "lines"};
+
+static size_t gen(const char *path, size_t want, size_t *nfox) {
+    FILE *f = fopen(path, "wb");
+    char line[256];
+    size_t w = 0;
+    *nfox = 0;
+    if (!f) return 0;
+    while (w < want) {
+        size_t o = 0;
+        int k, nw = 6 + (int)(rnd() % 10);
+        for (k = 0; k < nw; k++) {
+            size_t wi = (size_t)(rnd() % 16);
+            size_t l = strlen(words[wi]);
+            if (wi == 3) (*nfox)++;
+            memcpy(line + o, words[wi], l);
+            o += l;
+            line[o++] = k + 1 < nw ? ' ' : '\n';
+        }
+        fwrite(line, 1, o, f);
+        w += o;
+    }
+    fclose(f);
+    return w;
+}
+
+static uint64_t doc_hash(RtxDoc *d, size_t *n_out, size_t *nfoxes) {
+    static char buf[1 << 20];
+    uint64_t h = 1469598103934665603ull;
+    size_t off = 0, n = d->len(), i;
+    char prev = 0;
+    *nfoxes = 0;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    while (off < n) {
+        size_t take = n - off > sizeof(buf) ? sizeof(buf) : n - off;
+        size_t got = d->read_at(off, cc_slice_from_buffer(buf, take)) !>;
+        for (i = 0; i < got; i++) {
+            h ^= (unsigned char)buf[i];
+            h *= 1099511628211ull;
+            if (buf[i] == 'X' && prev == 'O') (*nfoxes)++;
+            prev = buf[i];
+        }
+        off += got;
+    }
+    *n_out = n;
+    return h;
+}
+
+int main(void) {
+    const char *path = "testdata/generated/replace_perf.txt";
+    const char *mbs = getenv("RTX_PERF_MB");
+    size_t mb = mbs && mbs[0] ? (size_t)atol(mbs) : 100;
+    size_t nfox = 0, n0, n1 = 0, nx = 0, sites;
+    uint64_t h0, h1;
+    double t0, t1, t2, t3;
+    long base_kb, hwm;
+    RtxDoc d = {0} @destroy;
+    RtxReplace j = {0} @destroy { rtx_replace_drop(&j); };
+    int st, bad = 0;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        unlink(path);
+        return 1;
+    }
+    rtx_safe_test_isol();
+    if (system("mkdir -p testdata/generated") != 0) return 1;
+    n0 = gen(path, mb << 20, &nfox);
+    d.from_path(cc_slice_cstr(path)) !>;
+    h0 = doc_hash(&d, &n1, &nx);
+    base_kb = proc_kb("VmRSS:");
+    printf("file %zu bytes, %zu fox; rss after open %.1f MiB\n", n0, nfox,
+           (double)base_kb / 1024.0);
+
+    hwm_reset();
+    t0 = now_ms();
+    rtx_replace_kick(&j, &d, cc_slice_cstr("fox"), 0, cc_slice_cstr("FOXES"), 0,
+                     (size_t)-1) !>;
+    /* Pumped as the UI does (48 ms turns). */
+    {
+        double longest = 0;
+        int turns = 0;
+        for (;;) {
+            double a = now_ms();
+            st = rtx_replace_step(&j, getenv("RTX_PERF_ONESTEP") ? 0 : 48, NULL) !>;
+            if (now_ms() - a > longest) longest = now_ms() - a;
+            turns++;
+            if (st != RTX_REPL_SCAN) break;
+        }
+        printf("  %d pump turns, longest turn %.0f ms, peak rss so far %.1f MiB\n", turns,
+               longest, (double)proc_kb("VmHWM:") / 1024.0);
+    }
+    t1 = now_ms();
+    sites = j.n;
+    if (st != RTX_REPL_READY) {
+        fprintf(stderr, "job state %d: %s\n", st, j.err ? j.err : "?");
+        unlink(path);
+        return 1;
+    }
+    t2 = now_ms();
+    (void)rtx_replace_commit(&j) !>;
+    t3 = now_ms();
+    hwm = proc_kb("VmHWM:");
+    printf("replace-all %zu sites: step %.0f ms  commit %.0f ms  total %.0f ms  "
+           "peak rss %.1f MiB (+%.1f)\n",
+           sites, t1 - t0, t3 - t2, t3 - t0, (double)hwm / 1024.0,
+           (double)(hwm - base_kb) / 1024.0);
+    printf("  rss after %.1f MiB, hist recs %zu\n", (double)proc_kb("VmRSS:") / 1024.0,
+           d.hist.len);
+    h1 = doc_hash(&d, &n1, &nx);
+    if (n1 != n0 + 2 * nfox || nx != nfox) {
+        fprintf(stderr, "FAIL: after replace len %zu (want %zu), FOXES %zu\n", n1,
+                n0 + 2 * nfox, nx);
+        bad = 1;
+    }
+
+    hwm_reset();
+    base_kb = proc_kb("VmRSS:");
+    t0 = now_ms();
+    d.undo() !>;
+    t1 = now_ms();
+    hwm = proc_kb("VmHWM:");
+    printf("undo %.0f ms  peak rss %.1f MiB (+%.1f)\n", t1 - t0, (double)hwm / 1024.0,
+           (double)(hwm - base_kb) / 1024.0);
+    if (doc_hash(&d, &n1, &nx) != h0 || n1 != n0) {
+        fprintf(stderr, "FAIL: undo bytes\n");
+        bad = 1;
+    }
+
+    hwm_reset();
+    base_kb = proc_kb("VmRSS:");
+    t0 = now_ms();
+    d.redo() !>;
+    t1 = now_ms();
+    hwm = proc_kb("VmHWM:");
+    printf("redo %.0f ms  peak rss %.1f MiB (+%.1f)\n", t1 - t0, (double)hwm / 1024.0,
+           (double)(hwm - base_kb) / 1024.0);
+    if (doc_hash(&d, &n1, &nx) != h1) {
+        fprintf(stderr, "FAIL: redo bytes\n");
+        bad = 1;
+    }
+
+    if (!getenv("RTX_PERF_NOSAFE")) {
+        char jp[4096];
+        struct stat sb;
+        hwm_reset();
+        base_kb = proc_kb("VmRSS:");
+        t0 = now_ms();
+        if (!rtx_safe_flush(&d, NULL)) {
+            fprintf(stderr, "FAIL: journal flush\n");
+            bad = 1;
+        }
+        t1 = now_ms();
+        hwm = proc_kb("VmHWM:");
+        sb.st_size = 0;
+        if (rtx_safe_file_path(jp, sizeof(jp), path)) stat(jp, &sb);
+        printf("journal flush %.0f ms  %.1f MiB on disk  peak rss %.1f MiB (+%.1f)\n",
+               t1 - t0, (double)sb.st_size / 1048576.0, (double)hwm / 1024.0,
+               (double)(hwm - base_kb) / 1024.0);
+        {
+            RtxDoc r = {0} @destroy;
+            RtxSafeCam cam;
+            int rc;
+            rtx_safe_cam_clear(&cam);
+            r.from_path(cc_slice_cstr(path)) !>;
+            t0 = now_ms();
+            rc = rtx_safe_load(&r, &cam);
+            t1 = now_ms();
+            printf("journal reload + replay %.0f ms (rc %d)\n", t1 - t0, rc);
+            if (doc_hash(&r, &n1, &nx) != h1) {
+                fprintf(stderr, "FAIL: reload bytes\n");
+                bad = 1;
+            }
+            t0 = now_ms();
+            r.undo() !>;
+            t1 = now_ms();
+            printf("undo after reload %.0f ms\n", t1 - t0);
+            if (doc_hash(&r, &n1, &nx) != h0) {
+                fprintf(stderr, "FAIL: undo after reload bytes\n");
+                bad = 1;
+            }
+        }
+        rtx_safe_drop(path);
+    }
+    unlink(path);
+    if (bad) return 1;
+    printf("replace_perf ok\n");
+    return 0;
+}

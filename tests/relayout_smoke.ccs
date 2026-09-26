@@ -1,0 +1,691 @@
+#!ccc ccs
+/*
+ * Incremental relayout (RtxLayoutPatch) is exact: after every edit the
+ * patched vis rows equal a fresh lines() fill of the same camera, row by
+ * row (byte_start, byte_len, line, wrap_i, width, height, pad, sec) plus
+ * MD table geometry. Random typing / Enter / deletes across lines / paste
+ * / undo / redo on plain text, code and markdown, in default, wrap and
+ * Rich panes, cell and pixel measures, and both cameras of a same-file
+ * split. Also counts how many edits the patch absorbed (it must engage).
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/ui.cch"
+#include "../core/browse.cch"
+
+static int fails = 0;
+static size_t n_edits = 0;
+static size_t n_patched = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static unsigned long long rng_s = 0x9e3779b97f4a7c15ull;
+
+static unsigned rnd(unsigned n) {
+    rng_s ^= rng_s << 13;
+    rng_s ^= rng_s >> 7;
+    rng_s ^= rng_s << 17;
+    return n ? (unsigned)(rng_s % n) : 0;
+}
+
+/* Cells: display columns; bold / italic / mono are wider and mono rows
+ * taller, so a style that moves changes widths and heights. */
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    double w = (double)rtx_utf8_cols(bytes);
+    (void)ctx;
+    (void)sec;
+    if (st.bold) w *= 1.5;
+    if (st.italic) w *= 1.25;
+    if (st.mono) w *= 1.125;
+    return w;
+}
+
+static double cell_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)sec;
+    return st.mono ? 1.5 : 1.0;
+}
+
+/* Pixels: a space is 8 units, so MD collect switches to md_px. */
+static double px_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    return 8.0 * cell_meas(ctx, bytes, st, sec);
+}
+
+static double px_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    return 16.0 * cell_lh(ctx, st, sec);
+}
+
+static int row_eq(const RtxVisRow *a, const RtxVisRow *b) {
+    return a->byte_start == b->byte_start && a->byte_len == b->byte_len &&
+           a->line == b->line && a->wrap_i == b->wrap_i && a->width == b->width &&
+           a->height == b->height && a->pad == b->pad && a->sec == b->sec;
+}
+
+/* Patched camera vs a fresh fill of the same lines at the same reveal. */
+static void !>(CCError) check_fresh(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
+                                    double width, const char *tag, size_t step) {
+    RtxLayout F = {0} @destroy;
+    size_t i, n;
+    char msg[512];
+    int bad = 0;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    F.view = L->view;
+    F.wrap = L->wrap;
+    F.wrap_char = L->wrap_char;
+    F.rich = L->rich;
+    F.reveal_lo = L->reveal_lo;
+    F.reveal_hi = L->reveal_hi;
+    if (!L->rows.len) return cc_ok();
+    F.lines(d, m, width, L->from_line, L->nlines) !>;
+    n = F.rows.len < L->rows.len ? F.rows.len : L->rows.len;
+    if (F.rows.len != L->rows.len) {
+        snprintf(msg, sizeof msg, "%s step %zu: rows %zu fresh %zu (from %zu n %zu)",
+                 tag, step, L->rows.len, F.rows.len, L->from_line, L->nlines);
+        expect(0, msg);
+        bad = 1;
+    }
+    for (i = 0; i < n && !bad; i++) {
+        const RtxVisRow *a = &L->rows.data[i];
+        const RtxVisRow *b = &F.rows.data[i];
+        if (!row_eq(a, b)) {
+            snprintf(msg, sizeof msg,
+                     "%s step %zu row %zu: [%zu+%zu L%zu w%.3f h%.3f p%.2f s%d] "
+                     "fresh [%zu+%zu L%zu w%.3f h%.3f p%.2f s%d]",
+                     tag, step, i, a->byte_start, a->byte_len, a->line, a->width,
+                     a->height, a->pad, (int)a->sec, b->byte_start, b->byte_len,
+                     b->line, b->width, b->height, b->pad, (int)b->sec);
+            expect(0, msg);
+            bad = 1;
+        }
+    }
+    if (!bad && L->total_height != F.total_height) {
+        snprintf(msg, sizeof msg, "%s step %zu: total_height %.3f fresh %.3f", tag,
+                 step, L->total_height, F.total_height);
+        expect(0, msg);
+    }
+    /* MD records ride with the rows: same split / trim / wrap as a fill. */
+    if (L->md_recs.len != F.md_recs.len) {
+        snprintf(msg, sizeof msg, "%s step %zu: md records %zu fresh %zu", tag, step,
+                 L->md_recs.len, F.md_recs.len);
+        expect(0, msg);
+    } else {
+        size_t r;
+        for (r = 0; r < L->md_recs.len; r++) {
+            const RtxMdRec *a = &L->md_recs.data[r];
+            const RtxMdRec *b = &F.md_recs.data[r];
+            int same = a->row == b->row && a->len == b->len && a->ti == b->ti &&
+                       a->tall == b->tall && a->nc == b->nc;
+            int c;
+            RtxMdRecView va, vb;
+            va.rec = a;
+            va.cells = &L->md_cells.data[a->cell];
+            va.lines = L->md_lines.data;
+            vb.rec = b;
+            vb.cells = &F.md_cells.data[b->cell];
+            vb.lines = F.md_lines.data;
+            for (c = 0; same && c < RTX_MD_TABLE_COLS; c++) {
+                const RtxMdCell *la, *lb;
+                const RtxMdRecCell *ca = rtx_md_view_cell(&va, c, &la);
+                const RtxMdRecCell *cb = rtx_md_view_cell(&vb, c, &lb);
+                size_t k;
+                if (!ca || !cb) {
+                    same = !ca && !cb;
+                    break;
+                }
+                same = ca->raw.lo == cb->raw.lo && ca->raw.hi == cb->raw.hi &&
+                       ca->trim.lo == cb->trim.lo && ca->trim.hi == cb->trim.hi &&
+                       ca->nl == cb->nl;
+                for (k = 0; same && k < ca->nl; k++)
+                    same = la[k].lo == lb[k].lo && la[k].hi == lb[k].hi;
+            }
+            if (!same) {
+                snprintf(msg, sizeof msg, "%s step %zu: md record %zu (row %zu) differs",
+                         tag, step, r, a->row);
+                expect(0, msg);
+                break;
+            }
+        }
+    }
+    if (L->md_ntab != F.md_ntab) {
+        snprintf(msg, sizeof msg, "%s step %zu: md_ntab %d fresh %d", tag, step,
+                 L->md_ntab, F.md_ntab);
+        expect(0, msg);
+    } else {
+        int t, c;
+        for (t = 0; t < L->md_ntab; t++) {
+            int same = L->md_tab[t].lo == F.md_tab[t].lo &&
+                       L->md_tab[t].hi == F.md_tab[t].hi &&
+                       L->md_tab[t].ncols == F.md_tab[t].ncols;
+            for (c = 0; c < L->md_tab[t].ncols && c < RTX_MD_TABLE_COLS; c++) {
+                if (L->md_colw[t][c] != F.md_colw[t][c] ||
+                    L->md_colpx[t][c] != F.md_colpx[t][c])
+                    same = 0;
+            }
+            if (!same) {
+                snprintf(msg, sizeof msg,
+                         "%s step %zu: md table %d differs: [%zu,%zu) c%d w0 %d/%d "
+                         "px0 %d/%d vs fresh [%zu,%zu) c%d; win [%zu,%zu) fresh [%zu,%zu)",
+                         tag, step, t, L->md_tab[t].lo, L->md_tab[t].hi,
+                         L->md_tab[t].ncols, L->md_colw[t][0], F.md_colw[t][0],
+                         L->md_colpx[t][0], F.md_colpx[t][0], F.md_tab[t].lo,
+                         F.md_tab[t].hi, F.md_tab[t].ncols, L->win_lo, L->win_hi,
+                         F.win_lo, F.win_hi);
+                expect(0, msg);
+            }
+        }
+    }
+    return cc_ok();
+}
+
+/* One wrap oracle: every table record's stored lines are what
+ * rtx_layout_md_cell_wrap returns, and height, wrap_li, col_at, cell_span
+ * and x_of -> hit all read that same wrap. */
+static size_t n_cells_checked = 0;
+static size_t n_hits_checked = 0;
+
+static void !>(CCError) md_consumers(const char *path, const RtxMeasure *m,
+                                     double width, double lh) {
+    RtxBuf b = {0} @destroy;
+    RtxLayout *L = &b.layout;
+    size_t i;
+    double y0 = 0;
+    char msg[512];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    L->rich = 1;
+    L->wrap = 1;
+    rtx_line_scan_to(&b.doc.tree, b.doc.len()) !>;
+    b.ensure_view((RtxMeasure *)m, width, 60) !>;
+    expect(L->md_ntab > 0, "md consumers: fixture has tables");
+    for (i = 0; i < L->rows.len; i++, y0 += L->rows.data[i - 1].height) {
+        const RtxVisRow *r = &L->rows.data[i];
+        const RtxMdRec *rec;
+        RtxMdRecView v;
+        CCArena frame;
+        char[:] bytes;
+        int ti = rtx_layout_md_index(L, r->byte_start), c, ncols;
+        if (ti < 0 || rtx_md_table_role(&L->md_tab[ti], r->byte_start) ==
+                          RTX_MD_ROLE_SEP)
+            continue;
+        rec = rtx_layout_md_rec(L, r->byte_start);
+        snprintf(msg, sizeof msg, "%s: table row %zu has a record", path, r->byte_start);
+        expect(rec != NULL && rec->len == r->byte_len, msg);
+        if (!rec || !r->byte_len) continue;
+        snprintf(msg, sizeof msg, "%s: row %zu height is tall x line", path,
+                 r->byte_start);
+        expect(r->height == lh * (double)rec->tall, msg);
+        frame = cc_arena_heap(r->byte_len + 64);
+        bytes = b.doc.scratch_span(r->byte_start, r->byte_len, frame) !>;
+        ncols = L->md_tab[ti].ncols;
+        /* A current fill hands out its own record, not a rebuilt one. */
+        expect(rtx_layout_md_view(L, &b.doc, m, r, bytes, NULL, &v) && v.rec == rec,
+               "md consumers: view is the stored record");
+        for (c = 0; c < ncols; c++) {
+            const RtxMdCell *lines;
+            const RtxMdRecCell *rc = rtx_md_view_cell(&v, c, &lines);
+            RtxMdCell want[RTX_MD_WRAP_MAX];
+            size_t nw, k, off;
+            int plain = 1;
+            if (!rc) break;
+            nw = rtx_layout_md_cell_wrap(L, &b.doc, m, r->byte_start, bytes,
+                                         rc->trim.lo, rc->trim.hi, ti, c, r->sec,
+                                         want, RTX_MD_WRAP_MAX);
+            snprintf(msg, sizeof msg, "%s: row %zu cell %d stored wrap == oracle",
+                     path, r->byte_start, c);
+            expect(nw == rc->nl, msg);
+            for (k = 0; k < nw && k < rc->nl; k++)
+                expect(lines[k].lo == want[k].lo && lines[k].hi == want[k].hi, msg);
+            n_cells_checked++;
+            for (off = rc->trim.lo; off < rc->trim.hi; off++) {
+                unsigned char ch = (unsigned char)bytes.ptr[off];
+                if (ch >= 0x80 || ch == '\\' ||
+                    rtx_layout_hidden_to(L, &b.doc, r->byte_start + off))
+                    plain = 0;
+            }
+            for (off = rc->trim.lo; off < rc->trim.hi; off++) {
+                size_t at = r->byte_start + off, li = 0, clo = 0, chi = 0, hit;
+                double x;
+                while (li + 1 < rc->nl && off - rc->trim.lo >= lines[li].hi) li++;
+                snprintf(msg, sizeof msg, "%s: %zu wrap_li / col_at / cell_span agree",
+                         path, at);
+                expect(rtx_layout_md_wrap_li(L, &b.doc, m, at) == (int)li, msg);
+                expect(rtx_layout_md_col_at(L, &b.doc, at) == c, msg);
+                expect(rtx_layout_md_cell_span(L, &b.doc, at, &clo, &chi) &&
+                           clo == r->byte_start + rc->trim.lo &&
+                           chi == r->byte_start + rc->trim.hi,
+                       msg);
+                if (!plain) continue;
+                x = L->x_of(&b.doc, m, at) !>;
+                hit = L->hit(&b.doc, m, x + 0.01, y0 + (double)li * lh + 0.01) !>;
+                snprintf(msg, sizeof msg, "%s: %zu x_of -> hit round trip (got %zu)",
+                         path, at, hit);
+                expect(hit == at, msg);
+                n_hits_checked++;
+            }
+        }
+        frame.destroy();
+    }
+    return cc_ok();
+}
+
+static const char *pastes[] = {
+    "x",
+    "hello world ",
+    "line one\nline two\n",
+    "**bold** and *it* `code`\n",
+    "| a | b |\n",
+    "```\nfenced\n```\n",
+    "- item\n- [ ] task\n",
+    "# Head\n",
+    "\n\n",
+    "[link](http://x.y) ",
+    "日本語 é ",
+    "int x = 1; /* c */\n",
+};
+
+static const char typeables[] = "abc  xyz*`_|#-[]()\"'/";
+
+/* A position inside the camera's rows most of the time, else anywhere. */
+static size_t pick_off(const RtxBuf *b) {
+    size_t n = b->doc.len();
+    if (b->layout.rows.len && rnd(10) < 8) {
+        const RtxVisRow *r0 = &b->layout.rows.data[0];
+        const RtxVisRow *r1 = &b->layout.rows.data[b->layout.rows.len - 1];
+        size_t lo = r0->byte_start, hi = r1->byte_start + r1->byte_len;
+        if (hi > n) hi = n;
+        if (hi > lo) return lo + rnd((unsigned)(hi - lo + 1));
+        return lo;
+    }
+    return n ? rnd((unsigned)(n + 1)) : 0;
+}
+
+static void !>(CCError) one_edit(RtxBuf *b) {
+    unsigned op = rnd(100);
+    size_t n = b->doc.len();
+    size_t at = pick_off(b);
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (at > n) at = n;
+    b->doc.caret = at;
+    b->doc.sel_anchor = at;
+    if (op < 40) {
+        b->type_cp((uint32_t)(unsigned char)typeables[rnd(sizeof typeables - 1)]) !>;
+    } else if (op < 50) {
+        b->enter() !>;
+    } else if (op < 60) {
+        b->backspace() !>;
+    } else if (op < 66) {
+        b->delete_forward() !>;
+    } else if (op < 74) {
+        /* Delete across lines: a selection up to ~120 bytes. */
+        size_t k = 1 + rnd(120);
+        b->doc.sel_anchor = at + k > n ? n : at + k;
+        b->backspace() !>;
+    } else if (op < 86) {
+        const char *s = pastes[rnd(sizeof pastes / sizeof pastes[0])];
+        b->doc.insert(at, cc_slice_from_buffer((char *)s, strlen(s))) !>;
+    } else if (op < 95) {
+        if (b->doc.can_undo()) b->doc.undo() !>;
+        else b->type_cp((uint32_t)'u') !>;
+    } else {
+        if (b->doc.can_redo()) b->doc.redo() !>;
+        else b->type_cp((uint32_t)'r') !>;
+    }
+    return cc_ok();
+}
+
+typedef struct {
+    const char *name;
+    int wrap;
+    int rich;
+} Mode;
+
+static void !>(CCError) run_file_at(const char *path, const Mode *md,
+                                    const RtxMeasure *m, double width, int vis,
+                                    size_t steps, int mid) {
+    RtxBuf b = {0} @destroy;
+    char tag[200];
+    size_t i, patched0;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.wrap = md->wrap;
+    b.layout.rich = md->rich;
+    rtx_line_scan_to(&b.doc.tree, b.doc.len()) !>;
+    b.top = mid ? b.doc.line_count() / 2 : 0;
+    b.ensure_view((RtxMeasure *)m, width, vis) !>;
+    snprintf(tag, sizeof tag, "%s [%s %s]", path, md->name,
+             m->measure == px_meas ? "px" : "cell");
+    patched0 = b.layout.patched;
+    for (i = 0; i < steps; i++) {
+        /* Now and then the camera moves: a refill, then patches from there. */
+        if (!mid && rnd(40) == 0) {
+            size_t lc = b.doc.line_count();
+            b.top = lc ? rnd((unsigned)lc) : 0;
+            b.top_wrap = 0;
+        }
+        one_edit(&b) !>;
+        b.after_edit((RtxMeasure *)m, width, vis) !>;
+        check_fresh(&b.layout, &b.doc, m, width, tag, i) !>;
+        n_edits++;
+        if (fails > 20) break;
+    }
+    n_patched += b.layout.patched - patched0;
+    return cc_ok();
+}
+
+static void !>(CCError) run_file(const char *path, const Mode *md, const RtxMeasure *m,
+                                 double width, int vis, size_t steps) {
+    return run_file_at(path, md, m, width, vis, steps, 0);
+}
+
+/* Seeking camera (no line cover): the patched rows equal a fresh fill_off
+ * at seek_off, labels included (line_guess, then the keyed origin). A
+ * handoff to lined mid-run checks against lines() from there. */
+static size_t n_seek_patched = 0;
+
+static void !>(CCError) check_fresh_seek(RtxBuf *b, const RtxMeasure *m, double width,
+                                         int vis, const char *tag, size_t step) {
+    RtxLayout F = {0} @destroy;
+    RtxLayout *L = &b->layout;
+    size_t i, n;
+    char msg[512];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (!b->seek_valid) return check_fresh(L, &b->doc, m, width, tag, step);
+    F.view = L->view;
+    F.wrap = L->wrap;
+    F.wrap_char = L->wrap_char;
+    F.rich = L->rich;
+    F.reveal_lo = L->reveal_lo;
+    F.reveal_hi = L->reveal_hi;
+    F.fill_off(&b->doc, m, width, b->seek_off, (size_t)vis + 8 + b->top_wrap) !>;
+    if (rtx_line_mark_ok(&b->doc.tree) && F.rows.len)
+        rtx_layout_reline(&F, rtx_isle_cam_line(b));
+    if (F.rows.len != L->rows.len || F.from_line != L->from_line ||
+        F.nlines != L->nlines) {
+        snprintf(msg, sizeof msg, "%s step %zu: seek rows %zu fresh %zu from %zu/%zu n %zu/%zu",
+                 tag, step, L->rows.len, F.rows.len, L->from_line, F.from_line,
+                 L->nlines, F.nlines);
+        expect(0, msg);
+        return cc_ok();
+    }
+    n = F.rows.len;
+    for (i = 0; i < n; i++) {
+        const RtxVisRow *a = &L->rows.data[i];
+        const RtxVisRow *c = &F.rows.data[i];
+        if (!row_eq(a, c)) {
+            snprintf(msg, sizeof msg,
+                     "%s step %zu seek row %zu: [%zu+%zu L%zu w%.3f] fresh [%zu+%zu L%zu w%.3f]",
+                     tag, step, i, a->byte_start, a->byte_len, a->line, a->width,
+                     c->byte_start, c->byte_len, c->line, c->width);
+            expect(0, msg);
+            return cc_ok();
+        }
+    }
+    if (L->total_height != F.total_height) {
+        snprintf(msg, sizeof msg, "%s step %zu: seek total_height %.3f fresh %.3f", tag,
+                 step, L->total_height, F.total_height);
+        expect(0, msg);
+    }
+    return cc_ok();
+}
+
+static void !>(CCError) run_file_seek(const char *path, const Mode *md,
+                                      const RtxMeasure *m, double width, int vis,
+                                      size_t steps) {
+    RtxBuf b = {0} @destroy;
+    char tag[200];
+    size_t i, patched0;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.wrap = md->wrap;
+    b.layout.rich = md->rich;
+    {
+        size_t floor = rtx_doc_line_floor(&b.doc, b.doc.len() / 2) !>;
+        rtx_buf_seek_set(&b, floor);
+    }
+    b.ensure_view((RtxMeasure *)m, width, vis) !>;
+    snprintf(tag, sizeof tag, "seek %s [%s %s]", path, md->name,
+             m->measure == px_meas ? "px" : "cell");
+    patched0 = b.layout.patched;
+    for (i = 0; i < steps; i++) {
+        one_edit(&b) !>;
+        b.after_edit((RtxMeasure *)m, width, vis) !>;
+        check_fresh_seek(&b, m, width, vis, tag, i) !>;
+        n_edits++;
+        if (fails > 20) break;
+    }
+    n_seek_patched += b.layout.patched - patched0;
+    n_patched += b.layout.patched - patched0;
+    return cc_ok();
+}
+
+/* Past RTX_HL_FULL_MAX / RTX_MARKUP_SCAN_MAX: window lex, window sections. */
+static int write_big_md(const char *out, const char *const *parts, size_t np,
+                        size_t want) {
+    FILE *o = fopen(out, "wb");
+    size_t total = 0, i;
+    char buf[4096];
+    if (!o) return 0;
+    while (total < want) {
+        for (i = 0; i < np; i++) {
+            FILE *f = fopen(parts[i], "rb");
+            size_t n;
+            if (!f) continue;
+            while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+                fwrite(buf, 1, n, o);
+                total += n;
+            }
+            fclose(f);
+        }
+    }
+    fclose(o);
+    return 1;
+}
+
+/* Two cameras on one document: both must be the fresh fill after edits
+ * that land in either window, above the side camera, or below it. */
+static void !>(CCError) run_split(const char *path, const RtxMeasure *m, double width,
+                                  int vis, size_t steps, int rich, int wrap) {
+    RtxWs w = {0} @destroy;
+    char *paths[1];
+    size_t i;
+    char tag[200];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    paths[0] = (char *)path;
+    w.open_files(1, paths) !>;
+    w.toggle_split();
+    snprintf(tag, sizeof tag, "split %s rich=%d wrap=%d", path, rich, wrap);
+    {
+        int p;
+        for (p = 0; p < 2; p++) {
+            RtxBuf *act;
+            w.set_focus(p);
+            act = RtxWs_active(&w);
+            act->layout.rich = rich;
+            act->layout.wrap = wrap;
+            rtx_line_scan_to(&act->doc.tree, act->doc.len()) !>;
+            act->top = p ? 6 : 0;
+            act->ensure_view((RtxMeasure *)m, width, vis) !>;
+        }
+    }
+    for (i = 0; i < steps; i++) {
+        RtxBuf *act;
+        int p;
+        w.set_focus((int)rnd(2));
+        act = RtxWs_active(&w);
+        one_edit(act) !>;
+        w.after_edit(w.pane[w.focus], (RtxMeasure *)m, width, width, vis) !>;
+        for (p = 0; p < 2; p++) {
+            int held = RtxWs_hold_pane(&w, p);
+            RtxBuf *b = w.bufs[w.pane[p]];
+            char t2[240];
+            snprintf(t2, sizeof t2, "%s pane %d", tag, p);
+            check_fresh(&b->layout, &b->doc, m, width, t2, i) !>;
+            RtxWs_drop_pane(&w, p, held);
+        }
+        n_edits++;
+        if (fails > 20) break;
+    }
+    {
+        int p;
+        for (p = 0; p < 2; p++) {
+            int held = RtxWs_hold_pane(&w, p);
+            n_patched += w.bufs[w.pane[p]]->layout.patched;
+            RtxWs_drop_pane(&w, p, held);
+        }
+    }
+    return cc_ok();
+}
+
+int main(void) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    static const char *files[] = {
+        "testdata/wrap.txt",
+        "testdata/mixed.txt",
+        "testdata/code_then_prose.txt",
+        "testdata/rich/code/embeds.c",
+        "testdata/rich/code/embeds.py",
+        "testdata/rich/code/embeds.html",
+        "testdata/rich/code/nested.md",
+        "testdata/rich/md/blocks.md",
+        "testdata/rich/md/edge_utf8.md",
+        "testdata/rich/md/fences.md",
+        "testdata/rich/md/headings.md",
+        "testdata/rich/md/inline.md",
+        "testdata/rich/md/links_images.md",
+        "testdata/rich/md/lists_tasks.md",
+        "testdata/rich/md/mermaid_math.md",
+        "testdata/rich/md/mixed_doc.md",
+        "testdata/rich/md/tables.md",
+        "testdata/rich/md/README.md",
+    };
+    static const Mode modes[] = {
+        {"default", 0, 0},
+        {"wrap", 1, 0},
+        {"rich", 0, 1},
+        {"rich-wrap", 1, 1},
+    };
+    RtxMeasure cm = {0}, pm = {0};
+    size_t f, k;
+    const char *steps_env = getenv("RTX_RELAYOUT_STEPS");
+    size_t steps = steps_env && steps_env[0] ? (size_t)atol(steps_env) : 120;
+    cm.measure = cell_meas;
+    cm.line_height = cell_lh;
+    pm.measure = px_meas;
+    pm.line_height = px_lh;
+
+    /* Doc edit span: union of edits, old extent tracked through them. */
+    {
+        RtxDoc d = {0} @destroy;
+        d.from_buffer("0123456789abcdef") !>;
+        d.span_reset();
+        d.insert(4, "XY") !>;                /* 0123XY456789abcdef */
+        expect(d.span.live && d.span.lo == 4 && d.span.hi == 6 && d.span.old_n == 0,
+               "span: first insert");
+        d.erase(10, 2) !>;                   /* 0123XY4567abcdef (old 89) */
+        expect(d.span.lo == 4 && d.span.hi == 10 && d.span.old_n == 6,
+               "span: later erase widens over unchanged bytes");
+        d.insert(1, "Q") !>;
+        expect(d.span.lo == 1 && d.span.hi == 11 && d.span.old_n == 9,
+               "span: edit before the span");
+        d.span_reset();
+        expect(!d.span.live && d.span.gen0 == d.edit_gen, "span: reset at edit_gen");
+    }
+
+    for (f = 0; f < sizeof files / sizeof files[0]; f++) {
+        for (k = 0; k < sizeof modes / sizeof modes[0]; k++) {
+            run_file(files[f], &modes[k], &cm, 40.0, 10, steps) !>;
+            if (modes[k].rich)
+                run_file(files[f], &modes[k], &pm, 320.0, 10, steps / 2) !>;
+            if (fails > 20) break;
+        }
+        if (fails > 20) break;
+    }
+    {
+        static const char *big = "testdata/generated/relayout_big.md";
+        FILE *lf;
+        if (write_big_md(big, files + 7, 11, 600 * 1024)) {
+            for (k = 0; k < sizeof modes / sizeof modes[0]; k++)
+                run_file_at(big, &modes[k], &cm, 40.0, 10, steps / 3, 1) !>;
+            run_file_at(big, &modes[3], &pm, 320.0, 10, steps / 3, 1) !>;
+            for (k = 0; k < sizeof modes / sizeof modes[0]; k++)
+                run_file_seek(big, &modes[k], &cm, 40.0, 10, steps / 3) !>;
+        }
+        lf = fopen("testdata/generated/large.txt", "rb");
+        if (lf) {
+            fclose(lf);
+            run_file_at("testdata/generated/large.txt", &modes[0], &cm, 40.0, 10,
+                        steps / 3, 1) !>;
+            run_file_at("testdata/generated/large.txt", &modes[1], &cm, 40.0, 10,
+                        steps / 3, 1) !>;
+            run_file_seek("testdata/generated/large.txt", &modes[0], &cm, 40.0, 10,
+                          steps / 3) !>;
+            run_file_seek("testdata/generated/large.txt", &modes[1], &cm, 40.0, 10,
+                          steps / 3) !>;
+        }
+        run_file_seek("testdata/rich/code/embeds.c", &modes[0], &cm, 40.0, 10,
+                      steps / 2) !>;
+        run_file_seek("testdata/rich/code/embeds.c", &modes[1], &cm, 40.0, 10,
+                      steps / 2) !>;
+    }
+    run_split("testdata/rich/md/mixed_doc.md", &cm, 40.0, 8, steps, 1, 1) !>;
+    run_split("testdata/rich/md/README.md", &cm, 40.0, 8, steps, 0, 0) !>;
+    run_split("testdata/rich/code/embeds.c", &cm, 40.0, 8, steps, 0, 1) !>;
+
+    md_consumers("testdata/rich/md/tables.md", &cm, 40.0, 1.0) !>;
+    md_consumers("testdata/rich/md/tables.md", &pm, 320.0, 16.0) !>;
+    md_consumers("testdata/rich/md/edge_utf8.md", &cm, 40.0, 1.0) !>;
+    md_consumers("testdata/rich/md/edge_utf8.md", &pm, 320.0, 16.0) !>;
+    md_consumers("testdata/rich/md/mixed_doc.md", &cm, 30.0, 1.0) !>;
+    expect(n_hits_checked > 50, "md consumers: round trips ran");
+    expect(n_patched * 4 > n_edits, "patch absorbs most edits (not every one refills)");
+    expect(n_seek_patched > 0, "a seeking camera patches too");
+    if (fails) {
+        fprintf(stderr, "relayout_smoke: %d failure(s)  edits=%zu patched=%zu\n", fails,
+                n_edits, n_patched);
+        return 1;
+    }
+    printf("relayout_smoke ok  edits=%zu patched=%zu seek_patched=%zu md_cells=%zu md_hits=%zu\n",
+           n_edits, n_patched, n_seek_patched, n_cells_checked, n_hits_checked);
+    return 0;
+}

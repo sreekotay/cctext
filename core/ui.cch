@@ -10,19 +10,31 @@
 #define RTX_UI_H
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include "utf8.cch"
 #include "nav_pair.cch"
 #include "batch.cch"
 #include "find.cch"
+#include "cmd.cch"
+#include "keymap.cch"
+#include "palette.cch"
+#include "slides.cch"
 
 const char *rtx_help_line(size_t i);
+/* Regenerate the help lines from the command table + keymap. */
+void rtx_help_rebuild(void);
+size_t rtx_help_n(void);
 void rtx_help_bind_apply(const char **names, size_t n);
+void rtx_help_bind_table(const char **names, const int *keys, size_t n);
 size_t rtx_apply_menu_n(void);
 const char *rtx_apply_menu_line(size_t i);
 
-/* Find / jump / browse field caret. Same clock; only these draw it. */
+/* Find / jump / browse field caret. Same clock; only these draw it. A
+ * host that shows the caret itself (caret_host) puts it at the field's
+ * caret cell instead: nothing painted. */
 const char *rtx_ui_prompt_caret(const RtxUi *ui) {
+    if (ui && ui->caret_host) return "";
     return rtx_ui_blink(ui) ? "_" : " ";
 }
 
@@ -41,38 +53,13 @@ void rtx_ui_cancel_jump(RtxUi *ui, RtxDoc *d) {
 void rtx_ui_clear_find(RtxUi *ui) {
     if (!ui) return;
     ui->find = 0;
+    /* A replace-all still collecting edits nothing: drop it. */
+    rtx_replace_drop(&ui->rjob);
 }
 
+/* Esc-overlay / Alt letter -> CMD_*: the command table's letters column. */
 int rtx_cmd_from_letter(int c) {
-    if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
-    switch (c) {
-    case 'q': return CMD_QUIT;
-    case 's': return CMD_SAVE;
-    case 'z': return CMD_UNDO;
-    case 'y': return CMD_REDO;
-    case 'x': return CMD_CUT;
-    case 'c': return CMD_COPY;
-    case 'v': return CMD_PASTE;
-    case 'w': return CMD_PANE;
-    case 'n': return CMD_NEXT;
-    case '\\': return CMD_SPLIT;
-    case 'g': return CMD_JUMP;
-    case 'f': return CMD_FIND;
-    case 'b':
-    case 'o': return CMD_BROWSE;
-    case 'a': return CMD_SEL_ALL;
-    case 'l': return CMD_VIEW;
-    case 'd': return CMD_RICH;
-    case 'm': return CMD_WRAP;
-    case 'u': return CMD_FOLLOW;
-    case 'k': return CMD_NAV_NEXT;
-    case 'p': return CMD_NAV_PREV;
-    case 'e': return CMD_NAV_INV;
-    case 'r': return CMD_NAV_INV_PREV;
-    case 't': return CMD_FOLD;
-    case '=': return CMD_STATS;
-    default: return CMD_NONE;
-    }
+    return rtx_cmd_letter(c);
 }
 
 int rtx_nav_from_cmd(int cmd) {
@@ -97,8 +84,28 @@ void rtx_ui_toggle_help(RtxUi *ui) {
     if (!ui) return;
     ui->help = !ui->help;
     if (ui->help) {
+        ui->help_top = 0;
         ui->stats = 0;
         ui->apply = 0;
+        ui->palette = 0;
+    }
+}
+
+/* Move the help overlay by `dir` lines (negative = up). `vis` is how many
+ * binding lines fit; 0 means do not clamp to a page (only floor at 0). */
+void rtx_ui_help_scroll(RtxUi *ui, int dir, int vis) {
+    size_t n, max_top;
+    if (!ui || !ui->help || !dir) return;
+    n = rtx_help_n();
+    if (vis < 1) vis = 1;
+    max_top = n > (size_t)vis ? n - (size_t)vis : 0;
+    if (dir < 0) {
+        size_t step = (size_t)(-dir);
+        if (ui->help_top > step) ui->help_top -= step;
+        else ui->help_top = 0;
+    } else {
+        ui->help_top += (size_t)dir;
+        if (ui->help_top > max_top) ui->help_top = max_top;
     }
 }
 
@@ -108,7 +115,45 @@ void rtx_ui_toggle_apply(RtxUi *ui) {
     if (ui->apply) {
         ui->help = 0;
         ui->stats = 0;
+        ui->palette = 0;
     }
+}
+
+/* RTX_CTX_* for the command table's enabled checks (palette, menus). */
+unsigned rtx_ui_cmd_ctx(RtxWs *w, const RtxUi *ui, int gui) {
+    unsigned f = gui ? RTX_CTX_GUI : 0;
+    RtxBuf *b;
+    if (!w) return f;
+    b = w->active();
+    if (w->browsing()) f |= RTX_CTX_BROWSE;
+    else if (b) f |= RTX_CTX_DOC;
+    if (ui && ui->find) f |= RTX_CTX_FIND;
+    if (ui && ui->find && ui->repl) f |= RTX_CTX_REPL;
+    if (w->npanes > 1) f |= RTX_CTX_SPLIT;
+    if (w->len > 1) f |= RTX_CTX_MULTI;
+    if (b && !w->browsing()) {
+        RtxApplyEnt ents[RTX_APPLY_MAX];
+        if (RtxBuf_in_table(b)) f |= RTX_CTX_TABLE;
+        if (b->doc.sel_anchor != b->doc.caret) f |= RTX_CTX_SEL;
+        if (b->doc.dirty()) f |= RTX_CTX_DIRTY;
+        if (RtxDoc_apply_list(&b->doc, ents, RTX_APPLY_MAX)) f |= RTX_CTX_APPLY;
+        if (RtxDoc_is_markup(&b->doc)) f |= RTX_CTX_MARKUP;
+    }
+    return f;
+}
+
+/* Command palette: opens over the pane (help / apply / stats close). */
+void rtx_ui_open_palette(RtxUi *ui, unsigned ctx) {
+    if (!ui) return;
+    ui->palette = 1;
+    ui->help = 0;
+    ui->apply = 0;
+    ui->stats = 0;
+    rtx_palette_open(&ui->pal, ctx);
+}
+
+void rtx_ui_close_palette(RtxUi *ui) {
+    if (ui) ui->palette = 0;
 }
 
 void rtx_ui_toggle_stats(RtxUi *ui) {
@@ -117,6 +162,7 @@ void rtx_ui_toggle_stats(RtxUi *ui) {
     if (ui->stats) {
         ui->help = 0;
         ui->apply = 0;
+        ui->palette = 0;
     }
 }
 
@@ -141,9 +187,22 @@ void rtx_ui_jump_header(const RtxUi *ui, const RtxDoc *d, char *dst, size_t n) {
                  ui ? ui->jump_buf : "", pct);
         return;
     }
+    if (ui && ui->jump_buf[0] == '#') {
+        snprintf(dst, n, "go to slide: %s%s", ui->jump_buf, rtx_ui_prompt_caret(ui));
+        return;
+    }
     snprintf(dst, n, "jump line or N%%: %s%s",
              ui ? ui->jump_buf : "",
              rtx_ui_prompt_caret(ui));
+}
+
+/* Go to Slide: the jump field on `#` (docs/slides.md). */
+void rtx_ui_start_slide_jump(RtxUi *ui, RtxDoc *d) {
+    rtx_ui_start_jump(ui, d);
+    if (!ui) return;
+    ui->jump_buf[0] = '#';
+    ui->jump_buf[1] = 0;
+    ui->jump_len = 1;
 }
 
 RtxField rtx_ui_find_field(RtxUi *ui) {
@@ -206,6 +265,9 @@ void rtx_ui_start_find(RtxUi *ui, RtxDoc *d) {
     ui->apply = 0;
     rtx_ui_clear_jump(ui);
     ui->find = 1;
+    ui->repl = 0; /* Ctrl-F again (or Alt-E) opens the replace row */
+    ui->repl_focus = 0;
+    ui->repl_msg[0] = 0;
     if (ui->find_len) rtx_field_select_all(rtx_ui_find_field(ui));
     else {
         ui->find_caret = 0;
@@ -260,26 +322,67 @@ void rtx_ui_fmt_pct(char *dst, size_t n, size_t a, size_t b) {
     snprintf(dst, n, "%.1f%%", (double)a * 100.0 / (double)b);
 }
 
+/* Option tags for the find header: "icase+word+regex", or "" when none. */
+void rtx_ui_find_opts_label(unsigned opts, char *dst, size_t n) {
+    size_t o = 0;
+    if (!dst || n == 0) return;
+    dst[0] = 0;
+    if (opts & RTX_FIND_ICASE) o += (size_t)snprintf(dst + o, n - o, "icase");
+    if ((opts & RTX_FIND_WORD) && o < n)
+        o += (size_t)snprintf(dst + o, n - o, "%sword", o ? "+" : "");
+    if ((opts & RTX_FIND_REGEX) && o < n)
+        o += (size_t)snprintf(dst + o, n - o, "%sregex", o ? "+" : "");
+}
+
+/* Alt-C / Alt-W / Alt-R in the find field (both hosts): toggle ignore-case,
+ * whole word, regex. 1 = handled (the caller re-applies the query). */
+int rtx_ui_find_toggle(RtxUi *ui, int letter) {
+    unsigned bit = 0;
+    if (!ui || !ui->find) return 0;
+    if (letter == 'c' || letter == 'C') bit = RTX_FIND_ICASE;
+    else if (letter == 'w' || letter == 'W') bit = RTX_FIND_WORD;
+    else if (letter == 'r' || letter == 'R') bit = RTX_FIND_REGEX;
+    if (!bit) return 0;
+    ui->find_opts ^= bit;
+    return 1;
+}
+
 void rtx_ui_find_stats(const RtxDoc *d, char *dst, size_t n) {
     char offb[16];
     char totb[16];
+    char tags[32];
+    char lng[64];
     int pct;
     size_t hits;
     size_t cur;
+    size_t nlong;
     if (!dst || n == 0) return;
-    hits = d ? d->find.hits.len : 0;
+    hits = d ? rtx_find_hits_n(&d->find) : 0;
     cur = d && d->find.pinned && hits ? d->find.cur + 1 : 0;
     pct = rtx_ui_find_pct(d);
+    rtx_ui_find_opts_label(d ? d->find.opts : 0, tags, sizeof(tags));
+    if (d && d->find.err) {
+        snprintf(dst, n, "%s%sregex: %s", tags, tags[0] ? "  " : "", d->find.err);
+        return;
+    }
+    lng[0] = 0;
+    nlong = d ? d->find.long_n : 0;
+    if (nlong) {
+        char ob[16];
+        rtx_ui_fmt_bytes(ob, sizeof(ob), d->find.long_off);
+        snprintf(lng, sizeof(lng), "  %zu over %d KiB @%s", nlong,
+                 (int)(RTX_FIND_SPAN / 1024), ob);
+    }
     if (pct >= 0) {
         rtx_ui_fmt_bytes(offb, sizeof(offb), d->find.scan_bytes);
         rtx_ui_fmt_bytes(totb, sizeof(totb), d->len());
-        snprintf(dst, n, "%zu/%zu  scanning... %d%%  %s/%s%s",
-                 cur, hits, pct, offb, totb,
-                 d->find.truncated ? "  capped" : "");
+        snprintf(dst, n, "%s%s%zu/%zu  scanning... %d%%  %s/%s%s%s", tags,
+                 tags[0] ? "  " : "", cur, hits, pct, offb, totb,
+                 d->find.truncated ? "  capped" : "", lng);
         return;
     }
-    snprintf(dst, n, "%zu/%zu%s",
-             cur, hits, d && d->find.truncated ? "  capped" : "");
+    snprintf(dst, n, "%s%s%zu/%zu%s%s", tags, tags[0] ? "  " : "", cur, hits,
+             d && d->find.truncated ? "  capped" : "", lng);
 }
 
 size_t rtx_ui_sanitize(char[:] src, char *dst, size_t dstn) {
@@ -297,13 +400,18 @@ size_t rtx_ui_sanitize(char[:] src, char *dst, size_t dstn) {
     return o;
 }
 
+/* One hit row: sanitized context (same byte count as the document text),
+ * the hit's column in it and its byte length (may run past the row). */
 void !>(CCError) rtx_ui_find_row_text(RtxDoc *d, size_t hit, size_t ctxn,
-                                            char *dst, size_t dstn, size_t *line1) {
+                                            char *dst, size_t dstn, size_t *line1,
+                                            size_t *col, size_t *len) {
     RtxFindHitView v;
     cc_arena_stack(scratch, RTX_FRAME_SCRATCH);
     if (!d || !dst || !line1) return cc_err(CC_ERR_INVALID_ARG, "find row");
     d->find_hit_view(hit, scratch, ctxn, &v) !>(e) { return cc_err(e); };
     *line1 = v.line1;
+    if (col) *col = v.col;
+    if (len) *len = v.len;
     rtx_ui_sanitize(v.ctx, dst, dstn);
     return cc_ok();
 }
@@ -317,7 +425,10 @@ void !>(CCError) rtx_ui_find_apply(RtxUi *ui, RtxDoc *d) {
     char[:] q;
     if (!ui || !d) return cc_err(CC_ERR_INVALID_ARG, "find apply");
     q = rtx_ui_find_query(ui);
-    if (!d->find_same_query(q)) d->find_set(q) !>(e) { return cc_err(e); };
+    if (!d->find_same(q, ui->find_opts)) {
+        ui->repl_msg[0] = 0;
+        d->find_set_opt(q, ui->find_opts) !>(e) { return cc_err(e); };
+    }
     d->find.cancel = 0;
     rtx_find_mark_near(d);
     return cc_ok();
@@ -340,6 +451,229 @@ int rtx_ui_find_char(RtxUi *ui, int ch) {
 void rtx_ui_find_backspace(RtxUi *ui) {
     if (!ui) return;
     rtx_field_backspace(rtx_ui_find_field(ui));
+}
+
+/* ------------------------------------------------------------ replace
+ * The replace row sits under the find field (DESIGN Replace). Keys in the
+ * find panel: Ctrl-F again / Alt-E show or hide it, Tab / Shift-Tab move
+ * between the fields, Enter in the replace field replaces the selected
+ * hit and selects the next one, Alt-A replaces all, Alt-L toggles "keep
+ * a multi-line selection as the scope". The query is the find field's. */
+
+RtxField rtx_ui_repl_field(RtxUi *ui) {
+    RtxField f = {0};
+    if (!ui) return f;
+    f.buf = ui->repl_buf;
+    f.len = &ui->repl_len;
+    f.cap = sizeof(ui->repl_buf);
+    f.caret = &ui->repl_caret;
+    f.sel = &ui->repl_sel;
+    return f;
+}
+
+/* The field keys edit: replace when it has focus, else find. */
+RtxField rtx_ui_focus_field(RtxUi *ui) {
+    if (ui && ui->repl && ui->repl_focus) return rtx_ui_repl_field(ui);
+    return rtx_ui_find_field(ui);
+}
+
+int rtx_ui_repl_focused(const RtxUi *ui) {
+    return ui && ui->find && ui->repl && ui->repl_focus;
+}
+
+/* Rows above the hit list: the find field, and the replace row. */
+int rtx_ui_find_head_rows(const RtxUi *ui) {
+    return ui && ui->find && ui->repl ? 2 : 1;
+}
+
+char[:] rtx_ui_repl_text(const RtxUi *ui) {
+    if (!ui || ui->repl_len == 0) return cc_slice_empty();
+    return ui->repl_buf.to_slice_n(ui->repl_len);
+}
+
+void rtx_ui_toggle_repl(RtxUi *ui) {
+    if (!ui || !ui->find) return;
+    ui->repl = !ui->repl;
+    ui->repl_focus = ui->repl;
+    if (ui->repl) rtx_field_select_all(rtx_ui_repl_field(ui));
+    rtx_ui_blink_show(ui);
+}
+
+/* Tab / Shift-Tab: the other field (there are two). 1 = handled. */
+int rtx_ui_find_tab(RtxUi *ui) {
+    if (!ui || !ui->find || !ui->repl) return 0;
+    ui->repl_focus = !ui->repl_focus;
+    rtx_field_select_all(rtx_ui_focus_field(ui));
+    rtx_ui_blink_show(ui);
+    return 1;
+}
+
+/* Find with the replace row open and focused (Edit > Replace). */
+void rtx_ui_start_replace(RtxUi *ui, RtxDoc *d) {
+    rtx_ui_start_find(ui, d);
+    if (!ui) return;
+    ui->repl = 1;
+    ui->repl_focus = ui->find_len ? 1 : 0;
+    rtx_field_select_all(rtx_ui_focus_field(ui));
+}
+
+/* Alt-L. 1 = handled. */
+int rtx_ui_repl_toggle_scope(RtxUi *ui) {
+    if (!ui || !ui->find || !ui->repl) return 0;
+    ui->repl_whole = !ui->repl_whole;
+    snprintf(ui->repl_msg, sizeof(ui->repl_msg), "%s",
+             ui->repl_whole ? "replace all: whole file" : "replace all: in selection");
+    return 1;
+}
+
+/* The selection a replace-all keeps to: multi-line, not the selected
+ * hit, and Alt-L not set. 1 = [*lo, *hi). */
+static int rtx_ui_repl_scope_n(const RtxUi *ui, RtxDoc *d, size_t *lo, size_t *hi,
+                               size_t limit) {
+    char buf[4096];
+    size_t a, b, off;
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    if (!ui || !d || ui->repl_whole || !d->has_sel() || d->sel_box) return 0;
+    a = d->sel_lo();
+    b = d->sel_hi();
+    if (d->find.pinned && d->find.cur < rtx_find_hits_n(&d->find) &&
+        d->find.hits.data[d->find.cur].off == a &&
+        d->find.hits.data[d->find.cur].off + d->find.hits.data[d->find.cur].len == b)
+        return 0;
+    for (off = a; off < b && off - a < limit;) {
+        size_t want = b - off < sizeof(buf) ? b - off : sizeof(buf);
+        size_t got = d->read_at(off, cc_slice_from_buffer(buf, want)) !>;
+        if (!got) return 0;
+        if (memchr(buf, '\n', got)) {
+            *lo = a;
+            *hi = b;
+            return 1;
+        }
+        off += got;
+    }
+    return 0;
+}
+
+int rtx_ui_repl_scope(const RtxUi *ui, RtxDoc *d, size_t *lo, size_t *hi) {
+    return rtx_ui_repl_scope_n(ui, d, lo, hi, (size_t)-1);
+}
+
+/* Scan or commit still owed: the host keeps its frame clock running. */
+int rtx_ui_repl_busy(const RtxUi *ui) {
+    return ui && ui->find && ui->rjob.state != RTX_REPL_IDLE;
+}
+
+void rtx_ui_repl_cancel(RtxUi *ui) {
+    if (!ui || ui->rjob.state == RTX_REPL_IDLE) return;
+    rtx_replace_drop(&ui->rjob);
+    snprintf(ui->repl_msg, sizeof(ui->repl_msg), "replace all cancelled; nothing replaced");
+}
+
+/* Commit a finished scan (or report a refusal). 1 = an edit landed: the
+ * host runs after_edit. */
+int !>(CCError) rtx_ui_repl_poll(RtxUi *ui, RtxDoc *d) {
+    RtxReplace *j;
+    size_t n, same;
+    if (!ui) return cc_ok(0);
+    j = &ui->rjob;
+    if (j->state == RTX_REPL_FAIL) {
+        char ob[16];
+        rtx_ui_fmt_bytes(ob, sizeof(ob), j->err_off);
+        snprintf(ui->repl_msg, sizeof(ui->repl_msg), "%s (@%s)",
+                 j->err ? j->err : "replace refused", ob);
+        rtx_replace_drop(j);
+        return cc_ok(0);
+    }
+    if (j->state != RTX_REPL_READY || !d || j->doc != d) return cc_ok(0);
+    same = j->same;
+    n = rtx_replace_commit(j) !>(e) {
+        rtx_replace_drop(j);
+        snprintf(ui->repl_msg, sizeof(ui->repl_msg), "%s",
+                 e.message ? e.message : "replace failed");
+        return cc_ok(0);
+    };
+    snprintf(ui->repl_msg, sizeof(ui->repl_msg), "%zu replaced%s%s", n,
+             ui->repl_scoped ? " in selection" : "",
+             same ? " (some already matched)" : "");
+    return cc_ok(n ? 1 : 0);
+}
+
+/* Enter in the replace field. 1 = an edit landed. */
+int !>(CCError) rtx_ui_replace_one(RtxUi *ui, RtxDoc *d) {
+    const char *why = NULL;
+    int hit;
+    if (!ui || !d || rtx_ui_repl_busy(ui)) return cc_ok(0);
+    rtx_ui_find_apply(ui, d) !>(e) { return cc_err(e); };
+    hit = d->replace_hit(rtx_ui_repl_text(ui), &why) !>(e) { return cc_err(e); };
+    if (why) snprintf(ui->repl_msg, sizeof(ui->repl_msg), "%s", why);
+    else if (hit) snprintf(ui->repl_msg, sizeof(ui->repl_msg), "replaced 1");
+    else ui->repl_msg[0] = 0;
+    return cc_ok(hit);
+}
+
+/* Alt-A. Kicks the job and runs its first slice; a small document is
+ * done (and committed) here. 1 = an edit landed. */
+int !>(CCError) rtx_ui_replace_all(RtxUi *ui, RtxDoc *d) {
+    size_t lo = 0, hi = (size_t)-1;
+    char[:] q;
+    if (!ui || !d || rtx_ui_repl_busy(ui)) return cc_ok(0);
+    q = rtx_ui_find_query(ui);
+    if (!q.len) {
+        snprintf(ui->repl_msg, sizeof(ui->repl_msg), "replace: nothing to find");
+        return cc_ok(0);
+    }
+    ui->repl_scoped = rtx_ui_repl_scope(ui, d, &lo, &hi);
+    rtx_replace_kick(&ui->rjob, d, q, ui->find_opts, rtx_ui_repl_text(ui), lo, hi) !>(e) {
+        if (e.kind == CC_ERR_OUT_OF_MEMORY) return cc_err(e);
+        snprintf(ui->repl_msg, sizeof(ui->repl_msg), "%s",
+                 e.message ? e.message : "replace refused");
+        return cc_ok(0);
+    };
+    ui->repl_msg[0] = 0;
+    rtx_replace_step(&ui->rjob, (long)RTX_LINE_ISLE_WORK_MS, NULL) !>(e) {
+        rtx_replace_drop(&ui->rjob);
+        return cc_err(e);
+    };
+    return rtx_ui_repl_poll(ui, d);
+}
+
+/* Find header text: the stats, the replace job's progress or result. */
+void rtx_ui_find_head(const RtxUi *ui, const RtxDoc *d, char *dst, size_t n) {
+    size_t o;
+    int pct;
+    if (!dst || n == 0) return;
+    pct = ui ? rtx_replace_pct(&ui->rjob) : -1;
+    if (ui && ui->find && pct >= 0) {
+        snprintf(dst, n, "replacing... %d%%  Esc cancel", pct);
+        return;
+    }
+    if (ui && ui->find && ui->rjob.state == RTX_REPL_READY) {
+        /* Painted the turn before the group lands (a large one blocks). */
+        snprintf(dst, n, "applying %zu edits as one undo step...", ui->rjob.n);
+        return;
+    }
+    rtx_ui_find_stats(d, dst, n);
+    if (!ui || !ui->repl_msg[0]) return;
+    o = cc_slice_cstr(dst).len;
+    if (o + 3 < n) snprintf(dst + o, n - o, "  %s", ui->repl_msg);
+}
+
+/* Tags on the replace row: "regex" when the template expands, and the
+ * scope a replace-all would take. */
+void rtx_ui_repl_tags(const RtxUi *ui, RtxDoc *d, char *dst, size_t n) {
+    size_t lo = 0, hi = 0;
+    int sc;
+    if (!dst || n == 0) return;
+    dst[0] = 0;
+    if (!ui) return;
+    sc = rtx_ui_repl_scope_n(ui, d, &lo, &hi, (size_t)64 * 1024); /* a paint hint */
+    snprintf(dst, n, "%s%sEnter one  Alt-A all%s",
+             (ui->find_opts & RTX_FIND_REGEX) ? "$1 ${name} \\n  " : "",
+             sc ? "in selection  " : "",
+             ui->repl_whole ? "  (Alt-L: whole file)" : "");
 }
 
 /* Viewport only — caret stays. Text snaps to the line at `off` (like jump %). */
@@ -385,7 +719,9 @@ void !>(RtxIndexErr) rtx_status_line_pos(const RtxBuf *b, char *dst, size_t dst_
     }
     plus = 1;
     abs = 0;
-    if (b->layout.rows.len) {
+    /* rows.data is arena-backed; never walk a len without a pointer (a
+     * torn fill / UAF would otherwise crash the status bar). */
+    if (b->layout.rows.len && b->layout.rows.data) {
         const RtxVisRow *use = NULL;
         for (i = 0; i < b->layout.rows.len; i++) {
             const RtxVisRow *row = &b->layout.rows.data[i];
@@ -519,6 +855,23 @@ int !>(RtxIndexErr) rtx_ui_apply_jump(RtxUi *ui, RtxBuf *b, int vis) {
         rtx_ui_clear_jump(ui);
         return cc_ok(0);
     }
+    if (ui->jump_buf[0] == '#') {
+        /* `#N`: slide N of a Marp deck (its first content line). */
+        size_t at;
+        for (i = 1; i < ui->jump_len; i++) {
+            char c = ui->jump_buf[i];
+            if (c >= '0' && c <= '9') val = val * 10 + (size_t)(c - '0');
+        }
+        at = val ? rtx_deck_slide_caret(d, (int)val - 1) : (size_t)-1;
+        rtx_ui_clear_jump(ui);
+        if (at == (size_t)-1) return cc_ok(0);
+        d->caret = at;
+        d->sel_anchor = at;
+        d->break_coalesce();
+        rtx_line_isle_kick(&d->tree, d->caret);
+        b->land(vis) !>;
+        return cc_ok(1);
+    }
     for (i = 0; i < ui->jump_len; i++) {
         char c = ui->jump_buf[i];
         if (c >= '0' && c <= '9' && !pct) {
@@ -604,6 +957,7 @@ void !>(RtxIndexErr) rtx_ui_jump_pump(RtxUi *ui, RtxBuf *b, int vis,
  * do not — treating them as pumping set TUI timeout 0 and paused the
  * worker around chrome every spin. */
 int rtx_ui_work_pumping(const RtxUi *ui, const RtxDoc *d) {
+    if (rtx_ui_repl_busy(ui)) return 1;
     if (!d) return 0;
     return ui && ui->jump && rtx_line_want_pumping(&d->tree);
 }
@@ -615,6 +969,15 @@ void !>(RtxIndexErr) rtx_ui_work_pump(RtxUi *ui, RtxBuf *b, int vis,
     }
     @errhandler(RtxIndexErr e) {
         return cc_err(e);
+    }
+    if (ui && !ui->find && ui->rjob.state != RTX_REPL_IDLE)
+        rtx_replace_drop(&ui->rjob); /* find closed: the job edits nothing */
+    if (ui && ui->find && ui->rjob.state == RTX_REPL_SCAN) {
+        rtx_replace_step(&ui->rjob, (long)RTX_LINE_ISLE_WORK_MS, yield) !>(e) {
+            rtx_replace_drop(&ui->rjob);
+            snprintf(ui->repl_msg, sizeof(ui->repl_msg), "%s",
+                     e.message ? e.message : "replace failed");
+        };
     }
     if (ui && b && ui->find) rtx_ui_find_pump(ui, &b->doc) !>;
     if (ui && b && ui->jump) rtx_ui_jump_pump(ui, b, vis, yield) !>;
@@ -658,7 +1021,162 @@ void rtx_ui_offer_conflict(RtxUi *ui) {
     ui->jump = 0;
     ui->find = 0;
     ui->ask_quit = 0;
+    ui->ask_xact = 0;
     ui->ask_conflict = 1;
+}
+
+/* Split transaction undo. 0 = cancel, 1 = all files, 2 = this file,
+ * -1 = not a choice. */
+int rtx_ui_xact_letter(int ch) {
+    if (ch == 'c' || ch == 'C' || ch == 'n' || ch == 'N') return 0;
+    if (ch == 'a' || ch == 'A' || ch == 'y' || ch == 'Y') return 1;
+    if (ch == 't' || ch == 'T' || ch == 'o' || ch == 'O') return 2;
+    return -1;
+}
+
+/* Undo on the focused buffer (DESIGN Edit groups). A workspace
+ * transaction whose members all sit at head undoes in every member; a
+ * split one opens ask_xact. 1 = an undo ran (host runs after_edit), 0 =
+ * asking. */
+int !>(CCError) rtx_ui_undo(RtxUi *ui, RtxWs *w) {
+    int bufi, scope;
+    if (!ui || !w || w->len == 0) return cc_ok(0);
+    bufi = w->pane[w->focus];
+    scope = RtxWs_undo_scope(w, bufi);
+    if (scope == RTX_UNDO_ASK) {
+        ui->help = 0;
+        ui->apply = 0;
+        ui->jump = 0;
+        ui->find = 0;
+        ui->ask_quit = 0;
+        ui->ask_conflict = 0;
+        ui->ask_xact = 1;
+        ui->xact_buf = bufi;
+        return cc_ok(0);
+    }
+    RtxWs_undo(w, bufi, scope) !>(e) { return cc_err(e); };
+    return cc_ok(1);
+}
+
+/* --- close buffers (buffer.close / close_others / close_all) --- */
+enum {
+    RTX_CLOSE_NONE = 0,
+    RTX_CLOSE_ONE,    /* the focused pane's buffer */
+    RTX_CLOSE_OTHERS, /* every buffer but that one */
+    RTX_CLOSE_ALL
+};
+
+static inline int rtx_ui_close_hit(int what, int keep, int i) {
+    if (what == RTX_CLOSE_ONE) return i == keep;
+    if (what == RTX_CLOSE_OTHERS) return i != keep;
+    return what == RTX_CLOSE_ALL;
+}
+
+/* Unsaved buffers a close would drop. */
+static inline int rtx_ui_close_unsaved(const RtxWs *w, int what, int keep) {
+    size_t i;
+    int n = 0;
+    if (!w) return 0;
+    for (i = 0; i < w->len; i++)
+        if (rtx_ui_close_hit(what, keep, (int)i) && RtxWs_buf_dirty(w, (int)i)) n++;
+    return n;
+}
+
+/* Close the set, last tab first so indices below stay put. */
+void !>(CCError) rtx_ui_close_run(RtxWs *w, int what, int keep,
+                                                int discard) {
+    int i;
+    if (what == RTX_CLOSE_ONE) return w->close_buf(keep, discard);
+    for (i = (int)w->len - 1; i >= 0; i--) {
+        if (!rtx_ui_close_hit(what, keep, i)) continue;
+        w->close_buf(i, discard) !>(e) { return cc_err(e); };
+        if (i < keep) keep--;
+    }
+    return cc_ok();
+}
+
+/* Close buffers. Clean ones close now (1). Unsaved ones open ask_close:
+ * save / don't save / cancel (0). Closing the last buffer leaves an
+ * untitled one; it never quits. */
+int !>(CCError) rtx_ui_offer_close(RtxWs *w, RtxUi *ui, int what) {
+    int keep;
+    if (!w || !ui || w->len == 0) return cc_ok(1);
+    RtxWs_panes_fix(w);
+    keep = w->pane[w->focus];
+    if (!rtx_ui_close_unsaved(w, what, keep)) {
+        rtx_ui_close_run(w, what, keep, 0) !>(e) { return cc_err(e); };
+        return cc_ok(1);
+    }
+    ui->help = 0;
+    ui->apply = 0;
+    ui->jump = 0;
+    ui->find = 0;
+    ui->ask_quit = 0;
+    ui->ask_conflict = 0;
+    ui->ask_xact = 0;
+    ui->ask_close = what;
+    ui->close_buf = keep;
+    return cc_ok(0);
+}
+
+/* "close name.txt" / "close 3 unsaved files" for the prompt. */
+void rtx_ui_close_label(const RtxUi *ui, const RtxWs *w, char *dst, size_t n) {
+    int k;
+    const char *p, *s;
+    if (!dst || !n) return;
+    dst[0] = 0;
+    if (!ui || !w || !ui->ask_close) return;
+    k = rtx_ui_close_unsaved(w, ui->ask_close, ui->close_buf);
+    if (ui->ask_close == RTX_CLOSE_ONE || k == 1) {
+        size_t i;
+        for (i = 0; i < w->len; i++) {
+            if (!rtx_ui_close_hit(ui->ask_close, ui->close_buf, (int)i)) continue;
+            if (!RtxWs_buf_dirty(w, (int)i)) continue;
+            p = RtxWs_buf_path(w, (int)i);
+            s = p ? strrchr(p, '/') : NULL;
+            snprintf(dst, n, "close %s", p ? (s ? s + 1 : p) : "untitled");
+            return;
+        }
+    }
+    snprintf(dst, n, "close %d unsaved files", k);
+}
+
+/* Answer ask_close (rtx_ui_quit_letter): 0 cancel, 1 save then close, 2
+ * close without saving (their journals are dropped, as quit-q does).
+ * 1 = closed. A save that fails (changed on disk, untitled) closes
+ * nothing and returns the error. */
+int !>(CCError) rtx_ui_close_answer(RtxUi *ui, RtxWs *w, int choice) {
+    int what, keep;
+    size_t i;
+    if (!ui || !w) return cc_ok(0);
+    what = ui->ask_close;
+    keep = ui->close_buf;
+    ui->ask_close = 0;
+    if (!what || (choice != 1 && choice != 2)) return cc_ok(0);
+    if (keep < 0 || (size_t)keep >= w->len) return cc_ok(0);
+    if (choice == 1) {
+        for (i = 0; i < w->len; i++) {
+            if (!rtx_ui_close_hit(what, keep, (int)i) || !RtxWs_buf_dirty(w, (int)i))
+                continue;
+            w->save_buf((int)i) !>(e) { return cc_err(e); };
+        }
+    }
+    rtx_ui_close_run(w, what, keep, choice == 2) !>(e) { return cc_err(e); };
+    return cc_ok(1);
+}
+
+/* Answer ask_xact (rtx_ui_xact_letter). 1 = an undo ran. */
+int !>(CCError) rtx_ui_xact_answer(RtxUi *ui, RtxWs *w, int choice) {
+    int bufi;
+    if (!ui || !w) return cc_ok(0);
+    bufi = ui->xact_buf;
+    ui->ask_xact = 0;
+    if (choice != 1 && choice != 2) return cc_ok(0);
+    if (bufi < 0 || (size_t)bufi >= w->len) return cc_ok(0);
+    RtxWs_undo(w, bufi, choice == 1 ? RTX_UNDO_ALL : RTX_UNDO_ONE) !>(e) {
+        return cc_err(e);
+    };
+    return cc_ok(1);
 }
 
 void rtx_ui_jump_backspace(RtxUi *ui, RtxDoc *d) {
@@ -670,6 +1188,12 @@ void rtx_ui_jump_backspace(RtxUi *ui, RtxDoc *d) {
 int rtx_ui_jump_char(RtxUi *ui, RtxDoc *d, int ch) {
     if (!ui || !ui->jump) return 0;
     if (d) rtx_line_want_cancel(&d->tree);
+    if (ch == '#' && ui->jump_len == 0) {
+        /* `#N`: a slide number (Marp deck). */
+        ui->jump_buf[ui->jump_len++] = '#';
+        ui->jump_buf[ui->jump_len] = 0;
+        return 1;
+    }
     if (ch >= '0' && ch <= '9' && ui->jump_len + 1 < sizeof(ui->jump_buf)) {
         /* Digits only before '%'. */
         size_t i;
@@ -680,7 +1204,8 @@ int rtx_ui_jump_char(RtxUi *ui, RtxDoc *d, int ch) {
         ui->jump_buf[ui->jump_len] = 0;
         return 1;
     }
-    if (ch == '%' && ui->jump_len > 0 && ui->jump_len + 1 < sizeof(ui->jump_buf)) {
+    if (ch == '%' && ui->jump_len > 0 && ui->jump_buf[0] != '#' &&
+        ui->jump_len + 1 < sizeof(ui->jump_buf)) {
         size_t i;
         for (i = 0; i < ui->jump_len; i++) {
             if (ui->jump_buf[i] == '%') return 0;
@@ -706,10 +1231,28 @@ typedef struct {
     int help;
     int version;
     int no_blink;
+    int no_scroll_regions; /* --no-scroll-regions / settings / RTX_SCROLL_REGIONS=0:
+                            * the TUI rewrites scrolled rows instead of
+                            * moving them with DECSTBM + DL / IL */
+    int caret_cell; /* --caret=cell / RTX_CARET=cell: paint the caret into
+                     * the text (reverse-video cell, painted bar) instead of
+                     * the terminal cursor / OS caret layer */
+    int caret_fade; /* --caret-fade: the GUI caret layer fades (~100 ms) */
     int backup;
+    int no_autopair; /* --no-autopair: typed openers do not close themselves */
+    int tab_spaces;  /* --tab-spaces=N: Tab inserts N spaces (0 = a tab) */
+    int tabs;        /* --tabs=auto|always|never: 1 / 2 / 0 (tab bar); -1 unset
+                      * (RTX_TABS, else auto: two or more buffers) */
     int stats_json; /* dump engine stats JSON on exit */
+    int rich;       /* settings.json "rich": 1 / 0; -1 = built-in (Rich) */
+    int esc_ms;     /* settings.json "esc_timeout_ms": a lone Esc's wait for
+                     * the rest of a sequence; 0 = built-in (RTX_ESC_MS wins) */
+    const char *keys_path;     /* --keys FILE (NULL: RTX_KEYS / default) */
+    const char *settings_path; /* --settings FILE */
+    char cfg_err[200];         /* settings.json trouble, for the status bar */
     int batch;      /* headless command runner */
     int safe;       /* with --batch: keep Safe journals (off by default) */
+    const char *project; /* --project DIR: quick-open / search root */
     int ncmds;
     char *cmds[RTX_CLI_CMD_MAX];
     int nfiles;
@@ -734,6 +1277,24 @@ int rtx_cli_view_of(const char *s) {
     return -1;
 }
 
+/* auto 1 / always 2 / never 0; -1 = not a mode. */
+int rtx_cli_tabs_of(const char *s) {
+    if (!s) return -1;
+    if (!strcmp(s, "auto")) return 1;
+    if (!strcmp(s, "always") || !strcmp(s, "on") || !strcmp(s, "1")) return 2;
+    if (!strcmp(s, "never") || !strcmp(s, "off") || !strcmp(s, "0")) return 0;
+    return -1;
+}
+
+/* --tabs, else RTX_TABS, else auto. */
+int rtx_cli_tabs(const RtxCli *cli) {
+    const char *e;
+    if (cli && cli->tabs >= 0) return cli->tabs;
+    e = getenv("RTX_TABS");
+    if (e && e[0] && rtx_cli_tabs_of(e) >= 0) return rtx_cli_tabs_of(e);
+    return 1;
+}
+
 void rtx_cli_usage(FILE *fp, const char *prog) {
     if (!fp) fp = stderr;
     if (!prog || !prog[0]) prog = "cctext";
@@ -742,14 +1303,37 @@ void rtx_cli_usage(FILE *fp, const char *prog) {
     fprintf(fp, "  -h, --help                 this message\n");
     fprintf(fp, "  -v, --version              print version (%s)\n", RTX_VERSION);
     fprintf(fp, "  --no-blink                 solid caret (no blink)\n");
+    fprintf(fp, "  --no-scroll-regions        cctext: rewrite scrolled rows (no DECSTBM\n");
+    fprintf(fp, "                             region scroll; also RTX_SCROLL_REGIONS=0)\n");
+    fprintf(fp, "  --caret=cursor|cell        caret: the terminal cursor / GUI caret layer\n");
+    fprintf(fp, "                             (default), or painted into the text (cell;\n");
+    fprintf(fp, "                             also RTX_CARET=cell)\n");
+    fprintf(fp, "  --caret-fade               cctext-ui: the caret fades in and out\n");
     fprintf(fp, "  --backup                   save in place (keep symlink); path~ is dirty span\n");
+    fprintf(fp, "  --no-autopair              typed ( [ { \" ` * _ do not insert their closer\n");
+    fprintf(fp, "  --tab-spaces=N             Tab inserts N spaces (0-16; default a tab)\n");
+    fprintf(fp, "  --keys FILE                key bindings (default: $RTX_KEYS, else\n");
+    fprintf(fp, "                             $XDG_CONFIG_HOME/cctext/keys.json or\n");
+    fprintf(fp, "                             ~/.config/cctext/keys.json)\n");
+    fprintf(fp, "  --settings FILE            defaults (tab_spaces, autopair, blink, caret,\n");
+    fprintf(fp, "                             caret_fade, rich, scroll_regions); default\n");
+    fprintf(fp, "                             settings.json beside keys.json\n");
+    fprintf(fp, "                             ($RTX_SETTINGS); flags override\n");
+    fprintf(fp, "  --tabs=auto|always|never   buffer tab bar (auto: 2+ buffers; also RTX_TABS)\n");
+    fprintf(fp, "  --no-tabs                  same as --tabs=never\n");
     fprintf(fp, "  --stats-json               print engine stats JSON on exit\n");
     fprintf(fp, "  --batch                    run -c / stdin cmds (no TTY)\n");
     fprintf(fp, "  -c CMD                     batch command (repeatable)\n");
     fprintf(fp, "  --safe                     with --batch: keep Safe journals\n");
+    fprintf(fp, "  --project DIR              project root for quick-open / search\n");
+    fprintf(fp, "                             (default: git root of the file or cwd)\n");
     fprintf(fp, "  --wrap                     soft wrap on for the following files\n");
     fprintf(fp, "  batch cmds: goto @N / N%% / LN, await index|island, print [N],\n");
-    fprintf(fp, "              read @off n, insert TEXT, save, stats-json, quit\n");
+    fprintf(fp, "              read @off n, insert TEXT, save, stats-json, quit,\n");
+    fprintf(fp, "              undo, redo, replace [--all] [--regex] [--icase]\n");
+    fprintf(fp, "              [--word] FIND REPL  ('..' / \"..\" quote; \"\" = empty),\n");
+    fprintf(fp, "              project-files [--rewalk] [--follow] [QUERY],\n");
+    fprintf(fp, "              project-search [--regex] [--icase] [--word] QUERY\n");
     fprintf(fp, "  --hex                      hex view for the following files\n");
     fprintf(fp, "  --grid                     column view for the following files\n");
     fprintf(fp, "  --view=default|hex|grid    view for the following files\n");
@@ -776,6 +1360,46 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
     if (!cli || !files || max_files < 1) return 1;
     *cli = (RtxCli){0};
     cli->view = RTX_VIEW_DEFAULT;
+    cli->rich = -1;
+    /* --keys / --settings first: settings.json fills the defaults the
+     * other flags then override. */
+    for (i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        CCSlice opt;
+        if (!a) continue;
+        opt = cc_slice_cstr(a);
+        if (opt.eq_cstr("--")) break;
+        if ((opt.eq_cstr("--keys") || opt.eq_cstr("--settings")) && i + 1 < argc) {
+            if (opt.eq_cstr("--keys")) cli->keys_path = argv[i + 1];
+            else cli->settings_path = argv[i + 1];
+            i++;
+        } else if (opt.starts_with(CC_SLICE_LIT("--keys="))) {
+            cli->keys_path = a + 7;
+        } else if (opt.starts_with(CC_SLICE_LIT("--settings="))) {
+            cli->settings_path = a + 11;
+        }
+    }
+    {
+        RtxSettings st = {0};
+        rtx_settings_load(cli->settings_path, &st, cli->cfg_err, sizeof cli->cfg_err);
+        if (st.has_tab_spaces) cli->tab_spaces = st.tab_spaces;
+        if (st.has_autopair) cli->no_autopair = !st.autopair;
+        if (st.has_blink) cli->no_blink = !st.blink;
+        if (st.has_caret) cli->caret_cell = st.caret_cell;
+        if (st.has_caret_fade) cli->caret_fade = st.caret_fade;
+        if (st.has_rich) cli->rich = st.rich;
+        if (st.has_esc_timeout_ms) cli->esc_ms = st.esc_timeout_ms;
+        if (st.has_scroll_regions) cli->no_scroll_regions = !st.scroll_regions;
+    }
+    {
+        const char *sr = getenv("RTX_SCROLL_REGIONS");
+        if (sr && sr[0]) cli->no_scroll_regions = sr[0] == '0';
+    }
+    cli->tabs = -1;
+    {
+        const char *ce = getenv("RTX_CARET");
+        if (ce && ce[0] && cc_slice_cstr(ce).eq_cstr("cell")) cli->caret_cell = 1;
+    }
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
         CCSlice opt;
@@ -800,12 +1424,70 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
                 cli->no_blink = 1;
                 continue;
             }
+            if (opt.eq_cstr("--no-scroll-regions")) {
+                cli->no_scroll_regions = 1;
+                continue;
+            }
+            if (opt.starts_with(CC_SLICE_LIT("--caret="))) {
+                CCSlice cv = cc_slice_cstr(a + 8);
+                if (cv.eq_cstr("cell") || cv.eq_cstr("paint")) {
+                    cli->caret_cell = 1;
+                } else if (cv.eq_cstr("cursor") || cv.eq_cstr("layer") ||
+                           cv.eq_cstr("hw")) {
+                    cli->caret_cell = 0;
+                } else {
+                    fprintf(stderr, "unknown --caret (cursor|cell)\n");
+                    return 1;
+                }
+                continue;
+            }
+            if (opt.eq_cstr("--caret-fade")) {
+                cli->caret_fade = 1;
+                continue;
+            }
             if (opt.eq_cstr("--backup")) {
                 cli->backup = 1;
                 continue;
             }
+            if (opt.eq_cstr("--no-autopair")) {
+                cli->no_autopair = 1;
+                continue;
+            }
+            if (opt.eq_cstr("--no-tabs")) {
+                cli->tabs = 0;
+                continue;
+            }
+            if (opt.starts_with(CC_SLICE_LIT("--tabs="))) {
+                cli->tabs = rtx_cli_tabs_of(a + 7);
+                if (cli->tabs < 0) {
+                    fprintf(stderr, "--tabs takes auto|always|never\n");
+                    return 1;
+                }
+                continue;
+            }
+            if (opt.starts_with(CC_SLICE_LIT("--tab-spaces="))) {
+                int ts = atoi(a + 13);
+                if (ts < 0 || ts > 16) {
+                    fprintf(stderr, "--tab-spaces takes 0-16\n");
+                    return 1;
+                }
+                cli->tab_spaces = ts;
+                continue;
+            }
             if (opt.eq_cstr("--stats-json")) {
                 cli->stats_json = 1;
+                continue;
+            }
+            if (opt.eq_cstr("--keys") || opt.eq_cstr("--settings")) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "%s needs a file\n", a);
+                    return 1;
+                }
+                i++; /* read in the first pass */
+                continue;
+            }
+            if (opt.starts_with(CC_SLICE_LIT("--keys=")) ||
+                opt.starts_with(CC_SLICE_LIT("--settings="))) {
                 continue;
             }
             if (opt.eq_cstr("--batch")) {
@@ -814,6 +1496,18 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
             }
             if (opt.eq_cstr("--safe")) {
                 cli->safe = 1;
+                continue;
+            }
+            if (opt.starts_with(CC_SLICE_LIT("--project="))) {
+                cli->project = a + 10;
+                continue;
+            }
+            if (opt.eq_cstr("--project")) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--project needs a directory\n");
+                    return 1;
+                }
+                cli->project = argv[++i];
                 continue;
             }
             if (opt.eq_cstr("-c")) {
@@ -893,6 +1587,25 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
         files[cli->nfiles++] = argv[i];
     }
     return 0;
+}
+
+/* Host start: settings that live outside RtxCli (rich default), the
+ * keymap for this host, and the help lines. Trouble with either file goes
+ * to `status` (the status bar), never a failure. */
+void rtx_cli_setup_keys(RtxCli *cli, int host, char *status, size_t status_n) {
+    char kerr[200];
+    kerr[0] = 0;
+    if (!cli) return;
+    if (cli->rich >= 0) rtx_safe_set_rich_default(cli->rich);
+    rtx_keymap_setup(host, cli->keys_path, kerr, sizeof kerr);
+    rtx_help_rebuild();
+    if (!status || !status_n) return;
+    if (kerr[0] && cli->cfg_err[0])
+        snprintf(status, status_n, "%s; %s", kerr, cli->cfg_err);
+    else if (kerr[0])
+        snprintf(status, status_n, "%s", kerr);
+    else if (cli->cfg_err[0])
+        snprintf(status, status_n, "%s", cli->cfg_err);
 }
 
 /* CLI --view / --wrap overrides the journal; otherwise keep the restored camera. */

@@ -1,0 +1,987 @@
+#!ccc ccs
+/*
+ * cctext-ui presentation mode (docs/slides.md). The current slide of a
+ * Marp deck fills the window, scaled to the deck's size (1280x720 for
+ * 16:9, 960x720 for 4:3) and letterboxed. A slide is laid out once, in
+ * slide pixels, into a display list (text runs, rules, boxes) from its
+ * lines (core/slides.cch): headings larger and bold, lists with markers,
+ * code in the mono face with the grammar's colours on a dark band,
+ * tables in measured columns, block quotes with a bar, header / footer /
+ * page number, and a labelled frame where an image goes (cctext-ui draws
+ * no bitmaps). Painting scales the list; a transition paints two lists
+ * with an offset, a clip, a scale or an alpha, and `morph` moves each
+ * line that has the same text on both slides from its old box to its new
+ * one (magic move). Build steps fade in.
+ *
+ * Frames come from the host loop at RTX_PRESENT_FRAME_MS only while a
+ * transition runs (rtx_present_wait_ms); a still slide wakes nothing.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "gui_plat.h"
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/nav_pair.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+#include "../core/slides.cch"
+#include "gui.cch"
+
+enum {
+    GP_TEXT = 1,
+    GP_RECT = 2,   /* filled */
+    GP_FRAME = 3,  /* stroked */
+    GP_LINE = 4    /* horizontal rule / underline */
+};
+
+enum {
+    GP_F_PROSE = 0,
+    GP_F_BOLD = 1,
+    GP_F_ITAL = 2,
+    GP_F_BOLD_ITAL = 3,
+    GP_F_MONO = 4,
+    GP_F_MONO_BOLD = 5
+};
+
+typedef struct {
+    float x, y, w, h;      /* slide px */
+    float size;            /* font px */
+    unsigned char kind;    /* GP_* */
+    unsigned char font;    /* GP_F_* */
+    unsigned char frag;
+    unsigned char strike;
+    unsigned char ul;
+    uint32_t rgb;
+    int grp;               /* line group (-1 none) */
+    unsigned txt, ntxt;    /* bytes in the pool */
+} GpItem;
+
+typedef struct {
+    uint64_t key;          /* kind + level + text: morph matching */
+    float x, y, w, h;
+    int frag;
+    int used;              /* matched this frame */
+} GpGroup;
+
+typedef struct {
+    int valid;
+    int slide;
+    size_t gen;
+    const void *doc;
+    GpItem *it;
+    size_t n, cap;
+    char *pool;
+    size_t pn, pcap;
+    GpGroup *g;
+    size_t ng, gcap;
+    RtxSlideTheme th;
+} GpList;
+
+static RtxSlideView g_gv;
+static GpList g_gl[2];     /* [0] shown slide, [1] the one a transition leaves */
+
+static Font gp_font(GuiFonts *f, int id) {
+    switch (id) {
+    case GP_F_BOLD: return f->prose_bold;
+    case GP_F_ITAL: return f->prose_italic;
+    case GP_F_BOLD_ITAL: return f->prose_bold_italic;
+    case GP_F_MONO: return f->mono;
+    case GP_F_MONO_BOLD: return f->mono_bold;
+    default: return f->prose;
+    }
+}
+
+static Color gp_rgb(uint32_t rgb, float a) {
+    Color c;
+    if (a < 0) a = 0;
+    if (a > 1) a = 1;
+    c.r = (unsigned char)((rgb >> 16) & 255);
+    c.g = (unsigned char)((rgb >> 8) & 255);
+    c.b = (unsigned char)(rgb & 255);
+    c.a = (unsigned char)(a * 255.0f + 0.5f);
+    return c;
+}
+
+static uint32_t gp_mix(uint32_t a, uint32_t b, double t) {
+    int k;
+    uint32_t out = 0;
+    for (k = 16; k >= 0; k -= 8) {
+        double ca = (double)((a >> k) & 255), cb = (double)((b >> k) & 255);
+        out |= (uint32_t)(ca + (cb - ca) * t + 0.5) << k;
+    }
+    return out;
+}
+
+static unsigned gp_pool(GpList *L, const char *s, size_t n) {
+    unsigned at;
+    if (L->pn + n + 1 > L->pcap) {
+        size_t cap = L->pcap ? L->pcap : 4096;
+        char *p;
+        while (cap < L->pn + n + 1) cap *= 2;
+        p = (char *)realloc(L->pool, cap);
+        if (!p) return 0;
+        L->pool = p;
+        L->pcap = cap;
+    }
+    at = (unsigned)L->pn;
+    memcpy(L->pool + L->pn, s, n);
+    L->pool[L->pn + n] = 0;
+    L->pn += n + 1;
+    return at;
+}
+
+static GpItem *gp_add(GpList *L, int kind, float x, float y, float w, float h, uint32_t rgb,
+                      int frag, int grp) {
+    GpItem *it;
+    if (L->n >= L->cap) {
+        size_t cap = L->cap ? L->cap * 2 : 256;
+        GpItem *p = (GpItem *)realloc(L->it, cap * sizeof *p);
+        if (!p) return NULL;
+        L->it = p;
+        L->cap = cap;
+    }
+    it = &L->it[L->n++];
+    memset(it, 0, sizeof *it);
+    it->kind = (unsigned char)kind;
+    it->x = x;
+    it->y = y;
+    it->w = w;
+    it->h = h;
+    it->rgb = rgb;
+    it->frag = (unsigned char)frag;
+    it->grp = grp;
+    return it;
+}
+
+static float gp_measure(GuiFonts *f, int font, float size, const char *s) {
+    Vector2 v = MeasureTextEx(gp_font(f, font), s, size, 0);
+    return v.x;
+}
+
+/* Layout constants, slide px. */
+#define GP_PAD_X 72.0f
+#define GP_PAD_Y 60.0f
+#define GP_BASE 30.0f
+#define GP_LH 1.38f
+#define GP_CODE 22.0f
+#define GP_TABLE 25.0f
+
+static float gp_head_size(int level) {
+    static const float sz[] = {GP_BASE, 54, 44, 36, 32, 30, 28};
+    return sz[level >= 1 && level <= 6 ? level : 0];
+}
+
+/* One word piece waiting on a row. */
+typedef struct {
+    size_t lo, hi;         /* text bytes (view offsets) */
+    int font;
+    float size;
+    uint32_t rgb;
+    unsigned char ul, strike, sp;
+    float w;
+} GpTok;
+
+#define GP_TOKS 1024
+
+typedef struct {
+    GpList *L;
+    GuiFonts *f;
+    const RtxSlideView *v;
+    float x0, x1;          /* content box */
+    float y;               /* next row top */
+    int center;
+} GpCtx;
+
+/* Tokens (words and spaces) of line `l` (cell `cell` only when >= 0). */
+static int gp_tokens(GpCtx *C, const RtxSlLine *l, int cell, int base_font, float size,
+                     uint32_t rgb, int code, const RtxSlideTheme *th, GpTok *out, int cap) {
+    const RtxSlideView *v = C->v;
+    unsigned g;
+    int n = 0;
+    for (g = l->seg0; g < l->seg0 + l->nseg && g < v->ns; g++) {
+        const RtxSlSeg *s = &v->segs[g];
+        size_t a, z, i;
+        int font = base_font;
+        uint32_t c = rgb;
+        unsigned char ul = 0, st = 0;
+        if (cell >= 0 && s->cell != cell) continue;
+        if (s->lo < v->base || s->hi > v->base + v->tlen) continue;
+        a = s->lo - v->base;
+        z = s->hi - v->base;
+        if (code) {
+            if (s->st.scope) {
+                RtxThemeColor tc = rtx_theme_color(s->st.scope);
+                c = ((uint32_t)tc.r << 16) | ((uint32_t)tc.g << 8) | tc.b;
+            }
+        } else {
+            int b = s->st.bold || base_font == GP_F_BOLD || base_font == GP_F_BOLD_ITAL;
+            int it = s->st.italic;
+            font = b ? (it ? GP_F_BOLD_ITAL : GP_F_BOLD) : (it ? GP_F_ITAL : GP_F_PROSE);
+            if (s->st.mono) {
+                font = b ? GP_F_MONO_BOLD : GP_F_MONO;
+                c = th->accent;
+            }
+            if (s->link) {
+                c = th->accent;
+                ul = 1;
+            }
+            st = (unsigned char)s->st.strike;
+        }
+        i = a;
+        while (i < z && n < cap) {
+            size_t j = i;
+            int sp = v->text[i] == ' ' || v->text[i] == '\t';
+            if (sp) {
+                while (j < z && (v->text[j] == ' ' || v->text[j] == '\t')) j++;
+                if (code) j = i + 1;
+            } else {
+                while (j < z && v->text[j] != ' ' && v->text[j] != '\t') j++;
+            }
+            out[n].lo = i;
+            out[n].hi = j;
+            out[n].font = font;
+            out[n].size = (font == GP_F_MONO || font == GP_F_MONO_BOLD) && !code
+                              ? size * 0.88f : size;
+            out[n].rgb = c;
+            out[n].ul = ul;
+            out[n].strike = st;
+            out[n].sp = (unsigned char)sp;
+            {
+                char tmp[512];
+                size_t k = j - i;
+                if (sp && !code) {
+                    tmp[0] = ' ';
+                    k = 1;
+                } else {
+                    if (k >= sizeof tmp) k = sizeof tmp - 1;
+                    memcpy(tmp, v->text + i, k);
+                }
+                tmp[k] = 0;
+                out[n].w = gp_measure(C->f, out[n].font, out[n].size, tmp);
+            }
+            n++;
+            i = j;
+        }
+    }
+    return n;
+}
+
+/* Emit the tokens of one row at y; shift for centring. */
+static void gp_row(GpCtx *C, const GpTok *t, int a, int z, float x, float xmax, float y,
+                   float lh, int frag, int grp) {
+    size_t first = C->L->n;
+    float x0 = x, w;
+    int k;
+    for (k = a; k < z; k++) {
+        GpItem *it;
+        if (t[k].sp) {
+            x += t[k].w;
+            continue;
+        }
+        it = gp_add(C->L, GP_TEXT, x, y + (lh - t[k].size * 1.2f) / 2, t[k].w, t[k].size * 1.2f,
+                    t[k].rgb, frag, grp);
+        if (!it) return;
+        it->font = (unsigned char)t[k].font;
+        it->size = t[k].size;
+        it->ul = t[k].ul;
+        it->strike = t[k].strike;
+        it->txt = gp_pool(C->L, C->v->text + t[k].lo, t[k].hi - t[k].lo);
+        it->ntxt = (unsigned)(t[k].hi - t[k].lo);
+        x += t[k].w;
+    }
+    w = x - x0;
+    if (C->center && xmax - x0 > w) {
+        float dx = (xmax - x0 - w) / 2;
+        size_t i;
+        for (i = first; i < C->L->n; i++) C->L->it[i].x += dx;
+    }
+}
+
+/* Greedy word wrap into [x, xmax); continuation rows start at xc. */
+static void gp_flow(GpCtx *C, const GpTok *t, int n, float x, float xc, float xmax, float lh,
+                    int frag, int grp) {
+    int i = 0;
+    int first = 1;
+    if (n == 0) {
+        C->y += lh;
+        return;
+    }
+    while (i < n) {
+        float xs = first ? x : xc, used = 0;
+        int j = i, brk = -1, end;
+        while (j < n && (used + t[j].w <= xmax - xs || j == i)) {
+            if (t[j].sp) brk = j;
+            used += t[j].w;
+            j++;
+        }
+        end = j;
+        if (j < n && brk > i) end = brk;
+        while (end > i && t[end - 1].sp) end--;
+        if (end == i) end = i + 1;
+        gp_row(C, t, i, end, xs, xmax, C->y, lh, frag, grp);
+        C->y += lh;
+        i = end;
+        while (i < n && t[i].sp) i++;
+        first = 0;
+    }
+}
+
+static uint64_t gp_hash(const char *s, size_t n, uint64_t h) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int gp_group(GpList *L, uint64_t key, int frag) {
+    GpGroup *g;
+    if (L->ng >= L->gcap) {
+        size_t cap = L->gcap ? L->gcap * 2 : 64;
+        GpGroup *p = (GpGroup *)realloc(L->g, cap * sizeof *p);
+        if (!p) return -1;
+        L->g = p;
+        L->gcap = cap;
+    }
+    g = &L->g[L->ng];
+    memset(g, 0, sizeof *g);
+    g->key = key;
+    g->frag = frag;
+    return (int)L->ng++;
+}
+
+/* Build the display list of slide `s`. */
+static int gp_build(GpList *L, GuiFonts *f, RtxDoc *d, const RtxDeck *k, int s) {
+    static GpTok tok[GP_TOKS];
+    const RtxSlide *sl;
+    GpCtx C;
+    size_t li;
+    float W, H, cx0, cx1, top, bottom;
+    RtxSlideTheme th;
+    L->n = L->pn = L->ng = 0;
+    L->valid = 0;
+    if (!k || s < 0 || (size_t)s >= k->n) return 0;
+    if (!rtx_slide_view(d, s, &g_gv)) return 0;
+    sl = &k->s[s];
+    th = rtx_slide_theme(k, sl);
+    L->th = th;
+    W = (float)k->w;
+    H = (float)k->h;
+    cx0 = GP_PAD_X;
+    cx1 = W - GP_PAD_X;
+    top = GP_PAD_Y;
+    bottom = H - GP_PAD_Y;
+    /* Header, footer, page number, and the bg image frame come first
+     * (grp -1: they never morph). */
+    if (sl->dir.header[0]) {
+        GpItem *it = gp_add(L, GP_TEXT, 30, 18, 0, 24, th.dim, 0, -1);
+        if (it) {
+            it->size = 19;
+            it->txt = gp_pool(L, sl->dir.header, strlen(sl->dir.header));
+            it->ntxt = (unsigned)strlen(sl->dir.header);
+        }
+    }
+    if (sl->dir.footer[0]) {
+        GpItem *it = gp_add(L, GP_TEXT, 30, H - 42, 0, 24, th.dim, 0, -1);
+        if (it) {
+            it->size = 19;
+            it->txt = gp_pool(L, sl->dir.footer, strlen(sl->dir.footer));
+            it->ntxt = (unsigned)strlen(sl->dir.footer);
+        }
+    }
+    if (sl->dir.paginate == 1 || sl->dir.paginate == 2) {
+        char pg[16];
+        int n = snprintf(pg, sizeof pg, "%d", sl->page);
+        float w = gp_measure(f, GP_F_PROSE, 21, pg);
+        GpItem *it = gp_add(L, GP_TEXT, W - 30 - w, H - 44, w, 26, th.dim, 0, -1);
+        if (it && n > 0) {
+            it->size = 21;
+            it->txt = gp_pool(L, pg, (size_t)n);
+            it->ntxt = (unsigned)n;
+        }
+    }
+    if (sl->nbg) {
+        char src[160], lab[200];
+        size_t sn = sl->bg_src_hi > sl->bg_src_lo ? sl->bg_src_hi - sl->bg_src_lo : 0;
+        float ix = 0, iw = W;
+        GpItem *it;
+        if (sn >= sizeof src) sn = sizeof src - 1;
+        src[0] = 0;
+        if (sn) {
+            size_t got = RtxDoc_read_at(d, sl->bg_src_lo, cc_slice_from_buffer(src, sn)) !>(e) {
+                (void)e;
+                @ok((size_t)0);
+            };
+            src[got] = 0;
+        }
+        snprintf(lab, sizeof lab, "background image  %s", src);
+        if (sl->bg_side) {
+            iw = W * (float)sl->bg_pct / 100.0f;
+            ix = sl->bg_side == 1 ? 0 : W - iw;
+            gp_add(L, GP_RECT, ix, 0, iw, H, gp_mix(th.bg, th.dim, 0.18), 0, -1);
+            gp_add(L, GP_FRAME, ix + 16, 16, iw - 32, H - 32, th.dim, 0, -1);
+            if (sl->bg_side == 1) cx0 = ix + iw + 56;
+            else cx1 = ix - 56;
+        } else {
+            gp_add(L, GP_FRAME, 12, 12, W - 24, H - 24, gp_mix(th.bg, th.dim, 0.5), 0, -1);
+        }
+        it = gp_add(L, GP_TEXT, ix + 28, sl->bg_side ? H / 2 - 12 : H - 76, 0, 24, th.dim, 0, -1);
+        if (it) {
+            it->size = 18;
+            it->font = GP_F_ITAL;
+            it->txt = gp_pool(L, lab, strlen(lab));
+            it->ntxt = (unsigned)strlen(lab);
+        }
+    }
+    C.L = L;
+    C.f = f;
+    C.v = &g_gv;
+    C.x0 = cx0;
+    C.x1 = cx1;
+    C.y = top;
+    C.center = th.center;
+    {
+        size_t body0 = L->n;
+        li = 0;
+        while (li < g_gv.nl) {
+            const RtxSlLine *l = &g_gv.lines[li];
+            float qx = cx0 + 30.0f * l->quote;
+            char txt[512];
+            uint64_t key;
+            int grp;
+            rtx_sl_line_text(&g_gv, l, txt, sizeof txt);
+            key = gp_hash(txt, strlen(txt), 1469598103934665603ULL ^ ((uint64_t)l->kind << 8 |
+                                                                        l->level));
+            if (l->kind == RTX_SL_ITEM) key = gp_hash(l->marker, strlen(l->marker), key);
+            grp = gp_group(L, key, l->frag);
+            if (l->quote) {
+                int q;
+                for (q = 0; q < l->quote; q++)
+                    gp_add(L, GP_RECT, cx0 + 30.0f * q, C.y + 4, 5, GP_BASE * GP_LH - 8,
+                           gp_mix(th.bg, th.dim, 0.6), l->frag, grp);
+            }
+            switch (l->kind) {
+            case RTX_SL_BLANK:
+                C.y += GP_BASE * 0.7f;
+                li++;
+                break;
+            case RTX_SL_HEAD: {
+                float sz = gp_head_size(l->level);
+                int n = gp_tokens(&C, l, -1, GP_F_BOLD, sz, l->level <= 2 ? th.head : th.fg, 0,
+                                  &th, tok, GP_TOKS);
+                gp_flow(&C, tok, n, qx, qx, cx1, sz * 1.25f, l->frag, grp);
+                if (l->level == 1 && !th.center) {
+                    GpItem *it = gp_add(L, GP_LINE, qx, C.y + 2, cx1 - qx, 1,
+                                        gp_mix(th.bg, th.dim, 0.35), l->frag, grp);
+                    (void)it;
+                    C.y += 10;
+                }
+                li++;
+                break;
+            }
+            case RTX_SL_PARA: {
+                float x = qx + 44.0f * l->indent;
+                int n = gp_tokens(&C, l, -1, GP_F_PROSE, GP_BASE, th.fg, 0, &th, tok, GP_TOKS);
+                gp_flow(&C, tok, n, x, x, cx1, GP_BASE * GP_LH, l->frag, grp);
+                li++;
+                break;
+            }
+            case RTX_SL_ITEM: {
+                float x = qx + 44.0f * (l->level - 1);
+                float mw = gp_measure(f, GP_F_BOLD, GP_BASE, l->marker);
+                float tx = x + (l->ordered ? mw + 12 : 36);
+                int n = gp_tokens(&C, l, -1, GP_F_PROSE, GP_BASE, th.fg, 0, &th, tok, GP_TOKS);
+                GpItem *it = gp_add(L, GP_TEXT, l->ordered ? x : x + 8,
+                                    C.y + (GP_BASE * GP_LH - GP_BASE * 1.2f) / 2, mw,
+                                    GP_BASE * 1.2f, th.accent, l->frag, grp);
+                if (it) {
+                    it->font = GP_F_BOLD;
+                    it->size = GP_BASE;
+                    it->txt = gp_pool(L, l->marker, strlen(l->marker));
+                    it->ntxt = (unsigned)strlen(l->marker);
+                }
+                {
+                    int save = C.center;
+                    C.center = 0;
+                    gp_flow(&C, tok, n, tx, tx, cx1, GP_BASE * GP_LH, l->frag, grp);
+                    C.center = save;
+                }
+                li++;
+                break;
+            }
+            case RTX_SL_CODE: {
+                size_t e = li;
+                float lh = GP_CODE * 1.42f, y0 = C.y, bw = cx1 - qx;
+                GpItem *band;
+                while (e < g_gv.nl && g_gv.lines[e].kind == RTX_SL_CODE) e++;
+                band = gp_add(L, GP_RECT, qx, y0, bw, (float)(e - li) * lh + 28, 0x1f2430,
+                              l->frag, grp);
+                (void)band;
+                C.y += 14;
+                for (; li < e; li++) {
+                    const RtxSlLine *c = &g_gv.lines[li];
+                    int n, kk;
+                    float x = qx + 20;
+                    char t2[512];
+                    int g2;
+                    rtx_sl_line_text(&g_gv, c, t2, sizeof t2);
+                    g2 = gp_group(L, gp_hash(t2, strlen(t2), 0x9e3779b97f4a7c15ULL), c->frag);
+                    n = gp_tokens(&C, c, -1, GP_F_MONO, GP_CODE, 0xd8dee9, 1, &th, tok, GP_TOKS);
+                    for (kk = 0; kk < n; kk++) {
+                        if (!tok[kk].sp) {
+                            GpItem *it = gp_add(L, GP_TEXT, x, C.y + (lh - GP_CODE * 1.2f) / 2,
+                                                tok[kk].w, GP_CODE * 1.2f, tok[kk].rgb, c->frag,
+                                                g2);
+                            if (it) {
+                                it->font = GP_F_MONO;
+                                it->size = GP_CODE;
+                                it->txt = gp_pool(L, g_gv.text + tok[kk].lo,
+                                                  tok[kk].hi - tok[kk].lo);
+                                it->ntxt = (unsigned)(tok[kk].hi - tok[kk].lo);
+                            }
+                        }
+                        x += tok[kk].w;
+                    }
+                    C.y += lh;
+                }
+                C.y += 14;
+                break;
+            }
+            case RTX_SL_ROW: {
+                size_t e = li, r;
+                float wcol[16], total = 0, pad = 18, x0t;
+                int nc = 0, c;
+                float lh = GP_TABLE * 1.5f;
+                memset(wcol, 0, sizeof wcol);
+                while (e < g_gv.nl && g_gv.lines[e].kind == RTX_SL_ROW) e++;
+                for (r = li; r < e; r++) {
+                    const RtxSlLine *t = &g_gv.lines[r];
+                    if (t->ncells > nc) nc = t->ncells > 16 ? 16 : t->ncells;
+                    for (c = 0; c < t->ncells && c < 16; c++) {
+                        int n = gp_tokens(&C, t, c, t->header ? GP_F_BOLD : GP_F_PROSE,
+                                          GP_TABLE, th.fg, 0, &th, tok, GP_TOKS), kk;
+                        float w = 0;
+                        for (kk = 0; kk < n; kk++) w += tok[kk].w;
+                        if (w > wcol[c]) wcol[c] = w;
+                    }
+                }
+                for (c = 0; c < nc; c++) total += wcol[c] + 2 * pad;
+                x0t = qx;
+                if (th.center && cx1 - qx > total) x0t = qx + (cx1 - qx - total) / 2;
+                for (r = li; r < e; r++) {
+                    const RtxSlLine *t = &g_gv.lines[r];
+                    float x = x0t;
+                    int g2;
+                    char t2[512];
+                    rtx_sl_line_text(&g_gv, t, t2, sizeof t2);
+                    g2 = gp_group(L, gp_hash(t2, strlen(t2), 0x51ed270b0f5a7d11ULL), t->frag);
+                    if (t->header)
+                        gp_add(L, GP_RECT, x0t, C.y, total, lh, gp_mix(th.bg, th.dim, 0.12),
+                               t->frag, g2);
+                    for (c = 0; c < nc; c++) {
+                        int n = gp_tokens(&C, t, c, t->header ? GP_F_BOLD : GP_F_PROSE,
+                                          GP_TABLE, t->header ? th.head : th.fg, 0, &th, tok,
+                                          GP_TOKS), kk;
+                        float w = 0, xx;
+                        int al = c < 16 ? g_gv.talign[c] : 0;
+                        for (kk = 0; kk < n; kk++) w += tok[kk].w;
+                        xx = x + pad + (al == RTX_MD_ALIGN_RIGHT ? wcol[c] - w
+                                        : al == RTX_MD_ALIGN_CENTER ? (wcol[c] - w) / 2 : 0);
+                        for (kk = 0; kk < n; kk++) {
+                            if (!tok[kk].sp) {
+                                GpItem *it = gp_add(L, GP_TEXT, xx,
+                                                    C.y + (lh - GP_TABLE * 1.2f) / 2, tok[kk].w,
+                                                    GP_TABLE * 1.2f, tok[kk].rgb, t->frag, g2);
+                                if (it) {
+                                    it->font = (unsigned char)tok[kk].font;
+                                    it->size = GP_TABLE;
+                                    it->ul = tok[kk].ul;
+                                    it->strike = tok[kk].strike;
+                                    it->txt = gp_pool(L, g_gv.text + tok[kk].lo,
+                                                      tok[kk].hi - tok[kk].lo);
+                                    it->ntxt = (unsigned)(tok[kk].hi - tok[kk].lo);
+                                }
+                            }
+                            xx += tok[kk].w;
+                        }
+                        x += wcol[c] + 2 * pad;
+                    }
+                    C.y += lh;
+                    gp_add(L, GP_LINE, x0t, C.y, total, 1, gp_mix(th.bg, th.dim, 0.45),
+                           t->frag, g2);
+                }
+                li = e;
+                break;
+            }
+            case RTX_SL_HR:
+                gp_add(L, GP_LINE, qx, C.y + GP_BASE * 0.6f, cx1 - qx, 2,
+                       gp_mix(th.bg, th.dim, 0.5), l->frag, grp);
+                C.y += GP_BASE * GP_LH;
+                li++;
+                break;
+            case RTX_SL_IMAGE: {
+                /* No bitmaps: a labelled frame the image's place. */
+                char lab[300];
+                const RtxSlSeg *src = l->nseg > 1 ? &g_gv.segs[l->seg0 + 1] : NULL;
+                float bw = (cx1 - qx) * 0.42f, bh = 150, bx = qx;
+                GpItem *it;
+                if (th.center) bx = qx + (cx1 - qx - bw) / 2;
+                snprintf(lab, sizeof lab, "image  %.*s", src ? (int)(src->hi - src->lo) : 0,
+                         src ? g_gv.text + (src->lo - g_gv.base) : "");
+                gp_add(L, GP_RECT, bx, C.y + 6, bw, bh, gp_mix(th.bg, th.dim, 0.12), l->frag, grp);
+                gp_add(L, GP_FRAME, bx, C.y + 6, bw, bh, th.dim, l->frag, grp);
+                it = gp_add(L, GP_TEXT, bx + 16, C.y + 6 + bh / 2 - 12, bw - 32, 24, th.dim,
+                            l->frag, grp);
+                if (it) {
+                    it->size = 18;
+                    it->font = GP_F_ITAL;
+                    it->txt = gp_pool(L, lab, strlen(lab));
+                    it->ntxt = (unsigned)strlen(lab);
+                }
+                C.y += bh + 16;
+                li++;
+                break;
+            }
+            default:
+                li++;
+                break;
+            }
+        }
+        /* Lead / uncover: the body sits in the middle. */
+        if (th.center && C.y - top < bottom - top) {
+            float dy = (bottom - top - (C.y - top)) / 2;
+            size_t i;
+            for (i = body0; i < L->n; i++) L->it[i].y += dy;
+        }
+    }
+    {
+        /* Group boxes (morph). */
+        size_t i;
+        for (i = 0; i < L->ng; i++) L->g[i].w = -1;
+        for (i = 0; i < L->n; i++) {
+            const GpItem *it = &L->it[i];
+            GpGroup *g;
+            if (it->grp < 0 || (size_t)it->grp >= L->ng) continue;
+            g = &L->g[it->grp];
+            if (g->w < 0) {
+                g->x = it->x;
+                g->y = it->y;
+                g->w = it->w;
+                g->h = it->h;
+            } else {
+                float x1 = g->x + g->w > it->x + it->w ? g->x + g->w : it->x + it->w;
+                float y1 = g->y + g->h > it->y + it->h ? g->y + g->h : it->y + it->h;
+                if (it->x < g->x) g->x = it->x;
+                if (it->y < g->y) g->y = it->y;
+                g->w = x1 - g->x;
+                g->h = y1 - g->y;
+            }
+        }
+    }
+    L->valid = 1;
+    L->slide = s;
+    L->gen = d->edit_gen;
+    L->doc = d;
+    return 1;
+}
+
+static GpList *gp_list(int slot, GuiFonts *f, RtxDoc *d, const RtxDeck *k, int s) {
+    GpList *L = &g_gl[slot];
+    GpList *O = &g_gl[slot ^ 1];
+    if (L->valid && L->slide == s && L->gen == d->edit_gen && L->doc == d) return L;
+    if (O->valid && O->slide == s && O->gen == d->edit_gen && O->doc == d) {
+        /* The other slot holds it (the slides swapped roles): swap. */
+        GpList t = *L;
+        *L = *O;
+        *O = t;
+        return L;
+    }
+    if (!gp_build(L, f, d, k, s)) return NULL;
+    return L;
+}
+
+typedef struct {
+    float rx, ry, sc;      /* slide rect origin, scale (window px per slide px) */
+    float dx, dy;          /* offset, slide px */
+    float zoom;            /* about the slide centre */
+    float alpha;
+    int step;              /* build steps shown */
+    int frag_in;           /* this step fades in (0 none) */
+    float frag_a;
+    float W, H;
+} GpXf;
+
+static void gp_item(GuiFonts *f, const GpList *L, const GpItem *it, const GpXf *X, float a,
+                    float ox, float oy, float zs) {
+    float cx = X->W / 2, cy = X->H / 2;
+    float x = (it->x - cx) * X->zoom * zs + cx + X->dx + ox;
+    float y = (it->y - cy) * X->zoom * zs + cy + X->dy + oy;
+    float s = X->sc * X->zoom * zs;
+    float px = X->rx + x * X->sc, py = X->ry + y * X->sc;
+    Color c = gp_rgb(it->rgb, a);
+    if (a <= 0.004f) return;
+    switch (it->kind) {
+    case GP_TEXT: {
+        float sz = it->size * s;
+        if (sz < 1) return;
+        DrawTextEx(gp_font(f, it->font), L->pool + it->txt, (Vector2){px, py}, sz, 0, c);
+        if (it->ul) {
+            int uy = (int)(py + sz * 1.12f);
+            DrawLine((int)px, uy, (int)(px + it->w * s), uy, c);
+        }
+        if (it->strike) {
+            int sy = (int)(py + sz * 0.62f);
+            DrawLine((int)px, sy, (int)(px + it->w * s), sy, c);
+        }
+        break;
+    }
+    case GP_RECT:
+        DrawRectangle((int)px, (int)py, (int)(it->w * s + 0.5f), (int)(it->h * s + 0.5f), c);
+        break;
+    case GP_FRAME:
+        DrawRectangleLines((int)px, (int)py, (int)(it->w * s + 0.5f), (int)(it->h * s + 0.5f), c);
+        break;
+    case GP_LINE: {
+        int h = (int)(it->h * s + 0.5f);
+        if (h < 1) h = 1;
+        DrawRectangle((int)px, (int)py, (int)(it->w * s + 0.5f), h, c);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* Paint a list: background, then every item shown at this step. */
+static void gp_paint(GuiFonts *f, const GpList *L, const GpXf *X, int bg) {
+    size_t i;
+    if (bg) {
+        float px = X->rx + X->dx * X->sc, py = X->ry + X->dy * X->sc;
+        DrawRectangle((int)px, (int)py, (int)(X->W * X->sc + 0.5f), (int)(X->H * X->sc + 0.5f),
+                      gp_rgb(L->th.bg, X->alpha));
+    }
+    for (i = 0; i < L->n; i++) {
+        const GpItem *it = &L->it[i];
+        float a = X->alpha;
+        float oy = 0;
+        if (it->frag > X->step) continue;
+        if (X->frag_in && it->frag == X->frag_in) {
+            a *= X->frag_a;
+            oy = (1.0f - X->frag_a) * 14.0f;
+        }
+        gp_item(f, L, it, X, a, 0, oy, 1);
+    }
+}
+
+/* Magic move: a group with the same key on both slides slides from its old
+ * box to its new one; the rest fades. */
+static void gp_morph(GuiFonts *f, const GpList *A, const GpList *B, const GpXf *XA,
+                     const GpXf *XB, double t) {
+    size_t i, j;
+    static int match[4096];
+    size_t na = A->ng < 4096 ? A->ng : 4096;
+    for (i = 0; i < na; i++) match[i] = -1;
+    for (j = 0; j < B->ng; j++) B->g[j].used = 0;
+    for (i = 0; i < na; i++) {
+        if (A->g[i].w < 0 || A->g[i].frag > XA->step) continue;
+        for (j = 0; j < B->ng; j++) {
+            if (B->g[j].used || B->g[j].w < 0 || B->g[j].frag > XB->step) continue;
+            if (B->g[j].key == A->g[i].key) {
+                match[i] = (int)j;
+                B->g[j].used = 1;
+                break;
+            }
+        }
+    }
+    /* Unmatched old items fade out, unmatched new ones fade in. */
+    for (i = 0; i < A->n; i++) {
+        const GpItem *it = &A->it[i];
+        if (it->frag > XA->step) continue;
+        if (it->grp >= 0 && (size_t)it->grp < na && match[it->grp] >= 0) continue;
+        gp_item(f, A, it, XA, (float)(1.0 - t), 0, 0, 1);
+    }
+    for (i = 0; i < B->n; i++) {
+        const GpItem *it = &B->it[i];
+        if (it->frag > XB->step) continue;
+        if (it->grp >= 0 && (size_t)it->grp < B->ng && B->g[it->grp].used) continue;
+        gp_item(f, B, it, XB, (float)t, 0, 0, 1);
+    }
+    /* Matched: draw the new items moved back by the box delta, shrinking
+     * to zero; scale follows the height ratio. */
+    for (i = 0; i < B->n; i++) {
+        const GpItem *it = &B->it[i];
+        const GpGroup *gb, *ga = NULL;
+        size_t k;
+        float fx, fy;
+        if (it->frag > XB->step || it->grp < 0 || (size_t)it->grp >= B->ng) continue;
+        gb = &B->g[it->grp];
+        if (!gb->used) continue;
+        for (k = 0; k < na; k++) {
+            if (match[k] == it->grp) {
+                ga = &A->g[k];
+                break;
+            }
+        }
+        if (!ga) continue;
+        fx = (float)((ga->x - gb->x) * (1.0 - t));
+        fy = (float)((ga->y - gb->y) * (1.0 - t));
+        {
+            GpXf X = *XB;
+            float zs = 1.0f;
+            if (gb->h > 1 && ga->h > 1) zs = (float)((ga->h / gb->h) * (1.0 - t) + t);
+            /* Scale about the group's origin (the copy below). */
+            X.dx += fx;
+            X.dy += fy;
+            {
+                GpItem copy = *it;
+                copy.x = gb->x + (it->x - gb->x) * zs;
+                copy.y = gb->y + (it->y - gb->y) * zs;
+                copy.size = it->size * zs;
+                copy.w = it->w * zs;
+                copy.h = it->h * zs;
+                gp_item(f, B, &copy, &X, 1.0f, 0, 0, 1);
+            }
+        }
+    }
+}
+
+void gui_draw_present(GuiFonts *fonts, RtxUi *ui, RtxBuf *act, int ww, int hh) {
+    RtxPresent *p = rtx_present();
+    const RtxDeck *k;
+    RtxDoc *d;
+    GpList *B, *A = NULL;
+    GpXf XB, XA;
+    float sc, rw, rh;
+    long now = rtx_ui_now_ms();
+    double t;
+    (void)ui;
+    ClearBackground((Color){12, 12, 14, 255});
+    if (!fonts || !act) return;
+    d = &act->doc;
+    k = rtx_deck_for(d);
+    if (!k || !k->n) {
+        DrawTextEx(fonts->mono, "not a Marp deck", (Vector2){20, 20}, 16, 0,
+                   (Color){200, 200, 200, 255});
+        return;
+    }
+    if ((size_t)p->slide >= k->n) p->slide = (int)k->n - 1;
+    sc = (float)ww / (float)k->w;
+    if ((float)hh / (float)k->h < sc) sc = (float)hh / (float)k->h;
+    rw = (float)k->w * sc;
+    rh = (float)k->h * sc;
+    memset(&XB, 0, sizeof XB);
+    XB.rx = ((float)ww - rw) / 2;
+    XB.ry = ((float)hh - rh) / 2;
+    XB.sc = sc;
+    XB.zoom = 1;
+    XB.alpha = 1;
+    XB.W = (float)k->w;
+    XB.H = (float)k->h;
+    XB.step = p->step;
+    XA = XB;
+    XA.step = p->from_step;
+    t = rtx_ease(rtx_present_t(p, now));
+    if (p->tr && p->tr != RTX_TR_FRAG && p->from_slide != p->slide) {
+        A = gp_list(1, fonts, d, k, p->from_slide);
+        B = gp_list(0, fonts, d, k, p->slide);
+        p->frames++;
+    } else {
+        B = gp_list(0, fonts, d, k, p->slide);
+    }
+    if (!B) return;
+    BeginScissorMode((int)XB.rx, (int)XB.ry, (int)(rw + 0.5f), (int)(rh + 0.5f));
+    if (!A) {
+        if (p->tr == RTX_TR_FRAG && p->dir > 0) {
+            XB.frag_in = p->step;
+            XB.frag_a = (float)t;
+            p->frames++;
+        }
+        gp_paint(fonts, B, &XB, 1);
+    } else {
+        float dir = p->dir < 0 ? -1.0f : 1.0f;
+        switch (p->tr) {
+        case RTX_TR_FADE:
+            DrawRectangle((int)XB.rx, (int)XB.ry, (int)(rw + 0.5f), (int)(rh + 0.5f),
+                          gp_rgb(gp_mix(A->th.bg, B->th.bg, t), 1));
+            XA.alpha = (float)(1 - t);
+            XB.alpha = (float)t;
+            gp_paint(fonts, A, &XA, 0);
+            gp_paint(fonts, B, &XB, 0);
+            break;
+        case RTX_TR_FADE_OUT:
+            if (t < 0.5) {
+                XA.alpha = (float)(1 - 2 * t);
+                DrawRectangle((int)XB.rx, (int)XB.ry, (int)(rw + 0.5f), (int)(rh + 0.5f),
+                              gp_rgb(gp_mix(A->th.bg, 0x000000, 2 * t), 1));
+                gp_paint(fonts, A, &XA, 0);
+            } else {
+                XB.alpha = (float)(2 * t - 1);
+                DrawRectangle((int)XB.rx, (int)XB.ry, (int)(rw + 0.5f), (int)(rh + 0.5f),
+                              gp_rgb(gp_mix(0x000000, B->th.bg, 2 * t - 1), 1));
+                gp_paint(fonts, B, &XB, 0);
+            }
+            break;
+        case RTX_TR_SLIDE:
+        case RTX_TR_PUSH:
+            XA.dx = (float)(-t) * XA.W * dir;
+            XB.dx = (float)(1 - t) * XB.W * dir;
+            gp_paint(fonts, A, &XA, 1);
+            gp_paint(fonts, B, &XB, 1);
+            break;
+        case RTX_TR_COVER:
+            XB.dx = (float)(1 - t) * XB.W * dir;
+            gp_paint(fonts, A, &XA, 1);
+            gp_paint(fonts, B, &XB, 1);
+            break;
+        case RTX_TR_REVEAL:
+            XA.dx = (float)(-t) * XA.W * dir;
+            gp_paint(fonts, B, &XB, 1);
+            gp_paint(fonts, A, &XA, 1);
+            break;
+        case RTX_TR_WIPE: {
+            float cw = (float)t * rw;
+            gp_paint(fonts, A, &XA, 1);
+            if (cw >= 1) {
+                BeginScissorMode(dir > 0 ? (int)XB.rx : (int)(XB.rx + rw - cw), (int)XB.ry,
+                                 (int)(cw + 0.5f), (int)(rh + 0.5f));
+                gp_paint(fonts, B, &XB, 1);
+                EndScissorMode();
+            }
+            break;
+        }
+        case RTX_TR_ZOOM:
+            gp_paint(fonts, A, &XA, 1);
+            XB.zoom = (float)(0.55 + 0.45 * t);
+            XB.alpha = (float)t;
+            {
+                /* The new slide's background grows with it. */
+                float zw = rw * XB.zoom, zh = rh * XB.zoom;
+                DrawRectangle((int)(XB.rx + (rw - zw) / 2), (int)(XB.ry + (rh - zh) / 2),
+                              (int)zw, (int)zh, gp_rgb(B->th.bg, (float)t));
+            }
+            gp_paint(fonts, B, &XB, 0);
+            break;
+        case RTX_TR_MORPH:
+            DrawRectangle((int)XB.rx, (int)XB.ry, (int)(rw + 0.5f), (int)(rh + 0.5f),
+                          gp_rgb(gp_mix(A->th.bg, B->th.bg, t), 1));
+            gp_morph(fonts, A, B, &XA, &XB, t);
+            break;
+        default:
+            gp_paint(fonts, B, &XB, 1);
+            break;
+        }
+    }
+    EndScissorMode();
+    if (p->num_len) {
+        char msg[32];
+        snprintf(msg, sizeof msg, "go to slide %s", p->num);
+        DrawRectangle(ww / 2 - 110, hh - 54, 220, 34, (Color){20, 20, 24, 220});
+        DrawTextEx(fonts->mono, msg, (Vector2){(float)(ww / 2 - 96), (float)(hh - 46)}, 16, 0,
+                   (Color){240, 240, 240, 255});
+    }
+}

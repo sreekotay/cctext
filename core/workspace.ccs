@@ -16,7 +16,9 @@
 #include "document.cch"
 #include "layout.cch"
 #include "find.cch"
+#include "rtx_par.cch"
 #include "workspace.cch"
+#include <stdatomic.h>
 
 int RtxWs_ensure(RtxWs *w) {
     if (!w) return 0;
@@ -37,6 +39,7 @@ void RtxBuf_destroy(RtxBuf *b) {
 static int rtx_buf_rich(const RtxBuf *b);
 static void !>(CCError) rtx_buf_pair_replace(RtxBuf *b, size_t lo, size_t hi,
                                             char[:] bytes);
+static int rtx_ws_find_path(const RtxWs *w, char[:0] path);
 
 static void rtx_ws_cam_from_buf(const RtxBuf *b, RtxSafeCam *c) {
     rtx_safe_cam_clear(c);
@@ -59,10 +62,8 @@ static void rtx_ws_cam_from_buf(const RtxBuf *b, RtxSafeCam *c) {
         c->mark_line = b->doc.tree.mark_line;
         c->mark_off = b->doc.tree.mark_off;
     } else if (rtx_line_isle_connected(&b->doc.tree)) {
-        long n = (long)b->doc.tree.scan_line + (long)b->doc.tree.isle_before;
-        if (n < 0) n = 0;
         c->mark_valid = 1;
-        c->mark_line = (size_t)n;
+        c->mark_line = rtx_line_isle_line(&b->doc.tree);
     } else if (!b->seek_valid &&
                (b->doc.lf_ready() || b->doc.index_covers(b->doc.caret))) {
         c->mark_valid = 1;
@@ -120,6 +121,8 @@ static const char *rtx_ws_buf_path(const RtxBuf *b) {
 
 static int rtx_ws_buf_dirty(const RtxBuf *b) {
     if (!b) return 0;
+    /* A held journal is unsaved work even when the text on screen is clean. */
+    if (b->safe_hold) return 1;
     if (b->parked) return b->park_dirty;
     return b->doc.dirty();
 }
@@ -179,6 +182,7 @@ static void rtx_ws_safe_note(RtxBuf *b) {
     b->safe_unlock = b->unlock;
     b->safe_pin = b->pin_view;
     b->park_dirty = b->doc.dirty();
+    if (!b->park_dirty) b->safe_rebased = 0; /* saved or undone: no drift left */
     b->safe_seen_sig = rtx_ws_safe_sig(b);
     b->safe_due_ms = 0;
 }
@@ -217,10 +221,17 @@ static int rtx_ws_flush_hist_buf(RtxBuf *b) {
     int ok;
     if (!b || b->parked) return 1;
     if (!rtx_ws_buf_path(b)) return 1;
+    /* The held journal is the only copy of those edits: never overwrite it. */
+    if (b->safe_hold) return 0;
     rtx_ws_cam_from_buf(b, &cam);
     ok = rtx_safe_flush(&b->doc, &cam);
-    if (ok) b->safe_fault = 0;
-    else if (b->doc.dirty()) b->safe_fault = 1;
+    if (ok) {
+        b->safe_fault = 0;
+        b->safe_backoff_ms = 0;
+        b->safe_retry_ms = 0;
+    } else if (b->doc.dirty()) {
+        b->safe_fault = 1;
+    }
     return ok;
 }
 
@@ -260,67 +271,222 @@ static void rtx_ws_park_buf(RtxBuf *b) {
     b->parked = 1;
 }
 
+/* Open path + its journal. A dirty journal whose file drifted on disk
+ * opens its pinned base instead (bytes as they were under the edits, named
+ * path, stamped with the old identity so Save asks) and replays there;
+ * *rebased says so. Anything that leaves bytes that are neither the file
+ * nor the journal (a replay that fails midway, a pin whose journal does
+ * not load) reopens the file clean; the journal stays on disk and the rc
+ * (FAULT / CONFLICT) tells the caller to hold it. */
+static int !>(CCError) rtx_ws_doc_open(RtxWs *w, RtxDoc *d, const char *path,
+                                      RtxSafeCam *cam, int *rebased) {
+    char base[4096];
+    int64_t bm = 0;
+    uint64_t bs = 0, bi = 0;
+    int pinned, rc;
+    if (rebased) *rebased = 0;
+    pinned = rtx_safe_base(path, base, sizeof(base), &bm, &bs, &bi);
+    if (pinned) {
+        @errhandler(CCError e) {
+            (void)e;
+            d->destroy();
+            pinned = 0;
+        }
+        d->from_base(cc_slice_cstr(base), cc_slice_cstr(path), bm, bs, bi) !>;
+    }
+    if (!pinned) d->from_path(cc_slice_cstr(path)) !>(e) { return cc_err(e); };
+    if (w) d->tree.busy_bind(w->busy_fn, w->busy_ctx);
+    rc = rtx_safe_load(d, cam);
+    if (rc == RTX_SAFE_LOAD_FAULT || (pinned && rc != RTX_SAFE_LOAD_HIST)) {
+        d->destroy();
+        rtx_safe_cam_clear(cam);
+        d->from_path(cc_slice_cstr(path)) !>(e) { return cc_err(e); };
+        if (w) d->tree.busy_bind(w->busy_fn, w->busy_ctx);
+    } else if (pinned && rebased) {
+        *rebased = 1;
+    }
+    return cc_ok(rc);
+}
+
+static int rtx_ws_hold_of(int rc) {
+    if (rc == RTX_SAFE_LOAD_FAULT) return RTX_SAFE_HOLD_REPLAY;
+    if (rc == RTX_SAFE_LOAD_CONFLICT) return RTX_SAFE_HOLD_CONFLICT;
+    return RTX_SAFE_HOLD_NONE;
+}
+
 static void !>(CCError) rtx_ws_unpark_buf(RtxWs *w, RtxBuf *b) {
     RtxSafeCam cam;
     const char *path;
+    int rc;
     if (!b || !b->parked) return cc_ok();
     path = rtx_ws_buf_path(b);
     if (!path) return cc_err(CC_ERR_INVALID_ARG, "parked untitled");
     rtx_safe_cam_clear(&cam);
-    b->doc.from_path(cc_slice_cstr(path)) !>(e) { return cc_err(e); };
-    if (w) b->doc.tree.busy_bind(w->busy_fn, w->busy_ctx);
-    rtx_safe_load(&b->doc, &cam);
+    rc = rtx_ws_doc_open(w, &b->doc, path, &cam, &b->safe_rebased) !>(e) {
+        return cc_err(e);
+    };
+    b->safe_hold = rtx_ws_hold_of(rc);
     rtx_ws_cam_to_buf(b, &cam);
     b->parked = 0;
     rtx_ws_safe_note(b);
     return cc_ok();
 }
 
+static int rtx_ws_slot_live(const RtxWs *w, int p) {
+    return w && p >= 0 && p < RTX_PANES_MAX && ((w->live_mask >> p) & 1u);
+}
+
 static int rtx_ws_buf_visible(const RtxWs *w, int bi) {
+    int i;
     if (!w || bi < 0) return 0;
-    if (w->pane[0] == bi) return 1;
-    if (w->npanes > 1 && w->pane[1] == bi) return 1;
+    for (i = 0; i < w->npanes && i < RTX_PANES_MAX; i++) {
+        int p = w->order[i];
+        if (rtx_ws_slot_live(w, p) && w->pane[p] == bi) return 1;
+    }
     return 0;
+}
+
+/* Preorder copy of the pane tree into the snapshot's flat node table.
+ * Leaves name an entry of the written path list (-1 = untitled). */
+static int rtx_ws_snap_tree(const RtxWs *w, int n, const int *ent_of_buf,
+                            RtxSafeWs *ws, int depth) {
+    int k, a, b;
+    const RtxPaneNode *nd;
+    if (!w || n < 0 || n >= RTX_PANE_NODES || depth > RTX_PANE_NODES) return -1;
+    if (ws->nnode >= RTX_SAFE_WS_NODES) return -1;
+    nd = &w->node[n];
+    k = ws->nnode++;
+    ws->node[k] = (RtxSafeWsNode){0};
+    if (nd->kind == RTX_PANE_NODE_LEAF) {
+        int bi = w->pane[nd->pane];
+        ws->node[k].kind = RTX_SAFE_WS_LEAF;
+        ws->node[k].ent = (bi >= 0 && (size_t)bi < w->len && bi < 64) ? ent_of_buf[bi] : -1;
+        ws->node[k].split = w->browse_split[nd->pane];
+        ws->node[k].a = -1;
+        ws->node[k].b = -1;
+        if (nd->pane == w->focus) ws->focus_node = k;
+        return k;
+    }
+    if (nd->kind != RTX_PANE_NODE_SPLIT) return -1;
+    ws->node[k].kind = RTX_SAFE_WS_SPLIT;
+    ws->node[k].dir = nd->dir;
+    ws->node[k].ratio = nd->ratio;
+    a = rtx_ws_snap_tree(w, nd->a, ent_of_buf, ws, depth + 1);
+    b = rtx_ws_snap_tree(w, nd->b, ent_of_buf, ws, depth + 1);
+    if (a < 0 || b < 0) return -1;
+    ws->node[k].a = a;
+    ws->node[k].b = b;
+    return k;
 }
 
 static void rtx_ws_write_ws(RtxWs *w) {
     RtxSafeWs ws;
     RtxSafeWsEnt ents[64];
+    int ent_of_buf[64];
     size_t i, n = 0;
     if (!w) return;
+    if (!rtx_safe_enabled()) {
+        /* --batch without --safe: nothing would land; skip the snapshot. */
+        w->browse_split_dirty = 0;
+        w->ws_pending = 0;
+        return;
+    }
     ws = (RtxSafeWs){0};
-    for (i = 0; i < w->len && n < 64; i++) {
-        const char *p = rtx_ws_buf_path(w->bufs[i]);
-        if (!p) continue;
-        snprintf(ents[n].path, sizeof(ents[n].path), "%s", p);
+    for (i = 0; i < w->len; i++) {
+        const char *path = rtx_ws_buf_path(w->bufs[i]);
+        if (i < 64) ent_of_buf[i] = -1;
+        if (!path || n >= 64 || i >= 64) continue;
+        /* Panes name an entry of this list, not a buffer slot: untitled
+         * buffers are not written, so slots and entries drift apart. */
+        ent_of_buf[i] = (int)n;
+        snprintf(ents[n].path, sizeof(ents[n].path), "%s", path);
         ents[n].view = w->bufs[i]->layout.view;
         ents[n].dirty = rtx_ws_buf_dirty(w->bufs[i]);
         n++;
     }
-    ws.npanes = w->npanes;
-    ws.focus = w->focus;
-    ws.pane0 = w->pane[0];
-    ws.pane1 = w->pane[1];
-    ws.split0 = w->browse_split[0];
-    ws.split1 = w->browse_split[1];
     ws.n = n;
     ws.ents = ents;
+    ws.focus_node = -1;
+    ws.root = -1;
+    {
+        /* Browse dividers: shown panes in tree order, then the rest. */
+        int k, p, m = 0;
+        for (k = 0; k < w->npanes && m < RTX_SAFE_WS_PANES; k++)
+            if (w->order[k] >= 0) ws.splits[m++] = w->browse_split[w->order[k]];
+        for (p = 0; p < RTX_PANES_MAX && m < RTX_SAFE_WS_PANES; p++)
+            if (!rtx_ws_slot_live(w, p)) ws.splits[m++] = w->browse_split[p];
+    }
+    if (w->root >= 0 && w->root < RTX_PANE_NODES &&
+        w->node[w->root].kind != RTX_PANE_NODE_FREE &&
+        rtx_ws_snap_tree(w, w->root, ent_of_buf, &ws, 0) >= 0) {
+        ws.root = 0;
+    } else {
+        ws.nnode = 0;
+    }
     rtx_safe_ws_write(&ws);
     w->browse_split_dirty = 0;
+    w->ws_pending = 0;
+}
+
+/* 0 = b stays parked (file moved, deleted, unreadable) and says so; its
+ * journal is untouched and the evicted doc is never shown. */
+static int rtx_ws_try_unpark(RtxWs *w, RtxBuf *b) {
+    int ok = 1;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            ok = 0;
+        }
+        rtx_ws_unpark_buf(w, b) !>;
+    }
+    b->park_fault = !ok;
+    return ok;
 }
 
 void !>(CCError) RtxWs_sync_live(RtxWs *w) {
     size_t i;
-    if (!w) return cc_ok();
-    for (i = 0; i < w->len; i++) {
-        if (rtx_ws_buf_visible(w, (int)i)) {
-            if (w->bufs[i]->parked)
-                rtx_ws_unpark_buf(w, w->bufs[i]) !>(e) { return cc_err(e); };
-        } else if (!w->bufs[i]->parked && rtx_ws_buf_path(w->bufs[i])) {
-            rtx_ws_park_buf(w->bufs[i]);
+    int k;
+    if (!w || w->len == 0) return cc_ok();
+    RtxWs_panes_fix(w);
+    /* Every visible pane shows a live doc. A buffer that cannot come back
+     * hands its pane to the next one that can; the rest keep going. */
+    for (k = 0; k < w->npanes; k++) {
+        size_t tries;
+        int p = w->order[k];
+        int bi = w->pane[p];
+        if (bi < 0 || (size_t)bi >= w->len) bi = 0;
+        for (tries = 0; tries < w->len; tries++) {
+            RtxBuf *b = w->bufs[bi];
+            if (!b->parked || rtx_ws_try_unpark(w, b)) break;
+            bi = (bi + 1) % (int)w->len;
         }
+        if (tries == w->len) {
+            w->add_empty() !>(e) { return cc_err(e); };
+            bi = (int)w->len - 1;
+        }
+        w->pane[p] = bi;
     }
-    rtx_ws_write_ws(w);
+    RtxWs_panes_fix(w);
+    for (i = 0; i < w->len; i++) {
+        if (!rtx_ws_buf_visible(w, (int)i) && !w->bufs[i]->parked &&
+            rtx_ws_buf_path(w->bufs[i]))
+            rtx_ws_park_buf(w->bufs[i]);
+    }
+    if (w->ws_hold) w->ws_pending = 1;
+    else rtx_ws_write_ws(w);
+    return cc_ok();
+}
+
+/* Startup: open_files' sync leaves the snapshot (temp + fsync + rename)
+ * to safe_pump, which the host runs after the frame — opening a file
+ * paints first. */
+static void !>(CCError) rtx_ws_sync_live_deferred(RtxWs *w) {
+    w->ws_hold = 1;
+    w->sync_live() !>(e) {
+        w->ws_hold = 0;
+        return cc_err(e);
+    };
+    w->ws_hold = 0;
     return cc_ok();
 }
 
@@ -336,7 +502,7 @@ void RtxWs_safe_flush_exit(RtxWs *w) {
     /* Divider is a preference, not an edit. A dirty quit still skips the
      * buffer journals, but a drag that has not debounced yet must land. */
     if (w->any_dirty()) {
-        if (w->browse_split_dirty) rtx_ws_write_ws(w);
+        if (w->browse_split_dirty || w->ws_pending) rtx_ws_write_ws(w);
         return;
     }
     RtxWs_safe_flush_all(w);
@@ -350,6 +516,66 @@ int rtx_ws_safe_fault(const RtxWs *w) {
     return 0;
 }
 
+static const char *rtx_ws_base_name(const char *p) {
+    const char *s = p ? strrchr(p, '/') : NULL;
+    return s ? s + 1 : (p ? p : "");
+}
+
+int rtx_ws_safe_fault_msg(const RtxWs *w, char *out, size_t n) {
+    size_t i;
+    if (!w || !out || n == 0) return 0;
+    out[0] = 0;
+    for (i = 0; i < w->len; i++) {
+        const RtxBuf *b = w->bufs[i];
+        const char *name = rtx_ws_base_name(rtx_ws_buf_path(b));
+        switch (b->safe_hold) {
+        case RTX_SAFE_HOLD_REPLAY:
+            snprintf(out, n,
+                     "%s: Safe journal could not be replayed; showing the file, "
+                     "journal kept (quit q drops it)", name);
+            return 1;
+        case RTX_SAFE_HOLD_CONFLICT:
+            snprintf(out, n,
+                     "%s changed on disk: unsaved edits held in Safe journal, "
+                     "not applied (quit q drops them)", name);
+            return 1;
+        case RTX_SAFE_HOLD_NONE:
+            break;
+        }
+    }
+    for (i = 0; i < w->len; i++) {
+        const RtxBuf *b = w->bufs[i];
+        if (!b->park_fault) continue;
+        snprintf(out, n,
+                 "%s could not be reopened (moved or deleted?); its Safe journal is kept",
+                 rtx_ws_base_name(rtx_ws_buf_path(b)));
+        return 1;
+    }
+    for (i = 0; i < w->len; i++) {
+        const RtxBuf *b = w->bufs[i];
+        if (b->parked || !b->safe_rebased || !b->doc.dirty()) continue;
+        snprintf(out, n,
+                 "%s changed on disk: recovered edits are on the version you had "
+                 "(Save asks to overwrite)",
+                 rtx_ws_base_name(rtx_ws_buf_path(b)));
+        return 1;
+    }
+    if (rtx_ws_safe_fault(w)) {
+        snprintf(out, n, "Safe journal write failed — unsaved edits kept in memory");
+        return 1;
+    }
+    return 0;
+}
+
+unsigned rtx_ws_safe_fault_sig(const RtxWs *w) {
+    char msg[512];
+    unsigned h = 2166136261u;
+    size_t i;
+    if (!rtx_ws_safe_fault_msg(w, msg, sizeof(msg))) return 0;
+    for (i = 0; msg[i]; i++) h = (h ^ (unsigned char)msg[i]) * 16777619u;
+    return h ? h : 1;
+}
+
 void RtxWs_safe_pump(RtxWs *w) {
     size_t i;
     long now;
@@ -358,6 +584,8 @@ void RtxWs_safe_pump(RtxWs *w) {
     if (w->browse_split_dirty && now >= w->browse_split_due) {
         rtx_ws_write_ws(w);
         w->browse_split_due = now + (long)RTX_SAFE_DEBOUNCE_MS;
+    } else if (w->ws_pending) {
+        rtx_ws_write_ws(w);
     }
     for (i = 0; i < w->len; i++) {
         RtxBuf *b = w->bufs[i];
@@ -372,13 +600,40 @@ void RtxWs_safe_pump(RtxWs *w) {
         if (sig != b->safe_seen_sig) {
             b->safe_seen_sig = sig;
             b->safe_due_ms = now + (long)RTX_SAFE_DEBOUNCE_MS;
+            /* A new edit does not jump a failed write's backoff. */
+            if (b->safe_due_ms < b->safe_retry_ms) b->safe_due_ms = b->safe_retry_ms;
         }
         if (now < b->safe_due_ms) continue;
-        if (rtx_ws_safe_hist_stale(b) && !rtx_ws_flush_hist_buf(b))
+        if (rtx_ws_safe_hist_stale(b) && !rtx_ws_flush_hist_buf(b)) {
+            /* Idle retry doubles up to RTX_SAFE_BACKOFF_MAX_MS, not every
+             * frame. Park / flush-all / save still try at once. */
+            if (!b->safe_backoff_ms) b->safe_backoff_ms = (long)RTX_SAFE_DEBOUNCE_MS;
+            else if (b->safe_backoff_ms < (long)RTX_SAFE_BACKOFF_MAX_MS)
+                b->safe_backoff_ms *= 2;
+            if (b->safe_backoff_ms > (long)RTX_SAFE_BACKOFF_MAX_MS)
+                b->safe_backoff_ms = (long)RTX_SAFE_BACKOFF_MAX_MS;
+            b->safe_retry_ms = now + b->safe_backoff_ms;
+            b->safe_due_ms = b->safe_retry_ms;
             continue;
+        }
         (void)rtx_ws_flush_state_buf(b);
         rtx_ws_safe_note(b);
     }
+}
+
+long RtxWs_safe_next_ms(const RtxWs *w, long now) {
+    size_t i;
+    long due = 0;
+    if (!w) return -1;
+    if (w->ws_pending) return 0;
+    if (w->browse_split_dirty) due = w->browse_split_due;
+    for (i = 0; i < w->len; i++) {
+        const RtxBuf *b = w->bufs[i];
+        if (b->parked || !b->safe_due_ms) continue;
+        if (!due || b->safe_due_ms < due) due = b->safe_due_ms;
+    }
+    if (!due) return -1;
+    return due > now ? due - now : 0;
 }
 
 int RtxWs_any_disk_changed(const RtxWs *w) {
@@ -386,7 +641,13 @@ int RtxWs_any_disk_changed(const RtxWs *w) {
     if (!w) return 0;
     for (i = 0; i < w->len; i++) {
         const RtxBuf *b = w->bufs[i];
-        if (b->parked || !b->doc.dirty()) continue;
+        if (b->parked) {
+            /* Parked dirty edits live in the journal: compare its base. */
+            const char *p = rtx_ws_buf_path(b);
+            if (b->park_dirty && p && rtx_safe_peek_conflict(p)) return 1;
+            continue;
+        }
+        if (!b->doc.dirty()) continue;
         if (b->doc.disk_changed()) return 1;
     }
     return 0;
@@ -397,8 +658,12 @@ void !>(CCError) RtxWs_save_dirty(RtxWs *w) {
     if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
     for (i = 0; i < w->len; i++) {
         RtxBuf *b = w->bufs[i];
-        if (b->parked && b->park_dirty)
+        if (b->parked && (b->park_dirty || b->safe_hold))
             rtx_ws_unpark_buf(w, b) !>(e) { return cc_err(e); };
+        /* Those edits are in a journal this buffer could not apply: a Save
+         * now would report success and leave them behind. */
+        if (b->safe_hold)
+            return cc_err(CC_ERR_IO, "unsaved edits held in Safe journal");
         if (b->parked || !b->doc.dirty()) continue;
         if (!b->doc.path.ptr || b->doc.path.len == 0)
             return cc_err(CC_ERR_INVALID_ARG, "untitled");
@@ -428,6 +693,7 @@ void RtxWs_safe_discard_dirty(RtxWs *w) {
             if (p) rtx_safe_drop(p);
         }
         w->bufs[i]->park_dirty = 0;
+        w->bufs[i]->safe_hold = RTX_SAFE_HOLD_NONE;
     }
     rtx_ws_write_ws(w);
 }
@@ -463,47 +729,648 @@ static void rtx_buf_swap_cam(RtxBuf *b, RtxPaneSnap *s) {
     pr = b->pref; b->pref = s->pref; s->pref = pr;
 }
 
+/* --- panes (DESIGN Interactive, Panes) ---
+ *
+ * A pane is a slot: its buf (pane[slot]), browse (nav / prev), and a
+ * camera. The camera fields of RtxBuf belong to one pane that shows it
+ * (b->cam_pane) — always the focused pane when it shows that buf, since
+ * every RtxBuf_* motion and edit runs on those fields. Any other pane on
+ * the same buf keeps its camera + layout in cam[slot] (`of` = that buf);
+ * hold_pane swaps it onto the buf for a draw or a refresh. */
+
+static void rtx_ws_cam_drop(RtxPaneSnap *s) {
+    if (!s) return;
+    if (s->live) s->layout.destroy();
+    *s = (RtxPaneSnap){0};
+}
+
+/* A second camera on b: the same origin, its own layout. */
+static void rtx_ws_cam_seed(RtxPaneSnap *s, const RtxBuf *b) {
+    *s = (RtxPaneSnap){0};
+    s->live = 1;
+    s->of = b;
+    s->top = b->top;
+    s->top_wrap = b->top_wrap;
+    s->left_col = b->left_col;
+    s->top_byte = b->top_byte;
+    s->seek_valid = b->seek_valid;
+    s->seek_off = b->seek_off;
+    s->seek_rel = b->seek_rel;
+    s->unlock = b->unlock;
+    s->layout.view = b->layout.view;
+    s->layout.wrap = b->layout.wrap;
+    s->layout.rich = b->layout.rich;
+    s->layout.grid_delim = b->layout.grid_delim;
+}
+
+int RtxWs_pane_live(const RtxWs *w, int p) {
+    return rtx_ws_slot_live(w, p);
+}
+
+static int rtx_ws_node_new(RtxWs *w) {
+    int i;
+    for (i = 0; i < RTX_PANE_NODES; i++) {
+        if (w->node[i].kind != RTX_PANE_NODE_FREE) continue;
+        w->node[i] = (RtxPaneNode){0};
+        w->node[i].kind = RTX_PANE_NODE_LEAF;
+        w->node[i].up = -1;
+        w->node[i].a = -1;
+        w->node[i].b = -1;
+        return i;
+    }
+    return -1;
+}
+
+static int rtx_ws_leaf_of(const RtxWs *w, int p) {
+    int i;
+    for (i = 0; i < RTX_PANE_NODES; i++)
+        if (w->node[i].kind == RTX_PANE_NODE_LEAF && w->node[i].pane == p) return i;
+    return -1;
+}
+
+static int rtx_ws_node_ok(const RtxWs *w, int n) {
+    return w && n >= 0 && n < RTX_PANE_NODES && w->node[n].kind != RTX_PANE_NODE_FREE;
+}
+
+/* Leaves under n, in order. -1 on a malformed tree (a cycle, a free
+ * child, more than RTX_PANES_MAX leaves). */
+static int rtx_ws_walk(const RtxWs *w, int n, int *out, int k, int depth) {
+    const RtxPaneNode *nd;
+    if (!rtx_ws_node_ok(w, n) || depth > RTX_PANE_NODES || k < 0) return -1;
+    nd = &w->node[n];
+    if (nd->kind == RTX_PANE_NODE_LEAF) {
+        if (k >= RTX_PANES_MAX || nd->pane < 0 || nd->pane >= RTX_PANES_MAX) return -1;
+        out[k] = nd->pane;
+        return k + 1;
+    }
+    k = rtx_ws_walk(w, nd->a, out, k, depth + 1);
+    return rtx_ws_walk(w, nd->b, out, k, depth + 1);
+}
+
+static int rtx_ws_first_leaf(const RtxWs *w, int n) {
+    int guard = 0;
+    while (rtx_ws_node_ok(w, n) && w->node[n].kind == RTX_PANE_NODE_SPLIT &&
+           guard++ < RTX_PANE_NODES)
+        n = w->node[n].a;
+    return rtx_ws_node_ok(w, n) && w->node[n].kind == RTX_PANE_NODE_LEAF
+               ? w->node[n].pane : -1;
+}
+
+static int rtx_ws_tree_ok(const RtxWs *w) {
+    int leaves[RTX_PANES_MAX];
+    unsigned seen = 0;
+    int k, i;
+    if (!rtx_ws_node_ok(w, w->root)) return 0;
+    if (w->tree_n != w->npanes) return 0;
+    k = rtx_ws_walk(w, w->root, leaves, 0, 0);
+    if (k != w->npanes) return 0;
+    for (i = 0; i < k; i++) {
+        if (seen & (1u << leaves[i])) return 0;
+        seen |= 1u << leaves[i];
+    }
+    return 1;
+}
+
+/* Slots 0..npanes-1 side by side, equal widths (a hand-set npanes). */
+static void rtx_ws_tree_build(RtxWs *w) {
+    int n = w->npanes, s, sub;
+    int i;
+    for (i = 0; i < RTX_PANE_NODES; i++) w->node[i] = (RtxPaneNode){0};
+    if (n < 1) n = 1;
+    if (n > RTX_PANES_MAX) n = RTX_PANES_MAX;
+    sub = rtx_ws_node_new(w);
+    w->node[sub].pane = n - 1;
+    for (s = n - 2; s >= 0; s--) {
+        int leaf = rtx_ws_node_new(w);
+        int sp;
+        w->node[leaf].pane = s;
+        sp = rtx_ws_node_new(w);
+        w->node[sp].kind = RTX_PANE_NODE_SPLIT;
+        w->node[sp].dir = RTX_SPLIT_COLS;
+        w->node[sp].ratio = 1000 / (n - s);
+        w->node[sp].a = leaf;
+        w->node[sp].b = sub;
+        w->node[leaf].up = sp;
+        w->node[sub].up = sp;
+        sub = sp;
+    }
+    w->root = sub;
+    w->npanes = n;
+    w->tree_n = n;
+}
+
+static void rtx_ws_order(RtxWs *w) {
+    int k = rtx_ws_walk(w, w->root, w->order, 0, 0);
+    int i;
+    if (k < 1) k = 0;
+    w->live_mask = 0;
+    for (i = 0; i < k; i++) w->live_mask |= 1u << w->order[i];
+    for (i = k; i < RTX_PANES_MAX; i++) w->order[i] = -1;
+    w->npanes = k;
+    w->tree_n = k;
+}
+
+/* The focused pane's camera is its buf's own. */
+static void rtx_ws_focus_own(RtxWs *w) {
+    int p = w->focus, o;
+    RtxBuf *b;
+    if (!rtx_ws_slot_live(w, p) || w->pane[p] < 0 || (size_t)w->pane[p] >= w->len)
+        return;
+    b = w->bufs[w->pane[p]];
+    o = b->cam_pane;
+    if (o == p) return;
+    if (!w->cam[p].live || w->cam[p].of != b) {
+        b->cam_pane = p;
+        return;
+    }
+    /* p's camera onto the buf; the owner's goes to its own slot. */
+    rtx_buf_swap_cam(b, &w->cam[p]);
+    if (rtx_ws_slot_live(w, o) && o != p) {
+        rtx_ws_cam_drop(&w->cam[o]);
+        w->cam[o] = w->cam[p];
+        w->cam[o].of = b;
+        w->cam[o].live = 1;
+        w->cam[p] = (RtxPaneSnap){0};
+    } else {
+        rtx_ws_cam_drop(&w->cam[p]);
+    }
+    b->cam_pane = p;
+}
+
+static void rtx_ws_cams_fix(RtxWs *w) {
+    int i, p;
+    size_t bi;
+    /* Dead slots and cameras on a buf the pane no longer shows. */
+    for (p = 0; p < RTX_PANES_MAX; p++) {
+        if (!w->cam[p].live) continue;
+        if (!rtx_ws_slot_live(w, p) || w->pane[p] < 0 || (size_t)w->pane[p] >= w->len ||
+            w->cam[p].of != w->bufs[w->pane[p]])
+            rtx_ws_cam_drop(&w->cam[p]);
+    }
+    /* Each shown buf: its own camera belongs to a pane that shows it. */
+    for (i = 0; i < w->npanes; i++) {
+        RtxBuf *b;
+        int o, q;
+        p = w->order[i];
+        if (w->pane[p] < 0 || (size_t)w->pane[p] >= w->len) continue;
+        b = w->bufs[w->pane[p]];
+        o = b->cam_pane;
+        if (rtx_ws_slot_live(w, o) && w->pane[o] == w->pane[p]) continue;
+        q = (rtx_ws_slot_live(w, w->focus) && w->pane[w->focus] == w->pane[p]) ? w->focus : p;
+        if (w->cam[q].live) {
+            /* The buf's camera was a pane's that left: q keeps its own. */
+            rtx_buf_swap_cam(b, &w->cam[q]);
+            rtx_ws_cam_drop(&w->cam[q]);
+        }
+        b->cam_pane = q;
+    }
+    for (i = 0; i < w->npanes; i++) {
+        RtxBuf *b;
+        p = w->order[i];
+        if (w->pane[p] < 0 || (size_t)w->pane[p] >= w->len) continue;
+        b = w->bufs[w->pane[p]];
+        if (b->cam_pane == p) {
+            if (w->cam[p].live) rtx_ws_cam_drop(&w->cam[p]);
+        } else if (!w->cam[p].live) {
+            rtx_ws_cam_seed(&w->cam[p], b);
+        }
+    }
+    rtx_ws_focus_own(w);
+    for (bi = 0; bi < w->len; bi++)
+        if (!rtx_ws_buf_visible(w, (int)bi)) w->bufs[bi]->cam_pane = -1;
+}
+
+void RtxWs_panes_fix(RtxWs *w) {
+    int i;
+    if (!w) return;
+    if (w->npanes < 1) w->npanes = 1;
+    if (w->npanes > RTX_PANES_MAX) w->npanes = RTX_PANES_MAX;
+    if (!rtx_ws_tree_ok(w)) rtx_ws_tree_build(w);
+    rtx_ws_order(w);
+    if (!rtx_ws_slot_live(w, w->focus)) w->focus = w->order[0];
+    if (w->len == 0) return;
+    for (i = 0; i < w->npanes; i++) {
+        int p = w->order[i];
+        if (w->pane[p] < 0 || (size_t)w->pane[p] >= w->len) w->pane[p] = 0;
+    }
+    rtx_ws_cams_fix(w);
+}
+
 int RtxWs_same_split(const RtxWs *w) {
-    return w && w->npanes == 2 && w->pane[0] == w->pane[1] && w->side.live;
+    int i, j;
+    if (!w) return 0;
+    for (i = 0; i < w->npanes; i++)
+        for (j = i + 1; j < w->npanes; j++)
+            if (w->pane[w->order[i]] == w->pane[w->order[j]]) return 1;
+    return 0;
 }
 
 int RtxWs_hold_pane(RtxWs *w, int p) {
-    if (!RtxWs_same_split(w) || p == w->focus) return 0;
-    rtx_buf_swap_cam(w->bufs[w->pane[p]], &w->side);
+    RtxBuf *b;
+    if (!w || p < 0 || p >= RTX_PANES_MAX || w->len == 0) return 0;
+    if (w->pane[p] < 0 || (size_t)w->pane[p] >= w->len) return 0;
+    b = w->bufs[w->pane[p]];
+    if (b->cam_pane == p || !w->cam[p].live || w->cam[p].of != b) return 0;
+    rtx_buf_swap_cam(b, &w->cam[p]);
     return 1;
 }
 
 void RtxWs_drop_pane(RtxWs *w, int p, int held) {
-    if (held) rtx_buf_swap_cam(w->bufs[w->pane[p]], &w->side);
+    if (held) rtx_buf_swap_cam(w->bufs[w->pane[p]], &w->cam[p]);
 }
 
-static void rtx_ws_side_drop(RtxWs *w) {
-    if (!w || !w->side.live) return;
-    w->side.layout.destroy();
-    w->side = (RtxPaneSnap){0};
+/* A camera's window: its laid-out rows, else its origin. */
+static void rtx_ws_cam_win(const RtxLayout *L, size_t origin, size_t *lo, size_t *hi) {
+    if (L && L->rows.len) {
+        *lo = L->rows.data[0].byte_start;
+        *hi = L->rows.data[L->rows.len - 1].byte_start +
+              L->rows.data[L->rows.len - 1].byte_len;
+    } else {
+        *lo = *hi = origin;
+    }
+}
+
+void RtxBuf_hl_trim(RtxBuf *b) {
+    size_t lo[2], hi[2];
+    if (!b) return;
+    rtx_ws_cam_win(&b->layout, b->seek_valid ? b->seek_off : b->doc.caret, &lo[0], &hi[0]);
+    lo[1] = hi[1] = b->doc.caret;
+    RtxDoc_hl_trim(&b->doc, lo, hi, 2);
+}
+
+/* Each buffer keeps the runs near every camera on it (panes showing it,
+ * held or not) and near its caret; the rest go (RtxDoc_hl_trim). */
+void RtxWs_hl_trim(RtxWs *w) {
+    size_t lo[RTX_HL_TRIM_WINS], hi[RTX_HL_TRIM_WINS];
+    size_t i;
+    if (!w) return;
+    for (i = 0; i < w->len; i++) {
+        RtxBuf *b = w->bufs[i];
+        size_t n = 0;
+        int k;
+        if (!b) continue;
+        rtx_ws_cam_win(&b->layout, b->seek_valid ? b->seek_off : b->doc.caret, &lo[n],
+                       &hi[n]);
+        n++;
+        lo[n] = hi[n] = b->doc.caret;
+        n++;
+        for (k = 0; k < RTX_PANES_MAX && n < (size_t)RTX_HL_TRIM_WINS; k++) {
+            const RtxPaneSnap *s = &w->cam[k];
+            if (!rtx_ws_slot_live(w, k) || w->pane[k] != (int)i || b->cam_pane == k ||
+                !s->live || s->of != b)
+                continue;
+            rtx_ws_cam_win(&s->layout, s->seek_valid ? s->seek_off : b->doc.caret, &lo[n],
+                           &hi[n]);
+            n++;
+        }
+        RtxDoc_hl_trim(&b->doc, lo, hi, n);
+    }
+}
+
+/* A slot that is about to show something new: no browse, no camera. */
+static void rtx_ws_slot_clear(RtxWs *w, int s) {
+    rtx_browse_drop(&w->nav[s]);
+    RtxWs_browse_prev_drop(w, s);
+    rtx_ws_cam_drop(&w->cam[s]);
+    w->pane_w[s] = 0;
+    w->pane_vis[s] = 0;
+}
+
+int RtxWs_split(RtxWs *w, int dir) {
+    int f, s, L, S, N, up;
+    if (!w || w->len == 0) return -1;
+    RtxWs_panes_fix(w);
+    if (w->npanes >= RTX_PANES_MAX) return -1;
+    f = w->focus;
+    for (s = 0; s < RTX_PANES_MAX; s++)
+        if (!rtx_ws_slot_live(w, s)) break;
+    L = rtx_ws_leaf_of(w, f);
+    if (s >= RTX_PANES_MAX || L < 0) return -1;
+    S = rtx_ws_node_new(w);
+    if (S < 0) return -1;
+    N = rtx_ws_node_new(w);
+    if (N < 0) {
+        w->node[S] = (RtxPaneNode){0};
+        return -1;
+    }
+    up = w->node[L].up;
+    w->node[S].kind = RTX_PANE_NODE_SPLIT;
+    w->node[S].dir = dir == RTX_SPLIT_ROWS ? RTX_SPLIT_ROWS : RTX_SPLIT_COLS;
+    w->node[S].ratio = 500;
+    w->node[S].a = L;
+    w->node[S].b = N;
+    w->node[S].up = up;
+    w->node[N].pane = s;
+    w->node[N].up = S;
+    w->node[L].up = S;
+    if (up < 0) w->root = S;
+    else if (w->node[up].a == L) w->node[up].a = S;
+    else w->node[up].b = S;
+    rtx_ws_slot_clear(w, s);
+    w->browse_split[s] = w->browse_split[f];
+    w->pane[s] = w->pane[f];
+    rtx_ws_order(w);
+    w->focus = s;
+    RtxWs_panes_fix(w);
+    return s;
+}
+
+int RtxWs_close_pane(RtxWs *w, int p) {
+    int L, S, T, up;
+    if (!w) return 0;
+    RtxWs_panes_fix(w);
+    if (!rtx_ws_slot_live(w, p) || w->npanes <= 1) return 0;
+    L = rtx_ws_leaf_of(w, p);
+    S = L >= 0 ? w->node[L].up : -1;
+    if (S < 0) return 0;
+    T = w->node[S].a == L ? w->node[S].b : w->node[S].a;
+    up = w->node[S].up;
+    w->node[T].up = up;
+    if (up < 0) w->root = T;
+    else if (w->node[up].a == S) w->node[up].a = T;
+    else w->node[up].b = T;
+    w->node[L] = (RtxPaneNode){0};
+    w->node[S] = (RtxPaneNode){0};
+    rtx_ws_slot_clear(w, p);
+    w->browse_split[p] = 0;
+    rtx_ws_order(w);
+    if (w->focus == p) w->focus = rtx_ws_first_leaf(w, T);
+    RtxWs_panes_fix(w);
+    {
+        @errhandler(CCError e) { (void)e; }
+        w->sync_live() !>;
+    }
+    return 1;
+}
+
+void RtxWs_focus_step(RtxWs *w, int dir) {
+    int i;
+    if (!w) return;
+    RtxWs_panes_fix(w);
+    if (w->npanes < 2) return;
+    for (i = 0; i < w->npanes; i++)
+        if (w->order[i] == w->focus) break;
+    if (i >= w->npanes) i = 0;
+    i = (i + (dir < 0 ? w->npanes - 1 : 1)) % w->npanes;
+    RtxWs_set_focus(w, w->order[i]);
+}
+
+static void rtx_ws_rects_walk(const RtxWs *w, int n, RtxPaneRect r, int gx, int gy,
+                              RtxPaneRect *leaf, RtxPaneRect *nodes, int depth) {
+    const RtxPaneNode *nd;
+    RtxPaneRect ra, rb;
+    int avail, first;
+    if (!rtx_ws_node_ok(w, n) || depth > RTX_PANE_NODES) return;
+    nd = &w->node[n];
+    if (nodes) nodes[n] = r;
+    if (nd->kind == RTX_PANE_NODE_LEAF) {
+        if (leaf && nd->pane >= 0 && nd->pane < RTX_PANES_MAX) leaf[nd->pane] = r;
+        return;
+    }
+    ra = r;
+    rb = r;
+    if (nd->dir == RTX_SPLIT_ROWS) {
+        avail = r.h - gy;
+        if (avail < 0) avail = 0;
+        first = (int)((long)avail * nd->ratio / 1000);
+        if (avail >= 2) {
+            if (first < 1) first = 1;
+            if (first > avail - 1) first = avail - 1;
+        }
+        ra.h = first;
+        rb.y = r.y + first + gy;
+        rb.h = avail - first;
+    } else {
+        avail = r.w - gx;
+        if (avail < 0) avail = 0;
+        first = (int)((long)avail * nd->ratio / 1000);
+        if (avail >= 2) {
+            if (first < 1) first = 1;
+            if (first > avail - 1) first = avail - 1;
+        }
+        ra.w = first;
+        rb.x = r.x + first + gx;
+        rb.w = avail - first;
+    }
+    rtx_ws_rects_walk(w, nd->a, ra, gx, gy, leaf, nodes, depth + 1);
+    rtx_ws_rects_walk(w, nd->b, rb, gx, gy, leaf, nodes, depth + 1);
+}
+
+void RtxWs_pane_rects(RtxWs *w, RtxPaneRect area, int gx, int gy, RtxPaneRect *out) {
+    int i;
+    if (!out) return;
+    for (i = 0; i < RTX_PANES_MAX; i++) out[i] = (RtxPaneRect){0};
+    if (!w) return;
+    RtxWs_panes_fix(w);
+    rtx_ws_rects_walk(w, w->root, area, gx, gy, out, NULL, 0);
+}
+
+/* The gap between a split's children. */
+static RtxPaneRect rtx_ws_gap_rect(const RtxWs *w, int n, RtxPaneRect r, int gx, int gy) {
+    RtxPaneRect g = r;
+    const RtxPaneNode *nd = &w->node[n];
+    int avail, first;
+    if (nd->dir == RTX_SPLIT_ROWS) {
+        avail = r.h - gy;
+        if (avail < 0) avail = 0;
+        first = (int)((long)avail * nd->ratio / 1000);
+        if (avail >= 2) {
+            if (first < 1) first = 1;
+            if (first > avail - 1) first = avail - 1;
+        }
+        g.y = r.y + first;
+        g.h = gy;
+    } else {
+        avail = r.w - gx;
+        if (avail < 0) avail = 0;
+        first = (int)((long)avail * nd->ratio / 1000);
+        if (avail >= 2) {
+            if (first < 1) first = 1;
+            if (first > avail - 1) first = avail - 1;
+        }
+        g.x = r.x + first;
+        g.w = gx;
+    }
+    return g;
+}
+
+int RtxWs_divider_at(RtxWs *w, RtxPaneRect area, int gx, int gy, int x, int y,
+                     int slop) {
+    RtxPaneRect leaf[RTX_PANES_MAX];
+    RtxPaneRect nodes[RTX_PANE_NODES];
+    int n;
+    if (!w) return -1;
+    RtxWs_panes_fix(w);
+    for (n = 0; n < RTX_PANE_NODES; n++) nodes[n] = (RtxPaneRect){0};
+    rtx_ws_rects_walk(w, w->root, area, gx, gy, leaf, nodes, 0);
+    for (n = 0; n < RTX_PANE_NODES; n++) {
+        RtxPaneRect g;
+        if (w->node[n].kind != RTX_PANE_NODE_SPLIT) continue;
+        g = rtx_ws_gap_rect(w, n, nodes[n], gx, gy);
+        if (w->node[n].dir == RTX_SPLIT_ROWS) {
+            if (x >= g.x && x < g.x + g.w && y >= g.y - slop && y < g.y + g.h + slop)
+                return n;
+        } else {
+            if (y >= g.y && y < g.y + g.h && x >= g.x - slop && x < g.x + g.w + slop)
+                return n;
+        }
+    }
+    return -1;
+}
+
+int RtxWs_dividers(RtxWs *w, RtxPaneRect area, int gx, int gy, int *node,
+                   RtxPaneRect *gap, int max) {
+    RtxPaneRect leaf[RTX_PANES_MAX];
+    RtxPaneRect nodes[RTX_PANE_NODES];
+    int n, k = 0;
+    if (!w) return 0;
+    RtxWs_panes_fix(w);
+    for (n = 0; n < RTX_PANE_NODES; n++) nodes[n] = (RtxPaneRect){0};
+    rtx_ws_rects_walk(w, w->root, area, gx, gy, leaf, nodes, 0);
+    for (n = 0; n < RTX_PANE_NODES && k < max; n++) {
+        if (w->node[n].kind != RTX_PANE_NODE_SPLIT) continue;
+        if (node) node[k] = n;
+        if (gap) gap[k] = rtx_ws_gap_rect(w, n, nodes[n], gx, gy);
+        k++;
+    }
+    return k;
+}
+
+int RtxWs_divider_dir(const RtxWs *w, int node) {
+    if (!w || node < 0 || node >= RTX_PANE_NODES ||
+        w->node[node].kind != RTX_PANE_NODE_SPLIT)
+        return -1;
+    return w->node[node].dir;
+}
+
+static int rtx_ws_ratio_clamp(int r) {
+    if (r < 50) r = 50;
+    if (r > 950) r = 950;
+    return r;
+}
+
+int RtxWs_divider_drag(RtxWs *w, RtxPaneRect area, int gx, int gy, int node,
+                       int x, int y) {
+    RtxPaneRect leaf[RTX_PANES_MAX];
+    RtxPaneRect nodes[RTX_PANE_NODES];
+    RtxPaneRect r;
+    int avail, at, ratio, n;
+    if (!w || node < 0 || node >= RTX_PANE_NODES ||
+        w->node[node].kind != RTX_PANE_NODE_SPLIT)
+        return 0;
+    for (n = 0; n < RTX_PANE_NODES; n++) nodes[n] = (RtxPaneRect){0};
+    rtx_ws_rects_walk(w, w->root, area, gx, gy, leaf, nodes, 0);
+    r = nodes[node];
+    if (w->node[node].dir == RTX_SPLIT_ROWS) {
+        avail = r.h - gy;
+        at = y - r.y;
+    } else {
+        avail = r.w - gx;
+        at = x - r.x;
+    }
+    if (avail < 2) return 0;
+    if (at < 1) at = 1;
+    if (at > avail - 1) at = avail - 1;
+    ratio = rtx_ws_ratio_clamp((int)((long)at * 1000 / avail));
+    /* Round-trip: keep the ratio whose rect puts the divider at `at`. */
+    while (ratio < 950 && (int)((long)avail * ratio / 1000) < at) ratio++;
+    if (ratio == w->node[node].ratio) return 0;
+    w->node[node].ratio = ratio;
+    return 1;
+}
+
+int RtxWs_pane_nudge(RtxWs *w, int axis, int delta) {
+    int n, guard = 0;
+    if (!w) return 0;
+    RtxWs_panes_fix(w);
+    n = rtx_ws_leaf_of(w, w->focus);
+    while (n >= 0 && guard++ < RTX_PANE_NODES) {
+        int u = w->node[n].up;
+        if (u < 0) break;
+        if (w->node[u].dir == axis) {
+            int r = rtx_ws_ratio_clamp(w->node[u].ratio + delta);
+            if (r == w->node[u].ratio) return 0;
+            w->node[u].ratio = r;
+            return 1;
+        }
+        n = u;
+    }
+    return 0;
+}
+
+int RtxWs_focus_dir(RtxWs *w, RtxPaneRect area, int gx, int gy, int dx, int dy) {
+    RtxPaneRect r[RTX_PANES_MAX];
+    RtxPaneRect f;
+    long best = -1;
+    int i, pick = -1;
+    if (!w) return 0;
+    RtxWs_pane_rects(w, area, gx, gy, r);
+    if (!rtx_ws_slot_live(w, w->focus)) return 0;
+    f = r[w->focus];
+    for (i = 0; i < w->npanes; i++) {
+        int p = w->order[i];
+        RtxPaneRect c = r[p];
+        long gap, over, score;
+        if (p == w->focus) continue;
+        if (dx > 0) gap = c.x - (f.x + f.w);
+        else if (dx < 0) gap = f.x - (c.x + c.w);
+        else if (dy > 0) gap = c.y - (f.y + f.h);
+        else gap = f.y - (c.y + c.h);
+        if (gap < 0) continue;
+        if (dx) {
+            long lo = c.y > f.y ? c.y : f.y;
+            long hi = (c.y + c.h) < (f.y + f.h) ? (c.y + c.h) : (f.y + f.h);
+            over = hi - lo;
+        } else {
+            long lo = c.x > f.x ? c.x : f.x;
+            long hi = (c.x + c.w) < (f.x + f.w) ? (c.x + c.w) : (f.x + f.w);
+            over = hi - lo;
+        }
+        if (over <= 0) continue;
+        score = gap * 100000L - over;
+        if (best < 0 || score < best) {
+            best = score;
+            pick = p;
+        }
+    }
+    if (pick < 0) return 0;
+    RtxWs_set_focus(w, pick);
+    return 1;
+}
+
+void RtxWs_pane_geom(RtxWs *w, int p, double width, int vis) {
+    if (!w || p < 0 || p >= RTX_PANES_MAX) return;
+    w->pane_w[p] = width;
+    w->pane_vis[p] = vis;
 }
 
 void RtxWs_destroy(RtxWs *w) {
     size_t i;
+    int p;
     if (!w) return;
-    rtx_ws_side_drop(w);
-    rtx_browse_drop(&w->nav[0]);
-    rtx_browse_drop(&w->nav[1]);
-    RtxWs_browse_prev_drop(w, 0);
-    RtxWs_browse_prev_drop(w, 1);
+    /* A snapshot open deferred and no pump ran: it still lands. */
+    if (w->ws_pending && w->len) rtx_ws_write_ws(w);
+    for (p = 0; p < RTX_PANES_MAX; p++) {
+        rtx_ws_cam_drop(&w->cam[p]);
+        rtx_browse_drop(&w->nav[p]);
+        RtxWs_browse_prev_drop(w, p);
+    }
     for (i = 0; i < w->len; i++) {
         w->bufs[i]->destroy();
     }
     w->bufs = NULL;
     w->cap = 0;
+    if (w->clip_a.base) w->clip_a.destroy();
     if (w->session.base) w->session.destroy();
     *w = (RtxWs){0};
 }
 
 RtxBuf *RtxWs_active(RtxWs *w) {
-    int bi;
+    int bi, f;
     if (!w || w->len == 0) return NULL;
-    bi = w->pane[w->focus];
+    f = w->focus;
+    if (f < 0 || f >= RTX_PANES_MAX) f = 0;
+    bi = w->pane[f];
     if (bi < 0 || (size_t)bi >= w->len) return w->bufs[0];
     return w->bufs[bi];
 }
@@ -560,13 +1427,15 @@ void !>(CCError) RtxWs_add_path(RtxWs *w, char[:0] path) {
     if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
     if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
     b = rtx_ws_new_buf(w) !>(e) { return cc_err(e); };
-    b->doc.from_path(path) !>(e) { return cc_err(e); };
-    b->doc.tree.busy_bind(w->busy_fn, w->busy_ctx);
-    rtx_ws_bind_path(w, b, path);
     {
         RtxSafeCam cam;
+        int rc;
         rtx_safe_cam_clear(&cam);
-        rtx_safe_load(&b->doc, &cam);
+        rc = rtx_ws_doc_open(w, &b->doc, path.ptr, &cam, &b->safe_rebased) !>(e) {
+            return cc_err(e);
+        };
+        rtx_ws_bind_path(w, b, path);
+        b->safe_hold = rtx_ws_hold_of(rc);
         rtx_ws_cam_to_buf(b, &cam);
     }
     rtx_ws_safe_note(b);
@@ -595,7 +1464,7 @@ void !>(CCError) RtxWs_add_empty(RtxWs *w) {
     b = rtx_ws_new_buf(w) !>(e) { return cc_err(e); };
     b->doc.empty() !>(e) { return cc_err(e); };
     b->doc.tree.busy_bind(w->busy_fn, w->busy_ctx);
-    b->layout.rich = 1;
+    b->layout.rich = rtx_safe_rich_default();
     b->layout.wrap = 1;
     w->len++;
     return cc_ok();
@@ -648,17 +1517,131 @@ void RtxWs_busy_bind(RtxWs *w, RtxBusyFn fn, void *ctx) {
     }
 }
 
+/* Snapshot tree -> w->node. Leaves take slots in order; slot_buf[k] is
+ * the k-th leaf's entry (the caller maps entries to buffers). */
+static int rtx_ws_tree_from_snap(RtxWs *w, const RtxSafeWs *snap, int sn, int up,
+                                 int *slot, int depth) {
+    const RtxSafeWsNode *s;
+    int n;
+    if (sn < 0 || sn >= snap->nnode || depth > RTX_SAFE_WS_NODES) return -1;
+    s = &snap->node[sn];
+    n = rtx_ws_node_new(w);
+    if (n < 0) return -1;
+    w->node[n].up = up;
+    if (s->kind == RTX_SAFE_WS_LEAF) {
+        if (*slot >= RTX_PANES_MAX) return -1;
+        w->node[n].pane = (*slot)++;
+        return n;
+    }
+    if (s->kind != RTX_SAFE_WS_SPLIT) return -1;
+    w->node[n].kind = RTX_PANE_NODE_SPLIT;
+    w->node[n].dir = s->dir == RTX_SPLIT_ROWS ? RTX_SPLIT_ROWS : RTX_SPLIT_COLS;
+    w->node[n].ratio = rtx_ws_ratio_clamp(s->ratio);
+    w->node[n].a = rtx_ws_tree_from_snap(w, snap, s->a, n, slot, depth + 1);
+    if (w->node[n].a < 0) return -1;
+    w->node[n].b = rtx_ws_tree_from_snap(w, snap, s->b, n, slot, depth + 1);
+    if (w->node[n].b < 0) return -1;
+    return n;
+}
+
+/* Snapshot leaves in order (the slots rtx_ws_tree_from_snap hands out). */
+static int rtx_ws_snap_leaves(const RtxSafeWs *snap, int sn, int *out, int k, int depth) {
+    const RtxSafeWsNode *s;
+    if (sn < 0 || sn >= snap->nnode || depth > RTX_SAFE_WS_NODES || k < 0) return -1;
+    s = &snap->node[sn];
+    if (s->kind == RTX_SAFE_WS_LEAF) {
+        if (k >= RTX_PANES_MAX) return -1;
+        out[k] = sn;
+        return k + 1;
+    }
+    k = rtx_ws_snap_leaves(snap, s->a, out, k, depth + 1);
+    return rtx_ws_snap_leaves(snap, s->b, out, k, depth + 1);
+}
+
 static void rtx_ws_load_browse_split(RtxWs *w) {
     CCArena hold;
     RtxSafeWs snap;
+    int leaves[RTX_PANES_MAX];
+    int k, i;
     if (!w) return;
     hold = cc_arena_heap(kilobytes(8));
     if (!hold.base) return;
     if (rtx_safe_ws_read(&snap, hold)) {
-        w->browse_split[0] = snap.split0;
-        w->browse_split[1] = snap.split1;
+        for (i = 0; i < RTX_PANES_MAX && i < RTX_SAFE_WS_PANES; i++)
+            w->browse_split[i] = snap.splits[i];
+        (void)leaves;
+        (void)k;
     }
     hold.destroy();
+}
+
+/* Restore the project's pane tree + buffers (parked until shown). */
+static int !>(CCError) rtx_ws_restore(RtxWs *w, RtxSafeWs *snap, CCArena hold) {
+    size_t k;
+    int *slot;
+    int leaves[RTX_PANES_MAX];
+    int nleaf, i, next = 0, root;
+    if (!snap->ok) return cc_ok(0);
+    for (i = 0; i < RTX_PANES_MAX && i < RTX_SAFE_WS_PANES; i++)
+        w->browse_split[i] = snap->splits[i];
+    if (!snap->n) return cc_ok(0);
+    /* Entry -> buffer slot. Entries that do not come back (gone, not a
+     * file) leave -1, so a pane restores by path, not by a position that
+     * has shifted. */
+    slot = (int *)cc_arena_alloc(hold, snap->n * sizeof(int), _Alignof(int));
+    if (!slot) return cc_err(CC_ERR_OUT_OF_MEMORY, "ws restore");
+    for (k = 0; k < snap->n; k++) {
+        struct stat st;
+        slot[k] = -1;
+        if (!snap->ents[k].path[0] || stat(snap->ents[k].path, &st) != 0)
+            continue;
+        w->add_parked(cc_slice_cstr(snap->ents[k].path), snap->ents[k].dirty,
+                      snap->ents[k].view) !>(e) {
+            continue;
+        };
+        slot[k] = (int)w->len - 1;
+    }
+    if (!w->len) return cc_ok(0);
+    nleaf = rtx_ws_snap_leaves(snap, snap->root, leaves, 0, 0);
+    root = nleaf > 0 ? rtx_ws_tree_from_snap(w, snap, snap->root, -1, &next, 0) : -1;
+    if (root < 0 || next != nleaf) {
+        for (i = 0; i < RTX_PANE_NODES; i++) w->node[i] = (RtxPaneNode){0};
+        nleaf = 0;
+        root = rtx_ws_node_new(w);
+        w->node[root].pane = 0;
+        w->pane[0] = 0;
+        w->root = root;
+        w->npanes = 1;
+        w->tree_n = 1;
+        w->focus = 0;
+        return cc_ok(1);
+    }
+    w->root = root;
+    w->npanes = nleaf;
+    w->tree_n = nleaf;
+    w->focus = 0;
+    for (i = 0; i < nleaf; i++) {
+        const RtxSafeWsNode *lf = &snap->node[leaves[i]];
+        int bi = lf->ent >= 0 && (size_t)lf->ent < snap->n ? slot[lf->ent] : -1;
+        w->pane[i] = bi;
+        if (leaves[i] == snap->focus_node) w->focus = i;
+    }
+    /* A pane whose file is gone shows a buffer no other pane restored. */
+    for (i = 0; i < nleaf; i++) {
+        size_t b;
+        if (w->pane[i] >= 0) continue;
+        w->pane[i] = 0;
+        for (b = 0; b < w->len; b++) {
+            int j, used = 0;
+            for (j = 0; j < nleaf; j++)
+                if (w->pane[j] == (int)b && j != i) used = 1;
+            if (!used) {
+                w->pane[i] = (int)b;
+                break;
+            }
+        }
+    }
+    return cc_ok(1);
 }
 
 void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
@@ -675,36 +1658,20 @@ void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
         RtxSafeWs snap = {0};
         int restored = 0;
         if (hold.base && rtx_safe_ws_read(&snap, hold)) {
-            w->browse_split[0] = snap.split0;
-            w->browse_split[1] = snap.split1;
+            restored = rtx_ws_restore(w, &snap, hold) !>(e) {
+                w->destroy();
+                hold.destroy();
+                return cc_err(e);
+            };
         }
-        if (snap.ok && snap.n) {
-            size_t k;
-            for (k = 0; k < snap.n; k++) {
-                struct stat st;
-                if (!snap.ents[k].path[0] || stat(snap.ents[k].path, &st) != 0)
-                    continue;
-                w->add_parked(cc_slice_cstr(snap.ents[k].path), snap.ents[k].dirty,
-                              snap.ents[k].view) !>(e) {
-                    continue;
-                };
-            }
-            if (w->len) {
-                w->npanes = snap.npanes >= 2 && w->len >= 2 ? 2 : 1;
-                w->focus = snap.focus;
-                if (w->focus < 0 || w->focus >= w->npanes) w->focus = 0;
-                w->pane[0] = snap.pane0;
-                w->pane[1] = snap.pane1;
-                if (w->pane[0] < 0 || (size_t)w->pane[0] >= w->len) w->pane[0] = 0;
-                if (w->pane[1] < 0 || (size_t)w->pane[1] >= w->len)
-                    w->pane[1] = w->len >= 2 ? 1 : 0;
-                w->sync_live() !>(e) {
-                    w->destroy();
-                    hold.destroy();
-                    return cc_err(e);
-                };
-                restored = 1;
-            }
+        if (restored) {
+            /* The old global snapshot lands in this project once. */
+            if (snap.legacy) rtx_safe_ws_migrated();
+            rtx_ws_sync_live_deferred(w) !>(e) {
+                w->destroy();
+                if (hold.base) hold.destroy();
+                return cc_err(e);
+            };
         }
         if (hold.base) hold.destroy();
         if (restored) return cc_ok();
@@ -712,6 +1679,7 @@ void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
             w->destroy();
             return cc_err(e);
         };
+        RtxWs_panes_fix(w);
         return cc_ok();
     }
     rtx_ws_load_browse_split(w);
@@ -723,6 +1691,8 @@ void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
             }
             continue;
         }
+        /* `a.txt ./a.txt` is one file: one document, one journal. */
+        if (rtx_ws_find_path(w, cc_slice_cstr(paths[i])) >= 0) continue;
         rtx_ws_add_path_or_create(w, cc_slice_cstr(paths[i])) !>(e) {
             if (e.kind == CC_ERR_NOT_FOUND &&
                 isatty(STDIN_FILENO) && isatty(STDERR_FILENO))
@@ -741,7 +1711,7 @@ void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
         w->npanes = 2;
         w->pane[1] = 1;
     }
-    w->sync_live() !>(e) {
+    rtx_ws_sync_live_deferred(w) !>(e) {
         w->destroy();
         return cc_err(e);
     };
@@ -765,12 +1735,14 @@ void rtx_buf_grid_bind(RtxBuf *b) {
 
 void RtxWs_set_view(RtxWs *w, int view) {
     size_t i;
+    int p;
     if (!w) return;
     for (i = 0; i < w->len; i++) {
         rtx_layout_set_view(&w->bufs[i]->layout, view);
         rtx_buf_grid_bind(w->bufs[i]);
     }
-    if (w->side.live) rtx_layout_set_view(&w->side.layout, view);
+    for (p = 0; p < RTX_PANES_MAX; p++)
+        if (w->cam[p].live) rtx_layout_set_view(&w->cam[p].layout, view);
 }
 
 void RtxWs_set_views(RtxWs *w, const int *views, int n) {
@@ -782,96 +1754,248 @@ void RtxWs_set_views(RtxWs *w, const int *views, int n) {
     }
 }
 
+static void rtx_ws_sync_quiet(RtxWs *w) {
+    @errhandler(CCError e) { (void)e; }
+    w->sync_live() !>;
+}
+
 void RtxWs_toggle_split(RtxWs *w) {
-    RtxBuf *b;
     if (!w || w->len == 0) return;
+    RtxWs_panes_fix(w);
     if (w->npanes == 1) {
-        w->npanes = 2;
-        if (w->len >= 2) w->pane[1] = (w->pane[0] + 1) % (int)w->len;
-        else w->pane[1] = w->pane[0];
-        w->focus = 1;
-        if (w->pane[0] == w->pane[1]) {
-            b = w->bufs[w->pane[0]];
-            w->side = (RtxPaneSnap){0};
-            w->side.live = 1;
-            w->side.top = b->top;
-            w->side.top_wrap = b->top_wrap;
-            w->side.left_col = b->left_col;
-            w->side.top_byte = b->top_byte;
-            w->side.unlock = b->unlock;
-            w->side.layout.view = b->layout.view;
-            w->side.layout.wrap = b->layout.wrap;
-            w->side.layout.rich = b->layout.rich;
+        int f = w->focus;
+        int s = RtxWs_split(w, RTX_SPLIT_COLS);
+        if (s < 0) return;
+        if (w->len >= 2) {
+            w->pane[s] = (w->pane[f] + 1) % (int)w->len;
+            RtxWs_panes_fix(w);
         }
     } else {
-        if (w->side.live) {
-            b = w->bufs[w->pane[0]];
-            if (w->focus == 1) rtx_buf_swap_cam(b, &w->side);
-            rtx_ws_side_drop(w);
+        /* Back to the first pane (in tree order). */
+        int keep = w->order[0];
+        int guard = 0;
+        RtxWs_set_focus(w, keep);
+        while (w->npanes > 1 && guard++ < RTX_PANES_MAX) {
+            int k, victim = -1;
+            for (k = 0; k < w->npanes; k++)
+                if (w->order[k] != keep) victim = w->order[k];
+            if (victim < 0 || !RtxWs_close_pane(w, victim)) break;
         }
-        w->npanes = 1;
-        w->focus = 0;
     }
+    rtx_ws_sync_quiet(w);
+}
+
+/* Step the focused pane by dir. Landing on another pane's buffer is a
+ * same-file split: that pane keeps its camera, this one gets its own. */
+static void rtx_ws_step_buf(RtxWs *w, int dir) {
+    if (!w || w->len == 0) return;
+    RtxWs_panes_fix(w);
+    w->pane[w->focus] = (w->pane[w->focus] + (int)w->len + dir) % (int)w->len;
+    RtxWs_panes_fix(w);
+    rtx_ws_sync_quiet(w);
 }
 
 void RtxWs_next_buf(RtxWs *w) {
-    if (!w || w->len == 0) return;
-    if (RtxWs_same_split(w)) {
-        rtx_buf_swap_cam(w->bufs[w->pane[0]], &w->side);
-        rtx_ws_side_drop(w);
-    }
-    w->pane[w->focus] = (w->pane[w->focus] + 1) % (int)w->len;
-    {
-        @errhandler(CCError e) { (void)e; }
-        w->sync_live() !>;
-    }
+    rtx_ws_step_buf(w, 1);
 }
 
 void RtxWs_prev_buf(RtxWs *w) {
-    if (!w || w->len == 0) return;
-    if (RtxWs_same_split(w)) {
-        rtx_buf_swap_cam(w->bufs[w->pane[0]], &w->side);
-        rtx_ws_side_drop(w);
-    }
-    w->pane[w->focus] = (w->pane[w->focus] + (int)w->len - 1) % (int)w->len;
-    {
-        @errhandler(CCError e) { (void)e; }
-        w->sync_live() !>;
-    }
+    rtx_ws_step_buf(w, -1);
 }
 
 void RtxWs_set_focus(RtxWs *w, int pane) {
-    if (!w || pane < 0 || pane >= w->npanes || pane == w->focus) return;
-    if (RtxWs_same_split(w))
-        rtx_buf_swap_cam(w->bufs[w->pane[0]], &w->side);
+    if (!w) return;
+    RtxWs_panes_fix(w);
+    if (!rtx_ws_slot_live(w, pane) || pane == w->focus) return;
     w->focus = pane;
+    RtxWs_panes_fix(w);
 }
 
 void RtxWs_focus_other(RtxWs *w) {
-    if (!w || w->npanes < 2) return;
-    RtxWs_set_focus(w, 1 - w->focus);
+    RtxWs_focus_step(w, 1);
 }
 
-void !>(CCError) RtxWs_set_clip(RtxWs *w, char[:] src) {
-    char[:] copy;
-    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
-    if (!src.ptr || src.len == 0) {
-        w->clip = cc_slice_empty();
-        return cc_ok();
-    }
-    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
-    copy = src.clone_into(w->session) !>(e) { return cc_err(e); };
-    w->clip = copy;
+void RtxWs_move_to_pane(RtxWs *w, int dir) {
+    int i, src, dst, bi;
+    if (!w || w->len == 0) return;
+    RtxWs_panes_fix(w);
+    if (w->npanes < 2) return;
+    src = w->focus;
+    for (i = 0; i < w->npanes; i++)
+        if (w->order[i] == src) break;
+    if (i >= w->npanes) return;
+    dst = w->order[(i + (dir < 0 ? w->npanes - 1 : 1)) % w->npanes];
+    bi = w->pane[src];
+    w->pane[dst] = bi;
+    if (w->len >= 2) w->pane[src] = (bi + 1) % (int)w->len;
+    w->focus = dst;
+    RtxWs_panes_fix(w);
+    rtx_ws_sync_quiet(w);
+}
+
+/* --- buffer list --- */
+
+const char *RtxWs_buf_path(const RtxWs *w, int bufi) {
+    if (!w || bufi < 0 || (size_t)bufi >= w->len) return NULL;
+    return rtx_ws_buf_path(w->bufs[bufi]);
+}
+
+int RtxWs_buf_dirty(const RtxWs *w, int bufi) {
+    if (!w || bufi < 0 || (size_t)bufi >= w->len) return 0;
+    return rtx_ws_buf_dirty(w->bufs[bufi]);
+}
+
+int RtxWs_buf_shown(const RtxWs *w, int bufi) {
+    return rtx_ws_buf_visible(w, bufi);
+}
+
+void RtxWs_show_buf(RtxWs *w, int bufi) {
+    if (!w || bufi < 0 || (size_t)bufi >= w->len) return;
+    RtxWs_panes_fix(w);
+    rtx_browse_drop(&w->nav[w->focus]);
+    RtxWs_browse_prev_drop(w, w->focus);
+    if (w->pane[w->focus] == bufi) return;
+    w->pane[w->focus] = bufi;
+    RtxWs_panes_fix(w);
+    rtx_ws_sync_quiet(w);
+}
+
+void !>(CCError) RtxWs_save_buf(RtxWs *w, int bufi) {
+    RtxBuf *b;
+    if (!w || bufi < 0 || (size_t)bufi >= w->len)
+        return cc_err(CC_ERR_INVALID_ARG, "save buf");
+    b = w->bufs[bufi];
+    if (b->parked && (b->park_dirty || b->safe_hold))
+        rtx_ws_unpark_buf(w, b) !>(e) { return cc_err(e); };
+    if (b->safe_hold) return cc_err(CC_ERR_IO, "unsaved edits held in Safe journal");
+    if (b->parked || !b->doc.dirty()) return cc_ok();
+    if (!b->doc.path.ptr || b->doc.path.len == 0)
+        return cc_err(CC_ERR_INVALID_ARG, "untitled");
+    if (b->doc.disk_changed()) return cc_err(CC_ERR_IO, "file changed on disk");
+    b->doc.save() !>(e) { return cc_err(e); };
+    b->doc.break_coalesce();
+    rtx_ws_flush_buf(b);
     return cc_ok();
 }
 
-static char[:] !>(CCError) rtx_ws_read_range(RtxWs *w, RtxDoc *d, size_t lo, size_t n) {
+/* Forget buffer bufi in the transaction table: drop its membership, and
+ * renumber members above it. */
+static void rtx_ws_xact_forget(RtxWs *w, int bufi) {
+    size_t i;
+    int k, o;
+    for (i = 0; i < w->xact_n; i++) {
+        RtxWsXact *x = &w->xacts[i];
+        for (k = 0, o = 0; k < x->nbuf; k++) {
+            if (x->bufs[k] == bufi) continue;
+            x->bufs[o++] = x->bufs[k] > bufi ? x->bufs[k] - 1 : x->bufs[k];
+        }
+        x->nbuf = o;
+    }
+}
+
+void !>(CCError) RtxWs_close_buf(RtxWs *w, int bufi, int discard) {
+    RtxBuf *b;
+    const char *path;
+    size_t i;
+    int p, next;
+    if (!w || bufi < 0 || (size_t)bufi >= w->len)
+        return cc_err(CC_ERR_INVALID_ARG, "close buf");
+    b = w->bufs[bufi];
+    if (!discard && rtx_ws_buf_dirty(b))
+        return cc_err(CC_ERR_INVALID_ARG, "unsaved");
+    RtxWs_panes_fix(w);
+    path = rtx_ws_buf_path(b);
+    if (discard && rtx_ws_buf_dirty(b)) {
+        if (path) rtx_safe_drop(path);
+    } else if (!b->parked && path) {
+        /* Clean: the camera (and a clean hist) stays for the next open. */
+        rtx_ws_flush_buf(b);
+    }
+    /* The last buffer: an untitled one takes its place. */
+    if (w->len == 1) {
+        w->add_empty() !>(e) { return cc_err(e); };
+    }
+    next = (size_t)bufi + 1 < w->len ? bufi + 1 : bufi - 1;
+    {
+        /* Prefer the nearest tab no other pane shows (right, then left). */
+        int k;
+        for (k = bufi + 1; k < (int)w->len; k++)
+            if (!rtx_ws_buf_visible(w, k)) break;
+        if (k < (int)w->len) {
+            next = k;
+        } else {
+            for (k = bufi - 1; k >= 0; k--)
+                if (!rtx_ws_buf_visible(w, k)) break;
+            if (k >= 0) next = k;
+        }
+    }
+    for (p = 0; p < RTX_PANES_MAX; p++) {
+        if (w->cam[p].live && w->cam[p].of == b) rtx_ws_cam_drop(&w->cam[p]);
+        if (rtx_ws_slot_live(w, p) && w->pane[p] == bufi) {
+            w->pane[p] = next;
+            rtx_browse_drop(&w->nav[p]);
+            RtxWs_browse_prev_drop(w, p);
+        }
+    }
+    b->destroy();
+    for (i = (size_t)bufi; i + 1 < w->len; i++) w->bufs[i] = w->bufs[i + 1];
+    /* The struct is reused by the next add (allocated once). */
+    w->bufs[w->len - 1] = b;
+    w->len--;
+    for (p = 0; p < RTX_PANES_MAX; p++)
+        if (w->pane[p] > bufi) w->pane[p]--;
+    rtx_ws_xact_forget(w, bufi);
+    RtxWs_panes_fix(w);
+    return w->sync_live();
+}
+
+/* The clip owns a heap arena of its own (not w.session, which lives until
+ * close). A new value is built on a fresh arena, adopted after it exists,
+ * and the old arena dies then. Empty is a real clear. */
+static void rtx_ws_clip_adopt(RtxWs *w, CCArena a, char[:] bytes) {
+    CCArena old = w->clip_a;
+    if (!bytes.ptr || bytes.len == 0) {
+        if (a.base) a.destroy();
+        a = (CCArena){0};
+        bytes = cc_slice_empty();
+    }
+    w->clip_a = a;
+    w->clip = bytes;
+    if (old.base) old.destroy();
+}
+
+static int rtx_ws_clip_same(const RtxWs *w, char[:] src) {
+    if (!w->clip.ptr || w->clip.len != src.len) return 0;
+    return src.len == 0 || memcmp(w->clip.ptr, src.ptr, src.len) == 0;
+}
+
+void !>(CCError) RtxWs_set_clip(RtxWs *w, char[:] src) {
+    CCArena a;
+    char[:] copy;
+    if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
+    if (!src.ptr || src.len == 0) {
+        rtx_ws_clip_adopt(w, (CCArena){0}, cc_slice_empty());
+        return cc_ok();
+    }
+    /* Hosts load the OS clipboard before every paste: same bytes, no copy. */
+    if (rtx_ws_clip_same(w, src)) return cc_ok();
+    a = cc_arena_heap(src.len + 64);
+    if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+    copy = src.clone_into(a) !>(e) {
+        a.destroy();
+        return cc_err(e);
+    };
+    rtx_ws_clip_adopt(w, a, copy);
+    return cc_ok();
+}
+
+/* [lo, lo + n) of d onto a (arena last). */
+static char[:] !>(CCError) rtx_ws_read_range(RtxDoc *d, size_t lo, size_t n, CCArena a) {
     char[:] copy;
     size_t got;
-    if (!w || !d) return cc_err(CC_ERR_INVALID_ARG, "read range");
+    if (!d || !a.base) return cc_err(CC_ERR_INVALID_ARG, "read range");
     if (n == 0) return cc_ok(cc_slice_empty());
-    if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
-    copy = w->session.alloc_slice_bytes(n);
+    copy = a.alloc_slice_bytes(n);
     if (!copy.ptr) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
     got = d->read_at(lo, copy.sub(0, n)) !>(e) { return cc_err(e); };
     if (got != n) return cc_err(CC_ERR_INTERNAL, "clipboard read");
@@ -881,60 +2005,76 @@ static char[:] !>(CCError) rtx_ws_read_range(RtxWs *w, RtxDoc *d, size_t lo, siz
 int !>(CCError) RtxWs_copy(RtxWs *w) {
     RtxDoc *d = w->doc();
     size_t lo, hi;
+    CCArena a;
+    char[:] bytes;
     if (!d || !d->has_sel()) return cc_ok(0);
     if (d->sel_box) {
-        CCArena a = {0} @destroy;
-        char[:] bytes;
         a = cc_arena_heap(kilobytes(8));
         if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
-        bytes = rtx_doc_box_text(d, a) !>(e) { return cc_err(e); };
-        w->set_clip(bytes) !>(e) { return cc_err(e); };
+        bytes = rtx_doc_box_text(d, a) !>(e) {
+            a.destroy();
+            return cc_err(e);
+        };
+        rtx_ws_clip_adopt(w, a, bytes);
         return cc_ok(1);
     }
     lo = d->sel_lo();
     hi = d->sel_hi();
-    {
-        char[:] bytes = rtx_ws_read_range(w, d, lo, hi - lo) !>(e) {
-            return cc_err(e);
-        };
-        w->clip = bytes;
-    }
+    a = cc_arena_heap(hi - lo + 64);
+    if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+    bytes = rtx_ws_read_range(d, lo, hi - lo, a) !>(e) {
+        a.destroy();
+        return cc_err(e);
+    };
+    rtx_ws_clip_adopt(w, a, bytes);
     return cc_ok(1);
 }
 
 void !>(CCError) RtxWs_cut(RtxWs *w) {
     RtxDoc *d = w->doc();
     size_t lo, hi;
-    char[:] copy = cc_slice_empty();
+    CCArena a;
+    char[:] copy;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "no buffer");
     if (!d->has_sel()) return cc_ok();
     if (d->sel_box) {
-        CCArena a = {0} @destroy;
-        char[:] bytes;
         a = cc_arena_heap(kilobytes(8));
         if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
-        bytes = rtx_doc_box_text(d, a) !>(e) { return cc_err(e); };
-        if (bytes.len) {
-            if (!w->ensure()) return cc_err(CC_ERR_OUT_OF_MEMORY, "workspace");
-            copy = bytes.clone_into(w->session) !>(e) { return cc_err(e); };
-        }
-        rtx_doc_box_apply(d, cc_slice_empty()) !>(e) { return cc_err(e); };
+        copy = rtx_doc_box_text(d, a) !>(e) {
+            a.destroy();
+            return cc_err(e);
+        };
+        rtx_doc_box_apply(d, cc_slice_empty()) !>(e) {
+            a.destroy();
+            return cc_err(e);
+        };
         d->sel_box = 0;
         d->sel_anchor = d->caret;
-        w->clip = copy;
+        rtx_ws_clip_adopt(w, a, copy);
         return cc_ok();
     }
     lo = d->sel_lo();
     hi = d->sel_hi();
-    copy = rtx_ws_read_range(w, d, lo, hi - lo) !>(e) { return cc_err(e); };
+    a = cc_arena_heap(hi - lo + 64);
+    if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "clipboard");
+    copy = rtx_ws_read_range(d, lo, hi - lo, a) !>(e) {
+        a.destroy();
+        return cc_err(e);
+    };
     /* Copy is bytes as selected; the cut removes the pair (join rule). */
-    if (rtx_buf_rich(w->active()))
+    if (rtx_buf_rich(w->active())) {
         rtx_buf_pair_replace(w->active(), lo, hi, cc_slice_empty()) !>(e) {
+            a.destroy();
             return cc_err(e);
         };
-    else
-        d->replace(lo, hi - lo, cc_slice_empty()) !>(e) { return cc_err(e); };
-    w->clip = copy;
+    } else {
+        d->replace(lo, hi - lo, cc_slice_empty()) !>(e) {
+            a.destroy();
+            return cc_err(e);
+        };
+    }
+    /* Clip after a successful cut. */
+    rtx_ws_clip_adopt(w, a, copy);
     return cc_ok();
 }
 
@@ -942,7 +2082,7 @@ void !>(CCError) RtxWs_paste(RtxWs *w) {
     RtxDoc *d = w->doc();
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "no buffer");
     if (!w->clip.ptr || w->clip.len == 0) return cc_ok();
-    return d->type(w->clip);
+    return RtxBuf_paste_text(w->active(), w->clip);
 }
 
 static void rtx_buf_hex_nib_reset(RtxBuf *b) {
@@ -1435,9 +2575,11 @@ static void !>(CCError) rtx_buf_md_insert_row(RtxBuf *b) {
     }
     n = rtx_md_empty_row(t->ncols, row + lead, sizeof(row) - lead);
     if (!n) return cc_ok();
+    b->doc.break_coalesce();
     b->doc.replace(insert_at, 0, row.to_slice_n(lead + n)) !>(e) {
         return cc_err(e);
     };
+    b->doc.break_coalesce();
     b->doc.caret = insert_at + lead + 1;
     b->doc.sel_anchor = b->doc.caret;
     b->clear_pref();
@@ -1445,14 +2587,16 @@ static void !>(CCError) rtx_buf_md_insert_row(RtxBuf *b) {
     return cc_ok();
 }
 
-/* Append one column to every table line. One replace of [t.lo, t.hi). */
+/* Append one column to every table line: one insert per line, one edit
+ * group (one undo step). */
 static void !>(CCError) rtx_buf_md_insert_col(RtxBuf *b) {
     int ti, sep;
     const RtxMdTable *t;
-    size_t tlo, thi, n, i, start, used, dcap, caret_rel, new_caret, add;
+    size_t tlo, thi, n, i, start, used, dcap, caret_rel, new_caret, add, nl, ne;
     CCArena src_a = {0};
     char[:] span;
     char *dst = NULL;
+    RtxEdit *eds = NULL;
     int src_on = 0;
     @errhandler(CCError e) {
         if (src_on) src_a.destroy();
@@ -1467,47 +2611,68 @@ static void !>(CCError) rtx_buf_md_insert_col(RtxBuf *b) {
     thi = t->hi;
     if (thi <= tlo) return cc_ok();
     n = thi - tlo;
+    nl = 1;
     src_a = cc_arena_heap(n + 4 * n + 96);
     if (!src_a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "md col src");
     src_on = 1;
     span = b->doc.scratch_span(tlo, n, src_a) !>;
+    for (i = 0; i < span.len; i++) {
+        if (span.ptr[i] == '\n') nl++;
+    }
     dcap = n + 4 * n + 32;
     dst = (char *)cc_arena_alloc(src_a, dcap, 1);
-    if (!dst) {
+    eds = (RtxEdit *)cc_arena_alloc(src_a, nl * sizeof(RtxEdit), 8);
+    if (!dst || !eds) {
         src_a.destroy();
         return cc_err(CC_ERR_OUT_OF_MEMORY, "md col dst");
     }
     used = 0;
+    ne = 0;
     caret_rel = b->doc.caret >= tlo ? b->doc.caret - tlo : 0;
     new_caret = b->doc.caret;
     i = 0;
     while (i < span.len) {
-        size_t ln;
+        size_t ln, keep, cr;
+        if (used >= dcap) {
+            src_a.destroy();
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "md col nl");
+        }
         start = i;
         while (i < span.len && span.ptr[i] != '\n') i++;
         ln = i - start;
+        cr = ln && span.ptr[start + ln - 1] == '\r' ? 1 : 0;
+        keep = ln - cr;
         sep = rtx_md_line_is_sep(span.ptr + start, ln);
         add = rtx_md_line_add_col(span.ptr + start, ln, sep, dst + used,
                                   dcap - used);
-        if (!add) {
+        if (!add || add < ln || ne >= nl) {
             src_a.destroy();
             return cc_err(CC_ERR_OUT_OF_MEMORY, "md col fit");
         }
+        /* add_col copies the line and appends before a kept `\r`: the
+         * site is that append. */
+        eds[ne].off = tlo + start + keep;
+        eds[ne].n = 0;
+        eds[ne].ins = cc_slice_from_buffer(dst + used + keep, add - ln);
+        ne++;
         used += add;
         if (caret_rel >= start && caret_rel <= i)
-            new_caret = tlo + used - (add >= 2 ? 2 : 0);
+            /* Inside the new cell: before its `|` (and a kept `\r`). */
+            new_caret = tlo + used - (add >= 2 ? 2 : 0) -
+                        (add >= 3 && dst[used - 1] == '\r' ? 1 : 0);
         if (i < span.len && span.ptr[i] == '\n') {
-            if (used >= dcap) {
-                src_a.destroy();
-                return cc_err(CC_ERR_OUT_OF_MEMORY, "md col nl");
-            }
-            dst[used++] = '\n';
+            used++;
             i++;
         }
     }
-    b->doc.replace(tlo, n, cc_slice_from_buffer(dst, used)) !>;
+    b->doc.replace_batch(eds, ne) !>;
     b->doc.caret = new_caret;
     b->doc.sel_anchor = new_caret;
+    if (b->doc.hist.head > 0) {
+        RtxHistRec *r = &b->doc.hist.recs[b->doc.hist.head - 1];
+        r->caret_after = new_caret;
+        r->sel_after = new_caret;
+    }
     src_a.destroy();
     src_on = 0;
     b->clear_pref();
@@ -1551,91 +2716,9 @@ static void !>(CCError) rtx_buf_md_delete_row(RtxBuf *b) {
         if (got == 1 && ch == '\n') del_n++;
     }
     if (!del_n) return cc_ok();
+    b->doc.break_coalesce();
     b->doc.replace(ls, del_n, cc_slice_empty()) !>(e) { return cc_err(e); };
-    b->clear_pref();
-    rtx_buf_hex_nib_reset(b);
-    return cc_ok();
-}
-
-/* Drop column `col` from every table line. One replace of [t.lo, t.hi). */
-static void !>(CCError) rtx_buf_md_delete_col(RtxBuf *b, int col) {
-    int ti, keep;
-    const RtxMdTable *t;
-    size_t tlo, thi, n, i, start, used, dcap, caret_rel, new_caret, add;
-    size_t line_dst0;
-    CCArena src_a = {0};
-    char[:] span;
-    char *dst = NULL;
-    int src_on = 0;
-    RtxMdCell cells[RTX_MD_TABLE_COLS];
-    @errhandler(CCError e) {
-        if (src_on) src_a.destroy();
-        return cc_err(e);
-    }
-    if (!b) return cc_err(CC_ERR_INVALID_ARG, "md col del");
-    ti = rtx_layout_md_index(&b->layout, b->doc.caret);
-    if (ti < 0) return cc_ok();
-    t = &b->layout.md_tab[ti];
-    if (t->ncols <= 1 || col < 0 || col >= t->ncols) return cc_ok();
-    keep = col > 0 ? col - 1 : 0;
-    tlo = t->lo;
-    thi = t->hi;
-    if (thi <= tlo) return cc_ok();
-    n = thi - tlo;
-    src_a = cc_arena_heap(n + n + 96);
-    if (!src_a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "md col del src");
-    src_on = 1;
-    span = b->doc.scratch_span(tlo, n, src_a) !>;
-    dcap = n + 8;
-    dst = (char *)cc_arena_alloc(src_a, dcap, 1);
-    if (!dst) {
-        src_a.destroy();
-        return cc_err(CC_ERR_OUT_OF_MEMORY, "md col del dst");
-    }
-    used = 0;
-    caret_rel = b->doc.caret >= tlo ? b->doc.caret - tlo : 0;
-    new_caret = b->doc.caret;
-    i = 0;
-    while (i < span.len) {
-        size_t ln, nc, lo, hi;
-        start = i;
-        while (i < span.len && span.ptr[i] != '\n') i++;
-        ln = i - start;
-        line_dst0 = used;
-        add = rtx_md_line_del_col(span.ptr + start, ln, col, dst + used,
-                                  dcap - used);
-        if (ln && !add) {
-            src_a.destroy();
-            return cc_err(CC_ERR_OUT_OF_MEMORY, "md col del fit");
-        }
-        used += add;
-        if (caret_rel >= start && caret_rel <= i) {
-            nc = rtx_md_row_split(dst + line_dst0, add, cells, RTX_MD_TABLE_COLS);
-            if (nc) {
-                int at = keep;
-                if (at >= (int)nc) at = (int)nc - 1;
-                lo = cells[at].lo;
-                hi = cells[at].hi;
-                rtx_md_span_trim(dst + line_dst0, &lo, &hi);
-                new_caret = tlo + line_dst0 + lo;
-            } else {
-                new_caret = tlo + line_dst0;
-            }
-        }
-        if (i < span.len && span.ptr[i] == '\n') {
-            if (used >= dcap) {
-                src_a.destroy();
-                return cc_err(CC_ERR_OUT_OF_MEMORY, "md col del nl");
-            }
-            dst[used++] = '\n';
-            i++;
-        }
-    }
-    b->doc.replace(tlo, n, cc_slice_from_buffer(dst, used)) !>;
-    b->doc.caret = new_caret;
-    b->doc.sel_anchor = new_caret;
-    src_a.destroy();
-    src_on = 0;
+    b->doc.break_coalesce();
     b->clear_pref();
     rtx_buf_hex_nib_reset(b);
     return cc_ok();
@@ -1650,10 +2733,10 @@ void !>(CCError) RtxBuf_move_md_col(RtxBuf *b, int dir) {
     ti = rtx_layout_md_index(&b->layout, b->doc.caret);
     t = ti >= 0 ? &b->layout.md_tab[ti] : NULL;
     c = rtx_layout_md_col_at(&b->layout, &b->doc, b->doc.caret);
+    /* Tab past the last cell grows the table; Shift-Tab only moves (the
+     * first cell steps to the row above, the table's first cell stays). */
     if (dir > 0 && t && c >= 0 && c + 1 >= t->ncols)
         return rtx_buf_md_insert_col(b);
-    if (dir < 0 && t && c == 0 && t->ncols > 1)
-        return rtx_buf_md_delete_col(b, 0);
     want = rtx_layout_md_step_cell(&b->layout, &b->doc, b->doc.caret, dir);
     if (want == b->doc.caret && dir > 0) return rtx_buf_md_insert_col(b);
     b->doc.caret = want;
@@ -1688,6 +2771,19 @@ void !>(CCError) RtxBuf_move_vert(RtxBuf *b, const RtxMeasure *m,
         return cc_ok();
     }
     return b->layout.move_vert(&b->doc, m, width, dir, shift, &b->pref);
+}
+
+void !>(CCError) RtxBuf_page_vert(RtxBuf *b, const RtxMeasure *m,
+                                        double width, int dir, size_t n, int shift) {
+    size_t k;
+    if (!b || !m) return cc_err(CC_ERR_INVALID_ARG, "page vert");
+    if (rtx_layout_is_hex(&b->layout)) {
+        for (k = 0; k < (n ? n : 1); k++)
+            RtxBuf_move_vert(b, m, width, dir, shift) !>(e) { return cc_err(e); };
+        return cc_ok();
+    }
+    return b->layout.page_vert(&b->doc, m, width, dir, n, shift, &b->pref,
+                               b->layout_width == width);
 }
 
 void !>(CCError) RtxBuf_move_edge(RtxBuf *b, int to_end, int shift,
@@ -1726,6 +2822,1547 @@ void !>(CCError) RtxBuf_move_edge(RtxBuf *b, int to_end, int shift,
     return cc_ok();
 }
 
+/* ------------------------------------------------------------------
+ * Markdown editing affordances (docs/md_view.md, Editing). Enter keeps
+ * list / quote containers going, Tab nests list items, typed pairs close
+ * themselves, a URL pasted over a selection becomes a link, and table
+ * rows / columns have explicit commands. Context comes from the line's
+ * own bytes (rtx_md_line_parse) plus a window of lines around it — never
+ * from the lexer — so none of this waits on a block pass. Every command
+ * that writes several places is one edit group (one undo step).
+ * ------------------------------------------------------------------ */
+
+static int g_rtx_autopair = 1;
+static int g_rtx_tab_spaces = 0;
+
+void rtx_edit_set_autopair(int on) { g_rtx_autopair = on ? 1 : 0; }
+int rtx_edit_autopair(void) { return g_rtx_autopair; }
+void rtx_edit_set_tab_spaces(int n) {
+    g_rtx_tab_spaces = n < 0 ? 0 : n > 16 ? 16 : n;
+}
+int rtx_edit_tab_spaces(void) { return g_rtx_tab_spaces; }
+
+/* Window of whole lines around the edit: RTX_MARKUP_LOOKBACK above (the
+ * block pass's reach), RTX_ME_AHEAD below. A list longer than that is
+ * renumbered only inside the window (leftover, never a wrong edit). */
+#define RTX_ME_AHEAD 65536
+#define RTX_ME_SPAN_MAX (1u << 20)
+#define RTX_ME_LINE_MAX 8192
+
+typedef struct {
+    size_t off;  /* doc offset of the line */
+    size_t len;  /* bytes, no newline */
+    int nl;      /* a newline follows */
+    int cr;      /* the line ends in `\r` (kept on every rewrite) */
+    const char *s;
+    RtxMdLine L;
+} RtxMeSrc;
+
+typedef struct {
+    char *t;     /* bytes (no newline, no `\r`) */
+    size_t n;
+    int src;     /* source line */
+    int fresh;   /* a line this command adds */
+    int moved;   /* indented / outdented by this command */
+    int inst;    /* renumber level instance (-1: none) */
+    RtxMdLine L;
+} RtxMeV;
+
+typedef struct {
+    CCArena a;
+    char *buf;
+    size_t lo, n;       /* buf is doc [lo, lo + n) */
+    RtxMeSrc *src;
+    size_t ns;
+    RtxMeV *v;
+    size_t nv, vcap;
+    size_t b0, b1;      /* block: src lines [b0, b1] */
+} RtxMeWin;
+
+static void rtx_me_drop(RtxMeWin *W) {
+    if (W && W->a.base) W->a.destroy();
+    if (W) *W = (RtxMeWin){0};
+}
+
+static char *rtx_me_alloc(RtxMeWin *W, size_t n) {
+    return (char *)cc_arena_alloc(W->a, n ? n : 1, 1);
+}
+
+/* Byte at `off` (0 past the end). */
+static char rtx_me_byte(const RtxDoc *d, size_t off) {
+    char c = 0;
+    size_t got;
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    if (!d || off >= d->len()) return 0;
+    got = d->read_at(off, cc_slice_from_buffer(&c, 1)) !>;
+    return got == 1 ? c : 0;
+}
+
+/* Start of the line holding `off`. Local backward read; a line longer
+ * than RTX_ME_SPAN_MAX answers (size_t)-1 (no context). */
+static size_t rtx_me_bol(const RtxDoc *d, size_t off) {
+    char tmp[256];
+    size_t at = off, got, k, n;
+    @errhandler(CCError e) {
+        (void)e;
+        return (size_t)-1;
+    }
+    while (at > 0) {
+        n = at > sizeof tmp ? sizeof tmp : at;
+        got = d->read_at(at - n, cc_slice_from_buffer(tmp, n)) !>;
+        if (got != n) return (size_t)-1;
+        for (k = n; k > 0; k--) {
+            if (tmp[k - 1] == '\n') return at - n + k;
+        }
+        at -= n;
+        if (off - at > RTX_ME_SPAN_MAX) return (size_t)-1;
+    }
+    return 0;
+}
+
+/* Read the window and split it into lines. [lo_bol, hi) must be inside. */
+static int !>(CCError) rtx_me_load(RtxMeWin *W, const RtxDoc *d, size_t lo_bol,
+                                  size_t hi) {
+    size_t len = d->len(), wlo, whi, i, s0, e0, nl, cap;
+    char[:] span;
+    *W = (RtxMeWin){0};
+    if (hi < lo_bol || hi - lo_bol > RTX_ME_SPAN_MAX) return cc_ok(0);
+    wlo = lo_bol > (size_t)RTX_MARKUP_LOOKBACK ? lo_bol - (size_t)RTX_MARKUP_LOOKBACK : 0;
+    whi = hi + RTX_ME_AHEAD;
+    if (whi > len || whi < hi) whi = len;
+    cap = 3 * (whi - wlo) + 8192;
+    W->a = cc_arena_heap(cap + (whi - wlo + 2) * (sizeof(RtxMeSrc) + 2 * sizeof(RtxMeV)));
+    if (!W->a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "md edit");
+    span = d->scratch_span(wlo, whi - wlo, W->a) !>(e) {
+        rtx_me_drop(W);
+        return cc_err(e);
+    };
+    W->buf = span.ptr;
+    W->n = span.len;
+    W->lo = wlo;
+    /* Whole lines only: drop a partial first / last line. */
+    s0 = 0;
+    if (wlo > 0) {
+        while (s0 < W->n && W->buf[s0] != '\n') s0++;
+        if (s0 < W->n) s0++;
+        if (wlo + s0 > lo_bol) s0 = lo_bol - wlo;
+    }
+    e0 = W->n;
+    if (whi < len) {
+        while (e0 > s0 && W->buf[e0 - 1] != '\n') e0--;
+        if (wlo + e0 < hi) e0 = W->n;
+    }
+    nl = 2;
+    for (i = s0; i < e0; i++) {
+        if (W->buf[i] == '\n') nl++;
+    }
+    W->src = (RtxMeSrc *)cc_arena_alloc(W->a, nl * sizeof(RtxMeSrc), 8);
+    W->vcap = nl + 8;
+    W->v = (RtxMeV *)cc_arena_alloc(W->a, W->vcap * sizeof(RtxMeV), 8);
+    if (!W->src || !W->v) {
+        rtx_me_drop(W);
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "md edit lines");
+    }
+    i = s0;
+    for (;;) {
+        size_t le = i;
+        RtxMeSrc *S = &W->src[W->ns++];
+        while (le < e0 && W->buf[le] != '\n') le++;
+        S->off = wlo + i;
+        S->s = W->buf + i;
+        S->len = le - i;
+        S->nl = le < e0;
+        S->cr = S->len && S->s[S->len - 1] == '\r';
+        rtx_md_line_parse(S->s, S->len, &S->L);
+        if (le >= e0) break;
+        i = le + 1;
+        if (i == e0) {
+            if (wlo + e0 == len) {
+                /* A newline at EOF: the empty last line is a line. */
+                RtxMeSrc *T = &W->src[W->ns++];
+                T->off = wlo + i;
+                T->s = W->buf + i;
+                T->len = 0;
+                T->nl = 0;
+                T->cr = 0;
+                rtx_md_line_parse(T->s, 0, &T->L);
+            }
+            break;
+        }
+    }
+    return cc_ok(1);
+}
+
+static long rtx_me_line_of(const RtxMeWin *W, size_t off) {
+    size_t i;
+    for (i = 0; i < W->ns; i++) {
+        size_t e = W->src[i].off + W->src[i].len;
+        if (off >= W->src[i].off && (off <= e)) return (long)i;
+    }
+    return -1;
+}
+
+/* Blank after the quote prefix too (a `>` alone is not a blank line of
+ * the list inside it, but it does not end it either). */
+static int rtx_me_empty(const RtxMdLine *L) {
+    return !L->kind && L->blank;
+}
+
+/* Block of list lines around [t0, t1]: up to a heading, a fence at the
+ * margin, another quote depth, or a paragraph after a blank line. */
+static void rtx_me_block(RtxMeWin *W, size_t t0, size_t t1) {
+    int depth = W->src[t0].L.qdepth;
+    size_t i = t0, j = t1;
+    while (i > 0) {
+        const RtxMdLine *P = &W->src[i - 1].L;
+        if (!rtx_me_empty(P) && P->qdepth != depth) break;
+        if (P->heading || (P->fence && P->ind == 0 && !P->kind)) break;
+        if (!P->kind && !rtx_me_empty(P) && P->ind == 0) {
+            /* Lazy continuation only right under a non-blank line. */
+            if (i < 2 || rtx_me_empty(&W->src[i - 2].L)) break;
+        }
+        i--;
+    }
+    while (j + 1 < W->ns) {
+        const RtxMdLine *N = &W->src[j + 1].L;
+        if (!rtx_me_empty(N) && N->qdepth != depth) break;
+        if (N->heading || (N->fence && N->ind == 0 && !N->kind)) break;
+        if (!N->kind && !rtx_me_empty(N) && N->ind == 0 &&
+            rtx_me_empty(&W->src[j].L))
+            break;
+        j++;
+    }
+    while (i < t0 && rtx_me_empty(&W->src[i].L)) i++;
+    while (j > t1 && rtx_me_empty(&W->src[j].L)) j--;
+    W->b0 = i;
+    W->b1 = j;
+}
+
+/* Virtual lines for the block: one per source line (text without `\r`). */
+static void rtx_me_virt(RtxMeWin *W) {
+    size_t i;
+    W->nv = 0;
+    for (i = W->b0; i <= W->b1 && W->nv < W->vcap; i++) {
+        RtxMeV *V = &W->v[W->nv++];
+        *V = (RtxMeV){0};
+        V->t = (char *)W->src[i].s;
+        V->n = W->src[i].len - (size_t)W->src[i].cr;
+        V->src = (int)i;
+        V->inst = -1;
+        V->L = W->src[i].L;
+    }
+}
+
+static long rtx_me_vof(const RtxMeWin *W, size_t src) {
+    size_t i;
+    for (i = 0; i < W->nv; i++) {
+        if ((size_t)W->v[i].src == src) return (long)i;
+    }
+    return -1;
+}
+
+static int rtx_me_set(RtxMeWin *W, RtxMeV *V, const char *a, size_t an,
+                      const char *b, size_t bn, const char *c, size_t cn) {
+    char *t = rtx_me_alloc(W, an + bn + cn);
+    if (!t) return 0;
+    if (an) memcpy(t, a, an);
+    if (bn) memcpy(t + an, b, bn);
+    if (cn) memcpy(t + an + bn, c, cn);
+    V->t = t;
+    V->n = an + bn + cn;
+    rtx_md_line_parse(V->t, V->n, &V->L);
+    return 1;
+}
+
+/* Insert a fresh virtual line after index `at`. */
+static RtxMeV *rtx_me_insert(RtxMeWin *W, size_t at) {
+    size_t k;
+    if (W->nv >= W->vcap) return NULL;
+    for (k = W->nv; k > at + 1; k--) W->v[k] = W->v[k - 1];
+    W->nv++;
+    W->v[at + 1] = (RtxMeV){0};
+    W->v[at + 1].src = W->v[at].src;
+    W->v[at + 1].fresh = 1;
+    W->v[at + 1].inst = -1;
+    return &W->v[at + 1];
+}
+
+static int rtx_me_same_list(const RtxMdLine *a, const RtxMdLine *b) {
+    if (a->kind != b->kind) return 0;
+    if (a->kind == RTX_MDL_BULLET) return a->bullet == b->bullet;
+    return a->delim == b->delim;
+}
+
+typedef struct {
+    size_t ind;
+    RtxMdLine L;     /* first item of the level (kind / bullet / delim) */
+    unsigned long first, last;
+    int count;
+    int inst;
+} RtxMeLvl;
+
+#define RTX_ME_LVLS 32
+#define RTX_ME_INST 1024
+
+/* Ordered lists count on: each level's number follows its previous
+ * sibling. A level whose first two original items share a number is
+ * lazy (`1.` `1.` `1.`) and keeps that number. An item this command moved
+ * into a new level starts it at 1. Two passes: the first decides lazy
+ * from original items only, the second writes. */
+static void rtx_me_renumber(RtxMeWin *W) {
+    RtxMeLvl lv[RTX_ME_LVLS];
+    signed char lazy[RTX_ME_INST];
+    int pass, ninst;
+    for (pass = 0; pass < 2; pass++) {
+        size_t i;
+        int nl = 0, prev_blank = 0;
+        char fch = 0;
+        size_t fn = 0;
+        ninst = 0;
+        if (pass == 0) {
+            for (i = 0; i < RTX_ME_INST; i++) lazy[i] = -1;
+        }
+        for (i = 0; i < W->nv; i++) {
+            RtxMeV *V = &W->v[i];
+            RtxMdLine *L = &V->L;
+            if (fch) {
+                if (L->fence == fch && L->fence_n >= fn && !L->fence_info) fch = 0;
+                continue;
+            }
+            if (L->fence && !L->kind) {
+                fch = L->fence;
+                fn = L->fence_n;
+                continue;
+            }
+            if (rtx_me_empty(L)) {
+                prev_blank = 1;
+                continue;
+            }
+            if (L->kind) {
+                while (nl > 0 && lv[nl - 1].ind > L->ind) nl--;
+                if (nl > 0 && lv[nl - 1].ind == L->ind &&
+                    rtx_me_same_list(&lv[nl - 1].L, L)) {
+                    RtxMeLvl *T = &lv[nl - 1];
+                    if (L->kind == RTX_MDL_ORDERED) {
+                        unsigned long want;
+                        if (pass == 0 && T->inst >= 0 && lazy[T->inst] < 0 &&
+                            !V->fresh && !V->moved)
+                            lazy[T->inst] = L->num == T->first ? 1 : 0;
+                        want = (T->inst >= 0 && lazy[T->inst] == 1) ? T->first
+                                                                     : T->last + 1;
+                        if (pass == 1 && L->num != want) {
+                            char dg[24];
+                            int dn = snprintf(dg, sizeof dg, "%lu", want);
+                            if (dn > 0 &&
+                                rtx_me_set(W, V, V->t, L->mlo, dg, (size_t)dn,
+                                           V->t + L->mhi - 1, V->n - (L->mhi - 1)))
+                                L = &V->L;
+                        }
+                        T->last = want;
+                    }
+                    T->count++;
+                    V->inst = T->inst;
+                } else {
+                    RtxMeLvl *T;
+                    if (nl > 0 && lv[nl - 1].ind == L->ind) nl--;
+                    if (nl >= RTX_ME_LVLS) nl = RTX_ME_LVLS - 1;
+                    T = &lv[nl++];
+                    T->ind = L->ind;
+                    T->L = *L;
+                    T->count = 1;
+                    T->inst = ninst < RTX_ME_INST ? ninst++ : -1;
+                    T->first = L->num;
+                    if (L->kind == RTX_MDL_ORDERED && V->moved) T->first = 1;
+                    if (pass == 1 && L->kind == RTX_MDL_ORDERED && L->num != T->first) {
+                        char dg[24];
+                        int dn = snprintf(dg, sizeof dg, "%lu", T->first);
+                        if (dn > 0)
+                            rtx_me_set(W, V, V->t, L->mlo, dg, (size_t)dn,
+                                       V->t + V->L.mhi - 1, V->n - (V->L.mhi - 1));
+                    }
+                    T->last = T->first;
+                    V->inst = T->inst;
+                }
+            } else if (L->ind == 0 && prev_blank) {
+                nl = 0;
+            }
+            prev_blank = 0;
+        }
+    }
+}
+
+/* Doc offset of (virtual line vi, column col) in the rewritten block. */
+static size_t rtx_me_pos(const RtxMeWin *W, size_t vi, size_t col) {
+    size_t pos = W->src[W->b0].off, i;
+    for (i = 0; i < W->nv; i++) {
+        const RtxMeV *V = &W->v[i];
+        const RtxMeSrc *S = &W->src[V->src];
+        int last = i + 1 >= W->nv || W->v[i + 1].src != V->src;
+        if (i == vi) return pos + (col > V->n ? V->n : col);
+        pos += V->n;
+        if (!last) pos += S->cr ? 2 : 1;
+        else pos += (size_t)S->cr + (size_t)S->nl;
+    }
+    return pos;
+}
+
+/* Rewrite the block: per source line, the joined virtual lines against
+ * the old bytes, trimmed to the changed middle. One group. */
+static size_t rtx_me_map(const RtxEdit *eds, size_t n, size_t x) {
+    size_t i;
+    ptrdiff_t acc = 0;
+    for (i = 0; i < n; i++) {
+        size_t o = eds[i].off, e = eds[i].off + eds[i].n;
+        if (x < o) break;
+        if (x < e) {
+            size_t in = x - o;
+            if (in > eds[i].ins.len) in = eds[i].ins.len;
+            return (size_t)((ptrdiff_t)o + acc) + in;
+        }
+        acc += (ptrdiff_t)eds[i].ins.len - (ptrdiff_t)eds[i].n;
+    }
+    return (size_t)((ptrdiff_t)x + acc);
+}
+
+/* `map`: caret / anc are pre-edit offsets carried through the sites (an
+ * insert at the offset lands before it); else they are final offsets. */
+static void !>(CCError) rtx_me_commit(RtxMeWin *W, RtxDoc *d, size_t caret,
+                                     size_t anc, int map) {
+    RtxEdit *eds;
+    size_t ne = 0, i, k;
+    eds = (RtxEdit *)cc_arena_alloc(W->a, (W->b1 - W->b0 + 2) * sizeof(RtxEdit), 8);
+    if (!eds) return cc_err(CC_ERR_OUT_OF_MEMORY, "md edit group");
+    i = 0;
+    while (i < W->nv) {
+        const RtxMeSrc *S = &W->src[W->v[i].src];
+        size_t j = i, tot = 0, o = 0, cp, cs, oldn, lim;
+        char *nw;
+        while (j < W->nv && W->v[j].src == W->v[i].src) {
+            tot += W->v[j].n + (S->cr ? 2 : 1);
+            j++;
+        }
+        nw = rtx_me_alloc(W, tot + 2);
+        if (!nw) return cc_err(CC_ERR_OUT_OF_MEMORY, "md edit line");
+        for (k = i; k < j; k++) {
+            if (W->v[k].n) memcpy(nw + o, W->v[k].t, W->v[k].n);
+            o += W->v[k].n;
+            if (S->cr) nw[o++] = '\r';
+            if (k + 1 < j) nw[o++] = '\n';
+        }
+        oldn = S->len;
+        cp = 0;
+        lim = oldn < o ? oldn : o;
+        while (cp < lim && S->s[cp] == nw[cp]) cp++;
+        cs = 0;
+        while (cs < lim - cp && S->s[oldn - 1 - cs] == nw[o - 1 - cs]) cs++;
+        if (cp != oldn || cp != o) {
+            eds[ne].off = S->off + cp;
+            eds[ne].n = oldn - cp - cs;
+            eds[ne].ins = cc_slice_from_buffer(nw + cp, o - cp - cs);
+            ne++;
+        }
+        i = j;
+    }
+    if (map) {
+        caret = rtx_me_map(eds, ne, caret);
+        anc = rtx_me_map(eds, ne, anc);
+    }
+    if (ne == 0) {
+        d->caret = caret;
+        d->sel_anchor = anc;
+        return cc_ok();
+    }
+    RtxDoc_break_coalesce(d);
+    d->replace_batch(eds, ne) !>(e) { return cc_err(e); };
+    RtxDoc_break_coalesce(d);
+    d->caret = caret;
+    d->sel_anchor = anc;
+    if (!d->hist.applying && d->hist.head > 0) {
+        RtxHistRec *r = &d->hist.recs[d->hist.head - 1];
+        r->caret_after = caret;
+        r->sel_after = anc;
+    }
+    return cc_ok();
+}
+
+/* Fence state at `bol`: 1 when that line is inside a fenced block (its
+ * body or its closer), scanning the window above. `open` (optional) is 1
+ * when the line itself opens one. */
+static int rtx_me_in_fence(const RtxMeWin *W, size_t line, int *open) {
+    size_t i;
+    char fch = 0;
+    size_t fn = 0;
+    if (open) *open = 0;
+    for (i = 0; i < line && i < W->ns; i++) {
+        const RtxMdLine *L = &W->src[i].L;
+        if (fch) {
+            if (L->fence == fch && L->fence_n >= fn && !L->fence_info) fch = 0;
+        } else if (L->fence) {
+            fch = L->fence;
+            fn = L->fence_n;
+        }
+    }
+    if (fch) return 1;
+    if (open && line < W->ns && W->src[line].L.fence) *open = 1;
+    return 0;
+}
+
+/* Previous list item above `line` at indent <= `ind` in the same quote. */
+static long rtx_me_prev_item(const RtxMeWin *W, size_t line, size_t ind, int lt) {
+    size_t i = line;
+    int depth = W->src[line].L.qdepth;
+    while (i > 0) {
+        const RtxMdLine *P = &W->src[--i].L;
+        if (rtx_me_empty(P)) continue;
+        if (P->qdepth != depth) return -1;
+        if (P->heading) return -1;
+        if (P->kind) {
+            if (lt ? P->ind < ind : P->ind <= ind) return (long)i;
+            continue;
+        }
+        if (P->ind == 0 && i > 0 && rtx_me_empty(&W->src[i - 1].L)) return -1;
+    }
+    return -1;
+}
+
+/* Indent (dir > 0) / outdent (dir < 0) width for list item `line`: nest
+ * under the previous sibling's content column, or back to the parent's
+ * indent. Fallback unit: 2 for bullets, the marker width for ordered. */
+static long rtx_me_indent_delta(const RtxMeWin *W, size_t line, int dir) {
+    const RtxMdLine *L = &W->src[line].L;
+    long p;
+    size_t unit = L->kind == RTX_MDL_ORDERED ? L->chi - L->mlo : 2;
+    if (unit < 2) unit = 2;
+    if (dir > 0) {
+        p = rtx_me_prev_item(W, line, L->ind, 0);
+        if (p >= 0) {
+            const RtxMdLine *P = &W->src[(size_t)p].L;
+            if (P->ind == L->ind) {
+                size_t col = P->chi - P->qhi;
+                if (col > L->ind) return (long)(col - L->ind);
+            }
+        }
+        return (long)unit;
+    }
+    if (L->ind == 0) return 0;
+    p = rtx_me_prev_item(W, line, L->ind, 1);
+    if (p >= 0) return -(long)(L->ind - W->src[(size_t)p].L.ind);
+    return -(long)(L->ind < unit ? L->ind : unit);
+}
+
+/* Shift one virtual line's indent (after its quote prefix) by delta. */
+static void rtx_me_shift(RtxMeWin *W, RtxMeV *V, long delta) {
+    size_t q = V->L.qhi, ws = V->L.ind, cut;
+    char sp[64];
+    if (delta > 0) {
+        size_t k, dn = (size_t)delta > sizeof sp ? sizeof sp : (size_t)delta;
+        for (k = 0; k < dn; k++) sp[k] = ' ';
+        rtx_me_set(W, V, V->t, q, sp, dn, V->t + q, V->n - q);
+        return;
+    }
+    cut = (size_t)(-delta);
+    /* A tab counts as reaching the next multiple of four. */
+    {
+        size_t col = 0, k = 0;
+        while (k < ws && col < cut) {
+            col = V->t[q + k] == '\t' ? (col / 4 + 1) * 4 : col + 1;
+            k++;
+        }
+        cut = k;
+    }
+    if (cut) rtx_me_set(W, V, V->t, q, NULL, 0, V->t + q + cut, V->n - q - cut);
+}
+
+static int rtx_buf_md_ok(const RtxBuf *b) {
+    return b && !rtx_layout_is_hex(&b->layout) && !rtx_layout_is_grid(&b->layout) &&
+           !b->doc.sel_box && RtxDoc_is_markup(&b->doc);
+}
+
+/* Tab / Shift-Tab over list items. 1 = handled (edited or refused with
+ * no change), 0 = not a list line (caller inserts a tab). */
+static int !>(CCError) rtx_buf_list_indent(RtxBuf *b, int dir) {
+    RtxDoc *d = &b->doc;
+    RtxMeWin W = {0};
+    size_t lo = d->sel_lo(), hi = d->sel_hi(), bol, t0, t1, i, prim;
+    long lt0, lt1, delta;
+    int any = 0, ok;
+    if (!rtx_buf_md_ok(b)) return cc_ok(0);
+    bol = rtx_me_bol(d, lo);
+    if (bol == (size_t)-1) return cc_ok(0);
+    if (hi > lo && rtx_me_byte(d, hi - 1) == '\n') hi--;
+    ok = rtx_me_load(&W, d, bol, hi) !>(e) { return cc_err(e); };
+    if (!ok) return cc_ok(0);
+    lt0 = rtx_me_line_of(&W, lo);
+    lt1 = rtx_me_line_of(&W, hi);
+    if (lt0 < 0 || lt1 < lt0 || rtx_me_in_fence(&W, (size_t)lt0, NULL)) {
+        rtx_me_drop(&W);
+        return cc_ok(0);
+    }
+    t0 = (size_t)lt0;
+    t1 = (size_t)lt1;
+    prim = t1 + 1;
+    for (i = t0; i <= t1; i++) {
+        if (W.src[i].L.kind) {
+            if (prim > t1) prim = i;
+            any = 1;
+        }
+    }
+    if (!any) {
+        rtx_me_drop(&W);
+        return cc_ok(0);
+    }
+    delta = rtx_me_indent_delta(&W, prim, dir);
+    if (delta == 0) {
+        rtx_me_drop(&W);
+        return cc_ok(1);
+    }
+    rtx_me_block(&W, t0, t1);
+    rtx_me_virt(&W);
+    for (i = t0; i <= t1; i++) {
+        long vi = rtx_me_vof(&W, i);
+        RtxMeV *V;
+        if (vi < 0) continue;
+        V = &W.v[vi];
+        if (rtx_me_empty(&V->L)) continue;
+        rtx_me_shift(&W, V, delta);
+        if (V->L.kind) V->moved = 1;
+    }
+    rtx_me_renumber(&W);
+    rtx_me_commit(&W, d, d->caret, d->sel_anchor, 1) !>(e) {
+        rtx_me_drop(&W);
+        return cc_err(e);
+    };
+    rtx_me_drop(&W);
+    return cc_ok(1);
+}
+
+/* Insert at the caret (replacing the selection) as one record. */
+static void !>(CCError) rtx_buf_insert_plain(RtxBuf *b, char[:] bytes) {
+    if (rtx_buf_rich(b) && b->doc.has_sel() && !b->doc.sel_box)
+        return rtx_buf_pair_replace(b, b->doc.sel_lo(), b->doc.sel_hi(), bytes);
+    return b->doc.type(bytes);
+}
+
+/* Enter / Shift-Enter in a Markdown document. 1 = handled. */
+static int !>(CCError) rtx_buf_md_enter(RtxBuf *b, int soft) {
+    RtxDoc *d = &b->doc;
+    RtxMeWin W = {0};
+    size_t lo = d->sel_lo(), hi = d->sel_hi(), bol, line, pcol, hcol, vi;
+    const RtxMdLine *L;
+    long lt;
+    int ok, opens = 0;
+    char pre[RTX_ME_LINE_MAX];
+    size_t pn = 0;
+    if (!rtx_buf_md_ok(b)) return cc_ok(0);
+    bol = rtx_me_bol(d, lo);
+    if (bol == (size_t)-1) return cc_ok(0);
+    if (hi - bol > RTX_ME_LINE_MAX) return cc_ok(0);
+    ok = rtx_me_load(&W, d, bol, hi) !>(e) { return cc_err(e); };
+    if (!ok) return cc_ok(0);
+    lt = rtx_me_line_of(&W, lo);
+    if (lt < 0 || rtx_me_line_of(&W, hi) != lt) {
+        rtx_me_drop(&W);
+        return cc_ok(0);
+    }
+    line = (size_t)lt;
+    L = &W.src[line].L;
+    pcol = lo - W.src[line].off;
+    hcol = hi - W.src[line].off;
+    if (pcol > L->n) pcol = L->n;
+    if (hcol > L->n) hcol = L->n;
+    /* Fenced code: keep this line's indent (quote prefix included). */
+    if (rtx_me_in_fence(&W, line, &opens) || opens) {
+        size_t k = 0;
+        const char *s = W.src[line].s;
+        while (k < L->n && k < pcol && k < sizeof pre - 2 &&
+               (s[k] == ' ' || s[k] == '\t' || (k < L->qhi))) {
+            pre[k] = s[k];
+            k++;
+        }
+        rtx_me_drop(&W);
+        {
+            char nl[RTX_ME_LINE_MAX + 2];
+            nl[0] = '\n';
+            if (k) memcpy(nl + 1, pre, k);
+            rtx_buf_insert_plain(b, cc_slice_from_buffer(nl, k + 1)) !>(e) {
+                return cc_err(e);
+            };
+        }
+        return cc_ok(1);
+    }
+    if (L->heading || (!L->kind && !L->qdepth) || (pcol == 0 && hcol == 0)) {
+        rtx_me_drop(&W);
+        return cc_ok(0);
+    }
+    /* A caret inside the markers stands at the content start. */
+    if (lo == hi && pcol < L->clo && pcol > 0) {
+        pcol = hcol = L->clo;
+    }
+    rtx_me_block(&W, line, line);
+    rtx_me_virt(&W);
+    vi = (size_t)rtx_me_vof(&W, line);
+    /* Enter on an empty item / quote line leaves the container. */
+    if (!soft && L->blank && pcol >= L->clo) {
+        RtxMeV *V = &W.v[vi];
+        if (L->kind && L->ind > 0) {
+            long delta = rtx_me_indent_delta(&W, line, -1);
+            rtx_me_shift(&W, V, delta);
+            V->moved = 1;
+        } else if (L->kind) {
+            size_t q = L->qhi;
+            rtx_me_set(&W, V, V->t, q, NULL, 0, NULL, 0);
+        } else {
+            /* Quote only: drop the innermost `>`. */
+            size_t g = L->qhi;
+            while (g > 0 && V->t[g - 1] != '>') g--;
+            if (g > 0) g--;
+            if (L->qdepth <= 1) g = 0;
+            rtx_me_set(&W, V, V->t, g, NULL, 0, NULL, 0);
+        }
+        rtx_me_renumber(&W);
+        rtx_me_commit(&W, d, rtx_me_pos(&W, vi, W.v[vi].n),
+                      rtx_me_pos(&W, vi, W.v[vi].n), 0) !>(e) {
+            rtx_me_drop(&W);
+            return cc_err(e);
+        };
+        rtx_me_drop(&W);
+        return cc_ok(1);
+    }
+    /* Continuation prefix: the quote bytes, the indent, then the marker
+     * (next number, a fresh `[ ]`) — or, soft, spaces to the content. */
+    {
+        const char *s = W.src[line].s;
+        size_t k, after, an;
+        RtxMeV *V, *F;
+        if (L->chi > sizeof pre - 16) {
+            rtx_me_drop(&W);
+            return cc_ok(0);
+        }
+        memcpy(pre, s, L->qhi + L->ind);
+        pn = L->qhi + L->ind;
+        if (L->kind && soft) {
+            for (k = L->mlo; k < L->chi; k++) pre[pn++] = ' ';
+            if (L->chi == L->mhi) pre[pn++] = ' ';
+        } else if (L->kind == RTX_MDL_BULLET) {
+            pre[pn++] = L->bullet;
+            for (k = L->mhi; k < L->chi; k++) pre[pn++] = s[k];
+            if (L->chi == L->mhi) pre[pn++] = ' ';
+        } else if (L->kind == RTX_MDL_ORDERED) {
+            int dn = snprintf(pre + pn, 24, "%lu", L->num + 1);
+            if (dn > 0) pn += (size_t)dn;
+            pre[pn++] = L->delim;
+            for (k = L->mhi; k < L->chi; k++) pre[pn++] = s[k];
+            if (L->chi == L->mhi) pre[pn++] = ' ';
+        }
+        if (L->kind && !soft && L->task) {
+            memcpy(pre + pn, "[ ] ", 4);
+            pn += 4;
+        }
+        after = hcol;
+        while (after < L->n && (s[after] == ' ' || s[after] == '\t')) after++;
+        an = L->n - after;
+        V = &W.v[vi];
+        F = rtx_me_insert(&W, vi);
+        if (!F) {
+            rtx_me_drop(&W);
+            return cc_ok(0);
+        }
+        V = &W.v[vi];
+        rtx_me_set(&W, F, pre, pn, s + after, an, NULL, 0);
+        rtx_me_set(&W, V, s, pcol, NULL, 0, NULL, 0);
+        /* A lazy `1.` `1.` list keeps its number. */
+        if (L->kind == RTX_MDL_ORDERED) {
+            long p = rtx_me_prev_item(&W, line, L->ind, 0);
+            int lazy = p >= 0 && W.src[(size_t)p].L.kind == RTX_MDL_ORDERED &&
+                       W.src[(size_t)p].L.ind == L->ind &&
+                       W.src[(size_t)p].L.num == L->num;
+            if (!lazy) {
+                size_t q;
+                for (q = line + 1; q < W.ns && q <= W.b1; q++) {
+                    const RtxMdLine *N = &W.src[q].L;
+                    if (rtx_me_empty(N)) continue;
+                    if (N->kind == RTX_MDL_ORDERED && N->ind == L->ind) {
+                        lazy = N->num == L->num;
+                        break;
+                    }
+                    if (N->kind && N->ind < L->ind) break;
+                    if (!N->kind && N->ind == 0) break;
+                }
+            }
+            if (lazy) {
+                char dg[24];
+                int dn = snprintf(dg, sizeof dg, "%lu", L->num);
+                if (dn > 0)
+                    rtx_me_set(&W, F, F->t, F->L.mlo, dg, (size_t)dn,
+                               F->t + F->L.mhi - 1, F->n - (F->L.mhi - 1));
+            }
+        }
+        if (!soft) rtx_me_renumber(&W);
+        {
+            /* Renumbering may widen the prefix; the moved text is `an`. */
+            size_t col = W.v[vi + 1].n >= an ? W.v[vi + 1].n - an : 0;
+            size_t at = rtx_me_pos(&W, vi + 1, col);
+            rtx_me_commit(&W, d, at, at, 0) !>(e) {
+                rtx_me_drop(&W);
+                return cc_err(e);
+            };
+        }
+    }
+    rtx_me_drop(&W);
+    return cc_ok(1);
+}
+
+/* ---- Auto-pairs (docs/md_view.md, Editing). A typed opener inserts its
+ * closer when a selection exists (wrap) or at a word boundary; typing a
+ * closer right before the one it auto-inserted steps over it; Backspace
+ * between an empty auto pair deletes both. The auto closers form one run
+ * [ap_lo, ap_hi) in front of the caret, valid only while nothing else
+ * edited the document (ap_gen) and the caret sits at ap_lo. */
+
+static int rtx_ap_valid(const RtxBuf *b) {
+    return b && b->ap_on && b->ap_gen == b->doc.edit_gen &&
+           b->doc.caret == b->ap_lo && !b->doc.has_sel() &&
+           b->ap_lo < b->ap_hi && b->ap_hi <= b->doc.len();
+}
+
+static void rtx_ap_note(RtxBuf *b, size_t lo, size_t hi) {
+    b->ap_open = (size_t)-1;
+    b->ap_on = lo < hi;
+    b->ap_lo = lo;
+    b->ap_hi = hi;
+    b->ap_gen = b->doc.edit_gen;
+}
+
+/* After a plain edit at the caret: keep the run in front of it. */
+static void rtx_ap_follow(RtxBuf *b, int trk, size_t c0, size_t n0) {
+    size_t c1 = b->doc.caret, n1 = b->doc.len();
+    long dc = (long)c1 - (long)c0, dn = (long)n1 - (long)n0;
+    if (!trk) return;
+    if (dc != dn || b->doc.has_sel()) {
+        b->ap_on = 0;
+        return;
+    }
+    rtx_ap_note(b, (size_t)((long)b->ap_lo + dc), (size_t)((long)b->ap_hi + dc));
+}
+
+static const char *rtx_ap_table(const RtxBuf *b, int *md) {
+    const char *t;
+    *md = 0;
+    if (!g_rtx_autopair || !b) return "";
+    if (rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout)) return "";
+    t = RtxDoc_autopairs(&b->doc);
+    *md = RtxDoc_is_markup(&b->doc);
+    return t ? t : "";
+}
+
+int RtxBuf_autopair_live(const RtxBuf *b) {
+    int md;
+    return rtx_ap_table(b, &md)[0] != 0;
+}
+
+static int rtx_ap_ws(char c) {
+    return c == 0 || c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static int rtx_ap_emph(char c) {
+    return c == '*' || c == '_' || c == '~';
+}
+
+/* Wrap the selection in o…c. Markdown emphasis wraps each line's text
+ * (trimmed); brackets / quotes wrap the whole range. The text stays
+ * selected, so a second `*` makes it bold. */
+static void !>(CCError) rtx_ap_wrap(RtxBuf *b, char o, char c, int per_line) {
+    RtxDoc *d = &b->doc;
+    size_t lo = d->sel_lo(), hi = d->sel_hi(), n = hi - lo, i, ne = 0, s0 = 0, e0 = 0;
+    CCArena a = {0};
+    char *buf;
+    RtxEdit *eds;
+    char oc[2];
+    int fwd = d->caret >= d->sel_anchor;
+    @errhandler(CCError e) {
+        if (a.base) a.destroy();
+        return cc_err(e);
+    }
+    if (n > RTX_ME_SPAN_MAX) return cc_ok();
+    oc[0] = o;
+    oc[1] = c;
+    a = cc_arena_heap(n + 64 + (n + 2) * sizeof(RtxEdit));
+    if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "wrap");
+    buf = (char *)cc_arena_alloc(a, n + 1, 1);
+    eds = (RtxEdit *)cc_arena_alloc(a, (n + 2) * sizeof(RtxEdit), 8);
+    if (!buf || !eds) {
+        a.destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "wrap");
+    }
+    {
+        size_t got = d->read_at(lo, cc_slice_from_buffer(buf, n)) !>;
+        if (got != n) {
+            a.destroy();
+            return cc_err(CC_ERR_INTERNAL, "wrap read");
+        }
+    }
+    i = 0;
+    while (i < n) {
+        size_t le = i, s, e;
+        if (per_line) {
+            while (le < n && buf[le] != '\n') le++;
+        } else {
+            le = n;
+        }
+        s = i;
+        e = le;
+        if (per_line) {
+            while (s < e && (buf[s] == ' ' || buf[s] == '\t')) s++;
+            while (e > s && rtx_ap_ws(buf[e - 1])) e--;
+        } else {
+            while (s < e && rtx_ap_ws(buf[s])) s++;
+            while (e > s && rtx_ap_ws(buf[e - 1])) e--;
+        }
+        if (e > s) {
+            if (ne == 0) s0 = lo + s;
+            e0 = lo + e;
+            eds[ne++] = (RtxEdit){ .off = lo + s, .n = 0, .ins = cc_slice_from_buffer(oc, 1) };
+            eds[ne++] = (RtxEdit){ .off = lo + e, .n = 0, .ins = cc_slice_from_buffer(oc + 1, 1) };
+        }
+        i = le + 1;
+    }
+    if (ne == 0) {
+        a.destroy();
+        return cc_ok();
+    }
+    d->break_coalesce();
+    d->replace_batch(eds, ne) !>;
+    d->break_coalesce();
+    {
+        size_t na = s0 + 1, nc = e0 + (ne - 1);
+        d->caret = fwd ? nc : na;
+        d->sel_anchor = fwd ? na : nc;
+        if (!d->hist.applying && d->hist.head > 0) {
+            RtxHistRec *r = &d->hist.recs[d->hist.head - 1];
+            r->caret_after = d->caret;
+            r->sel_after = d->sel_anchor;
+        }
+    }
+    a.destroy();
+    b->ap_on = 0;
+    return cc_ok();
+}
+
+/* Only whitespace and `>` between BOL and `c` (a list / quote marker
+ * position, where `*` / `_` / `-` start a bullet or a rule, not a mark). */
+static int rtx_ap_line_head(const RtxDoc *d, size_t c) {
+    size_t k = 0;
+    while (k < 64 && c > 0) {
+        char x = rtx_me_byte(d, c - 1);
+        if (x == '\n') return 1;
+        if (x != ' ' && x != '\t' && x != '>') return 0;
+        c--;
+        k++;
+    }
+    return c == 0;
+}
+
+/* 1 = handled (pair inserted, stepped over, or selection wrapped). */
+static int !>(CCError) rtx_buf_autopair(RtxBuf *b, char ch) {
+    RtxDoc *d = &b->doc;
+    const char *tab;
+    int md, i, oi = -1, ci = -1, trk, nest;
+    size_t c, len;
+    char prev, next;
+    if (d->sel_box) return cc_ok(0);
+    tab = rtx_ap_table(b, &md);
+    if (!tab[0]) return cc_ok(0);
+    if (!memchr(tab, ch, cc_slice_cstr(tab).len) && !memchr("()[]{}\"'`", ch, 9))
+        return cc_ok(0);
+    if (md) {
+        /* Inside a fence, code pairs. */
+        RtxMeWin W = {0};
+        size_t bol = rtx_me_bol(d, d->sel_lo());
+        int ok, in = 0;
+        if (bol != (size_t)-1) {
+            ok = rtx_me_load(&W, d, bol, bol) !>(e) { return cc_err(e); };
+            if (ok) {
+                long lt = rtx_me_line_of(&W, bol);
+                in = lt >= 0 && rtx_me_in_fence(&W, (size_t)lt, NULL);
+                rtx_me_drop(&W);
+            }
+        }
+        if (in) {
+            tab = "()[]{}\"\"''``";
+            md = 0;
+        }
+    }
+    for (i = 0; tab[i] && tab[i + 1]; i += 2) {
+        if (tab[i] == ch && oi < 0) oi = i;
+        if (tab[i + 1] == ch && ci < 0) ci = i;
+    }
+    if (oi < 0 && ci < 0) return cc_ok(0);
+    if (d->has_sel()) {
+        if (oi < 0) return cc_ok(0);
+        rtx_ap_wrap(b, tab[oi], tab[oi + 1], md && (rtx_ap_emph(ch) || ch == '`')) !>(e) {
+            return cc_err(e);
+        };
+        return cc_ok(1);
+    }
+    c = d->caret;
+    len = d->len();
+    prev = c > 0 ? rtx_me_byte(d, c - 1) : 0;
+    next = c < len ? rtx_me_byte(d, c) : 0;
+    trk = rtx_ap_valid(b);
+    nest = trk && c == b->ap_open && md && rtx_ap_emph(ch) && prev == ch &&
+           next == ch && oi >= 0 && tab[oi] == tab[oi + 1];
+    if (trk && ci >= 0 && next == ch) {
+        /* `*|*` + `*` nests (`**|**`) — the start of bold; else step over. */
+        if (!nest) {
+            d->break_coalesce();
+            d->caret = c + 1;
+            d->sel_anchor = c + 1;
+            rtx_ap_note(b, c + 1, b->ap_hi);
+            return cc_ok(1);
+        }
+    }
+    if (oi < 0) return cc_ok(0);
+    {
+        char o = tab[oi], cl = tab[oi + 1];
+        int sym = o == cl;
+        int next_ok = rtx_ap_ws(next) || next == ')' || next == ']' || next == '}' ||
+                      (!sym && (next == ',' || next == ';' || next == ':' || next == '.'));
+        int prev_ok = c == 0 || rtx_ap_ws(prev) || prev == '(' || prev == '[' ||
+                      prev == '{';
+        char pr[2];
+        if (!nest) {
+            if (!next_ok) return cc_ok(0);
+            if (sym && !prev_ok) return cc_ok(0);
+            if (sym && md && rtx_ap_emph(ch) && rtx_ap_line_head(d, c)) return cc_ok(0);
+        }
+        if (md && o == '(' && prev != ']') return cc_ok(0);
+        pr[0] = o;
+        pr[1] = cl;
+        d->break_coalesce();
+        d->replace(c, 0, cc_slice_from_buffer(pr, 2)) !>(e) { return cc_err(e); };
+        d->break_coalesce();
+        d->caret = c + 1;
+        d->sel_anchor = c + 1;
+        if (!d->hist.applying && d->hist.head > 0) {
+            RtxHistRec *r = &d->hist.recs[d->hist.head - 1];
+            r->caret_after = c + 1;
+            r->sel_after = c + 1;
+        }
+        if (trk && c == b->ap_lo) rtx_ap_note(b, c + 1, b->ap_hi + 2);
+        else rtx_ap_note(b, c + 1, c + 2);
+        b->ap_open = c + 1; /* an empty pair: `*` here nests (`**|**`) */
+    }
+    return cc_ok(1);
+}
+
+/* Backspace between an auto pair: both go. 1 = handled. */
+static int !>(CCError) rtx_buf_autopair_bs(RtxBuf *b) {
+    RtxDoc *d = &b->doc;
+    const char *tab;
+    int md, i;
+    size_t c = d->caret;
+    char prev, next;
+    if (!rtx_ap_valid(b) || c == 0) return cc_ok(0);
+    tab = rtx_ap_table(b, &md);
+    prev = rtx_me_byte(d, c - 1);
+    next = rtx_me_byte(d, c);
+    for (i = 0; tab[i] && tab[i + 1]; i += 2) {
+        if (tab[i] == prev && tab[i + 1] == next) break;
+    }
+    if (!tab[i] || !tab[i + 1]) {
+        /* The fence table (``` inside a fence) is not the doc's. */
+        const char *code = "()[]{}\"\"''``";
+        for (i = 0; code[i]; i += 2) {
+            if (code[i] == prev && code[i + 1] == next) break;
+        }
+        if (!code[i]) return cc_ok(0);
+    }
+    d->break_coalesce();
+    d->replace(c - 1, 2, cc_slice_empty()) !>(e) { return cc_err(e); };
+    d->break_coalesce();
+    d->caret = c - 1;
+    d->sel_anchor = c - 1;
+    rtx_ap_note(b, c - 1, b->ap_hi - 2);
+    return cc_ok(1);
+}
+
+/* ---- Smart paste. A URL pasted over a one-line selection in a Markdown
+ * document becomes `[selection](url)` (one undo step). Multi-line text
+ * pasted on a block-quote line gets the quote prefix on each new line. */
+
+static int rtx_paste_is_url(const char *s, size_t n) {
+    size_t i, k;
+    static const char *const sch[] = {"http://", "https://", "ftp://", "file://",
+                                      "mailto:", NULL};
+    if (!s || n < 8 || n > 4096) return 0;
+    for (i = 0; i < n; i++) {
+        if ((unsigned char)s[i] <= ' ' || s[i] == '<' || s[i] == '>' ||
+            s[i] == '"' || s[i] == '`')
+            return 0;
+    }
+    for (k = 0; sch[k]; k++) {
+        size_t sl = cc_slice_cstr(sch[k]).len;
+        if (n > sl && strncmp(s, sch[k], sl) == 0) return 1;
+    }
+    return 0;
+}
+
+void !>(CCError) RtxBuf_paste_text(RtxBuf *b, char[:] bytes) {
+    RtxDoc *d;
+    size_t s = 0, e;
+    @errhandler(CCError er) {
+        return cc_err(er);
+    }
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "paste");
+    d = &b->doc;
+    if (!bytes.ptr || bytes.len == 0) return cc_ok();
+    b->ap_on = 0;
+    e = bytes.len;
+    while (s < e && rtx_ap_ws(bytes.ptr[s])) s++;
+    while (e > s && rtx_ap_ws(bytes.ptr[e - 1])) e--;
+    if (rtx_buf_md_ok(b) && d->has_sel() &&
+        rtx_paste_is_url(bytes.ptr + s, e - s)) {
+        size_t lo = d->sel_lo(), hi = d->sel_hi(), k;
+        int one = hi - lo <= RTX_ME_LINE_MAX;
+        for (k = lo; one && k < hi; k++) {
+            char x = rtx_me_byte(d, k);
+            if (x == '\n') one = 0;
+        }
+        while (one && lo < hi && rtx_ap_ws(rtx_me_byte(d, lo))) lo++;
+        while (one && hi > lo && rtx_ap_ws(rtx_me_byte(d, hi - 1))) hi--;
+        if (one && hi > lo) {
+            CCArena a = cc_arena_heap(e - s + 64) @destroy;
+            char *tail;
+            RtxEdit eds[2];
+            if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "paste");
+            tail = (char *)cc_arena_alloc(a, e - s + 3, 1);
+            if (!tail) return cc_err(CC_ERR_OUT_OF_MEMORY, "paste");
+            tail[0] = ']';
+            tail[1] = '(';
+            memcpy(tail + 2, bytes.ptr + s, e - s);
+            tail[2 + e - s] = ')';
+            eds[0] = (RtxEdit){ .off = lo, .n = 0, .ins = cc_slice_from_buffer((void *)"[", 1) };
+            eds[1] = (RtxEdit){ .off = hi, .n = 0,
+                                .ins = cc_slice_from_buffer(tail, e - s + 3) };
+            d->break_coalesce();
+            d->replace_batch(eds, 2) !>;
+            d->break_coalesce();
+            d->caret = hi + 1 + e - s + 3;
+            d->sel_anchor = d->caret;
+            if (!d->hist.applying && d->hist.head > 0) {
+                RtxHistRec *r = &d->hist.recs[d->hist.head - 1];
+                r->caret_after = d->caret;
+                r->sel_after = d->caret;
+            }
+            return cc_ok();
+        }
+    }
+    /* Quote continuation: `> ` on every pasted line after the first. */
+    if (rtx_buf_md_ok(b) && memchr(bytes.ptr, '\n', bytes.len)) {
+        size_t lo = d->sel_lo(), bol = rtx_me_bol(d, lo);
+        char head[256];
+        RtxMdLine L;
+        size_t hn = 0;
+        if (bol != (size_t)-1 && lo - bol < sizeof head) {
+            hn = d->read_at(bol, cc_slice_from_buffer(head, lo - bol)) !>;
+            rtx_md_line_parse(head, hn, &L);
+            if (L.qdepth > 0 && !L.kind && hn >= L.qhi) {
+                size_t k, nl = 0, o = 0;
+                CCArena a = {0} @destroy;
+                char *out;
+                for (k = 0; k < bytes.len; k++) {
+                    if (bytes.ptr[k] == '\n') nl++;
+                }
+                a = cc_arena_heap(bytes.len + nl * L.qhi + 64);
+                if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "paste");
+                out = (char *)cc_arena_alloc(a, bytes.len + nl * L.qhi + 1, 1);
+                if (!out) return cc_err(CC_ERR_OUT_OF_MEMORY, "paste");
+                for (k = 0; k < bytes.len; k++) {
+                    out[o++] = bytes.ptr[k];
+                    if (bytes.ptr[k] == '\n' && k + 1 < bytes.len) {
+                        memcpy(out + o, head, L.qhi);
+                        o += L.qhi;
+                    }
+                }
+                d->break_coalesce();
+                rtx_buf_insert_plain(b, cc_slice_from_buffer(out, o)) !>;
+                d->break_coalesce();
+                return cc_ok();
+            }
+        }
+    }
+    d->break_coalesce();
+    d->type(bytes) !>;
+    d->break_coalesce();
+    return cc_ok();
+}
+
+/* ---- Tab: grid / Rich table cells keep their own meaning; list items
+ * nest; anything else inserts a tab (or `--tab-spaces` spaces) and
+ * Shift-Tab takes one indent unit off the line. */
+int !>(CCError) RtxBuf_tab(RtxBuf *b, int dir) {
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "tab");
+    if (rtx_layout_is_hex(&b->layout)) return cc_ok(0);
+    if (rtx_layout_is_grid(&b->layout)) {
+        b->move_grid_col(dir < 0 ? -1 : 1) !>;
+        return cc_ok(0);
+    }
+    if (rtx_buf_in_md_table(b)) {
+        size_t n0 = b->len();
+        b->move_md_col(dir < 0 ? -1 : 1) !>;
+        return cc_ok(b->len() != n0);
+    }
+    b->ap_on = 0;
+    if (rtx_buf_list_indent(b, dir < 0 ? -1 : 1) !>) return cc_ok(1);
+    if (dir < 0) {
+        /* Outdent this line by one tab / unit. */
+        RtxDoc *d = &b->doc;
+        size_t bol = rtx_me_bol(d, d->caret), k = 0, unit;
+        if (bol == (size_t)-1 || d->has_sel()) return cc_ok(0);
+        unit = g_rtx_tab_spaces ? (size_t)g_rtx_tab_spaces : 4;
+        if (rtx_me_byte(d, bol) == '\t') k = 1;
+        else {
+            while (k < unit && rtx_me_byte(d, bol + k) == ' ') k++;
+        }
+        if (!k) return cc_ok(0);
+        {
+            size_t c = d->caret;
+            d->break_coalesce();
+            d->replace(bol, k, cc_slice_empty()) !>;
+            d->break_coalesce();
+            d->caret = c >= bol + k ? c - k : bol;
+            d->sel_anchor = d->caret;
+        }
+        return cc_ok(1);
+    }
+    if (g_rtx_tab_spaces > 0) {
+        char sp[16];
+        size_t k, n = (size_t)g_rtx_tab_spaces;
+        for (k = 0; k < n; k++) sp[k] = ' ';
+        rtx_buf_insert_plain(b, cc_slice_from_buffer(sp, n)) !>;
+        return cc_ok(1);
+    }
+    b->type_cp((uint32_t)'\t') !>;
+    return cc_ok(1);
+}
+
+/* ---- Markdown table commands (Apply menu while the caret is in a
+ * table; each one undo step). The table is found from the bytes around
+ * the caret (rtx_md_table_cover over the window), in Source and Rich. */
+
+typedef struct {
+    RtxMeWin W;
+    RtxMdTable t;      /* offsets into W.buf */
+    size_t l0, l1;     /* src lines of the table */
+    size_t cl;         /* caret line */
+    int col;           /* caret column (0-based) */
+} RtxMeTable;
+
+static int rtx_tbl_col_of(const char *s, size_t n, size_t rel, int ncols) {
+    int c = rtx_md_row_col_at(s, n, rel, ncols);
+    if (c < 0 && rel + 1 <= n) c = rtx_md_row_col_at(s, n, rel + 1, ncols);
+    if (c < 0 && rel > 0) c = rtx_md_row_col_at(s, n, rel - 1, ncols);
+    if (c < 0) c = 0;
+    if (c >= ncols) c = ncols - 1;
+    return c;
+}
+
+static int !>(CCError) rtx_tbl_find(const RtxBuf *b, RtxMeTable *T) {
+    const RtxDoc *d = &b->doc;
+    size_t bol = rtx_me_bol(d, d->caret), i;
+    long lt;
+    int ok;
+    *T = (RtxMeTable){0};
+    if (bol == (size_t)-1) return cc_ok(0);
+    ok = rtx_me_load(&T->W, d, bol, bol) !>(e) { return cc_err(e); };
+    if (!ok) return cc_ok(0);
+    if (!rtx_md_table_cover(T->W.buf, T->W.n, bol - T->W.lo, &T->t)) {
+        rtx_me_drop(&T->W);
+        return cc_ok(0);
+    }
+    lt = rtx_me_line_of(&T->W, bol);
+    if (lt < 0) {
+        rtx_me_drop(&T->W);
+        return cc_ok(0);
+    }
+    T->cl = (size_t)lt;
+    T->l0 = T->l1 = T->cl;
+    for (i = 0; i < T->W.ns; i++) {
+        size_t o = T->W.src[i].off - T->W.lo;
+        if (o == T->t.lo) T->l0 = i;
+        if (o < T->t.hi) T->l1 = i;
+    }
+    {
+        const RtxMeSrc *S = &T->W.src[T->cl];
+        T->col = rtx_tbl_col_of(S->s, S->len - (size_t)S->cr, d->caret - S->off,
+                                T->t.ncols);
+    }
+    return cc_ok(1);
+}
+
+int RtxBuf_in_table(const RtxBuf *b) {
+    RtxMeTable T;
+    int ok;
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    if (!b || rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout))
+        return 0;
+    if (!RtxDoc_is_markup(&b->doc)) return 0;
+    ok = rtx_tbl_find(b, &T) !>;
+    if (ok) rtx_me_drop(&T.W);
+    return ok;
+}
+
+/* Rebuild one row with column `c` inserted (op 0), deleted (1), or
+ * swapped with c + 1 (2). Cells keep their bytes; the outer pipes and
+ * surrounding whitespace keep their shape. */
+static size_t rtx_tbl_row(const char *s, size_t n, int sep, int op, int c,
+                          char *dst, size_t cap) {
+    RtxMdCell cells[RTX_MD_TABLE_COLS + 1];
+    size_t a = 0, z = n, nc, o = 0, i;
+    int lead, trail;
+    const char *blank = sep ? "---" : "  ";
+    size_t bn = sep ? 3 : 2;
+    while (a < z && (s[a] == ' ' || s[a] == '\t')) a++;
+    while (z > a && (s[z - 1] == ' ' || s[z - 1] == '\t')) z--;
+    lead = a < z && s[a] == '|';
+    trail = z > a + (size_t)lead && s[z - 1] == '|' && (z < 2 || s[z - 2] != '\\');
+    nc = rtx_md_row_split(s + a, z - a, cells, RTX_MD_TABLE_COLS);
+    if (nc > RTX_MD_TABLE_COLS) nc = RTX_MD_TABLE_COLS;
+#define RTX_TBL_PUT(p, m)                                       \
+    do {                                                        \
+        if (o + (m) > cap) return 0;                            \
+        if (m) memcpy(dst + o, (p), (m));                       \
+        o += (m);                                               \
+    } while (0)
+    RTX_TBL_PUT(s, a);
+    if (lead) RTX_TBL_PUT("|", 1);
+    {
+        int first = 1;
+        size_t outc = 0;
+        size_t cols = nc;
+        if (op == 0 && (size_t)c > cols) cols = (size_t)c;
+        for (i = 0; i <= cols; i++) {
+            const char *cp = NULL;
+            size_t cn = 0;
+            int emit = 1;
+            if (op == 0 && (size_t)c == i) {
+                if (!first) RTX_TBL_PUT("|", 1);
+                RTX_TBL_PUT(blank, bn);
+                first = 0;
+                outc++;
+            }
+            if (i >= nc) {
+                if (op == 0 && i < (size_t)c) {
+                    cp = blank;
+                    cn = bn;
+                } else {
+                    continue;
+                }
+            } else {
+                size_t src = i;
+                if (op == 1 && (size_t)c == i) emit = 0;
+                if (op == 2 && (size_t)c == i && i + 1 < nc) src = i + 1;
+                if (op == 2 && (size_t)c + 1 == i) src = i - 1;
+                cp = s + a + cells[src].lo;
+                cn = cells[src].hi - cells[src].lo;
+            }
+            if (!emit) continue;
+            if (!first) RTX_TBL_PUT("|", 1);
+            RTX_TBL_PUT(cp, cn);
+            first = 0;
+            outc++;
+        }
+        (void)outc;
+    }
+    if (trail || (op == 0 && (size_t)c >= nc && nc > 0)) RTX_TBL_PUT("|", 1);
+    RTX_TBL_PUT(s + z, n - z);
+#undef RTX_TBL_PUT
+    return o;
+}
+
+static void !>(CCError) rtx_tbl_cols(RtxBuf *b, RtxMeTable *T, int op, int c,
+                                    int want_col) {
+    RtxMeWin *W = &T->W;
+    size_t i, caret = b->doc.caret;
+    long cvi;
+    W->b0 = T->l0;
+    W->b1 = T->l1;
+    rtx_me_virt(W);
+    for (i = 0; i < W->nv; i++) {
+        RtxMeV *V = &W->v[i];
+        size_t cap = V->n + 8 * (RTX_MD_TABLE_COLS + 2);
+        char *dst = rtx_me_alloc(W, cap);
+        int sep = rtx_md_line_is_sep(V->t, V->n);
+        size_t got;
+        if (!dst) return cc_err(CC_ERR_OUT_OF_MEMORY, "table col");
+        got = rtx_tbl_row(V->t, V->n, sep, op, c, dst, cap);
+        if (!got) return cc_err(CC_ERR_OUT_OF_MEMORY, "table row");
+        V->t = dst;
+        V->n = got;
+    }
+    cvi = rtx_me_vof(W, T->cl);
+    if (cvi >= 0) {
+        RtxMeV *V = &W->v[cvi];
+        RtxMdCell cells[RTX_MD_TABLE_COLS];
+        size_t nc = rtx_md_row_split(V->t, V->n, cells, RTX_MD_TABLE_COLS), lo, hi;
+        if (nc) {
+            if (want_col >= (int)nc) want_col = (int)nc - 1;
+            if (want_col < 0) want_col = 0;
+            lo = cells[want_col].lo;
+            hi = cells[want_col].hi;
+            rtx_md_span_trim(V->t, &lo, &hi);
+            if (lo == hi && lo > cells[want_col].lo) lo = cells[want_col].lo + 1;
+            if (lo > V->n) lo = V->n;
+            caret = rtx_me_pos(W, (size_t)cvi, lo);
+        }
+    }
+    return rtx_me_commit(W, &b->doc, caret, caret, 0);
+}
+
+void !>(CCError) RtxBuf_table_op(RtxBuf *b, int op) {
+    RtxMeTable T;
+    int ok, role;
+    @errhandler(CCError e) {
+        rtx_me_drop(&T.W);
+        return cc_err(e);
+    }
+    T = (RtxMeTable){0};
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "table op");
+    if (rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout))
+        return cc_ok();
+    ok = rtx_tbl_find(b, &T) !>;
+    if (!ok) return cc_ok();
+    b->ap_on = 0;
+    role = rtx_md_table_role(&T.t, b->doc.caret >= T.W.lo ? b->doc.caret - T.W.lo : 0);
+    switch (op) {
+        case RTX_TBL_COL_LEFT:
+            if (T.t.ncols >= RTX_MD_TABLE_COLS) break;
+            rtx_tbl_cols(b, &T, 0, T.col, T.col) !>;
+            break;
+        case RTX_TBL_COL_RIGHT:
+            if (T.t.ncols >= RTX_MD_TABLE_COLS) break;
+            rtx_tbl_cols(b, &T, 0, T.col + 1, T.col + 1) !>;
+            break;
+        case RTX_TBL_COL_DEL:
+            if (T.t.ncols <= 1) break;
+            rtx_tbl_cols(b, &T, 1, T.col, T.col < T.t.ncols - 1 ? T.col : T.col - 1) !>;
+            break;
+        case RTX_TBL_COL_MOVE_L:
+            if (T.col <= 0) break;
+            rtx_tbl_cols(b, &T, 2, T.col - 1, T.col - 1) !>;
+            break;
+        case RTX_TBL_COL_MOVE_R:
+            if (T.col + 1 >= T.t.ncols) break;
+            rtx_tbl_cols(b, &T, 2, T.col, T.col + 1) !>;
+            break;
+        case RTX_TBL_ROW_ABOVE:
+        case RTX_TBL_ROW_BELOW: {
+            /* New body row: above / below a body row, or first body row
+             * from the header / separator. */
+            RtxMeWin *W = &T.W;
+            size_t at = T.cl;
+            long vi;
+            RtxMeV *F;
+            char row[1 + 3 * RTX_MD_TABLE_COLS + 2];
+            size_t rn = rtx_md_empty_row(T.t.ncols, row, sizeof row);
+            if (!rn) break;
+            rn--; /* no newline: the join adds it */
+            if (role != RTX_MD_ROLE_BODY) {
+                at = T.l0 + 1;
+                for (at = T.l0; at < T.l1 && T.W.src[at].off - W->lo < T.t.sep_lo; at++) {}
+            } else if (op == RTX_TBL_ROW_ABOVE) {
+                at = T.cl - 1;
+            }
+            W->b0 = T.l0;
+            W->b1 = T.l1;
+            rtx_me_virt(W);
+            vi = rtx_me_vof(W, at);
+            if (vi < 0) break;
+            F = rtx_me_insert(W, (size_t)vi);
+            if (!F) break;
+            F->t = rtx_me_alloc(W, rn);
+            if (!F->t) {
+                rtx_me_drop(&T.W);
+                return cc_err(CC_ERR_OUT_OF_MEMORY, "table row");
+            }
+            memcpy(F->t, row, rn);
+            F->n = rn;
+            rtx_me_commit(W, &b->doc, rtx_me_pos(W, (size_t)vi + 1, 2),
+                          rtx_me_pos(W, (size_t)vi + 1, 2), 0) !>;
+            break;
+        }
+        case RTX_TBL_ROW_DEL: {
+            RtxMeWin *W = &T.W;
+            size_t lo, hi, caret;
+            RtxEdit ed;
+            const RtxMeSrc *S = &W->src[T.cl];
+            if (role != RTX_MD_ROLE_BODY) break;
+            lo = S->off;
+            hi = S->off + S->len + (size_t)S->nl;
+            if (!S->nl && lo > 0) {
+                lo--; /* last line: take the newline before it */
+            }
+            ed = (RtxEdit){ .off = lo, .n = hi - lo, .ins = cc_slice_empty() };
+            caret = lo < S->off ? W->src[T.cl - 1].off : lo;
+            b->doc.break_coalesce();
+            b->doc.replace_batch(&ed, 1) !>;
+            b->doc.break_coalesce();
+            b->doc.caret = caret;
+            b->doc.sel_anchor = caret;
+            if (!b->doc.hist.applying && b->doc.hist.head > 0) {
+                RtxHistRec *r = &b->doc.hist.recs[b->doc.hist.head - 1];
+                r->caret_after = caret;
+                r->sel_after = caret;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    rtx_me_drop(&T.W);
+    b->clear_pref();
+    return cc_ok();
+}
+
+static const char *const rtx_tbl_names[RTX_TBL_OPS] = {
+    "row above", "row below", "delete row", "column left", "column right",
+    "delete column", "move column left", "move column right",
+};
+static const char rtx_tbl_keys[RTX_TBL_OPS] = {'a', 'b', 'd', 'l', 'r', 'x', '<', '>'};
+
+const char *rtx_table_op_name(int op) {
+    return op >= 0 && op < RTX_TBL_OPS ? rtx_tbl_names[op] : NULL;
+}
+
+int rtx_table_op_key(int op) {
+    return op >= 0 && op < RTX_TBL_OPS ? rtx_tbl_keys[op] : 0;
+}
+
+int rtx_table_op_of_key(int ch) {
+    int i;
+    for (i = 0; i < RTX_TBL_OPS; i++) {
+        if (rtx_tbl_keys[i] == ch) return i;
+    }
+    return -1;
+}
+
+void !>(CCError) RtxBuf_enter_soft(RtxBuf *b) {
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "enter");
+    if (rtx_layout_is_hex(&b->layout)) return cc_ok();
+    b->ap_on = 0;
+    if (rtx_buf_md_enter(b, 1) !>(e) { return cc_err(e); }) return cc_ok();
+    return b->doc.type("\n");
+}
+
 void !>(CCError) RtxBuf_type_cp(RtxBuf *b, uint32_t cp) {
     int dig;
     size_t at, n, got;
@@ -1754,14 +4391,25 @@ void !>(CCError) RtxBuf_type_cp(RtxBuf *b, uint32_t cp) {
                 return b->doc.type(esc.to_slice_n(2));
             }
         }
-        if (rtx_buf_rich(b) && b->doc.has_sel() && !b->doc.sel_box) {
-            char buf[4];
-            int n = rtx_utf8_encode(cp, buf);
-            if (n <= 0) return cc_ok();
-            return rtx_buf_pair_replace(b, b->doc.sel_lo(), b->doc.sel_hi(),
-                                        buf.to_slice_n((size_t)n));
+        if (cp > 0 && cp < 0x80) {
+            int done = rtx_buf_autopair(b, (char)cp) !>(e) { return cc_err(e); };
+            if (done) return cc_ok();
         }
-        return b->doc.type_cp(cp);
+        {
+            int trk = rtx_ap_valid(b);
+            size_t c0 = b->doc.caret, n0 = b->doc.len();
+            if (rtx_buf_rich(b) && b->doc.has_sel() && !b->doc.sel_box) {
+                char buf[4];
+                int n = rtx_utf8_encode(cp, buf);
+                if (n <= 0) return cc_ok();
+                b->ap_on = 0;
+                return rtx_buf_pair_replace(b, b->doc.sel_lo(), b->doc.sel_hi(),
+                                            buf.to_slice_n((size_t)n));
+            }
+            b->doc.type_cp(cp) !>(e) { return cc_err(e); };
+            rtx_ap_follow(b, trk, c0, n0);
+        }
+        return cc_ok();
     }
     dig = rtx_hex_digit(cp);
     if (dig < 0) return cc_ok();
@@ -1799,12 +4447,28 @@ void !>(CCError) RtxBuf_enter(RtxBuf *b) {
     if (!b) return cc_err(CC_ERR_INVALID_ARG, "enter");
     if (rtx_layout_is_hex(&b->layout)) return cc_ok();
     if (rtx_buf_in_md_table(b)) return rtx_buf_md_insert_row(b);
+    b->ap_on = 0;
+    if (rtx_buf_md_enter(b, 0) !>(e) { return cc_err(e); }) return cc_ok();
     return b->doc.type("\n");
 }
 
+static void !>(CCError) rtx_buf_backspace_raw(RtxBuf *b);
+
 void !>(CCError) RtxBuf_backspace(RtxBuf *b) {
+    int trk;
+    size_t c0, n0;
     if (!b) return cc_err(CC_ERR_INVALID_ARG, "backspace");
     rtx_buf_hex_nib_reset(b);
+    if (rtx_buf_autopair_bs(b) !>(e) { return cc_err(e); }) return cc_ok();
+    trk = rtx_ap_valid(b);
+    c0 = b->doc.caret;
+    n0 = b->doc.len();
+    rtx_buf_backspace_raw(b) !>(e) { return cc_err(e); };
+    rtx_ap_follow(b, trk, c0, n0);
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_buf_backspace_raw(RtxBuf *b) {
     if (rtx_buf_byte_units(b) && !b->doc.has_sel() && b->doc.caret > 0) {
         return b->doc.replace(b->doc.caret - 1, 1, cc_slice_empty());
     }
@@ -1837,10 +4501,9 @@ void !>(CCError) RtxBuf_backspace(RtxBuf *b) {
                            ? rtx_md_table_role(&b->layout.md_tab[ti],
                                                b->doc.caret)
                            : RTX_MD_ROLE_NONE;
+            /* A cell start never eats a `|` or a column. */
             if (role == RTX_MD_ROLE_BODY && col == 0)
                 return rtx_buf_md_delete_row(b);
-            if (col >= 1 && ti >= 0 && b->layout.md_tab[ti].ncols > 1)
-                return rtx_buf_md_delete_col(b, col);
             return cc_ok();
         }
     }
@@ -2039,6 +4702,21 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
     return cc_ok();
 }
 
+/* A selected find hit carries its exact line (the scan counted every
+ * newline before it). Key the gutter origin on its floor so land keeps
+ * that camera instead of walking an island back to BOF for the label. */
+static void rtx_buf_key_from_find(RtxBuf *b, size_t floor) {
+    const RtxFindHit *h;
+    size_t n;
+    if (!b || !b->doc.find.pinned) return;
+    n = rtx_find_hits_n(&b->doc.find);
+    if (b->doc.find.cur >= n) return;
+    h = &b->doc.find.hits.data[b->doc.find.cur];
+    if (h->off != b->doc.caret || h->off < floor) return;
+    if (b->doc.index_covers(floor)) return;
+    rtx_line_origin_key(&b->doc.tree, floor, h->line);
+}
+
 void !>(RtxIndexErr) RtxBuf_land(RtxBuf *b, int vis) {
     size_t n;
     size_t off;
@@ -2066,6 +4744,7 @@ void !>(RtxIndexErr) RtxBuf_land(RtxBuf *b, int vis) {
         size_t floor = rtx_doc_line_floor_local(&b->doc, off) !>(e) {
             return cc_err(e);
         };
+        rtx_buf_key_from_find(b, floor);
         /* Jump keyed the origin on this exact floor. Keep it — seek_set
          * would clear a mid-file mark and kick an island back to BOF. */
         if (rtx_line_mark_ok(&b->doc.tree) && b->doc.tree.mark_off == floor) {
@@ -2567,62 +5246,152 @@ void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int 
 }
 
 static void !>(CCError) rtx_buf_refresh_view(RtxBuf *b, RtxMeasure *m, double width, int vis,
-                                            int edited) {
+                                            int edited, int patched) {
     if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
     if (edited) {
         b->clear_pref();
         b->pin_view = 0;
     }
-    /* Unlabeled seek stays a seek. line_of in ensure_view is the handoff. */
-    if (!rtx_layout_is_hex(&b->layout)) {
+    /* Unlabeled seek stays a seek. line_of in ensure_view is the handoff.
+     * A patched camera already holds the new rows (exact, see layout.cch);
+     * ensure_view still refills if the camera moved or came up short. */
+    if (!patched && !rtx_layout_is_hex(&b->layout)) {
         b->layout.clear_rows();
         b->layout_width = 0;
+    }
+    if (patched && b->seek_valid && b->layout.rows.len) {
+        /* A patched seeking camera labels its rows as a refill would:
+         * fill_off's line_guess, then the keyed origin (ensure_view does
+         * that step only after its own fill). */
+        rtx_layout_reline(&b->layout, b->doc.line_guess(b->seek_off));
+        RtxBuf_ensure_view(b, m, width, vis) !>(e) { return cc_err(e); };
+        if (b->seek_valid && rtx_line_mark_ok(&b->doc.tree) && b->layout.rows.len)
+            rtx_layout_reline(&b->layout, rtx_isle_cam_line(b));
+        return cc_ok();
     }
     return RtxBuf_ensure_view(b, m, width, vis);
 }
 
-void !>(CCError) RtxBuf_after_edit(RtxBuf *b, RtxMeasure *m, double width, int vis) {
-    if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
-    b->doc.reparse_edit(b->doc.last_off, b->doc.last_markup) !>(e) { return cc_err(e); };
-    return rtx_buf_refresh_view(b, m, width, vis, 1);
+/* Patch the camera at this width — lined, or seeking over whole lines
+ * (fill_off); hex and a width change refill (the layout patch declines
+ * the rest). */
+static void !>(CCError) rtx_buf_patch_plan(RtxBuf *b, double width, RtxLayoutPatch *p,
+                                          CCArena a) {
+    *p = (RtxLayoutPatch){0};
+    if (!b || b->layout_width != width ||
+        rtx_layout_is_hex(&b->layout) || !a.base)
+        return cc_ok();
+    return rtx_layout_patch_plan(&b->layout, &b->doc, p, a);
 }
 
+void !>(CCError) RtxBuf_after_edit(RtxBuf *b, RtxMeasure *m, double width, int vis) {
+    RtxLayoutPatch plan;
+    CCArena a;
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
+    a = cc_arena_heap(kilobytes(64));
+    rtx_buf_patch_plan(b, width, &plan, a) !>(e) {
+        if (a.base) a.destroy();
+        return cc_err(e);
+    };
+    b->doc.reparse_edit(b->doc.last_off, b->doc.last_markup) !>(e) {
+        if (a.base) a.destroy();
+        return cc_err(e);
+    };
+    rtx_layout_patch(&b->layout, &b->doc, m, width, &plan, a) !>(e) {
+        if (a.base) a.destroy();
+        b->doc.span_reset();
+        return cc_err(e);
+    };
+    if (a.base) a.destroy();
+    b->doc.span_reset();
+    return rtx_buf_refresh_view(b, m, width, vis, 1, plan.ok);
+}
+
+/* Text width / rows of pane p for a refresh: the focused pane's come
+ * from the caller; others from RtxWs_pane_geom, else the legacy pair
+ * (first pane width0, the rest width1). */
+static double rtx_ws_pane_width(const RtxWs *w, int p, int k, double width0,
+                                double width1) {
+    if (p == w->focus) return width0;
+    if (w->pane_w[p] > 0) return w->pane_w[p];
+    return k == 0 ? width0 : width1;
+}
+
+static int rtx_ws_pane_vis(const RtxWs *w, int p, int vis) {
+    if (p == w->focus) return vis;
+    return w->pane_vis[p] > 0 ? w->pane_vis[p] : vis;
+}
+
+/* Same file in several panes: one reparse, every camera on the buf
+ * patched or refilled (DESIGN Edits). Plans come before the reparse: they
+ * snapshot the runs each camera's rows were laid out with. */
 void !>(CCError) RtxWs_after_edit(RtxWs *w, int bufi, RtxMeasure *m,
                                         double width0, double width1, int vis) {
-    int p;
+    int k;
     int parsed = 0;
+    RtxLayoutPatch plan[RTX_PANES_MAX];
+    CCArena a;
+    RtxBuf *b;
     if (!w || !m || bufi < 0 || (size_t)bufi >= w->len)
         return cc_err(CC_ERR_INVALID_ARG, "ws after edit");
-    for (p = 0; p < w->npanes; p++) {
-        int held;
+    RtxWs_panes_fix(w);
+    b = w->bufs[bufi];
+    a = cc_arena_heap(kilobytes(64));
+    for (k = 0; k < RTX_PANES_MAX; k++) plan[k] = (RtxLayoutPatch){0};
+    for (k = 0; k < w->npanes; k++) {
+        int held, p = w->order[k];
         double width;
-        RtxBuf *b;
         if (w->pane[p] != bufi) continue;
         held = RtxWs_hold_pane(w, p);
-        b = w->bufs[bufi];
-        if (!parsed) {
-            b->doc.reparse_edit(b->doc.last_off, b->doc.last_markup) !>(e) {
-                RtxWs_drop_pane(w, p, held);
-                return cc_err(e);
-            };
-            parsed = 1;
-        }
-        width = (p == 0 || w->npanes < 2) ? width0 : width1;
-        rtx_buf_refresh_view(b, m, width, vis, p == w->focus) !>(e) {
+        width = rtx_ws_pane_width(w, p, k, width0, width1);
+        rtx_buf_patch_plan(b, width, &plan[p], a) !>(e) {
             RtxWs_drop_pane(w, p, held);
+            if (a.base) a.destroy();
             return cc_err(e);
         };
         RtxWs_drop_pane(w, p, held);
     }
+    for (k = 0; k < w->npanes; k++) {
+        int held, p = w->order[k];
+        double width;
+        if (w->pane[p] != bufi) continue;
+        held = RtxWs_hold_pane(w, p);
+        if (!parsed) {
+            b->doc.reparse_edit(b->doc.last_off, b->doc.last_markup) !>(e) {
+                RtxWs_drop_pane(w, p, held);
+                if (a.base) a.destroy();
+                return cc_err(e);
+            };
+            parsed = 1;
+        }
+        width = rtx_ws_pane_width(w, p, k, width0, width1);
+        rtx_layout_patch(&b->layout, &b->doc, m, width, &plan[p], a) !>(e) {
+            RtxWs_drop_pane(w, p, held);
+            if (a.base) a.destroy();
+            b->doc.span_reset();
+            return cc_err(e);
+        };
+        rtx_buf_refresh_view(b, m, width, rtx_ws_pane_vis(w, p, vis), p == w->focus,
+                             plan[p].ok) !>(e) {
+            RtxWs_drop_pane(w, p, held);
+            if (a.base) a.destroy();
+            b->doc.span_reset();
+            return cc_err(e);
+        };
+        RtxWs_drop_pane(w, p, held);
+    }
+    if (a.base) a.destroy();
+    if (parsed) b->doc.span_reset();
     return cc_ok();
 }
 
 void RtxWs_invalidate_buf_views(RtxWs *w, int bufi) {
-    int p;
+    int k;
     if (!w || bufi < 0 || (size_t)bufi >= w->len) return;
-    for (p = 0; p < w->npanes; p++) {
+    RtxWs_panes_fix(w);
+    for (k = 0; k < w->npanes; k++) {
         RtxBuf *b;
-        int held;
+        int held, p = w->order[k];
         if (w->pane[p] != bufi) continue;
         held = RtxWs_hold_pane(w, p);
         b = w->bufs[bufi];
@@ -2630,6 +5399,179 @@ void RtxWs_invalidate_buf_views(RtxWs *w, int bufi) {
         b->layout_width = 0;
         RtxWs_drop_pane(w, p, held);
     }
+}
+
+/* --- workspace transactions (DESIGN Edit groups) --- */
+
+static const RtxWsXact *rtx_ws_xact_find(const RtxWs *w, uint64_t id) {
+    size_t i;
+    if (!w || !id) return NULL;
+    for (i = w->xact_n; i-- > 0;) {
+        if (w->xacts[i].id == id) return &w->xacts[i];
+    }
+    return NULL;
+}
+
+static void !>(CCError) rtx_ws_xact_reserve(RtxWs *w) {
+    size_t c;
+    void *p;
+    if (!w || !RtxWs_ensure(w)) return cc_err(CC_ERR_OUT_OF_MEMORY, "xact");
+    if (w->xact_n < w->xact_cap) return cc_ok();
+    c = w->xact_cap ? w->xact_cap * 2 : 8;
+    p = cc_arena_realloc(w->session, w->session, w->xacts,
+                         w->xact_cap * sizeof(RtxWsXact), c * sizeof(RtxWsXact), 8);
+    if (!p) return cc_err(CC_ERR_OUT_OF_MEMORY, "xact");
+    w->xacts = (RtxWsXact *)p;
+    w->xact_cap = c;
+    return cc_ok();
+}
+
+static uint64_t rtx_ws_xact_next(RtxWs *w) {
+    if (!w->xact_last) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        w->xact_last = ((uint64_t)ts.tv_sec << 20) ^ (uint64_t)ts.tv_nsec;
+    }
+    if (++w->xact_last == 0) w->xact_last = 1;
+    return w->xact_last;
+}
+
+static int rtx_ws_bufi_ok(const RtxWs *w, int bufi) {
+    return w && bufi >= 0 && (size_t)bufi < w->len && w->bufs[bufi];
+}
+
+uint64_t !>(CCError) RtxWs_replace_xact(RtxWs *w, const RtxWsEdits *m, size_t n) {
+    uint64_t id;
+    size_t i, j, done;
+    RtxWsXact x = {0};
+    if (!w || (n && !m)) return cc_err(CC_ERR_INVALID_ARG, "xact");
+    if (n == 0) return cc_ok((uint64_t)0);
+    if (n > RTX_XACT_BUFS) return cc_err(CC_ERR_INVALID_ARG, "xact too many files");
+    for (i = 0; i < n; i++) {
+        if (!rtx_ws_bufi_ok(w, m[i].bufi)) return cc_err(CC_ERR_INVALID_ARG, "xact buf");
+        if (w->bufs[m[i].bufi]->parked)
+            return cc_err(CC_ERR_INVALID_ARG, "xact member parked");
+        if (w->bufs[m[i].bufi]->doc.broken)
+            return cc_err(CC_ERR_INTERNAL, "doc broken");
+        for (j = 0; j < i; j++) {
+            if (m[j].bufi == m[i].bufi) return cc_err(CC_ERR_INVALID_ARG, "xact buf twice");
+        }
+    }
+    rtx_ws_xact_reserve(w) !>(e) { return cc_err(e); };
+    id = rtx_ws_xact_next(w);
+    x.id = id;
+    for (done = 0; done < n; done++) {
+        RtxDoc *d = &w->bufs[m[done].bufi]->doc;
+        rtx_doc_replace_group(d, m[done].edits, m[done].n, id) !>(e) {
+            /* All or nothing: undo the members that landed. */
+            int k;
+            for (k = x.nbuf; k-- > 0;) {
+                RtxDoc *u = &w->bufs[x.bufs[k]]->doc;
+                u->undo() !>(e2) {
+                    (void)e2;
+                    return cc_err(CC_ERR_INTERNAL, "xact rollback");
+                };
+                rtx_hist_cut_tail(u);
+            }
+            return cc_err(e);
+        };
+        if (RtxDoc_undo_xact(d) == id) x.bufs[x.nbuf++] = m[done].bufi;
+    }
+    if (!x.nbuf) return cc_ok((uint64_t)0);
+    w->xacts[w->xact_n++] = x;
+    return cc_ok(id);
+}
+
+int RtxWs_undo_scope(const RtxWs *w, int bufi) {
+    const RtxWsXact *x;
+    uint64_t id;
+    int k, in = 0;
+    if (!rtx_ws_bufi_ok(w, bufi) || w->bufs[bufi]->parked) return RTX_UNDO_ONE;
+    id = RtxDoc_undo_xact(&w->bufs[bufi]->doc);
+    x = rtx_ws_xact_find(w, id);
+    if (!x) return RTX_UNDO_ONE;
+    for (k = 0; k < x->nbuf; k++) {
+        const RtxBuf *b = w->bufs[x->bufs[k]];
+        if (x->bufs[k] == bufi) {
+            in = 1;
+            continue;
+        }
+        if (b->parked || RtxDoc_undo_xact(&b->doc) != id) return RTX_UNDO_ASK;
+    }
+    return in ? RTX_UNDO_ALL : RTX_UNDO_ONE;
+}
+
+/* 1 if a record below head carries `id` (undo has not passed it). */
+static int rtx_ws_xact_below(const RtxDoc *d, uint64_t id) {
+    size_t i;
+    for (i = d->hist.head; i-- > 0;) {
+        if (d->hist.recs[i].xact == id) return 1;
+    }
+    return 0;
+}
+
+static void !>(CCError) rtx_ws_member_refresh(RtxWs *w, int bufi) {
+    RtxBuf *b = w->bufs[bufi];
+    b->doc.reparse_edit(b->doc.last_off, b->doc.last_markup) !>(e) {
+        return cc_err(e);
+    };
+    b->doc.span_reset();
+    RtxWs_invalidate_buf_views(w, bufi);
+    return cc_ok();
+}
+
+void !>(CCError) RtxWs_undo(RtxWs *w, int bufi, int scope) {
+    const RtxWsXact *x;
+    uint64_t id;
+    int k;
+    if (!rtx_ws_bufi_ok(w, bufi)) return cc_err(CC_ERR_INVALID_ARG, "undo buf");
+    if (w->bufs[bufi]->parked) return cc_err(CC_ERR_INVALID_ARG, "undo parked");
+    id = RtxDoc_undo_xact(&w->bufs[bufi]->doc);
+    x = scope == RTX_UNDO_ALL ? rtx_ws_xact_find(w, id) : NULL;
+    if (!x) return w->bufs[bufi]->doc.undo();
+    for (k = 0; k < x->nbuf; k++) {
+        if (w->bufs[x->bufs[k]]->parked)
+            return cc_err(CC_ERR_INVALID_ARG, "transaction member parked");
+    }
+    for (k = 0; k < x->nbuf; k++) {
+        RtxDoc *d = &w->bufs[x->bufs[k]]->doc;
+        int moved = 0;
+        while (rtx_ws_xact_below(d, id)) {
+            d->undo() !>(e) { return cc_err(e); };
+            moved = 1;
+        }
+        if (moved && x->bufs[k] != bufi) rtx_ws_member_refresh(w, x->bufs[k]) !>(e) {
+            return cc_err(e);
+        };
+    }
+    return cc_ok();
+}
+
+void !>(CCError) RtxWs_redo(RtxWs *w, int bufi) {
+    const RtxWsXact *x;
+    uint64_t id;
+    int k;
+    if (!rtx_ws_bufi_ok(w, bufi)) return cc_err(CC_ERR_INVALID_ARG, "redo buf");
+    if (w->bufs[bufi]->parked) return cc_err(CC_ERR_INVALID_ARG, "redo parked");
+    id = RtxDoc_redo_xact(&w->bufs[bufi]->doc);
+    x = rtx_ws_xact_find(w, id);
+    if (x) {
+        for (k = 0; k < x->nbuf; k++) {
+            const RtxBuf *b = w->bufs[x->bufs[k]];
+            if (b->parked || RtxDoc_redo_xact(&b->doc) != id) {
+                x = NULL;
+                break;
+            }
+        }
+    }
+    if (!x) return w->bufs[bufi]->doc.redo();
+    for (k = 0; k < x->nbuf; k++) {
+        w->bufs[x->bufs[k]]->doc.redo() !>(e) { return cc_err(e); };
+        if (x->bufs[k] != bufi) rtx_ws_member_refresh(w, x->bufs[k]) !>(e) {
+            return cc_err(e);
+        };
+    }
+    return cc_ok();
 }
 
 int RtxWs_any_dirty(const RtxWs *w) {
@@ -2661,13 +5603,16 @@ int RtxWs_nav_need_pump(const RtxBrowse *br) {
     return e->is_dir && strcmp(e->name, "..") != 0 && !e->sized;
 }
 
+void !>(CCError) RtxWs_browse_prev_pump(RtxWs *w);
+
 void !>(CCError) RtxWs_browse_pump(RtxWs *w) {
     int p;
     if (!w) return cc_ok();
-    for (p = 0; p < 2; p++) {
+    for (p = 0; p < RTX_PANES_MAX; p++) {
         if (w->nav[p].on && RtxWs_nav_need_pump(&w->nav[p]))
             rtx_browse_pump(&w->nav[p]) !>(e) { return cc_err(e); };
     }
+    RtxWs_browse_prev_pump(w) !>(e) { return cc_err(e); };
     return cc_ok();
 }
 
@@ -2692,7 +5637,7 @@ void rtx_ws_scans_set(RtxWs *w, int pause) {
 void RtxWs_browse_pause(RtxWs *w) {
     int p;
     if (!w) return;
-    for (p = 0; p < 2; p++) {
+    for (p = 0; p < RTX_PANES_MAX; p++) {
         if (w->nav[p].on)
             rtx_browse_pause(&w->nav[p]);
     }
@@ -2701,30 +5646,33 @@ void RtxWs_browse_pause(RtxWs *w) {
 void RtxWs_browse_resume(RtxWs *w) {
     int p;
     if (!w) return;
-    for (p = 0; p < 2; p++) {
+    for (p = 0; p < RTX_PANES_MAX; p++) {
         if (w->nav[p].on)
             rtx_browse_resume(&w->nav[p]);
     }
 }
 
 int RtxWs_browse_busy(const RtxWs *w) {
-    return w && ((w->nav[0].on && RtxWs_nav_need_pump(&w->nav[0])) ||
-                 (w->nav[1].on && RtxWs_nav_need_pump(&w->nav[1])));
+    int p;
+    if (!w) return 0;
+    for (p = 0; p < RTX_PANES_MAX; p++)
+        if (w->nav[p].on && RtxWs_nav_need_pump(&w->nav[p])) return 1;
+    return 0;
 }
 
 int RtxWs_browse_scanning(const RtxWs *w) {
     int p;
     if (!w) return 0;
-    for (p = 0; p < 2; p++) {
+    for (p = 0; p < RTX_PANES_MAX; p++) {
         if (!w->nav[p].on) continue;
         if (rtx_browse_listing_live(&w->nav[p])) return 1;
+        if (w->nav[p].scanning) return 1;
     }
-    return (w->nav[0].on && w->nav[0].scanning) ||
-           (w->nav[1].on && w->nav[1].scanning);
+    return 0;
 }
 
 RtxBrowse *RtxWs_browse_at(RtxWs *w, int pane) {
-    if (!w || pane < 0 || pane >= 2) return NULL;
+    if (!w || pane < 0 || pane >= RTX_PANES_MAX) return NULL;
     return &w->nav[pane];
 }
 
@@ -2735,22 +5683,6 @@ RtxBrowse *RtxWs_browse(RtxWs *w) {
 
 int RtxWs_browsing(const RtxWs *w) {
     return w && w->nav[w->focus].on;
-}
-
-static void rtx_ws_same_split_seed(RtxWs *w) {
-    RtxBuf *b;
-    if (!w || w->npanes != 2 || w->pane[0] != w->pane[1] || w->side.live) return;
-    b = w->bufs[w->pane[0]];
-    w->side = (RtxPaneSnap){0};
-    w->side.live = 1;
-    w->side.top = b->top;
-    w->side.top_wrap = b->top_wrap;
-    w->side.left_col = b->left_col;
-    w->side.top_byte = b->top_byte;
-    w->side.unlock = b->unlock;
-    w->side.layout.view = b->layout.view;
-    w->side.layout.wrap = b->layout.wrap;
-    w->side.layout.rich = b->layout.rich;
 }
 
 static int rtx_ws_find_path(const RtxWs *w, char[:0] path) {
@@ -2769,12 +5701,22 @@ static int rtx_ws_find_path(const RtxWs *w, char[:0] path) {
 void !>(CCError) RtxWs_open_in_pane(RtxWs *w, char[:0] path) {
     int pane, bufi, found;
     if (!w || !path.ptr || path.len == 0) return cc_err(CC_ERR_INVALID_ARG, "open path");
+    RtxWs_panes_fix(w);
     pane = w->focus;
+    /* Leave browse and drop any preview of this path before opening so
+     * the buffer is not born beside a live from_path of the same file
+     * (status / layout then walk a torn rows vec). */
+    rtx_browse_drop(&w->nav[pane]);
+    RtxWs_browse_prev_drop(w, pane);
     found = rtx_ws_find_path(w, path);
     if (found >= 0) bufi = found;
     else if (RtxWs_untitled(w)) {
+        int p;
         if (w->bufs[0]->doc.dirty())
             return cc_err(CC_ERR_INVALID_ARG, "untitled dirty");
+        /* Same struct, another document: no pane keeps a camera on it. */
+        for (p = 0; p < RTX_PANES_MAX; p++)
+            if (w->cam[p].of == w->bufs[0]) rtx_ws_cam_drop(&w->cam[p]);
         w->bufs[0]->destroy();
         *w->bufs[0] = (RtxBuf){0};
         w->len = 0;
@@ -2784,15 +5726,8 @@ void !>(CCError) RtxWs_open_in_pane(RtxWs *w, char[:0] path) {
         w->add_path(path) !>(e) { return cc_err(e); };
         bufi = (int)w->len - 1;
     }
-    if (RtxWs_same_split(w) && w->pane[pane] != bufi) {
-        if (w->focus == pane)
-            rtx_buf_swap_cam(w->bufs[w->pane[0]], &w->side);
-        rtx_ws_side_drop(w);
-    }
     w->pane[pane] = bufi;
-    rtx_ws_same_split_seed(w);
-    rtx_browse_drop(&w->nav[pane]);
-    RtxWs_browse_prev_drop(w, pane);
+    RtxWs_panes_fix(w);
     return w->sync_live();
 }
 
@@ -2977,9 +5912,19 @@ void !>(CCError) RtxWs_browse_backspace(RtxWs *w) {
 void RtxWs_browse_prev_drop(RtxWs *w, int pane) {
     RtxBrowsePrev *p;
     int view;
-    if (!w || pane < 0 || pane > 1) return;
+    if (!w || pane < 0 || pane >= RTX_PANES_MAX) return;
     p = &w->prev[pane];
     view = p->layout.view;
+    p->gen++;
+    if (p->h.live()) {
+        if (p->h.paused())
+            p->h.resume() !>(e) { (void)e; };
+        p->h.wait() !>(e) { (void)e; };
+    }
+    if (p->staging_live) {
+        p->staging.destroy();
+        p->staging_live = 0;
+    }
     if (p->live) {
         p->layout.destroy();
         p->doc.destroy();
@@ -2990,9 +5935,52 @@ void RtxWs_browse_prev_drop(RtxWs *w, int pane) {
     rtx_layout_set_view(&p->layout, view);
 }
 
+static void rtx_browse_prev_join(RtxBrowsePrev *p) {
+    if (!p || !p->h.live()) return;
+    if (p->h.paused())
+        p->h.resume() !>(e) { (void)e; };
+    p->h.wait() !>(e) { (void)e; };
+}
+
+static void rtx_browse_prev_staging_drop(RtxBrowsePrev *p) {
+    if (!p) return;
+    if (p->staging_live) {
+        p->staging.destroy();
+        p->staging_live = 0;
+    }
+    rtx_safe_cam_clear(&p->staging_cam);
+    p->load_fail = 0;
+    atomic_store_explicit(&p->load_done, 0, memory_order_release);
+}
+
+/* Drop the painted doc; keep view / warmed / want / gen / open arm. */
+static void rtx_browse_prev_drop_doc(RtxBrowsePrev *p) {
+    int view;
+    if (!p || !p->live) {
+        if (p && p->layout.store.base && !p->live) {
+            view = p->layout.view;
+            p->layout.destroy();
+            rtx_layout_set_view(&p->layout, view);
+        }
+        return;
+    }
+    view = p->layout.view;
+    p->layout.destroy();
+    p->doc.destroy();
+    p->live = 0;
+    p->path[0] = 0;
+    p->kind = RTX_BROWSE_PREV_EMPTY;
+    p->fill_w = 0;
+    p->fill_vis = 0;
+    p->fill_view = -1;
+    p->fill_char = 0;
+    rtx_safe_cam_clear(&p->cam);
+    rtx_layout_set_view(&p->layout, view);
+}
+
 void RtxWs_browse_prev_cycle(RtxWs *w, int pane) {
     RtxBrowsePrev *p;
-    if (!w || pane < 0 || pane > 1) return;
+    if (!w || pane < 0 || pane >= RTX_PANES_MAX) return;
     p = &w->prev[pane];
     rtx_layout_cycle_view(&p->layout);
     p->fill_view = -1;
@@ -3000,7 +5988,7 @@ void RtxWs_browse_prev_cycle(RtxWs *w, int pane) {
 
 void RtxWs_browse_prev_toggle_wrap(RtxWs *w, int pane) {
     RtxBrowsePrev *p;
-    if (!w || pane < 0 || pane > 1) return;
+    if (!w || pane < 0 || pane >= RTX_PANES_MAX) return;
     p = &w->prev[pane];
     if (!p->live) return;
     if (rtx_layout_is_hex(&p->layout) || rtx_layout_is_grid(&p->layout))
@@ -3029,7 +6017,8 @@ static void !>(CCError) rtx_ws_prev_fill(RtxBrowsePrev *p, RtxMeasure *m,
         }
         if (p->fill_w == width && p->fill_vis == vis &&
             p->fill_view == p->layout.view &&
-            p->fill_char == p->layout.wrap_char && p->layout.rows.len)
+            p->fill_char == p->layout.wrap_char &&
+            p->layout.rows.len >= want)
             return cc_ok();
         if (!m) return cc_ok();
         {
@@ -3037,8 +6026,6 @@ static void !>(CCError) rtx_ws_prev_fill(RtxBrowsePrev *p, RtxMeasure *m,
             if (p->cam.seek_valid) from = p->cam.seek_off;
             else if (p->cam.top_byte) from = p->cam.top_byte;
             else from = p->doc.caret;
-            /* Seek and caret sit on the selection. The first row is that
-             * whole line, not the tail after the caret. Grid snaps itself. */
             if (!rtx_layout_is_grid(&p->layout))
                 from = rtx_doc_line_floor(&p->doc, from) !>;
             p->layout.fill_off(&p->doc, m, width, from, want) !>(e) {
@@ -3053,6 +6040,161 @@ static void !>(CCError) rtx_ws_prev_fill(RtxBrowsePrev *p, RtxMeasure *m,
     return cc_ok();
 }
 
+/* Worker: open into staging only. Host adopts on pump / flush. */
+static void rtx_browse_prev_run(RtxBrowsePrev *p, uint64_t gen) {
+    RtxSafeCam cam;
+    if (!p || !p->want[0]) {
+        if (p) {
+            p->load_fail = 1;
+            atomic_store_explicit(&p->load_done, 1, memory_order_release);
+        }
+        return;
+    }
+    rtx_safe_cam_clear(&cam);
+    rtx_ws_doc_open(NULL, &p->staging, p->want, &cam, NULL) !>(e) {
+        (void)e;
+        if (p->gen == gen) {
+            p->load_fail = 1;
+            atomic_store_explicit(&p->load_done, 1, memory_order_release);
+        }
+        return;
+    };
+    if (p->gen != gen) {
+        p->staging.destroy();
+        return;
+    }
+    p->staging_cam = cam;
+    p->staging_live = 1;
+    p->load_fail = 0;
+    atomic_store_explicit(&p->load_done, 1, memory_order_release);
+}
+
+static void !>(CCError) rtx_browse_prev_kick(RtxBrowsePrev *p) {
+    int noop = 0;
+    RtxBrowsePrev *scan;
+    uint64_t gen;
+    if (!p || !p->want[0]) return cc_ok();
+    if (p->h.live()) return cc_ok();
+    rtx_browse_prev_staging_drop(p);
+    gen = p->gen;
+    scan = p;
+    atomic_store_explicit(&p->load_done, 0, memory_order_release);
+    p->load_fail = 0;
+    if (rtx_parallel_inline()) {
+        rtx_browse_prev_run(p, gen);
+        return cc_ok();
+    }
+    p->h = @parallel {
+        @serial { noop = 0; }
+        rtx_browse_prev_run(scan, gen);
+    } !>;
+    return cc_ok();
+}
+
+static void rtx_browse_prev_cancel(RtxBrowsePrev *p) {
+    if (!p) return;
+    p->gen++;
+    rtx_browse_prev_join(p);
+    rtx_browse_prev_staging_drop(p);
+}
+
+/* Move staging → painted doc when the arm finished for the current want.
+ * Returns 1 when the painted preview changed (host should dirty). */
+static int rtx_browse_prev_adopt(RtxBrowsePrev *p) {
+    int view;
+    if (!p) return 0;
+    rtx_browse_prev_join(p);
+    if (!atomic_load_explicit(&p->load_done, memory_order_acquire)) return 0;
+    if (!p->want[0]) {
+        rtx_browse_prev_staging_drop(p);
+        return 0;
+    }
+    view = p->layout.view;
+    if (p->load_fail || !p->staging_live) {
+        if (p->live) {
+            p->layout.destroy();
+            p->doc.destroy();
+            p->live = 0;
+        }
+        snprintf(p->path, sizeof(p->path), "%s", p->want);
+        p->kind = RTX_BROWSE_PREV_FAIL;
+        rtx_browse_prev_staging_drop(p);
+        rtx_layout_set_view(&p->layout, view);
+        p->ready_seq++;
+        return 1;
+    }
+    if (p->live) {
+        p->layout.destroy();
+        p->doc.destroy();
+    } else if (p->layout.store.base) {
+        p->layout.destroy();
+    }
+    p->doc = p->staging;
+    p->staging = (RtxDoc){0};
+    p->staging_live = 0;
+    p->cam = p->staging_cam;
+    rtx_safe_cam_clear(&p->staging_cam);
+    snprintf(p->path, sizeof(p->path), "%s", p->want);
+    p->want[0] = 0;
+    rtx_layout_set_view(&p->layout, p->cam.view ? p->cam.view : view);
+    p->layout.rich = p->cam.rich;
+    p->layout.wrap = p->cam.wrap;
+    p->layout.wrap_char = 1;
+    p->live = 1;
+    p->kind = RTX_BROWSE_PREV_FILE;
+    p->warmed = 1;
+    p->fill_view = -1;
+    atomic_store_explicit(&p->load_done, 0, memory_order_release);
+    p->load_fail = 0;
+    p->ready_seq++;
+    return 1;
+}
+
+int RtxWs_browse_prev_busy(const RtxWs *w) {
+    int p;
+    if (!w) return 0;
+    for (p = 0; p < RTX_PANES_MAX; p++) {
+        if (w->prev[p].h.live()) return 1;
+        if (atomic_load_explicit(&w->prev[p].load_done, memory_order_acquire) &&
+            w->prev[p].want[0])
+            return 1;
+    }
+    return 0;
+}
+
+unsigned RtxWs_browse_prev_ready_seq(const RtxWs *w) {
+    unsigned s = 0;
+    int p;
+    if (!w) return 0;
+    for (p = 0; p < RTX_PANES_MAX; p++) s += w->prev[p].ready_seq;
+    return s;
+}
+
+void !>(CCError) RtxWs_browse_prev_pump(RtxWs *w) {
+    int p;
+    if (!w) return cc_ok();
+    for (p = 0; p < RTX_PANES_MAX; p++) {
+        RtxBrowsePrev *pv = &w->prev[p];
+        if (!atomic_load_explicit(&pv->load_done, memory_order_acquire))
+            continue;
+        rtx_browse_prev_adopt(pv);
+    }
+    return cc_ok();
+}
+
+void !>(CCError) RtxWs_browse_prev_flush(RtxWs *w, int pane) {
+    RtxBrowsePrev *p;
+    if (!w || pane < 0 || pane >= RTX_PANES_MAX)
+        return cc_err(CC_ERR_INVALID_ARG, "browse preview flush");
+    p = &w->prev[pane];
+    if (p->want[0] && !p->h.live() &&
+        !atomic_load_explicit(&p->load_done, memory_order_acquire))
+        rtx_browse_prev_kick(p) !>(e) { return cc_err(e); };
+    rtx_browse_prev_join(p);
+    rtx_browse_prev_adopt(p);
+    return cc_ok();
+}
+
 void !>(CCError) RtxWs_browse_prev_sync(RtxWs *w, int pane, RtxMeasure *m,
                                         double width, int vis) {
     RtxBrowse *br;
@@ -3060,7 +6202,7 @@ void !>(CCError) RtxWs_browse_prev_sync(RtxWs *w, int pane, RtxMeasure *m,
     char path[RTX_BROWSE_DIR];
     int is_dir = 0;
     int have;
-    if (!w || pane < 0 || pane > 1)
+    if (!w || pane < 0 || pane >= RTX_PANES_MAX)
         return cc_err(CC_ERR_INVALID_ARG, "browse preview");
     br = &w->nav[pane];
     p = &w->prev[pane];
@@ -3070,43 +6212,61 @@ void !>(CCError) RtxWs_browse_prev_sync(RtxWs *w, int pane, RtxMeasure *m,
     }
     have = rtx_browse_sel_path(br, path, sizeof(path), &is_dir);
     if (!have) {
-        if (p->live || p->kind != RTX_BROWSE_PREV_EMPTY)
+        if (p->live || p->kind != RTX_BROWSE_PREV_EMPTY || p->want[0] ||
+            p->h.live())
             RtxWs_browse_prev_drop(w, pane);
         p->kind = RTX_BROWSE_PREV_EMPTY;
         return cc_ok();
     }
     if (is_dir) {
         if (p->live || p->kind != RTX_BROWSE_PREV_DIR ||
-            strcmp(p->path, path) != 0) {
+            strcmp(p->path, path) != 0 || p->want[0] || p->h.live()) {
+            int warmed = p->warmed;
             RtxWs_browse_prev_drop(w, pane);
+            p->warmed = warmed;
             snprintf(p->path, sizeof(p->path), "%s", path);
             p->kind = RTX_BROWSE_PREV_DIR;
         }
         return cc_ok();
     }
+    if (atomic_load_explicit(&p->load_done, memory_order_acquire))
+        rtx_browse_prev_adopt(p);
     if (p->live && p->kind == RTX_BROWSE_PREV_FILE &&
         strcmp(p->path, path) == 0) {
-        /* Fill the preview row. Word wrap stops at the space and the
-         * rest of the screen line stays blank. */
+        p->want[0] = 0;
         p->layout.wrap_char = 1;
         return rtx_ws_prev_fill(p, m, width, vis);
     }
-    RtxWs_browse_prev_drop(w, pane);
-    snprintf(p->path, sizeof(p->path), "%s", path);
-    p->doc.from_path(cc_slice_cstr(p->path)) !>(e) {
-        (void)e;
-        p->kind = RTX_BROWSE_PREV_FAIL;
-        return cc_ok();
-    };
-    rtx_safe_cam_clear(&p->cam);
-    rtx_safe_load(&p->doc, &p->cam);
-    rtx_layout_set_view(&p->layout, p->cam.view);
-    p->layout.rich = p->cam.rich;
-    p->layout.wrap = p->cam.wrap;
-    p->layout.wrap_char = 1;
-    p->live = 1;
-    p->kind = RTX_BROWSE_PREV_FILE;
-    return rtx_ws_prev_fill(p, m, width, vis);
+    /* New selection: cancel any in-flight open and kick off-main. Keep
+     * a live file painted until adopt so navigate does not flash empty. */
+    if (strcmp(p->want, path) != 0 ||
+        (!p->h.live() && !p->live &&
+         !atomic_load_explicit(&p->load_done, memory_order_acquire))) {
+        if (p->h.live() || p->want[0]) rtx_browse_prev_cancel(p);
+        else p->gen++;
+        snprintf(p->want, sizeof(p->want), "%s", path);
+        if (!(p->live && p->kind == RTX_BROWSE_PREV_FILE)) {
+            p->path[0] = 0;
+            p->kind = RTX_BROWSE_PREV_EMPTY;
+        }
+        rtx_browse_prev_kick(p) !>(e) { return cc_err(e); };
+    } else if (!p->h.live() && p->want[0] &&
+               !atomic_load_explicit(&p->load_done, memory_order_acquire)) {
+        rtx_browse_prev_kick(p) !>(e) { return cc_err(e); };
+    }
+    if (atomic_load_explicit(&p->load_done, memory_order_acquire)) {
+        rtx_browse_prev_adopt(p);
+        if (p->live) {
+            p->layout.wrap_char = 1;
+            return rtx_ws_prev_fill(p, m, width, vis);
+        }
+    }
+    /* Still opening: redraw the previous file if we kept it. */
+    if (p->live && p->kind == RTX_BROWSE_PREV_FILE) {
+        p->layout.wrap_char = 1;
+        return rtx_ws_prev_fill(p, m, width, vis);
+    }
+    return cc_ok();
 }
 
 
@@ -3132,23 +6292,48 @@ int rtx_click_count(RtxClickSeq *s, long now, size_t off) {
 }
 
 void rtx_ui_blink_show(RtxUi *ui) {
+    long now;
     if (!ui) return;
     ui->blink = 1;
     if (ui->no_blink) {
         ui->blink_at = 0;
         return;
     }
-    ui->blink_at = rtx_ui_now_ms();
+    now = rtx_ui_now_ms();
+    ui->blink_at = now;
+    ui->input_at = now;
+}
+
+static long rtx_ui_blink_idle(const RtxUi *ui) {
+    return ui->blink_idle_ms ? ui->blink_idle_ms : (long)RTX_UI_BLINK_IDLE_MS;
+}
+
+int rtx_ui_blink_live(const RtxUi *ui, long now) {
+    long idle;
+    if (!ui || ui->no_blink || ui->unfocused) return 0;
+    if (ui->blink_at == 0 || ui->input_at == 0) return 1; /* not started */
+    idle = rtx_ui_blink_idle(ui);
+    return idle < 0 || now - ui->input_at < idle;
 }
 
 int rtx_ui_blink_step(RtxUi *ui) {
     long now;
-    if (!ui || ui->no_blink) return 0;
+    if (!ui || ui->no_blink || ui->host_blinks) return 0;
     now = rtx_ui_now_ms();
     if (ui->blink_at == 0) {
         ui->blink = 1;
         ui->blink_at = now;
+        if (!ui->input_at) ui->input_at = now; /* launch counts as input */
         return 0;
+    }
+    if (!rtx_ui_blink_live(ui, now)) {
+        /* Settle visible. Idle stops on the phase boundary, so a caret that
+         * is on stays on without a paint. */
+        if (ui->blink) return 0;
+        if (!ui->unfocused && now - ui->blink_at < RTX_UI_BLINK_MS) return 0;
+        ui->blink = 1;
+        ui->blink_at = now;
+        return 1;
     }
     if (now - ui->blink_at >= RTX_UI_BLINK_MS) {
         ui->blink = !ui->blink;
@@ -3158,17 +6343,56 @@ int rtx_ui_blink_step(RtxUi *ui) {
     return 0;
 }
 
+long rtx_ui_blink_next_ms(const RtxUi *ui, long now) {
+    long left;
+    if (!ui || ui->no_blink || ui->host_blinks) return -1;
+    if (ui->blink_at == 0) return 0;
+    if (!rtx_ui_blink_live(ui, now)) {
+        if (ui->blink) return -1;
+        if (ui->unfocused) return 0;
+    }
+    left = (long)RTX_UI_BLINK_MS - (now - ui->blink_at);
+    return left > 0 ? left : 0;
+}
+
+int rtx_ui_blink_focus(RtxUi *ui, int in) {
+    int was;
+    if (!ui) return 0;
+    was = rtx_ui_blink(ui);
+    if (in) {
+        ui->unfocused = 0;
+        rtx_ui_blink_show(ui);
+    } else {
+        ui->unfocused = 1;
+        ui->blink = 1;
+    }
+    return was != rtx_ui_blink(ui);
+}
+
+long rtx_ui_blink_idle_env(void) {
+    const char *s = getenv("RTX_BLINK_IDLE_MS");
+    if (!s || !s[0]) return 0;
+    return strtol(s, NULL, 10);
+}
+
 int rtx_ui_blink(const RtxUi *ui) {
-    if (!ui || ui->no_blink || ui->blink_at == 0) return 1;
+    if (!ui || ui->no_blink || ui->host_blinks || ui->blink_at == 0 ||
+        ui->unfocused)
+        return 1;
     return ui->blink;
 }
 
 int rtx_ui_prompting(const RtxUi *ui) {
-    return ui && (ui->find || ui->jump);
+    return ui && (ui->find || ui->jump || ui->palette || ui->pick);
 }
 
 int rtx_ui_here(const RtxUi *ui, int focused, int at) {
+    if (ui && ui->caret_host) return 0;
     return focused && at && !rtx_ui_prompting(ui) && rtx_ui_blink(ui);
+}
+
+int rtx_ui_caret_at(const RtxUi *ui, int focused, int at) {
+    return focused && at && !rtx_ui_prompting(ui);
 }
 
 int rtx_gutter_cols(size_t nlines) {
@@ -3479,5 +6703,183 @@ RtxScrollRail rtx_browse_prev_rail(const RtxBrowsePrev *p, int vis) {
         if (r.vis > n - r.pos) r.vis = n - r.pos;
     }
     return r;
+}
+
+static void rtx_browse_prev_invalidate(RtxBrowsePrev *p) {
+    if (p) p->fill_view = -1;
+}
+
+void rtx_browse_prev_drag_end(RtxBrowsePrev *p) {
+    if (!p) return;
+    p->drag_vis = 0;
+    p->drag_len = 0;
+    p->drag_grab = 0;
+}
+
+/* Rebase seek onto the first visible row so top_wrap stays small. */
+static void !>(CCError) rtx_browse_prev_rebase(RtxBrowsePrev *p, RtxMeasure *m,
+                                               double width, int vis) {
+    size_t keep, floor, i;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    if (!p || !p->live || !p->layout.rows.len) return cc_ok();
+    if (p->cam.top_wrap == 0 || p->cam.top_wrap >= p->layout.rows.len)
+        return cc_ok();
+    keep = p->layout.rows.data[p->cam.top_wrap].byte_start;
+    floor = rtx_doc_line_floor(&p->doc, keep) !>;
+    p->cam.seek_off = floor;
+    p->cam.seek_valid = 1;
+    p->cam.top_wrap = 0;
+    rtx_browse_prev_invalidate(p);
+    rtx_ws_prev_fill(p, m, width, vis) !>;
+    for (i = 0; i < p->layout.rows.len; i++) {
+        if (p->layout.rows.data[i].byte_start == keep) {
+            p->cam.top_wrap = i;
+            break;
+        }
+        if (p->layout.rows.data[i].byte_start > keep) break;
+    }
+    if (p->cam.top_wrap &&
+        (size_t)vis + p->cam.top_wrap > p->layout.rows.len) {
+        rtx_browse_prev_invalidate(p);
+        rtx_ws_prev_fill(p, m, width, vis) !>;
+    }
+    return cc_ok();
+}
+
+void !>(CCError) rtx_browse_prev_scroll_vis(RtxBrowsePrev *p, RtxMeasure *m,
+                                            double width, int vis, int dir) {
+    size_t from, n;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    if (!p || !p->live) return cc_ok();
+    if (vis < 1) vis = 1;
+    if (rtx_layout_is_hex(&p->layout)) {
+        size_t top, rows, last;
+        n = p->doc.len();
+        rows = rtx_hex_row_count(n);
+        top = p->cam.top_byte ? p->cam.top_byte
+                              : (p->cam.seek_valid ? p->cam.seek_off : 0);
+        top = rtx_hex_align(top);
+        if (dir < 0) {
+            if (top >= (size_t)RTX_HEX_COLS) top -= (size_t)RTX_HEX_COLS;
+            else top = 0;
+        } else if (dir > 0) {
+            size_t next = top + (size_t)RTX_HEX_COLS;
+            last = rows > 1 ? (rows - 1) * (size_t)RTX_HEX_COLS : 0;
+            if (next <= last) top = next;
+        }
+        p->cam.top_byte = top;
+        p->cam.seek_off = top;
+        p->cam.seek_valid = 1;
+        p->cam.top_wrap = 0;
+        return cc_ok();
+    }
+    if (p->cam.seek_valid) from = p->cam.seek_off;
+    else if (p->cam.top_byte) from = p->cam.top_byte;
+    else from = p->doc.caret;
+    if (!rtx_layout_is_grid(&p->layout))
+        from = rtx_doc_line_floor(&p->doc, from) !>;
+    p->cam.seek_off = from;
+    p->cam.seek_valid = 1;
+    /* Room to step one row past the window. */
+    {
+        size_t need = p->cam.top_wrap + (size_t)vis + (dir > 0 ? 1 : 0);
+        size_t save = p->cam.top_wrap;
+        if (p->layout.rows.len < need || p->fill_view < 0) {
+            p->cam.top_wrap = need > (size_t)vis ? need - (size_t)vis : 0;
+            rtx_browse_prev_invalidate(p);
+            rtx_ws_prev_fill(p, m, width, vis) !>(e) {
+                p->cam.top_wrap = save;
+                return cc_err(e);
+            };
+            p->cam.top_wrap = save;
+        }
+    }
+    if (dir < 0) {
+        if (p->cam.top_wrap > 0) {
+            p->cam.top_wrap--;
+        } else if (from > 0) {
+            size_t prev = rtx_doc_line_floor(&p->doc, from - 1) !>;
+            size_t wraps = 1, i;
+            p->cam.seek_off = prev;
+            p->cam.seek_valid = 1;
+            p->cam.top_wrap = 0;
+            rtx_browse_prev_invalidate(p);
+            rtx_ws_prev_fill(p, m, width, vis) !>;
+            if (p->layout.rows.len) {
+                size_t line = p->layout.rows.data[0].line;
+                for (i = 1; i < p->layout.rows.len; i++) {
+                    if (p->layout.rows.data[i].line != line) break;
+                    wraps++;
+                }
+            }
+            if (wraps > 1) {
+                p->cam.top_wrap = wraps - 1;
+                if (p->layout.rows.len < (size_t)vis + p->cam.top_wrap) {
+                    rtx_browse_prev_invalidate(p);
+                    rtx_ws_prev_fill(p, m, width, vis) !>;
+                }
+            }
+        }
+    } else if (dir > 0) {
+        if (p->cam.top_wrap + (size_t)vis < p->layout.rows.len) {
+            p->cam.top_wrap++;
+        } else {
+            size_t idx = p->cam.top_wrap < p->layout.rows.len ? p->cam.top_wrap
+                                                              : 0;
+            size_t at, next;
+            int has;
+            if (!p->layout.rows.len) return cc_ok();
+            at = p->layout.rows.data[idx].byte_start;
+            has = rtx_doc_next_line_start(&p->doc, at, &next) !>;
+            if (has) {
+                p->cam.seek_off = next;
+                p->cam.seek_valid = 1;
+                p->cam.top_wrap = 0;
+                rtx_browse_prev_invalidate(p);
+            }
+        }
+    }
+    rtx_browse_prev_rebase(p, m, width, vis) !>;
+    return cc_ok();
+}
+
+void !>(CCError) rtx_browse_prev_scroll_to_off(RtxBrowsePrev *p, RtxMeasure *m,
+                                               double width, int vis,
+                                               size_t off) {
+    size_t n, floor;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    if (!p || !p->live) return cc_ok();
+    n = p->doc.len();
+    if (off > n) off = n;
+    if (rtx_layout_is_hex(&p->layout)) {
+        p->cam.top_byte = rtx_hex_align(off);
+        p->cam.seek_off = p->cam.top_byte;
+        p->cam.seek_valid = 1;
+        p->cam.top_wrap = 0;
+        return cc_ok();
+    }
+    floor = rtx_doc_line_floor(&p->doc, off) !>;
+    p->cam.seek_off = floor;
+    p->cam.seek_valid = 1;
+    p->cam.top_wrap = 0;
+    p->cam.top_byte = 0;
+    rtx_browse_prev_invalidate(p);
+    rtx_ws_prev_fill(p, m, width, vis) !>;
+    return cc_ok();
 }
 

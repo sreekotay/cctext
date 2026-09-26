@@ -1,0 +1,188 @@
+#!ccc cch
+/*
+ * Markdown block pass: a small CommonMark / GFM line classifier.
+ *
+ * One call per physical line, in order, carrying `RtxMdb` between lines.
+ * It opens and matches containers (block quotes, list items with their
+ * content indent), classifies the leaf (ATX / setext heading, fenced and
+ * indented code, thematic break, HTML block kinds 1-7, `$$` math, front
+ * matter, GFM table, link / footnote definition, paragraph) and returns
+ * the byte spans the lex plants plus the range the inline lex sees.
+ *
+ * The state holds no offsets (a checkpoint shifts; the state does not):
+ * the paragraph start is `pback` bytes before the line. It is small and
+ * compared whole, so the window lex checkpoints it beside the TM stack
+ * and an edit relex converges on it (docs/md_view.md, Blocks). Bytes are
+ * whatever the caller passes: a line whose opener sits above the lex
+ * start is leftover, never a wrong nest (see `RTX_MDB_UNSURE`).
+ *
+ * Pure: no document, no grammar. The TM walk in document.ccs maps spans
+ * to runs with the grammar's `cctext.block` rules. Bodies in md_block.ccs
+ * (linked with md_table.ccs in the rtx_md_table target).
+ */
+#ifndef RTX_MD_BLOCK_H
+#define RTX_MD_BLOCK_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define RTX_MDB_DEPTH 8
+
+/* Container kinds. */
+enum {
+    RTX_MDB_QUOTE = 1,
+    RTX_MDB_ITEM = 2
+};
+
+/* Leaf the state is inside of between lines. */
+enum {
+    RTX_MDB_LEAF_NONE = 0,
+    RTX_MDB_LEAF_PARA = 1,
+    RTX_MDB_LEAF_FENCE = 2,
+    RTX_MDB_LEAF_ICODE = 3,
+    RTX_MDB_LEAF_HTML = 4,
+    RTX_MDB_LEAF_MATH = 5,
+    RTX_MDB_LEAF_FRONT = 6,
+    RTX_MDB_LEAF_TABLE = 7
+};
+
+/* RtxMdb.flags */
+enum {
+    RTX_MDB_BOF = 1,      /* the next line is the document's first */
+    RTX_MDB_SOFT = 2,     /* lex began mid-document: no indented code until a
+                           * blank line then an unindented line resyncs */
+    RTX_MDB_UNSURE = 4,   /* fence parity unknown (the lex began where a fence
+                           * opened above it may still be open): a bare fence
+                           * or `$$` line is text until a fence line with an
+                           * info string opens one */
+    RTX_MDB_BLANK = 8,    /* the previous line was blank */
+    RTX_MDB_MARP = 16     /* Marp deck (front matter `marp: true`): a
+                           * top-level thematic break is a slide boundary
+                           * (RTX_MDB_S_SLIDE), not an hr (docs/slides.md) */
+};
+
+typedef struct {
+    unsigned char n;                    /* open containers */
+    unsigned char leaf;                 /* RTX_MDB_LEAF_* */
+    unsigned char ldep;                 /* containers the leaf lives in */
+    unsigned char flags;
+    unsigned char kind[RTX_MDB_DEPTH];  /* RTX_MDB_QUOTE / ITEM */
+    unsigned char ind[RTX_MDB_DEPTH];   /* ITEM: content indent (columns past the
+                                         * parent's content column) */
+    unsigned char fch;                  /* fence ` ~ ; math $ ; front - + */
+    unsigned char find;                 /* fence indent 0-3 */
+    unsigned char html;                 /* HTML block kind 1-7 */
+    unsigned char tcols;                /* table columns */
+    unsigned char pcells;               /* cells of the last paragraph line
+                                         * when it had a pipe, else 0 */
+    unsigned char pad[3];
+    unsigned short flen;                /* fence run length */
+    unsigned short poff;                /* paragraph start: byte in its line */
+    uint32_t plines;                    /* paragraph lines so far */
+    uint32_t pback;                     /* paragraph's first line BOL is this
+                                         * many bytes before this line's BOL */
+    uint32_t plen;                      /* last line's length with its NL */
+} RtxMdb;
+
+/* Span kinds (RtxMdbSpan.kind). */
+enum {
+    RTX_MDB_S_QUOTE = 1,      /* `>` markers (consecutive ones merge) */
+    RTX_MDB_S_ITEM,           /* list marker + the spaces after it */
+    RTX_MDB_S_TASK,           /* `[ ]` / `[x]` / `[X]` */
+    RTX_MDB_S_ATX,            /* `#`s + spaces; aux = level */
+    RTX_MDB_S_ATX_CLOSE,      /* closing `#`s */
+    RTX_MDB_S_SETEXT,         /* underline run; aux = level */
+    RTX_MDB_S_HR,             /* thematic break */
+    RTX_MDB_S_FENCE_OPEN,     /* fence run (info in RtxMdbLine) */
+    RTX_MDB_S_FENCE_CLOSE,
+    RTX_MDB_S_ICODE,          /* indented code content */
+    RTX_MDB_S_HTML,           /* HTML block line (open / body / close) */
+    RTX_MDB_S_MATH_OPEN,      /* `$$` */
+    RTX_MDB_S_MATH_CLOSE,
+    RTX_MDB_S_FRONT_OPEN,     /* `---` / `+++` at BOF */
+    RTX_MDB_S_FRONT_CLOSE,
+    RTX_MDB_S_TABLE_SEP,      /* GFM delimiter row; aux = columns */
+    RTX_MDB_S_REF_LABEL,      /* `[label]:` */
+    RTX_MDB_S_REF_DEST,       /* its destination */
+    RTX_MDB_S_REF_TITLE,
+    RTX_MDB_S_FOOT_LABEL,     /* `[^x]:` */
+    RTX_MDB_S_SLIDE           /* Marp slide separator (RTX_MDB_MARP only): a
+                               * thematic break outside every container */
+};
+
+typedef struct {
+    size_t lo;
+    size_t hi;
+    unsigned char kind;
+    unsigned char aux;
+} RtxMdbSpan;
+
+#define RTX_MDB_SPANS 20
+
+/* What the inline lex does with [c_lo, c_hi). */
+enum {
+    RTX_MDB_M_NONE = 0,   /* nothing (blank, rule, fence delimiter) */
+    RTX_MDB_M_INLINE = 1, /* paragraph / heading / cell content */
+    RTX_MDB_M_GUEST = 2,  /* body of an open fence / HTML / front matter */
+    RTX_MDB_M_RAW = 3     /* body with no lex (math, unknown fence) */
+};
+
+typedef struct {
+    RtxMdbSpan sp[RTX_MDB_SPANS];
+    int nsp;
+    size_t c_lo;          /* content (buffer offsets) */
+    size_t c_hi;
+    size_t info_lo;       /* fence info string, trimmed */
+    size_t info_hi;
+    size_t title_lo;      /* setext: first title byte (may precede `lo` of the
+                           * buffer: the caller clips) */
+    size_t title_back;    /* setext: title start is this many bytes before BOL */
+    unsigned char mode;   /* RTX_MDB_M_* */
+    unsigned char drop;   /* the paragraph ended before this line: open inline
+                           * frames are dropped at its start */
+    unsigned char hard;   /* inline frames end with this line (heading, row) */
+    unsigned char close0; /* a leaf (RTX_MDB_LEAF_*) ended at this line's start */
+    unsigned char open;   /* a leaf frame opens on this line */
+    unsigned char close;  /* the leaf frame closes on this line */
+    unsigned char row;    /* table row: lex each cell on its own */
+    unsigned char para;   /* paragraph line */
+    unsigned char setext; /* level; the title runs [BOL - title_back, BOL - 1) */
+    unsigned char lazy;   /* paragraph continuation past unmatched containers */
+} RtxMdbLine;
+
+/* Fresh state. `bof`: the first line is the document's first. `soft`: the
+ * lex starts mid-document (no container context yet). `unsure`: fence
+ * parity unknown. */
+void rtx_mdb_init(RtxMdb *st, int bof, int soft, int unsure);
+
+/* Classify buf[lo, eol) (eol excludes the newline). Updates *st. */
+void rtx_mdb_line(RtxMdb *st, const char *buf, size_t lo, size_t eol,
+                  RtxMdbLine *out);
+
+/* 1 if the line (no NL) is a fence line: <= 3 spaces, then >= 3 backticks
+ * or tildes (a backtick fence's info has no backtick). *info: 1 when an
+ * info string follows. */
+int rtx_mdb_fence_line(const char *s, size_t n, int *info);
+
+/* Marp mode on / off for a state rtx_mdb_init made (it survives lines and
+ * rides in checkpoints like the other flags). */
+void rtx_mdb_set_marp(RtxMdb *st, int on);
+
+/* 1 when s[0, n) opens with YAML front matter (`---` line … `---` / `...`)
+ * holding a top-level `marp: true` line. Reads only what it is given; the
+ * caller passes the document's first bytes (RTX_MDB_MARP_PROBE). */
+#define RTX_MDB_MARP_PROBE 4096
+int rtx_mdb_marp_front(const char *s, size_t n);
+
+/* Equal states (a checkpoint compare). */
+int rtx_mdb_eq(const RtxMdb *a, const RtxMdb *b);
+
+/* 1 when a relex may start from this state: no paragraph is open (a setext
+ * underline later could restyle lines before the start). */
+int rtx_mdb_seedable(const RtxMdb *st);
+
+/* HTML block start kind (1-7) of s[0, n) (after indentation), 0 if none.
+ * `para`: a paragraph is open (kind 7 cannot interrupt it). */
+int rtx_mdb_html_start(const char *s, size_t n, int para);
+
+#endif

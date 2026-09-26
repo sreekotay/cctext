@@ -67,3 +67,66 @@ bind the slice and style first.
 `d->runs.truncate(n)` / `L->rows.clear()` — method is on the Vec field,
 including `@typehooks` owners (`RtxDoc`, `RtxLayout`). No `Vec::[T] *`
 peel bind.
+
+## Product in an array bound of a header struct (2026-09-22)
+
+`RtxMdCell lines[RTX_MD_TABLE_COLS * RTX_MD_WRAP_MAX];` in `layout.cch`
+fails the clean lowerer's header extraction: `cannot extract layout.cch:
+RTX_MD_TABLE_COLS* is not a type` (it reads `A * B` as a pointer type).
+The target build then stops but a multi-target `ccc build` still exits
+without an obvious error in a filtered log — check the binary's mtime.
+Use a literal macro (`RTX_MD_REC_LINES 512`) and `_Static_assert` the
+product in the `.ccs`.
+
+## Tree chapters lower as their own module (2026-09-23)
+
+`piece_tree_lines.cch` is spliced into the tree TU, but the clean lowerer
+lowers it as a module first: `!>` on a `static` function of
+`piece_tree.ccs` fails with `no visible declaration, so the producer could
+not be typed as a Result`. Make it non-`static` and declare it in
+`piece_tree_priv.cch`.
+
+A `.ccs` cannot `#include` another `.ccs` (`is a source unit; a quoted
+include names a face`). To build the tree TU with different `#ifndef`
+knobs, pass `--cc-flags '-DRTX_...=...'` with its own `--out-dir` /
+`--bin-dir` (`run_named_lix` in make.shcc).
+
+## A face may not include a bare `.h` (2026-09-23)
+
+The clean lowerer places each `.cch` under `out*/.cc-build/clean/` and
+compiles it as its own module with no repo `-I`. A plain `.h` it
+includes is not placed there, so `#include "ui_cmd.h"` / `<core/ui_cmd.h>`
+from `ui_types.cch` failed every fresh build (`No such file or
+directory`; a warm `out/` hid it). Shared C-only headers a face needs
+are faces too (`core/ui_cmd.cch`); plain C (`gui_plat.h` for
+`ui_plat.c`) includes the `.cch` by path.
+
+`scripts/cclower_root.py` runs the `cclower_cc` beside `ccc` (`$CCC` or
+PATH, symlinks resolved), then PATH, then `~/.local/bin`
+(`CCLOWER_CC` overrides) — Docker installs to `/opt/ccc`.
+
+## Sanitizer runs (2026-09-23)
+
+`./make.shcc @smoke_tsan` adds `scripts/tsan.supp` to `TSAN_OPTIONS`
+(runtime-internal reports only). Ubuntu 24.04 needs
+`sysctl vm.mmap_rnd_bits=28` for TSan; Docker needs
+`--security-opt seccomp=unconfined`. Pass `fast_unwind_on_fatal=1` in
+`ASAN_OPTIONS`: the default slow unwinder dies on a fiber stack
+(`nested bug in the same thread`). The turnstile cond-wake runtime bug
+(FRICTION.md) fails `@smoke_asan` / flakes `@smoke_tsan` until
+concurrent-c fixes it.
+
+## 64 CC_TARGETs per build file (2026-09-23)
+
+`ccc 0.4.0` stops with `cc: too many CC_TARGET entries or sources in
+build.cc` once a build file declares a 65th `CC_TARGET`. Nothing else
+fails, but adding a test to build.cc breaks every build. Tests past the
+cap live in `build_tests.cc`, which keeps a copy of the core library
+targets. `make.shcc`'s `build_file_of(name)` routes `run_named` and the
+ASan / TSan runs there. Keep the two library blocks equal.
+
+A target may list several sources (`CC_TARGET rtx_md_table obj
+core/md_table.ccs core/md_block.ccs`); that adds no `CC_TARGET` entry,
+so a new library TU can join an existing target instead of taking a
+slot (65 sources over 64 targets builds). `ccc build --build-file F a b`
+builds only `a` (2026-09-23): build targets one call each.

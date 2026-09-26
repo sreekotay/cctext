@@ -1,0 +1,135 @@
+#!ccc ccs
+/*
+ * Line-index throughput (a perf tool, not a smoke).
+ *
+ *   ./bin/lf_perf FILE
+ *
+ * Each op opens FILE fresh (not timed), then:
+ *   prefix  rtx_line_scan_to(len)             the prefix scan to EOF
+ *   jump    `g L` for L at 90% of the lines: want_kick + want_step waves
+ *           (the host's 256 KiB budget) until the line is reached
+ *   island  isle_kick at 90% of the bytes + isle_finish (lanes back to 0)
+ *   lineof  line_of at 100k random offsets once the prefix is at EOF
+ * RESULT lines give ms and GB/s over the bytes walked, best of
+ * RTX_PERF_TRIALS (default 3).
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "../core/document.cch"
+#include "../core/lf.cch"
+
+static double perf_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static void emit(const char *op, size_t bytes, double ms) {
+    printf("RESULT op=%s bytes=%zu ms=%.3f GBps=%.2f\n", op, bytes, ms,
+           ms > 0 ? (double)bytes / 1.0e9 / (ms / 1000.0) : 0.0);
+    fflush(stdout);
+}
+
+int main(int argc, char **argv) {
+    const char *src = argc > 1 ? argv[1] : "testdata/generated/large.txt";
+    const char *te = getenv("RTX_PERF_TRIALS");
+    int trials = te && te[0] ? atoi(te) : 3, t;
+    size_t n = 0, lines = 0, target = 0, walked = 0;
+    double best;
+    @errhandler(RtxIndexErr e) {
+        fprintf(stderr, "lf_perf: index %s\n", e.message ? e.message : "?");
+        return 1;
+    }
+    @errhandler(CCError e) {
+        fprintf(stderr, "lf_perf: %s\n", e.message ? e.message : "?");
+        return 1;
+    }
+    if (trials < 1) trials = 1;
+    printf("lf_perf: %s\n", rtx_lf_impl());
+
+    best = -1.0;
+    for (t = 0; t < trials; t++) {
+        RtxDoc d = {0} @destroy;
+        double t0, ms;
+        d.from_path(cc_slice_cstr(src)) !>;
+        n = d.len();
+        t0 = perf_ms();
+        rtx_line_scan_to(&d.tree, n) !>;
+        ms = perf_ms() - t0;
+        lines = d.tree.scan_line;
+        if (best < 0 || ms < best) best = ms;
+    }
+    emit("prefix", n, best);
+
+    target = lines / 10 * 9;
+    best = -1.0;
+    for (t = 0; t < trials; t++) {
+        RtxDoc d = {0} @destroy;
+        double t0, ms;
+        d.from_path(cc_slice_cstr(src)) !>;
+        t0 = perf_ms();
+        rtx_line_want_kick(&d.tree, target + 1);
+        while (rtx_line_want_pumping(&d.tree)) {
+            if (!rtx_line_want_step(&d.tree, (size_t)RTX_LINE_ISLE_BUDGET)) break;
+        }
+        ms = perf_ms() - t0;
+        walked = d.tree.want_off;
+        if (d.tree.want_known != target) {
+            fprintf(stderr, "lf_perf: jump reached %zu want %zu\n", d.tree.want_known,
+                    target);
+            return 1;
+        }
+        if (best < 0 || ms < best) best = ms;
+    }
+    emit("jump", walked, best);
+
+    best = -1.0;
+    for (t = 0; t < trials; t++) {
+        RtxDoc d = {0} @destroy;
+        double t0, ms;
+        size_t at;
+        d.from_path(cc_slice_cstr(src)) !>;
+        at = rtx_doc_line_floor(&d, n / 10 * 9) !>;
+        t0 = perf_ms();
+        rtx_line_isle_kick(&d.tree, at);
+        rtx_line_isle_finish(&d.tree) !>;
+        ms = perf_ms() - t0;
+        walked = at;
+        if (!rtx_line_isle_connected(&d.tree)) {
+            fprintf(stderr, "lf_perf: island did not connect\n");
+            return 1;
+        }
+        if (rtx_line_isle_line(&d.tree) + 1 < target) {
+            fprintf(stderr, "lf_perf: island line %zu\n", rtx_line_isle_line(&d.tree));
+            return 1;
+        }
+        if (best < 0 || ms < best) best = ms;
+    }
+    emit("island", walked, best);
+
+    {
+        RtxDoc d = {0} @destroy;
+        double t0, ms;
+        size_t i, sum = 0;
+        unsigned long long r = 88172645463325252ULL;
+        d.from_path(cc_slice_cstr(src)) !>;
+        rtx_line_scan_to(&d.tree, n) !>;
+        printf("lf_perf: lines %zu slots %zu ready %d scan_off %zu\n", d.tree.scan_line,
+               d.tree.line_off_len, d.tree.lf_ready, d.tree.line_scan_off);
+        t0 = perf_ms();
+        for (i = 0; i < 100000; i++) {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            sum += d.line_of((size_t)(r % (n ? n : 1))) !>;
+        }
+        ms = perf_ms() - t0;
+        printf("RESULT op=lineof calls=100000 ms=%.3f us_per=%.3f (%zu)\n", ms,
+               ms / 100.0, sum & 1);
+    }
+    return 0;
+}

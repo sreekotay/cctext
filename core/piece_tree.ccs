@@ -29,8 +29,11 @@ static double rtx_mono_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
+#define RTX_BUSY_DELAY_MS 100.0
+
 static void rtx_busy_end(RtxPieceTree *t) {
     if (!t || !t->busy_fn) return;
+    t->busy_t0_ms = 0.0;
     /* A line already in the scan still calls end. The TUI hook erases
      * the spinner and drops the row cache. busy_last_ms stays 0 until
      * a pulse is actually shown. */
@@ -47,6 +50,13 @@ static void rtx_busy_pulse(RtxPieceTree *t, const char *label, size_t done,
     int pct;
     if (!t || !t->busy_fn || !label) return;
     now = rtx_mono_ms();
+    /* Nothing shown before an op has run RTX_BUSY_DELAY_MS: a short scan
+     * (every open's first window) must not paint and erase a spinner
+     * ahead of the first frame. */
+    if (t->busy_last_ms <= 0.0) {
+        if (t->busy_t0_ms <= 0.0) t->busy_t0_ms = now;
+        if (now - t->busy_t0_ms < RTX_BUSY_DELAY_MS) return;
+    }
     if (t->busy_last_ms > 0.0 && now - t->busy_last_ms < 50.0 &&
         !(total > 0 && done >= total)) {
         return;
@@ -55,16 +65,6 @@ static void rtx_busy_pulse(RtxPieceTree *t, const char *label, size_t done,
     if (total == 0) pct = -1;
     else pct = rtx_pct(done, total);
     t->busy_fn(t->busy_ctx, label, pct);
-}
-
-static size_t rtx_count_lf(const char *p, size_t n) {
-    size_t c = 0;
-    size_t i;
-    if (!p) return 0;
-    for (i = 0; i < n; i++) {
-        if (p[i] == '\n') c++;
-    }
-    return c;
 }
 
 static size_t rtx_original_len(const RtxPieceTree *t) {
@@ -80,7 +80,7 @@ static int rtx_orig_is_mem(const RtxPieceTree *t) {
 /* Count newlines in a piece range. Store I/O surfaces as Result. */
 static size_t !>(CCError) rtx_buf_count_lf(const RtxPieceTree *t, RtxBufKind buf,
                                             size_t start, size_t len) {
-    char tmp[RTX_IO_CHUNK];
+    char tmp[16 * 1024];
     size_t off = 0;
     size_t c = 0;
     if (!t) return cc_err(CC_ERR_INVALID_ARG, "count lf");
@@ -203,6 +203,41 @@ static void !>(CCError) rtx_lf_recount_node(RtxPieceTree *t, RtxNode *n) {
 
 int rtx_line_off_push(RtxPieceTree *t, size_t off);
 
+/* Count the newlines of buf[0, n) (document bytes from `base`) onto *line,
+ * pushing a stride slot after each newline that brings *line to a multiple
+ * of RTX_LINE_STRIDE. With stop != RTX_LINE_NO_STOP, stop just past the
+ * newline that brings *line to >= stop (*hit = 1); a *line already at or
+ * past stop stops at the next newline. Returns the bytes consumed (n
+ * without a stop), or RTX_LINE_EAT_FAIL when a slot push fails. Same
+ * result as a byte loop; the counter jumps from slot to slot. */
+size_t rtx_line_eat(RtxPieceTree *t, const char *buf, size_t n, size_t base,
+                    size_t *line, size_t stop, int *hit) {
+    size_t pos = 0;
+    *hit = 0;
+    while (pos < n) {
+        size_t need = (size_t)RTX_LINE_STRIDE - *line % (size_t)RTX_LINE_STRIDE;
+        size_t seen = 0, at;
+        if (stop != RTX_LINE_NO_STOP) {
+            size_t to = stop > *line ? stop - *line : 1;
+            if (to < need) need = to;
+        }
+        at = rtx_nth_lf(buf + pos, n - pos, need, &seen);
+        if (at == (size_t)-1) {
+            *line += seen;
+            return n;
+        }
+        *line += need;
+        pos += at + 1;
+        if (*line % (size_t)RTX_LINE_STRIDE == 0 && !rtx_line_off_push(t, base + pos))
+            return RTX_LINE_EAT_FAIL;
+        if (stop != RTX_LINE_NO_STOP && *line >= stop) {
+            *hit = 1;
+            return pos;
+        }
+    }
+    return n;
+}
+
 static void !>(CCError) rtx_tree_seed_original(RtxPieceTree *t) {
     RtxNode *n;
     size_t olen;
@@ -235,13 +270,12 @@ static void !>(CCError) rtx_tree_seed_original(RtxPieceTree *t) {
     return cc_ok();
 }
 
-/* Smoke probe. Not a product surface. */
-static size_t rtx_read_accounted;
+/* Smoke probe. Not a product surface. Find / island lanes add to it
+ * from worker threads, so it is one atomic counter. */
+static _Atomic size_t rtx_read_accounted;
 
 size_t rtx_read_account_take(void) {
-    size_t n = rtx_read_accounted;
-    rtx_read_accounted = 0;
-    return n;
+    return atomic_exchange_explicit(&rtx_read_accounted, 0, memory_order_relaxed);
 }
 
 /* Success: got = min(dest.len, len-off). A hole inside that range is INTERNAL. */
@@ -272,7 +306,7 @@ size_t !>(CCError) RtxPieceTree_read_at(const RtxPieceTree *t, size_t offset,
         got += take;
     }
     if (got != need) return cc_err(CC_ERR_INTERNAL, "read_at short");
-    rtx_read_accounted += got;
+    atomic_fetch_add_explicit(&rtx_read_accounted, got, memory_order_relaxed);
     return cc_ok(got);
 }
 
@@ -304,7 +338,7 @@ size_t !>(CCError) RtxPieceTree_read_uncached(const RtxPieceTree *t, size_t offs
         got += take;
     }
     if (got != need) return cc_err(CC_ERR_INTERNAL, "read_uncached short");
-    rtx_read_accounted += got;
+    atomic_fetch_add_explicit(&rtx_read_accounted, got, memory_order_relaxed);
     return cc_ok(got);
 }
 
@@ -323,10 +357,11 @@ void !>(RtxIndexErr) rtx_line_scan_to(RtxPieceTree *t, size_t want_off) {
     }
     while (t->line_scan_off < want_off) {
         size_t take = want_off - t->line_scan_off;
-        size_t got, i;
+        size_t got;
+        int hit;
         if (take > sizeof(buf)) take = sizeof(buf);
         rtx_busy_pulse(t, "indexing", t->line_scan_off, want_off);
-        got = RtxPieceTree_read_at(t, t->line_scan_off, cc_slice_from_buffer(buf, take)) !>(e) {
+        got = RtxPieceTree_read_uncached(t, t->line_scan_off, cc_slice_from_buffer(buf, take)) !>(e) {
             rtx_busy_end(t);
             return cc_err(rtx_index_from_cc(e));
         };
@@ -334,16 +369,10 @@ void !>(RtxIndexErr) rtx_line_scan_to(RtxPieceTree *t, size_t want_off) {
             rtx_busy_end(t);
             return cc_err(rtx_index_err("line scan"));
         }
-        for (i = 0; i < got; i++) {
-            if (buf[i] == '\n') {
-                t->scan_line++;
-                if (t->scan_line % (size_t)RTX_LINE_STRIDE == 0) {
-                    if (!rtx_line_off_push(t, t->line_scan_off + i + 1)) {
-                        rtx_busy_end(t);
-                        return cc_err(rtx_index_err("line_off"));
-                    }
-                }
-            }
+        if (rtx_line_eat(t, buf, got, t->line_scan_off, &t->scan_line,
+                         RTX_LINE_NO_STOP, &hit) == RTX_LINE_EAT_FAIL) {
+            rtx_busy_end(t);
+            return cc_err(rtx_index_err("line_off"));
         }
         t->line_scan_off += got;
     }
@@ -380,11 +409,12 @@ void !>(RtxIndexErr) rtx_line_scan_through_line(RtxPieceTree *t, size_t want_lin
         if (!rtx_line_off_push(t, 0)) return cc_err(rtx_index_err("line_off"));
     }
     while (t->scan_line < want_line && t->line_scan_off < len) {
-        size_t got, i;
+        size_t got, used;
+        int hit;
         size_t take = sizeof(buf);
         if (take > len - t->line_scan_off) take = len - t->line_scan_off;
         rtx_busy_pulse(t, "jump", t->scan_line, want_line);
-        got = RtxPieceTree_read_at(t, t->line_scan_off, cc_slice_from_buffer(buf, take)) !>(e) {
+        got = RtxPieceTree_read_uncached(t, t->line_scan_off, cc_slice_from_buffer(buf, take)) !>(e) {
             rtx_busy_end(t);
             return cc_err(rtx_index_from_cc(e));
         };
@@ -392,23 +422,14 @@ void !>(RtxIndexErr) rtx_line_scan_through_line(RtxPieceTree *t, size_t want_lin
             rtx_busy_end(t);
             return cc_err(rtx_index_err("line scan"));
         }
-        for (i = 0; i < got; i++) {
-            if (buf[i] == '\n') {
-                t->scan_line++;
-                if (t->scan_line % (size_t)RTX_LINE_STRIDE == 0) {
-                    if (!rtx_line_off_push(t, t->line_scan_off + i + 1)) {
-                        rtx_busy_end(t);
-                        return cc_err(rtx_index_err("line_off"));
-                    }
-                }
-                if (t->scan_line >= want_line) {
-                    t->line_scan_off += i + 1;
-                    break;
-                }
-            }
+        used = rtx_line_eat(t, buf, got, t->line_scan_off, &t->scan_line, want_line,
+                            &hit);
+        if (used == RTX_LINE_EAT_FAIL) {
+            rtx_busy_end(t);
+            return cc_err(rtx_index_err("line_off"));
         }
-        if (t->scan_line >= want_line) break;
-        t->line_scan_off += got;
+        t->line_scan_off += used;
+        if (hit) break;
     }
     rtx_busy_end(t);
     if (t->line_scan_off >= len) {
@@ -448,7 +469,9 @@ static void !>(CCError) rtx_lf_ensure(RtxPieceTree *t) {
 /*
  * Append a copy of [from, from+n) at EOF via frame chunk + store append.
  * Maintains the line index (one patch after the copy).
- * Returns newlines copied.
+ * Returns newlines copied. A read or append fault leaves the tree as it
+ * was: the tip grows (or a fresh tip goes in) only after every chunk
+ * landed. Bytes already appended to the add file stay there, unreferenced.
  */
 size_t !>(CCError) RtxPieceTree_append_copy(RtxPieceTree *t, size_t from,
                                                       size_t n) {
@@ -457,6 +480,7 @@ size_t !>(CCError) RtxPieceTree_append_copy(RtxPieceTree *t, size_t from,
     size_t at;
     RtxNode *tip;
     size_t lf = 0;
+    size_t first = 0;
     char chunk[64 * 1024];
     if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
     if (n == 0) return cc_ok((size_t)0);
@@ -464,6 +488,9 @@ size_t !>(CCError) RtxPieceTree_append_copy(RtxPieceTree *t, size_t from,
     if (from > RtxPieceTree_len(t) || n > RtxPieceTree_len(t) - from) {
         return cc_err(CC_ERR_INVALID_ARG, "append_copy range");
     }
+    /* Island lanes walk nodes and pread the add file. Join before any
+     * node, weight, or add_len moves. */
+    rtx_isle_handle_stop(t);
     rtx_lf_ensure(t) !>(e) { return cc_err(e); };
 
     tip = NULL;
@@ -477,16 +504,11 @@ size_t !>(CCError) RtxPieceTree_append_copy(RtxPieceTree *t, size_t from,
             tip = NULL;
         }
     }
-    if (!tip) {
-        tip = rtx_node_new_piece_lf(t, RTX_BUF_ADD, t->add_len, 0, 0);
-        if (!tip) return cc_err(CC_ERR_OUT_OF_MEMORY, "append tip");
-        rtx_bst_insert(t, tip, RtxPieceTree_len(t));
-    }
 
     while (off < n) {
         size_t take = n - off;
         size_t got, i;
-        size_t start;
+        size_t start, want_start;
         if (take > sizeof(chunk)) take = sizeof(chunk);
         got = RtxPieceTree_read_at(t, from + off, cc_slice_from_buffer(chunk, take)) !>(e) {
             return cc_err(e);
@@ -495,19 +517,22 @@ size_t !>(CCError) RtxPieceTree_append_copy(RtxPieceTree *t, size_t from,
         start = RtxPageStore_append_add(&t->store, chunk, got) !>(e) {
             return cc_err(e);
         };
-        if (tip->piece.len == 0) tip->piece.start = start;
-        else if (start != tip->piece.start + tip->piece.len) {
-            return cc_err(CC_ERR_INTERNAL, "append_copy gap");
-        }
-        for (i = 0; i < got; i++) {
-            if (chunk[i] == '\n') lf++;
-        }
         t->add_len = t->store.add_len;
-        tip->piece.len += got;
+        if (off == 0) first = start;
+        want_start = tip ? tip->piece.start + tip->piece.len + off : first + off;
+        if (start != want_start) return cc_err(CC_ERR_INTERNAL, "append_copy gap");
+        lf += rtx_count_lf(chunk, got);
         off += got;
     }
-    tip->piece.lf_count += lf;
-    rtx_node_pull_up(tip);
+    if (tip) {
+        tip->piece.len += n;
+        tip->piece.lf_count += lf;
+        rtx_node_pull_up(tip);
+    } else {
+        tip = rtx_node_new_piece_lf(t, RTX_BUF_ADD, first, n, lf);
+        if (!tip) return cc_err(CC_ERR_OUT_OF_MEMORY, "append tip");
+        rtx_bst_insert(t, tip, at);
+    }
     rtx_line_index_note_insert(t, at, n, lf);
     return cc_ok(lf);
 }
@@ -701,9 +726,13 @@ static int rtx_lf_huge(const RtxPieceTree *t) {
 
 /*
  * Truncate the progressive index at `off` and clear lf_ready so later
- * line_* resume from here. Does not read past `off`.
+ * line_* resume from here. Does not read past `off`. A slot at `off`
+ * itself stays (its newline is before `off`); dropping it loses the slot
+ * for good, since the resumed scan starts past that newline. When the
+ * last slot is more than RTX_LINE_ISLE_BUDGET back, the frontier parks on
+ * that slot instead of counting up to `off`.
  */
-static void !>(CCError) rtx_lf_invalidate_from(RtxPieceTree *t, size_t off) {
+void !>(CCError) rtx_lf_invalidate_from(RtxPieceTree *t, size_t off) {
     size_t keep, from_slot, at;
     size_t extra;
     @errhandler(RtxIndexErr ie) {
@@ -714,7 +743,7 @@ static void !>(CCError) rtx_lf_invalidate_from(RtxPieceTree *t, size_t off) {
         if (!rtx_line_off_push(t, 0)) return cc_err(CC_ERR_OUT_OF_MEMORY, "line_off");
     }
     keep = 0;
-    while (keep < t->line_off_len && t->line_off[keep] < off) keep++;
+    while (keep < t->line_off_len && t->line_off[keep] <= off) keep++;
     from_slot = keep > 0 ? keep - 1 : 0;
     t->line_off_len = from_slot + 1;
     at = t->line_off[from_slot];
@@ -722,10 +751,11 @@ static void !>(CCError) rtx_lf_invalidate_from(RtxPieceTree *t, size_t off) {
     extra = 0;
     if (off > at) {
         if (off - at > (size_t)RTX_LINE_ISLE_BUDGET) {
+            /* Long lines: do not claim [at, off) without counting it. */
             t->scan_line = from_slot * (size_t)RTX_LINE_STRIDE;
-            t->line_scan_off = off;
+            t->line_scan_off = at;
             t->lf_ready = 0;
-            t->line_off_ok = 0;
+            t->line_off_ok = 1;
             return cc_ok();
         }
         extra = rtx_count_lf_range(t, at, off - at) !>;
@@ -752,7 +782,25 @@ static void !>(CCError) rtx_lf_prepare_edit(RtxPieceTree *t, size_t off,
     len = RtxPieceTree_len(t);
     if (off > len) off = len;
     if (rtx_lf_huge(t)) {
-        if (t->lf_ready) t->lf_ready = 0;
+        if (t->lf_ready) {
+            /* Leaving exact weights (a small doc grew past SOFT_MIN). The
+             * cursor stopped where the doc turned ready; the weights and a
+             * complete stride index say where it is now. */
+            if (t->line_off_ok && t->root &&
+                t->line_off_len == (size_t)t->root->subtree_lf / (size_t)RTX_LINE_STRIDE + 1) {
+                t->line_scan_off = len;
+                t->scan_line = (size_t)t->root->subtree_lf;
+            } else {
+                t->line_off_len = 0;
+                if (!rtx_line_off_push(t, 0)) {
+                    return cc_err(CC_ERR_OUT_OF_MEMORY, "line_off");
+                }
+                t->line_scan_off = 0;
+                t->scan_line = 0;
+                t->line_off_ok = 1;
+            }
+            t->lf_ready = 0;
+        }
         if (off < len) {
             if (lines_change && off <= t->line_scan_off) {
                 rtx_lf_invalidate_from(t, off) !>(e) { return cc_err(e); };
@@ -792,11 +840,18 @@ static int rtx_ins_prof_on = 0;
 static RtxInsertProf rtx_ins_prof;
 static int rtx_fail_replace;
 static int rtx_fail_replace_unrestorable;
+static size_t rtx_fail_replace_skip;
 
 void RtxPieceTree_fail_next_replace(RtxPieceTree *t, int unrestorable) {
     (void)t;
     rtx_fail_replace = 1;
     rtx_fail_replace_unrestorable = unrestorable ? 1 : 0;
+    rtx_fail_replace_skip = 0;
+}
+
+void RtxPieceTree_fail_replace_after(RtxPieceTree *t, size_t skip, int unrestorable) {
+    RtxPieceTree_fail_next_replace(t, unrestorable);
+    rtx_fail_replace_skip = skip;
 }
 
 void RtxPieceTree_profile_insert(RtxPieceTree *t, int on) {
@@ -985,14 +1040,17 @@ static void !>(CCError) rtx_range_piece_fill(const RtxPieceTree *t, size_t off, 
         out[i].buf = (unsigned char)node->piece.buf;
         out[i].start = node->piece.start + local;
         out[i].len = take;
-        if (local == 0 && take == node->piece.len) {
+        /* Progressive weights are not counts (split halves and the seeded
+         * original carry 0). Say so; splice recounts or treats as unknown. */
+        out[i].lf_ok = t->lf_ready ? 1 : 0;
+        if (!t->lf_ready) {
+            lf = 0;
+        } else if (local == 0 && take == node->piece.len) {
             lf = node->piece.lf_count;
-        } else if (t->lf_ready) {
+        } else {
             lf = rtx_buf_count_lf(t, node->piece.buf, out[i].start, take) !>(e) {
                 return cc_err(e);
             };
-        } else {
-            lf = 0;
         }
         out[i].lf_count = lf;
         i++;
@@ -1031,10 +1089,12 @@ void !>(CCError) RtxPieceTree_splice_refs(RtxPieceTree *t, size_t off,
     if (!refs) return cc_err(CC_ERR_INVALID_ARG, "splice refs");
     len = RtxPieceTree_len(t);
     if (off > len) return cc_err(CC_ERR_INVALID_ARG, "splice off");
+    rtx_isle_handle_stop(t);
     {
+        /* An uncounted ref may hold newlines: treat it as a line change. */
         int lines = 0;
         for (i = 0; i < nrefs; i++) {
-            if (refs[i].lf_count) {
+            if (refs[i].lf_count || !refs[i].lf_ok) {
                 lines = 1;
                 break;
             }
@@ -1046,6 +1106,7 @@ void !>(CCError) RtxPieceTree_splice_refs(RtxPieceTree *t, size_t off,
     for (i = 0; i < nrefs; i++) {
         RtxNode *node;
         size_t lf;
+        size_t note_lf;
         unsigned char buf = refs[i].buf;
         if (refs[i].len == 0) continue;
         if (buf != RTX_BUF_ORIGINAL && buf != RTX_BUF_ADD) {
@@ -1058,12 +1119,26 @@ void !>(CCError) RtxPieceTree_splice_refs(RtxPieceTree *t, size_t off,
         } else if (refs[i].start + refs[i].len > t->add_len) {
             return cc_err(CC_ERR_INVALID_ARG, "splice add");
         }
-        lf = t->lf_ready ? refs[i].lf_count : 0;
+        /* Ready weights must be counts: recount a ref captured while the
+         * index was progressive. Progressive nodes carry 0; the index
+         * gets the count when there is one, else RTX_LF_UNKNOWN. */
+        note_lf = refs[i].lf_ok ? refs[i].lf_count : RTX_LF_UNKNOWN;
+        if (t->lf_ready) {
+            if (refs[i].lf_ok) {
+                lf = refs[i].lf_count;
+            } else {
+                lf = rtx_buf_count_lf(t, (RtxBufKind)buf, refs[i].start,
+                                      refs[i].len) !>(e) { return cc_err(e); };
+            }
+            note_lf = lf;
+        } else {
+            lf = 0;
+        }
         node = rtx_node_new_piece_lf(t, (RtxBufKind)buf, refs[i].start, refs[i].len, lf);
         if (!node) return cc_err(CC_ERR_OUT_OF_MEMORY, "splice node");
         rtx_bst_insert(t, node, at);
         if (!t->line_off_suspend) {
-            rtx_line_index_note_insert(t, at, refs[i].len, node->piece.lf_count);
+            rtx_line_index_note_insert(t, at, refs[i].len, note_lf);
         }
         at += refs[i].len;
     }
@@ -1078,7 +1153,9 @@ void !>(CCError) RtxPieceTree_replace(RtxPieceTree *t, size_t off, size_t n,
     size_t nrefs = 0;
     CCArena hold = {0};
     if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
-    if (rtx_fail_replace) {
+    if (rtx_fail_replace && rtx_fail_replace_skip) {
+        rtx_fail_replace_skip--;
+    } else if (rtx_fail_replace) {
         int unrest = rtx_fail_replace_unrestorable;
         rtx_fail_replace = 0;
         rtx_fail_replace_unrestorable = 0;
@@ -1092,6 +1169,10 @@ void !>(CCError) RtxPieceTree_replace(RtxPieceTree *t, size_t off, size_t n,
         }
     }
     if (n == 0 && ins.len == 0) return cc_ok();
+    /* Join the island before the first mutation: its lanes walk nodes
+     * (read_uncached) and pause gates only the write stage. note_insert /
+     * note_erase drop it after the tree already moved — too late. */
+    rtx_isle_handle_stop(t);
     if (n && ins.len) {
         size_t np = rtx_range_piece_count(t, off, n) !>(e) { return cc_err(e); };
         size_t need = np * sizeof(RtxPieceRef) + 64;
@@ -1322,6 +1403,234 @@ void !>(CCError) RtxPieceTree_write_fd_from(RtxPieceTree *t, int fd, size_t from
 
 #include "piece_tree_lines.cch"
 
+/* ------------------------------------------------------------ bulk
+ * DESIGN Edit groups (bulk): a large group lands as one piece-sequence
+ * swap instead of one tree replace per site. */
+
+size_t RtxPieceTree_add_end(const RtxPieceTree *t) {
+    return t ? t->add_len : 0;
+}
+
+void !>(CCError) RtxPieceTree_stage_add(RtxPieceTree *t, size_t rel, char[:] bytes) {
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
+    if (bytes.len == 0) return cc_ok();
+    if (!bytes.ptr) return cc_err(CC_ERR_INVALID_ARG, "null stage bytes");
+    return RtxPageStore_stage_add(&t->store, rel, bytes.ptr, bytes.len);
+}
+
+/* An RB tree over 2^60 pieces is at most 122 deep. */
+#define RTX_BULK_STACK 128
+
+static size_t !>(CCError) rtx_bulk_count(const RtxPieceTree *t) {
+    const RtxNode *st[RTX_BULK_STACK];
+    const RtxNode *n = t->root;
+    size_t sp = 0, c = 0;
+    while (n || sp) {
+        while (n) {
+            if (sp == RTX_BULK_STACK) return cc_err(CC_ERR_INTERNAL, "tree depth");
+            st[sp++] = n;
+            n = n->left;
+        }
+        n = st[--sp];
+        c++;
+        n = n->right;
+    }
+    return cc_ok(c);
+}
+
+typedef struct {
+    RtxPiece *p;
+    size_t n;
+    size_t cap;
+} RtxBulkSeq;
+
+/* Append a piece; one that continues the last piece's bytes merges. */
+static void rtx_bulk_push(RtxBulkSeq *o, RtxBufKind buf, size_t start, size_t len,
+                          size_t lf) {
+    RtxPiece *l;
+    if (!len) return;
+    if (o->n) {
+        l = &o->p[o->n - 1];
+        if (l->buf == buf && l->start + l->len == start) {
+            l->len += len;
+            l->lf_count += lf;
+            return;
+        }
+    }
+    o->p[o->n].buf = buf;
+    o->p[o->n].start = start;
+    o->p[o->n].len = len;
+    o->p[o->n].lf_count = lf;
+    o->n++;
+}
+
+/* Balanced subtree over p[a, b). With the middle split every level but
+ * the last is full; the last level (`red`) is red, the rest black. */
+static RtxNode *rtx_bulk_build(RtxPieceTree *t, const RtxPiece *p, size_t a, size_t b,
+                               int depth, int red, RtxNode *parent) {
+    size_t m;
+    RtxNode *n;
+    if (a >= b) return NULL;
+    m = a + (b - a) / 2;
+    n = rtx_node_alloc(t);
+    if (!n) return NULL;
+    n->piece = p[m];
+    n->parent = parent;
+    n->color = depth == red ? RTX_RB_RED : RTX_RB_BLACK;
+    n->left = rtx_bulk_build(t, p, a, m, depth + 1, red, n);
+    n->right = rtx_bulk_build(t, p, m + 1, b, depth + 1, red, n);
+    rtx_node_pull(n);
+    return n;
+}
+
+void !>(CCError) RtxPieceTree_bulk_swap(RtxPieceTree *t, size_t lo, size_t old_n,
+                                        const RtxPieceRef *refs, size_t nrefs,
+                                        size_t staged) {
+    CCArena a = {0} @destroy;
+    RtxBulkSeq o = {0};
+    const RtxNode *st[RTX_BULK_STACK];
+    const RtxNode *n;
+    size_t len, hi, i, nodes, need, pos, sp, add_cap, olen, new_n = 0;
+    int ready, placed = 0, levels, red;
+    if (!t) return cc_err(CC_ERR_INVALID_ARG, "null tree");
+    len = RtxPieceTree_len(t);
+    if (lo > len || old_n > len - lo) return cc_err(CC_ERR_INVALID_ARG, "bulk range");
+    if (nrefs && !refs) return cc_err(CC_ERR_INVALID_ARG, "bulk refs");
+    if (staged && !t->store.add_open) return cc_err(CC_ERR_INVALID_ARG, "bulk staged");
+    add_cap = t->add_len + staged;
+    if (add_cap < t->add_len) return cc_err(CC_ERR_INVALID_ARG, "bulk staged");
+    olen = rtx_original_len(t);
+    for (i = 0; i < nrefs; i++) {
+        size_t lim = refs[i].buf == RTX_BUF_ORIGINAL ? olen : add_cap;
+        if (refs[i].buf != RTX_BUF_ORIGINAL && refs[i].buf != RTX_BUF_ADD)
+            return cc_err(CC_ERR_INVALID_ARG, "bulk buf");
+        if (refs[i].start > lim || refs[i].len > lim - refs[i].start)
+            return cc_err(CC_ERR_INVALID_ARG, "bulk ref range");
+        if (new_n + refs[i].len < new_n) return cc_err(CC_ERR_INVALID_ARG, "bulk size");
+        new_n += refs[i].len;
+    }
+    if (len - old_n + new_n < new_n) return cc_err(CC_ERR_INVALID_ARG, "bulk size");
+    hi = lo + old_n;
+    /* Island lanes walk nodes: join before any node moves. */
+    rtx_isle_handle_stop(t);
+    if (staged) {
+        /* Unreferenced until the rebuild: a later failure leaves them as
+         * the bytes of a failed append. */
+        RtxPageStore_commit_add(&t->store, staged);
+        t->add_len = t->store.add_len;
+    }
+    rtx_lf_prepare_edit(t, lo, 1) !>(e) { return cc_err(e); };
+    ready = t->lf_ready;
+    nodes = rtx_bulk_count(t) !>(e) { return cc_err(e); };
+    need = nodes + nrefs + 2;
+    a = cc_arena_heap(need * sizeof(RtxPiece) + 64);
+    if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "bulk seq");
+    o.p = (RtxPiece *)cc_arena_alloc(a, need * sizeof(RtxPiece), 8);
+    if (!o.p) return cc_err(CC_ERR_OUT_OF_MEMORY, "bulk seq");
+    o.cap = need;
+    /* The new sequence: prefix pieces (the one across lo clipped), refs,
+     * suffix pieces (the one across hi clipped). Every count that reads
+     * happens here, before the tree is touched. */
+    pos = 0;
+    sp = 0;
+    n = t->root;
+    while (n || sp) {
+        size_t pe;
+        const RtxPiece *p;
+        while (n) {
+            st[sp++] = n;
+            n = n->left;
+        }
+        n = st[--sp];
+        p = &n->piece;
+        pe = pos + p->len;
+        if (!placed && pe > lo) {
+            if (pos < lo) {
+                size_t lf = 0;
+                if (ready)
+                    lf = rtx_buf_count_lf(t, p->buf, p->start, lo - pos) !>(e) {
+                        return cc_err(e);
+                    };
+                rtx_bulk_push(&o, p->buf, p->start, lo - pos, lf);
+            }
+            for (i = 0; i < nrefs; i++) {
+                size_t lf = 0;
+                if (ready) {
+                    if (refs[i].lf_ok) lf = refs[i].lf_count;
+                    else
+                        lf = rtx_buf_count_lf(t, (RtxBufKind)refs[i].buf, refs[i].start,
+                                              refs[i].len) !>(e) { return cc_err(e); };
+                }
+                rtx_bulk_push(&o, (RtxBufKind)refs[i].buf, refs[i].start, refs[i].len, lf);
+            }
+            placed = 1;
+        }
+        if (pe <= lo) {
+            rtx_bulk_push(&o, p->buf, p->start, p->len, p->lf_count);
+        } else if (pe > hi) {
+            if (pos >= hi) {
+                rtx_bulk_push(&o, p->buf, p->start, p->len, p->lf_count);
+            } else {
+                size_t cut = hi - pos, lf = 0;
+                if (ready)
+                    lf = rtx_buf_count_lf(t, p->buf, p->start + cut, p->len - cut) !>(e) {
+                        return cc_err(e);
+                    };
+                rtx_bulk_push(&o, p->buf, p->start + cut, p->len - cut, lf);
+            }
+        }
+        pos = pe;
+        n = n->right;
+    }
+    if (!placed) {
+        for (i = 0; i < nrefs; i++) {
+            size_t lf = 0;
+            if (ready) {
+                if (refs[i].lf_ok) lf = refs[i].lf_count;
+                else
+                    lf = rtx_buf_count_lf(t, (RtxBufKind)refs[i].buf, refs[i].start,
+                                          refs[i].len) !>(e) { return cc_err(e); };
+            }
+            rtx_bulk_push(&o, (RtxBufKind)refs[i].buf, refs[i].start, refs[i].len, lf);
+        }
+    }
+    /* Nodes for the new sequence exist before the old tree goes. */
+    for (i = nodes; i < o.n; i++) {
+        RtxNode *x = (RtxNode *)cc_arena_alloc(*t->arena, sizeof(RtxNode), _Alignof(RtxNode));
+        if (!x) return cc_err(CC_ERR_OUT_OF_MEMORY, "bulk nodes");
+        rtx_node_recycle(t, x);
+    }
+    /* From here nothing fails. */
+    sp = 0;
+    n = t->root;
+    while (n || sp) {
+        RtxNode *x;
+        const RtxNode *next;
+        while (n) {
+            st[sp++] = n;
+            n = n->left;
+        }
+        x = (RtxNode *)st[--sp];
+        next = x->right;
+        rtx_node_recycle(t, x);
+        n = next;
+    }
+    t->root = NULL;
+    levels = 0;
+    for (i = o.n; i; i >>= 1) levels++;
+    red = levels > 1 ? levels - 1 : -1;
+    t->root = rtx_bulk_build(t, o.p, 0, o.n, 0, red, NULL);
+    if (t->root) t->root->color = RTX_RB_BLACK;
+    if (t->lf_ready) {
+        if (t->line_off_ok && t->line_off_len) rtx_line_index_rebuild_suffix(t, lo);
+        else rtx_line_index_build(t);
+    }
+    rtx_line_want_cancel(t);
+    rtx_line_pins_wipe_from(t, lo);
+    rtx_line_isle_drop(t);
+    return cc_ok();
+}
+
 void rtx_isle_handle_stop(RtxPieceTree *t) {
     if (!t) return;
     rtx_isle_store_cancel(t, 1);
@@ -1353,12 +1662,17 @@ static int rtx_isle_run(RtxPieceTree *t) {
     size_t remain;
     size_t n_sz;
     size_t acc;
+    size_t plen;
     int n;
     int i;
     bool fin;
     if (!t) return 0;
+    /* Pin targets: the tree does not change while the arm runs (every
+     * mutation joins the island first). */
+    plen = RtxPieceTree_len(t);
+    /* Planted by the caller before the kick. Do not read line_scan_off:
+     * the host's prefix pump writes it while this arm runs. */
     span_lo = t->isle_floor;
-    if (span_lo < t->line_scan_off) span_lo = t->line_scan_off;
     span_hi = t->isle_anchor;
     if (span_hi < span_lo) span_hi = span_lo;
     remain = span_hi - span_lo;
@@ -1383,12 +1697,16 @@ static int rtx_isle_run(RtxPieceTree *t) {
             size_t want;
             size_t got;
             size_t lfs;
+            size_t npin;
+            size_t pin_slot[RTX_LINE_MARK_MAX];
+            size_t pin_tail[RTX_LINE_MARK_MAX];
 
             hi = span_hi - (size_t)i * (size_t)RTX_ISLE_BLOCK;
             lo = hi > (size_t)RTX_ISLE_BLOCK ? hi - (size_t)RTX_ISLE_BLOCK : 0;
             if (lo < span_lo) lo = span_lo;
             want = hi > lo ? hi - lo : 0;
             lfs = 0;
+            npin = 0;
             if (want && !rtx_isle_load_cancel(t) && rtx_isle_load_live(t)) {
                 CCArena lane =
                     cc_arena_heap((size_t)RTX_ISLE_BLOCK + kilobytes(64)) @destroy;
@@ -1397,21 +1715,49 @@ static int rtx_isle_run(RtxPieceTree *t) {
                 if (buf) {
                     got = rtx_isle_read_block(t, lo, buf, want);
                     if (got < want && got) lo = hi - got;
-                    lfs = rtx_count_lf(buf, got);
+                    if (got == want) {
+                        /* Count down from hi in segments cut at the 1/32
+                         * targets in (lo, hi]; each cut's tail is LFs in
+                         * [target, hi). Same bytes as one count. */
+                        size_t s = RTX_LINE_MARK_MAX;
+                        size_t cut = got;
+                        while (s-- > 0) {
+                            size_t tgt = rtx_line_pin_target(s, plen);
+                            if (tgt > hi) continue;
+                            if (tgt <= lo) break;
+                            lfs += rtx_count_lf(buf + (tgt - lo), cut - (tgt - lo));
+                            cut = tgt - lo;
+                            pin_slot[npin] = s;
+                            pin_tail[npin] = lfs;
+                            npin++;
+                        }
+                        lfs += rtx_count_lf(buf, cut);
+                    } else {
+                        lfs = rtx_count_lf(buf, got);
+                    }
                 } else {
                     rtx_isle_store_cancel(t, 1);
                 }
             }
 
             @stage (ts, 0, i) {
-                while (t->isle_h.paused && !rtx_isle_load_cancel(t))
+                while ((t->isle_h.paused || rtx_isle_load_hold(t))
+                       && !rtx_isle_load_cancel(t))
                     cc_yield();
                 if (!rtx_isle_load_cancel(t) && rtx_isle_load_live(t)) {
+                    size_t k;
+                    for (k = 0; k < npin; k++) {
+                        t->isle_pin_rel[pin_slot[k]] = acc + pin_tail[k];
+                        t->isle_pin_set[pin_slot[k]] = 1;
+                    }
                     acc += lfs;
-                    t->isle_before = acc;
-                    t->isle_from = lo;
-                    if (t->isle_from <= span_lo)
-                        t->isle_from = span_lo;
+                    /* before, then from: a reader that sees from connected
+                     * reads this count. */
+                    atomic_store_explicit(&t->isle_before, acc,
+                                          memory_order_release);
+                    atomic_store_explicit(&t->isle_from,
+                                          lo <= span_lo ? span_lo : lo,
+                                          memory_order_release);
                 }
             }
 
@@ -1436,6 +1782,12 @@ void !>(CCError) rtx_isle_listing_start(RtxPieceTree *t) {
     if (t->isle_anchor <= t->line_scan_off || t->isle_anchor <= t->isle_floor)
         return cc_ok();
     if (t->isle_h.live()) return cc_ok();
+    /* Host thread, arm down: the prefix may have passed the floor since
+     * the kick. The arm reads only the floor planted here. */
+    if (t->line_scan_off > t->isle_floor) {
+        t->isle_floor = t->line_scan_off;
+        t->isle_base_line = t->scan_line;
+    }
     t->isle_h = @parallel {
         @serial { noop = 0; }
         rtx_isle_run(scan);
@@ -1445,6 +1797,7 @@ void !>(CCError) rtx_isle_listing_start(RtxPieceTree *t) {
 
 void !>(CCError) rtx_line_isle_finish(RtxPieceTree *t) {
     if (!t) return cc_ok();
+    rtx_isle_store_hold(t, 0);
     if (rtx_isle_load_live(t) && !t->isle_h.live() && rtx_line_isle_pumping(t)
         && !rtx_isle_load_cancel(t))
         rtx_isle_listing_start(t) !>(e) { return cc_err(e); };
@@ -1464,6 +1817,10 @@ void rtx_line_isle_pause(RtxPieceTree *t) {
 void rtx_line_isle_resume(RtxPieceTree *t) {
     if (!t || !t->isle_h.live() || !t->isle_h.paused()) return;
     t->isle_h.resume() !>(e) { (void)e; };
+}
+
+void rtx_line_isle_hold(RtxPieceTree *t, int on) {
+    rtx_isle_store_hold(t, on ? 1 : 0);
 }
 
 int RtxPieceTree_lf_ready(const RtxPieceTree *t) {

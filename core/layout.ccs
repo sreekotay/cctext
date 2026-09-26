@@ -4,6 +4,7 @@
  * / UFCS; this file owns the wrap / hit-test bodies.
  */
 #include <ccc/std/prelude.cch>
+#include <stdlib.h>
 #include "utf8.cch"
 #include "document.cch"
 #include "layout.cch"
@@ -68,8 +69,12 @@ int RtxLayout_ensure(RtxLayout *L) {
 void RtxLayout_reset(RtxLayout *L) {
     if (!L) return;
     L->rows.destroy();
+    L->md_recs.destroy();
+    L->md_cells.destroy();
+    L->md_lines.destroy();
     if (L->store.base) L->store.reset();
     L->total_height = 0;
+    L->fill_lined = 0;
     rtx_grid_geom_destroy(&L->grid);
     L->grid_hdr_end = 0;
     L->grid_hdr_on = 0;
@@ -82,6 +87,9 @@ void RtxLayout_reset(RtxLayout *L) {
 void RtxLayout_destroy(RtxLayout *L) {
     if (!L) return;
     L->rows.destroy();
+    L->md_recs.destroy();
+    L->md_cells.destroy();
+    L->md_lines.destroy();
     rtx_grid_geom_destroy(&L->grid);
     if (L->store.base) L->store.destroy();
     *L = (RtxLayout){0};
@@ -103,12 +111,19 @@ static int rtx_layout_is_break(char c) {
     return c == ' ' || c == '\t';
 }
 
+static size_t g_rtx_row_gen;
+
+static size_t rtx_layout_row_gen(void) {
+    return __atomic_add_fetch(&g_rtx_row_gen, 1, __ATOMIC_RELAXED);
+}
+
 static int rtx_layout_push_row(RtxLayout *L, const RtxMeasure *m,
                                size_t byte_start, size_t byte_len, size_t phys,
                                double w, double h, double pad,
                                RtxSectionKind sec) {
     RtxVisRow row = {0};
     RtxStyle z = {0};
+    row.gen = rtx_layout_row_gen();
     row.byte_start = byte_start;
     row.byte_len = byte_len;
     row.line = phys;
@@ -370,9 +385,21 @@ static void !>(CCError) rtx_layout_grid_walk(RtxLayout *L, RtxDocLayout d,
             (unsigned char *)cc_arena_alloc(L->store, n ? n : 1, 1);
         L->grid.hold_from = from;
         L->grid.hold_n = n;
-        if (hold)
-            for (hi = 0; hi < n; hi++)
-                hold[hi] = rtx_layout_grid_held(d, from + hi) ? 1 : 0;
+        /* Runs are constant on [a, style_next(a)); only the section can
+         * still flip the face inside that stretch, so one style_at per
+         * edge and a section compare per byte. */
+        hi = 0;
+        while (hold && hi < n) {
+            size_t e = d->style_next(from + hi, from + n) - from;
+            unsigned char h = rtx_layout_grid_held(d, from + hi) ? 1 : 0;
+            RtxSectionKind sk = d->section_at(from + hi);
+            if (e <= hi) e = hi + 1;
+            hold[hi++] = h;
+            for (; hi < e; hi++) {
+                if (d->section_at(from + hi) == sk) hold[hi] = h;
+                else hold[hi] = rtx_layout_grid_held(d, from + hi) ? 1 : 0;
+            }
+        }
         L->grid.hold = hold;
     }
     L->grid_hdr_end = hlen;
@@ -499,13 +526,84 @@ int rtx_hint_standin_cols(const char *g, size_t n) {
     return cols;
 }
 
+static int rtx_hide_edge_cmp(const void *a, const void *b) {
+    size_t x = *(const size_t *)a, y = *(const size_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* Edge table from `off`: hidden_to at each edge in [off, off + span). A
+ * span with too many edges halves; one that cannot be proven (no run
+ * index) turns the cursor into plain hidden_to. */
+static void rtx_hide_build(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
+                           size_t off) {
+    size_t raw[4 * RTX_HIDE_CUR_MAX + 2];
+    size_t span = 2048, cnt, hi, k;
+    int n;
+    hc->ok = 1;
+    hc->i = 0;
+    hc->reveal_lo = L->reveal_lo;
+    hc->reveal_hi = L->reveal_hi;
+    for (;;) {
+        hi = off + span;
+        cnt = d->mark_edges(off, hi, raw, 4 * RTX_HIDE_CUR_MAX);
+        if (cnt != (size_t)-1) break;
+        if (span <= 16) {
+            hc->slow = 1;
+            return;
+        }
+        span /= 4;
+    }
+    if (L->reveal_lo > off && L->reveal_lo < hi) raw[cnt++] = L->reveal_lo;
+    if (L->reveal_hi > off && L->reveal_hi < hi) raw[cnt++] = L->reveal_hi;
+    if (cnt > 1) qsort(raw, cnt, sizeof raw[0], rtx_hide_edge_cmp);
+    hc->e[0] = off;
+    n = 1;
+    for (k = 0; k < cnt; k++) {
+        if (raw[k] == hc->e[n - 1]) continue;
+        if (n >= RTX_HIDE_CUR_MAX) {
+            hi = raw[k]; /* the table stops at the first edge it cannot hold */
+            break;
+        }
+        hc->e[n++] = raw[k];
+    }
+    hc->n = n;
+    hc->lo = off;
+    hc->hi = hi;
+    for (k = 0; k < (size_t)n; k++) hc->v[k] = rtx_layout_hidden_to(L, d, hc->e[k]);
+}
+
+size_t rtx_layout_hidden_cur(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
+                             size_t off) {
+    int i;
+    if (!L || !L->has_marks) return 0;
+    if (!hc || hc->slow) return rtx_layout_hidden_to(L, d, off);
+    if (!hc->ok || off < hc->lo || off >= hc->hi || hc->reveal_lo != L->reveal_lo ||
+        hc->reveal_hi != L->reveal_hi) {
+        rtx_hide_build(L, d, hc, off);
+        if (hc->slow) return rtx_layout_hidden_to(L, d, off);
+    }
+    i = hc->i;
+    if (hc->e[i] > off) i = 0;
+    while (i + 1 < hc->n && hc->e[i + 1] <= off) i++;
+    hc->i = i;
+    return hc->v[i];
+}
+
 int rtx_layout_hint_vis(const RtxLayout *L, RtxDocLayout d, size_t off,
                         const char *row, size_t rel, size_t row_n,
                         RtxHintVis *out) {
+    return rtx_layout_hint_vis_cur(L, d, NULL, off, row, rel, row_n, out);
+}
+
+int rtx_layout_hint_vis_cur(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
+                            size_t off, const char *row, size_t rel, size_t row_n,
+                            RtxHintVis *out) {
     size_t to, n;
     if (!out) return 0;
-    *out = (RtxHintVis){0};
-    to = rtx_layout_hidden_to(L, d, off);
+    out->skip = 0;
+    out->gn = 0;
+    if (!L || !L->has_marks) return 0;
+    to = hc ? rtx_layout_hidden_cur(L, d, hc, off) : rtx_layout_hidden_to(L, d, off);
     if (!to) return 0;
     n = row_n > rel ? row_n - rel : 0;
     if (to > off) {
@@ -556,6 +654,7 @@ static size_t rtx_list_mark_len(const char *s, size_t n) {
 
 /* List line: leading visible ws and the painted mark width (`•  ` / `1. `). */
 static int rtx_layout_list_hang(const RtxLayout *L, RtxDocLayout d,
+                                RtxStyleCur *sc, RtxHideCur *hc,
                                 const RtxMeasure *m, size_t from,
                                 char[:] bytes, size_t lo, size_t hi,
                                 RtxSectionKind sec, double *lead_w,
@@ -567,11 +666,11 @@ static int rtx_layout_list_hang(const RtxLayout *L, RtxDocLayout d,
     while (i < hi) {
         RtxHintVis hv;
         size_t off = from + i;
-        if (rtx_layout_hint_vis(L, d, off, bytes.ptr, i, hi, &hv)) {
+        if (rtx_layout_hint_vis_cur(L, d, hc, off, bytes.ptr, i, hi, &hv)) {
             if (hv.gn) {
                 if (lead_w) *lead_w = lead;
                 if (mark_w) *mark_w = rtx_layout_standin_w(m, &hv,
-                    d->style_at(off), sec);
+                    d->style_cur(sc, off), sec);
                 return 1;
             }
             i += hv.skip;
@@ -582,7 +681,7 @@ static int rtx_layout_list_hang(const RtxLayout *L, RtxDocLayout d,
             size_t step = cl.n ? cl.n : 1;
             if (step == 1 && (bytes.ptr[i] == ' ' || bytes.ptr[i] == '\t')) {
                 char[:] sp = bytes.sub(i, i + step);
-                RtxStyle st = d->style_at(off);
+                RtxStyle st = d->style_cur(sc, off);
                 lead += m->measure(m->ctx, sp, st, sec);
                 i += step;
                 continue;
@@ -594,7 +693,7 @@ static int rtx_layout_list_hang(const RtxLayout *L, RtxDocLayout d,
             if (lead_w) *lead_w = lead;
             if (mark_w) {
                 char[:] mk = bytes.sub(i, i + mn);
-                RtxStyle st = d->style_at(from + i);
+                RtxStyle st = d->style_cur(sc, from + i);
                 *mark_w = m->measure(m->ctx, mk, st, sec);
             }
             return 1;
@@ -603,8 +702,12 @@ static int rtx_layout_list_hang(const RtxLayout *L, RtxDocLayout d,
     return 0;
 }
 
-/* Leading `|` plus following spaces. Continuation hangs under the cell. */
+/* Leading `|` plus following spaces. Continuation hangs under the cell.
+ * Rich MD lens only (markup section, like the table child): a shell
+ * pipeline or a Rust closure opening with `|` is code, and Source panes
+ * show bytes. */
 static int rtx_layout_table_hang(const RtxLayout *L, RtxDocLayout d,
+                                 RtxStyleCur *sc, RtxHideCur *hc,
                                  const RtxMeasure *m, size_t from,
                                  char[:] bytes, size_t lo, size_t hi,
                                  RtxSectionKind sec, double *lead_w,
@@ -612,12 +715,13 @@ static int rtx_layout_table_hang(const RtxLayout *L, RtxDocLayout d,
     size_t i = lo;
     size_t j, pipes, mn;
     double lead = 0;
-    if (!L || !d || !m || !m->measure || !bytes.ptr || lo >= hi) return 0;
+    if (!L || !L->rich || sec != RTX_SEC_MARKUP) return 0;
+    if (!d || !m || !m->measure || !bytes.ptr || lo >= hi) return 0;
     while (i < hi) {
         size_t off = from + i;
         if (L->has_marks) {
             RtxHintVis hv;
-            if (rtx_layout_hint_vis(L, d, off, bytes.ptr, i, hi, &hv)) {
+            if (rtx_layout_hint_vis_cur(L, d, hc, off, bytes.ptr, i, hi, &hv)) {
                 if (hv.gn) return 0;
                 i += hv.skip;
                 continue;
@@ -628,7 +732,7 @@ static int rtx_layout_table_hang(const RtxLayout *L, RtxDocLayout d,
             size_t step = cl.n ? cl.n : 1;
             if (step == 1 && (bytes.ptr[i] == ' ' || bytes.ptr[i] == '\t')) {
                 char[:] sp = bytes.sub(i, i + step);
-                RtxStyle st = d->style_at(off);
+                RtxStyle st = d->style_cur(sc, off);
                 lead += m->measure(m->ctx, sp, st, sec);
                 i += step;
                 continue;
@@ -648,7 +752,7 @@ static int rtx_layout_table_hang(const RtxLayout *L, RtxDocLayout d,
     if (lead_w) *lead_w = lead;
     if (mark_w) {
         char[:] mk = bytes.sub(i, i + mn);
-        RtxStyle st = d->style_at(from + i);
+        RtxStyle st = d->style_cur(sc, from + i);
         *mark_w = m->measure(m->ctx, mk, st, sec);
     }
     return 1;
@@ -732,33 +836,15 @@ static int rtx_layout_md_row_sep(const RtxLayout *L, size_t row) {
            RTX_MD_ROLE_SEP;
 }
 
-static void rtx_layout_md_copy(RtxLayout *dst, const RtxLayout *src) {
-    int i, j, n;
-    if (!dst || !src) return;
-    n = src->md_ntab;
-    if (n < 0) n = 0;
-    if (n > RTX_MD_TABLE_FILL) n = RTX_MD_TABLE_FILL;
-    dst->md_ntab = n;
-    dst->md_keep = n > 0 ? 1 : 0;
-    dst->md_px = src->md_px;
-    for (i = 0; i < n; i++) {
-        dst->md_tab[i] = src->md_tab[i];
-        for (j = 0; j < RTX_MD_TABLE_COLS; j++) {
-            dst->md_colw[i][j] = src->md_colw[i][j];
-            dst->md_colpx[i][j] = src->md_colpx[i][j];
-        }
-    }
-}
-
-static void rtx_layout_md_step(const RtxLayout *L, RtxDocLayout d, size_t base,
-                               char[:] bytes, size_t i, size_t hi, size_t *step,
-                               int *cols) {
+static void rtx_layout_md_step(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
+                               size_t base, char[:] bytes, size_t i, size_t hi,
+                               size_t *step, int *cols) {
     if (step) *step = 1;
     if (cols) *cols = 0;
     if (!bytes.ptr || i >= hi) return;
     {
         RtxHintVis hv;
-        if (rtx_layout_hint_vis(L, d, base + i, bytes.ptr, i, hi, &hv)) {
+        if (rtx_layout_hint_vis_cur(L, d, hc, base + i, bytes.ptr, i, hi, &hv)) {
             if (step) *step = hv.skip;
             if (cols) *cols = rtx_hint_standin_cols(hv.g, hv.gn);
             return;
@@ -781,12 +867,13 @@ static void rtx_layout_md_step(const RtxLayout *L, RtxDocLayout d, size_t base,
 
 static int rtx_layout_md_vis(const RtxLayout *L, RtxDocLayout d, size_t base,
                              char[:] bytes, size_t lo, size_t hi) {
+    RtxHideCur hc = {0};
     size_t i = lo;
     int cols = 0;
     while (i < hi) {
         size_t step = 1;
         int dc = 0;
-        rtx_layout_md_step(L, d, base, bytes, i, hi, &step, &dc);
+        rtx_layout_md_step(L, d, &hc, base, bytes, i, hi, &step, &dc);
         cols += dc;
         i += step;
     }
@@ -797,6 +884,8 @@ static double rtx_layout_md_measure_span(const RtxLayout *L, RtxDocLayout d,
                                          const RtxMeasure *m, size_t base,
                                          char[:] bytes, size_t lo, size_t hi,
                                          RtxSectionKind sec) {
+    RtxStyleCur sc = {0};
+    RtxHideCur hc = {0};
     double w = 0;
     size_t i = lo;
     if (!m || !m->measure || !bytes.ptr || lo >= hi) return 0;
@@ -804,14 +893,14 @@ static double rtx_layout_md_measure_span(const RtxLayout *L, RtxDocLayout d,
         RtxStyle st;
         {
             RtxHintVis hv;
-            if (rtx_layout_hint_vis(L, d, base + i, bytes.ptr, i, hi, &hv)) {
-                w += rtx_layout_standin_w(m, &hv, d->style_at(base + i), sec);
+            if (rtx_layout_hint_vis_cur(L, d, &hc, base + i, bytes.ptr, i, hi, &hv)) {
+                w += rtx_layout_standin_w(m, &hv, d->style_cur(&sc, base + i), sec);
                 i += hv.skip;
                 if (i > hi) i = hi;
                 continue;
             }
         }
-        st = d->style_at(base + i);
+        st = d->style_cur(&sc, base + i);
         if (i + 1 < hi && bytes.ptr[i] == '\\' && bytes.ptr[i + 1] == '|') {
             char bar[1];
             bar[0] = '|';
@@ -1062,104 +1151,427 @@ static size_t rtx_layout_md_lookback(RtxDocLayout d, size_t from) {
     return win;
 }
 
-static void rtx_layout_md_push(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
-                               size_t base, char[:] ext, RtxMdTable t) {
-    RtxSectionKind sec;
-    if (!L || !d || L->md_ntab >= RTX_MD_TABLE_FILL) return;
-    sec = d->section_at(base + t.lo);
-    rtx_layout_md_widths(L, d, m, base, ext, &t, L->md_colw[L->md_ntab],
-                         L->md_colpx[L->md_ntab], sec);
-    t.lo += base;
-    t.hi += base;
-    t.sep_lo += base;
-    t.sep_hi += base;
-    t.body_lo += base;
-    L->md_tab[L->md_ntab] = t;
-    L->md_ntab++;
+/* The MD block pass (tables, their lookback lex) runs only where a MARKUP
+ * section may be: [from - lookback walk, to]. A code pane with Rich on
+ * pays one section compare, not a second lex (DESIGN: zero cost when
+ * unused). */
+static int rtx_layout_md_on(const RtxLayout *L, RtxDocLayout d, size_t from,
+                            size_t to) {
+    size_t back = 2 * (size_t)RTX_MARKUP_LOOKBACK;
+    if (!L || !d || !L->rich || L->view == RTX_VIEW_GRID || L->view == RTX_VIEW_HEX)
+        return 0;
+    return d->markup_near(from > back ? from - back : 0, to);
 }
 
-static void rtx_layout_md_collect(RtxLayout *L, RtxDocLayout d,
-                                  const RtxMeasure *m, size_t from,
-                                  char[:] bytes, double max_width) {
-    char[:] ext;
-    size_t base, fill_lo, fill_hi, rel;
-    CCArena frame = {0};
-    if (!L) return;
-    if (L->md_keep) return;
-    L->md_ntab = 0;
-    L->md_px = 0;
-    if (!L->rich || L->view == RTX_VIEW_GRID || L->view == RTX_VIEW_HEX)
-        return;
-    if (!bytes.ptr || !d) return;
-    L->md_px = rtx_layout_md_unit(m, RTX_SEC_MARKUP) >= 2.0 ? 1 : 0;
-    ext = bytes;
-    base = from;
-    fill_lo = 0;
-    fill_hi = bytes.len;
-    if (from > 0) {
-        size_t win = rtx_layout_md_lookback(d, from);
-        size_t n = bytes.len + (from - win);
-        int got = 0;
-        @errhandler(CCError e) {
-            (void)e;
-            got = 0;
-        }
-        d->ensure_hl(rtx_hl_keep(win, n)) !>;
-        frame = cc_arena_heap(n + 64);
-        if (frame.base) {
-            ext = d->scratch_span(win, n, frame) !>;
-            if (ext.ptr && ext.len) got = 1;
-        }
-        if (got) {
-            base = win;
-            fill_lo = from - win;
-            fill_hi = fill_lo + bytes.len;
-        } else {
-            ext = bytes;
-            if (frame.base) {
-                frame.destroy();
-                frame = (CCArena){0};
-            }
-        }
+/* Where a fill's window lex starts. With the MD pass on it is that pass's
+ * lookback start, so the pass finds its bytes lexed: one lex of window +
+ * lookback, not the window and then both again. */
+static size_t rtx_layout_hl_lo(const RtxLayout *L, RtxDocLayout d, size_t from,
+                               size_t to) {
+    size_t lo;
+    if (!L || L->md_keep || from == 0 || !rtx_layout_md_on(L, d, from, to)) return from;
+    lo = rtx_layout_md_lookback(d, from);
+    return to - lo > (size_t)RTX_HL_WIN_MAX ? from : lo;
+}
+
+/* Natural widths of table `ti` (L->md_tab[ti], doc offsets) from `ext`
+ * (bytes from `base`), plus its widest column — the md_px vote. */
+static void rtx_layout_md_nat(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
+                              size_t base, char[:] ext, int ti) {
+    RtxMdTable t = L->md_tab[ti];
+    RtxSectionKind sec;
+    int c, n, mw = 0, mpx = 0;
+    sec = d->section_at(t.lo);
+    t.lo -= base;
+    t.hi -= base;
+    t.sep_lo -= base;
+    t.sep_hi -= base;
+    t.body_lo -= base;
+    rtx_layout_md_widths(L, d, m, base, ext, &t, L->md_colw[ti], L->md_colpx[ti],
+                         sec);
+    n = t.ncols > RTX_MD_TABLE_COLS ? RTX_MD_TABLE_COLS : t.ncols;
+    for (c = 0; c < n; c++) {
+        if (L->md_colw[ti][c] > mw) mw = L->md_colw[ti][c];
+        if (L->md_colpx[ti][c] > mpx) mpx = L->md_colpx[ti][c];
     }
-    rel = 0;
+    L->md_natw[ti] = mw;
+    L->md_natpx[ti] = mpx;
+}
+
+/* Window + RTX_MARKUP_LOOKBACK bytes and the GFM tables touching the fill
+ * (doc offsets). `frame` owns `ext` until rtx_layout_md_scan_done. */
+typedef struct {
+    CCArena frame;
+    char[:] ext;
+    size_t base;
+    int n;
+    RtxMdTable t[RTX_MD_TABLE_FILL];
+} RtxMdScan;
+
+/* The Markdown block pass put this line in a leaf with no tables in it
+ * (fence, indented code, HTML block, math, front matter). */
+static int rtx_layout_md_in_leaf(RtxDocLayout d, size_t off) {
+    int role = d->md_block_at(off);
+    return role == RTX_MDB_ROLE_FENCE || role == RTX_MDB_ROLE_CODE ||
+           role == RTX_MDB_ROLE_HTML || role == RTX_MDB_ROLE_MATH ||
+           role == RTX_MDB_ROLE_FRONT;
+}
+
+/* Tables of s->ext touching [fill_lo, fill_hi) (ext offsets). */
+static void rtx_layout_md_detect(RtxDocLayout d, RtxMdScan *s, size_t fill_lo,
+                                 size_t fill_hi) {
+    size_t rel = 0;
+    s->n = 0;
     if (fill_lo > 0) {
         RtxMdTable t;
-        if (rtx_md_table_cover(ext.ptr, ext.len, fill_lo, &t)) {
+        if (rtx_md_table_cover(s->ext.ptr, s->ext.len, fill_lo, &t) &&
+            !rtx_layout_md_in_leaf(d, s->base + t.lo)) {
             rel = t.hi;
-            rtx_layout_md_push(L, d, m, base, ext, t);
+            s->t[s->n++] = t;
         }
     }
-    while (L->md_ntab < RTX_MD_TABLE_FILL) {
+    while (s->n < RTX_MD_TABLE_FILL) {
         RtxMdTable t;
-        if (!rtx_md_table_next(ext.ptr, ext.len, rel, &t)) break;
+        if (!rtx_md_table_next(s->ext.ptr, s->ext.len, rel, &t)) break;
         if (t.hi <= fill_lo) {
             rel = t.hi;
             continue;
         }
         if (t.lo >= fill_hi) break;
+        if (rtx_layout_md_in_leaf(d, s->base + t.lo)) {
+            rel = t.sep_lo; /* pipes in a fence / code / HTML block: no table */
+            continue;
+        }
         rel = t.hi;
-        rtx_layout_md_push(L, d, m, base, ext, t);
+        s->t[s->n++] = t;
     }
-    if (frame.base) frame.destroy();
-    /* A proportional host measures an em in many units; TUI stays 1≈1. */
+}
+
+/* A table may go on past the fill: one reaches its end, or its last line
+ * has a `|` (a header whose separator is below). */
+static int rtx_layout_md_runs_on(const RtxMdScan *s, size_t fill_hi) {
+    size_t i;
+    int k;
+    for (k = 0; k < s->n; k++)
+        if (s->t[k].hi >= fill_hi) return 1;
+    i = fill_hi;
+    if (i > 0 && s->ext.ptr[i - 1] == '\n') i--;
+    while (i > 0 && s->ext.ptr[i - 1] != '\n') {
+        if (s->ext.ptr[i - 1] == '|') return 1;
+        i--;
+    }
+    return 0;
+}
+
+/* The tables the fill [from, from + len) touches, read whole: from the
+ * lookback start (a header above the fill) to RTX_MARKUP_LOOKBACK past the
+ * fill (rows below it). A table's geometry is its header and every row, so
+ * it does not depend on where a fill starts or stops: a pane scrolled by a
+ * line, a motion's one-line scratch and a page fill measure it alike. The
+ * fill and lookback are lexed first (the block pass names leaves); the
+ * bytes past the fill are read only when a table may run on into them,
+ * and lexed only as far as one does. */
+static void rtx_layout_md_scan(RtxDocLayout d, size_t from, char[:] bytes,
+                               RtxMdScan *s) {
+    size_t fill_lo, fill_hi, end, win, dlen, tail = 0;
+    int got = 0;
+    *s = (RtxMdScan){0};
+    s->ext = bytes;
+    s->base = from;
+    if (!bytes.ptr || !d) return;
+    fill_lo = 0;
+    fill_hi = bytes.len;
+    end = from + bytes.len;
+    win = from > 0 ? rtx_layout_md_lookback(d, from) : 0;
+    dlen = d->len();
     {
-        int i, c, maxw = 0, maxpx = 0;
-        for (i = 0; i < L->md_ntab; i++) {
-            int n = L->md_tab[i].ncols;
-            if (n > RTX_MD_TABLE_COLS) n = RTX_MD_TABLE_COLS;
-            for (c = 0; c < n; c++) {
-                if (L->md_colw[i][c] > maxw) maxw = L->md_colw[i][c];
-                if (L->md_colpx[i][c] > maxpx) maxpx = L->md_colpx[i][c];
+        @errhandler(CCError e) {
+            (void)e;
+            got = 0;
+        }
+        d->ensure_hl(rtx_hl_keep(win, end - win)) !>;
+        if (win < from) {
+            s->frame = cc_arena_heap((end - win) + 64);
+            if (s->frame.base) {
+                s->ext = d->scratch_span(win, end - win, s->frame) !>;
+                if (s->ext.ptr && s->ext.len == end - win) got = 1;
             }
         }
-        if (maxpx > maxw + 2) L->md_px = 1;
     }
+    if (got) {
+        s->base = win;
+        fill_lo = from - win;
+        fill_hi = fill_lo + bytes.len;
+    } else {
+        s->ext = bytes;
+        if (s->frame.base) s->frame.destroy();
+        s->frame = (CCArena){0};
+    }
+    rtx_layout_md_detect(d, s, fill_lo, fill_hi);
+    if (end < dlen && rtx_layout_md_runs_on(s, fill_hi)) {
+        CCArena f2;
+        char[:] ext2 = cc_slice_empty();
+        size_t base = s->base, n2;
+        tail = dlen - end < (size_t)RTX_MARKUP_LOOKBACK ? dlen - end
+                                                         : (size_t)RTX_MARKUP_LOOKBACK;
+        n2 = (end - base) + tail;
+        got = 0;
+        f2 = cc_arena_heap(n2 + 64);
+        if (f2.base) {
+            @errhandler(CCError e) {
+                (void)e;
+                got = 0;
+            }
+            ext2 = d->scratch_span(base, n2, f2) !>;
+            if (ext2.ptr && ext2.len == n2) got = 1;
+        }
+        if (got) {
+            if (s->frame.base) s->frame.destroy();
+            s->frame = f2;
+            s->ext = ext2;
+            rtx_layout_md_detect(d, s, fill_lo, fill_hi);
+        } else if (f2.base) {
+            f2.destroy();
+        }
+    }
+    {
+        int i;
+        size_t hi = end;
+        for (i = 0; i < s->n; i++) {
+            s->t[i].lo += s->base;
+            s->t[i].hi += s->base;
+            s->t[i].sep_lo += s->base;
+            s->t[i].sep_hi += s->base;
+            s->t[i].body_lo += s->base;
+            if (s->t[i].hi > hi) hi = s->t[i].hi;
+        }
+        /* Rows past the fill: their styles size the cells (hidden marks). */
+        if (hi > end) {
+            @errhandler(CCError e) {
+                (void)e;
+            }
+            d->ensure_hl(rtx_hl_keep(end, hi - end)) !>;
+        }
+    }
+}
+
+static void rtx_layout_md_scan_done(RtxMdScan *s) {
+    if (s && s->frame.base) s->frame.destroy();
+    if (s) s->frame = (CCArena){0};
+}
+
+/* md_px: a proportional host measures an em in many units; TUI stays 1≈1. */
+static int rtx_layout_md_px_vote(const RtxLayout *L, const RtxMeasure *m) {
+    int i, maxw = 0, maxpx = 0;
+    if (rtx_layout_md_unit(m, RTX_SEC_MARKUP) >= 2.0) return 1;
+    for (i = 0; i < L->md_ntab; i++) {
+        if (L->md_natw[i] > maxw) maxw = L->md_natw[i];
+        if (L->md_natpx[i] > maxpx) maxpx = L->md_natpx[i];
+    }
+    return maxpx > maxw + 2;
+}
+
+static void rtx_layout_md_collect(RtxLayout *L, RtxDocLayout d,
+                                  const RtxMeasure *m, size_t from,
+                                  char[:] bytes, double max_width) {
+    RtxMdScan s;
+    int i;
+    if (!L) return;
+    if (L->md_keep) return;
+    L->md_ntab = 0;
+    L->md_px = 0;
+    if (!bytes.ptr || !d || !rtx_layout_md_on(L, d, from, from + bytes.len)) return;
+    rtx_layout_md_scan(d, from, bytes, &s);
+    /* The lookback lex may plant runs: the fill gate reads what it saw. */
+    L->has_marks = d->has_marks();
+    for (i = 0; i < s.n; i++) {
+        L->md_tab[i] = s.t[i];
+        L->md_ntab = i + 1;
+        rtx_layout_md_nat(L, d, m, s.base, s.ext, i);
+    }
+    rtx_layout_md_scan_done(&s);
+    L->md_px = rtx_layout_md_px_vote(L, m);
     /* Wrap on: fit columns to the pane so cell wrap can engage. */
     if (L->wrap && max_width > 0) {
-        int i;
         for (i = 0; i < L->md_ntab; i++) rtx_layout_md_fit(L, i, max_width);
     }
+}
+
+/* ---- MD records: layout-epoch cell split + wrap (layout.cch RtxMdRec) ---- */
+
+_Static_assert(RTX_MD_REC_LINES >= RTX_MD_TABLE_COLS * RTX_MD_WRAP_MAX,
+               "RtxMdRecTmp holds every wrap line of a record");
+
+const RtxMdRec *rtx_layout_md_rec(const RtxLayout *L, size_t row) {
+    size_t lo = 0, hi;
+    if (!L || !L->md_recs.len) return NULL;
+    hi = L->md_recs.len;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (L->md_recs.data[mid].row < row) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo < L->md_recs.len && L->md_recs.data[lo].row == row)
+        return &L->md_recs.data[lo];
+    return NULL;
+}
+
+/* The oracle into scratch: split, trimmed spans, and — when the pane wraps —
+ * every cell's lines. One body for the fill and for a stale row. */
+static void rtx_layout_md_rec_make(const RtxLayout *L, RtxDocLayout d,
+                                   const RtxMeasure *m, size_t row, char[:] rowb,
+                                   int ti, RtxSectionKind sec, RtxMdRecTmp *t) {
+    RtxMdCell cells[RTX_MD_TABLE_COLS];
+    size_t c, stored, lim, nline = 0;
+    int ncols = L->md_tab[ti].ncols;
+    t->rec = (RtxMdRec){0};
+    t->rec.row = row;
+    t->rec.len = rowb.len;
+    t->rec.ti = ti;
+    t->rec.tall = 1;
+    t->rec.nc = rowb.ptr ? rtx_md_row_split(rowb.ptr, rowb.len, cells,
+                                            RTX_MD_TABLE_COLS)
+                         : 0;
+    stored = t->rec.nc < (size_t)RTX_MD_TABLE_COLS ? t->rec.nc
+                                                    : (size_t)RTX_MD_TABLE_COLS;
+    lim = (size_t)ncols < stored ? (size_t)ncols : stored;
+    for (c = 0; c < stored; c++) {
+        RtxMdRecCell *rc = &t->cells[c];
+        size_t lo = cells[c].lo, hi = cells[c].hi;
+        rtx_md_span_trim(rowb.ptr, &lo, &hi);
+        *rc = (RtxMdRecCell){0};
+        rc->raw = cells[c];
+        rc->trim.lo = lo;
+        rc->trim.hi = hi;
+        rc->line = nline;
+        if (L->wrap && c < lim) {
+            rc->nl = rtx_layout_md_cell_wrap(L, d, m, row, rowb, lo, hi, ti, (int)c,
+                                             sec, &t->lines[nline], RTX_MD_WRAP_MAX);
+            nline += rc->nl;
+            if ((int)rc->nl > t->rec.tall) t->rec.tall = (int)rc->nl;
+        }
+    }
+    t->view.rec = &t->rec;
+    t->view.cells = t->cells;
+    t->view.lines = t->lines;
+}
+
+static int rtx_layout_md_rec_ready(RtxLayout *L) {
+    if (!L->md_recs.data) {
+        Vec::[RtxMdRec] v = vec_new::[RtxMdRec](L->store);
+        if (!v.data) return 0;
+        L->md_recs = v;
+    }
+    if (!L->md_cells.data) {
+        Vec::[RtxMdRecCell] v = vec_new::[RtxMdRecCell](L->store);
+        if (!v.data) return 0;
+        L->md_cells = v;
+    }
+    if (!L->md_lines.data) {
+        Vec::[RtxMdCell] v = vec_new::[RtxMdCell](L->store);
+        if (!v.data) return 0;
+        L->md_lines = v;
+    }
+    return 1;
+}
+
+/* Append one record (view `v`: any source) to the fill's store. */
+static int rtx_layout_md_rec_store(RtxLayout *L, const RtxMdRecView *v, size_t row) {
+    RtxMdRec rec = *v->rec;
+    size_t c, k, stored;
+    if (!rtx_layout_md_rec_ready(L)) return 0;
+    stored = rec.nc < (size_t)RTX_MD_TABLE_COLS ? rec.nc : (size_t)RTX_MD_TABLE_COLS;
+    rec.row = row;
+    rec.cell = L->md_cells.len;
+    for (c = 0; c < stored; c++) {
+        RtxMdRecCell rc = v->cells[c];
+        rc.line = L->md_lines.len;
+        for (k = 0; k < rc.nl; k++) {
+            if (L->md_lines.push(v->lines[v->cells[c].line + k]) != 0) return 0;
+        }
+        if (L->md_cells.push(rc) != 0) return 0;
+    }
+    return L->md_recs.push(rec) == 0;
+}
+
+/* Layout walk: make and keep the record for the table vis row at `row`.
+ * Returns its height in lines (>= 1), 0 on OOM. */
+static int rtx_layout_md_rec_push(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
+                                  size_t row, char[:] rowb, int ti,
+                                  RtxSectionKind sec) {
+    RtxMdRecTmp t;
+    if (!L || ti < 0 || ti >= L->md_ntab) return 0;
+    rtx_layout_md_rec_make(L, d, m, row, rowb, ti, sec, &t);
+    if (!rtx_layout_md_rec_store(L, &t.view, row)) return 0;
+    return t.rec.tall;
+}
+
+static void rtx_layout_md_view_of(const RtxLayout *L, const RtxMdRec *rec,
+                                  RtxMdRecView *out) {
+    out->rec = rec;
+    out->cells = &L->md_cells.data[rec->cell];
+    out->lines = L->md_lines.data;
+}
+
+int rtx_layout_md_view(const RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
+                       const RtxVisRow *r, char[:] bytes, RtxMdRecTmp *tmp,
+                       RtxMdRecView *out) {
+    const RtxMdRec *rec;
+    int ti;
+    if (!L || !d || !r || !out) return 0;
+    ti = rtx_layout_md_index(L, r->byte_start);
+    if (ti < 0 || rtx_md_table_role(&L->md_tab[ti], r->byte_start) == RTX_MD_ROLE_SEP)
+        return 0;
+    /* Rows current for these bytes: the fill's record. */
+    if (L->fill_gen == d->edit_stamp()) {
+        rec = rtx_layout_md_rec(L, r->byte_start);
+        if (rec && rec->len == r->byte_len) {
+            rtx_layout_md_view_of(L, rec, out);
+            return 1;
+        }
+    }
+    /* Edited since the fill (a command asking before after_edit): the same
+     * oracle over the row's current bytes, in caller scratch. */
+    if (!tmp || (r->byte_len && bytes.len < r->byte_len)) return 0;
+    rtx_layout_md_rec_make(L, d, m, r->byte_start, bytes, ti, r->sec, tmp);
+    *out = tmp->view;
+    return 1;
+}
+
+/* A view's split into `cells` (stored cells copied); returns the split
+ * count, like rtx_md_row_split. */
+static size_t rtx_layout_md_rec_split(const RtxMdRecView *v, RtxMdCell *cells) {
+    size_t i, stored;
+    stored = v->rec->nc < (size_t)RTX_MD_TABLE_COLS ? v->rec->nc
+                                                     : (size_t)RTX_MD_TABLE_COLS;
+    for (i = 0; i < stored; i++) cells[i] = v->cells[i].raw;
+    return v->rec->nc;
+}
+
+/* rtx_md_row_col_at over a view: which of the first ncols cells holds
+ * `rel`; -1 on a `|`. */
+static int rtx_layout_md_rec_col(const RtxMdRecView *v, size_t rel, int ncols) {
+    size_t i, lim;
+    if (ncols <= 0) return -1;
+    lim = v->rec->nc < (size_t)ncols ? v->rec->nc : (size_t)ncols;
+    if (lim > (size_t)RTX_MD_TABLE_COLS) lim = RTX_MD_TABLE_COLS;
+    for (i = 0; i < lim; i++) {
+        if (rel >= v->cells[i].raw.lo && rel < v->cells[i].raw.hi) return (int)i;
+    }
+    return -1;
+}
+
+/* Cell `c`'s wrap lines (relative to its trimmed start). 0 when the pane
+ * does not wrap it. */
+static size_t rtx_layout_md_rec_wrap(const RtxMdRecView *v, int c, RtxMdCell *out,
+                                     size_t cap) {
+    size_t k, n, stored;
+    stored = v->rec->nc < (size_t)RTX_MD_TABLE_COLS ? v->rec->nc
+                                                     : (size_t)RTX_MD_TABLE_COLS;
+    if (c < 0 || (size_t)c >= stored || !out) return 0;
+    n = v->cells[c].nl < cap ? v->cells[c].nl : cap;
+    for (k = 0; k < n; k++) out[k] = v->lines[v->cells[c].line + k];
+    return n;
 }
 
 static size_t rtx_layout_md_wrap_li_rel(const RtxMdCell *lines, size_t nl,
@@ -1182,6 +1594,8 @@ static int rtx_layout_md_x_cols_row(const RtxLayout *L, RtxDocLayout d,
     int c, ncols;
     RtxMdCell cells[RTX_MD_TABLE_COLS];
     size_t nc;
+    RtxMdRecTmp tmp;
+    RtxMdRecView v;
     if (!L || !r || ti < 0) return -1;
     t = &L->md_tab[ti];
     cw = L->md_colw[ti];
@@ -1191,8 +1605,9 @@ static int rtx_layout_md_x_cols_row(const RtxLayout *L, RtxDocLayout d,
     else rel = off - r->byte_start;
     if (rel > n) rel = n;
     if (rtx_md_table_role(t, off) == RTX_MD_ROLE_SEP) return 0;
-    nc = rtx_md_row_split(bytes.ptr, n, cells, RTX_MD_TABLE_COLS);
-    c = rtx_md_row_col_at(bytes.ptr, n, rel, ncols);
+    if (!rtx_layout_md_view(L, d, NULL, r, bytes, &tmp, &v)) return -1;
+    nc = rtx_layout_md_rec_split(&v, cells);
+    c = rtx_layout_md_rec_col(&v, rel, ncols);
     if (c < 0) {
         size_t i;
         if (nc == 0 || rel < cells[0].lo) return rtx_md_col_origin(cw, ncols, 0);
@@ -1213,8 +1628,7 @@ static int rtx_layout_md_x_cols_row(const RtxLayout *L, RtxDocLayout d,
         if (L->wrap && hi > lo) {
             RtxMdCell lines[RTX_MD_WRAP_MAX];
             size_t nl, li, slo, shi, rel_cell;
-            nl = rtx_layout_md_cell_wrap(L, d, NULL, r->byte_start, bytes, lo, hi,
-                                         ti, c, r->sec, lines, RTX_MD_WRAP_MAX);
+            nl = rtx_layout_md_rec_wrap(&v, c, lines, RTX_MD_WRAP_MAX);
             if (nl < 1) {
                 lines[0].lo = 0;
                 lines[0].hi = hi - lo;
@@ -1257,7 +1671,7 @@ static double rtx_layout_md_step_px(const RtxLayout *L, RtxDocLayout d,
                                     RtxSectionKind sec, size_t *step) {
     size_t n = 1;
     int vis = 0;
-    rtx_layout_md_step(L, d, base, bytes, i, hi, &n, &vis);
+    rtx_layout_md_step(L, d, NULL, base, bytes, i, hi, &n, &vis);
     if (step) *step = n;
     if (!vis || !m || !m->measure) return 0;
     if (n == 2 && i + 1 < hi && bytes.ptr[i] == '\\' &&
@@ -1333,35 +1747,6 @@ static size_t rtx_layout_md_wrap_px(const RtxLayout *L, RtxDocLayout d,
     return nf ? nf : 1;
 }
 
-static int rtx_layout_md_row_lines(const RtxLayout *L, RtxDocLayout d,
-                                   const RtxMeasure *m, size_t base,
-                                   char[:] bytes, int ti, RtxSectionKind sec) {
-    const RtxMdTable *t;
-    RtxMdCell cells[RTX_MD_TABLE_COLS];
-    RtxMdCell lines[RTX_MD_WRAP_MAX];
-    size_t nc, c, lim;
-    int h = 1;
-    if (!L || ti < 0 || ti >= L->md_ntab || !bytes.ptr) return 1;
-    t = &L->md_tab[ti];
-    nc = rtx_md_row_split(bytes.ptr, bytes.len, cells, RTX_MD_TABLE_COLS);
-    lim = (size_t)t->ncols < nc ? (size_t)t->ncols : nc;
-    for (c = 0; c < lim; c++) {
-        size_t lo = cells[c].lo, hi = cells[c].hi;
-        size_t nh;
-        rtx_md_span_trim(bytes.ptr, &lo, &hi);
-        if (L->md_px && m && m->measure) {
-            double max_px = (double)L->md_colpx[ti][c];
-            nh = rtx_layout_md_wrap_px(L, d, m, base, bytes, lo, hi, max_px, sec,
-                                       lines, RTX_MD_WRAP_MAX);
-        } else {
-            nh = rtx_md_wrap_field(bytes.ptr + lo, hi - lo, L->md_colw[ti][c],
-                                   lines, RTX_MD_WRAP_MAX);
-        }
-        if ((int)nh > h) h = (int)nh;
-    }
-    return h < 1 ? 1 : h;
-}
-
 size_t rtx_layout_md_cell_wrap(const RtxLayout *L, RtxDocLayout d,
                                const RtxMeasure *m, size_t row_base,
                                char[:] bytes, size_t lo, size_t hi, int ti,
@@ -1379,58 +1764,54 @@ size_t rtx_layout_md_cell_wrap(const RtxLayout *L, RtxDocLayout d,
 
 int rtx_layout_md_wrap_li(const RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
                           size_t off) {
-    int ti, c;
+    int ti, c, li = 0;
     const RtxVisRow *r;
-    size_t i, rel, lo, hi;
-    RtxMdCell cells[RTX_MD_TABLE_COLS];
-    RtxMdCell lines[RTX_MD_WRAP_MAX];
-    size_t nc, nl;
-    CCArena frame = {0};
-    char[:] bytes = cc_slice_empty();
-    int ok = 1;
+    const RtxMdRec *rec;
+    RtxMdRecView v;
+    size_t rel;
     if (!L || !d || L->rows.len == 0) return 0;
     ti = rtx_layout_md_index(L, off);
     if (ti < 0) return 0;
     if (rtx_md_table_role(&L->md_tab[ti], off) == RTX_MD_ROLE_SEP) return 0;
     if (!L->wrap) return 0;
-    i = L->row_of(off);
-    r = &L->rows.data[i];
+    r = &L->rows.data[L->row_of(off)];
     if (!r->byte_len) return 0;
-    frame = cc_arena_heap(r->byte_len + 64);
-    if (!frame.base) return 0;
-    {
-        @errhandler(CCError e) {
-            (void)e;
-            ok = 0;
-        }
-        bytes = d->scratch_span(r->byte_start, r->byte_len, frame) !>;
-    }
-    if (!ok) {
-        frame.destroy();
-        return 0;
-    }
-    nc = rtx_md_row_split(bytes.ptr, bytes.len, cells, RTX_MD_TABLE_COLS);
     rel = off < r->byte_start ? 0 : off - r->byte_start;
-    if (rel > bytes.len) rel = bytes.len;
-    c = rtx_md_row_col_at(bytes.ptr, bytes.len, rel, L->md_tab[ti].ncols);
-    if (c < 0 || (size_t)c >= nc) {
+    if (rel > r->byte_len) rel = r->byte_len;
+    rec = L->fill_gen == d->edit_stamp() ? rtx_layout_md_rec(L, r->byte_start) : NULL;
+    if (rec && rec->len == r->byte_len) {
+        rtx_layout_md_view_of(L, rec, &v);
+    } else {
+        /* Edited since the fill: the row's current bytes, same oracle. */
+        RtxMdRecTmp tmp;
+        CCArena frame = cc_arena_heap(r->byte_len + 64);
+        char[:] bytes;
+        int ok;
+        if (!frame.base) return 0;
+        bytes = d->scratch_span(r->byte_start, r->byte_len, frame) !>(e) {
+            (void)e;
+            frame.destroy();
+            return 0;
+        };
+        ok = rtx_layout_md_view(L, d, m, r, bytes, &tmp, &v);
+        if (ok) {
+            c = rtx_layout_md_rec_col(&v, rel, L->md_tab[ti].ncols);
+            if (c >= 0 && (size_t)c < v.rec->nc && c < RTX_MD_TABLE_COLS &&
+                v.cells[c].nl)
+                li = (int)rtx_layout_md_wrap_li_rel(
+                    v.lines + v.cells[c].line, v.cells[c].nl,
+                    rel > v.cells[c].trim.lo ? rel - v.cells[c].trim.lo : 0);
+        }
         frame.destroy();
+        return li;
+    }
+    c = rtx_layout_md_rec_col(&v, rel, L->md_tab[ti].ncols);
+    if (c < 0 || (size_t)c >= v.rec->nc || c >= RTX_MD_TABLE_COLS || !v.cells[c].nl)
         return 0;
-    }
-    lo = cells[c].lo;
-    hi = cells[c].hi;
-    rtx_md_span_trim(bytes.ptr, &lo, &hi);
-    nl = rtx_layout_md_cell_wrap(L, d, m, r->byte_start, bytes, lo, hi, ti, c,
-                                 r->sec, lines, RTX_MD_WRAP_MAX);
-    if (nl < 1) {
-        frame.destroy();
-        return 0;
-    }
-    {
-        size_t li = rtx_layout_md_wrap_li_rel(lines, nl, rel > lo ? rel - lo : 0);
-        frame.destroy();
-        return (int)li;
-    }
+    return (int)rtx_layout_md_wrap_li_rel(v.lines + v.cells[c].line, v.cells[c].nl,
+                                          rel > v.cells[c].trim.lo
+                                              ? rel - v.cells[c].trim.lo
+                                              : 0);
 }
 
 static double rtx_layout_md_x_px_row(const RtxLayout *L, RtxDocLayout d,
@@ -1442,6 +1823,8 @@ static double rtx_layout_md_x_px_row(const RtxLayout *L, RtxDocLayout d,
     int c, ncols;
     RtxMdCell cells[RTX_MD_TABLE_COLS];
     size_t nc;
+    RtxMdRecTmp tmp;
+    RtxMdRecView v;
     if (!L || !r || ti < 0) return 0;
     t = &L->md_tab[ti];
     cpx = L->md_colpx[ti];
@@ -1451,8 +1834,9 @@ static double rtx_layout_md_x_px_row(const RtxLayout *L, RtxDocLayout d,
     else rel = off - r->byte_start;
     if (rel > n) rel = n;
     if (rtx_md_table_role(t, off) == RTX_MD_ROLE_SEP) return 0;
-    nc = rtx_md_row_split(bytes.ptr, n, cells, RTX_MD_TABLE_COLS);
-    c = rtx_md_row_col_at(bytes.ptr, n, rel, ncols);
+    if (!rtx_layout_md_view(L, d, m, r, bytes, &tmp, &v)) return 0;
+    nc = rtx_layout_md_rec_split(&v, cells);
+    c = rtx_layout_md_rec_col(&v, rel, ncols);
     if (c < 0) {
         size_t i;
         if (nc == 0 || rel < cells[0].lo)
@@ -1475,8 +1859,7 @@ static double rtx_layout_md_x_px_row(const RtxLayout *L, RtxDocLayout d,
         if (L->wrap && hi > lo) {
             RtxMdCell lines[RTX_MD_WRAP_MAX];
             size_t nl, li, slo, shi, rel_cell;
-            nl = rtx_layout_md_cell_wrap(L, d, m, r->byte_start, bytes, lo, hi,
-                                         ti, c, r->sec, lines, RTX_MD_WRAP_MAX);
+            nl = rtx_layout_md_rec_wrap(&v, c, lines, RTX_MD_WRAP_MAX);
             if (nl < 1) {
                 lines[0].lo = 0;
                 lines[0].hi = hi - lo;
@@ -1523,7 +1906,10 @@ static int rtx_layout_md_line_at(const RtxLayout *L, RtxDocLayout d, size_t off,
         if (i < L->rows.len) {
             size_t a = L->rows.data[i].byte_start;
             size_t n = L->rows.data[i].byte_len;
-            if (a >= t->lo && a < t->hi) {
+            /* row_of falls back to the first / last row for an offset off
+             * the rows (a motion target above or below the pane): that row
+             * is another line — snapping to it stalled up / down. */
+            if (a >= t->lo && a < t->hi && off >= a && off <= a + n) {
                 *ls = a;
                 *ln = n;
                 return 1;
@@ -1573,14 +1959,67 @@ static size_t rtx_layout_md_first_vis(const RtxLayout *L, RtxDocLayout d,
     return base + lo;
 }
 
+/* Split + trimmed spans of the table line at `ls` (`ln` bytes). From the
+ * fill's record when the line is one of its vis rows; else one split of
+ * the bytes (a line outside the fill). `nc` is clamped to the stored
+ * cells. 0: unreadable. */
+static int rtx_layout_md_line_cells(const RtxLayout *L, RtxDocLayout d, size_t ls,
+                                    size_t ln, RtxMdCell *raw, RtxMdCell *trim,
+                                    size_t *nc) {
+    const RtxMdRec *rec = L->fill_gen == d->edit_stamp() ? rtx_layout_md_rec(L, ls)
+                                                         : NULL;
+    size_t i, n;
+    if (rec && rec->len == ln) {
+        n = rec->nc < (size_t)RTX_MD_TABLE_COLS ? rec->nc : (size_t)RTX_MD_TABLE_COLS;
+        for (i = 0; i < n; i++) {
+            raw[i] = L->md_cells.data[rec->cell + i].raw;
+            trim[i] = L->md_cells.data[rec->cell + i].trim;
+        }
+        *nc = n;
+        return 1;
+    }
+    {
+        CCArena frame = cc_arena_heap(ln + 64);
+        char[:] bytes;
+        if (!frame.base) return 0;
+        bytes = d->scratch_span(ls, ln, frame) !>(e) {
+            (void)e;
+            frame.destroy();
+            return 0;
+        };
+        n = rtx_md_row_split(bytes.ptr, bytes.len, raw, RTX_MD_TABLE_COLS);
+        if (n > (size_t)RTX_MD_TABLE_COLS) n = RTX_MD_TABLE_COLS;
+        for (i = 0; i < n; i++) {
+            size_t lo = raw[i].lo, hi = raw[i].hi;
+            rtx_md_span_trim(bytes.ptr, &lo, &hi);
+            trim[i].lo = lo;
+            trim[i].hi = hi;
+        }
+        frame.destroy();
+        *nc = n;
+        return 1;
+    }
+}
+
+/* rtx_md_row_col_at over a split. */
+static int rtx_layout_md_cells_col(const RtxMdCell *raw, size_t nc, size_t rel,
+                                   int ncols) {
+    size_t i;
+    if (ncols <= 0) return -1;
+    if ((size_t)ncols < nc) nc = (size_t)ncols;
+    for (i = 0; i < nc; i++) {
+        if (rel >= raw[i].lo && rel < raw[i].hi) return (int)i;
+    }
+    return -1;
+}
+
 static size_t rtx_layout_md_snap_once(const RtxLayout *L, RtxDocLayout d,
                                       size_t off, int dir) {
     int ti, c, ncols;
     const RtxMdTable *t;
     size_t ls, ln, rel, nc, i;
     RtxMdCell cells[RTX_MD_TABLE_COLS];
-    CCArena frame;
-    char[:] bytes;
+    RtxMdCell trim[RTX_MD_TABLE_COLS];
     size_t lo, hi, want;
     if (!L || !d) return off;
     ti = rtx_layout_md_index(L, off);
@@ -1594,106 +2033,70 @@ static size_t rtx_layout_md_snap_once(const RtxLayout *L, RtxDocLayout d,
     }
     if (!rtx_layout_md_line_at(L, d, off, &ls, &ln)) return off;
     if (!ln) return off;
-    frame = cc_arena_heap(ln + 64);
-    if (!frame.base) return off;
-    bytes = d->scratch_span(ls, ln, frame) !>(e) {
-        (void)e;
-        frame.destroy();
-        return off;
-    };
-    nc = rtx_md_row_split(bytes.ptr, bytes.len, cells, RTX_MD_TABLE_COLS);
+    if (!rtx_layout_md_line_cells(L, d, ls, ln, cells, trim, &nc)) return off;
     if (off < ls) rel = 0;
     else rel = off - ls;
-    if (rel > bytes.len) rel = bytes.len;
-    c = rtx_md_row_col_at(bytes.ptr, bytes.len, rel, ncols);
+    if (rel > ln) rel = ln;
+    c = rtx_layout_md_cells_col(cells, nc, rel, ncols);
     if (c >= 0 && (size_t)c < nc) {
-        lo = cells[c].lo;
-        hi = cells[c].hi;
-        rtx_md_span_trim(bytes.ptr, &lo, &hi);
+        lo = trim[c].lo;
+        hi = trim[c].hi;
         if (rel >= lo && rel <= hi) {
             if (dir == 0) {
                 size_t to = rtx_layout_hidden_to(L, d, ls + rel);
-                if (to && to > ls + rel && to <= ls + hi) {
-                    frame.destroy();
-                    return to;
-                }
+                if (to && to > ls + rel && to <= ls + hi) return to;
             }
-            frame.destroy();
             return off;
         }
         if (rel < lo) {
             want = dir < 0 ? (size_t)0 : rtx_layout_md_first_vis(L, d, ls, lo, hi);
             if (dir < 0) {
                 if (c == 0) want = ls ? ls - 1 : ls + lo;
-                else {
-                    size_t plo = cells[c - 1].lo, phi = cells[c - 1].hi;
-                    rtx_md_span_trim(bytes.ptr, &plo, &phi);
-                    want = ls + phi;
-                }
+                else want = ls + trim[c - 1].hi;
             }
-            frame.destroy();
             return want;
         }
         /* trailing pad */
         if (dir > 0) {
-            if ((size_t)c + 1 < nc && (size_t)c + 1 < (size_t)ncols) {
-                size_t nlo = cells[c + 1].lo, nhi = cells[c + 1].hi;
-                rtx_md_span_trim(bytes.ptr, &nlo, &nhi);
-                want = ls + nlo;
-            } else {
-                want = ls + bytes.len;
-            }
+            if ((size_t)c + 1 < nc && (size_t)c + 1 < (size_t)ncols)
+                want = ls + trim[c + 1].lo;
+            else
+                want = ls + ln;
         } else {
             want = ls + hi;
         }
-        frame.destroy();
         return want;
     }
     /* `|` delimiter or leftover past the split */
-    if (nc == 0) {
-        frame.destroy();
-        return off;
-    }
+    if (nc == 0) return off;
     if (rel < cells[0].lo) {
-        lo = cells[0].lo;
-        hi = cells[0].hi;
-        rtx_md_span_trim(bytes.ptr, &lo, &hi);
-        want = dir < 0 ? (ls ? ls - 1 : ls + lo)
+        lo = trim[0].lo;
+        hi = trim[0].hi;
+        return dir < 0 ? (ls ? ls - 1 : ls + lo)
                        : rtx_layout_md_first_vis(L, d, ls, lo, hi);
-        frame.destroy();
-        return want;
     }
     for (i = 0; i < nc && i < (size_t)ncols; i++) {
-        size_t next_lo = (i + 1 < nc) ? cells[i + 1].lo : bytes.len;
+        size_t next_lo = (i + 1 < nc) ? cells[i + 1].lo : ln;
         if (rel >= cells[i].hi && rel < next_lo) {
-            size_t plo = cells[i].lo, phi = cells[i].hi;
-            rtx_md_span_trim(bytes.ptr, &plo, &phi);
+            size_t phi = trim[i].hi;
             if (dir < 0) {
                 want = ls + phi;
             } else if (dir > 0) {
-                if (i + 1 < nc) {
-                    size_t nlo = cells[i + 1].lo, nhi = cells[i + 1].hi;
-                    rtx_md_span_trim(bytes.ptr, &nlo, &nhi);
-                    want = ls + nlo;
-                } else {
-                    want = ls + bytes.len;
-                }
+                if (i + 1 < nc) want = ls + trim[i + 1].lo;
+                else want = ls + ln;
             } else {
                 /* Land on the pipe that closes cell i: stay at that
                  * cell's end so type / click insert there. Leading `|`
                  * is handled above (first cell start). */
                 want = ls + phi;
             }
-            frame.destroy();
             return want;
         }
     }
     {
-        size_t plo = cells[nc - 1].lo, phi = cells[nc - 1].hi;
-        rtx_md_span_trim(bytes.ptr, &plo, &phi);
-        want = dir < 0 ? ls + phi : ls + bytes.len;
+        size_t phi = trim[nc - 1].hi;
+        want = dir < 0 ? ls + phi : ls + ln;
         if (dir == 0) want = ls + phi;
-        frame.destroy();
         return want;
     }
 }
@@ -1729,111 +2132,82 @@ static int rtx_layout_md_own_col(const RtxMdCell *cells, size_t nc, int ncols,
     return lim - 1;
 }
 
-int rtx_layout_md_cell_span(const RtxLayout *L, RtxDocLayout d, size_t off,
-                            size_t *clo, size_t *chi) {
-    int ti, c, ncols;
+/* The line under `off` in table `ti` and the cell that owns it. */
+static int rtx_layout_md_owner(const RtxLayout *L, RtxDocLayout d, size_t off,
+                               size_t *ls, RtxMdCell *cells, RtxMdCell *trim,
+                               size_t *nc, int *c) {
+    int ti;
     const RtxMdTable *t;
-    size_t ls, ln, rel, nc;
-    RtxMdCell cells[RTX_MD_TABLE_COLS];
-    CCArena frame;
-    char[:] bytes;
-    size_t lo, hi;
-    if (!L || !d || !clo || !chi) return 0;
+    size_t ln, rel;
     ti = rtx_layout_md_index(L, off);
     if (ti < 0) return 0;
     t = &L->md_tab[ti];
     if (rtx_md_table_role(t, off) == RTX_MD_ROLE_SEP) return 0;
-    if (!rtx_layout_md_line_at(L, d, off, &ls, &ln) || !ln) return 0;
-    frame = cc_arena_heap(ln + 64);
-    if (!frame.base) return 0;
-    bytes = d->scratch_span(ls, ln, frame) !>(e) {
-        (void)e;
-        frame.destroy();
-        return 0;
-    };
-    nc = rtx_md_row_split(bytes.ptr, bytes.len, cells, RTX_MD_TABLE_COLS);
-    ncols = t->ncols;
-    rel = off < ls ? 0 : off - ls;
-    if (rel > bytes.len) rel = bytes.len;
-    c = rtx_layout_md_own_col(cells, nc, ncols, rel);
-    if (c < 0 || (size_t)c >= nc) {
-        frame.destroy();
-        return 0;
-    }
-    lo = cells[c].lo;
-    hi = cells[c].hi;
-    rtx_md_span_trim(bytes.ptr, &lo, &hi);
-    *clo = ls + lo;
-    *chi = ls + hi;
-    frame.destroy();
+    if (!rtx_layout_md_line_at(L, d, off, ls, &ln) || !ln) return 0;
+    if (!rtx_layout_md_line_cells(L, d, *ls, ln, cells, trim, nc)) return 0;
+    rel = off < *ls ? 0 : off - *ls;
+    if (rel > ln) rel = ln;
+    *c = rtx_layout_md_own_col(cells, *nc, t->ncols, rel);
+    return 1;
+}
+
+int rtx_layout_md_cell_span(const RtxLayout *L, RtxDocLayout d, size_t off,
+                            size_t *clo, size_t *chi) {
+    int c;
+    size_t ls, nc;
+    RtxMdCell cells[RTX_MD_TABLE_COLS];
+    RtxMdCell trim[RTX_MD_TABLE_COLS];
+    if (!L || !d || !clo || !chi) return 0;
+    if (!rtx_layout_md_owner(L, d, off, &ls, cells, trim, &nc, &c)) return 0;
+    if (c < 0 || (size_t)c >= nc) return 0;
+    *clo = ls + trim[c].lo;
+    *chi = ls + trim[c].hi;
     return 1;
 }
 
 size_t rtx_layout_md_step_cell(const RtxLayout *L, RtxDocLayout d, size_t off,
                                int dir) {
-    int ti, c, ncols, next;
-    const RtxMdTable *t;
-    size_t ls, ln, rel, nc, lo, hi;
+    int c, next, ti;
+    size_t ls, nc;
     RtxMdCell cells[RTX_MD_TABLE_COLS];
-    CCArena frame;
-    char[:] bytes;
+    RtxMdCell trim[RTX_MD_TABLE_COLS];
     if (!L || !d || dir == 0) return off;
     ti = rtx_layout_md_index(L, off);
     if (ti < 0) return off;
-    t = &L->md_tab[ti];
-    if (rtx_md_table_role(t, off) == RTX_MD_ROLE_SEP) return off;
-    if (!rtx_layout_md_line_at(L, d, off, &ls, &ln) || !ln) return off;
-    frame = cc_arena_heap(ln + 64);
-    if (!frame.base) return off;
-    bytes = d->scratch_span(ls, ln, frame) !>(e) {
-        (void)e;
-        frame.destroy();
-        return off;
-    };
-    nc = rtx_md_row_split(bytes.ptr, bytes.len, cells, RTX_MD_TABLE_COLS);
-    ncols = t->ncols;
-    rel = off < ls ? 0 : off - ls;
-    if (rel > bytes.len) rel = bytes.len;
-    c = rtx_layout_md_own_col(cells, nc, ncols, rel);
+    if (!rtx_layout_md_owner(L, d, off, &ls, cells, trim, &nc, &c)) return off;
     next = c + (dir > 0 ? 1 : -1);
-    if (c < 0 || next < 0 || next >= ncols || (size_t)next >= nc) {
-        frame.destroy();
+    if (c == 0 && next < 0) {
+        const RtxMdTable *t = &L->md_tab[ti];
+        size_t p = ls, pls, pln;
+        int pc, last;
+        while (p > t->lo) {
+            if (!rtx_layout_md_line_at(L, d, p - 1, &pls, &pln) || pls >= p)
+                return off;
+            if (rtx_md_table_role(t, pls) == RTX_MD_ROLE_SEP) {
+                p = pls;
+                continue;
+            }
+            if (!rtx_layout_md_owner(L, d, pls, &pls, cells, trim, &nc, &pc))
+                return off;
+            last = t->ncols < (int)nc ? t->ncols : (int)nc;
+            if (last <= 0) return off;
+            last--;
+            return rtx_layout_md_first_vis(L, d, pls, trim[last].lo, trim[last].hi);
+        }
         return off;
     }
-    lo = cells[next].lo;
-    hi = cells[next].hi;
-    rtx_md_span_trim(bytes.ptr, &lo, &hi);
-    off = rtx_layout_md_first_vis(L, d, ls, lo, hi);
-    frame.destroy();
-    return off;
+    if (c < 0 || next < 0 || next >= L->md_tab[ti].ncols || (size_t)next >= nc)
+        return off;
+    return rtx_layout_md_first_vis(L, d, ls, trim[next].lo, trim[next].hi);
 }
 
 int rtx_layout_md_col_at(const RtxLayout *L, RtxDocLayout d, size_t off) {
-    int ti, c, ncols;
-    const RtxMdTable *t;
-    size_t ls, ln, rel, nc;
+    int c;
+    size_t ls, nc;
     RtxMdCell cells[RTX_MD_TABLE_COLS];
-    CCArena frame;
-    char[:] bytes;
+    RtxMdCell trim[RTX_MD_TABLE_COLS];
     if (!L || !d) return -1;
-    ti = rtx_layout_md_index(L, off);
-    if (ti < 0) return -1;
-    t = &L->md_tab[ti];
-    if (rtx_md_table_role(t, off) == RTX_MD_ROLE_SEP) return -1;
-    if (!rtx_layout_md_line_at(L, d, off, &ls, &ln) || !ln) return -1;
-    frame = cc_arena_heap(ln + 64);
-    if (!frame.base) return -1;
-    bytes = d->scratch_span(ls, ln, frame) !>(e) {
-        (void)e;
-        frame.destroy();
-        return -1;
-    };
-    nc = rtx_md_row_split(bytes.ptr, bytes.len, cells, RTX_MD_TABLE_COLS);
-    ncols = t->ncols;
-    rel = off < ls ? 0 : off - ls;
-    if (rel > bytes.len) rel = bytes.len;
-    c = rtx_layout_md_own_col(cells, nc, ncols, rel);
-    frame.destroy();
+    if (!rtx_layout_md_owner(L, d, off, &ls, cells, trim, &nc, &c)) return -1;
     return c;
 }
 
@@ -1847,12 +2221,15 @@ static size_t rtx_layout_md_hit_px(const RtxLayout *L, const RtxVisRow *r,
     RtxMdCell cells[RTX_MD_TABLE_COLS];
     size_t nc, n;
     double lh;
+    RtxMdRecTmp tmp;
+    RtxMdRecView v;
     if (!L || !r || !d || ti < 0) return r ? r->byte_start : 0;
+    if (!rtx_layout_md_view(L, d, m, r, bytes, &tmp, &v)) return r->byte_start;
     t = &L->md_tab[ti];
     cpx = L->md_colpx[ti];
     ncols = t->ncols;
     n = bytes.len;
-    nc = rtx_md_row_split(bytes.ptr, n, cells, RTX_MD_TABLE_COLS);
+    nc = rtx_layout_md_rec_split(&v, cells);
     if (x < 0) x = 0;
     if (y_in < 0) y_in = 0;
     lh = m && m->line_height ? m->line_height(m->ctx, (RtxStyle){0}, r->sec)
@@ -1870,7 +2247,7 @@ static size_t rtx_layout_md_hit_px(const RtxLayout *L, const RtxVisRow *r,
     for (c = 0; c < ncols; c++) {
         int right = rtx_md_px_vline(cpx, ncols, c + 1);
         if (x < (double)right + (double)RTX_MD_PX_LINE || c + 1 == ncols) {
-            size_t lo, hi, i, slo, shi;
+            size_t lo, hi, i, slo, shi, eol;
             double cell_px, pad, local;
             if ((size_t)c >= nc) return r->byte_start + n;
             lo = cells[c].lo;
@@ -1878,12 +2255,11 @@ static size_t rtx_layout_md_hit_px(const RtxLayout *L, const RtxVisRow *r,
             rtx_md_span_trim(bytes.ptr, &lo, &hi);
             slo = lo;
             shi = hi;
+            eol = hi;
             if (L->wrap && hi > lo) {
                 RtxMdCell lines[RTX_MD_WRAP_MAX];
                 size_t nl, li;
-                nl = rtx_layout_md_cell_wrap(L, d, m, r->byte_start, bytes, lo,
-                                             hi, ti, c, r->sec, lines,
-                                             RTX_MD_WRAP_MAX);
+                nl = rtx_layout_md_rec_wrap(&v, c, lines, RTX_MD_WRAP_MAX);
                 if (nl < 1) {
                     lines[0].lo = 0;
                     lines[0].hi = hi - lo;
@@ -1895,6 +2271,15 @@ static size_t rtx_layout_md_hit_px(const RtxLayout *L, const RtxVisRow *r,
                 shi = lo + lines[li].hi;
                 if (shi > hi) shi = hi;
                 if (slo > shi) slo = shi;
+                /* Past the end of a wrap line that is not the cell's last:
+                 * its last cluster, not `shi` — that is the next line's
+                 * first byte (the caret would paint there, and up / down
+                 * would count it on that line). */
+                eol = shi;
+                if (li + 1 < nl && shi > slo) {
+                    eol = shi - 1;
+                    while (eol > slo && ((unsigned char)bytes.ptr[eol] & 0xC0) == 0x80) eol--;
+                }
             }
             cell_px = rtx_layout_md_measure_span(L, d, m, r->byte_start, bytes,
                                                  slo, shi, r->sec);
@@ -1904,7 +2289,7 @@ static size_t rtx_layout_md_hit_px(const RtxLayout *L, const RtxVisRow *r,
             if (local < pad) return r->byte_start + slo;
             local -= pad;
             if (local >= cell_px) {
-                if (shi > slo) return r->byte_start + shi;
+                if (shi > slo) return r->byte_start + eol;
                 return r->byte_start + cells[c].lo;
             }
             i = slo;
@@ -1916,7 +2301,7 @@ static size_t rtx_layout_md_hit_px(const RtxLayout *L, const RtxVisRow *r,
                 local -= pw;
                 i += step;
             }
-            return r->byte_start + shi;
+            return r->byte_start + eol;
         }
     }
     return r->byte_start + n;
@@ -1931,6 +2316,8 @@ static size_t rtx_layout_md_hit_row(const RtxLayout *L, const RtxVisRow *r,
     double unit, acc;
     RtxMdCell cells[RTX_MD_TABLE_COLS];
     size_t nc, n;
+    RtxMdRecTmp tmp;
+    RtxMdRecView v;
     if (!L || !r || !d) return r ? r->byte_start : 0;
     ti = rtx_layout_md_index(L, r->byte_start);
     if (ti < 0) return r->byte_start;
@@ -1940,7 +2327,8 @@ static size_t rtx_layout_md_hit_row(const RtxLayout *L, const RtxVisRow *r,
     cw = L->md_colw[ti];
     ncols = t->ncols;
     n = bytes.len;
-    nc = rtx_md_row_split(bytes.ptr, n, cells, RTX_MD_TABLE_COLS);
+    if (!rtx_layout_md_view(L, d, m, r, bytes, &tmp, &v)) return r->byte_start;
+    nc = rtx_layout_md_rec_split(&v, cells);
     unit = rtx_layout_md_unit(m, r->sec);
     if (x < 0) x = 0;
     if (y_in < 0) y_in = 0;
@@ -1963,7 +2351,7 @@ static size_t rtx_layout_md_hit_row(const RtxLayout *L, const RtxVisRow *r,
         int next = (int)acc + w;
         int in_gap = (c + 1 < ncols);
         if (dc < next + (in_gap ? RTX_MD_TABLE_GAP : 0) || c + 1 == ncols) {
-            size_t lo, hi, i, slo, shi;
+            size_t lo, hi, i, slo, shi, eol;
             int cell_w, pad, local;
             if ((size_t)c >= nc) return r->byte_start + n;
             lo = cells[c].lo;
@@ -1971,12 +2359,11 @@ static size_t rtx_layout_md_hit_row(const RtxLayout *L, const RtxVisRow *r,
             rtx_md_span_trim(bytes.ptr, &lo, &hi);
             slo = lo;
             shi = hi;
+            eol = hi;
             if (L->wrap && hi > lo) {
                 RtxMdCell lines[RTX_MD_WRAP_MAX];
                 size_t nl, li;
-                nl = rtx_layout_md_cell_wrap(L, d, m, r->byte_start, bytes, lo,
-                                             hi, ti, c, r->sec, lines,
-                                             RTX_MD_WRAP_MAX);
+                nl = rtx_layout_md_rec_wrap(&v, c, lines, RTX_MD_WRAP_MAX);
                 if (nl < 1) {
                     lines[0].lo = 0;
                     lines[0].hi = hi - lo;
@@ -1988,6 +2375,15 @@ static size_t rtx_layout_md_hit_row(const RtxLayout *L, const RtxVisRow *r,
                 shi = lo + lines[li].hi;
                 if (shi > hi) shi = hi;
                 if (slo > shi) slo = shi;
+                /* Past the end of a wrap line that is not the cell's last:
+                 * its last cluster, not `shi` — that is the next line's
+                 * first byte (the caret would paint there, and up / down
+                 * would count it on that line). */
+                eol = shi;
+                if (li + 1 < nl && shi > slo) {
+                    eol = shi - 1;
+                    while (eol > slo && ((unsigned char)bytes.ptr[eol] & 0xC0) == 0x80) eol--;
+                }
             }
             cell_w = rtx_layout_md_vis(L, d, r->byte_start, bytes, slo, shi);
             pad = rtx_md_align_pad((int)t->align[c], w, cell_w);
@@ -1995,20 +2391,20 @@ static size_t rtx_layout_md_hit_row(const RtxLayout *L, const RtxVisRow *r,
             if (local < pad) return r->byte_start + slo;
             local -= pad;
             if (local >= cell_w) {
-                if (shi > slo) return r->byte_start + shi;
+                if (shi > slo) return r->byte_start + eol;
                 return r->byte_start + cells[c].lo;
             }
             i = slo;
             while (i < shi) {
                 size_t step = 1;
                 int vis = 0;
-                rtx_layout_md_step(L, d, r->byte_start, bytes, i, shi, &step,
+                rtx_layout_md_step(L, d, NULL, r->byte_start, bytes, i, shi, &step,
                                    &vis);
                 if (local < vis) return r->byte_start + i;
                 local -= vis;
                 i += step;
             }
-            return r->byte_start + shi;
+            return r->byte_start + eol;
         }
         acc += (double)(w + RTX_MD_TABLE_GAP);
     }
@@ -2024,8 +2420,9 @@ static int rtx_layout_size_eq(RtxStyle a, RtxStyle b) {
 /* Next relative edge: style_next, clipped by hint_next when Rich marks are
  * live. Same boundary rule as row_measure. */
 static size_t rtx_layout_style_edge(const RtxLayout *L, RtxDocLayout d,
-                                    size_t from, size_t i, size_t hi) {
-    size_t nxt = d->style_next(from + i, from + hi) - from;
+                                    RtxStyleCur *sc, size_t from, size_t i,
+                                    size_t hi) {
+    size_t nxt = d->style_cur_next(sc, from + i, from + hi) - from;
     if (L->has_marks) {
         size_t hn = d->hint_next(from + i, from + nxt) - from;
         if (hn < nxt) nxt = hn;
@@ -2043,13 +2440,14 @@ static size_t rtx_layout_style_edge(const RtxLayout *L, RtxDocLayout d,
  * style_next call and one measure — a 3 MiB JSON line pays as before.
  */
 static double rtx_layout_row_measure(const RtxLayout *L, RtxDocLayout d,
+                                     RtxStyleCur *sc, RtxHideCur *hc,
                                      const RtxMeasure *m, size_t from,
                                      char[:] bytes, size_t lo, size_t hi,
                                      RtxSectionKind sec, double *h_out) {
     RtxStyle cur;
     size_t seg = lo, k = lo;
     double w = 0, h;
-    cur = d->style_at(from + lo);
+    cur = d->style_cur(sc, from + lo);
     h = m->line_height(m->ctx, cur, sec);
     while (k < hi) {
         size_t nxt;
@@ -2059,22 +2457,22 @@ static double rtx_layout_row_measure(const RtxLayout *L, RtxDocLayout d,
          * (list marker / task box). The segment resumes past it. */
         {
             RtxHintVis hv;
-            if (rtx_layout_hint_vis(L, d, from + k, bytes.ptr, k, hi, &hv)) {
+            if (rtx_layout_hint_vis_cur(L, d, hc, from + k, bytes.ptr, k, hi, &hv)) {
                 if (seg < k) {
                     char[:] sp = bytes.sub(seg, k);
                     w += m->measure(m->ctx, sp, cur, sec);
                 }
-                w += rtx_layout_standin_w(m, &hv, d->style_at(from + k), sec);
+                w += rtx_layout_standin_w(m, &hv, d->style_cur(sc, from + k), sec);
                 k += hv.skip;
                 if (k > hi) k = hi;
                 seg = k;
-                if (k < hi) cur = d->style_at(from + k);
+                if (k < hi) cur = d->style_cur(sc, from + k);
                 continue;
             }
         }
-        nxt = rtx_layout_style_edge(L, d, from, k, hi);
+        nxt = rtx_layout_style_edge(L, d, sc, from, k, hi);
         if (nxt >= hi) break;
-        st = d->style_at(from + nxt);
+        st = d->style_cur(sc, from + nxt);
         k = nxt;
         if (rtx_layout_size_eq(st, cur)) continue;
         char[:] sp = bytes.sub(seg, k);
@@ -2100,6 +2498,9 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
     /* Callers set L->from_line (exact for lines(); fill_off guess is a
      * gutter label, not a camera). */
     size_t phys = L->from_line;
+    /* One forward cursor each over the runs and the hidden hints. */
+    RtxStyleCur sc = {0};
+    RtxHideCur hc = {0};
     while (i < n) {
         RtxSectionKind sec = d->section_at(from + i);
         size_t line_end = i;
@@ -2132,13 +2533,15 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                     if (role == RTX_MD_ROLE_SEP && L->md_px &&
                         h > (double)RTX_MD_PX_SEP)
                         h = (double)RTX_MD_PX_SEP;
-                    else if (role != RTX_MD_ROLE_SEP && L->wrap) {
-                        /* Tall record: GUI (md_px) and TUI both grow height so
+                    else if (role != RTX_MD_ROLE_SEP) {
+                        /* The record (split + cell wrap, once per fill). Tall
+                         * record: GUI (md_px) and TUI both grow height so
                          * paint can emit every wrap line. */
                         char[:] rowb = bytes.sub(i, line_end);
-                        int lines = rtx_layout_md_row_lines(L, d, m, from + i,
-                                                            rowb, ti, sec);
-                        if (lines > 1) h *= (double)lines;
+                        int lines = rtx_layout_md_rec_push(L, d, m, from + i, rowb,
+                                                           ti, sec);
+                        if (!lines) return cc_err(CC_ERR_OUT_OF_MEMORY, "md record");
+                        if (L->wrap && lines > 1) h *= (double)lines;
                     }
                 }
                 if (!rtx_layout_push_row(L, m, from + i, line_end - i, phys,
@@ -2156,20 +2559,20 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
         {
             double lead = 0, mark = 0, first_pad = 0, hang = 0;
             int hanging = 0;
-            int listed = rtx_layout_list_hang(L, d, m, from, bytes, i, line_end,
+            int listed = rtx_layout_list_hang(L, d, &sc, &hc, m, from, bytes, i, line_end,
                                               sec, &lead, &mark);
             if (listed) {
                 first_pad = rtx_layout_list_indent_w(m, sec);
                 hang = first_pad + lead + mark;
                 hanging = 1;
-            } else if (rtx_layout_table_hang(L, d, m, from, bytes, i, line_end,
+            } else if (rtx_layout_table_hang(L, d, &sc, &hc, m, from, bytes, i, line_end,
                                              sec, &lead, &mark)) {
                 hang = lead + mark;
                 hanging = 1;
             }
         if (!wrap) {
             double h = 0;
-            double w = rtx_layout_row_measure(L, d, m, from, bytes, i, line_end,
+            double w = rtx_layout_row_measure(L, d, &sc, &hc, m, from, bytes, i, line_end,
                                               sec, &h);
             if (!rtx_layout_push_row(L, m, from + i, line_end - i, phys,
                                      w + first_pad, h, first_pad, sec)) {
@@ -2203,10 +2606,10 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                     size_t nxt;
                     {
                         RtxHintVis hv;
-                        if (rtx_layout_hint_vis(L, d, from + i, bytes.ptr, i,
-                                                line_end, &hv)) {
+                        if (rtx_layout_hint_vis_cur(L, d, &hc, from + i, bytes.ptr,
+                                                    i, line_end, &hv)) {
                             if (hv.gn) {
-                                RtxStyle hs = d->style_at(from + i);
+                                RtxStyle hs = d->style_cur(&sc, from + i);
                                 double sw = rtx_layout_standin_w(m, &hv, hs, sec);
                                 double sh = m->line_height(m->ctx, hs, sec);
                                 if (w > 0 && w + sw > limit) {
@@ -2220,14 +2623,14 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                             continue;
                         }
                     }
-                    st = d->style_at(from + i);
-                    nxt = rtx_layout_style_edge(L, d, from, i, line_end);
+                    st = d->style_cur(&sc, from + i);
+                    nxt = rtx_layout_style_edge(L, d, &sc, from, i, line_end);
                     /* Coalesce scope-only edges like row_measure — wrap width
                      * ignores colour, so one cluster walk covers the span. */
                     while (nxt < line_end) {
-                        RtxStyle st2 = d->style_at(from + nxt);
+                        RtxStyle st2 = d->style_cur(&sc, from + nxt);
                         if (!rtx_layout_size_eq(st2, st)) break;
-                        nxt = rtx_layout_style_edge(L, d, from, nxt, line_end);
+                        nxt = rtx_layout_style_edge(L, d, &sc, from, nxt, line_end);
                     }
                     while (i < nxt) {
                         RtxUtf8Cl cl;
@@ -2236,8 +2639,8 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                         double gw, gh;
                         {
                             RtxHintVis hv;
-                            if (rtx_layout_hint_vis(L, d, from + i, bytes.ptr, i,
-                                                    line_end, &hv))
+                            if (rtx_layout_hint_vis_cur(L, d, &hc, from + i,
+                                                        bytes.ptr, i, line_end, &hv))
                                 break;
                         }
                         cl = rtx_utf8_cluster(bytes, i);
@@ -2270,7 +2673,7 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                 if (i == row_start) {
                     RtxUtf8Cl cl = rtx_utf8_cluster(bytes, i);
                     size_t step = cl.n ? cl.n : 1;
-                    RtxStyle st = d->style_at(from + i);
+                    RtxStyle st = d->style_cur(&sc, from + i);
                     char[:] one = bytes.sub(i, i + step);
                     w = m->measure(m->ctx, one, st, sec);
                     h = m->line_height(m->ctx, st, sec);
@@ -2307,6 +2710,8 @@ void !>(CCError) RtxLayout_range(RtxLayout *L, RtxDocLayout d, const RtxMeasure 
     /* Fill-epoch gate: every hidden-hint check is one compare when 0. */
     L->has_marks = L->rich && L->view != RTX_VIEW_GRID && L->view != RTX_VIEW_HEX &&
                    d->has_marks();
+    /* Rows (and MD records) describe the doc at this stamp. */
+    L->fill_gen = d->edit_stamp();
     {
         size_t dlen = d->len();
         if (from >= dlen) return cc_ok();
@@ -2351,6 +2756,7 @@ void !>(CCError) RtxLayout_doc(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m
 void !>(CCError) RtxLayout_lines(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
                             double max_width, size_t from_line, size_t nlines) {
     size_t total, from, to;
+    int capped;
     @errhandler(CCError e) {
         return cc_err(e);
     }
@@ -2375,12 +2781,25 @@ void !>(CCError) RtxLayout_lines(RtxLayout *L, RtxDocLayout d, const RtxMeasure 
         to = d->line_start(want_line + nlines) !>;
     }
     if (to < from) to = from;
-    if (to - from > (size_t)RTX_HL_WIN_MAX) to = from + (size_t)RTX_HL_WIN_MAX;
-    d->ensure_hl(rtx_hl_span(from, to)) !>;
+    capped = 0;
+    if (to - from > (size_t)RTX_HL_WIN_MAX) {
+        to = from + (size_t)RTX_HL_WIN_MAX;
+        capped = 1;
+    }
+    {
+        size_t hl = rtx_layout_hl_lo(L, d, from, to);
+        d->ensure_hl(L->hl_keep ? rtx_hl_keep(hl, to - hl) : rtx_hl_span(hl, to)) !>;
+    }
     L->reset();
     L->from_line = from_line;
     L->nlines = nlines;
-    return L->range(d, m, from, to - from, max_width);
+    L->range(d, m, from, to - from, max_width) !>;
+    /* Rows are exactly these lines over these bytes: a patch may reuse them. */
+    L->fill_lined = !capped && L->view == RTX_VIEW_DEFAULT && !L->md_keep;
+    L->fill_gen = d->edit_stamp();
+    L->win_lo = from;
+    L->win_hi = to;
+    return cc_ok();
 }
 
 void !>(CCError) RtxLayout_fill(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
@@ -2438,17 +2857,35 @@ void !>(CCError) RtxLayout_fill_off(RtxLayout *L, RtxDocLayout d, const RtxMeasu
     }
     n = off - from;
     if (n == 0 && from < len) n = 1;
-    d->ensure_hl(rtx_hl_win(from, n)) !>(e) { return cc_err(e); };
+    {
+        size_t hl = rtx_layout_hl_lo(L, d, from, from + n);
+        RtxHlWin hw = L->hl_keep ? rtx_hl_keep(hl, n + (from - hl))
+                                 : rtx_hl_win(hl, n + (from - hl));
+        d->ensure_hl(hw) !>(e) { return cc_err(e); };
+    }
     L->reset();
     /* Gutter label until seek_label; not a camera origin. */
     L->from_line = d->line_guess(from);
     L->nlines = seen ? seen : 1;
-    return L->range(d, m, from, n, max_width);
+    L->range(d, m, from, n, max_width) !>(e) { return cc_err(e); };
+    /* Whole lines [from, from + n): `seen` newlines, or the rest of the
+     * doc — what lines() lays out for that many lines from a line start,
+     * so a seeking camera patches like a lined one (its gutter labels are
+     * the caller's: rtx_buf_refresh_view). A byte cap mid-line is not. */
+    if (n && (seen >= min_rows || from + n == len)) {
+        L->fill_lined = L->view == RTX_VIEW_DEFAULT && !L->md_keep;
+        L->fill_gen = d->edit_stamp();
+        L->win_lo = from;
+        L->win_hi = from + n;
+    }
+    return cc_ok();
 }
 
 static size_t !>(CCError) rtx_layout_hit_bytes(const RtxLayout *L, const RtxVisRow *r,
                                               RtxDocLayout d, const RtxMeasure *m,
                                               double x, char[:] bytes) {
+    RtxStyleCur sc = {0};
+    RtxHideCur hc = {0};
     size_t k = 0;
     size_t hit = r->byte_start + r->byte_len;
     double cx = 0;
@@ -2460,11 +2897,11 @@ static size_t !>(CCError) rtx_layout_hit_bytes(const RtxLayout *L, const RtxVisR
         double gw;
         {
             RtxHintVis hv;
-            if (rtx_layout_hint_vis(L, d, r->byte_start + k, bytes.ptr, k,
+            if (rtx_layout_hint_vis_cur(L, d, &hc, r->byte_start + k, bytes.ptr, k,
                                     bytes.len, &hv)) {
                 if (hv.gn) {
                     double gw = rtx_layout_standin_w(m, &hv,
-                                                    d->style_at(r->byte_start + k),
+                                                    d->style_cur(&sc, r->byte_start + k),
                                                     r->sec);
                     if (x < cx + gw) {
                         hit = r->byte_start + k + hv.skip;
@@ -2478,7 +2915,7 @@ static size_t !>(CCError) rtx_layout_hit_bytes(const RtxLayout *L, const RtxVisR
         }
         cl = rtx_utf8_cluster(bytes, k);
         step = cl.n ? cl.n : 1;
-        st = d->style_at(r->byte_start + k);
+        st = d->style_cur(&sc, r->byte_start + k);
         one = bytes.sub(k, k + step);
         gw = m->measure(m->ctx, one, st, r->sec);
         if (cx + gw / 2.0 >= x) {
@@ -2542,6 +2979,8 @@ static size_t !>(CCError) rtx_layout_hit_row(const RtxLayout *L, const RtxVisRow
 static double rtx_layout_x_of_bytes(const RtxLayout *L, const RtxVisRow *r,
                                     RtxDocLayout d, const RtxMeasure *m,
                                     size_t off, char[:] bytes) {
+    RtxStyleCur sc = {0};
+    RtxHideCur hc = {0};
     size_t k = 0;
     double x = 0;
     while (k < bytes.len && r->byte_start + k < off) {
@@ -2549,9 +2988,9 @@ static double rtx_layout_x_of_bytes(const RtxLayout *L, const RtxVisRow *r,
         size_t step;
         {
             RtxHintVis hv;
-            if (rtx_layout_hint_vis(L, d, r->byte_start + k, bytes.ptr, k,
+            if (rtx_layout_hint_vis_cur(L, d, &hc, r->byte_start + k, bytes.ptr, k,
                                     bytes.len, &hv)) {
-                x += rtx_layout_standin_w(m, &hv, d->style_at(r->byte_start + k),
+                x += rtx_layout_standin_w(m, &hv, d->style_cur(&sc, r->byte_start + k),
                                           r->sec);
                 k += hv.skip;
                 continue;
@@ -2561,7 +3000,7 @@ static double rtx_layout_x_of_bytes(const RtxLayout *L, const RtxVisRow *r,
         step = cl.n ? cl.n : 1;
         if (r->byte_start + k + step > off) break;
         {
-            RtxStyle st = d->style_at(r->byte_start + k);
+            RtxStyle st = d->style_cur(&sc, r->byte_start + k);
             char[:] one = bytes.sub(k, k + step);
             x += m->measure(m->ctx, one, st, r->sec);
         }
@@ -2804,10 +3243,144 @@ void RtxLayout_move_row_edge(RtxLayout *L, RtxDoc *d, int to_end, int shift) {
     d->break_coalesce();
 }
 
+/* ---- Vertical motion over Rich tables ----
+ * A motion scratch classifies every table its fill touches, measured
+ * whole as the pane measures it (md_scan). A table's separator line is
+ * never a landing. In soft wrap a header / body record
+ * whose cells wrap steps by the wrap lines of the cell under the goal x:
+ * down from a cell's last line (up from its first) leaves the record, and
+ * up into a record lands on that cell's last line. */
+
+#define RTX_MD_LI_LAST ((size_t)RTX_MD_WRAP_MAX)
+
+/* y inside record row `r` for cell wrap line `li` (the md hit reads it). */
+static double rtx_layout_md_li_y(const RtxMeasure *m, const RtxVisRow *r, size_t li) {
+    double lh = m && m->line_height ? m->line_height(m->ctx, (RtxStyle){0}, r->sec) : 1.0;
+    if (lh < 1.0) lh = 1.0;
+    return ((double)li + 0.5) * lh;
+}
+
+/* 1: row `row` of `R` is a table header / body record whose cells wrap
+ * (soft wrap, Rich: taller than one line). */
+static int rtx_layout_md_rec_row(const RtxLayout *R, const RtxMeasure *m, size_t row) {
+    int ti;
+    size_t a;
+    double lh;
+    if (!R || !R->wrap || !R->rich || row >= R->rows.len) return 0;
+    lh = m && m->line_height ? m->line_height(m->ctx, (RtxStyle){0}, R->rows.data[row].sec)
+                             : 1.0;
+    if (lh < 1.0) lh = 1.0;
+    if (R->rows.data[row].height < 1.5 * lh) return 0;
+    a = R->rows.data[row].byte_start;
+    ti = rtx_layout_md_index(R, a);
+    return ti >= 0 && rtx_md_table_role(&R->md_tab[ti], a) != RTX_MD_ROLE_SEP;
+}
+
+/* Wrap lines of the cell at `x` on row `row` (1 off a record). */
+static size_t !>(CCError) rtx_layout_md_cell_nl(const RtxLayout *R, RtxDoc *d,
+                                              const RtxMeasure *m, size_t row, double x) {
+    size_t at;
+    if (!rtx_layout_md_rec_row(R, m, row)) return cc_ok(1);
+    at = rtx_layout_hit_row(R, &R->rows.data[row], d, m, x,
+                            rtx_layout_md_li_y(m, &R->rows.data[row], RTX_MD_LI_LAST)) !>(e) {
+        return cc_err(e);
+    };
+    return cc_ok((size_t)rtx_layout_md_wrap_li(R, d, m, at) + 1);
+}
+
+/* The caret's cell wrap line `li` on row `row` and its cell's line count
+ * `nl` (0 / 1 off a record, or with the goal at the row's end). */
+static void !>(CCError) rtx_layout_md_caret_li(const RtxLayout *R, RtxDoc *d,
+                                             const RtxMeasure *m, size_t row, size_t caret,
+                                             const RtxPref *pref, size_t *li, size_t *nl) {
+    double x;
+    *li = 0;
+    *nl = 1;
+    if (pref->eol || !rtx_layout_md_rec_row(R, m, row)) return cc_ok();
+    x = RtxLayout_x_of(R, d, m, caret) !>(e) { return cc_err(e); };
+    *nl = rtx_layout_md_cell_nl(R, d, m, row, x) !>(e) { return cc_err(e); };
+    *li = (size_t)rtx_layout_md_wrap_li(R, d, m, caret);
+    if (*li >= *nl) *li = *nl - 1;
+    return cc_ok();
+}
+
+/* Where move_vert puts the caret on row `row` of `R`: the goal x on cell
+ * wrap line `li` (or the row's end with the goal at line ends), then the
+ * fold and table snaps. */
+static size_t !>(CCError) rtx_layout_vert_land(const RtxLayout *R, RtxDoc *d,
+                                             const RtxMeasure *m, size_t row, size_t li,
+                                             int dir, const RtxPref *pref) {
+    size_t at;
+    if (pref->eol) {
+        at = R->rows.data[row].byte_start + R->rows.data[row].byte_len;
+    } else {
+        at = rtx_layout_hit_row(R, &R->rows.data[row], d, m, pref->x,
+                                rtx_layout_md_li_y(m, &R->rows.data[row], li)) !>(e) {
+            return cc_err(e);
+        };
+    }
+    at = d->fold_snap(at, dir);
+    return cc_ok(rtx_layout_md_snap(R, d, at, 0));
+}
+
+/* Up / down inside a record: the next wrap line of the caret's cell (at
+ * `cur`, line `li` of `nl`) whose landing is not `cur` — a line whose goal
+ * x snaps back to the caret (hidden marks, a short line) is passed over.
+ * 0: none left, the motion leaves the record. */
+static int !>(CCError) rtx_layout_md_rec_step(const RtxLayout *R, RtxDoc *d,
+                                            const RtxMeasure *m, size_t row, size_t li,
+                                            size_t nl, int dir, size_t cur,
+                                            const RtxPref *pref, size_t *at) {
+    size_t l = li;
+    while (dir > 0 ? l + 1 < nl : l > 0) {
+        size_t a;
+        l = dir > 0 ? l + 1 : l - 1;
+        a = rtx_layout_vert_land(R, d, m, row, l, dir, pref) !>(e) { return cc_err(e); };
+        if (a != cur) {
+            *at = a;
+            return cc_ok(1);
+        }
+    }
+    return cc_ok(0);
+}
+
+/* A caret on a table's separator line (a click or an edit can leave it
+ * there; motion never lands on it) moves as from the body's first byte,
+ * where md_snap puts it. `S` is a scratch; `*start` is the caret's line. */
+static void !>(CCError) rtx_layout_md_off_sep(RtxLayout *S, RtxDoc *d, const RtxMeasure *m,
+                                            double width, int wrap, size_t *start,
+                                            int shift) {
+    size_t c, got, i;
+    char buf[256];
+    int dash = 0;
+    if (!S->rich) return cc_ok();
+    /* Only a line of `|`, `:`, `-` and blanks can be one (no fill else). */
+    got = d->read_at(*start, cc_slice_from_buffer(buf, sizeof buf)) !>(e) {
+        return cc_err(e);
+    };
+    for (i = 0; i < got && buf[i] != '\n' && buf[i] != '\r'; i++) {
+        if (buf[i] == '-') dash = 1;
+        else if (buf[i] != '|' && buf[i] != ':' && buf[i] != ' ' && buf[i] != '\t')
+            return cc_ok();
+    }
+    if (!dash) return cc_ok();
+    S->wrap = wrap;
+    S->fill_off(d, m, width, *start, 1) !>(e) { return cc_err(e); };
+    if (rtx_layout_md_role_at(S, *start) != RTX_MD_ROLE_SEP) return cc_ok();
+    c = rtx_layout_md_snap(S, d, d->caret, 0);
+    if (c == d->caret) return cc_ok();
+    d->caret = c;
+    if (!shift) d->sel_anchor = c;
+    *start = rtx_doc_line_floor(d, c) !>(ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    };
+    return cc_ok();
+}
+
 void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
                                 double width, int dir, int shift, RtxPref *pref) {
     size_t start;
-    size_t row;
+    size_t row, li, nl, bare;
     int capture;
     RtxLayout one = {0} @destroy;
     @errhandler(CCError e) {
@@ -2817,17 +3390,20 @@ void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *
         return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
     }
     if (!L || !d || !m || !pref) return cc_err(CC_ERR_INVALID_ARG, "move vert");
-    /* Scratch rows measure like the pane: same Rich bit, reveal, and
-     * fill-epoch table geom (one physical line cannot reclassify a table). */
+    /* Scratch rows measure like the pane: same Rich bit and reveal; a
+     * table is classified and measured whole around any fill (md_scan), so
+     * the scratch's tables are the pane's. */
     one.rich = L->rich;
     one.reveal_lo = L->reveal_lo;
     one.reveal_hi = L->reveal_hi;
-    rtx_layout_md_copy(&one, L);
+    one.hl_keep = 1;
     if (!shift) {
         d->sel_anchor = d->caret;
         d->sel_box = 0;
     }
     start = rtx_doc_line_floor(d, d->caret) !>;
+    if (L->view != RTX_VIEW_GRID)
+        rtx_layout_md_off_sep(&one, d, m, width, L->wrap, &start, shift) !>;
     capture = !pref->ok;
     if (capture && L->view != RTX_VIEW_GRID) {
         pref->col = d->caret - start;
@@ -2949,25 +3525,23 @@ void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *
     if (!L->wrap) {
         size_t ns = start;
         size_t nend, nlen, next;
-        int has;
-        if (dir < 0) {
-            if (start == 0) {
-                if (!shift) d->sel_anchor = d->caret;
-                d->break_coalesce();
-                return cc_ok();
-            }
-            ns = rtx_doc_line_floor(d, start - 1) !>;
-        } else {
-            has = rtx_doc_next_line_start(d, start, &next) !>;
-            if (!has) {
-                if (!shift) d->sel_anchor = d->caret;
-                d->break_coalesce();
-                return cc_ok();
-            }
-            ns = next;
+        int has, guard = 0;
+        /* Goal is the visual x of the caret's row, as in wrap: a byte
+         * column drifts across CJK, tabs, proportional text, hidden hints,
+         * and table cells. Box select stays byte columns (box_sync reads
+         * pref->col). Past a capped row (> RTX_FILL_OFF_CAP) x is -1 and
+         * the byte column is the goal. */
+        if (capture) pref->x = -1.0;
+        if (capture && !pref->eol && !d->sel_box) {
+            one.wrap = 0;
+            one.fill_off(d, m, width, start, 1) !>;
+            if (one.rows.len &&
+                d->caret <= one.rows.data[0].byte_start + one.rows.data[0].byte_len)
+                pref->x = one.x_of(d, m, d->caret) !>;
         }
-        nend = rtx_doc_line_end_caret(d, ns) !>;
-        if (L->rich && rtx_layout_md_role_at(L, ns) == RTX_MD_ROLE_SEP) {
+        /* One line, and on past a table's separator line (never a landing).
+         * The scratch fill of the line classifies the table around it. */
+        for (;;) {
             if (dir < 0) {
                 if (ns == 0) {
                     if (!shift) d->sel_anchor = d->caret;
@@ -2984,31 +3558,54 @@ void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *
                 }
                 ns = next;
             }
-            nend = rtx_doc_line_end_caret(d, ns) !>;
+            one.wrap = 0;
+            one.fill_off(d, m, width, ns, 1) !>;
+            if (!L->rich || guard++ >= 8 ||
+                rtx_layout_md_role_at(&one, ns) != RTX_MD_ROLE_SEP)
+                break;
         }
+        nend = rtx_doc_line_end_caret(d, ns) !>;
         nlen = nend - ns;
-        if (pref->eol) d->caret = nend;
-        else d->caret = ns + (pref->col < nlen ? pref->col : nlen);
+        if (pref->eol) {
+            d->caret = nend;
+        } else if (!d->sel_box && pref->x >= 0) {
+            if (one.rows.len && one.rows.data[0].byte_start == ns)
+                d->caret = rtx_layout_hit_row(&one, &one.rows.data[0], d, m,
+                                              pref->x, 0.0) !>;
+            else
+                d->caret = ns;
+        } else {
+            d->caret = ns + (pref->col < nlen ? pref->col : nlen);
+        }
         d->caret = d->cluster_align(d->caret) !>(e) { return cc_err(e); };
         if (d->caret < ns) d->caret = ns;
         if (d->caret > nend) d->caret = nend;
         d->caret = d->fold_snap(d->caret, dir);
-        d->caret = rtx_layout_md_snap(L, d, d->caret, 0);
+        d->caret = rtx_layout_md_snap(&one, d, d->caret, 0);
         if (!shift) d->sel_anchor = d->caret;
         d->break_coalesce();
         return cc_ok();
     }
-    if (L->rich && rtx_layout_md_role_at(L, start) == RTX_MD_ROLE_SEP) {
-        int ti = rtx_layout_md_index(L, start);
-        if (ti >= 0) start = L->md_tab[ti].lo;
-    }
     one.wrap = 1;
     one.fill_off(d, m, width, start, 1) !>;
-    if (one.rows.len == 0) return cc_ok();
+    /* No row (the empty line after a final newline): up still steps. */
     row = one.row_of(d->caret);
+    bare = start;
     if (capture && !pref->eol) {
         double x = one.x_of(d, m, d->caret) !>;
         pref->x = x;
+    }
+    /* A table record whose cells wrap: first the lines of the caret's cell. */
+    rtx_layout_md_caret_li(&one, d, m, row, d->caret, pref, &li, &nl) !>;
+    if (nl > 1) {
+        size_t at = 0;
+        int in = rtx_layout_md_rec_step(&one, d, m, row, li, nl, dir, d->caret, pref, &at) !>;
+        if (in) {
+            d->caret = at;
+            if (!shift) d->sel_anchor = d->caret;
+            d->break_coalesce();
+            return cc_ok();
+        }
     }
     if (dir < 0) {
         if (row > 0) row--;
@@ -3028,7 +3625,9 @@ void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *
                 prev = rtx_doc_line_floor(d, prev - 1) !>;
             }
             row = one.rows.len ? one.rows.len - 1 : 0;
+            bare = prev;
         }
+        li = RTX_MD_LI_LAST;
     } else {
         if (row + 1 < one.rows.len) row++;
         else {
@@ -3053,7 +3652,17 @@ void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *
                 }
             }
             row = 0;
+            bare = next;
         }
+        li = 0;
+    }
+    if (one.rows.len == 0) {
+        /* A line with no row (the empty line after a final newline): its
+         * start. (A hit on no row was BOF.) */
+        d->caret = bare;
+        if (!shift) d->sel_anchor = d->caret;
+        d->break_coalesce();
+        return cc_ok();
     }
     if (row >= one.rows.len) row = one.rows.len ? one.rows.len - 1 : 0;
     {
@@ -3075,25 +3684,974 @@ void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *
         }
     }
     if (row >= one.rows.len) row = one.rows.len ? one.rows.len - 1 : 0;
-    if (pref->eol) {
-        d->caret = one.rows.data[row].byte_start + one.rows.data[row].byte_len;
-    } else {
-        size_t at = rtx_layout_hit_row(&one, &one.rows.data[row], d, m, pref->x,
-                                       0.0) !>;
-        d->caret = at;
-    }
-    d->caret = d->fold_snap(d->caret, dir);
-    d->caret = rtx_layout_md_snap(L, d, d->caret, 0);
+    d->caret = rtx_layout_vert_land(&one, d, m, row, li, dir, pref) !>;
     if (!shift) d->sel_anchor = d->caret;
     d->break_coalesce();
     return cc_ok();
 }
 
-void !>(CCError) RtxLayout_after_edit(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
-                                 double max_width, size_t off) {
+/* Step `n` lines from (`row`, caret `*at`) over `R`'s rows the way n
+ * move_vert calls do: inside a table record the caret's cell wrap lines
+ * (rtx_layout_md_rec_step), else one row, past a table's separator row (up
+ * to 8). Returns the lines actually taken; `*row` is where it stopped and
+ * `*at` its landing when that is a record ((size_t)-1: land at the goal). */
+static size_t !>(CCError) rtx_layout_page_steps(const RtxLayout *R, RtxDoc *d,
+                                              const RtxMeasure *m, const RtxPref *pref,
+                                              size_t *row, size_t *at, int dir, size_t n) {
+    size_t r = *row, c = *at, took = 0;
+    while (took < n) {
+        size_t t = r;
+        int guard = 0;
+        if (c != (size_t)-1 && !pref->eol && rtx_layout_md_rec_row(R, m, r)) {
+            size_t li, nl, a = 0;
+            int in;
+            rtx_layout_md_caret_li(R, d, m, r, c, pref, &li, &nl) !>(e) { return cc_err(e); };
+            in = rtx_layout_md_rec_step(R, d, m, r, li, nl, dir, c, pref, &a) !>(e) {
+                return cc_err(e);
+            };
+            if (in) {
+                c = a;
+                took++;
+                continue;
+            }
+        }
+        if (dir > 0) {
+            if (t + 1 >= R->rows.len) break;
+            t++;
+        } else {
+            if (t == 0) break;
+            t--;
+        }
+        while (rtx_layout_md_row_sep(R, t) && guard++ < 8) {
+            if (dir > 0 && t + 1 < R->rows.len) t++;
+            else if (dir < 0 && t > 0) t--;
+            else break;
+        }
+        /* A separator at the edge of these rows: what is past it is not
+         * here (the caller steps on singly). */
+        if (rtx_layout_md_row_sep(R, t)) break;
+        r = t;
+        c = (size_t)-1;
+        if (!pref->eol && rtx_layout_md_rec_row(R, m, r))
+            c = rtx_layout_vert_land(R, d, m, r, dir > 0 ? 0 : RTX_MD_LI_LAST, dir, pref) !>(e) {
+                return cc_err(e);
+            };
+        took++;
+    }
+    *row = r;
+    *at = c;
+    return cc_ok(took);
+}
+
+/* The caret lands on `R`'s row `row` (a record's landing `at`), as the
+ * last move_vert would. */
+static void !>(CCError) rtx_layout_page_land(const RtxLayout *R, RtxDoc *d,
+                                            const RtxMeasure *m, size_t row, size_t at,
+                                            int dir, int shift, const RtxPref *pref) {
+    if (at != (size_t)-1) {
+        d->caret = at;
+    } else {
+        d->caret = rtx_layout_vert_land(R, d, m, row, dir > 0 ? 0 : RTX_MD_LI_LAST, dir,
+                                        pref) !>(e) {
+            return cc_err(e);
+        };
+    }
+    if (!shift) d->sel_anchor = d->caret;
+    d->break_coalesce();
+    return cc_ok();
+}
+
+/* PageUp / PageDown: n rows of move_vert in at most one scratch fill.
+ * Each move_vert laid out the caret's line and its neighbour (two fills,
+ * each an ensure_hl of its own one-line window): a page was ~100 fills and
+ * as many window lexes. Soft wrap walks the rows of one fill — the pane's
+ * own when they hold the target (`rows_ok`: laid out at this width, this
+ * edit stamp) — and lands at the goal x as the last move_vert would.
+ * Unwrapped steps physical lines (one fill classifies the tables they
+ * cross) and lays out only the landing line. */
+void !>(CCError) RtxLayout_page_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
+                                double width, int dir, size_t n, int shift,
+                                RtxPref *pref, int rows_ok) {
+    size_t start, k;
+    RtxLayout one = {0} @destroy;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    if (!L || !d || !m || !pref) return cc_err(CC_ERR_INVALID_ARG, "page vert");
+    if (n <= 1 || L->view != RTX_VIEW_DEFAULT || d->sel_box) {
+        for (k = 0; k < (n ? n : 1); k++)
+            L->move_vert(d, m, width, dir, shift, pref) !>;
+        return cc_ok();
+    }
+    one.rich = L->rich;
+    one.reveal_lo = L->reveal_lo;
+    one.reveal_hi = L->reveal_hi;
+    one.hl_keep = 1;
+    if (!shift) {
+        d->sel_anchor = d->caret;
+        d->sel_box = 0;
+    }
+    start = rtx_doc_line_floor(d, d->caret) !>;
+    rtx_layout_md_off_sep(&one, d, m, width, L->wrap, &start, shift) !>;
+    if (!pref->ok) {
+        /* move_vert's capture: the goal is the caret's x on its own row. */
+        pref->col = d->caret - start;
+        pref->ok = 1;
+        pref->x = -1.0;
+        if (!pref->eol) {
+            one.wrap = L->wrap;
+            one.fill_off(d, m, width, start, 1) !>;
+            if (L->wrap || (one.rows.len && d->caret <= one.rows.data[0].byte_start +
+                                                          one.rows.data[0].byte_len))
+                pref->x = one.x_of(d, m, d->caret) !>;
+            one.reset();
+        }
+    }
+    if (!L->wrap) {
+        /* Physical lines: step n line starts (a table's separator line is
+         * skipped as move_vert skips it), then land on the last one. */
+        size_t ns = start, nend, nlen;
+        size_t moved = 0, s_lo = 1, s_hi = 0;
+        RtxLayout scan = {0} @destroy;
+        scan.rich = L->rich;
+        scan.reveal_lo = L->reveal_lo;
+        scan.reveal_hi = L->reveal_hi;
+        scan.hl_keep = 1;
+        scan.wrap = 0;
+        for (k = 0; k < n; k++) {
+            size_t next = ns;
+            int has, guard = 0, edge = 0;
+            for (;;) {
+                if (dir < 0) {
+                    if (next == 0) {
+                        edge = 1;
+                        break;
+                    }
+                    next = rtx_doc_line_floor(d, next - 1) !>;
+                } else {
+                    has = rtx_doc_next_line_start(d, next, &next) !>;
+                    if (!has) {
+                        edge = 1;
+                        break;
+                    }
+                }
+                if (!L->rich || guard++ >= 8) break;
+                if (next < s_lo || next >= s_hi) {
+                    /* One fill over the next lines (few enough that no more
+                     * than RTX_MD_TABLE_FILL tables touch it: a table is two
+                     * lines at least, so it knows each table move_vert's
+                     * line fill would). */
+                    size_t from = next, left = 2 * (n - k) + 2, j;
+                    if (left > 2 * (size_t)RTX_MD_TABLE_FILL - 3)
+                        left = 2 * (size_t)RTX_MD_TABLE_FILL - 3;
+                    if (dir < 0) {
+                        for (j = 0; j < left && from > 0; j++)
+                            from = rtx_doc_line_floor(d, from - 1) !>;
+                        left = j;
+                    }
+                    scan.fill_off(d, m, width, from, left + 1) !>;
+                    s_lo = scan.rows.len ? scan.rows.data[0].byte_start : 1;
+                    s_hi = scan.rows.len ? scan.rows.data[scan.rows.len - 1].byte_start +
+                                               scan.rows.data[scan.rows.len - 1].byte_len
+                                         : 0;
+                    if (next < s_lo || next >= s_hi) break;
+                }
+                if (rtx_layout_md_role_at(&scan, next) != RTX_MD_ROLE_SEP) break;
+            }
+            if (edge) break;
+            ns = next;
+            moved++;
+        }
+        if (!moved) {
+            if (!shift) d->sel_anchor = d->caret;
+            d->break_coalesce();
+            return cc_ok();
+        }
+        nend = rtx_doc_line_end_caret(d, ns) !>;
+        nlen = nend - ns;
+        /* The landing line's own fill, as move_vert lays it out. */
+        one.wrap = 0;
+        one.fill_off(d, m, width, ns, 1) !>;
+        if (pref->eol) {
+            d->caret = nend;
+        } else if (pref->x >= 0) {
+            if (one.rows.len && one.rows.data[0].byte_start == ns)
+                d->caret = rtx_layout_hit_row(&one, &one.rows.data[0], d, m, pref->x,
+                                              0.0) !>;
+            else
+                d->caret = ns;
+        } else {
+            d->caret = ns + (pref->col < nlen ? pref->col : nlen);
+        }
+        d->caret = d->cluster_align(d->caret) !>;
+        if (d->caret < ns) d->caret = ns;
+        if (d->caret > nend) d->caret = nend;
+        d->caret = d->fold_snap(d->caret, dir);
+        d->caret = rtx_layout_md_snap(&one, d, d->caret, 0);
+        if (!shift) d->sel_anchor = d->caret;
+        d->break_coalesce();
+        return cc_ok();
+    }
+    /* Soft wrap. The pane's rows, when they hold the caret and the target. */
+    if (rows_ok && L->rows.len && L->fill_gen == d->edit_stamp() &&
+        L->md_ntab < RTX_MD_TABLE_FILL &&
+        d->caret >= L->rows.data[0].byte_start &&
+        d->caret <= L->rows.data[L->rows.len - 1].byte_start +
+                        L->rows.data[L->rows.len - 1].byte_len) {
+        size_t row = L->row_of(d->caret), r = row, took, at = d->caret;
+        size_t last = L->rows.data[L->rows.len - 1].byte_start +
+                      L->rows.data[L->rows.len - 1].byte_len;
+        took = rtx_layout_page_steps(L, d, m, pref, &r, &at, dir, n) !>;
+        /* Short only at BOF / EOF: the rows begin at 0 / end at len. */
+        if (took == n || (dir < 0 && L->rows.data[0].byte_start == 0) ||
+            (dir > 0 && last >= d->len())) {
+            if (!took) {
+                if (!shift) d->sel_anchor = d->caret;
+                d->break_coalesce();
+                return cc_ok();
+            }
+            return rtx_layout_page_land(L, d, m, r, at, dir, shift, pref);
+        }
+    }
+    one.wrap = 1;
+    {
+        size_t from = start, lines = n + 1, row, took, at;
+        if (dir < 0) {
+            /* n lines above hold at least n rows (a fold may hide some:
+             * the rest is stepped one row at a time). */
+            for (k = 0; k < n && from > 0; k++)
+                from = rtx_doc_line_floor(d, from - 1) !>;
+            lines = k + 1;
+        }
+        one.fill_off(d, m, width, from, lines) !>;
+        if (one.rows.len == 0) return cc_ok();
+        if (one.md_ntab >= RTX_MD_TABLE_FILL) {
+            /* Its table set may be cut short (RTX_MD_TABLE_FILL): the rows
+             * of a table past it are not a record. Step as move_vert. */
+            for (k = 0; k < n; k++) L->move_vert(d, m, width, dir, 1, pref) !>;
+            if (!shift) d->sel_anchor = d->caret;
+            return cc_ok();
+        }
+        row = one.row_of(d->caret);
+        /* The line after a final newline has no row: it is below them. */
+        if (d->caret > one.rows.data[one.rows.len - 1].byte_start +
+                           one.rows.data[one.rows.len - 1].byte_len)
+            row = one.rows.len;
+        at = d->caret;
+        took = rtx_layout_page_steps(&one, d, m, pref, &row, &at, dir, n) !>;
+        if (took < n) {
+            int edge = dir < 0 ? one.rows.data[0].byte_start == 0
+                               : one.rows.data[one.rows.len - 1].byte_start +
+                                         one.rows.data[one.rows.len - 1].byte_len >=
+                                     d->len();
+            if (!edge) {
+                /* A fold or a capped line: land here, move the rest singly. */
+                rtx_layout_page_land(&one, d, m, row, at, dir, 1, pref) !>;
+                for (k = took; k < n; k++)
+                    L->move_vert(d, m, width, dir, 1, pref) !>;
+                if (!shift) d->sel_anchor = d->caret;
+                return cc_ok();
+            }
+            if (!took) {
+                if (!shift) d->sel_anchor = d->caret;
+                d->break_coalesce();
+                return cc_ok();
+            }
+        }
+        return rtx_layout_page_land(&one, d, m, row, at, dir, shift, pref);
+    }
+}
+
+/* ---- Incremental relayout (layout.cch: RtxLayoutPatch) ----
+ *
+ * Rows from `lines()` are whole physical lines over [win_lo, win_hi). The
+ * doc's edit span maps old bytes to new: a boundary b <= elo stays, b >=
+ * elo+eold moves by delta, a boundary inside the span has no image. A line
+ * keeps its rows when its bytes are outside the span AND nothing the walk
+ * reads for it moved: runs (style / hints / marks), reveal, section, MD
+ * geometry, has_marks. Runs are diffed over the window, so a fence opened
+ * above relays exactly the lines whose styles moved — never a guess. */
+
+#define RTX_PATCH_NONE ((size_t)-1)
+
+static size_t rtx_patch_map(const RtxLayoutPatch *p, size_t b) {
+    if (b <= p->elo) return b;
+    if (b >= p->elo + p->eold) return b - p->eold + p->enew;
+    return RTX_PATCH_NONE;
+}
+
+/* Outward images of a boundary inside the span (dirty spans only). */
+static size_t rtx_patch_map_lo(const RtxLayoutPatch *p, size_t b) {
+    size_t x = rtx_patch_map(p, b);
+    return x == RTX_PATCH_NONE ? p->elo : x;
+}
+
+static size_t rtx_patch_map_hi(const RtxLayoutPatch *p, size_t b) {
+    size_t x = rtx_patch_map(p, b);
+    return x == RTX_PATCH_NONE ? p->elo + p->enew : x;
+}
+
+static int rtx_patch_run_cmp(const void *pa, const void *pb) {
+    const RtxRun *a = (const RtxRun *)pa;
+    const RtxRun *b = (const RtxRun *)pb;
+    if (a->start != b->start) return a->start < b->start ? -1 : 1;
+    if (a->len != b->len) return a->len < b->len ? -1 : 1;
+    if (a->planter != b->planter) return a->planter < b->planter ? -1 : 1;
+    if (a->hint_a != b->hint_a) return a->hint_a < b->hint_a ? -1 : 1;
+    if (a->hint_b != b->hint_b) return a->hint_b < b->hint_b ? -1 : 1;
+    if (a->mark != b->mark) return a->mark < b->mark ? -1 : 1;
+    if (a->rule != b->rule) return a->rule < b->rule ? -1 : 1;
+    if (a->style.bold != b->style.bold) return a->style.bold < b->style.bold ? -1 : 1;
+    if (a->style.italic != b->style.italic)
+        return a->style.italic < b->style.italic ? -1 : 1;
+    if (a->style.mono != b->style.mono) return a->style.mono < b->style.mono ? -1 : 1;
+    if (a->style.strike != b->style.strike)
+        return a->style.strike < b->style.strike ? -1 : 1;
+    if (a->style.scope != b->style.scope)
+        return a->style.scope < b->style.scope ? -1 : 1;
+    return 0;
+}
+
+/* Runs any walk query in [from, to] can see, in a total order. */
+static void !>(CCError) rtx_patch_runs(const RtxDoc *d, size_t from, size_t to,
+                                       Vec::[RtxRun] *out, CCArena a) {
+    size_t i;
+    Vec::[RtxRun] v = vec_new::[RtxRun](a);
+    if (!v.data) return cc_err(CC_ERR_OUT_OF_MEMORY, "patch runs");
+    for (i = 0; i < d->runs.len; i++) {
+        RtxRun r = d->runs.data[i];
+        if (!r.len || r.start > to || r.start + r.len < from) continue;
+        if (v.push(r) != 0) return cc_err(CC_ERR_OUT_OF_MEMORY, "patch runs");
+    }
+    if (v.len > 1) qsort(v.data, v.len, sizeof(RtxRun), rtx_patch_run_cmp);
+    *out = v;
+    return cc_ok();
+}
+
+/* Rich: a table above the window (MD lookback) is measured from runs
+ * before `from`, so the diff reaches back as far as the lookback walk. */
+static size_t rtx_patch_snap_lo(const RtxLayout *L, RtxDocLayout d, size_t from,
+                                size_t to) {
+    size_t back = 2 * (size_t)RTX_MARKUP_LOOKBACK;
+    if (!rtx_layout_md_on(L, d, from, to)) return from;
+    return from > back ? from - back : 0;
+}
+
+/* 1 when the rows are whole lines, byte- and line-contiguous from
+ * [win_lo, win_hi) (no fold gap, no record walk). */
+static int rtx_patch_rows_ok(const RtxLayout *L) {
+    size_t i, e;
+    const RtxVisRow *r = L->rows.data;
+    if (!L->rows.len || r[0].byte_start != L->win_lo || r[0].line != L->from_line)
+        return 0;
+    for (i = 1; i < L->rows.len; i++) {
+        size_t end = r[i - 1].byte_start + r[i - 1].byte_len;
+        if (r[i].line == r[i - 1].line) {
+            if (r[i].byte_start != end) return 0;
+        } else if (r[i].line != r[i - 1].line + 1 || r[i].byte_start != end + 1) {
+            return 0;
+        }
+    }
+    e = r[L->rows.len - 1].byte_start + r[L->rows.len - 1].byte_len;
+    return e == L->win_hi || e + 1 == L->win_hi;
+}
+
+/* First row of the line that holds old byte `x` (x <= last row end). */
+static size_t rtx_patch_line_first(const RtxLayout *L, size_t x) {
+    size_t lo = 0, hi = L->rows.len;
+    const RtxVisRow *r = L->rows.data;
+    while (lo + 1 < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (r[mid].byte_start <= x) lo = mid;
+        else hi = mid;
+    }
+    while (lo > 0 && r[lo - 1].line == r[lo].line) lo--;
+    return lo;
+}
+
+static size_t rtx_patch_line_last(const RtxLayout *L, size_t i) {
+    while (i + 1 < L->rows.len && L->rows.data[i + 1].line == L->rows.data[i].line)
+        i++;
+    return i;
+}
+
+/* Count '\n' in [lo, hi). `k` > 0 stops after the k-th: *stop is the next
+ * line start (else hi). */
+static size_t !>(CCError) rtx_patch_nl(RtxDoc *d, size_t lo, size_t hi, size_t k,
+                                       size_t *stop) {
+    char buf[512];
+    size_t off = lo, n = 0;
+    if (stop) *stop = hi;
+    while (off < hi) {
+        size_t take = hi - off, got, i;
+        if (take > sizeof(buf)) take = sizeof(buf);
+        got = d->read_at(off, cc_slice_from_buffer(buf, take)) !>(e) {
+            return cc_err(e);
+        };
+        if (!got) break;
+        for (i = 0; i < got; i++) {
+            if (buf[i] != '\n') continue;
+            n++;
+            if (k && n == k) {
+                if (stop) *stop = off + i + 1;
+                return cc_ok(n);
+            }
+        }
+        off += got;
+    }
+    return cc_ok(n);
+}
+
+void !>(CCError) rtx_layout_patch_plan(RtxLayout *L, RtxDoc *d, RtxLayoutPatch *p,
+                                       CCArena a) {
+    RtxEditSpan sp;
+    size_t dlen, old_len, A, Z, E, R, T, eend;
+    int eof_old, have_to = 0;
+    const RtxVisRow *r;
+    if (!p) return cc_err(CC_ERR_INVALID_ARG, "patch plan");
+    *p = (RtxLayoutPatch){0};
+    if (!L || !d) return cc_ok();
+    sp = d->span;
+    /* Refill: rows not from lines() at the span's base, a view with its own
+     * record walk, folds (skipped interiors move), `=` / large delete
+     * (sections rescanned by a full reparse). */
+    if (!sp.live || !L->fill_lined || L->fill_gen != sp.gen0) return cc_ok();
+    if (L->view != RTX_VIEW_DEFAULT || L->md_keep || d->fold_n || d->last_markup)
+        return cc_ok();
+    if (!rtx_patch_rows_ok(L)) return cc_ok();
+    dlen = d->len();
+    if (sp.hi < sp.lo || dlen + sp.old_n < sp.hi - sp.lo) return cc_ok();
+    old_len = dlen + sp.old_n - (sp.hi - sp.lo);
+    p->elo = sp.lo;
+    p->eold = sp.old_n;
+    p->enew = sp.hi - sp.lo;
+    A = L->win_lo;
+    Z = L->win_hi;
+    R = L->rows.len;
+    r = L->rows.data;
+    E = r[R - 1].byte_start + r[R - 1].byte_len;
+    T = L->nlines;
+    eof_old = Z == old_len;
+    eend = p->elo + p->eold;
+    p->from = A;
+    if (p->elo < A) return cc_ok(); /* above the camera: its top line moves */
+    if (!eof_old && T != r[R - 1].line - L->from_line + 1) return cc_ok();
+    if (!eof_old && p->elo >= Z) {
+        /* Past the window: rows keep their bytes; only runs can move. */
+        p->after = 1;
+        p->to = Z;
+        p->nlines = T;
+        p->rlo = p->rhi = Z;
+        p->pre_n = R;
+        p->post_i = R;
+        p->ok = 1;
+        p->snap_lo = rtx_patch_snap_lo(L, d, p->from, p->to);
+        return rtx_patch_runs(d, p->snap_lo, p->to, &p->runs, a);
+    }
+    /* Eating the window's closing newline joins the next camera line. */
+    if (!eof_old && eend >= Z) return cc_ok();
+    if (p->elo > E) {
+        /* EOF after a trailing newline: the edit starts the phantom line. */
+        p->pre_n = R;
+        p->rlo = E + 1;
+        p->phys_rlo = r[R - 1].line + 1;
+    } else {
+        size_t f = rtx_patch_line_first(L, p->elo);
+        p->pre_n = f;
+        p->rlo = r[f].byte_start;
+        p->phys_rlo = r[f].line;
+    }
+    {
+        size_t rhi_old;
+        if (eend > E) {
+            rhi_old = old_len;
+            p->post_i = R;
+        } else {
+            size_t lb = rtx_patch_line_last(L, rtx_patch_line_first(L, eend));
+            rhi_old = r[lb].byte_start + r[lb].byte_len;
+            p->post_i = lb + 1;
+        }
+        if (rhi_old < eend) return cc_ok();
+        p->rhi = rhi_old - p->eold + p->enew;
+    }
+    if (p->rhi < p->rlo || p->rhi - p->rlo > (size_t)RTX_HL_WIN_MAX) return cc_ok();
+    p->post_n = R - p->post_i;
+    p->region_nl = rtx_patch_nl(d, p->rlo, p->rhi, 0, NULL) !>(e) { return cc_err(e); };
+    if (eof_old) {
+        p->eof = 1;
+        p->to = dlen;
+    } else {
+        /* Keep the window's line count: Enter drops tail lines, a join pulls
+         * lines in from past the old end (what lines() would lay out). */
+        size_t last = L->from_line + T; /* first line past the window */
+        size_t reg_end = p->phys_rlo + p->region_nl;
+        size_t next_line;
+        if (reg_end >= last) return cc_ok(); /* paste taller than the window */
+        next_line = reg_end + 1;
+        p->nlines = T;
+        if (p->post_n) {
+            size_t k, base = r[p->post_i].line;
+            for (k = 0; k < p->post_n; k++) {
+                if (r[p->post_i + k].line - base + next_line >= last) break;
+            }
+            if (k < p->post_n) {
+                p->to = rtx_patch_map(p, r[p->post_i + k].byte_start);
+                p->post_n = k;
+                have_to = 1;
+            } else {
+                next_line += r[R - 1].line - base + 1;
+            }
+        }
+        if (!have_to) {
+            size_t want = last - next_line, stop = 0, got;
+            p->tail_lo = rtx_patch_map(p, Z);
+            if (p->tail_lo == RTX_PATCH_NONE) return cc_ok();
+            p->tail_hi = p->tail_lo;
+            p->to = p->tail_lo;
+            if (want) {
+                got = rtx_patch_nl(d, p->tail_lo, dlen, want, &stop) !>(e) {
+                    return cc_err(e);
+                };
+                p->tail_hi = stop;
+                p->to = stop;
+                if (got < want) p->eof = 1;
+            }
+        }
+    }
+    if (p->to < p->from || p->to - p->from > (size_t)RTX_HL_WIN_MAX) return cc_ok();
+    p->ok = 1;
+    p->snap_lo = rtx_patch_snap_lo(L, d, p->from, p->to);
+    return rtx_patch_runs(d, p->snap_lo, p->to, &p->runs, a);
+}
+
+typedef struct {
+    size_t lo, end;  /* new bytes; end = line end (the NL, or doc end) */
+    size_t line;     /* first physical line */
+    size_t r0, rn;   /* old rows to reuse */
+    long shift_b;    /* byte shift for reused rows */
+    long shift_l;    /* line shift for reused rows */
+    int relay;
+} RtxPatchSeg;
+
+typedef struct {
+    int ntab, px;
+    RtxMdTable tab[RTX_MD_TABLE_FILL];
+    int colw[RTX_MD_TABLE_FILL][RTX_MD_TABLE_COLS];
+    int colpx[RTX_MD_TABLE_FILL][RTX_MD_TABLE_COLS];
+    int natw[RTX_MD_TABLE_FILL];
+    int natpx[RTX_MD_TABLE_FILL];
+} RtxPatchMd;
+
+static void rtx_patch_md_save(const RtxLayout *L, RtxPatchMd *s) {
+    int i, j;
+    s->ntab = L->md_ntab;
+    s->px = L->md_px;
+    for (i = 0; i < L->md_ntab && i < RTX_MD_TABLE_FILL; i++) {
+        s->tab[i] = L->md_tab[i];
+        s->natw[i] = L->md_natw[i];
+        s->natpx[i] = L->md_natpx[i];
+        for (j = 0; j < RTX_MD_TABLE_COLS; j++) {
+            s->colw[i][j] = L->md_colw[i][j];
+            s->colpx[i][j] = L->md_colpx[i][j];
+        }
+    }
+}
+
+/* Same table membership / columns / align after the edit (old mapped). */
+static int rtx_patch_md_geom(const RtxPatchMd *s, const RtxMdScan *sc,
+                             const RtxLayoutPatch *p) {
+    int i, j;
+    if (s->ntab != sc->n) return 0;
+    for (i = 0; i < s->ntab; i++) {
+        const RtxMdTable *o = &s->tab[i];
+        const RtxMdTable *n = &sc->t[i];
+        if (rtx_patch_map(p, o->lo) != n->lo || rtx_patch_map(p, o->hi) != n->hi ||
+            rtx_patch_map(p, o->sep_lo) != n->sep_lo ||
+            rtx_patch_map(p, o->sep_hi) != n->sep_hi ||
+            rtx_patch_map(p, o->body_lo) != n->body_lo || o->ncols != n->ncols)
+            return 0;
+        /* Slots past ncols are stale scratch, not geometry. */
+        for (j = 0; j < o->ncols && j < RTX_MD_TABLE_COLS; j++) {
+            if (o->align[j] != n->align[j]) return 0;
+        }
+    }
+    return 1;
+}
+
+static int rtx_patch_md_widths_same(const RtxLayout *L, const RtxPatchMd *s, int i) {
+    int j;
+    for (j = 0; j < s->tab[i].ncols && j < RTX_MD_TABLE_COLS; j++) {
+        if (s->colw[i][j] != L->md_colw[i][j] || s->colpx[i][j] != L->md_colpx[i][j])
+            return 0;
+    }
+    return 1;
+}
+
+/* Group old rows [i0, i0+n) into one segment per line, one shift. */
+static int rtx_patch_seg_rows(const RtxLayout *L, Vec::[RtxPatchSeg] *v, size_t i0,
+                              size_t n, long shift_b, long shift_l) {
+    size_t i = i0, end = i0 + n;
+    const RtxVisRow *r = L->rows.data;
+    while (i < end) {
+        size_t j = i;
+        RtxPatchSeg s = {0};
+        while (j + 1 < end && r[j + 1].line == r[i].line) j++;
+        s.lo = (size_t)((long)r[i].byte_start + shift_b);
+        s.end = (size_t)((long)(r[j].byte_start + r[j].byte_len) + shift_b);
+        s.line = (size_t)((long)r[i].line + shift_l);
+        s.r0 = i;
+        s.rn = j - i + 1;
+        s.shift_b = shift_b;
+        s.shift_l = shift_l;
+        if (v->push(s) != 0) return 0;
+        i = j + 1;
+    }
+    return 1;
+}
+
+/* Byte spans whose lines relay: [lo, hi), new coords. Run diff hull,
+ * both reveal spans, re-measured tables. */
+#define RTX_PATCH_SPANS (4 + RTX_MD_TABLE_FILL)
+typedef struct {
+    int n;
+    size_t lo[RTX_PATCH_SPANS];
+    size_t hi[RTX_PATCH_SPANS];
+} RtxPatchSpans;
+
+static void rtx_patch_span_add(RtxPatchSpans *s, size_t lo, size_t hi) {
+    if (hi <= lo) return;
+    if (s->n < RTX_PATCH_SPANS) {
+        s->lo[s->n] = lo;
+        s->hi[s->n++] = hi;
+        return;
+    }
+    /* Full: fold into the last (conservative). */
+    if (lo < s->lo[s->n - 1]) s->lo[s->n - 1] = lo;
+    if (hi > s->hi[s->n - 1]) s->hi[s->n - 1] = hi;
+}
+
+static int rtx_patch_span_hits(const RtxPatchSpans *s, size_t lo, size_t end) {
+    int k;
+    for (k = 0; k < s->n; k++) {
+        if (s->lo[k] <= end && s->hi[k] > lo) return 1;
+    }
+    return 0;
+}
+
+void !>(CCError) rtx_layout_patch(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
+                                  double max_width, RtxLayoutPatch *p, CCArena a) {
+    size_t i, dlen, old_n;
+    int wrap, md = 0;
+    Vec::[RtxRun] now;
+    Vec::[RtxPatchSeg] segs;
+    RtxVisRow *old;
+    RtxPatchSpans dirty = {0};
+    RtxPatchMd was;
+    RtxMdScan sc;
+    RtxMdRec *orec = NULL;
+    RtxMdRecCell *ocell = NULL;
+    RtxMdCell *oline = NULL;
+    size_t orec_n, ocell_n, oline_n;
+    if (!p || !p->ok) return cc_ok();
+    p->ok = 0;
+    if (!L || !d || !m || !m->measure || !m->line_height)
+        return cc_err(CC_ERR_INVALID_ARG, "layout patch");
+    /* The highlight window a refill of these lines asks for, in its order. */
+    d->ensure_hl(rtx_hl_span(rtx_layout_hl_lo(L, d, p->from, p->to), p->to)) !>(e) {
+        return cc_err(e);
+    };
+    /* MD tables: classify the new window (a byte scan, as collect does). A
+     * table set / column / align change refills; widths are re-measured
+     * below only for tables the edit, run diff or reveal touched. */
+    if (rtx_layout_md_on(L, d, p->from, p->to)) {
+        char[:] win = cc_slice_empty();
+        rtx_patch_md_save(L, &was);
+        if (p->to > p->from) {
+            win = d->scratch_span(p->from, p->to - p->from, a) !>(e) {
+                return cc_err(e);
+            };
+        }
+        rtx_layout_md_scan(d, p->from, win, &sc);
+        if (!rtx_patch_md_geom(&was, &sc, p)) {
+            rtx_layout_md_scan_done(&sc);
+            return cc_ok();
+        }
+        md = 1;
+    } else if (L->md_ntab > 0) {
+        return cc_ok(); /* tables from a markup fill: that fill decides */
+    }
+    /* Reveal after every lex a fill does (the scan's lookback pass can
+     * move marks), before widths — hidden hints size MD cells. Rows paint
+     * the old span (mapped); ensure_view sets the caret's, which is this
+     * one. Lines under either relay. */
+    {
+        size_t olo = rtx_patch_map(p, L->reveal_lo);
+        size_t ohi = rtx_patch_map(p, L->reveal_hi);
+        size_t mlo = rtx_patch_map_lo(p, L->reveal_lo);
+        size_t mhi = rtx_patch_map_hi(p, L->reveal_hi);
+        int had = L->reveal_hi > L->reveal_lo;
+        rtx_layout_reveal(L, d, d->caret, d->sel_anchor);
+        if (olo == RTX_PATCH_NONE || ohi == RTX_PATCH_NONE || olo != L->reveal_lo ||
+            ohi != L->reveal_hi) {
+            if (had) rtx_patch_span_add(&dirty, mlo, mhi + 1);
+            rtx_patch_span_add(&dirty, L->reveal_lo, L->reveal_hi + 1);
+        }
+    }
+    if ((L->rich && d->has_marks()) != L->has_marks) {
+        if (md) rtx_layout_md_scan_done(&sc);
+        return cc_ok();
+    }
+    /* Runs: symmetric difference over the snapshot range, as one hull. */
+    rtx_patch_runs(d, p->snap_lo, p->to, &now, a) !>(e) {
+        if (md) rtx_layout_md_scan_done(&sc);
+        return cc_err(e);
+    };
+    {
+        size_t x = 0, y = 0, dlo = 0, dhi = 0;
+        while (x < p->runs.len || y < now.len) {
+            int c;
+            const RtxRun *o = x < p->runs.len ? &p->runs.data[x] : NULL;
+            const RtxRun *n = y < now.len ? &now.data[y] : NULL;
+            size_t lo, hi;
+            if (o && n) c = rtx_patch_run_cmp(o, n);
+            else c = o ? -1 : 1;
+            if (c == 0) {
+                x++;
+                y++;
+                continue;
+            }
+            if (c < 0) {
+                lo = o->start;
+                hi = o->start + o->len + 1;
+                x++;
+            } else {
+                lo = n->start;
+                hi = n->start + n->len + 1;
+                y++;
+            }
+            if (dhi <= dlo) {
+                dlo = lo;
+                dhi = hi;
+            } else {
+                if (lo < dlo) dlo = lo;
+                if (hi > dhi) dhi = hi;
+            }
+        }
+        rtx_patch_span_add(&dirty, dlo, dhi);
+    }
+    if (md) {
+        /* Tables clear of the edit, run diff and reveal keep their widths
+         * (same bytes, same runs). Touched ones re-measure; if a width
+         * moved, every row of that table relays. */
+        int t, px;
+        int touched[RTX_MD_TABLE_FILL];
+        for (t = 0; t < sc.n; t++) {
+            size_t tlo = sc.t[t].lo, thi = sc.t[t].hi;
+            touched[t] = rtx_patch_span_hits(&dirty, tlo, thi);
+            if (!p->after && p->rlo <= thi && p->rhi + 1 > tlo) touched[t] = 1;
+            /* A table is measured to its end: an edit past the window in
+             * its rows can move the widths of the rows on screen. */
+            if (p->after && p->elo >= tlo && p->elo <= thi) touched[t] = 1;
+            L->md_tab[t] = sc.t[t];
+            if (touched[t]) rtx_layout_md_nat(L, d, m, sc.base, sc.ext, t);
+        }
+        rtx_layout_md_scan_done(&sc);
+        px = rtx_layout_md_px_vote(L, m);
+        if (px != was.px) return cc_ok();
+        L->md_px = px;
+        for (t = 0; t < L->md_ntab; t++) {
+            if (!touched[t]) continue;
+            if (L->wrap && max_width > 0) rtx_layout_md_fit(L, t, max_width);
+            if (!rtx_patch_md_widths_same(L, &was, t))
+                rtx_patch_span_add(&dirty, L->md_tab[t].lo, L->md_tab[t].hi);
+        }
+    }
+    /* Segments: kept lines, the edited lines, shifted lines, tail. */
+    dlen = d->len();
+    segs = vec_new::[RtxPatchSeg](a);
+    if (!segs.data) return cc_err(CC_ERR_OUT_OF_MEMORY, "patch segs");
+    if (!rtx_patch_seg_rows(L, &segs, 0, p->pre_n, 0, 0))
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "patch segs");
+    /* The edited lines. An empty region at doc end is the phantom line
+     * after a trailing newline: lines() lays out no row there. */
+    if (!p->after && (p->rhi > p->rlo || p->rlo < dlen)) {
+        RtxPatchSeg s = {0};
+        s.lo = p->rlo;
+        s.end = p->rhi;
+        s.line = p->phys_rlo;
+        s.relay = 1;
+        if (segs.push(s) != 0) return cc_err(CC_ERR_OUT_OF_MEMORY, "patch segs");
+    }
+    if (p->post_n) {
+        long sb = (long)p->enew - (long)p->eold;
+        long sl = (long)(p->phys_rlo + p->region_nl + 1) -
+                  (long)L->rows.data[p->post_i].line;
+        if (!rtx_patch_seg_rows(L, &segs, p->post_i, p->post_n, sb, sl))
+            return cc_err(CC_ERR_OUT_OF_MEMORY, "patch segs");
+    }
+    if (p->tail_hi > p->tail_lo) {
+        RtxPatchSeg s = {0};
+        size_t next = L->from_line;
+        if (segs.len) {
+            const RtxPatchSeg *pv = &segs.data[segs.len - 1];
+            next = (pv->relay ? pv->line + p->region_nl : pv->line) + 1;
+        }
+        s.lo = p->tail_lo;
+        /* tail_hi is a line start (after its NL) or doc end. */
+        s.end = p->tail_hi;
+        if (p->tail_hi < dlen || !p->eof) s.end = p->tail_hi - 1;
+        else {
+            char c = 0;
+            size_t got = d->read_at(dlen - 1, cc_slice_from_buffer(&c, 1)) !>(e) {
+                return cc_err(e);
+            };
+            if (got == 1 && c == '\n') s.end = dlen - 1;
+        }
+        s.line = next;
+        s.relay = 1;
+        if (segs.push(s) != 0) return cc_err(CC_ERR_OUT_OF_MEMORY, "patch segs");
+    }
+    /* Kept lines relay when runs / reveal / a table width moved under them,
+     * or their section is not the one they were laid out in. */
+    for (i = 0; i < segs.len; i++) {
+        RtxPatchSeg *s = &segs.data[i];
+        if (s->relay) continue;
+        if (rtx_patch_span_hits(&dirty, s->lo, s->end) ||
+            d->section_at(s->lo) != L->rows.data[s->r0].sec)
+            s->relay = 1;
+    }
+    /* Emit: old rows to scratch, then reuse / relay in line order. A relay
+     * run walks its lines with their closing NL, exactly like range(). */
+    old_n = L->rows.len;
+    old = (RtxVisRow *)cc_arena_alloc(a, (old_n ? old_n : 1) * sizeof(RtxVisRow), 8);
+    if (!old) return cc_err(CC_ERR_OUT_OF_MEMORY, "patch rows");
+    for (i = 0; i < old_n; i++) old[i] = L->rows.data[i];
+    /* MD records ride with their rows: a kept row keeps its record (the
+     * table's widths did not move, or every row of it relays). */
+    orec_n = L->md_recs.len;
+    ocell_n = L->md_cells.len;
+    oline_n = L->md_lines.len;
+    if (orec_n) {
+        orec = (RtxMdRec *)cc_arena_alloc(a, orec_n * sizeof(RtxMdRec), 8);
+        ocell = (RtxMdRecCell *)cc_arena_alloc(a, (ocell_n ? ocell_n : 1) *
+                                                      sizeof(RtxMdRecCell), 8);
+        oline = (RtxMdCell *)cc_arena_alloc(a, (oline_n ? oline_n : 1) *
+                                                   sizeof(RtxMdCell), 8);
+        if (!orec || !ocell || !oline) return cc_err(CC_ERR_OUT_OF_MEMORY, "patch recs");
+        for (i = 0; i < orec_n; i++) orec[i] = L->md_recs.data[i];
+        for (i = 0; i < ocell_n; i++) ocell[i] = L->md_cells.data[i];
+        for (i = 0; i < oline_n; i++) oline[i] = L->md_lines.data[i];
+    }
+    {
+        size_t keep_from = L->from_line;
+        size_t ri = 0;
+        L->rows.clear();
+        L->md_recs.clear();
+        L->md_cells.clear();
+        L->md_lines.clear();
+        L->total_height = 0;
+        L->fill_lined = 0;
+        wrap = L->wrap && max_width > 0;
+        i = 0;
+        while (i < segs.len) {
+            const RtxPatchSeg *s = &segs.data[i];
+            size_t j, lo, hi;
+            char[:] bytes;
+            if (!s->relay) {
+                size_t k;
+                for (k = 0; k < s->rn; k++) {
+                    RtxVisRow row = old[s->r0 + k];
+                    size_t was = row.byte_start;
+                    row.byte_start = (size_t)((long)row.byte_start + s->shift_b);
+                    row.line = (size_t)((long)row.line + s->shift_l);
+                    if (!rtx_layout_push(L, row)) {
+                        L->reset();
+                        return cc_err(CC_ERR_OUT_OF_MEMORY, "patch rows");
+                    }
+                    while (ri < orec_n && orec[ri].row < was) ri++;
+                    if (ri < orec_n && orec[ri].row == was) {
+                        RtxMdRecView v;
+                        v.rec = &orec[ri];
+                        v.cells = &ocell[orec[ri].cell];
+                        v.lines = oline;
+                        if (!rtx_layout_md_rec_store(L, &v, row.byte_start)) {
+                            L->reset();
+                            return cc_err(CC_ERR_OUT_OF_MEMORY, "patch recs");
+                        }
+                    }
+                }
+                i++;
+                continue;
+            }
+            j = i;
+            while (j + 1 < segs.len && segs.data[j + 1].relay) j++;
+            lo = s->lo;
+            hi = segs.data[j].end < dlen ? segs.data[j].end + 1 : dlen;
+            if (hi > lo) {
+                bytes = d->scratch_span(lo, hi - lo, a) !>(e) {
+                    L->reset();
+                    return cc_err(e);
+                };
+                L->from_line = s->line;
+                rtx_layout_range_walk(L, d, m, lo, hi - lo, max_width, wrap,
+                                      bytes) !>(e) {
+                    L->from_line = keep_from;
+                    L->reset();
+                    return cc_err(e);
+                };
+                L->from_line = keep_from;
+            }
+            i = j + 1;
+        }
+    }
+    L->nlines = p->nlines;
+    if (p->eof) {
+        char c = 0;
+        size_t last = L->rows.len ? L->rows.data[L->rows.len - 1].line : L->from_line;
+        L->nlines = last - L->from_line + 1;
+        if (dlen) {
+            size_t got = d->read_at(dlen - 1, cc_slice_from_buffer(&c, 1)) !>(e) {
+                return cc_err(e);
+            };
+            if (got == 1 && c == '\n') L->nlines++;
+        }
+    }
+    L->win_lo = p->from;
+    L->win_hi = p->to;
+    L->fill_gen = d->edit_stamp();
+    L->fill_lined = 1;
+    L->patched++;
+    p->ok = 1;
+    return cc_ok();
+}
+
+void !>(CCError) RtxLayout_after_edit(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
+                                 double max_width) {
+    RtxLayoutPatch p = {0};
+    CCArena a;
     size_t fl, nl;
-    (void)off;
     if (!L || !d || !m) return cc_err(CC_ERR_INVALID_ARG, "layout after edit");
+    a = cc_arena_heap(kilobytes(64));
+    if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "layout after edit");
+    rtx_layout_patch_plan(L, d, &p, a) !>(e) {
+        a.destroy();
+        return cc_err(e);
+    };
+    d->reparse_edit(d->last_off, d->last_markup) !>(e) {
+        a.destroy();
+        return cc_err(e);
+    };
+    rtx_layout_patch(L, d, m, max_width, &p, a) !>(e) {
+        a.destroy();
+        d->span_reset();
+        return cc_err(e);
+    };
+    a.destroy();
+    d->span_reset();
+    if (p.ok) return cc_ok();
     fl = L->from_line;
     nl = L->nlines;
     if (nl == 0) nl = d->line_count();

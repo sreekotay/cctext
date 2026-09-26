@@ -1,0 +1,463 @@
+#!ccc ccs
+/*
+ * File-backed line-index property smoke. Trees open with from_path (the
+ * page store and the progressive index), then take random inserts,
+ * deletes at line starts and stride boundaries, pastes of multi-newline
+ * blocks (64·k newlines with and without a trailing \n), long lines,
+ * edits that cross RTX_LINE_SOFT_MIN both ways, and undo / redo of large
+ * deletes (capture_range + splice_refs, the way hist does). After each op
+ * the stride slots, scan cursor, line_start / line_of / line_count are
+ * compared against a naive model.
+ *
+ * `./make.shcc @smoke` runs it twice: with the product knobs, and with the
+ * tree TU compiled small (-DRTX_LINE_STRIDE / RTX_LINE_SOFT_MIN /
+ * RTX_LINE_ISLE_BUDGET into out-lix/) so thousands of ops cross every
+ * threshold in seconds. The test reads the same macros.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/piece_tree.cch"
+
+#define LIX_S ((size_t)RTX_LINE_STRIDE)
+#define LIX_SOFT ((size_t)RTX_LINE_SOFT_MIN)
+#define LIX_BUDGET ((size_t)RTX_LINE_ISLE_BUDGET)
+#define LIX_SMALL (LIX_SOFT < (size_t)(64 * 1024))
+#define LIX_CAP (LIX_SOFT * 6 + (size_t)(64 * 1024))
+#define LIX_UNDO_MAX 8
+
+static int fails = 0;
+static unsigned long long lix_rng = 1;
+static char lix_tag[160];
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s [%s]\n", msg, lix_tag);
+        fails++;
+    }
+}
+
+static size_t lix_next(void) {
+    lix_rng ^= lix_rng << 13;
+    lix_rng ^= lix_rng >> 7;
+    lix_rng ^= lix_rng << 17;
+    return (size_t)(lix_rng >> 1);
+}
+
+static size_t lix_below(size_t n) {
+    return n ? lix_next() % n : 0;
+}
+
+typedef struct {
+    char *buf;
+    size_t n;
+    size_t *ls;    /* line starts (0-based line i starts at ls[i]) */
+    size_t nls;
+    size_t ls_cap;
+} LixModel;
+
+static void lix_lines(LixModel *m) {
+    size_t i;
+    m->nls = 0;
+    m->ls[m->nls++] = 0;
+    for (i = 0; i < m->n; i++)
+        if (m->buf[i] == '\n') m->ls[m->nls++] = i + 1;
+}
+
+static size_t lix_nl_before(const LixModel *m, size_t off) {
+    size_t lo = 0, hi = m->nls;
+    /* Last line start <= off; its index is the newline count before off
+     * when off itself is a start, else the same line. */
+    while (lo + 1 < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (m->ls[mid] <= off) lo = mid;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static void lix_ins(LixModel *m, size_t off, const char *p, size_t k) {
+    memmove(m->buf + off + k, m->buf + off, m->n - off);
+    memcpy(m->buf + off, p, k);
+    m->n += k;
+}
+
+static void lix_del(LixModel *m, size_t off, size_t k) {
+    memmove(m->buf + off, m->buf + off + k, m->n - off - k);
+    m->n -= k;
+}
+
+/* Stride slots and the scan cursor against the model. White-box on
+ * purpose: a wrong slot is silent until a lookup lands on it. */
+static void lix_invariants(const RtxPieceTree *t, const LixModel *m) {
+    size_t k;
+    if (!t->lf_ready) {
+        size_t want_lines;
+        if (t->line_scan_off > m->n) {
+            expect(0, "scan cursor past len");
+            return;
+        }
+        want_lines = lix_nl_before(m, t->line_scan_off);
+        if (t->scan_line != want_lines) {
+            fprintf(stderr, "  scan_line %zu want %zu at %zu\n", t->scan_line,
+                    want_lines, t->line_scan_off);
+            expect(0, "scan_line counts the prefix");
+            return;
+        }
+        if (t->line_off_len != t->scan_line / LIX_S + 1) {
+            fprintf(stderr, "  slots %zu want %zu (scan_line %zu)\n",
+                    t->line_off_len, t->scan_line / LIX_S + 1, t->scan_line);
+            expect(0, "one stride slot per stride line in the prefix");
+        }
+    } else if (t->line_off_ok) {
+        if (t->line_off_len != (m->nls - 1) / LIX_S + 1) {
+            fprintf(stderr, "  ready slots %zu want %zu\n", t->line_off_len,
+                    (m->nls - 1) / LIX_S + 1);
+            expect(0, "ready index has every stride slot");
+        }
+    }
+    for (k = 0; k < t->line_off_len; k++) {
+        size_t line = k * LIX_S;
+        if (line >= m->nls || t->line_off[k] != m->ls[line]) {
+            fprintf(stderr, "  slot %zu = %zu want %zu (lf_ready %d)\n", k,
+                    t->line_off[k], line < m->nls ? m->ls[line] : (size_t)-1,
+                    t->lf_ready);
+            expect(0, "stride slot is its line start");
+            return;
+        }
+    }
+}
+
+static void lix_lookups(RtxPieceTree *t, const LixModel *m, int full) {
+    size_t i, samples;
+    @errhandler(RtxIndexErr e) {
+        fprintf(stderr, "  index: %s\n", e.message ? e.message : "?");
+        expect(0, "lookup failed");
+        return;
+    }
+    if (full) {
+        rtx_line_scan_to(t, m->n) !>;
+        if (t->line_count() != m->nls) {
+            fprintf(stderr, "  line_count %zu want %zu\n", t->line_count(), m->nls);
+            expect(0, "line_count");
+        }
+    } else {
+        rtx_line_scan_to(t, lix_below(m->n + 1)) !>;
+    }
+    lix_invariants(t, m);
+    samples = LIX_SMALL ? 48 : 24;
+    for (i = 0; i < samples; i++) {
+        size_t line = i < 4 ? i * LIX_S : lix_below(m->nls + 1);
+        size_t got, want;
+        if (!full && !t->lf_ready && line > t->scan_line) continue;
+        got = t->line_start(line) !>;
+        want = line < m->nls ? m->ls[line] : m->n;
+        if (got != want) {
+            fprintf(stderr, "  line_start(%zu) %zu want %zu\n", line, got, want);
+            expect(0, "line_start");
+            return;
+        }
+    }
+    for (i = 0; i < samples; i++) {
+        size_t off = lix_below(m->n + 1), got;
+        if (i < 8 && m->nls > 1) off = m->ls[lix_below(m->nls)];
+        if (!t->index_covers(off)) continue;
+        got = t->line_of(off) !>;
+        if (got != lix_nl_before(m, off)) {
+            fprintf(stderr, "  line_of(%zu) %zu want %zu\n", off, got,
+                    lix_nl_before(m, off));
+            expect(0, "line_of");
+            return;
+        }
+    }
+}
+
+/* Offsets that hurt: stride-slot line starts, other line starts, anywhere. */
+static size_t lix_pick_off(const LixModel *m) {
+    size_t r = lix_below(8);
+    if (m->nls > 1 && r < 3) {
+        size_t slots = (m->nls - 1) / LIX_S + 1;
+        size_t line = lix_below(slots) * LIX_S;
+        if (line < m->nls) return m->ls[line];
+    }
+    if (m->nls > 1 && r < 6) return m->ls[lix_below(m->nls)];
+    return lix_below(m->n + 1);
+}
+
+/* Exactly `nl` newlines, lines of 0..max bytes. Without tail_nl the
+ * block ends in bytes after its last newline. */
+static size_t lix_block(char *dst, size_t cap, size_t nl, size_t max, int tail_nl) {
+    size_t n = 0, i, j, w;
+    for (i = 0; i < nl && n + max + 2 < cap; i++) {
+        w = lix_below(max + 1);
+        for (j = 0; j < w; j++) dst[n++] = (char)('a' + (int)lix_below(26));
+        dst[n++] = '\n';
+    }
+    if (!tail_nl || nl == 0) {
+        w = 1 + lix_below(max + 1);
+        for (j = 0; j < w && n < cap; j++) dst[n++] = 'z';
+    }
+    return n;
+}
+
+typedef struct {
+    size_t off;
+    size_t n;
+    RtxPieceRef *refs;
+    size_t nrefs;
+    char *bytes;
+    CCArena a;
+} LixUndo;
+
+static void lix_seed_file(const char *path, LixModel *m) {
+    FILE *fp;
+    size_t want, i;
+    want = LIX_SOFT / 2 + lix_below(LIX_SOFT * 2);
+    m->n = 0;
+    while (m->n < want) {
+        size_t w = lix_below(4) == 0 ? lix_below(24) : lix_below(6);
+        /* Now and then a line longer than the island budget. */
+        if (lix_below(40) == 0) w = LIX_BUDGET + lix_below(LIX_BUDGET);
+        if (m->n + w + 1 > want) w = want - m->n > 1 ? want - m->n - 1 : 0;
+        for (i = 0; i < w; i++) m->buf[m->n++] = (char)('A' + (int)lix_below(26));
+        m->buf[m->n++] = '\n';
+    }
+    if (lix_below(2)) m->n--; /* sometimes no final newline */
+    fp = fopen(path, "wb");
+    expect(fp != NULL, "seed fopen");
+    if (!fp) return;
+    if (m->n) expect(fwrite(m->buf, 1, m->n, fp) == m->n, "seed write");
+    fclose(fp);
+    lix_lines(m);
+}
+
+static void !>(CCError) lix_run(unsigned seed, int ops) {
+    char path[128];
+    char blk[8192];
+    LixModel m = {0};
+    LixUndo undo[LIX_UNDO_MAX];
+    size_t nundo = 0, u;
+    int op;
+    CCArena ma = cc_arena_heap(LIX_CAP * (1 + sizeof(size_t)) + kilobytes(64)) @destroy;
+    @errhandler(CCError e) { return cc_err(e); }
+    memset(undo, 0, sizeof undo);
+    lix_rng = 0x9E3779B97F4A7C15ull ^ ((unsigned long long)seed * 0x100000001B3ull);
+    if (!lix_rng) lix_rng = 1;
+    m.buf = (char *)cc_arena_alloc(ma, LIX_CAP, 1);
+    m.ls = (size_t *)cc_arena_alloc(ma, (LIX_CAP + 1) * sizeof(size_t), 8);
+    if (!m.buf || !m.ls) return cc_err(CC_ERR_OUT_OF_MEMORY, "lix model");
+    m.ls_cap = LIX_CAP + 1;
+    if (system("mkdir -p testdata/generated") != 0)
+        return cc_err(CC_ERR_IO, "mkdir");
+    snprintf(path, sizeof path, "testdata/generated/lix_%u.txt", seed);
+    lix_seed_file(path, &m);
+    {
+        RtxPieceTree t = {0} @destroy;
+        t.from_path(cc_slice_cstr(path)) !>;
+        for (op = 0; op < ops && fails < 8; op++) {
+            size_t r = lix_below(100), off, k;
+            snprintf(lix_tag, sizeof lix_tag, "seed %u op %d r %zu len %zu", seed,
+                     op, r, m.n);
+            if (r < 22) {
+                /* Paste 64·k newlines (stride multiples) or a few. */
+                size_t nl = lix_below(3) ? LIX_S * (1 + lix_below(3)) : lix_below(5);
+                int tail = (int)lix_below(2);
+                k = lix_block(blk, sizeof blk, nl, 7, tail);
+                off = lix_pick_off(&m);
+                if (m.n + k < LIX_CAP) {
+                    t.replace(off, 0, cc_slice_from_buffer(blk, k)) !>;
+                    lix_ins(&m, off, blk, k);
+                }
+            } else if (r < 34) {
+                /* Type a few letters, no newline. */
+                k = 1 + lix_below(6);
+                for (u = 0; u < k; u++) blk[u] = (char)('a' + (int)lix_below(26));
+                off = lix_pick_off(&m);
+                t.replace(off, 0, cc_slice_from_buffer(blk, k)) !>;
+                lix_ins(&m, off, blk, k);
+            } else if (r < 50) {
+                /* Delete at a line start: inside the line (no LF) or across. */
+                off = lix_pick_off(&m);
+                if (off < m.n) {
+                    size_t end = off;
+                    if (lix_below(2)) {
+                        while (end < m.n && m.buf[end] != '\n' && end - off < 9) end++;
+                        if (end == off && end < m.n && m.buf[end] != '\n') end++;
+                    } else {
+                        end = off + 1 + lix_below(LIX_S * 12);
+                    }
+                    if (end > m.n) end = m.n;
+                    if (end > off) {
+                        t.replace(off, end - off, cc_slice_empty()) !>;
+                        lix_del(&m, off, end - off);
+                    }
+                }
+            } else if (r < 58) {
+                /* Replace a span with a multi-line block. */
+                off = lix_pick_off(&m);
+                k = lix_block(blk, sizeof blk, lix_below(2) ? LIX_S : 1 + lix_below(4), 5,
+                              (int)lix_below(2));
+                {
+                    size_t del = lix_below(40);
+                    if (del > m.n - off) del = m.n - off;
+                    if (m.n - del + k < LIX_CAP) {
+                        t.replace(off, del, cc_slice_from_buffer(blk, k)) !>;
+                        lix_del(&m, off, del);
+                        lix_ins(&m, off, blk, k);
+                    }
+                }
+            } else if (r < 66 && nundo < LIX_UNDO_MAX && m.n > 2) {
+                /* Large delete, kept for undo: past the island budget, and
+                 * often enough to drop the body under SOFT_MIN. */
+                LixUndo *h = &undo[nundo];
+                size_t del = LIX_BUDGET + 1 + lix_below(LIX_SOFT);
+                off = lix_below(2) ? lix_pick_off(&m) : lix_below(m.n / 3 + 1);
+                if (del > m.n - off) del = m.n - off;
+                if (del) {
+                    h->a = cc_arena_heap(del + kilobytes(64));
+                    if (!h->a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "undo arena");
+                    t.capture_range(off, del, h->a, &h->refs, &h->nrefs) !>;
+                    h->bytes = (char *)cc_arena_alloc(h->a, del, 1);
+                    if (!h->bytes) return cc_err(CC_ERR_OUT_OF_MEMORY, "undo bytes");
+                    memcpy(h->bytes, m.buf + off, del);
+                    h->off = off;
+                    h->n = del;
+                    t.replace(off, del, cc_slice_empty()) !>;
+                    lix_del(&m, off, del);
+                    nundo++;
+                }
+            } else if (r < 76 && nundo > 0) {
+                /* Undo (splice refs back) or redo (erase again). */
+                LixUndo *h = &undo[--nundo];
+                off = h->off <= m.n ? h->off : m.n;
+                if (m.n + h->n < LIX_CAP) {
+                    t.splice_refs(off, h->refs, h->nrefs) !>;
+                    lix_ins(&m, off, h->bytes, h->n);
+                    if (lix_below(3) == 0) {
+                        t.replace(off, h->n, cc_slice_empty()) !>;
+                        lix_del(&m, off, h->n);
+                    }
+                }
+                h->a.destroy();
+                memset(h, 0, sizeof *h);
+            } else if (r < 84) {
+                /* Big paste: crosses SOFT_MIN upward from a small body. */
+                size_t want = LIX_SOFT / 2 + lix_below(LIX_SOFT);
+                if (m.n + want < LIX_CAP) {
+                    size_t done = 0;
+                    off = lix_pick_off(&m);
+                    while (done < want) {
+                        k = lix_block(blk, sizeof blk, 1 + lix_below(LIX_S * 2), 30,
+                                      (int)lix_below(2));
+                        if (k > want - done) k = want - done;
+                        t.replace(off + done, 0, cc_slice_from_buffer(blk, k)) !>;
+                        lix_ins(&m, off + done, blk, k);
+                        done += k;
+                    }
+                }
+            } else if (r < 92) {
+                /* Pump the prefix a little, the way the host idles. */
+                (void)rtx_line_prefix_step(&t, 1 + lix_below(LIX_BUDGET));
+            } else {
+                /* Drop a big chunk off the end (shrink below SOFT_MIN). */
+                size_t del = lix_below(m.n / 2 + 1);
+                if (del) {
+                    t.replace(m.n - del, del, cc_slice_empty()) !>;
+                    lix_del(&m, m.n - del, del);
+                }
+            }
+            lix_lines(&m);
+            expect(t.len() == m.n, "len");
+            expect(!t.index_fault(), "no index fault");
+            lix_invariants(&t, &m);
+            if (op % 5 == 4 || lix_below(4) == 0) lix_lookups(&t, &m, lix_below(3) != 0);
+            if (op % 97 == 96) expect(t.check(), "tree weights");
+        }
+        lix_lookups(&t, &m, 1);
+        expect(t.check(), "tree weights at end");
+    }
+    for (u = 0; u < nundo; u++)
+        if (undo[u].a.base) undo[u].a.destroy();
+    remove(path);
+    return cc_ok();
+}
+
+/* Density guess never reads, and a big file must not wrap scan_line * off. */
+static void lix_guess_overflow(void) {
+    RtxPieceTree t = {0} @destroy;
+    size_t keep_len, g;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    snprintf(lix_tag, sizeof lix_tag, "line_guess");
+    t.empty() !>;
+    t.replace(0, 0, "a\nb\n") !>;
+    keep_len = t.root->subtree_len;
+    /* 1 TiB body, prefix scanned to 2^40 with 2^30 lines: 2^31 at 2^41. */
+    t.root->subtree_len = (size_t)1 << 42;
+    t.line_scan_off = (size_t)1 << 40;
+    t.scan_line = (size_t)1 << 30;
+    g = t.line_guess((size_t)1 << 41);
+    t.root->subtree_len = keep_len;
+    t.line_scan_off = 0;
+    t.scan_line = 0;
+    if (g != ((size_t)1 << 31)) {
+        fprintf(stderr, "  line_guess %zu want %zu\n", g, (size_t)1 << 31);
+        expect(0, "line_guess does not overflow");
+    }
+}
+
+int main(void) {
+    unsigned seed;
+    unsigned seeds = LIX_SMALL ? 64u : 6u;
+    int ops = LIX_SMALL ? 400 : 160;
+    const char *env = getenv("LIX_SEEDS");
+    @errhandler(CCError e) {
+        fprintf(stderr, "line_index_file_prop_smoke: %s [%s]\n",
+                e.message ? e.message : "?", lix_tag);
+        return 1;
+    }
+    if (env && env[0]) seeds = (unsigned)strtoul(env, NULL, 10);
+    /* The tree TU must be built with the knobs this TU sees. */
+    {
+        RtxPieceTree t = {0} @destroy;
+        size_t i, n = 0;
+        char probe[512];
+        FILE *fp;
+        for (i = 0; i < LIX_S * 3 + 1; i++) {
+            probe[n++] = 'p';
+            probe[n++] = '\n';
+        }
+        (void)system("mkdir -p testdata/generated");
+        fp = fopen("testdata/generated/lix_probe.txt", "wb");
+        if (fp) {
+            fwrite(probe, 1, n, fp);
+            fclose(fp);
+        }
+        t.from_path(cc_slice_cstr("testdata/generated/lix_probe.txt")) !>;
+        {
+            @errhandler(RtxIndexErr ie) {
+                (void)ie;
+                expect(0, "probe scan");
+            }
+            rtx_line_scan_to(&t, t.len()) !>;
+        }
+        snprintf(lix_tag, sizeof lix_tag, "knob probe");
+        expect(t.line_off_len == 4, "tree TU built with this RTX_LINE_STRIDE");
+        remove("testdata/generated/lix_probe.txt");
+    }
+    lix_guess_overflow();
+    for (seed = 1; seed <= seeds && fails < 8; seed++) lix_run(seed, ops) !>;
+    if (fails) {
+        fprintf(stderr, "line_index_file_prop_smoke: %d fails (stride %zu soft %zu budget %zu)\n",
+                fails, LIX_S, LIX_SOFT, LIX_BUDGET);
+        return 1;
+    }
+    printf("line_index_file_prop_smoke ok  stride=%zu soft=%zu budget=%zu seeds=%u ops=%d\n",
+           LIX_S, LIX_SOFT, LIX_BUDGET, seeds, ops);
+    return 0;
+}

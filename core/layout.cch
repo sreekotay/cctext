@@ -23,8 +23,8 @@ typedef struct {
 
 /* Goal column for up/down. `eol` sticks to each line/row end (End key). */
 typedef struct {
-    double x;     /* measure units; wrap on */
-    size_t col;   /* bytes from physical line start; wrap off */
+    double x;     /* measure units from row start; -1 = use col */
+    size_t col;   /* bytes from physical line start; grid, box, capped row */
     int ok;
     int eol;
 } RtxPref;
@@ -38,6 +38,8 @@ typedef struct {
     double height;
     double pad;    /* Rich list: left indent / hang. 0 otherwise */
     RtxSectionKind sec;
+    size_t gen;    /* unique per laid-out row; a patch keeps a kept row's (its
+                    * bytes and runs did not move): paint may replay it */
 } RtxVisRow;
 
 enum {
@@ -46,6 +48,44 @@ enum {
     RTX_VIEW_HEX = 2,
     RTX_VIEW_GRID = 3
 };
+
+/* MD table records: one per header / body vis row, built by the layout
+ * walk and dropped with the rows (layout epoch, on L->store). The split,
+ * the trimmed spans and each cell's wrap lines from
+ * rtx_layout_md_cell_wrap — the one wrap oracle, computed once per fill;
+ * row height, paint, x_of, hit, caret and cell motion read it. Spans are
+ * row-relative; wrap lines are relative to the trimmed cell start. */
+typedef struct {
+    RtxMdCell raw;         /* rtx_md_row_split cell */
+    RtxMdCell trim;        /* GFM-trimmed content */
+    size_t line;           /* first wrap line in md_lines */
+    size_t nl;             /* wrap lines; 0 when the pane does not wrap */
+} RtxMdRecCell;
+
+typedef struct {
+    size_t row;            /* vis row byte_start (sort key) */
+    size_t len;            /* vis row byte_len */
+    int ti;                /* table in md_tab */
+    int tall;              /* most wrap lines of any cell (1 when unwrapped) */
+    size_t nc;             /* split count; cells hold min(nc, RTX_MD_TABLE_COLS) */
+    size_t cell;           /* first cell in md_cells */
+} RtxMdRec;
+
+/* A record to read: the fill's (cells / lines in md_cells / md_lines) or
+ * one built into RtxMdRecTmp from a row edited since the fill. Cell c is
+ * cells[c]; its wrap lines are lines + cells[c].line. */
+typedef struct {
+    const RtxMdRec *rec;
+    const RtxMdRecCell *cells;
+    const RtxMdCell *lines;
+} RtxMdRecView;
+
+typedef struct {
+    RtxMdRec rec;
+    RtxMdRecCell cells[RTX_MD_TABLE_COLS];
+    RtxMdCell lines[RTX_MD_REC_LINES];
+    RtxMdRecView view;     /* points into this struct: do not copy it */
+} RtxMdRecTmp;
 
 typedef struct {
     CCArena store;         /* layout epoch: vis rows until width/edit reset */
@@ -70,10 +110,25 @@ typedef struct {
     int grid_hdr_on;       /* 1: paint a sticky header row */
     int md_ntab;           /* fill-epoch GFM tables; Rich default/wrap only */
     int md_keep;           /* scratch: keep parent's tables across reset */
+    int hl_keep;           /* scratch (motion): lex with rtx_hl_keep — never
+                            * replaces or shrinks the pane's window lex */
     int md_px;             /* 1: measure units are pixels (GUI); TUI stays 0 */
     RtxMdTable md_tab[RTX_MD_TABLE_FILL];
     int md_colw[RTX_MD_TABLE_FILL][RTX_MD_TABLE_COLS];
     int md_colpx[RTX_MD_TABLE_FILL][RTX_MD_TABLE_COLS];
+    Vec::[RtxMdRec] md_recs;         /* layout epoch, row order (see RtxMdRec) */
+    Vec::[RtxMdRecCell] md_cells;
+    Vec::[RtxMdCell] md_lines;
+    int md_natw[RTX_MD_TABLE_FILL];  /* widest natural column (pre-fit): md_px vote */
+    int md_natpx[RTX_MD_TABLE_FILL];
+    /* Fill epoch of `lines()`: rows are exactly lines [from_line, +nlines)
+     * over bytes [win_lo, win_hi) at doc edit_stamp fill_gen. Anything else
+     * (fill_off, doc, a capped window) leaves fill_lined 0: no patch. */
+    int fill_lined;
+    size_t fill_gen;
+    size_t win_lo;
+    size_t win_hi;
+    size_t patched;        /* stat: edits absorbed by a patch, not a refill */
 } RtxLayout;
 
 void rtx_layout_set_view(RtxLayout *L, int view);
@@ -107,6 +162,29 @@ typedef struct {
 int rtx_layout_hint_vis(const RtxLayout *L, RtxDocLayout d, size_t off,
                         const char *row, size_t rel, size_t row_n,
                         RtxHintVis *out);
+/* Forward cursor for hidden_to over one walk (a fill, a row paint):
+ * hidden_to is constant between the edges of hinted / path runs and the
+ * reveal span (RtxDoc_mark_edges), so a table of those edges over the
+ * next couple of KiB answers each cluster with a pointer step instead of
+ * three run lookups. Results equal hidden_to at every byte. Frame
+ * scratch: zero it, use it within one walk (runs and reveal fixed). One
+ * compare when !has_marks. */
+#define RTX_HIDE_CUR_MAX 48
+typedef struct {
+    size_t lo, hi;          /* table covers [lo, hi) */
+    size_t reveal_lo, reveal_hi;
+    int ok;
+    int slow;               /* edges not provable: plain hidden_to */
+    int n, i;
+    size_t e[RTX_HIDE_CUR_MAX]; /* e[0] = lo, ascending */
+    size_t v[RTX_HIDE_CUR_MAX]; /* hidden_to on [e[k], e[k+1]) */
+} RtxHideCur;
+size_t rtx_layout_hidden_cur(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
+                             size_t off);
+/* hint_vis through a hide cursor (hc may be NULL). */
+int rtx_layout_hint_vis_cur(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
+                            size_t off, const char *row, size_t rel, size_t row_n,
+                            RtxHintVis *out);
 int rtx_hint_standin_cols(const char *g, size_t n);
 
 /* Fill-epoch table that contains `off`, or -1. Source / grid / hex: -1. */
@@ -121,7 +199,9 @@ size_t rtx_layout_md_snap(const RtxLayout *L, RtxDocLayout d, size_t off,
  * it closes). 1 if `off` is on a header/body row. */
 int rtx_layout_md_cell_span(const RtxLayout *L, RtxDocLayout d, size_t off,
                             size_t *clo, size_t *chi);
-/* Next / previous cell landing. Same row only; `off` if none. */
+/* Next / previous cell landing on this row. Previous from the first cell
+ * is the last cell of the record above (the sep row is not a record);
+ * `off` at the table's first cell or past the row's last cell. */
 size_t rtx_layout_md_step_cell(const RtxLayout *L, RtxDocLayout d, size_t off,
                                int dir);
 /* 0-based column that owns `off`, or -1. */
@@ -136,6 +216,29 @@ size_t rtx_layout_md_cell_wrap(const RtxLayout *L, RtxDocLayout d,
 /* Wrap-line index of `off` inside its MD cell (0 if N/A). */
 int rtx_layout_md_wrap_li(const RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
                           size_t off);
+/* The fill's record for the table vis row that starts at `row`, or NULL.
+ * Pointers live until the next fill or patch. */
+const RtxMdRec *rtx_layout_md_rec(const RtxLayout *L, size_t row);
+/* Record to read for table vis row `r` (`bytes` its current bytes): the
+ * fill's when the rows are current for the doc (fill_gen == edit_stamp),
+ * else the same oracle over `bytes` into `tmp` (a command asking between
+ * an edit and after_edit). 0: not a header / body row. */
+int rtx_layout_md_view(const RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
+                       const RtxVisRow *r, char[:] bytes, RtxMdRecTmp *tmp,
+                       RtxMdRecView *out);
+/* Cell `c` of a view, or NULL past the stored split; `lines` gets its wrap
+ * lines (cell->nl of them, relative to cell->trim.lo; NULL when none). */
+static inline const RtxMdRecCell *rtx_md_view_cell(const RtxMdRecView *v, int c,
+                                                   const RtxMdCell **lines) {
+    size_t stored;
+    if (lines) *lines = NULL;
+    if (!v || !v->rec || c < 0) return NULL;
+    stored = v->rec->nc < (size_t)RTX_MD_TABLE_COLS ? v->rec->nc
+                                                     : (size_t)RTX_MD_TABLE_COLS;
+    if ((size_t)c >= stored) return NULL;
+    if (lines && v->cells[c].nl) *lines = v->lines + v->cells[c].line;
+    return &v->cells[c];
+}
 
 int RtxLayout_ensure(RtxLayout *L);
 void RtxLayout_reset(RtxLayout *L);
@@ -145,6 +248,10 @@ static inline void RtxLayout_clear_rows(RtxLayout *L) {
     if (!L) return;
     rows = &L->rows;
     rows->clear();
+    L->md_recs.clear();
+    L->md_cells.clear();
+    L->md_lines.clear();
+    L->fill_lined = 0;
 }
 
 #define RTX_FILL_OFF_CAP RTX_GRID_REC_CAP
@@ -191,8 +298,53 @@ void RtxLayout_move_row_edge(RtxLayout *L, RtxDoc *d, int to_end, int shift);
 /* Visual-row up/down when wrap is on; physical lines when it is off. */
 void !>(CCError) RtxLayout_move_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
                                 double width, int dir, int shift, RtxPref *pref);
-void !>(CCError) RtxLayout_after_edit(RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
-                                 double max_width, size_t off);
+/* `n` rows of move_vert (PageUp / PageDown) with one scratch fill — or
+ * none when `L`'s own rows (laid out at `width`: `rows_ok`) hold the
+ * target. Grid steps row by row. */
+void !>(CCError) RtxLayout_page_vert(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
+                                double width, int dir, size_t n, int shift,
+                                RtxPref *pref, int rows_ok);
+/*
+ * Incremental relayout across the doc's edit span (DESIGN Edits: every
+ * matching camera's vis rows are made current — by a patch that is exact,
+ * or by a refill). Two phases because one reparse serves every camera:
+ *
+ *   plan  (after the edit, before reparse): window geometry from the new
+ *         bytes and the old rows; snapshot of the runs / sections the rows
+ *         were laid out with (already shifted by the edit).
+ *   patch (after reparse): diff runs, sections, marks gate, reveal, MD
+ *         tables; relay out only the edited lines plus lines whose runs,
+ *         reveal or table widths changed; reuse the rest (byte / line
+ *         shifted). Tables re-measure only when touched.
+ *
+ * `ok == 0` after either phase: the caller refills (clear rows). Width is
+ * the caller's check (layout_width). Plan storage lives on `a`.
+ */
+typedef struct {
+    int ok;
+    size_t elo, eold, enew;   /* old [elo, elo+eold) is new [elo, elo+enew) */
+    int after;                /* edit is past the window: identity map */
+    int eof;                  /* new window runs to doc end */
+    size_t from, to;          /* new window bytes */
+    size_t nlines;            /* new window line count */
+    size_t rlo, rhi;          /* edited lines, new bytes; rhi = line end */
+    size_t pre_n;             /* old rows [0, pre_n) keep */
+    size_t post_i, post_n;    /* old rows [post_i, post_i+post_n) shift */
+    size_t phys_rlo;          /* line number at rlo */
+    size_t region_nl;         /* newlines in new [rlo, rhi) */
+    size_t tail_lo, tail_hi;  /* extra lines past the old window (join) */
+    size_t snap_lo;           /* run snapshot [snap_lo, to]: window + MD lookback */
+    Vec::[RtxRun] runs;       /* runs over [from, to) before reparse */
+    Vec::[RtxSection] secs;   /* sections that decide section_at in [from, to) */
+} RtxLayoutPatch;
+
+void !>(CCError) rtx_layout_patch_plan(RtxLayout *L, RtxDoc *d, RtxLayoutPatch *p,
+                                       CCArena a);
+void !>(CCError) rtx_layout_patch(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
+                                  double max_width, RtxLayoutPatch *p, CCArena a);
+/* One camera: plan, reparse, patch; refill (lines) when the patch declines. */
+void !>(CCError) RtxLayout_after_edit(RtxLayout *L, RtxDoc *d, const RtxMeasure *m,
+                                 double max_width);
 void !>(CCError) RtxLayout_view_after_edit(RtxLayout *L, RtxDoc *d, const RtxMeasure *m, double width);
 /* Shift row.line when a seek window's from_line becomes an exact line_of. */
 void rtx_layout_reline(RtxLayout *L, size_t from_line);

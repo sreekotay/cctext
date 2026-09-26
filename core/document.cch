@@ -11,6 +11,8 @@
 #include <stdint.h>
 #include "piece_tree.cch"
 #include "scope.cch"
+#include "rx.cch"
+#include "md_block.cch"
 
 /* CODE and MARKUP are both lexed (TM / spike) and keep scope in style_at.
  * MARKUP is a grammar whose JSON declares `"cctext": { "kind": "markup" }`;
@@ -44,10 +46,10 @@ typedef enum {
     RTX_TM_LOOKBACK = 0,
     RTX_TM_CATCHUP = 1,
 } RtxTmWalk;
-#define RTX_MARKUP_WIN_SECS 64
 #define RTX_MARKUP_CACHE_WINDOWS 8
-#define RTX_TM_CKPT_STRIDE 16384
-#define RTX_TM_CKPT_MAX 256
+#define RTX_TM_CKPT_STRIDE 4096
+#define RTX_TM_WIN_STRIDE 1024 /* window lex checkpoints (hl_cov) */
+#define RTX_TM_CKPT_MAX 1024
 #define RTX_TM_CKPT_DEPTH 32
 #define RTX_TM_CATCHUP_MAX (512 * 1024)
 #define RTX_FOLD_MAX 8
@@ -57,12 +59,33 @@ typedef struct {
     size_t hi;
 } RtxFold;
 
+/* The window lex a section over RTX_HL_FULL_MAX last ran. Its TM runs over
+ * [lo, hi) stand (an edit inside is relexed from its checkpoints and
+ * stops where the lex converges); its checkpoints from `anchor` (where
+ * that lex started; `bare`: with an empty stack) are that lex's state. A
+ * later ensure_hl inside [lo, hi) lexes nothing. Any other checkpoint
+ * drop at or below `hi`, an edit outside [lo, hi], or a reparse ends it. */
+typedef struct {
+    size_t anchor;
+    size_t lo;
+    size_t hi;
+    int bare;
+    int live;
+    /* Markdown block pass (a `blocks` grammar): below `md_inl` the lex
+     * classifies blocks only (its anchor's lead-in); `md_flags` is the
+     * anchor's RTX_MDB_SOFT / UNSURE. A bare relex restarts with both. */
+    size_t md_inl;
+    unsigned char md_flags;
+} RtxHlCov;
+
 typedef struct {
     size_t off;
     unsigned char n;
+    unsigned char md; /* 1: `mdb` holds the Markdown block state (at a BOL) */
     unsigned short rule[RTX_TM_CKPT_DEPTH];
     unsigned short lang[RTX_TM_CKPT_DEPTH];  /* rtx_tm_langs index */
     unsigned short embed[RTX_TM_CKPT_DEPTH]; /* guest lang, 0xffff = none */
+    RtxMdb mdb;
 } RtxTmCkpt;
 
 /* Hist copies deleted bytes only up to this (typing/backspace coalesce).
@@ -79,6 +102,7 @@ typedef struct {
     unsigned bold : 1;
     unsigned italic : 1;
     unsigned mono : 1;
+    unsigned strike : 1;
     RtxScope scope;
 } RtxStyle;
 
@@ -107,8 +131,11 @@ typedef struct {
     unsigned char hint_a;  /* span: matched begin bytes (clamp 255); else 0 */
     unsigned char hint_b;  /* span: matched end bytes; 0 = unclosed / not a span */
     unsigned char mark;    /* RTX_ARITY_* + RTX_MARK_DEST; copied from the rule */
-    unsigned short rule;   /* rtx_tm_rule_tag; prose / captures stay 0 */
+    unsigned short rule;   /* rtx_tm_rule_tag; RTX_RUN_NO_RULE for prose / captures */
 } RtxRun;
+
+/* No TM rule behind this run. Distinct from rule 0 (a grammar's first rule). */
+#define RTX_RUN_NO_RULE 0xffffu
 
 static inline int rtx_run_arity(const RtxRun *r) {
     return r ? (int)(r->mark & RTX_MARK_ARITY) : RTX_ARITY_PAIR;
@@ -145,6 +172,29 @@ typedef struct {
     pieces: RtxHistRefs;
 };
 
+/* A bulk edit group (DESIGN Edit groups, bulk): one record for every
+ * site. Old bytes [lo, lo + old_n) are the piece sequence `olds`, new
+ * bytes [lo, lo + new_n) are `news`; undo / redo swap one for the other
+ * (bytes stay in the original / add buffers). `enc` is the site list, the
+ * journal payload: per site varint(gap from the previous site's old end),
+ * varint(del_n << 1 | same), varint(ins_n << 1 | same), then the deleted
+ * and inserted bytes that are not the previous site's (same = 1). A
+ * record loaded from a journal has `ready` 0 and no sequences until its
+ * first undo / redo rebuilds them from `enc`. Session arena. */
+typedef struct {
+    size_t lo;
+    size_t old_n;
+    size_t new_n;
+    size_t nsites;
+    const char *enc;
+    size_t enc_n;
+    RtxPieceRef *olds;
+    size_t nold;
+    RtxPieceRef *news;
+    size_t nnew;
+    int ready;
+} RtxHistBulk;
+
 typedef struct {
     size_t off;
     RtxHistDel del;
@@ -159,6 +209,14 @@ typedef struct {
     int sel_box_after;
     size_t box_acol_after;
     size_t box_ccol_after;
+    /* Edit group (DESIGN Edit groups): 0 = a record of its own. Members
+     * of one group share an id and sit contiguous on recs in apply order
+     * (descending offset); undo / redo move over the whole run. `xact` is
+     * a workspace transaction id (0 = none) stamped on every member. */
+    size_t group;
+    uint64_t xact;
+    /* Bulk group (its own group id, one record): NULL otherwise. */
+    RtxHistBulk *bulk;
 } RtxHistRec;
 
 RtxHistRec rtx_hist_rec_empty(void);
@@ -171,9 +229,10 @@ typedef struct {
     RtxHistRec *recs;
     size_t len;
     size_t cap;
-    size_t head;
+    size_t head;           /* never rests inside a group */
     int applying;
     int coalesce;
+    size_t group_next;     /* last group id handed out */
 } RtxHistory;
 
 #ifndef RTX_FIND_BUDGET
@@ -189,16 +248,45 @@ enum {
 #define RTX_FIND_CAP 4
 #endif
 
+/* Longest regex match a block can see past its commit edge: blocks read
+ * this much overlap, and a candidate still open there is a leftover
+ * (`long_n` / `long_off`), never a silent miss or a clipped hit. The
+ * edit seam is the same size. */
+#ifndef RTX_FIND_SPAN
+#define RTX_FIND_SPAN (64 * 1024)
+#endif
+/* Bytes a block keeps before its start: \b / ^ / lookbehind context. */
+#define RTX_FIND_CTX (RTX_RX_LOOKBEHIND_MAX + 4)
+
+/* Find options (RtxFind.opts). A literal query is a plain string (hits
+ * may overlap, like before); REGEX hits are leftmost-first and do not
+ * overlap. WORD keeps a hit only when no word scalar touches either end
+ * from outside. ICASE folds ASCII and the simple Unicode pairs. */
+enum {
+    RTX_FIND_ICASE = 1u,
+    RTX_FIND_WORD = 2u,
+    RTX_FIND_REGEX = 4u
+};
+
 /* One published hit. `line` is newlines before `off`, counted while the
  * block was scanned — not a density guess from the line index. */
 typedef struct {
     size_t off;
     size_t line;
+    size_t len;
 } RtxFindHit;
 
 typedef struct {
     CCArena store;         /* created on first find_set */
     char[:] query;
+    unsigned opts;         /* RTX_FIND_*; part of the query's identity */
+    const RtxRx *rx;       /* compiled query, on store */
+    const char *err;       /* regex compile error (static text): no scan */
+    size_t chain_end;      /* write stage: end of the last REGEX hit appended */
+    /* Leftovers: a regex candidate still undecided RTX_FIND_SPAN past a
+     * block edge. Count and the first offset; written in the stage. */
+    _Atomic size_t long_n;
+    _Atomic size_t long_off;
     Vec::[RtxFindHit] hits; /* on store; append only in @stage */
     size_t scan_off;
     size_t scan_line;      /* newlines before scan_off; a resume continues */
@@ -213,8 +301,34 @@ typedef struct {
     _Atomic unsigned char truncated;
     _Atomic unsigned char pinned;   /* user selected a hit (click / next / prev) */
     _Atomic unsigned char cancel;
+    /* hits.len as last published. The write stage appends and then
+     * stores this (release); host readers take it (acquire) and read only
+     * data[0, n). data does not move while the arm is live (the kick
+     * reserves RTX_FIND_MAX). Host mutators run with the arm joined and
+     * republish. */
+    _Atomic size_t hits_pub;
     CCParallel h;
 } RtxFind;
+
+static inline size_t rtx_find_hits_n(const RtxFind *f) {
+    return f ? atomic_load_explicit(&f->hits_pub, memory_order_acquire) : 0;
+}
+
+static inline void rtx_find_hits_publish(RtxFind *f) {
+    if (f) atomic_store_explicit(&f->hits_pub, f->hits.len, memory_order_release);
+}
+
+/* Every edit since the last view refresh, as one span: old bytes
+ * [lo, lo + old_n) are now [lo, hi). `gen0` is edit_gen when the span was
+ * reset — a layout whose rows were laid out at gen0 can patch across it
+ * (RtxLayout patch); any other layout refills. Not an undo record. */
+typedef struct {
+    size_t gen0;
+    size_t lo;
+    size_t hi;
+    size_t old_n;
+    int live;              /* 0: no edit since gen0 */
+} RtxEditSpan;
 
 typedef struct {
     RtxPieceTree tree;     /* document epoch: page store + nodes */
@@ -222,6 +336,13 @@ typedef struct {
     CCArena analysis;      /* secs + runs + tm_ckpt; reset on reparse */
     Vec::[RtxSection] secs;
     Vec::[RtxRun] runs;
+    Vec::[size_t] run_top; /* max-of-end tree over sorted runs; analysis epoch */
+    size_t run_top_n;      /* runs.len it was built for; 0 = stale, walk linear */
+    const RtxRun *run_top_of; /* runs.data it was built for */
+    size_t runs_sorted;    /* runs[0, runs_sorted) are in start order (clip bound) */
+    size_t runs_maxlen;    /* >= every len in that prefix; (size_t)-1 = unknown */
+    int runs_marks;        /* a hinted run, as of the last run_top build */
+    size_t runs_trim;      /* trim again once runs.len passes this */
     size_t caret;
     size_t sel_anchor;
     int sel_box;           /* 0 = stream [anchor, caret); 1 = column box */
@@ -229,7 +350,7 @@ typedef struct {
     size_t box_ccol;
     char[:] path;
     int disk_valid;        /* 1: disk_* is path at open / last save */
-    int64_t disk_mtime;
+    int64_t disk_mtime;    /* nanoseconds (st_mtim / st_mtimespec) */
     uint64_t disk_sz;
     uint64_t disk_ino;
     int save_overwrite;    /* one-shot: next save ignores disk_changed */
@@ -237,19 +358,37 @@ typedef struct {
     size_t edit_gen;       /* bumps on every successful content change (incl. coalesce) */
     size_t last_off;
     int last_markup;       /* `=` / large delete — sections may have moved */
+    RtxEditSpan span;      /* union of edits since span_reset (view patch) */
     int hl_full;
     RtxMarkupWin hl_win[RTX_MARKUP_CACHE_WINDOWS]; /* bounded visited-window cache */
     size_t hl_win_stamp;
     Vec::[RtxTmCkpt] tm_ckpt; /* stack at stride points; analysis epoch */
+    RtxHlCov hl_cov;       /* windowed lex the next edit relexes from */
     int broken;            /* unrestorable tree; refuse further edits */
     RtxHistory hist;
     RtxFind find;           /* find.cch: set / step / invalidate / goto */
     RtxFold folds[RTX_FOLD_MAX]; /* session; in-window regions only */
     size_t fold_n;
+    int marp;               /* the last Markdown lex read `marp: true` front
+                             * matter (RtxDoc_marp); an edit that flips it
+                             * reparses */
 } RtxDoc;
 
 static inline size_t RtxDoc_len(const RtxDoc *d) {
     return d ? RtxPieceTree_len(&d->tree) : 0;
+}
+
+/* Content stamp: edit_gen. A layout records it per fill so a patch knows
+ * which bytes its rows were laid out over. */
+static inline size_t RtxDoc_edit_stamp(const RtxDoc *d) {
+    return d ? d->edit_gen : 0;
+}
+
+/* Views caught up with every edit: the next edit starts a new span. */
+static inline void RtxDoc_span_reset(RtxDoc *d) {
+    if (!d) return;
+    d->span = (RtxEditSpan){0};
+    d->span.gen0 = d->edit_gen;
 }
 
 static inline size_t RtxDoc_line_count(const RtxDoc *d) {
@@ -325,6 +464,11 @@ void RtxDoc_break_coalesce(RtxDoc *d);
 void RtxDoc_destroy(RtxDoc *d);
 void !>(CCError) RtxDoc_empty(RtxDoc *d);
 void !>(CCError) RtxDoc_from_path(RtxDoc *d, char[:0] path);
+/* Safe recovery: the bytes are `base` (a pinned copy of the file a dirty
+ * journal's hist is relative to); path, grammar, and save are `path`; the
+ * disk stamp is that base's identity, so a Save to a drifted `path` asks. */
+void !>(CCError) RtxDoc_from_base(RtxDoc *d, char[:0] base, char[:0] path,
+                                  int64_t mtime_ns, uint64_t sz, uint64_t ino);
 void !>(CCError) RtxDoc_from_buffer(RtxDoc *d, char[:] bytes);
 void !>(CCError) RtxDoc_reparse(RtxDoc *d);
 size_t !>(CCError) RtxDoc_cluster_align(const RtxDoc *d, size_t off);
@@ -335,6 +479,36 @@ RtxStyle RtxDoc_style_at(const RtxDoc *d, size_t off);
 /* Smallest run start / end in (off, hi], else hi. style_at is constant on
  * [off, style_next(off, hi)). Layout's per-run measure walks this. */
 size_t RtxDoc_style_next(const RtxDoc *d, size_t off, size_t hi);
+/* Forward cursor over the runs: style_cur(c, off) == style_at(off) and
+ * style_cur_next(c, off, hi) == style_next(off, hi) for any off, in O(1)
+ * amortized when off only grows (a fill, a row paint). It keeps the runs
+ * that cover the last offset; a backward query, a jump or a changed run
+ * table reseeks. Frame scratch: zero it, use it within one walk, drop it. */
+#define RTX_STYLE_CUR_DEPTH 24
+typedef struct {
+    const void *runs;   /* run table the state was built on (identity) */
+    size_t nruns;
+    size_t at;          /* last offset walked to */
+    size_t nxt;         /* first run index with start > at */
+    size_t lim;         /* raw style holds on [at, lim) */
+    RtxStyle raw;       /* runs only; scope before the section rule */
+    size_t sec_lo, sec_hi; /* section kind holds on [sec_lo, sec_hi) */
+    RtxSectionKind sec;
+    int ok;             /* 0: seek first */
+    int slow;           /* 1: no live run index (or too deep): per-query calls */
+    int sec_ok;
+    unsigned nact;
+    size_t act[RTX_STYLE_CUR_DEPTH]; /* covering run indices, ascending */
+} RtxStyleCur;
+RtxStyle RtxDoc_style_cur(const RtxDoc *d, RtxStyleCur *c, size_t off);
+size_t RtxDoc_style_cur_next(const RtxDoc *d, RtxStyleCur *c, size_t off, size_t hi);
+/* Offsets in (lo, hi) where a markup-lens query (hint_at / dest_at /
+ * path_at) can change value: the edges of every hinted or path run that
+ * reaches [lo - 1, hi], and one past each run end (path_at's inclusive
+ * end). Unsorted, may repeat. Returns the count, or (size_t)-1 when more
+ * than `cap` would be written. */
+size_t RtxDoc_mark_edges(const RtxDoc *d, size_t lo, size_t hi, size_t *out,
+                         size_t cap);
 /* Markup lens (docs/md_view.md). hint_at: `off` is inside a run's begin or
  * end hint → its [lo, hi). mark_at: a hinted run's [start, start+len]
  * holds `off` (inclusive end) → the run span; reveal-on-entry reads it. */
@@ -343,6 +517,50 @@ int RtxDoc_mark_at(const RtxDoc *d, size_t off, size_t *lo, size_t *hi);
 /* has_marks: any hinted run (per-fill gate). hint_next: next hint start in
  * (off, hi], else hi. */
 int RtxDoc_has_marks(const RtxDoc *d);
+/* 1 when the markup lens may apply somewhere in [lo, hi]: a MARKUP or
+ * grammarless PROSE section overlaps it (an unresolved one reads as the
+ * path kind). Rich block policy (MD tables and their lookback lex) runs
+ * only then — a code grammar plants no hints and no tables, so a JSON /
+ * C pane skips it. */
+int RtxDoc_markup_near(const RtxDoc *d, size_t lo, size_t hi);
+/* Markdown line context from the line's own bytes (no runs, no lex):
+ * quote markers, list marker, task box, heading, fence. Editing policy
+ * (Enter / Tab / apply) reads this so it does not wait on a block pass.
+ * Offsets are into the line; `n` excludes the newline (a `\r` is ignored). */
+enum {
+    RTX_MDL_NONE = 0,
+    RTX_MDL_BULLET = 1,
+    RTX_MDL_ORDERED = 2
+};
+typedef struct {
+    size_t qhi;          /* end of the quote prefix (`> > `); 0 = none */
+    int qdepth;
+    size_t ind;          /* indent bytes after the quote prefix */
+    int kind;            /* RTX_MDL_* */
+    size_t mlo, mhi;     /* list marker (`-`, `12.`) */
+    char bullet;         /* `-` `*` `+` */
+    char delim;          /* `.` `)` */
+    unsigned long num;   /* ordered number */
+    size_t chi;          /* item content column (after marker spaces) */
+    int task;            /* `[ ]` / `[x]` box at chi */
+    size_t clo;          /* content start (after the box) */
+    int blank;           /* only whitespace from clo */
+    int heading;         /* ATX `#`… opener */
+    char fence;          /* '`' / '~': a fence line (open or close) */
+    size_t fence_n;      /* fence run length */
+    int fence_info;      /* non-blank bytes after the run */
+    size_t n;            /* line length used (no `\r`) */
+} RtxMdLine;
+void rtx_md_line_parse(const char *s, size_t n, RtxMdLine *out);
+/* The path grammar declares `kind: markup` (Markdown editing policy). */
+int RtxDoc_is_markup(const RtxDoc *d);
+/* Marp deck: the first RTX_MDB_MARP_PROBE bytes open with front matter that
+ * holds `marp: true` (docs/slides.md). A bounded read, no cache. */
+int RtxDoc_marp(const RtxDoc *d);
+/* Auto-close pairs for this path (opener, closer, one byte each; "" =
+ * none): the grammar's `cctext.pairs` / `autoClosingPairs`, else a
+ * built-in table by kind (markup / code; no grammar pairs nothing). */
+const char *RtxDoc_autopairs(const RtxDoc *d);
 size_t RtxDoc_hint_next(const RtxDoc *d, size_t off, size_t hi);
 /* Path dest run covering `off` → [lo, hi) of that run. */
 int RtxDoc_dest_at(const RtxDoc *d, size_t off, size_t *lo, size_t *hi);
@@ -378,11 +596,29 @@ void !>(CCError) RtxDoc_apply_cycle(RtxDoc *d, size_t off);
 void !>(CCError) RtxDoc_apply_named(RtxDoc *d, char[:0] name);
 /* Innermost hint at `off` whose rule has `cctext.apply`. NULL if none. */
 const char *RtxDoc_mark_apply(const RtxDoc *d, size_t off);
+/* Markdown block role (RTX_MDB_ROLE_*) of the innermost block-pass run
+ * covering `off` (fence, indented code, HTML block, math, front matter,
+ * heading, quote, list …), 0 when none. Reads the runs the lex planted:
+ * a table classify asks it so a `|` row inside a fence is no table. */
+int RtxDoc_md_block_at(const RtxDoc *d, size_t off);
+/* Outline: headings whose run starts in [lo, hi), in order — the level
+ * (ATX `#` count, setext 1 / 2) and the title bytes. Reads the runs of
+ * the lexed window only (no index, no lex). Returns the count written
+ * (at most cap). */
+typedef struct {
+    size_t off;      /* heading run start (opener or setext title) */
+    size_t title_lo; /* title bytes */
+    size_t title_hi;
+    int level;       /* 1-6; 0 = a heading run with no known level */
+} RtxOutlineEnt;
+size_t RtxDoc_outline(const RtxDoc *d, size_t lo, size_t hi, RtxOutlineEnt *out,
+                      size_t cap);
 /* Dest content (path) or pair interior (wrapped autolink). 1 if `off` is
  * on a followable mark. */
 int RtxDoc_link_target(const RtxDoc *d, size_t off, size_t *lo, size_t *hi);
 /* Markup lens / pair arity (docs/mark_arity.md). Not a second write —
- * always ends in one `replace`. Rich pane edit paths call this via
+ * one `replace`, or one edit group (one undo step) when it pulls in
+ * partner hints outside [lo, hi). Rich pane edit paths call this via
  * `rtx_buf_pair_replace`; Source panes use `replace`. Prefix / path
  * refuse partner union. Cap RTX_HL_WIN_MAX, else plain replace. */
 void !>(CCError) RtxDoc_replace_join(RtxDoc *d, size_t lo, size_t hi, char[:] bytes);
@@ -424,9 +660,11 @@ typedef @typeview Highlight on RtxDoc {
 } *RtxDocHighlight;
 typedef @typeview Layout on RtxDoc {
     r: len, line_count, line_start, line_guess, index_covers,
-       read_at, scratch_span, style_at, style_next, hint_at, mark_at,
-       has_marks, hint_next, dest_at, path_at, section_at, ensure_hl,
-       fold_covers;
+       read_at, scratch_span, style_at, style_next, style_cur, style_cur_next,
+       mark_edges, hint_at, mark_at,
+       has_marks, markup_near, hint_next, dest_at, path_at, section_at, ensure_hl,
+       md_block_at, outline,
+       fold_covers, edit_stamp;
 } *RtxDocLayout;
 
 #endif /* RTX_DOCUMENT_H */

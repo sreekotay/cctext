@@ -1,0 +1,272 @@
+/*
+ * cctext key decoder: a table of byte windows → events.
+ *
+ * The decoder is a pure function over a byte buffer (frontend/cctext_keys).
+ * Typed `<3` / `[I` / `[O` are text; only a tail right after a timed-out
+ * ESC may be a mouse / focus report. A dangling CSI at the ESC timeout is
+ * dropped, never typed. Bracketed paste ends at ESC [ 201 ~ even when the
+ * terminator is split across reads, and CR / CR LF become LF.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "../frontend/cctext_keys.cch"
+
+static int fails = 0;
+
+typedef struct {
+    const char *name;
+    const char *in;
+    unsigned flags;
+    size_t used;   /* expected bytes consumed (0 = incomplete) */
+    int kind;
+    int ch;
+    int shift;
+    int mx, my;
+} Row;
+
+static const Row rows[] = {
+    {"plain a", "a", 0, 1, KEY_CHAR, 'a', 0, 0, 0},
+    {"typed <3 is text", "<3)", 0, 1, KEY_CHAR, '<', 0, 0, 0},
+    {"typed [I is text", "[I]", 0, 1, KEY_CHAR, '[', 0, 0, 0},
+    {"typed [O is text", "[O]", 0, 1, KEY_CHAR, '[', 0, 0, 0},
+    {"typed [<0;1;1M is text", "[<0;1;1M", 0, 1, KEY_CHAR, '[', 0, 0, 0},
+    {"after ESC: [<0;5;7M is a click", "[<0;5;7M", CCTEXT_KEY_AFTER_ESC, 8,
+     KEY_MOUSE, 0, 0, 5, 7},
+    {"after ESC: [I is focus", "[I", CCTEXT_KEY_AFTER_ESC, 2, KEY_FOCUS, 0, 0,
+     0, 0},
+    {"after ESC: [A is text", "[A", CCTEXT_KEY_AFTER_ESC, 1, KEY_CHAR, '[', 0,
+     0, 0},
+    {"after ESC: lone [ waits", "[", CCTEXT_KEY_AFTER_ESC, 0, KEY_NONE, 0, 0, 0,
+     0},
+    {"lone ESC waits", "\x1b", 0, 0, KEY_NONE, 0, 0, 0, 0},
+    {"lone ESC final is Help", "\x1b", CCTEXT_KEY_FINAL, 1, KEY_HELP, 0, 0, 0,
+     0},
+    {"ESC ESC is Help", "\x1b\x1b", 0, 1, KEY_HELP, 0, 0, 0, 0},
+    {"dangling CSI waits", "\x1b[1;", 0, 0, KEY_NONE, 0, 0, 0, 0},
+    {"dangling CSI final drops", "\x1b[1;", CCTEXT_KEY_FINAL, 4, KEY_NONE, 0, 0,
+     0, 0},
+    {"up", "\x1b[A", 0, 3, KEY_UP, 0, 0, 0, 0},
+    {"enter", "\r", 0, 1, KEY_ENTER, 0, 0, 0, 0},
+    {"alt-enter is enter", "\x1b\r", 0, 2, KEY_ENTER, 0, 0, 0, 0},
+    {"kitty shift-enter", "\x1b[13;2u", 0, 7, KEY_ENTER, 0, 1, 0, 0},
+    {"modifyOtherKeys shift-enter", "\x1b[27;2;13~", 0, 10, KEY_ENTER, 0, 1, 0, 0},
+    {"ss3 up", "\x1bOA", 0, 3, KEY_UP, 0, 0, 0, 0},
+    {"shift right", "\x1b[1;2C", 0, 6, KEY_RIGHT, 0, 1, 0, 0},
+    {"ctrl left is home", "\x1b[1;5D", 0, 6, KEY_HOME, 0, 0, 0, 0},
+    {"ctrl home", "\x1b[1;5H", 0, 6, KEY_DOC_HOME, 0, 0, 0, 0},
+    {"ctrl end", "\x1b[1;5F", 0, 6, KEY_DOC_END, 0, 0, 0, 0},
+    {"ctrl-shift end", "\x1b[1;6F", 0, 6, KEY_DOC_END, 0, 1, 0, 0},
+    {"ctrl home ~", "\x1b[1;5~", 0, 6, KEY_DOC_HOME, 0, 0, 0, 0},
+    {"page up", "\x1b[5~", 0, 4, KEY_PAGE_UP, 0, 0, 0, 0},
+    {"page down", "\x1b[6~", 0, 4, KEY_PAGE_DOWN, 0, 0, 0, 0},
+    {"shift page down", "\x1b[6;2~", 0, 6, KEY_PAGE_DOWN, 0, 1, 0, 0},
+    {"insert is nothing", "\x1b[2~", 0, 4, KEY_NONE, 0, 0, 0, 0},
+    {"shift insert pastes", "\x1b[2;2~", 0, 6, KEY_PASTE, 0, 1, 0, 0},
+    {"ctrl insert copies", "\x1b[2;5~", 0, 6, KEY_COPY, 0, 0, 0, 0},
+    {"delete", "\x1b[3~", 0, 4, KEY_DELETE, 0, 0, 0, 0},
+    {"shift tab", "\x1b[Z", 0, 3, KEY_TAB, 0, 1, 0, 0},
+    {"paste begin", "\x1b[200~abc", 0, 6, KEY_PASTE_BEGIN, 0, 0, 0, 0},
+    {"stray paste end", "\x1b[201~", 0, 6, KEY_NONE, 0, 0, 0, 0},
+    {"focus in", "\x1b[I", 0, 3, KEY_FOCUS, 0, 0, 0, 0},
+    {"sgr click", "\x1b[<0;12;3M", 0, 10, KEY_MOUSE, 0, 0, 12, 3},
+    {"sgr release", "\x1b[<0;12;3m", 0, 10, KEY_MOUSE_UP, 0, 0, 12, 3},
+    {"sgr drag", "\x1b[<32;13;3M", 0, 11, KEY_MOUSE_DRAG, 0, 0, 13, 3},
+    {"sgr wheel down", "\x1b[<65;2;2M", 0, 10, KEY_WHEEL_DOWN, 0, 0, 2, 2},
+    {"sgr shift wheel", "\x1b[<68;2;2M", 0, 10, KEY_WHEEL_UP, 0, 1, 2, 2},
+    {"partial mouse waits", "\x1b[<0;12", 0, 0, KEY_NONE, 0, 0, 0, 0},
+    {"alt-f", "\x1b" "f", 0, 2, KEY_CMD_LETTER, 'f', 0, 0, 0},
+    {"csi u ctrl-enter", "\x1b[13;5u", 0, 7, KEY_ENTER, 0, 0, 0, 0},
+    {"csi u ctrl-.", "\x1b[46;5u", 0, 7, KEY_APPLY_MENU, 0, 0, 0, 0},
+    {"modify other ctrl-=", "\x1b[27;5;61~", 0, 10, KEY_STATS, 0, 0, 0, 0},
+    /* Buffers and panes (built-in meanings; the keymap binds the chords). */
+    {"ctrl-w is the next pane", "\x17", 0, 1, KEY_OTHER_PANE, 0, 0, 0, 0},
+    {"ctrl-backslash splits right", "\x1c", 0, 1, KEY_SPLIT, 0, 0, 0, 0},
+    {"ctrl-_ splits down", "\x1f", 0, 1, KEY_SPLIT_DOWN, 0, 0, 0, 0},
+    {"ctrl-] closes the pane", "\x1d", 0, 1, KEY_PANE_CLOSE, 0, 0, 0, 0},
+    {"ctrl-alt-left nudges", "\x1b[1;7D", 0, 6, KEY_PANE_NUDGE, 0, 0, 0, 0},
+    {"middle click", "\x1b[<1;4;1M", 0, 9, KEY_MOUSE_MID, 0, 0, 4, 1},
+    {"middle release", "\x1b[<1;4;1m", 0, 9, KEY_NONE, 0, 0, 4, 1},
+    {"tab", "\t", 0, 1, KEY_TAB, 0, 0, 0, 0},
+    {"cr", "\r", 0, 1, KEY_ENTER, 0, 0, 0, 0},
+    {"del", "\x7f", 0, 1, KEY_BACKSPACE, 0, 0, 0, 0},
+    {"ctrl-q", "\x11", 0, 1, KEY_QUIT, 0, 0, 0, 0},
+    {"ctrl-k nav", "\x0b", 0, 1, KEY_NAV, 0, 0, 0, 0},
+    {"utf8 e-acute", "\xc3\xa9", 0, 2, KEY_CHAR, 0xe9, 0, 0, 0},
+    {"utf8 partial waits", "\xe2\x82", 0, 0, KEY_NONE, 0, 0, 0, 0},
+    {"utf8 partial final drops", "\xe2\x82", CCTEXT_KEY_FINAL, 2, KEY_NONE, 0, 0,
+     0, 0},
+    {"invalid byte drops", "\xff" "a", 0, 1, KEY_NONE, 0, 0, 0, 0},
+    {"runaway csi drops", "\x1b[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;"
+                          "1;1;1;1;1;1;1;1;1;1",
+     0, 66, KEY_NONE, 0, 0, 0, 0},
+};
+
+static void run_rows(void) {
+    size_t i;
+    for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        const Row *r = &rows[i];
+        CctextKey k;
+        size_t n = strlen(r->in);
+        size_t used = cctext_key_decode((const unsigned char *)r->in, n, r->flags, &k);
+        int ok = used == r->used;
+        if (ok && used) {
+            ok = k.kind == r->kind;
+            if (ok && (r->kind == KEY_CHAR || r->kind == KEY_CMD_LETTER))
+                ok = k.ch == r->ch;
+            if (ok && r->shift) ok = k.shift == 1;
+            if (ok && (r->mx || r->my)) ok = k.mx == r->mx && k.my == r->my;
+        }
+        if (!ok) {
+            fprintf(stderr, "FAIL: %s: used %zu (want %zu) kind %d (want %d) ch %d\n",
+                    r->name, used, r->used, k.kind, r->kind, k.ch);
+            fails++;
+        }
+    }
+}
+
+/* Chords the keymap may rebind (core/keymap.cch): the palette's
+ * Ctrl-Shift-P (kitty CSI u, xterm modifyOtherKeys) and F1, Ctrl / Alt
+ * letters, Ctrl-Tab and Ctrl-PgUp / PgDn. `kind` keeps the built-in
+ * meaning; plain keys carry no chord. */
+typedef struct {
+    const char *name;
+    const char *in;
+    size_t used;
+    int kind;
+    uint32_t chord;
+} ChordRow;
+
+#define C_ RTX_CHORD_CTRL
+#define S_ RTX_CHORD_SHIFT
+#define A_ RTX_CHORD_ALT
+
+static const ChordRow chord_rows[] = {
+    {"kitty ctrl-shift-p", "\x1b[112;6u", 8, KEY_CMD_LETTER, C_ | S_ | 'p'},
+    {"kitty ctrl-shift-P (upper)", "\x1b[80;6u", 7, KEY_CMD_LETTER, C_ | S_ | 'p'},
+    {"modifyOtherKeys ctrl-shift-p", "\x1b[27;6;80~", 10, KEY_CMD_LETTER,
+     C_ | S_ | 'p'},
+    {"ss3 f1", "\x1bOP", 3, KEY_NONE, RTX_KEY_F1},
+    {"csi f1", "\x1b[11~", 5, KEY_NONE, RTX_KEY_F1},
+    {"csi shift-f1", "\x1b[1;2P", 6, KEY_NONE, S_ | RTX_KEY_F1},
+    {"f5", "\x1b[15~", 5, KEY_NONE, RTX_KEY_F1 + 4},
+    {"f12", "\x1b[24~", 5, KEY_NONE, RTX_KEY_F1 + 11},
+    {"ctrl-p byte", "\x10", 1, KEY_NAV, C_ | 'p'},
+    /* Project rows (workspace.*): the keymap takes these chords. */
+    {"kitty ctrl-shift-f", "\x1b[102;6u", 8, KEY_CMD_LETTER, C_ | S_ | 'f'},
+    {"modifyOtherKeys ctrl-shift-F", "\x1b[27;6;70~", 10, KEY_CMD_LETTER, C_ | S_ | 'f'},
+    {"alt-shift-f (ESC F)", "\x1b" "F", 2, KEY_CMD_LETTER, A_ | S_ | 'f'},
+    {"ss3 f4", "\x1bOS", 3, KEY_NONE, RTX_KEY_F1 + 3},
+    {"shift-f4", "\x1b[1;2S", 6, KEY_NONE, S_ | (RTX_KEY_F1 + 3)},
+    {"ctrl-s byte", "\x13", 1, KEY_SAVE, C_ | 's'},
+    {"ctrl-backslash", "\x1c", 1, KEY_SPLIT, C_ | '\\'},
+    {"alt-p", "\x1b" "p", 2, KEY_CMD_LETTER, A_ | 'p'},
+    {"alt-colon", "\x1b:", 2, KEY_CMD_LETTER, A_ | ':'},
+    {"kitty ctrl-tab", "\x1b[9;5u", 6, KEY_NONE, C_ | RTX_KEY_TAB},
+    {"kitty ctrl-shift-tab", "\x1b[9;6u", 6, KEY_NONE, C_ | S_ | RTX_KEY_TAB},
+    {"ctrl-pgdn pages unless bound", "\x1b[6;5~", 6, KEY_PAGE_DOWN,
+     C_ | RTX_KEY_PGDN},
+    {"csi u ctrl-.", "\x1b[46;5u", 7, KEY_APPLY_MENU, C_ | '.'},
+    {"f6", "\x1b[17~", 5, KEY_NONE, RTX_KEY_F1 + 5},
+    {"shift-f6", "\x1b[17;2~", 7, KEY_NONE, S_ | (RTX_KEY_F1 + 5)},
+    {"ctrl-] byte", "\x1d", 1, KEY_PANE_CLOSE, C_ | ']'},
+    {"ctrl-_ byte is ctrl+-", "\x1f", 1, KEY_SPLIT_DOWN, C_ | '-'},
+    {"ctrl-alt-left", "\x1b[1;7D", 6, KEY_PANE_NUDGE, C_ | A_ | RTX_KEY_LEFT},
+    {"ctrl-pgup pages unless bound", "\x1b[5;5~", 6, KEY_PAGE_UP, C_ | RTX_KEY_PGUP},
+    {"plain p: no chord", "p", 1, KEY_CHAR, 0},
+    {"tab: no chord", "\t", 1, KEY_TAB, 0},
+    {"backspace (^H): no chord", "\x08", 1, KEY_BACKSPACE, 0},
+    {"enter: no chord", "\r", 1, KEY_ENTER, 0},
+    {"page down: no chord", "\x1b[6~", 4, KEY_PAGE_DOWN, 0},
+    {"kitty shift-enter: no chord", "\x1b[13;2u", 7, KEY_ENTER, 0},
+};
+
+static void run_chords(void) {
+    size_t i;
+    for (i = 0; i < sizeof(chord_rows) / sizeof(chord_rows[0]); i++) {
+        const ChordRow *r = &chord_rows[i];
+        CctextKey k;
+        size_t n = strlen(r->in);
+        size_t used = cctext_key_decode((const unsigned char *)r->in, n,
+                                        CCTEXT_KEY_FINAL, &k);
+        if (used != r->used || k.kind != r->kind || k.chord != r->chord) {
+            fprintf(stderr,
+                    "FAIL: chord %s: used %zu (want %zu) kind %d (want %d) "
+                    "chord %x (want %x)\n",
+                    r->name, used, r->used, k.kind, r->kind, (unsigned)k.chord,
+                    (unsigned)r->chord);
+            fails++;
+        }
+    }
+}
+
+/* A whole paste typed through the decoder is all text: no key but CHAR,
+ * ENTER, TAB. This is what an unbracketed terminal sends. */
+static void run_text(void) {
+    const char *s = "if (a<3) arr[I] = x[O]; y<9>;\r\n\tz";
+    size_t n = strlen(s), at = 0;
+    char out[128];
+    size_t on = 0;
+    while (at < n) {
+        CctextKey k;
+        size_t used = cctext_key_decode((const unsigned char *)s + at, n - at,
+                                        CCTEXT_KEY_FINAL, &k);
+        if (!used) break;
+        if (k.kind == KEY_CHAR) out[on++] = (char)k.ch;
+        else if (k.kind == KEY_ENTER) out[on++] = '\n';
+        else if (k.kind == KEY_TAB) out[on++] = '\t';
+        else {
+            fprintf(stderr, "FAIL: text: kind %d at %zu\n", k.kind, at);
+            fails++;
+        }
+        at += used;
+    }
+    out[on] = 0;
+    if (strcmp(out, "if (a<3) arr[I] = x[O]; y<9>;\n\n\tz") != 0) {
+        fprintf(stderr, "FAIL: text round trip: %s\n", out);
+        fails++;
+    }
+}
+
+static void run_paste(void) {
+    const char *all = "a\r\nb\rc\x1b[201~tail";
+    size_t body = 99;
+    size_t used = cctext_paste_end((const unsigned char *)all, strlen(all), &body);
+    char norm[32];
+    size_t nn;
+    if (used != 12 || body != 6) {
+        fprintf(stderr, "FAIL: paste end used %zu body %zu\n", used, body);
+        fails++;
+    }
+    /* Split terminator: hold back the prefix of ESC [ 2 0 1 ~. */
+    used = cctext_paste_end((const unsigned char *)"xyz\x1b[20", 7, &body);
+    if (used != 0 || body != 3) {
+        fprintf(stderr, "FAIL: split end used %zu body %zu\n", used, body);
+        fails++;
+    }
+    used = cctext_paste_end((const unsigned char *)"xyz\x1b" "a", 5, &body);
+    if (used != 0 || body != 5) {
+        fprintf(stderr, "FAIL: esc-a is body: used %zu body %zu\n", used, body);
+        fails++;
+    }
+    memcpy(norm, "a\r\nb\rc\t\r", 9);
+    nn = cctext_paste_norm(norm, 8);
+    if (nn != 7 || memcmp(norm, "a\nb\nc\t\n", 7) != 0) {
+        fprintf(stderr, "FAIL: paste norm %zu\n", nn);
+        fails++;
+    }
+}
+
+int main(void) {
+    run_rows();
+    run_chords();
+    run_text();
+    run_paste();
+    if (fails) {
+        fprintf(stderr, "key_decode_smoke: %d failed\n", fails);
+        return 1;
+    }
+    printf("key_decode_smoke: ok\n");
+    return 0;
+}

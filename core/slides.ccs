@@ -1,0 +1,1408 @@
+#!ccc ccs
+/*
+ * Marp slides (linked TU; see slides.cch and docs/slides.md): deck index,
+ * directives, a slide as styled lines, and the presenter state.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "document.cch"
+#include "md_block.cch"
+#include "md_table.cch"
+#include "cmd.cch"
+#include "slides.cch"
+
+/* ---- small parsing helpers -------------------------------------------- */
+
+static int sl_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+static void sl_trim(const char *s, size_t *lo, size_t *hi) {
+    while (*lo < *hi && sl_ws(s[*lo])) (*lo)++;
+    while (*hi > *lo && sl_ws(s[*hi - 1])) (*hi)--;
+}
+
+static int sl_lower(int c) {
+    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
+}
+
+/* s[0, n) equals lit, ASCII case folded. */
+static int sl_eq(const char *s, size_t n, const char *lit) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (!lit[i] || sl_lower((unsigned char)s[i]) != sl_lower((unsigned char)lit[i]))
+            return 0;
+    }
+    return lit[n] == 0;
+}
+
+/* YAML-ish scalar: trim, drop matching quotes. */
+static void sl_unquote(const char *s, size_t *lo, size_t *hi) {
+    sl_trim(s, lo, hi);
+    if (*hi - *lo >= 2 && (s[*lo] == '"' || s[*lo] == '\'') && s[*hi - 1] == s[*lo]) {
+        (*lo)++;
+        (*hi)--;
+    }
+}
+
+static void sl_copy(char *dst, size_t cap, const char *s, size_t n) {
+    if (!dst || !cap) return;
+    if (n >= cap) n = cap - 1;
+    if (n) memcpy(dst, s, n);
+    dst[n] = 0;
+}
+
+static int sl_hex(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    c = sl_lower(c);
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+typedef struct {
+    const char *name;
+    uint32_t rgb;
+} SlColorName;
+
+static const SlColorName sl_colors[] = {
+    {"black", 0x000000}, {"white", 0xffffff}, {"red", 0xff0000},
+    {"green", 0x008000}, {"blue", 0x0000ff}, {"navy", 0x000080},
+    {"teal", 0x008080}, {"aqua", 0x00ffff}, {"cyan", 0x00ffff},
+    {"yellow", 0xffff00}, {"orange", 0xffa500}, {"purple", 0x800080},
+    {"gray", 0x808080}, {"grey", 0x808080}, {"silver", 0xc0c0c0},
+    {"maroon", 0x800000}, {"olive", 0x808000}, {"lime", 0x00ff00},
+    {"fuchsia", 0xff00ff}, {"magenta", 0xff00ff}, {"pink", 0xffc0cb},
+    {"brown", 0xa52a2a}, {"beige", 0xf5f5dc}, {"ivory", 0xfffff0},
+    {"lightgray", 0xd3d3d3}, {"lightgrey", 0xd3d3d3}, {"darkgray", 0xa9a9a9},
+    {"darkgrey", 0xa9a9a9}, {"gold", 0xffd700}, {"indigo", 0x4b0082},
+    {"violet", 0xee82ee}, {"crimson", 0xdc143c}, {"tan", 0xd2b48c},
+    {"khaki", 0xf0e68c}, {"salmon", 0xfa8072}, {"coral", 0xff7f50},
+    {"tomato", 0xff6347}, {"skyblue", 0x87ceeb}, {"steelblue", 0x4682b4},
+    {"royalblue", 0x4169e1}, {"midnightblue", 0x191970}, {"darkblue", 0x00008b},
+    {"darkgreen", 0x006400}, {"darkred", 0x8b0000}, {"whitesmoke", 0xf5f5f5},
+    {"aliceblue", 0xf0f8ff}, {"lavender", 0xe6e6fa}, {"honeydew", 0xf0fff0},
+    {"linen", 0xfaf0e6}, {"slategray", 0x708090}, {"darkslategray", 0x2f4f4f},
+    {"aquamarine", 0x7fffd4}, {"turquoise", 0x40e0d0}, {"chocolate", 0xd2691e},
+    {NULL, 0},
+};
+
+int rtx_slide_color(const char *s, size_t n, uint32_t *out) {
+    size_t lo = 0, hi = n, i;
+    uint32_t v = 0;
+    if (!s || !out) return 0;
+    sl_unquote(s, &lo, &hi);
+    if (hi <= lo) return 0;
+    if (s[lo] == '#') {
+        size_t k = hi - lo - 1;
+        if (k != 3 && k != 6) return 0;
+        for (i = lo + 1; i < hi; i++) {
+            int h = sl_hex((unsigned char)s[i]);
+            if (h < 0) return 0;
+            if (k == 3) v = (v << 8) | (uint32_t)(h * 17);
+            else v = (v << 4) | (uint32_t)h;
+        }
+        *out = v;
+        return 1;
+    }
+    for (i = 0; sl_colors[i].name; i++) {
+        if (sl_eq(s + lo, hi - lo, sl_colors[i].name)) {
+            *out = sl_colors[i].rgb;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    const char *name;
+    int tr;
+} SlTrName;
+
+/* Marp CLI's built-in transitions. The ones cctext does not draw map to
+ * the nearest it does (docs/slides.md). */
+static const SlTrName sl_trs[] = {
+    {"none", RTX_TR_NONE}, {"fade", RTX_TR_FADE}, {"fade-out", RTX_TR_FADE_OUT},
+    {"slide", RTX_TR_SLIDE}, {"push", RTX_TR_PUSH}, {"cover", RTX_TR_COVER},
+    {"reveal", RTX_TR_REVEAL}, {"wipe", RTX_TR_WIPE}, {"wiper", RTX_TR_WIPE},
+    {"zoom", RTX_TR_ZOOM}, {"implode", RTX_TR_ZOOM}, {"explode", RTX_TR_ZOOM},
+    {"morph", RTX_TR_MORPH}, {"magic-move", RTX_TR_MORPH},
+    {"overlap", RTX_TR_FADE}, {"in-out", RTX_TR_FADE_OUT}, {"glow", RTX_TR_FADE},
+    {"swap", RTX_TR_PUSH}, {"swoosh", RTX_TR_SLIDE}, {"pull", RTX_TR_REVEAL},
+    {"drop", RTX_TR_COVER}, {"iris-in", RTX_TR_ZOOM}, {"iris-out", RTX_TR_ZOOM},
+    {"melt", RTX_TR_WIPE}, {"diamond", RTX_TR_ZOOM}, {"star", RTX_TR_ZOOM},
+    {"clockwise", RTX_TR_WIPE}, {"counterclockwise", RTX_TR_WIPE},
+    {"cube", RTX_TR_PUSH}, {"cylinder", RTX_TR_PUSH}, {"flip", RTX_TR_FADE},
+    {"pivot", RTX_TR_FADE}, {"rotate", RTX_TR_FADE},
+    {NULL, 0},
+};
+
+int rtx_slide_transition(const char *s, size_t n, int *ms) {
+    size_t lo = 0, hi = n, a, i;
+    int tr = RTX_TR_FADE;
+    if (ms) *ms = RTX_TR_DEFAULT_MS;
+    if (!s) return RTX_TR_NONE;
+    sl_unquote(s, &lo, &hi);
+    a = lo;
+    while (a < hi && !sl_ws(s[a])) a++;
+    if (a == lo) return RTX_TR_NONE;
+    for (i = 0; sl_trs[i].name; i++) {
+        if (sl_eq(s + lo, a - lo, sl_trs[i].name)) {
+            tr = sl_trs[i].tr;
+            break;
+        }
+    }
+    /* Duration: `0.5s` / `300ms`. */
+    while (a < hi && sl_ws(s[a])) a++;
+    if (a < hi && ms) {
+        double v = 0, f = 0.1;
+        int frac = 0, any = 0;
+        size_t k = a;
+        for (; k < hi; k++) {
+            char c = s[k];
+            if (c >= '0' && c <= '9') {
+                any = 1;
+                if (frac) {
+                    v += (c - '0') * f;
+                    f /= 10;
+                } else {
+                    v = v * 10 + (c - '0');
+                }
+            } else if (c == '.' && !frac) {
+                frac = 1;
+            } else {
+                break;
+            }
+        }
+        if (any) {
+            if (k + 1 < hi + 1 && k + 2 <= hi && s[k] == 'm' && s[k + 1] == 's') *ms = (int)v;
+            else if (k < hi && s[k] == 's') *ms = (int)(v * 1000.0 + 0.5);
+            if (*ms < 0) *ms = 0;
+            if (*ms > 10000) *ms = 10000;
+        }
+    }
+    return tr;
+}
+
+/* ---- directives ---------------------------------------------------------- */
+
+enum {
+    SL_M_PAG = 1u << 0,
+    SL_M_CLS = 1u << 1,
+    SL_M_HDR = 1u << 2,
+    SL_M_FTR = 1u << 3,
+    SL_M_BG = 1u << 4,
+    SL_M_FG = 1u << 5,
+    SL_M_TR = 1u << 6
+};
+
+static void sl_dir_default(RtxSlideDir *d) {
+    memset(d, 0, sizeof *d);
+}
+
+static void sl_class(RtxSlideDir *d) {
+    const char *c = d->cls;
+    size_t i = 0;
+    d->lead = 0;
+    d->invert = 0;
+    while (c[i]) {
+        size_t a;
+        while (c[i] == ' ') i++;
+        a = i;
+        while (c[i] && c[i] != ' ') i++;
+        if (sl_eq(c + a, i - a, "lead")) d->lead = 1;
+        if (sl_eq(c + a, i - a, "invert")) d->invert = 1;
+    }
+}
+
+/* One `key: value`. Returns 1 when `key` is a Marp directive. With
+ * `apply`, globals go to the deck, locals to `loc` (and on to later
+ * slides), `_key` spots to `spot` (this slide only, bits in *smask). */
+static int sl_directive(RtxDeck *k, RtxSlideDir *loc, RtxSlideDir *spot,
+                        unsigned *smask, const char *key, size_t kn,
+                        const char *v, size_t vn, int apply) {
+    static const char *const known[] = {
+        "theme", "size", "headingDivider", "style", "lang", "marp", "math",
+        "title", "description", "author", "image", "keywords", "url",
+        "paginate", "header", "footer", "class", "backgroundColor",
+        "backgroundImage", "backgroundPosition", "backgroundRepeat",
+        "backgroundSize", "color", "transition", NULL,
+    };
+    int sp = 0, i, hit = -1;
+    RtxSlideDir *t;
+    size_t lo = 0, hi = vn;
+    if (kn && key[0] == '_') {
+        sp = 1;
+        key++;
+        kn--;
+    }
+    for (i = 0; known[i]; i++) {
+        if (sl_eq(key, kn, known[i])) {
+            hit = i;
+            break;
+        }
+    }
+    if (hit < 0) return 0;
+    if (!apply) return 1;
+    sl_unquote(v, &lo, &hi);
+    v += lo;
+    vn = hi - lo;
+    t = sp ? spot : loc;
+    switch (hit) {
+    case 0: /* theme */
+        sl_copy(k->theme, sizeof k->theme, v, vn);
+        return 1;
+    case 1: /* size */
+        if (sl_eq(v, vn, "4:3")) {
+            k->w = 960;
+            k->h = 720;
+        } else {
+            k->w = 1280;
+            k->h = 720;
+        }
+        return 1;
+    case 2: { /* headingDivider: N or [a, b] */
+        size_t j;
+        k->hdiv = 0;
+        k->hdiv_mask = 0;
+        if (vn && v[0] == '[') {
+            for (j = 0; j < vn; j++) {
+                if (v[j] >= '1' && v[j] <= '6') k->hdiv_mask |= 1u << (v[j] - '0');
+            }
+        } else if (vn && v[0] >= '1' && v[0] <= '6') {
+            k->hdiv = v[0] - '0';
+        }
+        return 1;
+    }
+    case 13: /* paginate: true / false / hold / skip */
+        if (sl_eq(v, vn, "true")) t->paginate = 1;
+        else if (sl_eq(v, vn, "hold")) t->paginate = 2;
+        else if (sl_eq(v, vn, "skip")) t->paginate = 3;
+        else t->paginate = 0;
+        if (sp) *smask |= SL_M_PAG;
+        return 1;
+    case 14: /* header */
+        sl_copy(t->header, sizeof t->header, v, vn);
+        if (sp) *smask |= SL_M_HDR;
+        return 1;
+    case 15: /* footer */
+        sl_copy(t->footer, sizeof t->footer, v, vn);
+        if (sp) *smask |= SL_M_FTR;
+        return 1;
+    case 16: /* class */
+        sl_copy(t->cls, sizeof t->cls, v, vn);
+        sl_class(t);
+        if (sp) *smask |= SL_M_CLS;
+        return 1;
+    case 17: /* backgroundColor */
+        t->bg_set = (unsigned char)rtx_slide_color(v, vn, &t->bg);
+        if (sp) *smask |= SL_M_BG;
+        return 1;
+    case 22: /* color */
+        t->fg_set = (unsigned char)rtx_slide_color(v, vn, &t->fg);
+        if (sp) *smask |= SL_M_FG;
+        return 1;
+    case 23: { /* transition */
+        int ms = RTX_TR_DEFAULT_MS;
+        t->trans = (unsigned char)rtx_slide_transition(v, vn, &ms);
+        t->trans_ms = (unsigned short)ms;
+        if (sp) *smask |= SL_M_TR;
+        return 1;
+    }
+    default:
+        return 1; /* known, not drawn (style, lang, metadata, …) */
+    }
+}
+
+/* `key: value` lines of s[lo, hi). All lines directives → applied, 1.
+ * Anything else (a note, prose) → nothing applied, 0 (Marp: a comment
+ * that is not directives is a presenter note). */
+static int sl_kv_block(RtxDeck *k, RtxSlideDir *loc, RtxSlideDir *spot,
+                       unsigned *smask, const char *s, size_t lo, size_t hi) {
+    int pass, any = 0;
+    for (pass = 0; pass < 2; pass++) {
+        size_t i = lo;
+        while (i < hi) {
+            const char *nl = (const char *)memchr(s + i, '\n', hi - i);
+            size_t e = nl ? (size_t)(nl - s) : hi, a = i, z = e, c;
+            sl_trim(s, &a, &z);
+            i = nl ? e + 1 : hi;
+            if (a == z || s[a] == '#') continue;
+            c = a;
+            while (c < z && s[c] != ':') c++;
+            if (c >= z) {
+                if (!pass) return 0;
+                continue;
+            }
+            {
+                size_t kl = a, kh = c;
+                sl_trim(s, &kl, &kh);
+                if (!sl_directive(k, loc, spot, smask, s + kl, kh - kl, s + c + 1,
+                                  z - c - 1, pass)) {
+                    if (!pass) return 0;
+                }
+                any = 1;
+            }
+        }
+        if (!pass && !any) return 0;
+    }
+    return 1;
+}
+
+/* ---- deck index ----------------------------------------------------------- */
+
+static RtxSlide *sl_push(RtxDeck *k) {
+    if (k->n >= (size_t)RTX_DECK_SLIDES_MAX) return NULL;
+    if (k->n >= k->cap) {
+        size_t cap = k->cap ? k->cap * 2 : 32;
+        RtxSlide *p = (RtxSlide *)realloc(k->s, cap * sizeof *p);
+        if (!p) return NULL;
+        k->s = p;
+        k->cap = cap;
+    }
+    memset(&k->s[k->n], 0, sizeof k->s[k->n]);
+    return &k->s[k->n++];
+}
+
+/* `*` or `N)`: Marp's fragmented list markers. */
+static int sl_frag_marker(const char *b, size_t lo, size_t hi) {
+    size_t i = lo;
+    if (i >= hi) return 0;
+    if (b[i] == '*') return 1;
+    while (i < hi && b[i] >= '0' && b[i] <= '9') i++;
+    return i > lo && i < hi && b[i] == ')';
+}
+
+/* Next `![alt](src)` in s[i, e): alt [*alo, *ahi), src [*slo, *shi); returns
+ * the byte after it, or 0. */
+static size_t sl_image(const char *s, size_t i, size_t e, size_t *alo, size_t *ahi,
+                       size_t *slo, size_t *shi) {
+    for (; i + 1 < e; i++) {
+        size_t j, depth = 0;
+        if (s[i] != '!' || s[i + 1] != '[') continue;
+        if (i > 0 && s[i - 1] == '\\') continue;
+        j = i + 2;
+        while (j < e && s[j] != ']') j++;
+        if (j + 1 >= e || s[j + 1] != '(') continue;
+        *alo = i + 2;
+        *ahi = j;
+        j += 2;
+        *slo = j;
+        while (j < e && !(s[j] == ')' && depth == 0)) {
+            if (s[j] == '(') depth++;
+            else if (s[j] == ')') depth--;
+            j++;
+        }
+        if (j >= e) return 0;
+        *shi = j;
+        {   /* `src "title"`: the url is the first word */
+            size_t q = *slo;
+            while (q < *shi && !sl_ws(s[q])) q++;
+            *shi = q;
+        }
+        return j + 1;
+    }
+    return 0;
+}
+
+/* Words of an image alt: `bg`, `left` / `right[:N%]`, `fit` / `contain` /
+ * `cover` / `auto`. 1 when it is a background image. */
+static int sl_bg_alt(const char *s, size_t lo, size_t hi, unsigned char *side,
+                     unsigned char *pct, unsigned char *fit) {
+    int bg = 0;
+    size_t i = lo;
+    *side = 0;
+    *pct = 50;
+    *fit = 0;
+    while (i < hi) {
+        size_t a;
+        while (i < hi && sl_ws(s[i])) i++;
+        a = i;
+        while (i < hi && !sl_ws(s[i])) i++;
+        if (a == i) break;
+        if (sl_eq(s + a, i - a, "bg")) bg = 1;
+        else if (i - a >= 4 && sl_eq(s + a, 4, "left")) *side = 1;
+        else if (i - a >= 5 && sl_eq(s + a, 5, "right")) *side = 2;
+        else if (sl_eq(s + a, i - a, "fit") || sl_eq(s + a, i - a, "contain")) *fit = 1;
+        else if (sl_eq(s + a, i - a, "auto")) *fit = 2;
+        if ((*side) && (i - a > 5)) {
+            size_t c = a;
+            int v = 0;
+            while (c < i && s[c] != ':') c++;
+            for (c++; c < i && s[c] >= '0' && s[c] <= '9'; c++) v = v * 10 + (s[c] - '0');
+            if (v > 0 && v < 100) *pct = (unsigned char)v;
+        }
+    }
+    return bg;
+}
+
+/* Only images (and blanks) on the line. */
+static int sl_images_only(const char *s, size_t lo, size_t hi) {
+    size_t i = lo, alo, ahi, slo, shi;
+    int any = 0;
+    for (;;) {
+        size_t nx;
+        while (i < hi && sl_ws(s[i])) i++;
+        if (i >= hi) return any;
+        if (s[i] != '!') return 0;
+        nx = sl_image(s, i, hi, &alo, &ahi, &slo, &shi);
+        if (!nx || alo != i + 2) return 0;
+        any = 1;
+        i = nx;
+    }
+}
+
+static void sl_close(RtxDeck *k, RtxSlide *s, size_t hi, const RtxSlideDir *loc,
+                     const RtxSlideDir *spot, unsigned smask) {
+    if (!s) return;
+    s->hi = hi < s->lo ? s->lo : hi;
+    s->dir = *loc;
+    if (smask & SL_M_PAG) s->dir.paginate = spot->paginate;
+    if (smask & SL_M_CLS) {
+        memcpy(s->dir.cls, spot->cls, sizeof s->dir.cls);
+        s->dir.lead = spot->lead;
+        s->dir.invert = spot->invert;
+    }
+    if (smask & SL_M_HDR) memcpy(s->dir.header, spot->header, sizeof s->dir.header);
+    if (smask & SL_M_FTR) memcpy(s->dir.footer, spot->footer, sizeof s->dir.footer);
+    if (smask & SL_M_BG) {
+        s->dir.bg_set = spot->bg_set;
+        s->dir.bg = spot->bg;
+    }
+    if (smask & SL_M_FG) {
+        s->dir.fg_set = spot->fg_set;
+        s->dir.fg = spot->fg;
+    }
+    if (smask & SL_M_TR) {
+        s->dir.trans = spot->trans;
+        s->dir.trans_ms = spot->trans_ms;
+    }
+    (void)k;
+}
+
+void rtx_deck_free(RtxDeck *k) {
+    if (!k) return;
+    free(k->s);
+    memset(k, 0, sizeof *k);
+}
+
+void rtx_deck_build(RtxDeck *k, const char *b, size_t n, int complete) {
+    RtxMdb st;
+    RtxMdbLine L;
+    RtxSlideDir loc, spot;
+    unsigned smask = 0;
+    RtxSlide *cur;
+    size_t i = 0, front_lo = 0, com_lo = 0;
+    int in_front = 0, in_com = 0, content = 0, have_title = 0;
+    RtxSlide *keep_s;
+    size_t keep_cap;
+    if (!k) return;
+    keep_s = k->s;
+    keep_cap = k->cap;
+    memset(k, 0, sizeof *k);
+    k->s = keep_s;
+    k->cap = keep_cap;
+    k->w = 1280;
+    k->h = 720;
+    sl_copy(k->theme, sizeof k->theme, "default", 7);
+    k->complete = complete;
+    k->scanned = n;
+    if (!b) return;
+    k->marp = rtx_mdb_marp_front(b, n < (size_t)RTX_MDB_MARP_PROBE ? n : (size_t)RTX_MDB_MARP_PROBE);
+    if (!k->marp) return;
+    sl_dir_default(&loc);
+    sl_dir_default(&spot);
+    rtx_mdb_init(&st, 1, 0, 0);
+    rtx_mdb_set_marp(&st, 1);
+    cur = sl_push(k);
+    if (!cur) return;
+    while (i < n) {
+        const char *nl = (const char *)memchr(b + i, '\n', n - i);
+        size_t eol = nl ? (size_t)(nl - b) : n;
+        size_t next = nl ? eol + 1 : n;
+        int j, slide_sep = 0, hr_head = 0, is_html = 0, frags = 0;
+        rtx_mdb_line(&st, b, i, eol, &L);
+        for (j = 0; j < L.nsp; j++) {
+            const RtxMdbSpan *p = &L.sp[j];
+            switch (p->kind) {
+            case RTX_MDB_S_FRONT_OPEN:
+                in_front = 1;
+                front_lo = next;
+                break;
+            case RTX_MDB_S_FRONT_CLOSE:
+                if (in_front) {
+                    sl_kv_block(k, &loc, &spot, &smask, b, front_lo, i);
+                    in_front = 0;
+                    cur->lo = next;
+                }
+                break;
+            case RTX_MDB_S_SLIDE:
+                slide_sep = 1;
+                break;
+            case RTX_MDB_S_HTML:
+                is_html = 1;
+                if (p->aux == 2) {
+                    in_com = 1;
+                    com_lo = p->lo;
+                }
+                break;
+            case RTX_MDB_S_ITEM:
+                if (sl_frag_marker(b, p->lo, p->hi)) frags++;
+                break;
+            case RTX_MDB_S_ATX:
+                if (st.n == 0 && ((k->hdiv && p->aux <= k->hdiv) ||
+                                  (k->hdiv_mask & (1u << p->aux))))
+                    hr_head = 1;
+                break;
+            default:
+                break;
+            }
+        }
+        if (slide_sep) {
+            RtxSlide *nx;
+            sl_close(k, cur, i, &loc, &spot, smask);
+            smask = 0;
+            nx = sl_push(k);
+            if (!nx) {
+                k->complete = 0;
+                k->scanned = i;
+                return;
+            }
+            cur = nx;
+            cur->sep = i;
+            cur->lo = next;
+            content = 0;
+            have_title = 0;
+            i = next;
+            continue;
+        }
+        if (hr_head && content) {
+            RtxSlide *nx;
+            sl_close(k, cur, i, &loc, &spot, smask);
+            smask = 0;
+            nx = sl_push(k);
+            if (!nx) {
+                k->complete = 0;
+                k->scanned = i;
+                return;
+            }
+            cur = nx;
+            cur->sep = i;
+            cur->lo = i;
+            content = 0;
+            have_title = 0;
+        }
+        cur->nfrag += frags;
+        if (in_com) {
+            is_html = 1;
+            if (L.close == RTX_MDB_LEAF_HTML || st.leaf != RTX_MDB_LEAF_HTML) {
+                /* The comment's text: past `<!--`, before `-->`. */
+                size_t a = com_lo + 4, z = eol;
+                const char *end = NULL;
+                size_t q;
+                for (q = a; q + 3 <= eol; q++) {
+                    if (b[q] == '-' && b[q + 1] == '-' && b[q + 2] == '>') {
+                        end = b + q;
+                        break;
+                    }
+                }
+                if (end) z = (size_t)(end - b);
+                /* Not all directives: a presenter note (not drawn). */
+                if (a <= z) (void)sl_kv_block(k, &loc, &spot, &smask, b, a, z);
+                in_com = 0;
+            }
+        }
+        if (!in_front && !is_html && L.mode != RTX_MDB_M_NONE && L.c_hi > L.c_lo)
+            content = 1;
+        if (!in_front && !is_html && !have_title) {
+            for (j = 0; j < L.nsp; j++) {
+                if (L.sp[j].kind == RTX_MDB_S_ATX && L.c_hi > L.c_lo) {
+                    cur->title_lo = L.c_lo;
+                    cur->title_hi = L.c_hi;
+                    have_title = 2;
+                }
+            }
+            if (!have_title && L.para && L.c_hi > L.c_lo &&
+                !sl_images_only(b, L.c_lo, L.c_hi) && cur->title_hi <= cur->title_lo) {
+                cur->title_lo = L.c_lo;
+                cur->title_hi = L.c_hi;
+            }
+            if (L.setext && L.title_back <= i) {
+                cur->title_lo = i - L.title_back;
+                cur->title_hi = i ? i - 1 : 0;
+                have_title = 2;
+            }
+        }
+        if (L.para && L.c_hi > L.c_lo) {
+            /* `![bg …](…)`: background images of this slide. */
+            size_t q = L.c_lo, alo, ahi, slo, shi;
+            for (;;) {
+                unsigned char side, pct, fit;
+                size_t nx = sl_image(b, q, L.c_hi, &alo, &ahi, &slo, &shi);
+                if (!nx) break;
+                if (sl_bg_alt(b, alo, ahi, &side, &pct, &fit)) {
+                    if (!cur->nbg) {
+                        cur->bg_side = side;
+                        cur->bg_pct = pct;
+                        cur->bg_fit = fit;
+                        cur->bg_src_lo = slo;
+                        cur->bg_src_hi = shi;
+                    }
+                    if (cur->nbg < 255) cur->nbg++;
+                }
+                q = nx;
+            }
+        }
+        i = next;
+    }
+    sl_close(k, cur, n, &loc, &spot, smask);
+    {
+        /* Pages: `hold` shows the number without counting, `skip` hides it
+         * and does not count. */
+        size_t s;
+        int page = 0;
+        for (s = 0; s < k->n; s++) {
+            int m = k->s[s].dir.paginate;
+            if (m == 2 || m == 3) k->s[s].page = page ? page : 1;
+            else k->s[s].page = ++page;
+        }
+    }
+}
+
+int rtx_deck_slide_of(const RtxDeck *k, size_t off) {
+    size_t lo = 0, hi;
+    if (!k || !k->marp || !k->n) return -1;
+    if (!k->complete && off >= k->scanned) return -1;
+    hi = k->n;
+    while (hi - lo > 1) {
+        size_t mid = (lo + hi) / 2;
+        if (k->s[mid].sep <= off) lo = mid;
+        else hi = mid;
+    }
+    return (int)lo;
+}
+
+/* ---- the document's deck (one-entry cache) -------------------------------- */
+
+static RtxDeck g_deck;
+static const void *g_deck_path;
+static int g_deck_ok;
+
+const RtxDeck *rtx_deck_for(RtxDoc *d) {
+    size_t len, take;
+    CCArena a;
+    char[:] b;
+    if (!d) return NULL;
+    len = d->len();
+    if (g_deck_ok && g_deck.doc == (const void *)d && g_deck.gen == d->edit_gen &&
+        g_deck.len == len && g_deck_path == (const void *)d->path.ptr)
+        return g_deck.marp ? &g_deck : NULL;
+    g_deck_ok = 0;
+    if (!RtxDoc_is_markup(d) || !RtxDoc_marp(d)) {
+        rtx_deck_build(&g_deck, NULL, 0, 1);
+    } else {
+        take = len > (size_t)RTX_DECK_SCAN_MAX ? (size_t)RTX_DECK_SCAN_MAX : len;
+        a = cc_arena_heap(take + 64);
+        if (!a.base) return NULL;
+        b = d->scratch_span(0, take, a) !>(e) {
+            (void)e;
+            a.destroy();
+            return NULL;
+        };
+        rtx_deck_build(&g_deck, b.ptr, b.len, take == len);
+        a.destroy();
+    }
+    g_deck.doc = d;
+    g_deck.gen = d->edit_gen;
+    g_deck.len = len;
+    g_deck_path = d->path.ptr;
+    g_deck_ok = 1;
+    return g_deck.marp ? &g_deck : NULL;
+}
+
+size_t rtx_slides_status(RtxDoc *d, size_t off, char *dst, size_t n) {
+    const RtxDeck *k;
+    int s;
+    int w;
+    if (!dst || !n) return 0;
+    dst[0] = 0;
+    if (!d) return 0;
+    if (d->len() > (size_t)RTX_DECK_STATUS_MAX && g_deck_ok && g_deck.doc == (const void *)d &&
+        (g_deck.gen != d->edit_gen || g_deck.len != d->len())) {
+        /* A big deck is not re-indexed per keystroke for the status bar:
+         * the last index, marked approximate (present / go-to rebuild). */
+        if (!g_deck.marp) return 0;
+        s = rtx_deck_slide_of(&g_deck, off);
+        if (s < 0) return 0;
+        w = snprintf(dst, n, "slide ~%d/%zu", s + 1, g_deck.n);
+        return w > 0 ? (size_t)w : 0;
+    }
+    k = rtx_deck_for(d);
+    if (!k) return 0;
+    s = rtx_deck_slide_of(k, off);
+    if (s < 0) w = snprintf(dst, n, "slide ?/%zu+", k->n);
+    else w = snprintf(dst, n, "slide %d/%zu%s", s + 1, k->n, k->complete ? "" : "+");
+    return w > 0 ? (size_t)w : 0;
+}
+
+size_t rtx_deck_outline(RtxDoc *d, RtxOutlineEnt *out, size_t cap) {
+    const RtxDeck *k = rtx_deck_for(d);
+    size_t i;
+    if (!k || !out) return 0;
+    for (i = 0; i < k->n && i < cap; i++) {
+        out[i].off = k->s[i].sep;
+        out[i].title_lo = k->s[i].title_lo;
+        out[i].title_hi = k->s[i].title_hi;
+        out[i].level = 1;
+    }
+    return i;
+}
+
+size_t rtx_deck_slide_caret(RtxDoc *d, int s) {
+    const RtxDeck *k = rtx_deck_for(d);
+    char buf[2048];
+    size_t lo, hi, got, i, line;
+    if (!k || s < 0 || (size_t)s >= k->n) return (size_t)-1;
+    lo = k->s[s].lo <= d->len() ? k->s[s].lo : d->len();
+    hi = k->s[s].hi > lo ? k->s[s].hi : lo;
+    if (hi - lo > sizeof buf) hi = lo + sizeof buf;
+    if (hi <= lo) return lo;
+    got = RtxDoc_read_at(d, lo, cc_slice_from_buffer(buf, hi - lo)) !>(e) {
+        (void)e;
+        return lo;
+    };
+    /* The first line with text (past blank lines), else the slide start. */
+    line = 0;
+    for (i = 0; i < got; i++) {
+        if (buf[i] == '\n') line = i + 1;
+        else if (!sl_ws(buf[i])) return lo + line;
+    }
+    return lo;
+}
+
+RtxSlideTheme rtx_slide_theme(const RtxDeck *k, const RtxSlide *s) {
+    RtxSlideTheme t;
+    const char *th = k ? k->theme : "default";
+    int inv = s ? s->dir.invert : 0;
+    memset(&t, 0, sizeof t);
+    if (sl_eq(th, strlen(th), "gaia")) {
+        t.bg = inv ? 0x455a64 : 0xfff8e1;
+        t.fg = inv ? 0xfff8e1 : 0x455a64;
+        t.head = t.fg;
+        t.accent = inv ? 0x81d4fa : 0x0288d1;
+        t.code_bg = inv ? 0x37474f : 0xf3e9c6;
+        t.dim = inv ? 0xb0bec5 : 0x78909c;
+    } else if (sl_eq(th, strlen(th), "uncover")) {
+        t.bg = inv ? 0x202228 : 0xfdfcff;
+        t.fg = inv ? 0xfdfcff : 0x202228;
+        t.head = t.fg;
+        t.accent = 0x009dd5;
+        t.code_bg = inv ? 0x2e3038 : 0xeeeef2;
+        t.dim = inv ? 0xa0a0a8 : 0x707078;
+        t.center = 1;
+    } else {
+        t.bg = inv ? 0x0d1117 : 0xffffff;
+        t.fg = inv ? 0xe6edf3 : 0x24292f;
+        t.head = inv ? 0x79c0ff : 0x1f3a5f;
+        t.accent = inv ? 0x58a6ff : 0x0969da;
+        t.code_bg = inv ? 0x161b22 : 0xf6f8fa;
+        t.dim = inv ? 0x8b949e : 0x57606a;
+    }
+    if (s && s->dir.lead) t.center = 1;
+    if (s && s->dir.bg_set) t.bg = s->dir.bg;
+    if (s && s->dir.fg_set) {
+        t.fg = s->dir.fg;
+        t.head = s->dir.fg;
+    }
+    return t;
+}
+
+/* ---- one slide as lines ------------------------------------------------------ */
+
+static int sl_line_push(RtxSlideView *v, RtxSlLine **out) {
+    if (v->nl >= v->lcap) {
+        size_t cap = v->lcap ? v->lcap * 2 : 64;
+        RtxSlLine *p = (RtxSlLine *)realloc(v->lines, cap * sizeof *p);
+        if (!p) return 0;
+        v->lines = p;
+        v->lcap = cap;
+    }
+    *out = &v->lines[v->nl++];
+    memset(*out, 0, sizeof **out);
+    (*out)->seg0 = (unsigned)v->ns;
+    return 1;
+}
+
+static int sl_seg_push(RtxSlideView *v, size_t lo, size_t hi, RtxStyle st, int cell,
+                       int link) {
+    RtxSlSeg *g;
+    if (hi <= lo) return 1;
+    if (v->ns >= v->scap) {
+        size_t cap = v->scap ? v->scap * 2 : 256;
+        RtxSlSeg *p = (RtxSlSeg *)realloc(v->segs, cap * sizeof *p);
+        if (!p) return 0;
+        v->segs = p;
+        v->scap = cap;
+    }
+    /* Merge with the previous segment when nothing differs. */
+    if (v->ns && v->nl) {
+        RtxSlSeg *pv = &v->segs[v->ns - 1];
+        RtxSlLine *ln = &v->lines[v->nl - 1];
+        if (ln->nseg && pv->hi == lo && pv->cell == cell && pv->link == link &&
+            memcmp(&pv->st, &st, sizeof st) == 0) {
+            pv->hi = hi;
+            return 1;
+        }
+    }
+    g = &v->segs[v->ns++];
+    g->lo = lo;
+    g->hi = hi;
+    g->st = st;
+    g->cell = (unsigned char)cell;
+    g->link = (unsigned char)link;
+    if (v->nl) v->lines[v->nl - 1].nseg++;
+    return 1;
+}
+
+/* Rich inline content [lo, hi) of the document: hints and link
+ * destinations are not shown (as in a Rich pane), styles from the runs. */
+static void sl_inline(RtxDoc *d, RtxSlideView *v, size_t lo, size_t hi, int cell,
+                      int raw) {
+    size_t off = lo;
+    while (off < hi) {
+        size_t hlo, hhi, end, h;
+        RtxStyle st;
+        int link = 0;
+        if (!raw) {
+            if (RtxDoc_hint_at(d, off, &hlo, &hhi) && hhi > off) {
+                off = hhi < hi ? hhi : hi;
+                continue;
+            }
+            if (RtxDoc_dest_at(d, off, &hlo, &hhi) && hhi > off) {
+                off = hhi < hi ? hhi : hi;
+                continue;
+            }
+        }
+        end = RtxDoc_style_next(d, off, hi);
+        if (!raw) {
+            h = RtxDoc_hint_next(d, off, hi);
+            if (h < end) end = h;
+            {
+                size_t plo, phi, klo, khi;
+                if (RtxDoc_path_at(d, off, &plo, &phi, &klo, &khi) && off >= klo &&
+                    off < khi) {
+                    link = 1;
+                    if (khi < end) end = khi;
+                }
+            }
+        }
+        if (end <= off) end = off + 1;
+        st = RtxDoc_style_at(d, off);
+        if (!sl_seg_push(v, off, end, st, cell, link)) return;
+        off = end;
+    }
+}
+
+static int sl_lex(RtxDoc *d, size_t lo, size_t n) {
+    RtxDoc_ensure_hl(d, rtx_hl_keep(lo, n)) !>(e) {
+        (void)e;
+        return 0;
+    };
+    return 1;
+}
+
+void rtx_slide_view_free(RtxSlideView *v) {
+    if (!v) return;
+    free(v->text);
+    free(v->lines);
+    free(v->segs);
+    memset(v, 0, sizeof *v);
+}
+
+static const char *const sl_bullets[] = {"\xe2\x80\xa2", "\xe2\x97\xa6", "\xe2\x96\xaa"};
+
+int rtx_slide_view(RtxDoc *d, int k, RtxSlideView *v) {
+    const RtxDeck *deck;
+    const RtxSlide *s;
+    RtxMdb st;
+    RtxMdbLine L;
+    size_t lo, hi, i, base;
+    const char *t;
+    int in_html = 0, in_fence = 0, nfrag = 0, prev_n = 0;
+    unsigned char cfrag[RTX_MDB_DEPTH];
+    size_t para_first = (size_t)-1;
+    if (!v) return 0;
+    free(v->text);
+    v->text = NULL;
+    v->nl = v->ns = 0;
+    v->nfrag = 0;
+    v->slide = -1;
+    memset(v->talign, 0, sizeof v->talign);
+    deck = rtx_deck_for(d);
+    if (!deck || k < 0 || (size_t)k >= deck->n) return 0;
+    s = &deck->s[k];
+    lo = s->lo;
+    hi = s->hi;
+    if (hi > lo + (size_t)RTX_SLIDE_BYTES_MAX) hi = lo + (size_t)RTX_SLIDE_BYTES_MAX;
+    v->slide = k;
+    v->gen = d->edit_gen;
+    v->base = base = lo;
+    v->tlen = hi - lo;
+    v->text = (char *)malloc(v->tlen + 1);
+    if (!v->text) return 0;
+    if (v->tlen) {
+        size_t got = RtxDoc_read_at(d, lo, cc_slice_from_buffer(v->text, v->tlen)) !>(e) {
+            (void)e;
+            @ok((size_t)0);
+        };
+        v->tlen = got;
+    }
+    v->text[v->tlen] = 0;
+    if (v->tlen) sl_lex(d, lo, v->tlen);
+    t = v->text;
+    memset(cfrag, 0, sizeof cfrag);
+    rtx_mdb_init(&st, 0, 0, 0);
+    rtx_mdb_set_marp(&st, 1);
+    i = 0;
+    while (i < v->tlen) {
+        const char *nl = (const char *)memchr(t + i, '\n', v->tlen - i);
+        size_t eol = nl ? (size_t)(nl - t) : v->tlen;
+        size_t next = nl ? eol + 1 : v->tlen;
+        int j, has_item = 0, item_frag = 0, qd = 0, ld = 0, fr = 0;
+        const RtxMdbSpan *item = NULL;
+        const RtxMdbSpan *task = NULL;
+        RtxSlLine *ln;
+        rtx_mdb_line(&st, t, i, eol, &L);
+        for (j = 0; j < st.n; j++) {
+            if (st.kind[j] == RTX_MDB_QUOTE) qd++;
+            else ld++;
+        }
+        /* Fragment of this line: its list item's, or the enclosing one's. */
+        for (j = prev_n; j < st.n; j++) cfrag[j] = j > 0 ? cfrag[j - 1] : 0;
+        for (j = 0; j < L.nsp; j++) {
+            if (L.sp[j].kind == RTX_MDB_S_ITEM) {
+                has_item = 1;
+                item = &L.sp[j];
+                if (sl_frag_marker(t, L.sp[j].lo, L.sp[j].hi)) item_frag = 1;
+            } else if (L.sp[j].kind == RTX_MDB_S_TASK) {
+                task = &L.sp[j];
+            }
+        }
+        if (has_item && st.n > 0) {
+            int par = 0;
+            for (j = 0; j + 1 < st.n; j++)
+                if (cfrag[j] > par) par = cfrag[j];
+            cfrag[st.n - 1] = (unsigned char)(item_frag ? ++nfrag : par);
+        }
+        prev_n = st.n;
+        for (j = 0; j < st.n; j++)
+            if (cfrag[j] > fr) fr = cfrag[j];
+
+        if (in_html) {
+            if (L.close == RTX_MDB_LEAF_HTML || st.leaf != RTX_MDB_LEAF_HTML) in_html = 0;
+            i = next;
+            continue;
+        }
+        {
+            int skip = 0, sep = 0, setext = 0, atx = 0, alvl = 0, code = 0, hr = 0;
+            for (j = 0; j < L.nsp; j++) {
+                switch (L.sp[j].kind) {
+                case RTX_MDB_S_HTML:
+                    if (!L.close) in_html = 1;
+                    skip = 1;
+                    break;
+                case RTX_MDB_S_FENCE_OPEN:
+                    in_fence = 1;
+                    skip = 1;
+                    break;
+                case RTX_MDB_S_FENCE_CLOSE:
+                    in_fence = 0;
+                    skip = 1;
+                    break;
+                case RTX_MDB_S_REF_LABEL:
+                case RTX_MDB_S_FRONT_OPEN:
+                case RTX_MDB_S_FRONT_CLOSE:
+                case RTX_MDB_S_SLIDE:
+                    skip = 1;
+                    break;
+                case RTX_MDB_S_TABLE_SEP:
+                    sep = 1;
+                    break;
+                case RTX_MDB_S_SETEXT:
+                    setext = L.sp[j].aux;
+                    break;
+                case RTX_MDB_S_ATX:
+                    atx = 1;
+                    alvl = L.sp[j].aux;
+                    break;
+                case RTX_MDB_S_ICODE:
+                case RTX_MDB_S_MATH_OPEN:
+                case RTX_MDB_S_MATH_CLOSE:
+                    code = 1;
+                    break;
+                case RTX_MDB_S_HR:
+                    hr = 1;
+                    break;
+                default:
+                    break;
+                }
+            }
+            if (L.close0 == RTX_MDB_LEAF_FENCE) in_fence = 0;
+            if (skip) {
+                i = next;
+                continue;
+            }
+            if (sep) {
+                /* The header row is the paragraph line before it. */
+                RtxMdCell cells[16];
+                size_t nc = rtx_md_row_split(t + L.c_lo, eol - L.c_lo, cells, 16), c;
+                if (!nc) {
+                    nc = rtx_md_row_split(t + i, eol - i, cells, 16);
+                    for (c = 0; c < nc; c++) {
+                        cells[c].lo += i - L.c_lo;
+                        cells[c].hi += i - L.c_lo;
+                    }
+                }
+                for (c = 0; c < nc && c < 16; c++) {
+                    size_t a = L.c_lo + cells[c].lo, z = L.c_lo + cells[c].hi;
+                    int left, right;
+                    sl_trim(t, &a, &z);
+                    left = a < z && t[a] == ':';
+                    right = z > a && t[z - 1] == ':';
+                    v->talign[c] = (unsigned char)(left && right ? RTX_MD_ALIGN_CENTER
+                                                   : right ? RTX_MD_ALIGN_RIGHT
+                                                           : RTX_MD_ALIGN_LEFT);
+                }
+                if (v->nl && v->lines[v->nl - 1].kind == RTX_SL_PARA) {
+                    /* Re-split the header line into cells. */
+                    RtxSlLine *h = &v->lines[v->nl - 1];
+                    size_t hl = h->lo - base, he, q;
+                    RtxMdCell hc[16];
+                    size_t hn;
+                    he = hl;
+                    while (he < v->tlen && t[he] != '\n') he++;
+                    v->ns = h->seg0;
+                    h->nseg = 0;
+                    h->kind = RTX_SL_ROW;
+                    h->header = 1;
+                    {
+                        size_t a0 = hl;
+                        while (a0 < he && sl_ws(t[a0])) a0++;
+                        /* Past quote markers when the table is quoted. */
+                        while (a0 < he && t[a0] == '>') {
+                            a0++;
+                            while (a0 < he && sl_ws(t[a0])) a0++;
+                        }
+                        hn = rtx_md_row_split(t + a0, he - a0, hc, 16);
+                        h->ncells = (unsigned char)hn;
+                        for (q = 0; q < hn; q++) {
+                            size_t a = a0 + hc[q].lo, z = a0 + hc[q].hi;
+                            sl_trim(t, &a, &z);
+                            sl_inline(d, v, base + a, base + z, (int)q, 0);
+                        }
+                    }
+                }
+                i = next;
+                continue;
+            }
+            if (setext && para_first != (size_t)-1) {
+                size_t q;
+                for (q = para_first; q < v->nl; q++) {
+                    v->lines[q].kind = RTX_SL_HEAD;
+                    v->lines[q].level = (unsigned char)setext;
+                }
+                para_first = (size_t)-1;
+                i = next;
+                continue;
+            }
+            if (!L.para) para_first = (size_t)-1;
+            if (L.mode == RTX_MDB_M_NONE && L.c_hi <= L.c_lo && !hr && !atx) {
+                /* Blank: one paragraph gap, none at the top. */
+                if (v->nl && v->lines[v->nl - 1].kind != RTX_SL_BLANK) {
+                    if (!sl_line_push(v, &ln)) break;
+                    ln->kind = RTX_SL_BLANK;
+                    ln->lo = base + i;
+                    ln->quote = (unsigned char)qd;
+                    ln->frag = (unsigned char)fr;
+                }
+                i = next;
+                continue;
+            }
+            if (L.para && sl_images_only(t, L.c_lo, L.c_hi)) {
+                /* Background images are the slide's; a content image is a
+                 * line of its own (alt, then src). */
+                size_t q = L.c_lo, alo, ahi, slo, shi;
+                for (;;) {
+                    unsigned char side, pct, fit;
+                    size_t nx = sl_image(t, q, L.c_hi, &alo, &ahi, &slo, &shi);
+                    RtxStyle plain;
+                    if (!nx) break;
+                    q = nx;
+                    if (sl_bg_alt(t, alo, ahi, &side, &pct, &fit)) continue;
+                    if (!sl_line_push(v, &ln)) break;
+                    ln->kind = RTX_SL_IMAGE;
+                    ln->lo = base + i;
+                    ln->quote = (unsigned char)qd;
+                    ln->frag = (unsigned char)fr;
+                    memset(&plain, 0, sizeof plain);
+                    sl_seg_push(v, base + alo, base + ahi, plain, 0, 0);
+                    sl_seg_push(v, base + slo, base + shi, plain, 1, 0);
+                }
+                para_first = (size_t)-1;
+                i = next;
+                continue;
+            }
+            if (!sl_line_push(v, &ln)) break;
+            ln->lo = base + i;
+            ln->quote = (unsigned char)qd;
+            ln->frag = (unsigned char)fr;
+            if (hr) {
+                ln->kind = RTX_SL_HR;
+            } else if (atx) {
+                ln->kind = RTX_SL_HEAD;
+                ln->level = (unsigned char)alvl;
+                sl_inline(d, v, base + L.c_lo, base + L.c_hi, 0, 0);
+            } else if (code || (in_fence && L.mode == RTX_MDB_M_GUEST) ||
+                       L.mode == RTX_MDB_M_RAW) {
+                ln->kind = RTX_SL_CODE;
+                sl_inline(d, v, base + L.c_lo, base + L.c_hi, 0, 1);
+            } else if (L.row) {
+                RtxMdCell cells[16];
+                size_t nc = rtx_md_row_split(t + L.c_lo, L.c_hi - L.c_lo, cells, 16), c;
+                ln->kind = RTX_SL_ROW;
+                ln->ncells = (unsigned char)nc;
+                for (c = 0; c < nc; c++) {
+                    size_t a = L.c_lo + cells[c].lo, z = L.c_lo + cells[c].hi;
+                    sl_trim(t, &a, &z);
+                    sl_inline(d, v, base + a, base + z, (int)c, 0);
+                }
+            } else if (has_item && item) {
+                size_t mlo = item->lo, mhi = item->hi;
+                while (mhi > mlo && sl_ws(t[mhi - 1])) mhi--;
+                ln->kind = RTX_SL_ITEM;
+                ln->level = (unsigned char)(ld ? ld : 1);
+                if (t[mlo] >= '0' && t[mlo] <= '9') {
+                    size_t mn = mhi - mlo;
+                    ln->ordered = 1;
+                    if (mn > 10) mn = 10;
+                    memcpy(ln->marker, t + mlo, mn);
+                    ln->marker[mn] = 0;
+                    if (mn && ln->marker[mn - 1] == ')') ln->marker[mn - 1] = '.';
+                } else {
+                    snprintf(ln->marker, sizeof ln->marker, "%s",
+                             sl_bullets[(ln->level - 1) % 3]);
+                }
+                if (task) {
+                    int on = t[task->lo + 1] == 'x' || t[task->lo + 1] == 'X';
+                    snprintf(ln->marker, sizeof ln->marker, "%s",
+                             on ? "\xe2\x98\x91" : "\xe2\x98\x90");
+                }
+                if (L.mode == RTX_MDB_M_INLINE)
+                    sl_inline(d, v, base + L.c_lo, base + L.c_hi, 0, 0);
+                para_first = v->nl - 1;
+            } else {
+                ln->kind = RTX_SL_PARA;
+                ln->indent = (unsigned char)ld;
+                if (L.mode == RTX_MDB_M_INLINE)
+                    sl_inline(d, v, base + L.c_lo, base + L.c_hi, 0, 0);
+                if (L.para && para_first == (size_t)-1) para_first = v->nl - 1;
+            }
+        }
+        i = next;
+    }
+    while (v->nl && v->lines[v->nl - 1].kind == RTX_SL_BLANK) v->nl--;
+    v->nfrag = nfrag;
+    return 1;
+}
+
+size_t rtx_sl_line_text(const RtxSlideView *v, const RtxSlLine *l, char *dst, size_t n) {
+    size_t w = 0, g;
+    if (!dst || !n) return 0;
+    dst[0] = 0;
+    if (!v || !l) return 0;
+    for (g = l->seg0; g < l->seg0 + l->nseg && g < v->ns; g++) {
+        const RtxSlSeg *s = &v->segs[g];
+        size_t a = s->lo - v->base, z = s->hi - v->base, k = z - a;
+        if (s->lo < v->base || z > v->tlen) continue;
+        if (g > l->seg0 && s->cell != v->segs[g - 1].cell && w + 3 < n) {
+            memcpy(dst + w, " | ", 3);
+            w += 3;
+        }
+        if (w + k >= n) k = n - 1 - w;
+        memcpy(dst + w, v->text + a, k);
+        w += k;
+        if (w + 1 >= n) break;
+    }
+    dst[w] = 0;
+    return w;
+}
+
+/* ---- presenter ----------------------------------------------------------------- */
+
+static RtxPresent g_present;
+
+RtxPresent *rtx_present(void) {
+    return &g_present;
+}
+
+static int sl_nfrag(const RtxDeck *k, int s) {
+    if (!k || s < 0 || (size_t)s >= k->n) return 0;
+    return k->s[s].nfrag;
+}
+
+static void sl_anim(RtxPresent *p, int tr, int ms, int dir, long now) {
+    p->tr = tr;
+    p->ms = ms > 0 ? ms : RTX_TR_DEFAULT_MS;
+    p->dir = dir;
+    p->t0 = now;
+    if (tr == RTX_TR_NONE || ms == 0) p->tr = RTX_TR_NONE;
+}
+
+int rtx_present_start(RtxPresent *p, RtxDoc *d, size_t caret, long now) {
+    const RtxDeck *k;
+    int s;
+    if (!p) return 0;
+    memset(p, 0, sizeof *p);
+    k = rtx_deck_for(d);
+    if (!k || !k->n) {
+        snprintf(p->msg, sizeof p->msg, "not a Marp deck (front matter needs marp: true)");
+        return 0;
+    }
+    s = rtx_deck_slide_of(k, caret);
+    if (s < 0) s = 0;
+    p->on = 1;
+    p->slide = p->from_slide = s;
+    p->step = p->from_step = 0;
+    (void)now;
+    return 1;
+}
+
+size_t rtx_present_stop(RtxPresent *p, RtxDoc *d) {
+    size_t c;
+    if (!p) return 0;
+    c = rtx_deck_slide_caret(d, p->slide);
+    p->on = 0;
+    p->tr = 0;
+    p->num_len = 0;
+    return c == (size_t)-1 ? 0 : c;
+}
+
+int rtx_present_goto(RtxPresent *p, RtxDoc *d, int slide, int step, long now) {
+    const RtxDeck *k = rtx_deck_for(d);
+    int tr = RTX_TR_NONE, ms = RTX_TR_DEFAULT_MS, dir;
+    if (!p || !k || !k->n) return RTX_PK_NONE;
+    if (slide < 0) slide = 0;
+    if ((size_t)slide >= k->n) slide = (int)k->n - 1;
+    if (step < 0) step = 0;
+    if (step > sl_nfrag(k, slide)) step = sl_nfrag(k, slide);
+    if (slide == p->slide && step == p->step) return RTX_PK_SAME;
+    dir = (slide > p->slide || (slide == p->slide && step > p->step)) ? 1 : -1;
+    if (slide != p->slide) {
+        /* A slide's transition plays into it; going back plays the
+         * transition of the slide being left, reversed. */
+        const RtxSlide *s = &k->s[dir > 0 ? slide : p->slide];
+        tr = s->dir.trans;
+        ms = s->dir.trans_ms;
+    } else if (dir > 0) {
+        tr = RTX_TR_FRAG;
+        ms = RTX_TR_FRAG_MS;
+    }
+    p->from_slide = p->slide;
+    p->from_step = p->step;
+    p->slide = slide;
+    p->step = step;
+    sl_anim(p, tr, ms, dir, now);
+    return RTX_PK_MOVE;
+}
+
+int rtx_present_next(RtxPresent *p, RtxDoc *d, long now) {
+    const RtxDeck *k = rtx_deck_for(d);
+    if (!p || !k) return RTX_PK_NONE;
+    if (p->step < sl_nfrag(k, p->slide)) return rtx_present_goto(p, d, p->slide, p->step + 1, now);
+    if ((size_t)p->slide + 1 < k->n) return rtx_present_goto(p, d, p->slide + 1, 0, now);
+    return RTX_PK_SAME;
+}
+
+int rtx_present_prev(RtxPresent *p, RtxDoc *d, long now) {
+    const RtxDeck *k = rtx_deck_for(d);
+    if (!p || !k) return RTX_PK_NONE;
+    if (p->step > 0) return rtx_present_goto(p, d, p->slide, p->step - 1, now);
+    if (p->slide > 0)
+        return rtx_present_goto(p, d, p->slide - 1, sl_nfrag(k, p->slide - 1), now);
+    return RTX_PK_SAME;
+}
+
+int rtx_present_key(RtxPresent *p, RtxDoc *d, int key, int ch, long now) {
+    const RtxDeck *k;
+    if (!p || !p->on) return RTX_PK_NONE;
+    k = rtx_deck_for(d);
+    if (!k) return RTX_PK_EXIT;
+    if (key == RTX_KEY_ESC || (!key && (ch == 'q' || ch == 'Q'))) {
+        if (key == RTX_KEY_ESC && p->num_len) {
+            p->num_len = 0;
+            return RTX_PK_SAME;
+        }
+        return RTX_PK_EXIT;
+    }
+    if (!key && ch >= '0' && ch <= '9') {
+        if (p->num_len + 1 < sizeof p->num) p->num[p->num_len++] = (char)ch;
+        p->num[p->num_len] = 0;
+        return RTX_PK_SAME;
+    }
+    if (key == RTX_KEY_ENTER && p->num_len) {
+        int v = atoi(p->num);
+        p->num_len = 0;
+        p->num[0] = 0;
+        if (v < 1) v = 1;
+        return rtx_present_goto(p, d, v - 1, 0, now);
+    }
+    if (key == RTX_KEY_BACKSPACE && p->num_len) {
+        p->num[--p->num_len] = 0;
+        return RTX_PK_SAME;
+    }
+    if (key == RTX_KEY_RIGHT || key == RTX_KEY_DOWN || key == RTX_KEY_PGDN ||
+        key == RTX_KEY_ENTER || (!key && (ch == ' ' || ch == 'n' || ch == 'j' || ch == 'l')))
+        return rtx_present_next(p, d, now);
+    if (key == RTX_KEY_LEFT || key == RTX_KEY_UP || key == RTX_KEY_PGUP ||
+        key == RTX_KEY_BACKSPACE || (!key && (ch == 'p' || ch == 'k' || ch == 'h')))
+        return rtx_present_prev(p, d, now);
+    if (key == RTX_KEY_HOME) return rtx_present_goto(p, d, 0, 0, now);
+    if (key == RTX_KEY_END)
+        return rtx_present_goto(p, d, (int)k->n - 1, sl_nfrag(k, (int)k->n - 1), now);
+    return RTX_PK_NONE;
+}
+
+double rtx_present_t(const RtxPresent *p, long now) {
+    double t;
+    if (!p || !p->tr || p->ms <= 0) return 1.0;
+    t = (double)(now - p->t0) / (double)p->ms;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    return t;
+}
+
+double rtx_ease(double t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) * (-2 * t + 2) * (-2 * t + 2) / 2;
+}
+
+int rtx_present_tick(RtxPresent *p, long now) {
+    if (!p || !p->tr) return 0;
+    if (now - p->t0 >= p->ms) {
+        p->tr = RTX_TR_NONE;
+        p->from_slide = p->slide;
+        p->from_step = p->step;
+        return 0;
+    }
+    return 1;
+}
+
+long rtx_present_wait_ms(const RtxPresent *p, long now) {
+    long left;
+    if (!p || !p->on || !p->tr) return -1;
+    left = (long)p->ms - (now - p->t0);
+    if (left <= 0) return 0;
+    return left < RTX_PRESENT_FRAME_MS ? left : RTX_PRESENT_FRAME_MS;
+}

@@ -1,0 +1,295 @@
+/*
+ * Browse walk: a deep search over more folders than RTX_BROWSE_JOB_MAX is
+ * not truncated (the cap is queue depth); workers read the query copied at
+ * kick, not br->glob the host is editing; a host move during a live walk
+ * lands on the same name after the join; a failing wave stops instead of
+ * restarting forever; spawned children get this environment and are
+ * reaped; a console editor is not started on this tty.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <time.h>
+#include "../core/browse.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static void touch(const char *path, const char *body) {
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    if (body) fputs(body, f);
+    fclose(f);
+}
+
+static size_t hits(RtxBrowse *br, const char *need) {
+    RtxBrowsePub v = rtx_browse_view_snap(br);
+    size_t i, n = 0;
+    if (!v.ents) return 0;
+    for (i = 0; i < v.len; i++)
+        if (!v.ents[i].sep && strstr(v.ents[i].name, need)) n++;
+    return n;
+}
+
+static void sleep_ms(long ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+static void br_open(RtxBrowse *br, const char *dir, const char *glob) {
+    *br = (RtxBrowse){0};
+    br->on = 1;
+    rtx_browse_abs(br->dir, sizeof(br->dir), cc_slice_cstr(dir));
+    snprintf(br->glob, sizeof(br->glob), "%s", glob ? glob : "");
+    br->glob_len = strlen(br->glob);
+}
+
+/* 30 x 30 folders plus 20 under ten of them: 1130 folder jobs, more than
+ * RTX_BROWSE_JOB_MAX, while the queue itself stays under the cap. */
+static int make_tree(const char *root) {
+    char p[512];
+    int t, k;
+    mkdir("testdata/generated", 0755);
+    mkdir(root, 0755);
+    snprintf(p, sizeof(p), "%s/t29/s29/needle_last.txt", root);
+    if (access(p, F_OK) == 0) return 1;
+    for (t = 0; t < 30; t++) {
+        snprintf(p, sizeof(p), "%s/t%02d", root, t);
+        mkdir(p, 0755);
+        for (k = 0; k < 30; k++) {
+            snprintf(p, sizeof(p), "%s/t%02d/s%02d", root, t, k);
+            if (mkdir(p, 0755) != 0 && access(p, F_OK) != 0) return 0;
+        }
+    }
+    for (t = 0; t < 10; t++) {
+        for (k = 0; k < 20; k++) {
+            snprintf(p, sizeof(p), "%s/t%02d/s00/l%02d", root, t, k);
+            if (mkdir(p, 0755) != 0 && access(p, F_OK) != 0) return 0;
+        }
+    }
+    snprintf(p, sizeof(p), "%s/t00/s00/needle_first.txt", root);
+    touch(p, "x\n");
+    snprintf(p, sizeof(p), "%s/t09/s00/l19/needle_deep.txt", root);
+    touch(p, "x\n");
+    snprintf(p, sizeof(p), "%s/t29/s29/needle_last.txt", root);
+    touch(p, "x\n");
+    return 1;
+}
+
+static void make_list(const char *root) {
+    char p[512];
+    int i;
+    mkdir(root, 0755);
+    snprintf(p, sizeof(p), "%s/f2999", root);
+    if (access(p, F_OK) == 0) return;
+    /* Wide enough that the first wave is still collecting when the host
+     * pauses it right after the kick. */
+    for (i = 0; i < 3000; i++) {
+        snprintf(p, sizeof(p), "%s/f%04d", root, i);
+        touch(p, "x\n");
+    }
+}
+
+static int zombie_kids(void) {
+    char path[64], buf[4096];
+    DIR *d = opendir("/proc/self/task");
+    struct dirent *de;
+    int z = 0;
+    if (!d) return 0;
+    while ((de = readdir(d)) != NULL) {
+        FILE *f;
+        size_t n;
+        char *p;
+        if (de->d_name[0] == '.') continue;
+        snprintf(path, sizeof(path), "/proc/self/task/%s/children", de->d_name);
+        f = fopen(path, "r");
+        if (!f) continue;
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        for (p = strtok(buf, " \n"); p; p = strtok(NULL, " \n")) {
+            char sp[64], st[512];
+            FILE *g;
+            size_t m;
+            char *rp;
+            snprintf(sp, sizeof(sp), "/proc/%s/stat", p);
+            g = fopen(sp, "r");
+            if (!g) continue;
+            m = fread(st, 1, sizeof(st) - 1, g);
+            fclose(g);
+            st[m] = 0;
+            rp = strrchr(st, ')');
+            if (rp && rp[1] == ' ' && rp[2] == 'Z') z++;
+        }
+    }
+    closedir(d);
+    return z;
+}
+
+int main(int argc, char **argv) {
+    const char *tree = "testdata/generated/bw_tree";
+    const char *list = "testdata/generated/bw_list";
+    int inline_mode = getenv("RTX_PARALLEL_INLINE") != NULL;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    /* Spawned as "this app" by the spawn checks below: do nothing. */
+    if (argc > 1) return 0;
+    (void)argv;
+    expect(make_tree(tree), "make tree");
+    make_list(list);
+
+    /* 1. More folders than RTX_BROWSE_JOB_MAX: not capped, both needles. */
+    {
+        RtxBrowse br;
+        br_open(&br, tree, "needle");
+        rtx_browse_kick(&br) !>;
+        rtx_browse_finish(&br) !>;
+        expect(!rtx_browse_truncated(&br), "deep search over >JOB_MAX folders is not capped");
+        expect(hits(&br, "needle_first") == 1, "first needle found");
+        expect(hits(&br, "needle_last") == 1, "last needle found (past 1024 jobs)");
+        expect(hits(&br, "needle_deep") == 1, "third-level needle found");
+        rtx_browse_drop(&br);
+    }
+
+    /* 2. The host edits br->glob before its next kick; the running walk
+     * keeps the query it was kicked with. */
+    {
+        RtxBrowse br;
+        size_t n = 0;
+        br_open(&br, tree, "needle");
+        rtx_browse_kick(&br) !>;
+        snprintf(br.glob, sizeof(br.glob), "zzz_none");
+        br.glob_len = strlen(br.glob);
+        while (rtx_browse_scanning(&br) && n++ < 100000) rtx_browse_pump(&br) !>;
+        expect(hits(&br, "needle_first") == 1 && hits(&br, "needle_last") == 1,
+               "walk reads the kicked query, not the edited glob");
+        rtx_browse_drop(&br);
+    }
+
+    /* 3. A move on the hold list during a live rescan keeps its name. */
+    if (!inline_mode) {
+        RtxBrowse br;
+        br_open(&br, list, "");
+        rtx_browse_kick(&br) !>;
+        rtx_browse_finish(&br) !>;
+        snprintf(br.glob, sizeof(br.glob), "f1");
+        br.glob_len = 2;
+        rtx_browse_kick_keep(&br) !>;
+        rtx_browse_pause(&br);
+        {
+            RtxBrowsePub v = rtx_browse_view_snap(&br);
+            size_t i, at = (size_t)-1;
+            for (i = 0; v.ents && i < v.len; i++)
+                if (strcmp(v.ents[i].name, "f1500") == 0) at = i;
+            if (rtx_browse_listing_live(&br) && at != (size_t)-1 && at > 1001) {
+                rtx_browse_select(&br, at, 40);
+                rtx_browse_resume(&br);
+                rtx_browse_finish(&br) !>;
+                {
+                    RtxBrowsePub w = rtx_browse_view_snap(&br);
+                    expect(w.ents && w.cur < w.len &&
+                               strcmp(w.ents[w.cur].name, "f1500") == 0,
+                           "host move follows its name across the join");
+                }
+            } else {
+                rtx_browse_resume(&br);
+                rtx_browse_finish(&br) !>;
+                printf("browse_walk_smoke: host-move check skipped (walk not live)\n");
+            }
+        }
+        rtx_browse_drop(&br);
+    }
+
+    /* 4. A wave that fails is not pending: the pump does not restart it. */
+    {
+        RtxBrowse br;
+        int k;
+        br_open(&br, list, "");
+        rtx_browse_test_fail_waves(50);
+        rtx_browse_kick(&br) !>;
+        for (k = 0; k < 10; k++) rtx_browse_pump(&br) !>;
+        expect(rtx_browse_test_fail_left() == 49, "failed wave is not restarted");
+        expect(!rtx_browse_scanning(&br), "failed wave clears scanning");
+        rtx_browse_test_fail_waves(0);
+        rtx_browse_drop(&br);
+    }
+
+#if !defined(__APPLE__)
+    /* 5. ^N on Linux: never a second editor on this tty; a terminal
+     * window gets our environment; the child is reaped. */
+    {
+        RtxBrowse br;
+        char script[1024], out[1024], cwd[512], buf[512];
+        size_t i;
+        int ok, waited;
+        FILE *f;
+        if (!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
+        snprintf(out, sizeof(out), "%s/testdata/generated/bw_term.out", cwd);
+        snprintf(script, sizeof(script), "%s/testdata/generated/bw_term.sh", cwd);
+        unlink(out);
+        f = fopen(script, "w");
+        if (f) {
+            fprintf(f, "#!/bin/sh\necho \"MARK=$RTX_BW_MARK ARGS=$1\" > '%s'\n", out);
+            fclose(f);
+        }
+        chmod(script, 0755);
+        br_open(&br, list, "");
+        rtx_browse_kick(&br) !>;
+        rtx_browse_finish(&br) !>;
+        for (i = 0; i < br.ents.len; i++)
+            if (strcmp(br.ents.data[i].name, "f0000") == 0) br.cur = i;
+        unsetenv("DISPLAY");
+        unsetenv("WAYLAND_DISPLAY");
+        unsetenv("TERMINAL");
+        ok = rtx_browse_spawn(&br, 0);
+        expect(!ok, "no DISPLAY: refuses to start a console editor on this tty");
+        expect(rtx_host_spawn_why()[0] != 0, "refusal says why");
+        setenv("DISPLAY", ":99", 1);
+        setenv("TERMINAL", script, 1);
+        setenv("RTX_BW_MARK", "42", 1);
+        ok = rtx_browse_spawn(&br, 0);
+        expect(ok, "spawn through $TERMINAL");
+        buf[0] = 0;
+        for (waited = 0; waited < 3000; waited += 20) {
+            f = fopen(out, "r");
+            if (f) {
+                size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+                fclose(f);
+                buf[n] = 0;
+                if (strchr(buf, '\n')) break;
+            }
+            sleep_ms(20);
+        }
+        expect(strstr(buf, "MARK=42") != NULL, "spawned child gets this environment");
+        expect(strstr(buf, "ARGS=-e") != NULL, "terminal runs the editor with -e");
+        for (waited = 0; waited < 3000 && rtx_host_reap() > 0; waited += 20)
+            sleep_ms(20);
+        sleep_ms(50);
+        rtx_browse_pump(&br) !>;
+        expect(zombie_kids() == 0, "spawned children are reaped");
+        unsetenv("DISPLAY");
+        unsetenv("TERMINAL");
+        rtx_browse_drop(&br);
+    }
+#endif
+    if (fails) {
+        fprintf(stderr, "browse_walk_smoke: %d failed\n", fails);
+        return 1;
+    }
+    printf("browse_walk_smoke: ok\n");
+    return 0;
+}

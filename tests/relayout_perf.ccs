@@ -1,0 +1,217 @@
+#!ccc ccs
+/*
+ * Per-keystroke relayout: RtxBuf_after_edit (patch, refill on decline)
+ * against the pre-patch body (reparse, clear rows, full ensure_view) in
+ * one binary, same camera, same edits.
+ *
+ *   ./bin/relayout_perf path [mode] [keys]
+ *   mode: default | wrap | rich | rich-wrap (default rich-wrap)
+ *
+ * Camera is lined at the middle of the file (index scanned first), pane
+ * 100 cells x 50 rows. Keys are typed on a visible line: letters, with an
+ * Enter and a Backspace every 16. Emits RESULT lines (ms per key: mean,
+ * p50, p95, max) for `patch` and `refill`, and the patch hit count.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/ui.cch"
+#include "../core/browse.cch"
+
+#define PERF_W 100.0
+#define PERF_VIS 50
+
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return (double)rtx_utf8_cols(bytes);
+}
+
+static double cell_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 1.0;
+}
+
+static double mono_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static int dcmp(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The pre-patch RtxBuf_after_edit body. */
+static void !>(CCError) refill_after_edit(RtxBuf *b, RtxMeasure *m) {
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    b->doc.reparse_edit(b->doc.last_off, b->doc.last_markup) !>;
+    b->doc.span_reset();
+    b->clear_pref();
+    b->pin_view = 0;
+    b->layout.clear_rows();
+    b->layout_width = 0;
+    b->ensure_view(m, PERF_W, PERF_VIS) !>;
+    return cc_ok();
+}
+
+static void !>(CCError) run(const char *path, const char *mode, int keys, int patch,
+                            double *out, size_t *hits) {
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    size_t at, lc;
+    int k;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    m.measure = cell_meas;
+    m.line_height = cell_lh;
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.wrap = strstr(mode, "wrap") != NULL;
+    b.layout.rich = strncmp(mode, "rich", 4) == 0;
+    rtx_line_scan_to(&b.doc.tree, b.doc.len()) !>;
+    lc = b.doc.line_count();
+    b.top = lc / 2;
+    b.ensure_view(&m, PERF_W, PERF_VIS) !>;
+    /* A visible line a third of the way down the pane. */
+    {
+        size_t ri = b.layout.rows.len / 3;
+        at = b.layout.rows.data[ri].byte_start;
+    }
+    b.doc.caret = at;
+    b.doc.sel_anchor = at;
+    for (k = 0; k < keys; k++) {
+        double t0, t1;
+        if (k % 16 == 7) b.enter() !>;
+        else if (k % 16 == 12) b.backspace() !>;
+        else b.type_cp((uint32_t)('a' + k % 26)) !>;
+        t0 = mono_ms();
+        if (patch) b.after_edit(&m, PERF_W, PERF_VIS) !>;
+        else refill_after_edit(&b, &m) !>;
+        t1 = mono_ms();
+        out[k] = t1 - t0;
+    }
+    *hits = b.layout.patched;
+    return cc_ok();
+}
+
+static void report(const char *label, const char *path, const char *mode,
+                   double *v, int n) {
+    double sum = 0;
+    int i;
+    for (i = 0; i < n; i++) sum += v[i];
+    qsort(v, (size_t)n, sizeof(double), dcmp);
+    printf("RESULT file=%s mode=%s path=%s keys=%d mean_ms=%.4f p50_ms=%.4f "
+           "p95_ms=%.4f max_ms=%.4f\n",
+           path, mode, label, n, sum / n, v[n / 2], v[(n * 95) / 100], v[n - 1]);
+    fflush(stdout);
+}
+
+/* Frame-side MD work: a full Rich wrap fill at a table, then per frame the
+ * queries paint / caret / click make for every table cell offset in view
+ * (x_of, wrap_li, hit). */
+static void !>(CCError) md_frame(const char *path, int frames) {
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    CCArena frame = {0};
+    char[:] all;
+    size_t at, lc, i, q = 0;
+    double t0, t_fill, t_q;
+    int f;
+    const char *hit;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    m.measure = cell_meas;
+    m.line_height = cell_lh;
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.wrap = 1;
+    b.layout.rich = 1;
+    rtx_line_scan_to(&b.doc.tree, b.doc.len()) !>;
+    lc = b.doc.line_count();
+    /* Camera on the first table past the middle. */
+    frame = cc_arena_heap(b.doc.len() + 64);
+    all = b.doc.scratch_span(0, b.doc.len(), frame) !>;
+    hit = strstr(all.ptr + all.len / 2, "\n| ");
+    at = hit ? (size_t)(hit - all.ptr) + 1 : all.len / 2;
+    b.top = b.doc.line_of(at) !>(ie) { return cc_err(CC_ERR_IO, "line_of"); };
+    if (b.top > 2) b.top -= 2;
+    (void)lc;
+    frame.destroy();
+    t0 = mono_ms();
+    for (f = 0; f < frames; f++) {
+        b.layout.clear_rows();
+        b.layout_width = 0;
+        b.ensure_view(&m, 60.0, PERF_VIS) !>;
+    }
+    t_fill = (mono_ms() - t0) / frames;
+    t0 = mono_ms();
+    for (f = 0; f < frames; f++) {
+        double y = 0;
+        for (i = 0; i < b.layout.rows.len; i++) {
+            const RtxVisRow *r = &b.layout.rows.data[i];
+            size_t off;
+            if (rtx_layout_md_index(&b.layout, r->byte_start) >= 0) {
+                for (off = r->byte_start; off < r->byte_start + r->byte_len; off++) {
+                    double x = b.layout.x_of(&b.doc, &m, off) !>;
+                    int li = rtx_layout_md_wrap_li(&b.layout, &b.doc, &m, off);
+                    size_t h = b.layout.hit(&b.doc, &m, x, y + li) !>;
+                    q += (h == off);
+                }
+            }
+            y += r->height;
+        }
+    }
+    t_q = (mono_ms() - t0) / frames;
+    printf("RESULT file=%s mode=md-frame fill_ms=%.4f queries_ms=%.4f md_ntab=%d "
+           "rows=%zu exact_hits=%zu\n",
+           path, t_fill, t_q, b.layout.md_ntab, b.layout.rows.len, q / (size_t)frames);
+    return cc_ok();
+}
+
+int main(int argc, char **argv) {
+    const char *path = argc > 1 ? argv[1] : "testdata/generated/md_250k.md";
+    const char *mode = argc > 2 ? argv[2] : "rich-wrap";
+    int keys = argc > 3 ? atoi(argv[3]) : 200;
+    double *a, *b;
+    size_t hits = 0, hits0 = 0;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    if (keys < 1) keys = 1;
+    if (strcmp(mode, "md-frame") == 0) {
+        md_frame(path, keys) !>;
+        return 0;
+    }
+    a = (double *)calloc((size_t)keys, sizeof(double));
+    b = (double *)calloc((size_t)keys, sizeof(double));
+    if (!a || !b) return 1;
+    run(path, mode, keys, 0, b, &hits0) !>;
+    run(path, mode, keys, 1, a, &hits) !>;
+    report("refill", path, mode, b, keys);
+    report("patch", path, mode, a, keys);
+    printf("RESULT file=%s mode=%s patched=%zu/%d\n", path, mode, hits, keys);
+    free(a);
+    free(b);
+    return 0;
+}

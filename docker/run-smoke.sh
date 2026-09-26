@@ -9,7 +9,8 @@
 #   CPUSET=0              docker --cpuset-cpus (one real core; --cpus is quota)
 #   CPUS=1                docker --cpus (CFS quota; not enough alone)
 #   MEMORY=2g             docker --memory (dup_scale @smoke needs ~1 GiB doc + headroom)
-#   CCC_REF=              pin concurrent-c git ref at build time
+#   CCC_REF=              concurrent-c git ref at build time (default: the
+#                         Dockerfile's pinned commit)
 #   SKIP_BUILD=1          reuse existing image
 set -euo pipefail
 
