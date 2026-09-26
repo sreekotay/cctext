@@ -3412,15 +3412,14 @@ static void ma_leaf_scan(RtxWb *wb, WMa *m, uint32_t j) {
 
 /* ---- build, deltas, value */
 
-static void ma_build(RtxWb *wb, WMa *m) {
+/* A build in three steps (ma_build_batch interleaves the leaf walks of
+ * many MAs over one table, so each leaf's cells are read from cache). */
+static int ma_build_begin(RtxWb *wb, WMa *m, ECtx *c, WGRow *g) {
     WTab *t = &wb->tabs[m->tab];
-    ECtx c;
-    uint32_t j, r;
-    WGRow g;
     wb->st.ma_full++;
     acc_reset(&m->a);
-    if (!m->grp && !acc_need(&m->a, &m->o, wb->ma)) return;
-    if (!ma_lv_fit(wb, m, t)) return;
+    if (!m->grp && !acc_need(&m->a, &m->o, wb->ma)) return 0;
+    if (!ma_lv_fit(wb, m, t)) return 0;
     m->lvok = 1;
     m->segok = 0;
     m->anyresc = 0;
@@ -3430,39 +3429,94 @@ static void ma_build(RtxWb *wb, WMa *m) {
         memset(&m->gm, 0, sizeof m->gm);
         m->gver++;
         m->gstale = 0;
-        if (!wg_row_alloc(wb, m, &g)) return;
+        if (!wg_row_alloc(wb, m, g)) return 0;
     }
-    ma_ctx(wb, m, &c, 0);
-    for (j = 0; j < t->nlv; j++) {
-        uint32_t lo = t->lvlo[j], hi = lo + t->lvn[j];
-        WBest b;
-        b.has = 0;
-        m->lstop[j] = 0;
-        m->lresc[j] = 0;
-        for (r = lo; r < hi; r++) {
-            if (m->grp) {
-                wg_con(&c, m, (int32_t)r, &g);
-                if (g.stop) m->lstop[j]++;
-                wg_apply(wb, m, &g, t->rowcell[r], 1);
-                continue;
-            }
-            {
-                WCon k;
-                wb_con(&c, &m->o, (int32_t)r, &k);
-                acc_apply(&m->a, &m->o, &k, 1);
-                if (k.k == CN_STOP) m->lstop[j]++;
-                else if (m->lbest && k.k == CN_VAL && !wv_isnan(&k.v)) {
-                    WBest x;
-                    x.v = k.v;
-                    x.rid = t->rowcell[r];
-                    x.has = 1;
-                    if (wb_better(wb, m->o.fn, &x, &b)) b = x;
-                }
+    ma_ctx(wb, m, c, 0);
+    return 1;
+}
+
+static void ma_build_leaf(RtxWb *wb, WMa *m, ECtx *c, WGRow *g, uint32_t j) {
+    WTab *t = &wb->tabs[m->tab];
+    uint32_t lo = t->lvlo[j], hi = lo + t->lvn[j], r;
+    WBest b;
+    b.has = 0;
+    m->lstop[j] = 0;
+    m->lresc[j] = 0;
+    for (r = lo; r < hi; r++) {
+        if (m->grp) {
+            wg_con(c, m, (int32_t)r, g);
+            if (g->stop) m->lstop[j]++;
+            wg_apply(wb, m, g, t->rowcell[r], 1);
+            continue;
+        }
+        {
+            WCon k;
+            wb_con(c, &m->o, (int32_t)r, &k);
+            acc_apply(&m->a, &m->o, &k, 1);
+            if (k.k == CN_STOP) m->lstop[j]++;
+            else if (m->lbest && k.k == CN_VAL && !wv_isnan(&k.v)) {
+                WBest x;
+                x.v = k.v;
+                x.rid = t->rowcell[r];
+                x.has = 1;
+                if (wb_better(wb, m->o.fn, &x, &b)) b = x;
             }
         }
-        if (m->lbest) m->lbest[j] = b;
     }
-    if (m->lbest) ma_seg_build(wb, m, t);
+    if (m->lbest) m->lbest[j] = b;
+}
+
+static void ma_build(RtxWb *wb, WMa *m) {
+    ECtx c;
+    WGRow g;
+    uint32_t j;
+    if (!ma_build_begin(wb, m, &c, &g)) return;
+    for (j = 0; j < wb->tabs[m->tab].nlv; j++) ma_build_leaf(wb, m, &c, &g, j);
+    if (m->lbest) ma_seg_build(wb, m, &wb->tabs[m->tab]);
+}
+
+/* calc_all: MA mi, and with it every other plain MA over its table whose
+ * inputs are all computed already (ordered before `top`): one pass over
+ * the leaves for all of them, each leaf's rows read once from memory.
+ * built[] marks them. */
+static void ma_build_batch(RtxWb *wb, uint32_t mi, uint64_t top, uint8_t *built) {
+    WMa *m0 = &wb->mas[mi];
+    WTab *t = &wb->tabs[m0->tab];
+    uint32_t *b, nb = 0, i, j, k;
+    ECtx *cs;
+    built[mi] = 1;
+    if (m0->grp || t->ntma < 2) {
+        ma_build(wb, m0);
+        return;
+    }
+    b = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)t->ntma * sizeof(uint32_t), 16);
+    cs = (ECtx *)cc_arena_alloc(wb->sa, (size_t)t->ntma * sizeof(ECtx), 16);
+    if (!b || !cs) {
+        ma_build(wb, m0);
+        return;
+    }
+    b[nb++] = mi;
+    for (i = 0; i < t->ntma; i++) {
+        uint32_t x = t->tma[i];
+        const WMa *m = &wb->mas[x];
+        const WNode *mn;
+        int ok = 1;
+        if (x == mi || built[x] || !m->live || m->grp) continue;
+        mn = &wb->nodes[m->node];
+        if (mn->kind != NK_MA || mn->cyc) continue;
+        for (k = 0; k < mn->ndeps && ok; k++)
+            if (wb->nodes[mn->deps[k]].topo >= top) ok = 0;
+        if (ok) b[nb++] = x;
+    }
+    for (i = 0, k = 0; i < nb; i++) {
+        built[b[i]] = 1;
+        if (ma_build_begin(wb, &wb->mas[b[i]], &cs[k], NULL)) b[k++] = b[i];
+    }
+    nb = k;
+    for (j = 0; j < t->nlv; j++)
+        for (i = 0; i < nb; i++) ma_build_leaf(wb, &wb->mas[b[i]], &cs[i], NULL, j);
+    for (i = 0; i < nb; i++)
+        if (wb->mas[b[i]].lbest) ma_seg_build(wb, &wb->mas[b[i]], t);
 }
 
 static int wb_dirty_cmp(const void *a, const void *b) {
@@ -4972,12 +5026,14 @@ static void wb_recalc(RtxWb *wb) {
 /* Every node in dependency order (after a rebuild). */
 static void wb_calc_all(RtxWb *wb) {
     uint32_t *order, v;
+    uint8_t *built;
     if (!wb->nn) {
         wb->st.visited = 0;
         return;
     }
     order = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)wb->nn * sizeof(uint32_t), 16);
-    if (!order) return;
+    built = (uint8_t *)wb_alloc(wb->sa, (size_t)wb->nma + 1);
+    if (!order || !built) return;
     for (v = 0; v < wb->nn; v++) order[(wb->nodes[v].topo >> 16) - 1] = v;
     for (v = 0; v < wb->nn; v++) {
         uint32_t id = order[v];
@@ -4990,8 +5046,8 @@ static void wb_calc_all(RtxWb *wb) {
                 n->v = wb->cyv[n->cyi];
             } else {
                 WVal x;
-                ma_build(wb, m);
-                x = ma_value(wb, m);
+                if (!built[n->mai]) ma_build_batch(wb, n->mai, n->topo, built);
+                x = ma_value(wb, &wb->mas[n->mai]);
                 wb->nodes[id].v = x;
             }
             continue;
