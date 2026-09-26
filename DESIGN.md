@@ -33,7 +33,7 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Document | piece-tree arena + page-store arena (fds + LRU page pool) | `RtxDoc.destroy()` |
 | Session | `d.session` | close (path, undo) |
 | Analysis | `d.analysis` | `analysis.reset()` on reparse |
-| Workbook | `d.derived` → `RtxWb` (`core/wb.ccs`, `*.wb.md` only): own heap arenas for the model (names, cells, ASTs, graph), values, and per-operation scratch | a structural edit (or garbage past its bound) rebuilds the model; cell / calc-line / prose edits patch it; `RtxDoc.destroy()` |
+| Workbook | `d.derived` → `RtxWb` (`core/wb.ccs`, `*.wb.md` only): own heap arenas for the model (names, cells, ASTs, graph, maintained-aggregate partials and leaves), values, and per-operation scratch; a recalc's queued row deltas and old values in two heap vectors | a structural edit (header, fence, caption, a table's end) or garbage past its bound rebuilds the model; cell / calc-line / prose edits and whole-row inserts / deletes inside a table patch it (rows as MA deltas, docs/workbook.md "W2 as built"); `RtxDoc.destroy()` |
 | Find | `d.find.store` (query + hits) | new query resets; `RtxDoc.destroy()`; edit invalidates offsets |
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs) |
@@ -745,6 +745,8 @@ Commit only after the new value exists: hist after `tree.replace` (reserve coale
 Mark motion and fold walk the runs `ensure_hl` already produced. They do not lex ahead, pump, or keep a file-shaped table. Heading pairs use those runs; brace pairs (`{}` `[]` `()`) match on the caret’s 256KiB analysis page plus at most one neighbor page each side (same grain as `RTX_HL_WIN_MAX`, not the 64KiB store). Paint does not `ensure_hl` that span — skip uses whatever runs the layout window already has. A fold is stored only when both ends are in that window. Layout skips interiors; caret and scroll jump to the fold edge; hex ignores folds. Folds are document state (`RtxDoc.folds`, cap `RTX_FOLD_MAX`), shared by every pane on the doc — per-pane folds are a known non-feature.
 
 Grid, hex, and the markup lens (Rich hints, nested children, injected lex) are paint policies over the same bytes and the same runs — see [docs/md_view.md](docs/md_view.md). Pair / prefix / path mark shapes: [docs/mark_arity.md](docs/mark_arity.md).
+
+A workbook formula's live value while the caret is in it (`` → value``, dimmed: `rtx_theme_annot`) is paint too, in Rich and Source: the stand-in of the formula's last cluster carries the cluster's glyphs and then the annotation (`RtxHintVis.ann`), so every width, wrap, table fit and hit that already walks stand-ins counts it with no new walk; `x_of` and hits stop before it, so the caret at the formula's end sits before it and a click on it lands there. It holds no bytes: copy, search and save never see it ([docs/workbook.md](docs/workbook.md#live-value-annotation)).
 
 A Marp deck is one more view of the same bytes ([docs/slides.md](docs/slides.md)): `marp: true` in the first 4 KiB sets a block-pass flag that rides in the checkpoints (a top-level thematic break is a slide separator), the deck index is that block pass over a bounded prefix keyed by the edit stamp (slide numbers need every separator before the caret, as line numbers need the line index), and presenting a slide lexes only that slide. The presenter is host-neutral state; a transition asks the host loop for frames only while it plays (`rtx_present_wait_ms`), so a still slide wakes nothing.
 

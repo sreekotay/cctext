@@ -1,6 +1,6 @@
 # Workbooks: named tables, dependency recalc, giant data
 
-**Status: W0 (Names) landed** — see [W0 as built](#w0-as-built): embedded named tables, `params` / `calc`, the formula language, the DAG with Tarjan and cutoff recalc on edit deltas, values in the Rich lens, rename. W1–W5 are design. Open questions in §9 (decisions for W0 there).
+**Status: W0 (Names) and W2 (Aggregates, embedded tables) landed** — see [W0 as built](#w0-as-built): embedded named tables, `params` / `calc`, the formula language, the DAG with Tarjan and cutoff recalc on edit deltas, values in the Rich lens, rename; and [W2 as built](#w2-as-built): maintained aggregates updated by row deltas with exact float / dec sums, `group`, rows inserted and deleted as deltas, and the live value annotation while the caret is in a formula. W1 and W3–W5 are design. Open questions in §9 (decisions for W0 there).
 
 TODO.md: *"spreadsheets / cell references — NOT normal reference — named,
 and dependencies based."* This note answers that. A **workbook** is a
@@ -191,7 +191,9 @@ sums use an exact expansion (Shewchuk non-overlapping partials, usually
 2–3 doubles) per leaf, and those combine exactly up the tree and round
 once. The result is **bit-identical no matter the edit history or tree
 shape**. That property is what makes subtract-old / add-new exact
-(section 4).
+(section 4). (As built in W2: a fixed-point superaccumulator rather than
+an expansion — the same exactness with a bounded, order-free state; see
+[W2 as built](#w2-as-built).)
 
 ## 4. Dependency graph and incremental recalc
 
@@ -465,7 +467,7 @@ the rule that an unknown version is ignored are all the same as Safe.
 |---|---|---|
 | **W0 Names** | `.wb.md` parse; embedded tables; `params`/`calc`; formula grammar and binder; DAG, Tarjan, topo recalc with cutoff; Rich paints values (md_view Derived value); error values; rename refactor | fixtures under `testdata/wb/`: every calc and cell value asserted; cycles reported with path; rename round-trips; recalc after one cell edit visits only dependents (counter smoke) |
 | **W1 Index** | external `table` binding; header check; counted B+tree leaves; replace hook, split/merge, quote re-sync; progressive two-state parallel build; exact grid row numbers; `RTXI` persistence and validation | **1e8-row CSV (~6 GB)**: build ≥ 1 GB/s on 8 cores; reopen with cached index ≤ 50 ms; `g row N` ≤ 1 ms; RSS ≤ 64 MB above page cache; property smoke: 10k random edits, then index == fresh build (leaf-for-leaf positions) |
-| **W2 Aggregates** | typed columns, zone maps, MAs (sum/count/avg/min/max), where filters, group MA, exact dec/float, pending propagation | single-cell edit in the 1e8 table updates `sum(where)` and dependents ≤ 2 ms; incremental == from-scratch (bit-identical) after random edits, undo, and region flips; `@perf_check` pins |
+| **W2 Aggregates** (built for embedded tables: [W2 as built](#w2-as-built); zone maps and pending are W1's) | typed columns, zone maps, MAs (sum/count/avg/min/max), where filters, group MA, exact dec/float, pending propagation | single-cell edit in the 1e8 table updates `sum(where)` and dependents ≤ 2 ms; incremental == from-scratch (bit-identical) after random edits, undo, and region flips; `@perf_check` pins |
 | **W3 Relations** | key/secondary indexes (RAM then LSM), lookups, computed columns, cross-table deltas, linear rewrite | Customers edit touches only leaves with that key (leaf-visit counter); `#dup` / `#schema` fixtures |
 | **W4 Views & UI** | filter and sort views, frozen key column, tabs, formula bar (TUI and GUI), externalize apply | exact scroll over a 1e8-row filter view; tab switch keeps camera via `RTXC` |
 | **W5 Scale** | columnar sidecar, append fast path, `use` imports, `export` verb | new MA over an indexed 1e8 table ≤ 2 s from sidecar; appending 1 GB to a log re-indexes only the tail |
@@ -609,8 +611,9 @@ a keyed lookup: 0 rows is `null`, 2+ rows `#dup` unless
 `and` / `or` / `not`, `= != <> < <= > >=`, `+ - * / %`, and `abs`
 `round(x[, n])` `floor` `ceil` `coalesce` `len` `lower` `upper`
 `iserror` `iferror(x, y)` and `min` / `max` of two or more values.
-`group` / `join` / `sort` / `top` parse to `#parse(… W2 / W4)`. No
-volatile functions: time is a param (`asof`).
+`group` / `join` / `sort` / `top` parse to `#parse(… W2 / W4)` (W2 built
+`group`; see [W2 as built](#w2-as-built)). No volatile functions: time is
+a param (`asof`).
 
 **Errors are values** with provenance: `#div0(division by zero in
 Targets.gap[2])`, `#name(unknown name nope)`, `#ref(T has no column zz)`,
@@ -723,9 +726,253 @@ incremental workbook with one built from scratch after every step.
 
 **Limits (W0).** Aggregates rescan their table (no leaf partials); a
 where-filter per row of another table is O(rows²) on edit. Structural
-edits reparse the whole workbook. Values are not colored by kind or
+edits reparse the whole workbook. (W2 lifts the first and the row
+inserts / deletes of the last: [W2 as built](#w2-as-built).) Values are not colored by kind or
 error in the lens. Sheet rename, `types:`, `uses` imports, formula bar
 and hover are later phases.
+
+## W2 as built
+
+W2 (maintained aggregates) landed for **embedded** tables, ahead of W1
+(owner decision: W2 first, with the interface W1's on-disk leaves plug
+into — [below](#the-ma-interface-for-w1)). Every aggregate in a formula
+and every `group` is a **maintained aggregate (MA)**: a graph node whose
+state is exact partials over its table's rows, kept current by row
+deltas. A cell edit never re-reads the tables its aggregates cover.
+Code: `core/wb.ccs` (the MA engine, the row path, groups),
+`core/wb_num.cch` / `core/wb_num.ccs` (exact arithmetic), the annotation
+in `core/layout.ccs` and both frontends' stand-in painters.
+
+**What an MA is.** One per `sum` / `count` / `avg` / `min` / `max` /
+`distinct` / `any` / `all` (and `?` forms) in a cell or calc formula,
+nested ones included (`sum(A.v where v > avg(A.v))` is two MAs: the inner
+one is a scalar input of the outer). Its inputs are of two kinds:
+
+- **row columns** — columns of its table read in the row context (`v`,
+  `A.v`, `region`): a changed cell queues its row on every MA that reads
+  its column (`WTab.cma`), and at the MA's pop the row's **old**
+  contribution is subtracted and the new one added. The old one is
+  evaluated against the values from before this recalc (each changed
+  node keeps `ov` until the recalc ends), so no per-row state is stored.
+- **scalar inputs** — names, params, this row's cells (`@region`),
+  lookups, fields, other aggregates: an ordinary graph edge. A change
+  **rebuilds that MA with one walk of its table** (`where d >= asof` when
+  `asof` moves). Zone maps are not built (optional, not cheap enough to
+  pay for embedded tables).
+
+The formula depends on the MA node, not on the columns, so W0's early
+cutoff now also stops at an MA whose value did not change.
+
+**A row's contribution** is one of: *skipped* (`where` false or null, a
+null value, an error under `?`), a *stop* (an error value, or a type error
+the aggregate cannot skip: `sum` over text, `where` not boolean, `any`
+over a number — the aggregate's value is the **first stop row's error in
+row order**, found through per-leaf stop counts, no walk), or a *value*.
+
+**Partials.** Invertible, at the root: counts; the exact sums below;
+`distinct`'s per-value counts (a key → count map; `distinct` is the
+number of keys with a count); `any` / `all` true / false counts; min /
+max's per-kind counts (a column mixing kinds is `#type`). `min` / `max`
+keep a best row per **leaf** (a run of 64 consecutive rows; 128 splits,
+under 16 merges into a neighbour — the W1 leaf shape) and a tree over the
+leaves; a changed row only compares against its leaf's best, and losing
+the extreme rescans that one leaf (≤ 128 rows), then O(log leaves) up the
+tree. `count(T)` has no inputs at all: only row inserts / deletes move it.
+
+**Exact numbers** (the owner's hard requirement: an MA maintained
+through any edits, undo, row inserts and deletes is bit-identical to one
+built from scratch):
+
+- `int` / `dec(p)`: per scale, an exact 128-bit sum (a row adds one i64;
+  2^32 rows cannot overflow it). The value combines them in a 256-bit
+  integer of units 10^-18 (`RtxXd`) and reads it back at the widest scale
+  present — exact, independent of order. Only a result that does not fit
+  an int64 is `#num(sum too large)` (W0's i128 bound on partial sums
+  depended on order; W2's does not).
+- `float`: a **superaccumulator** (`RtxXs`): a fixed-point integer in units
+  of 2^-1074 spanning the whole double range, as 70 signed 64-bit limbs of
+  32 bits each (Radford Neal's "small accumulator": each add touches three
+  limbs, carries wait, a renormalise every 2^30 adds). Adding or
+  subtracting a finite double is exact; the value is the exact real sum
+  **rounded once, to nearest, ties to even**. Subtraction is the same
+  add with the sign flipped, so a delta is exact.
+- `int` / `dec` mixed with `float` in one aggregate: the exact real sum of
+  every value — the decs as exact decimals, not as rounded doubles — then
+  one rounding (`rtx_xs_round_mixed`: the float part × 10^18 plus the dec
+  part × 2^1074, divided once).
+- **Non-finite rules** (counted apart from the accumulator, so they are
+  invertible too): any NaN, or +inf and -inf together, makes the sum the
+  canonical quiet NaN (`0x7ff8000000000000`, one bit pattern); else any
+  +inf is +inf, any -inf is -inf. A finite sum past DBL_MAX rounds to
+  ±inf (IEEE overflow: the halfway point to 2^1024 goes to inf, ties to
+  even). An exact zero is +0.0 (so -0.0 alone sums to +0.0).
+- `avg` is `sum / count` over that exact sum (a double division); `count`
+  is exact.
+- `min` / `max`: numbers compare **exactly** across `int` / `dec` /
+  `float` (a dec against a float is decided by the exact difference, not
+  by converting); ties keep the **earliest row**; any NaN among the values
+  makes the result the canonical NaN (W0 kept whichever came first — an
+  order dependence).
+- `distinct` keys numbers by exact value (`2`, `2.00` and `2.0` are one
+  key; a float that is not a decimal of scale ≤ 18 keys by its bits),
+  text by bytes, one NaN key.
+
+**Rule changes from W0** (each W0 one depended on row order or history):
+row errors take precedence over a mixed-kinds `min` / `max`; NaN in `min`
+/ `max`; the `#num` bound on sums; a dec mixed into a float sum adds as an
+exact decimal. Every W0 fixture is unchanged except `checks`' `group`
+line, which now has a value.
+
+**Groups.** `name = group T by col { out: agg(...), ... }` (a calc or
+param name only; the root of its formula) is one group MA: a map from
+the key (the column's value, keyed as `distinct` keys) to one partial per
+output. `count()` counts the group's rows; any aggregate over bare column
+names of `T` works, `where` and `?` too. Read a group with a keyed
+lookup, `by[region = "EU"].total` (a missing key is `null`); the dump
+lists every group in key order, and the Rich lens paints `3 groups`. Its
+value carries a version that moves when any group changes, so its
+lookups re-read (O(1) each) and cut off at their own values. A group's
+`min` / `max` that loses its extreme recomputes that key with one walk;
+a key error stops the whole group (its first stop row's error). Editing a
+group's definition (not its table) re-binds like any formula; `join` /
+`sort` / `top` still parse to `#parse(… W4)`.
+
+**Rows as deltas.** An edit that replaces whole body rows of one table
+with pipe rows — a new row, a deleted one, a moved one (a swap in one
+replace), several at once, a row whose cell count changed — takes the
+**row path**: every MA over the table subtracts the old rows'
+contributions (current values), their cell nodes die, the new rows get
+nodes (ids appended; a row's position maps to its cells through
+`WTab.rowcell`), their formulas bind, and each MA takes them as new rows
+at its next pop. The leaves take the rows (split / merge; every MA's leaf
+arrays mirror them). Error cells below the edit re-evaluate (their
+messages name row numbers); so do cycle paths. The header, separator,
+caption, a fence, a row that would end or split the table, a table at EOF
+without a newline, and 0 or over 10 000 rows still reparse. Dumps and
+cycle paths follow document order, not node ids, so a workbook edited
+this way and one built from scratch print the same.
+
+**Pending** stays a W1 bit: `WMa.pending` exists and is never set —
+embedded tables have no asynchronous build. W1's progressive build sets
+it while an MA covers a prefix, and dependents carry it (§5).
+
+**`first` and lookups** are not maintained: `T[cond]` and `first(...)`
+depend on the columns they read and rescan their table when one changes,
+as in W0 (a key index is W3).
+
+### The MA interface for W1
+
+The engine is written against leaves, so W1's counted B+tree plugs in
+where `WTab.lvn` / `lvlo` / `rleaf` (rows per leaf, first row, row →
+leaf) are today:
+
+| Piece | Embedded (W2) | W1 plug-in |
+|---|---|---|
+| a row's contribution | `wb_con(ctx, WOut, row)`: evaluates `where` / the argument over the row's cells | the same over a record parsed from the leaf's bytes; the old record is parsed from the bytes captured pre-replace |
+| the partial | `WAcc` + `acc_apply(±1)` + `acc_value` | unchanged: a leaf keeps a `WAcc` (with its `RtxXs` / `RtxXd`), an inner node merges children with `rtx_xs_merge` / `rtx_xd_merge` and count adds — exact, so the root is the same whatever the tree shape |
+| stop rows | per-leaf `lstop`; the first stop row by walking leaves in order | the same counts summed up the tree; descend to the first leaf with one |
+| min / max | per-leaf `lbest` (value + row) under a segment tree (`seg`) | the leaf best in the leaf partial, merged up the B+tree (left wins ties) |
+| structure | `lv_ins` / `lv_del` / `lv_split` / `lv_merge` mirror every MA's arrays | the index hook's leaf split / merge |
+| deltas | `ma_dirty(rid)` queues a row; `ma_apply` does old-out / new-in | the leaf hook's `(leaf, old partial, new partial)`: subtract and add the leaf's partial up the path |
+
+### Live value annotation
+
+While the caret is in a formula — a cell's `=…` or a calc expression —
+its value paints **after** it as a dimmed annotation: `s = sum(T.a) → 4`,
+in Rich (where the formula is revealed) and in Source, in both
+frontends. Each keystroke re-binds and re-evaluates that formula through
+the incremental path and the annotation shows the new result at once; a
+half-typed formula shows its error with the message (`→ #parse(expected ,
+or ) at column 8)`); dependents update as before. When the caret leaves,
+the value paints in place again (Rich) or nothing shows (Source).
+
+- It holds **no bytes**: it rides as the stand-in of the formula's last
+  cluster (`RtxHintVis.ann`: that cluster's glyphs, then ` → value`), so
+  copy, search, undo and save never see it (the PTY test checks the file).
+- The caret at the formula's end sits **before** it (`x_of` and the TUI
+  cursor stop at the cluster's glyphs); a click on it lands at the
+  formula's end; selection paints only real glyphs.
+- It is dimmer than text: the theme entry `rtx_theme_annot()`
+  (`comment.annotation` scope; `\e[38;5;244m` in a terminal).
+- **Layout decision:** in a table the annotation **widens the column**
+  while it shows (the table fit already re-fits per fill; when the pane
+  is too narrow, the cell wraps inside the fitted column). Wrapping the
+  annotation inside a fixed column instead would change the row's height
+  on every value-length change and move every line below; widening moves
+  only that table's columns, and only while the caret is in the cell.
+- Cost: typing in a formula cell with the annotation showing is
+  3.7 ms p50 against W0's 3.9 ms for the same keystrokes without it (the
+  rebind + regraph of a formula edit dominates both); typing in a
+  literal cell is 2.1 ms (W0 2.8 ms).
+
+### Tests
+
+- `wb_smoke`: the four W0 fixtures (only `checks`' `group` line changed);
+  the W0 counter now asserts 18 visits (the 7 MAs, and 4 formulas whose
+  MA kept its value are cut off) and that the edit walks no table;
+  `xsum` — `testdata/wb/xsum.txt` (`tests/wb_xsum_gen.py`: Python's
+  exact `Fraction` sums rounded once) — every float set summed forward,
+  backward, shuffled, with junk added and subtracted, and as two merged
+  halves, all bit-equal to the reference; mixed float + dec; exact dec
+  sums (two routes); exact dec / float comparison; `counter_1000` — one
+  cell edit under 1000 aggregates evaluates each MA's row exactly twice
+  (old, new), builds none, rescans no leaf, and removing the max's
+  extreme rescans one leaf per max MA; `groups_rows` — group values,
+  listing, a two-row insert and a delete as deltas, undo; `annotation` —
+  the stand-in, x_of / hit before it, keystrokes, a half-typed error,
+  Source, a table cell (its column widens), no bytes.
+- `wb_prop_smoke` (new, in `@smoke` / `@smoke_inline`): 4 seeds × 1500
+  random steps over an MA-heavy workbook — cell edits with int / dec /
+  float values including 1e308, 4.9e-324, -0e0, 1e999 (inf), NaN from
+  `@x - @x`, huge decs, text, errors; keystrokes; param changes that flip
+  predicates; calc formula changes; row inserts, deletes, swaps, 3-row
+  deletes; header edits (reparse); undo / redo. After every step, every
+  value and every MA of every formula (floats as raw bits) equals a
+  workbook built from scratch.
+- `tui_pty_test.py wb_annotation`: the annotation in a terminal —
+  appears, dims, follows keystrokes (`+`, `1`, `0`: `#parse`, `5`, `14`),
+  a half-typed error, Source, a table cell, the cursor before it, gone
+  when the caret leaves, never in the file.
+
+### Perf
+
+`wb_perf`, release, same shared host, base (W0, `b8b7e3e`) and W2
+interleaved, best p50 of 4 runs: 3000 rows × 7 columns, 9 000 row
+formulas, 10 calc aggregates (the `aggs` workbook adds 1000 calc
+aggregates over one column).
+
+| Op | W0 | W2 | Notes |
+|---|---|---|---|
+| one cell edit, 1000 aggregates over its column | 101 ms | **0.70 ms** | each MA: one O(1) delta (2 row evaluations) |
+| one literal edit | 0.94 ms | 0.22 ms | the 10 aggregates take deltas, no rescan |
+| a new row / its delete | 14.8 ms | 1.95 ms | row path, no reparse (regraph for the row's formulas) |
+| a param a `where` reads (`k`) | 0.34 ms | 0.45 ms | that MA's one walk (W0 rescanned too; the MA also rebuilds its leaves) |
+| one formula edit (edges change) | 1.9 ms | 1.6 ms | |
+| one prose keystroke | 0.004 ms | 0.004 ms | |
+| open, 3000 rows | 66 ms | 68 ms | MAs built in the initial pass |
+| open, + 1000 aggregates | 154 ms | 180 ms | 1000 walks either way; MA bookkeeping |
+| keystroke in a table cell, type + Rich relayout | 2.79 ms | 2.06 ms | plain `.md`: 1.75 ms |
+| keystroke at a formula's end (annotation on in W2) | 3.92 ms | 3.72 ms | plain `.md`: 1.76 ms |
+
+**Decisions.**
+
+- W2 before W1, for embedded tables, over leaves shaped like W1's.
+- One MA per aggregate occurrence (not shared across formulas): errors
+  raised inside keep naming their formula (`in Targets.actual[2]`), as in
+  W0. The §4 rewrite of `where region = @region` across rows into one
+  group MA is not automatic; `group` is explicit.
+- Old contributions come from the values before the recalc, not from
+  stored per-row state: no memory per row × MA.
+- A scalar input's change rebuilds the MA with one walk; zone maps are
+  not built.
+- Group lookups are `G[key = value].out` (the design's keyed-lookup form).
+- The annotation widens a table column rather than wrapping in it.
+
+**Limits (W2).** `first` / lookups rescan (W3 key index). Zone maps are
+not built. Editing a group's definition reparses the workbook (its
+readers bind its outputs by name). Inserts into a table with no body
+rows reparse. A scalar input's change costs its MA one walk of the table
+(≤ 10 000 rows for an embedded table).
 
 ## Locks
 
@@ -739,5 +986,5 @@ and hover are later phases.
 | Build | Dest-live Scan-table row; two-state parallel parse; publish at `@stage`; partial is `pending`, never final |
 | Persistence | `RTXI` in the cache dir; identity triple + schema/parser hash + sampled leaf hashes; unknown ver ignored |
 | Edits | `replace` hook on the table doc; cancel+wait a live build, patch built leaves, re-kick |
-| Arithmetic | `dec` exact i128; `float` exact expansion, rounded once; results independent of edit history |
+| Arithmetic | `dec` exact (per-scale i128, a 256-bit total); `float` exact superaccumulator, rounded once (NaN / ±inf by count); results independent of edit history and row order |
 | Non-goals | A1 grids, macros, volatile functions, collaborative OT, server engines, writing values into CSVs |
