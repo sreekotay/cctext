@@ -1,0 +1,397 @@
+#!ccc ccs
+/*
+ * Workbook W2 property smoke (docs/workbook.md "W2 as built"): after
+ * every random step — cell edits with int / dec / float values including
+ * extremes, NaN, +-inf, huge / tiny magnitudes, keystrokes, predicate
+ * flips, param changes, row inserts / deletes / moves, formula changes,
+ * undo / redo — every value, and every maintained aggregate (MA) of every
+ * formula, is bit-identical to a workbook built from scratch from the
+ * same bytes: floats compared as raw bits. Several seeds.
+ *
+ *   ./bin/wb_prop_smoke [steps per seed]     (default 1500)
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/document.cch"
+#include "../core/wb.cch"
+
+static int fails = 0;
+static uint64_t rng;
+
+static uint64_t rnd(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+}
+
+static size_t rnd_n(size_t n) {
+    return n ? (size_t)(rnd() % n) : 0;
+}
+
+static char *doc_bytes(RtxDoc *d, size_t *out_n) {
+    size_t n = d->len();
+    char *p = (char *)malloc(n + 1);
+    *out_n = 0;
+    if (!p) return NULL;
+    if (n) {
+        size_t got = d->read_at(0, cc_slice_from_buffer(p, n)) ?> 0;
+        if (got != n) {
+            free(p);
+            return NULL;
+        }
+    }
+    p[n] = 0;
+    *out_n = n;
+    return p;
+}
+
+static int rep(RtxDoc *d, size_t off, size_t n, const char *s) {
+    size_t sn = strlen(s);
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    d->replace(off, n, sn ? cc_slice_from_buffer((char *)s, sn) : cc_slice_empty()) !>;
+    return 1;
+}
+
+static void undo(RtxDoc *d) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return;
+    }
+    if (d->can_undo()) d->undo() !>;
+}
+
+static void redo(RtxDoc *d) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return;
+    }
+    if (d->can_redo()) d->redo() !>;
+}
+
+#define DUMP_CAP (4u << 20)
+static char g_a[DUMP_CAP];
+static char g_b[DUMP_CAP];
+
+static const char g_src[] =
+    "# P\n"
+    "\n"
+    "Aggregates over one table: sums, extremes, filters, groups.\n"
+    "\n"
+    "```params\n"
+    "k = 3\n"
+    "lim = 2.5\n"
+    "asof = 2026-03-01\n"
+    "```\n"
+    "\n"
+    "Table: A\n"
+    "\n"
+    "| id | g | x | y | d | f |\n"
+    "|----|---|---|---|---|---|\n"
+    "%s"
+    "\n"
+    "Prose between.\n"
+    "\n"
+    "```calc\n"
+    "s1 = sum(A.x)\n"
+    "s2 = sum(A.y)\n"
+    "s3 = sum?(A.f)\n"
+    "s4 = sum(A.x where g = \"a\")\n"
+    "s5 = avg(A.y where d >= asof)\n"
+    "s6 = min(A.x)\n"
+    "s7 = max(A.y where x > lim)\n"
+    "s8 = count(A where y > k)\n"
+    "s9 = distinct(A.g)\n"
+    "s10 = distinct(A.x)\n"
+    "s11 = any(A.x > 0)\n"
+    "s12 = all(A.y > -100)\n"
+    "s13 = sum?(A.x + A.y)\n"
+    "s14 = min?(A.f)\n"
+    "s15 = max?(A.f where f > s1 / 100)\n"
+    "s16 = count(A)\n"
+    "s17 = avg?(A.f)\n"
+    "s18 = sum(A.y where g != \"b\") + sum(A.y where g = \"b\")\n"
+    "by = group A by g { n: count(), t: sum(x), lo: min(y), hi: max(x), u: distinct(y), e: sum(f) }\n"
+    "ga = by[g = \"a\"].t\n"
+    "gb = by[g = \"b\"].hi\n"
+    "gc = by[g = \"c\"].e\n"
+    "```\n"
+    "\n"
+    "Tail.\n";
+
+static const char *const g_x[] = {
+    "1", "-1", "0", "2.5", "1e308", "-1e308", "1e-320", "-0e0", "1e999", "-1e999", "0.1", "0.2",
+    "0.3", "123456789.125", "4.9e-324", "1.7976931348623157e308", "3", "-7", "", "x", "=1/0",
+    "=@y", "=@y * 1.5", "2.2250738585072014e-308", "9007199254740993", "=@x", "1e16", "-1e16"};
+static const char *const g_y[] = {
+    "12.50", "-3.25", "0.01", "100", "9223372036854775807", "92233720368547758.07",
+    "0.000000000000000001", "", "=@x", "=1/0", "7", "-7.5", "0.1", "1.10", "=@y", "zz"};
+static const char *const g_g[] = {"a", "b", "c", "", "=@y", "=@x", "1", "1.0", "a", "b", "=1/0"};
+static const char *const g_d[] = {"2026-01-01", "2026-03-01", "2026-06-30", "", "2025-12-31",
+                                  "2026-02-28"};
+static const char *const g_f[] = {
+    "=@x * 2", "=@y / @x", "=@x - @x", "=sum(A.x where id < @id)", "=@y + @x",
+    "=count(A where g = @g)", "", "7", "=max(A.y where g = @g)", "=@x * @x", "=s2 + @y"};
+static const char *const g_k[] = {"3", "0", "-1", "100", "2.5", "1e300"};
+static const char *const g_lim[] = {"2.5", "0", "1e300", "-1e300", "0.3"};
+static const char *const g_asof[] = {"2026-03-01", "2025-01-01", "2027-01-01", "2026-02-28"};
+static const char *const g_calc[] = {
+    "sum(A.x)", "sum(A.y where x > lim)", "min(A.y)", "max(A.x where g = \"a\")", "count(A.f)",
+    "distinct(A.y)", "avg(A.x)", "sum(A.x where d < asof) - sum(A.x where d >= asof)", "s1 + 1"};
+
+#define N_OF(a) (sizeof(a) / sizeof((a)[0]))
+
+static const char *pick(const char *const *a, size_t n) {
+    return a[rnd_n(n)];
+}
+
+static void row_text(char *buf, size_t cap, int id) {
+    snprintf(buf, cap, "| %d | %s | %s | %s | %s | %s |\n", id, pick(g_g, N_OF(g_g)),
+             pick(g_x, N_OF(g_x)), pick(g_y, N_OF(g_y)), pick(g_d, N_OF(g_d)),
+             pick(g_f, N_OF(g_f)));
+}
+
+/* Row lines of table A: [lo, hi) without NL. */
+static size_t rows_of(const char *p, size_t n, size_t *lo, size_t *hi, size_t cap) {
+    const char *t = strstr(p, "Table: A\n"), *sep;
+    size_t k = 0, at;
+    if (!t) return 0;
+    sep = strstr(t, "|----");
+    if (!sep) return 0;
+    at = (size_t)(strchr(sep, '\n') - p) + 1;
+    while (at < n && p[at] == '|' && k < cap) {
+        size_t e = at;
+        while (e < n && p[e] != '\n') e++;
+        lo[k] = at;
+        hi[k] = e;
+        k++;
+        at = e + 1;
+    }
+    return k;
+}
+
+/* Cell c (0-based) of the row line [lo, hi): the bytes between its pipes. */
+static int cell_of(const char *p, size_t lo, size_t hi, size_t c, size_t *clo, size_t *chi) {
+    size_t i, k = 0;
+    *clo = *chi = 0;
+    for (i = lo; i < hi; i++) {
+        if (p[i] != '|') continue;
+        if (k == c + 1) {
+            *chi = i;
+            return 1;
+        }
+        k++;
+        if (k == c + 1) *clo = i + 1;
+    }
+    return 0;
+}
+
+/* `name = ` line in a fence: the expression after it. */
+static int def_of(const char *p, const char *name, size_t *elo, size_t *ehi) {
+    char key[64];
+    const char *h;
+    snprintf(key, sizeof key, "\n%s = ", name);
+    h = strstr(p, key);
+    if (!h) return 0;
+    *elo = (size_t)(h - p) + strlen(key);
+    *ehi = *elo;
+    while (p[*ehi] && p[*ehi] != '\n') (*ehi)++;
+    return 1;
+}
+
+static int step(RtxDoc *d, int i) {
+    size_t n = 0, lo[512], hi[512], nr, a, b;
+    char *p = doc_bytes(d, &n);
+    int kind = (int)rnd_n(100), ok = 1;
+    char buf[512];
+    if (!p) return 0;
+    nr = rows_of(p, n, lo, hi, 512);
+    if (kind < 40 && nr) {
+        size_t r = rnd_n(nr), c = rnd_n(6);
+        static const char *const *pools[6] = {NULL, g_g, g_x, g_y, g_d, g_f};
+        static const size_t npool[6] = {0, N_OF(g_g), N_OF(g_x), N_OF(g_y), N_OF(g_d), N_OF(g_f)};
+        if (cell_of(p, lo[r], hi[r], c, &a, &b)) {
+            if (c == 0) snprintf(buf, sizeof buf, " %d ", (int)rnd_n(60));
+            else snprintf(buf, sizeof buf, " %s ", pick(pools[c], npool[c]));
+            ok = rep(d, a, b - a, buf);
+        }
+    } else if (kind < 52 && nr) {
+        /* a keystroke or a backspace inside a cell */
+        size_t r = rnd_n(nr), c = 1 + rnd_n(5);
+        if (cell_of(p, lo[r], hi[r], c, &a, &b) && b > a) {
+            size_t at = a + rnd_n(b - a);
+            static const char keys[] = "0123456789.-e1x";
+            if (rnd_n(3) == 0 && at > a && p[at] != '|') ok = rep(d, at, 1, "");
+            else {
+                char ch[2] = {keys[rnd_n(sizeof keys - 1)], 0};
+                ok = rep(d, at, 0, ch);
+            }
+        }
+    } else if (kind < 62) {
+        /* a param: the predicates flip */
+        static const char *const names[] = {"k", "lim", "asof"};
+        size_t w = rnd_n(3);
+        if (def_of(p, names[w], &a, &b))
+            ok = rep(d, a, b - a,
+                     w == 0 ? pick(g_k, N_OF(g_k)) : w == 1 ? pick(g_lim, N_OF(g_lim))
+                                                          : pick(g_asof, N_OF(g_asof)));
+    } else if (kind < 66) {
+        /* a calc formula changes */
+        char nm[8];
+        snprintf(nm, sizeof nm, "s%d", 1 + (int)rnd_n(18));
+        if (def_of(p, nm, &a, &b)) ok = rep(d, a, b - a, pick(g_calc, N_OF(g_calc)));
+    } else if (kind < 74 && nr < 200) {
+        size_t r = rnd_n(nr + 1);
+        row_text(buf, sizeof buf, (int)rnd_n(60));
+        ok = rep(d, r < nr ? lo[r] : hi[nr - 1] + 1, 0, buf);
+    } else if (kind < 80 && nr > 1) {
+        size_t r = rnd_n(nr);
+        ok = rep(d, lo[r], hi[r] - lo[r] + 1, "");
+    } else if (kind < 83 && nr > 2) {
+        /* move: two adjacent rows swap in one replace */
+        size_t r = rnd_n(nr - 1), l1 = hi[r] - lo[r], l2 = hi[r + 1] - lo[r + 1];
+        char *sw = (char *)malloc(l1 + l2 + 3);
+        if (sw) {
+            memcpy(sw, p + lo[r + 1], l2);
+            sw[l2] = '\n';
+            memcpy(sw + l2 + 1, p + lo[r], l1);
+            sw[l1 + l2 + 1] = '\n';
+            sw[l1 + l2 + 2] = 0;
+            ok = rep(d, lo[r], l1 + l2 + 2, sw);
+            free(sw);
+        }
+    } else if (kind < 85 && nr > 3) {
+        /* several rows at once */
+        size_t r = rnd_n(nr - 2);
+        ok = rep(d, lo[r], hi[r + 2] - lo[r] + 1, "");
+    } else if (kind < 86) {
+        /* the header: a reparse */
+        const char *h = strstr(p, "|  id | g |");
+        if (h) ok = rep(d, (size_t)(h - p) + 1, 1, "");
+        else if ((h = strstr(p, "| id | g |")) != NULL) ok = rep(d, (size_t)(h - p) + 1, 0, " ");
+    } else if (kind < 94) {
+        undo(d);
+    } else {
+        redo(d);
+    }
+    (void)i;
+    free(p);
+    return ok;
+}
+
+static void run_seed(uint64_t seed, int steps) {
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats st;
+    char rows[64 * 64], *src;
+    size_t at = 0, srcn;
+    int s, bad = 0, r;
+    const int flags = RTX_WB_DUMP_BITS | RTX_WB_DUMP_MAS;
+    CCArena keep_a;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    rng = seed;
+    for (r = 0; r < 40; r++) {
+        row_text(rows + at, sizeof rows - at, r + 1);
+        at += strlen(rows + at);
+    }
+    srcn = sizeof g_src + at + 16;
+    src = (char *)malloc(srcn);
+    if (!src) return;
+    snprintf(src, srcn, g_src, rows);
+    srcn = strlen(src);
+    keep_a = cc_arena_heap(srcn + 64);
+    {
+        char[:] sl = cc_slice_from_buffer(src, srcn);
+        char[:] keep = sl.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    free(src);
+    wb = rtx_wb_attach(&d);
+    if (!wb) {
+        fprintf(stderr, "FAIL: attach\n");
+        fails++;
+        return;
+    }
+    for (s = 0; s < steps && bad < 3; s++) {
+        size_t n = 0, la, lb;
+        char *p;
+        RtxDoc x = {0};
+        RtxWb *xw;
+        if (!step(&d, s)) {
+            fprintf(stderr, "FAIL: seed %llx step %d: edit\n", (unsigned long long)seed, s);
+            fails++;
+            bad++;
+            continue;
+        }
+        p = doc_bytes(&d, &n);
+        la = rtx_wb_dump_ex(wb, &d, flags, g_a, sizeof g_a);
+        {
+            CCArena sa = cc_arena_heap(n + 64);
+            char[:] sl = cc_slice_from_buffer(p, n);
+            char[:] keep = sl.clone_into(sa) !>;
+            x.from_buffer(keep) !>;
+            xw = rtx_wb_attach(&x);
+            lb = rtx_wb_dump_ex(xw, &x, flags, g_b, sizeof g_b);
+            RtxDoc_destroy(&x);
+            sa.destroy();
+        }
+        if (la != lb || memcmp(g_a, g_b, la) != 0) {
+            size_t i = 0, line = 1, ls = 0;
+            while (i < la && i < lb && g_a[i] == g_b[i]) {
+                if (g_a[i] == '\n') {
+                    line++;
+                    ls = i + 1;
+                }
+                i++;
+            }
+            fprintf(stderr,
+                    "FAIL: seed %llx step %d: incremental != scratch at dump line %zu\n"
+                    "  inc:     %.*s\n  scratch: %.*s\n",
+                    (unsigned long long)seed, s, line, (int)(strchr(g_a + ls, '\n') ? strchr(g_a + ls, '\n') - (g_a + ls) : 0),
+                    g_a + ls, (int)(strchr(g_b + ls, '\n') ? strchr(g_b + ls, '\n') - (g_b + ls) : 0),
+                    g_b + ls);
+            if (getenv("WB_PROP_VERBOSE")) fprintf(stderr, "--- doc\n%s\n", p);
+            fails++;
+            bad++;
+        }
+        free(p);
+    }
+    rtx_wb_stats(wb, &d, &st);
+    printf("wb_prop_smoke seed %llx: %d steps, rebuilds %zu, cell %zu, line %zu, rows %zu, "
+           "prose %zu, MA builds %zu, deltas %zu, rescans %zu, MAs %zu\n",
+           (unsigned long long)seed, s, st.rebuilds, st.fast_cell, st.fast_line, st.fast_rows,
+           st.fast_prose, st.ma_full, st.ma_delta, st.ma_rescan, st.mas);
+    if (st.fast_rows < (size_t)steps / 20 || st.fast_cell < (size_t)steps / 5 ||
+        st.ma_delta < (size_t)steps) {
+        fprintf(stderr, "FAIL: seed %llx: fast paths not exercised\n", (unsigned long long)seed);
+        fails++;
+    }
+    RtxDoc_destroy(&d);
+    keep_a.destroy();
+}
+
+int main(int argc, char **argv) {
+    int steps = argc > 1 ? atoi(argv[1]) : 1500;
+    static const uint64_t seeds[] = {0x9E3779B97F4A7C15ull, 0xD1B54A32D192ED03ull,
+                                     0x243F6A8885A308D3ull, 0x13198A2E03707344ull};
+    size_t i;
+    if (steps < 1) steps = 1;
+    for (i = 0; i < sizeof seeds / sizeof seeds[0]; i++) run_seed(seeds[i], steps);
+    if (fails) {
+        fprintf(stderr, "wb_prop_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("wb_prop_smoke: ok\n");
+    return 0;
+}

@@ -22,6 +22,7 @@
 #include "../core/document.cch"
 #include "../core/layout.cch"
 #include "../core/wb.cch"
+#include "../core/wb_num.cch"
 
 static int fails = 0;
 
@@ -801,6 +802,267 @@ static void too_big(void) {
     free(p);
 }
 
+/* ------------------------------------------------ W2: exact arithmetic */
+
+static double bits_d(uint64_t b) {
+    double f;
+    memcpy(&f, &b, sizeof f);
+    return f;
+}
+
+static uint64_t d_bits(double f) {
+    uint64_t b;
+    memcpy(&b, &f, sizeof b);
+    return b;
+}
+
+/* testdata/wb/xsum.txt (tests/wb_xsum_gen.py: Python's exact Fraction sums,
+ * rounded once): each float set summed forward, backward, shuffled, with
+ * junk added then subtracted, and as two merged halves — all must round to
+ * the same bits. */
+static void xsum(void) {
+    size_t n = 0, lines = 0;
+    char *txt = read_file("testdata/wb/xsum.txt", &n), *line, *save = NULL;
+    static double fs[10000];
+    static int64_t dv[64];
+    static int dsc[64];
+    if (!txt) {
+        expect(0, "xsum fixture");
+        return;
+    }
+    for (line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char kind = line[0];
+        char *p = line + 2, *e;
+        lines++;
+        if (kind == 'F' || kind == 'M') {
+            uint64_t want = strtoull(p, &e, 16);
+            size_t nf = strtoul(e, &e, 10), nd = 0, i, pass;
+            for (i = 0; i < nf && i < 10000; i++) fs[i] = bits_d(strtoull(e, &e, 16));
+            if (kind == 'M') {
+                nd = strtoul(e, &e, 10);
+                for (i = 0; i < nd && i < 64; i++) {
+                    dv[i] = strtoll(e, &e, 10);
+                    dsc[i] = (int)strtol(e + 1, &e, 10);
+                }
+            }
+            for (pass = 0; pass < 5; pass++) {
+                RtxXs x, y;
+                RtxXd dd;
+                double got;
+                rtx_xs_zero(&x);
+                rtx_xs_zero(&y);
+                rtx_xd_zero(&dd);
+                if (pass == 2)
+                    for (i = nf; i > 1; i--) {
+                        size_t j = rnd_n(i);
+                        double t = fs[i - 1];
+                        fs[i - 1] = fs[j];
+                        fs[j] = t;
+                    }
+                for (i = 0; i < nf; i++) {
+                    size_t k = pass == 1 ? nf - 1 - i : i;
+                    if (pass == 3) {
+                        /* junk in, then out: subtraction is exact */
+                        double junk = bits_d(rnd() & 0x7fefffffffffffffull);
+                        rtx_xs_add(&x, junk, 1);
+                        rtx_xs_add(&x, fs[k], 1);
+                        rtx_xs_add(&x, junk, -1);
+                    } else if (pass == 4) {
+                        rtx_xs_add(i % 2 ? &y : &x, fs[k], 1);
+                    } else {
+                        rtx_xs_add(&x, fs[k], 1);
+                    }
+                }
+                if (pass == 4) rtx_xs_merge(&x, &y, 1);
+                for (i = 0; i < nd; i++) rtx_xd_add(&dd, dv[i], dsc[i], 1);
+                got = kind == 'M' ? rtx_xs_round_mixed(&x, &dd) : rtx_xs_round(&x);
+                if (d_bits(got) != want) {
+                    fprintf(stderr, "FAIL: xsum line %zu pass %zu: got %016llx want %016llx\n", lines,
+                            pass, (unsigned long long)d_bits(got), (unsigned long long)want);
+                    fails++;
+                    break;
+                }
+            }
+        } else if (kind == 'D') {
+            int sc = (int)strtol(p, &e, 10), ok;
+            char want[32];
+            size_t nd, i;
+            RtxXd dd;
+            int64_t got = 0;
+            while (*e == ' ') e++;
+            for (i = 0; *e && *e != ' ' && i < sizeof want - 1; i++) want[i] = *e++;
+            want[i] = 0;
+            nd = strtoul(e, &e, 10);
+            rtx_xd_zero(&dd);
+            for (i = 0; i < nd; i++) {
+                int64_t v = strtoll(e, &e, 10);
+                int s = (int)strtol(e + 1, &e, 10);
+                rtx_xd_add(&dd, v, s, 1);
+                rtx_xd_add(&dd, 777, 5, 1); /* junk in and out */
+                rtx_xd_add(&dd, 777, 5, -1);
+            }
+            ok = rtx_xd_get(&dd, sc, &got);
+            if (!strcmp(want, "X") ? ok : (!ok || got != strtoll(want, NULL, 10))) {
+                fprintf(stderr, "FAIL: xsum line %zu: dec sum %lld (ok %d) want %s\n", lines,
+                        (long long)got, ok, want);
+                fails++;
+            }
+        } else if (kind == 'C') {
+            int want = (int)strtol(p, &e, 10);
+            int64_t v = strtoll(e, &e, 10);
+            int sc = (int)strtol(e, &e, 10);
+            double f = bits_d(strtoull(e, &e, 16));
+            int got = rtx_num_cmp_dec_f(v, sc, f);
+            if (got != want) {
+                fprintf(stderr, "FAIL: xsum line %zu: cmp %d want %d\n", lines, got, want);
+                fails++;
+            }
+        }
+    }
+    expect(lines > 200, "xsum fixture lines");
+    free(txt);
+}
+
+/* One cell edit under 1000 aggregates of its column: every MA takes an
+ * O(1) delta (two contribution evaluations: the row's old and new), none
+ * walks the table; then lowering that row (the max's best) rescans only
+ * its leaf. */
+static void counter_1000(void) {
+    size_t cap = 256u << 10, at = 0, off, i;
+    char *src = (char *)malloc(cap);
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats s0, s1;
+    CCArena keep_a;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        free(src);
+        return;
+    }
+    if (!src) return;
+    at += (size_t)snprintf(src + at, cap - at, "# C\n\nTable: T\n\n| id | v |\n|----|---|\n");
+    for (i = 0; i < 500; i++) at += (size_t)snprintf(src + at, cap - at, "| %zu | %zu |\n", i, i % 7);
+    at += (size_t)snprintf(src + at, cap - at, "\n```calc\n");
+    for (i = 0; i < 1000; i++) {
+        if (i < 700) at += (size_t)snprintf(src + at, cap - at, "s%zu = sum(T.v where id > %zu)\n", i, i % 500);
+        else if (i < 800) at += (size_t)snprintf(src + at, cap - at, "s%zu = avg(T.v where id < %zu)\n", i, i % 500);
+        else if (i < 900) at += (size_t)snprintf(src + at, cap - at, "s%zu = count(T where v > %zu)\n", i, i % 7);
+        else at += (size_t)snprintf(src + at, cap - at, "s%zu = max(T.v where id >= %zu)\n", i, i % 300);
+    }
+    at += (size_t)snprintf(src + at, cap - at, "```\n");
+    keep_a = cc_arena_heap(at + 64);
+    {
+        char[:] sl = cc_slice_from_buffer(src, at);
+        char[:] keep = sl.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    wb = rtx_wb_attach(&d);
+    if (!wb) {
+        expect(0, "counter_1000 attach");
+        free(src);
+        return;
+    }
+    rtx_wb_stats(wb, &d, &s0);
+    expect(s0.mas == 1000 && s0.ma_full == 1000, "1000 MAs, each built by one walk at open");
+    /* row 350: v = 0 (350 % 7) -> 100, a new maximum: no leaf loses its best */
+    off = find_off(&d, "| 350 | 0 |", 0);
+    expect(off != (size_t)-1 && rep(&d, off + 8, 1, "100"), "edit v[351]");
+    rtx_wb_stats(wb, &d, &s1);
+    if (s1.ma_rows - s0.ma_rows != 2000 || s1.ma_full != s0.ma_full || s1.ma_rescan != s0.ma_rescan)
+        fprintf(stderr, "FAIL: 1000 MAs: rows %zu full %zu rescans %zu\n", s1.ma_rows - s0.ma_rows,
+                s1.ma_full - s0.ma_full, s1.ma_rescan - s0.ma_rescan);
+    expect(s1.ma_rows - s0.ma_rows == 2000, "each MA evaluates the row twice (old, new): O(1)");
+    expect(s1.ma_full == s0.ma_full, "no MA walks its table");
+    expect(s1.ma_rescan == s0.ma_rescan, "no leaf rescan");
+    expect(s1.fast_cell == s0.fast_cell + 1 && s1.rebuilds == s0.rebuilds, "one cell fast path");
+    check_eval(wb, &d, "s950", "100");
+    /* back to 0: the max MAs covering row 350 lost their best: one leaf each */
+    rtx_wb_stats(wb, &d, &s0);
+    expect(rep(&d, off + 8, 3, "0"), "edit v[351] back");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.ma_full == s0.ma_full, "removing the extreme walks no table");
+    expect(s1.ma_rescan - s0.ma_rescan == 100 && s1.ma_rows - s0.ma_rows <= 2000 + 100 * 128,
+           "each max MA rescans one leaf");
+    check_eval(wb, &d, "s950", "6");
+    RtxDoc_destroy(&d);
+    keep_a.destroy();
+    free(src);
+}
+
+/* group, distinct, and a row insert / delete as deltas (no reparse). */
+static void groups_rows(void) {
+    static const char src[] =
+        "# G\n\n"
+        "Table: S\n\n"
+        "| region | amount | n |\n"
+        "|--------|--------|---|\n"
+        "| EU     | 10.50  | 1 |\n"
+        "| US     | 20.25  | 2 |\n"
+        "| EU     | 1.25   | 3 |\n"
+        "| APAC   | 7.00   | 4 |\n"
+        "\n"
+        "```calc\n"
+        "by = group S by region { n: count(), total: sum(amount), top: max(amount) }\n"
+        "eu = by[region = \"EU\"].total\n"
+        "eu_n = by[region = \"EU\"].n\n"
+        "top_us = by[region = \"US\"].top\n"
+        "none = by[region = \"LATAM\"].total\n"
+        "k = distinct(S.region)\n"
+        "tot = sum(S.amount)\n"
+        "```\n";
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats s0, s1;
+    size_t off;
+    CCArena keep_a = cc_arena_heap(sizeof src + 64) @destroy;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    {
+        char[:] sl = cc_slice_from_buffer((char *)src, sizeof src - 1);
+        char[:] keep = sl.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    wb = rtx_wb_attach(&d);
+    if (!wb) {
+        expect(0, "groups attach");
+        return;
+    }
+    check_eval(wb, &d, "eu", "11.75");
+    check_eval(wb, &d, "eu_n", "2");
+    check_eval(wb, &d, "top_us", "20.25");
+    check_eval(wb, &d, "none", "null");
+    check_eval(wb, &d, "k", "3");
+    rtx_wb_dump(wb, &d, g_dump, sizeof g_dump);
+    expect(strstr(g_dump, "G.by = {\"APAC\": n=1, total=7.00, top=7.00; \"EU\": n=2, total=11.75, "
+                          "top=10.50; \"US\": n=1, total=20.25, top=20.25}") != NULL,
+           "group listing in key order");
+    rtx_wb_stats(wb, &d, &s0);
+    off = find_off(&d, "| US ", 0);
+    expect(rep(&d, off, 0, "| EU     | 100.00 | 5 |\n| LATAM  | 3.00   | 6 |\n"), "insert two rows");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.rebuilds == s0.rebuilds && s1.fast_rows == s0.fast_rows + 1, "rows: no reparse");
+    expect(s1.ma_full == s0.ma_full, "rows: no MA walk");
+    check_eval(wb, &d, "eu", "111.75");
+    check_eval(wb, &d, "none", "3.00");
+    check_eval(wb, &d, "k", "4");
+    check_eval(wb, &d, "tot", "142.00");
+    /* delete the EU 100.00 row */
+    off = find_off(&d, "| EU     | 100.00", 0);
+    rtx_wb_stats(wb, &d, &s0);
+    expect(rep(&d, off, strlen("| EU     | 100.00 | 5 |\n"), ""), "delete a row");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.rebuilds == s0.rebuilds && s1.ma_full == s0.ma_full, "delete: a delta");
+    check_eval(wb, &d, "eu", "11.75");
+    check_eval(wb, &d, "tot", "42.00");
+    expect(undo(&d), "undo the delete");
+    check_eval(wb, &d, "eu", "111.75");
+    RtxDoc_destroy(&d);
+}
+
 int main(void) {
     fixture("revenue");
     fixture("checks");
@@ -812,6 +1074,9 @@ int main(void) {
     rename_rt();
     property();
     too_big();
+    xsum();
+    counter_1000();
+    groups_rows();
     if (fails) {
         fprintf(stderr, "wb_smoke: %d failure(s)\n", fails);
         return 1;
