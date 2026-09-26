@@ -15,6 +15,13 @@
 #include "slides.cch"
 #include "lf.cch"
 #include <stdatomic.h>
+#include <time.h>
+
+static long rtx_batch_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
 
 enum { RTX_BATCH_PRINT_DEFAULT = 40 };
 
@@ -435,6 +442,12 @@ static RtxProj *rtx_batch_proj(RtxWs *w, unsigned flags, int rewalk, int wait_wa
         }
     }
     rtx_proj_open(g_bproj, cc_slice_cstr(root), flags) !>;
+    {
+        /* The search index file: only with Safe on (`--safe`), like the
+         * journals (the Safe dir, never the project). */
+        char cache[RTX_PROJ_PATH];
+        if (rtx_safe_dir(cache, sizeof cache)) rtx_proj_index_dir(g_bproj, cache);
+    }
     /* project-search does not wait: its arms chase the walk. */
     if (wait_walk) rtx_proj_finish(g_bproj) !>;
     return g_bproj;
@@ -538,12 +551,85 @@ static int rtx_batch_project_files(RtxWs *w, const char *arg, FILE *out, FILE *e
     return RTX_BATCH_OK;
 }
 
-/* project-search [--regex] [--icase] [--word] [--no-ignore] [--max-size N] [--] QUERY
+/* project-index [--pct N] [--update] [--lanes N]
+ * Build the project's search index in the Safe cache dir (needs
+ * `--safe`), or update it (only the changed blocks; a full build when
+ * there is none or too much changed), then report its size and cost. */
+static int rtx_batch_project_index(RtxWs *w, const char *arg, FILE *out, FILE *err) {
+    RtxProj *p;
+    const char *rest = arg;
+    int ok, bad = 0, upd = 0;
+    unsigned long long lanes = 0;
+    const RtxSiBuildOut *r;
+    @errhandler(CCError e) {
+        return rtx_batch_fail(err, e.message ? e.message : "project-index");
+    }
+    for (;;) {
+        const char *s = rtx_batch_skip_ws(rest);
+        if (rtx_batch_flag(s, "--pct")) {
+            char num[32];
+            size_t nn = 0;
+            unsigned long long v = 0;
+            if (!rtx_batch_arg(s + 5, num, sizeof num, &nn, &rest, &bad) || bad ||
+                !rtx_batch_parse_u64(num, &v) || v < 1 || v > 50)
+                return rtx_batch_fail(err, "project-index: --pct 1-50");
+            rtx_si_set_pct((long)v);
+        } else if (rtx_batch_flag(s, "--lanes")) {
+            char num[32];
+            size_t nn = 0;
+            if (!rtx_batch_arg(s + 7, num, sizeof num, &nn, &rest, &bad) || bad ||
+                !rtx_batch_parse_u64(num, &lanes) || lanes < 1 || lanes > 8)
+                return rtx_batch_fail(err, "project-index: --lanes 1-8");
+        } else if (rtx_batch_flag(s, "--update")) {
+            upd = 1;
+            rest = s + 8;
+        } else {
+            rest = s;
+            break;
+        }
+    }
+    if (rest && rest[0])
+        return rtx_batch_fail(err, "project-index [--pct N] [--update] [--lanes N]");
+    p = rtx_batch_proj(w, 0, 0, 1, err);
+    if (!p) return RTX_BATCH_ERR;
+    if (!p->si_path[0])
+        return rtx_batch_fail(err, "project-index: needs --safe (the index lives in the Safe dir)");
+    ok = rtx_proj_index_build_mode(p, upd, (int)lanes) !>;
+    r = &p->si_last;
+    if (!ok) return rtx_batch_fail(err, r->err ? r->err : "project-index failed");
+    fprintf(out, "# index: %u files, %llu bytes indexed; %llu B (%.2f%% of them; budget %llu B)"
+                 " = file table %llu (%.3f%%) + unit dir %llu + filters %llu\n",
+            r->files, (unsigned long long)r->corpus, (unsigned long long)r->bytes,
+            r->corpus ? 100.0 * (double)r->bytes / (double)r->corpus : 0.0,
+            (unsigned long long)r->budget, (unsigned long long)r->ftab_bytes,
+            r->corpus ? 100.0 * (double)r->ftab_bytes / (double)r->corpus : 0.0,
+            (unsigned long long)r->udir_bytes, (unsigned long long)r->filt_bytes);
+    fprintf(out, "# index: %u units (%u blocks, %u chunks), %llu distinct trigrams (per unit,"
+                 " summed), fill %.3f; peak %.1f MiB\n",
+            r->units, r->blocks, r->chunks, (unsigned long long)r->distinct, r->fill,
+            (double)r->peak / 1048576.0);
+    if (r->update)
+        fprintf(out, "# update: %u same, %u changed, %u new, %u gone files; %u units re-read,"
+                     " %u new; %llu bytes read; stat %ld ms, read %ld ms, write %ld ms,"
+                     " total %ld ms (the last full build: %ld ms)\n",
+                r->upd_same, r->upd_changed, r->upd_new, r->upd_gone, r->upd_dirty,
+                r->upd_tail, (unsigned long long)r->upd_bytes, r->ms_stat, r->ms_pass2,
+                r->ms_write, r->ms, r->full_ms);
+    else
+        fprintf(out, "# build%s%s%s: pass 1 %ld ms, pass 2 %ld ms, write %ld ms, total %ld ms\n",
+                r->why_full ? " (update: " : "", r->why_full ? r->why_full : "",
+                r->why_full ? ")" : "", r->ms_pass1, r->ms_pass2, r->ms_write, r->ms);
+    return RTX_BATCH_OK;
+}
+
+/* project-search [--regex] [--icase] [--word] [--no-ignore] [--max-size N]
+ *                [--stats] [--] QUERY
  * One line per match: path:line:col: preview. Then `# N matches in F
- * files` (and the binary / big files skipped). */
+ * files` (and the binary / big files skipped, and the files the search
+ * index skipped). --stats adds the index and time split lines. */
 static int rtx_batch_project_search(RtxWs *w, const char *arg, FILE *out, FILE *err) {
     unsigned opts = 0;
-    int bad = 0;
+    int bad = 0, stats = 0;
     unsigned long long maxb = 0;
     unsigned wflags = 0;
     const char *rest = arg;
@@ -567,6 +653,9 @@ static int rtx_batch_project_search(RtxWs *w, const char *arg, FILE *out, FILE *
         } else if (rtx_batch_flag(s, "--no-ignore")) {
             wflags |= RTX_PROJ_NO_IGNORE;
             rest = s + 11;
+        } else if (rtx_batch_flag(s, "--stats")) {
+            stats = 1;
+            rest = s + 7;
         } else if (rtx_batch_flag(s, "--max-size")) {
             char num[32];
             size_t nn = 0;
@@ -627,10 +716,38 @@ static int rtx_batch_project_search(RtxWs *w, const char *arg, FILE *out, FILE *
         if (on) fwrite(ob, 1, on, out);
     }
     fprintf(out, "# %zu matches in %zu files (%zu binary, %zu over size skipped)%s;"
-                 " %zu files, %llu bytes in %ld ms\n",
+                 " %zu files, %llu bytes in %ld ms",
             nh, ng, p->ps.n_bin, p->ps.n_big, p->ps.truncated ? " capped" : "",
             (size_t)atomic_load(&p->ps.pub_files),
             (unsigned long long)atomic_load(&p->ps.pub_bytes), p->ps.t_ms - p->ps.t0_ms);
+    if (p->ps.n_idx_skip) fprintf(out, "; %zu skipped by the index", p->ps.n_idx_skip);
+    if (p->ps.n_idx_chunk) fprintf(out, "; %zu read by chunks", p->ps.n_idx_chunk);
+    fputc('\n', out);
+    if (stats) {
+        const RtxProjIdx *x = p->cur;
+        fprintf(out, "# time: walk %ld ms, search %ld ms; lanes (summed) stat %.1f ms,"
+                     " read %.1f ms, scan %.1f ms\n",
+                x ? x->t_ms - x->t0_ms : 0, p->ps.t_ms - p->ps.t0_ms,
+                (double)p->ps.us_stat / 1000.0, (double)p->ps.us_read / 1000.0,
+                (double)p->ps.us_scan / 1000.0);
+        if (p->si_path[0]) {
+            const RtxSi *si = p->si;
+            fprintf(out, "# index: %s", !si ? "not loaded" : si->load_rc > 0 ? "loaded"
+                                          : si->load_rc < 0 ? "rejected" : "none");
+            if (si && si->load_rc > 0)
+                fprintf(out, " (%u files, %llu B, %u units) in %ld ms", si->nfiles,
+                        (unsigned long long)si->file_bytes, si->nunits, si->load_ms);
+            fprintf(out, "; %s", p->ps.si_state == 1 ? "pruning" : "plain scan");
+            if (p->ps.si_state == 1)
+                fprintf(out, ", %zu candidate files (%.2f%% of %u), %zu files skipped unread,"
+                             " %zu read by chunks, plan %.2f ms",
+                        p->ps.si_ncand,
+                        si && si->nfiles ? 100.0 * (double)p->ps.si_ncand / si->nfiles : 0.0,
+                        si ? si->nfiles : 0, p->ps.n_idx_skip, p->ps.n_idx_chunk,
+                        (double)p->ps.si_us / 1000.0);
+            fputc('\n', out);
+        }
+    }
     fflush(out);
     return RTX_BATCH_OK;
 }
@@ -851,6 +968,7 @@ int rtx_batch_exec(RtxWs *w, const char *line, FILE *out, FILE *err) {
         if (c.eq_cstr("redo")) return rtx_batch_undo(w, 1, err);
         if (c.eq_cstr("project-files")) return rtx_batch_project_files(w, rest, out, err);
         if (c.eq_cstr("project-search")) return rtx_batch_project_search(w, rest, out, err);
+        if (c.eq_cstr("project-index")) return rtx_batch_project_index(w, rest, out, err);
         if (c.eq_cstr("stats-json") || c.eq_cstr("stats_json")) {
             rtx_batch_write_stats_json(out, rtx_batch_buf(w));
             return RTX_BATCH_OK;

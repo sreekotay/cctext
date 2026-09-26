@@ -49,6 +49,16 @@
  * once per chunk. A cancel leaves every published group whole. The arm
  * stops at the index count it saw; the pump starts the next arm while
  * the index grows (search overlaps the walk).
+ *
+ * Search index (core/sindex.cch), built only on demand ("Build Search
+ * Index" / "Update Search Index", batch `project-index [--update]`): a
+ * Bloom filter per 64 KiB block of files or chunk of a big file. When
+ * one exists and the query has required literals, the arm computes the
+ * passing units once; lanes then stat each file and skip it unread when
+ * it is an indexed, unchanged, trusted file none of whose units pass
+ * (ps.n_idx_skip), and read a big one only around its passing chunks
+ * when the pattern stays on one line (ps.n_idx_chunk). Otherwise the
+ * search is the plain scan. Results are the same.
  */
 #ifndef RTX_PROJ_H
 #define RTX_PROJ_H
@@ -59,6 +69,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "rx.cch"
+#include "sindex.cch"
 
 #ifndef RTX_PROJ_PATH
 #define RTX_PROJ_PATH 4096
@@ -246,6 +257,14 @@ typedef struct {
     _Atomic uint64_t pub_bytes;
     size_t next;            /* next file id; host reads after the join */
     size_t n_bin, n_big, n_err;
+    size_t n_idx_skip;      /* files the search index skipped unread */
+    size_t n_idx_chunk;     /* files read only around passing chunks */
+    uint64_t us_stat, us_read, us_scan; /* lane time, summed (stats) */
+    int si_state;           /* 0 undecided, 1 pruning, 2 plain scan */
+    int si_plan;            /* the query had required literals */
+    uint64_t *si_cand;      /* passing index units (bits, on `store`) */
+    size_t si_ncand;        /* files with a passing unit */
+    long si_us;             /* plan + candidates time */
     int truncated;
     int on;                 /* a query is set */
     int complete;           /* every index file searched, index done */
@@ -270,6 +289,16 @@ typedef struct RtxProj {
     char *mru[RTX_PROJ_MRU_MAX];  /* relative paths, most recent first */
     size_t nmru;
     CCArena mru_a;
+    char si_path[RTX_PROJ_PATH]; /* the index file; "" = none (off) */
+    RtxSi *si;              /* loaded by the first search arm; NULL */
+    int si_tried;           /* a load was tried */
+    void *sib;              /* RtxSiBuildWalk: on-demand build (calloc) */
+    int si_want;            /* asked while the walk runs: 1 build, 2 update */
+    RtxSiBuildOut si_last;  /* the last build's report */
+    _Atomic size_t si_done; /* build progress: file reads (2 per file) */
+    size_t si_total;
+    uint64_t keep[RTX_SI_KEEP_MAX][2]; /* (dev, ino) never skipped */
+    size_t nkeep;
 } RtxProj;
 
 /* Git root of `start` (a file or a directory; "" = cwd) into dst
@@ -312,6 +341,30 @@ void rtx_proj_test_chunk(int files);
 void rtx_proj_mru_load(RtxProj *p, const char *dir);
 void rtx_proj_mru_touch(RtxProj *p, const char *rel);
 int rtx_proj_mru_rank(const RtxProj *p, const char *rel, size_t n);
+
+/* Search index: its file lives under `dir` (the Safe cache dir,
+ * w/<hash>.si); unset = no index. keep: files it never skips (dirty
+ * buffers). */
+void rtx_proj_index_dir(RtxProj *p, const char *dir);
+void rtx_proj_keep_clear(RtxProj *p);
+void rtx_proj_keep_add(RtxProj *p, const char *abs);
+/* Build (a full rebuild) the index now, on this thread (batch, tests);
+ * waits for the walk. 1 = written; the report in p->si_last. */
+int !>(CCError) rtx_proj_index_build(RtxProj *p);
+/* Update it (rtx_si_update: only the changed blocks; a full build when
+ * there is no index or too much changed). */
+int !>(CCError) rtx_proj_index_update(RtxProj *p);
+/* Either, with `lanes` build lanes (0 = one per core; 1 = one thread). */
+int !>(CCError) rtx_proj_index_build_mode(RtxProj *p, int update, int lanes);
+/* The same as a background arm (UI); the pump joins it and the next
+ * search loads the new file. A walk in progress defers the kick. */
+void !>(CCError) rtx_proj_index_kick(RtxProj *p);
+void !>(CCError) rtx_proj_index_kick_update(RtxProj *p);
+void !>(CCError) rtx_proj_index_kick_mode(RtxProj *p, int update);
+/* 1 = a build is running or waiting for the walk. */
+int rtx_proj_index_building(const RtxProj *p);
+/* Build progress 0..100. */
+int rtx_proj_index_pct(const RtxProj *p);
 
 /* Quick-open. set scores the query now; update scores files published
  * since (and rescans after a swap). 1 = the list changed. */

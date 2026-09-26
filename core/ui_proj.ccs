@@ -77,7 +77,10 @@ static int rtx_ui_proj_ensure(RtxUi *ui) {
                  e.message ? e.message : "cannot open");
         return 0;
     };
-    if (rtx_safe_dir(cache, sizeof cache)) rtx_proj_mru_load(ui->proj, cache);
+    if (rtx_safe_dir(cache, sizeof cache)) {
+        rtx_proj_mru_load(ui->proj, cache);
+        rtx_proj_index_dir(ui->proj, cache);
+    }
     return 1;
 }
 
@@ -210,6 +213,15 @@ void !>(CCError) rtx_ui_pick_start(RtxUi *ui, RtxWs *w, int mode) {
     ui->stats = 0;
     ui->pick_msg[0] = 0;
     if (!rtx_ui_proj_ensure(ui)) return cc_ok();
+    if (mode == RTX_PICK_SEARCH && w) {
+        /* Buffers with unsaved edits: the search index never skips them. */
+        int i;
+        rtx_proj_keep_clear(ui->proj);
+        for (i = 0; i < (int)w->len; i++) {
+            const char *bp = RtxWs_buf_path(w, i);
+            if (bp && bp[0] && RtxWs_buf_dirty(w, i)) rtx_proj_keep_add(ui->proj, bp);
+        }
+    }
     ui->pick = mode;
     m = rtx_pick_mi(ui);
     if (mode == RTX_PICK_SEARCH) rtx_pick_prefill(ui, w);
@@ -277,6 +289,36 @@ void !>(CCError) rtx_ui_pick_rewalk(RtxUi *ui) {
     return rtx_proj_rewalk(ui->proj);
 }
 
+static void !>(CCError) rtx_ui_proj_index_mode(RtxUi *ui, int update) {
+    if (!ui) return cc_ok();
+    if (!rtx_ui_proj_ensure(ui)) return cc_ok();
+    if (!ui->proj->si_path[0]) {
+        snprintf(ui->pick_msg, sizeof ui->pick_msg,
+                 rtx_si_enabled() ? "search index: no cache directory"
+                                  : "search index is off (search_index: false)");
+        return cc_ok();
+    }
+    rtx_proj_index_kick_mode(ui->proj, update) !>(e) {
+        snprintf(ui->pick_msg, sizeof ui->pick_msg, "search index: %s",
+                 e.message ? e.message : "failed");
+        return cc_ok();
+    };
+    ui->si_seen = 1;
+    snprintf(ui->pick_msg, sizeof ui->pick_msg,
+             update ? "updating the search index..." : "building the search index...");
+    return cc_ok();
+}
+
+void !>(CCError) rtx_ui_proj_index(RtxUi *ui) {
+    rtx_ui_proj_index_mode(ui, 0) !>(e) { return cc_err(e); };
+    return cc_ok();
+}
+
+void !>(CCError) rtx_ui_proj_index_update(RtxUi *ui) {
+    rtx_ui_proj_index_mode(ui, 1) !>(e) { return cc_err(e); };
+    return cc_ok();
+}
+
 int !>(CCError) rtx_ui_pick_pump(RtxUi *ui) {
     RtxProj *p;
     int repaint = 0;
@@ -284,6 +326,30 @@ int !>(CCError) rtx_ui_pick_pump(RtxUi *ui) {
     if (!ui || !ui->proj || !rtx_proj_is_open(ui->proj)) return cc_ok(0);
     p = ui->proj;
     rtx_proj_pump(p) !>(e) { return cc_err(e); };
+    if (ui->si_seen && !rtx_proj_index_building(p)) {
+        /* The build finished: say so where the status shows pick_msg. */
+        const RtxSiBuildOut *r = &p->si_last;
+        ui->si_seen = 0;
+        ui->si_note = 1;
+        if (r->ok && r->update)
+            snprintf(ui->pick_msg, sizeof ui->pick_msg,
+                     "search index updated: %u changed, %u new, %u gone files; %u blocks"
+                     " re-read in %.2f s (a full build: %.1f s)",
+                     r->upd_changed, r->upd_new, r->upd_gone, r->upd_dirty + r->upd_tail,
+                     (double)r->ms / 1000.0, (double)r->full_ms / 1000.0);
+        else if (r->ok)
+            snprintf(ui->pick_msg, sizeof ui->pick_msg,
+                     "search index: %u files, %.1f MiB (%.2f%% of %.0f MiB) in %.1f s%s%s%s",
+                     r->files, (double)r->bytes / 1048576.0,
+                     r->corpus ? 100.0 * (double)r->bytes / (double)r->corpus : 0.0,
+                     (double)r->corpus / 1048576.0, (double)r->ms / 1000.0,
+                     r->why_full ? " (full build: " : "", r->why_full ? r->why_full : "",
+                     r->why_full ? ")" : "");
+        else
+            snprintf(ui->pick_msg, sizeof ui->pick_msg, "search index: %s",
+                     r->err ? r->err : "failed");
+        repaint = 1;
+    }
     if (ui->pick_due && rtx_ui_now_ms() >= ui->pick_due) {
         rtx_pick_search_kick(ui) !>(e) { return cc_err(e); };
         repaint = 1;
@@ -306,14 +372,16 @@ int !>(CCError) rtx_ui_pick_pump(RtxUi *ui) {
 int rtx_ui_pick_busy(const RtxUi *ui) {
     if (!ui || !ui->proj || !rtx_proj_is_open(ui->proj)) return 0;
     if (ui->pick_due) return 1;
-    return rtx_proj_walking(ui->proj) || rtx_proj_searching(ui->proj);
+    return rtx_proj_walking(ui->proj) || rtx_proj_searching(ui->proj) ||
+           rtx_proj_index_building(ui->proj);
 }
 
 long rtx_ui_pick_next_ms(const RtxUi *ui, long now) {
     long due = -1;
     if (!ui || !ui->proj) return -1;
     if (ui->pick_due) due = ui->pick_due > now ? ui->pick_due - now : 0;
-    if (rtx_proj_walking(ui->proj) || rtx_proj_searching(ui->proj)) {
+    if (rtx_proj_walking(ui->proj) || rtx_proj_searching(ui->proj) ||
+        rtx_proj_index_building(ui->proj)) {
         /* Progress ticks while the overlay shows it; else join soon. */
         long tick = ui->pick ? 50 : 200;
         if (due < 0 || tick < due) due = tick;
@@ -351,6 +419,14 @@ void rtx_ui_pick_head(const RtxUi *ui, char *dst, size_t n) {
             snprintf(dst, n, "%s%s%zu matches in %zu files%s%s", opts, opts[0] ? "  " : "", nh,
                      ng, p->ps.truncated ? "  capped" : "",
                      ui->pick_due ? "  ..." : "");
+            if (p->ps.complete && p->ps.n_idx_skip && !ui->pick_due) {
+                size_t k = strlen(dst);
+                snprintf(dst + k, n - k, "  index skipped %zu", p->ps.n_idx_skip);
+            }
+            if (rtx_proj_index_building(p)) {
+                size_t k = strlen(dst);
+                snprintf(dst + k, n - k, "  indexing %d%%", rtx_proj_index_pct(p));
+            }
             if (rtx_proj_searching(p) && !ui->pick_due) {
                 size_t k = strlen(dst);
                 snprintf(dst + k, n - k, "  searching %zu%%",

@@ -107,6 +107,9 @@ typedef struct {
     RtxRxScratch rxs;
     size_t bin, big, err;
     uint64_t bytes;
+    size_t skip;            /* files the search index ruled out, unread */
+    size_t chunked;         /* files read only around passing chunks */
+    uint64_t us_stat, us_read, us_scan;
 } RtxPsSlot;
 
 typedef struct RtxPsWalk {
@@ -115,9 +118,34 @@ typedef struct RtxPsWalk {
     char root[RTX_PROJ_PATH];
     size_t root_n;
     size_t end;
+    RtxSi **si;             /* &p->si: loaded by the first arm */
+    const char *si_path;    /* p->si_path ("" = no index) */
+    int *si_tried;
+    const RtxSi *six;       /* pruning: the index the candidates are of */
+    const uint64_t *cand;   /* passing units (bits) */
+    int one_line;           /* no match crosses a '\n': chunk reads */
+    size_t nkeep;
+    uint64_t keep[RTX_SI_KEEP_MAX][2];
     _Atomic unsigned char done;
     CCParallel h;
 } RtxPsWalk;
+
+/* On-demand index build: one arm (the build shards inside it). */
+typedef struct RtxSiBuildWalk {
+    RtxProj *p;
+    const RtxProjIdx *idx;
+    char root[RTX_PROJ_PATH];
+    size_t root_n;
+    char out[RTX_PROJ_PATH];
+    size_t max_bytes;
+    RtxSiBuildOut res;
+    int ok;
+    int update;             /* rtx_si_update (falls back to a build) */
+    int lanes;              /* 0 = default */
+    _Atomic unsigned char cancel;
+    _Atomic unsigned char done;
+    CCParallel h;
+} RtxSiBuildWalk;
 
 _Static_assert(RTX_PROJ_HCH_MAX >= (int)(RTX_PROJ_HITS_MAX >> RTX_PROJ_HCH_BITS) + 1,
                "hit chunk table covers RTX_PROJ_HITS_MAX");
@@ -1240,6 +1268,8 @@ int rtx_proj_root_of(const char *start, char *dst, size_t n) {
 }
 
 static void rtx_ps_drop_arm(RtxProj *p);
+static void rtx_sib_drop(RtxProj *p);
+static void rtx_sib_join_done(RtxProj *p);
 static void rtx_ps_free(RtxProj *p);
 static void !>(CCError) rtx_ps_restart(RtxProj *p);
 static void rtx_pick_free(RtxProjPick *k);
@@ -1276,6 +1306,13 @@ void rtx_proj_close(RtxProj *p) {
     size_t i;
     if (!p) return;
     rtx_ps_free(p);
+    rtx_sib_drop(p);
+    rtx_si_free(p->si);
+    p->si = NULL;
+    p->si_tried = 0;
+    p->si_want = 0;
+    p->si_path[0] = 0;
+    p->nkeep = 0;
     if (p->next) rtx_idx_free(p->next);
     if (p->cur) rtx_idx_free(p->cur);
     p->next = NULL;
@@ -1387,8 +1424,14 @@ int !>(CCError) rtx_proj_pump(RtxProj *p) {
     if (p->next) {
         rtx_pw_join_done(p->next);
         if (!p->next->wk && !rtx_idx_walking(p->next)) {
-            /* Re-walk done: the search reads the old index; join it first. */
+            /* Re-walk done: the search and an index build read the old
+             * index; join them first (a cancelled build writes nothing). */
             rtx_ps_drop_arm(p);
+            if (p->sib) {
+                int upd = ((RtxSiBuildWalk *)p->sib)->update;
+                rtx_sib_drop(p);
+                p->si_want = upd ? 2 : 1;
+            }
             rtx_idx_free(p->cur);
             p->cur = p->next;
             p->next = NULL;
@@ -1398,6 +1441,12 @@ int !>(CCError) rtx_proj_pump(RtxProj *p) {
     }
     if (rtx_ps_pump(p) !>(e) { return cc_err(e); })
         busy = 1;
+    /* The build: join a finished one (the next search loads its file),
+     * or start the one asked for during the walk. */
+    if (p->sib && !p->ps.wk) rtx_sib_join_done(p);
+    if (p->si_want && !p->sib && !p->next && !rtx_idx_walking(p->cur))
+        rtx_proj_index_kick_mode(p, p->si_want == 2) !>(e) { return cc_err(e); };
+    if (p->sib || p->si_want) busy = 1;
     if (rtx_proj_walking(p)) busy = 1;
     return cc_ok(busy);
 }
@@ -1881,6 +1930,9 @@ static int rtx_ps_slot_reset(RtxPsSlot *s) {
     s->fh = NULL;
     s->bin = s->big = s->err = 0;
     s->bytes = 0;
+    s->skip = 0;
+    s->chunked = 0;
+    s->us_stat = s->us_read = s->us_scan = 0;
     if (s->hit_a.base) s->hit_a.reset();
     else {
         s->hit_a = cc_arena_heap(kilobytes(64));
@@ -1903,9 +1955,206 @@ static int rtx_ps_slot_file(RtxPsSlot *s, uint32_t id, size_t first) {
     return 0;
 }
 
-/* Lane: read file `id` whole and append its hits to the chunk. Stops
- * once the chunk holds more than RTX_PROJ_HITS_MAX hits: the stage then
- * caps before that file, so no group is ever cut. */
+static int rtx_ps_keep(const RtxPsWalk *wk, const struct stat *st) {
+    size_t i;
+    for (i = 0; i < wk->nkeep; i++)
+        if (wk->keep[i][0] == (uint64_t)st->st_dev && wk->keep[i][1] == (uint64_t)st->st_ino)
+            return 1;
+    return 0;
+}
+
+/* Lane: the read buffer holds at least `need` bytes. 0 = no memory. */
+static int rtx_ps_buf(RtxPsSlot *s, size_t need) {
+    size_t cap;
+    if (s->buf_cap >= need) return 1;
+    cap = need < ((size_t)1 << 20) ? ((size_t)1 << 20) : need;
+    if (s->buf_a.base) s->buf_a.destroy();
+    s->buf_a = cc_arena_heap(cap + kilobytes(4));
+    s->buf = s->buf_a.base ? (char *)cc_arena_alloc(s->buf_a, cap, 16) : NULL;
+    s->buf_cap = s->buf ? cap : 0;
+    return s->buf != NULL;
+}
+
+/* Lane: matches starting in buf[lo, stop) of the text buf[0, n), which
+ * sits at file offset `base`; lo is a line start of line `line`. ctx:
+ * the regex context of buf[0]. -1 = out of lane scratch. */
+static int rtx_ps_match(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s, const char *buf,
+                        size_t n, size_t lo, size_t stop, unsigned ctx, uint64_t base,
+                        uint32_t line) {
+    const RtxProjSearch *ps = wk->ps;
+    RtxRxIn in;
+    size_t p = lo, lpos = lo, lstart = lo;
+    memset(&in, 0, sizeof in);
+    in.s = buf;
+    in.n = n;
+    in.gpos = RTX_RX_UNSET;
+    in.ctx = ctx;
+    while (p < stop && s->nh <= RTX_PROJ_HITS_MAX) {
+        size_t ms = 0, me = 0;
+        int r = rtx_rx_search(ps->rx, &in, p, stop, 1, &s->rxs, &ms, &me);
+        size_t le, ws, we;
+        RtxPsHit h;
+        if (r != RTX_RX_MATCH) break;
+        if (me == ms || ((ps->opts & RTX_PS_WORD) && !rtx_ps_word_ok(buf, n, ms, me))) {
+            p = rtx_ps_next_cp(buf, n, ms);
+            continue;
+        }
+        if (lpos < ms) {
+            size_t c = rtx_count_lf(buf + lpos, ms - lpos);
+            if (c) {
+                line += c;
+                lstart = lpos + rtx_last_lf(buf + lpos, ms - lpos) + 1;
+            }
+            lpos = ms;
+        }
+        {
+            const char *nl = (const char *)memchr(buf + ms, '\n', n - ms);
+            le = nl ? (size_t)(nl - buf) : n;
+        }
+        if (le > lstart && buf[le - 1] == '\r') le--;
+        ws = lstart;
+        we = le;
+        if (we - ws > RTX_PROJ_PV_MAX) {
+            ws = ms > lstart + 40 ? ms - 40 : lstart;
+            while (ws > lstart && ((unsigned char)buf[ws] & 0xC0) == 0x80) ws--;
+            we = ws + RTX_PROJ_PV_MAX;
+            if (we > le) we = le;
+            while (we > ws && we < le && ((unsigned char)buf[we] & 0xC0) == 0x80) we--;
+        }
+        memset(&h, 0, sizeof h);
+        h.file = id;
+        h.line = line;
+        h.off = base + ms;
+        h.col = (uint32_t)(ms - lstart + 1);
+        h.mlen = (uint32_t)(me - ms);
+        h.pvhit = (uint16_t)(ms >= ws ? (ms - ws < we - ws ? ms - ws : we - ws) : 0);
+        if (rtx_ps_slot_hit(s, &h, buf + ws, we - ws) < 0) return -1;
+        p = me;
+    }
+    return 0;
+}
+
+static int rtx_ps_pread(int fd, char *dst, size_t n, uint64_t off) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = pread(fd, dst + got, n - got, (off_t)(off + got));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return 0;
+        got += (size_t)r;
+    }
+    return 1;
+}
+
+/* Lane: an indexed big file, read only around its passing chunks. Each
+ * run of passing chunks [cs, ce) widens to whole lines: from the '\n'
+ * before cs (kept as context) to the byte after the '\n' at or after
+ * ce - 1 (context), so a one-line pattern sees what it sees in the whole
+ * file. Runs whose widened ranges meet are merged; a region never scans
+ * text an earlier one scanned. 0 = read error (the caller reads whole). */
+static int rtx_ps_scan_chunks(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s, int fd,
+                              uint64_t size, long k, uint32_t u0, uint32_t nu) {
+    const RtxSi *si = wk->six;
+    const uint64_t pad = 256;
+    uint64_t done_to = 0; /* file offset scanned up to (a line start) */
+    uint32_t j = 0;
+    long t0 = rtx_proj_now_us(), tr = 0;
+    (void)k;
+    while (j < nu) {
+        uint64_t cs, ce, a, b, lo, st, en;
+        uint32_t ja, jb;
+        size_t q;
+        uint32_t line;
+        uint64_t nlb;
+        while (j < nu && !((wk->cand[(u0 + j) >> 6] >> ((u0 + j) & 63)) & 1u)) j++;
+        if (j >= nu) break;
+        ja = j;
+        /* The run, and every later run whose padded range meets it. */
+        for (;;) {
+            while (j + 1 < nu && ((wk->cand[(u0 + j + 1) >> 6] >> ((u0 + j + 1) & 63)) & 1u)) j++;
+            jb = j;
+            j++;
+            {
+                uint32_t nx = j;
+                while (nx < nu && !((wk->cand[(u0 + nx) >> 6] >> ((u0 + nx) & 63)) & 1u)) nx++;
+                if (nx < nu && (uint64_t)nx * RTX_SI_BLK <=
+                                   (uint64_t)(jb + 1) * RTX_SI_BLK + RTX_SI_OVL + 2 * pad) {
+                    j = nx;
+                    continue;
+                }
+            }
+            break;
+        }
+        cs = (uint64_t)ja * RTX_SI_BLK;
+        ce = (uint64_t)(jb + 1) * RTX_SI_BLK + RTX_SI_OVL;
+        if (ce > size) ce = size;
+        a = cs > pad ? cs - pad : 0;
+        b = ce + pad < size ? ce + pad : size;
+        /* Widen until the line bounds (and one byte of context) are in. */
+        for (;;) {
+            long r0 = rtx_proj_now_us();
+            int need_more = 0;
+            if (!rtx_ps_buf(s, (size_t)(b - a) + 1)) return 0;
+            if (!rtx_ps_pread(fd, s->buf, (size_t)(b - a), a)) return 0;
+            s->bytes += b - a;
+            tr += rtx_proj_now_us() - r0;
+            /* start: after the last '\n' before cs (0 when none) */
+            q = cs > a ? rtx_last_lf(s->buf, (size_t)(cs - a)) : (size_t)-1;
+            if (q == (size_t)-1 && a > 0) {
+                a = a > (cs - a) * 4 ? a - (cs - a) * 4 : 0;
+                need_more = 1;
+            }
+            lo = q == (size_t)-1 ? 0 : a + q + 1;
+            /* end: after the first '\n' at or after ce - 1, plus a byte */
+            {
+                uint64_t from = ce - 1;
+                const char *nl =
+                    (const char *)memchr(s->buf + (from - a), '\n', (size_t)(b - from));
+                if (nl) {
+                    en = a + (uint64_t)(nl - s->buf) + 1;
+                    if (en < size && en + 1 > b) {
+                        b = en + 1;
+                        need_more = 1;
+                    }
+                } else if (b < size) {
+                    b = b + (b - a) * 2 < size ? b + (b - a) * 2 : size;
+                    need_more = 1;
+                    en = size;
+                } else {
+                    en = size;
+                }
+            }
+            if (!need_more) break;
+        }
+        st = lo > done_to ? lo : done_to;
+        if (st >= en) continue;
+        /* The line at st: newlines before cs (stored per chunk), less the
+         * ones in [st, cs) or plus the ones in [cs, st). */
+        nlb = si->unl[u0 + ja];
+        if (st <= cs) nlb -= rtx_count_lf(s->buf + (st - a), (size_t)(cs - st));
+        else nlb += rtx_count_lf(s->buf + (cs - a), (size_t)(st - cs));
+        line = (uint32_t)(nlb + 1);
+        {
+            /* The text starts at the context byte before st (a '\n'), or
+             * at the file start; it ends one byte past en (or at EOF). */
+            uint64_t t0o = st > 0 ? st - 1 : 0;
+            uint64_t t1o = en < size ? en + 1 : size;
+            unsigned ctx = st == 0 ? (RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0) : 0;
+            if (rtx_ps_match(wk, id, s, s->buf + (t0o - a), (size_t)(t1o - t0o),
+                             (size_t)(st - t0o), (size_t)(en - t0o), ctx, t0o, line) < 0)
+                return -1;
+        }
+        done_to = en;
+        if (s->nh > RTX_PROJ_HITS_MAX) break;
+    }
+    s->us_read += (uint64_t)tr;
+    s->us_scan += (uint64_t)(rtx_proj_now_us() - t0 - tr);
+    return 1;
+}
+
+/* Lane: read file `id` (whole, or only its passing chunks) and append
+ * its hits to the chunk. Stops once the chunk holds more than
+ * RTX_PROJ_HITS_MAX hits: the stage then caps before that file, so no
+ * group is ever cut. */
 static void rtx_ps_scan(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s) {
     const RtxProjSearch *ps = wk->ps;
     const RtxProjFile *f;
@@ -1914,11 +2163,11 @@ static void rtx_ps_scan(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s) {
     int fd;
     struct stat st;
     size_t size, got = 0;
-    RtxRxIn in;
-    size_t p = 0, lpos = 0, lstart = 0;
     size_t first = s->nh;
-    uint32_t line = 1;
+    long t0 = rtx_proj_now_us(), t1, t2 = 0;
     long slow = atomic_load(&g_proj_slow_us);
+    long ck = -1;          /* chunk reads: the index id */
+    uint32_t cu0 = 0, cnu = 0;
     if (slow > 0) usleep((useconds_t)slow);
     /* The lane keeps its last directory open: a chunk's files mostly
      * share one, and openat(dir, name) skips resolving the root path
@@ -1945,6 +2194,34 @@ static void rtx_ps_scan(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s) {
         s->dfd_ok = 1;
         s->dfd_dir = f->dir;
     }
+    /* Search index, pruning: an indexed, unchanged, trusted file none of
+     * whose units can match is skipped unread; a big one some of whose
+     * chunks can is read there only (one-line patterns). Anything else
+     * (new, changed, racy, a dirty buffer's file) is read whole. */
+    if (wk->cand) {
+        struct stat st0;
+        if (fstatat(s->dfd, rtx_idx_str(wk->idx, f->name), &st0, 0) == 0 &&
+            S_ISREG(st0.st_mode) && st0.st_size > 0 && (size_t)st0.st_size <= ps->max_bytes) {
+            long k = rtx_si_find(wk->six, &st0);
+            if (k >= 0 && !rtx_ps_keep(wk, &st0)) {
+                uint32_t u0 = 0, nu = rtx_si_units(wk->six, k, &u0), j, pass = 0;
+                for (j = 0; j < nu; j++)
+                    pass += (uint32_t)((wk->cand[(u0 + j) >> 6] >> ((u0 + j) & 63)) & 1u);
+                if (!pass) {
+                    s->skip++;
+                    s->us_stat += (uint64_t)(rtx_proj_now_us() - t0);
+                    return;
+                }
+                if (nu > 1 && pass < nu && wk->one_line) {
+                    ck = k;
+                    cu0 = u0;
+                    cnu = nu;
+                }
+            }
+        }
+    }
+    t1 = rtx_proj_now_us();
+    s->us_stat += (uint64_t)(t1 - t0);
     fd = openat(s->dfd, rtx_idx_str(wk->idx, f->name), O_RDONLY | O_CLOEXEC | O_NOCTTY);
     if (fd < 0) {
         s->err++;
@@ -1965,18 +2242,31 @@ static void rtx_ps_scan(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s) {
         close(fd);
         return;
     }
-    if (s->buf_cap < size + 1) {
-        size_t cap = size + 1;
-        if (cap < ((size_t)1 << 20)) cap = (size_t)1 << 20;
-        if (s->buf_a.base) s->buf_a.destroy();
-        s->buf_a = cc_arena_heap(cap + kilobytes(4));
-        s->buf = s->buf_a.base ? (char *)cc_arena_alloc(s->buf_a, cap, 16) : NULL;
-        s->buf_cap = s->buf ? cap : 0;
-        if (!s->buf) {
+    /* Chunk reads: the open file is still the indexed one (a text file,
+     * so no binary test). */
+    if (ck >= 0 && rtx_si_find(wk->six, &st) == ck) {
+        int r = rtx_ps_scan_chunks(wk, id, s, fd, (uint64_t)size, ck, cu0, cnu);
+        if (r != 0) {
             close(fd);
-            s->err++;
+            if (r < 0) {
+                /* Out of lane scratch: drop this file's hits, never half. */
+                s->nh = first;
+                s->err++;
+                return;
+            }
+            s->chunked++;
+            if (s->nh > first && rtx_ps_slot_file(s, id, first) < 0) {
+                s->nh = first;
+                s->err++;
+            }
             return;
         }
+        s->nh = first; /* a read failed: read it whole */
+    }
+    if (!rtx_ps_buf(s, size + 1)) {
+        close(fd);
+        s->err++;
+        return;
     }
     /* The binary test reads 8 KiB first: a binary costs one read. */
     while (got < size) {
@@ -1994,66 +2284,24 @@ static void rtx_ps_scan(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s) {
     }
     close(fd);
     s->bytes += got;
+    t2 = rtx_proj_now_us();
+    s->us_read += (uint64_t)(t2 - t1);
     if (memchr(s->buf, 0, got < 8192 ? got : 8192)) {
         s->bin++;
         return;
     }
-    memset(&in, 0, sizeof in);
-    in.s = s->buf;
-    in.n = got;
-    in.gpos = RTX_RX_UNSET;
-    in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
-    while (p < got && s->nh <= RTX_PROJ_HITS_MAX) {
-        size_t ms = 0, me = 0;
-        int r = rtx_rx_search(ps->rx, &in, p, got, 1, &s->rxs, &ms, &me);
-        size_t le, ws, we;
-        RtxPsHit h;
-        if (r != RTX_RX_MATCH) break;
-        if (me == ms || ((ps->opts & RTX_PS_WORD) && !rtx_ps_word_ok(s->buf, got, ms, me))) {
-            p = rtx_ps_next_cp(s->buf, got, ms);
-            continue;
-        }
-        if (lpos < ms) {
-            size_t c = rtx_count_lf(s->buf + lpos, ms - lpos);
-            if (c) {
-                line += c;
-                lstart = lpos + rtx_last_lf(s->buf + lpos, ms - lpos) + 1;
-            }
-            lpos = ms;
-        }
-        {
-            const char *nl = (const char *)memchr(s->buf + ms, '\n', got - ms);
-            le = nl ? (size_t)(nl - s->buf) : got;
-        }
-        if (le > lstart && s->buf[le - 1] == '\r') le--;
-        ws = lstart;
-        we = le;
-        if (we - ws > RTX_PROJ_PV_MAX) {
-            ws = ms > lstart + 40 ? ms - 40 : lstart;
-            while (ws > lstart && ((unsigned char)s->buf[ws] & 0xC0) == 0x80) ws--;
-            we = ws + RTX_PROJ_PV_MAX;
-            if (we > le) we = le;
-            while (we > ws && we < le && ((unsigned char)s->buf[we] & 0xC0) == 0x80) we--;
-        }
-        memset(&h, 0, sizeof h);
-        h.file = id;
-        h.line = line;
-        h.off = ms;
-        h.col = (uint32_t)(ms - lstart + 1);
-        h.mlen = (uint32_t)(me - ms);
-        h.pvhit = (uint16_t)(ms >= ws ? (ms - ws < we - ws ? ms - ws : we - ws) : 0);
-        if (rtx_ps_slot_hit(s, &h, s->buf + ws, we - ws) < 0) {
-            /* Out of lane scratch: drop this file's hits, never half. */
-            s->nh = first;
-            s->err++;
-            return;
-        }
-        p = me;
+    if (rtx_ps_match(wk, id, s, s->buf, got, 0, got, RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0, 0, 1) <
+        0) {
+        /* Out of lane scratch: drop this file's hits, never half. */
+        s->nh = first;
+        s->err++;
+        return;
     }
     if (s->nh > first && rtx_ps_slot_file(s, id, first) < 0) {
         s->nh = first;
         s->err++;
     }
+    s->us_scan += (uint64_t)(rtx_proj_now_us() - t2);
 }
 
 static char *rtx_ps_pv_put(RtxProjSearch *ps, const char *src, size_t n, uint32_t *off) {
@@ -2117,6 +2365,11 @@ static void rtx_ps_stage(RtxProjSearch *ps, size_t hi, const RtxPsSlot *s) {
     ps->n_bin += s->bin;
     ps->n_big += s->big;
     ps->n_err += s->err;
+    ps->n_idx_skip += s->skip;
+    ps->n_idx_chunk += s->chunked;
+    ps->us_stat += s->us_stat;
+    ps->us_read += s->us_read;
+    ps->us_scan += s->us_scan;
     ps->next = hi;
     for (i = 0; i < s->nfh; i++) {
         if (rtx_ps_stage_file(ps, s, &s->fh[i]) < 0) {
@@ -2147,6 +2400,38 @@ void rtx_proj_test_chunk(int files) {
     atomic_store(&g_ps_chunk, files);
 }
 
+/* First arm of a query (arm thread; no other arm is live): load the
+ * index once per project, plan the query, and compute its candidates.
+ * With no index file nothing here runs: the plain scan hashes nothing. */
+static void rtx_ps_si_decide(RtxPsWalk *wk) {
+    RtxProjSearch *ps = wk->ps;
+    RtxSi *si;
+    RtxSiQ *q;
+    long t0 = rtx_proj_now_us();
+    ps->si_state = 2;
+    if (!wk->si_path || !wk->si_path[0]) return;
+    if (!*wk->si_tried) {
+        *wk->si_tried = 1;
+        *wk->si = rtx_si_load(wk->si_path, wk->root, wk->root_n);
+    }
+    si = *wk->si;
+    if (!si || si->load_rc != 1) return;
+    t0 = rtx_proj_now_us(); /* the plan, not the load */
+    q = (RtxSiQ *)malloc(sizeof(RtxSiQ));
+    if (!q) return;
+    if (rtx_si_plan(ps->rx, q)) {
+        size_t nw = ((size_t)si->nunits + 63) / 64 + 1;
+        uint64_t *cand = (uint64_t *)cc_arena_alloc(ps->store, nw * 8, 8);
+        ps->si_plan = 1;
+        if (cand && rtx_si_cands(si, q, cand, &ps->si_ncand)) {
+            ps->si_cand = cand;
+            ps->si_state = 1;
+        }
+    }
+    free(q);
+    ps->si_us = rtx_proj_now_us() - t0;
+}
+
 /* One arm: files [next, end) in id order, one `@parallel wait` like the
  * find block loop. A ticket is a chunk of RTX_PS_CHUNK files: the lane
  * scans them into its cache replica and the stage appends their groups
@@ -2161,6 +2446,12 @@ static int rtx_ps_run(RtxPsWalk *wk) {
     int n, i;
     bool fin;
     if (k < 1) k = RTX_PS_CHUNK;
+    if (!ps->si_state) rtx_ps_si_decide(wk);
+    if (ps->si_state == 1) {
+        wk->six = *wk->si;
+        wk->cand = ps->si_cand;
+        wk->one_line = rtx_rx_one_line(ps->rx);
+    }
     if (base >= end || (end - base) / k >= (size_t)INT_MAX) {
         atomic_store_explicit(&wk->done, 1, memory_order_release);
         return 1;
@@ -2209,6 +2500,195 @@ static int rtx_ps_run(RtxPsWalk *wk) {
     }
     atomic_store_explicit(&wk->done, 1, memory_order_release);
     return 1;
+}
+
+/* ---------------------------------------------- search index: build */
+
+static int rtx_sib_run(RtxSiBuildWalk *wk) {
+    const RtxProjIdx *x = wk->idx;
+    size_t n = rtx_idx_nf(x), i;
+    char **rel = (char **)calloc(n + 1, sizeof(char *));
+    CCArena pa = cc_arena_heap(megabytes(4));
+    RtxSiBuildIn in;
+    wk->ok = 0;
+    if (!rel || !pa.base) {
+        wk->res.err = "out of memory";
+        goto out;
+    }
+    for (i = 0; i < n; i++) {
+        char path[RTX_PROJ_PATH];
+        size_t pn = rtx_idx_path(x, i, path, sizeof path, NULL);
+        rel[i] = (char *)cc_arena_alloc(pa, pn + 1, 1);
+        if (!rel[i]) {
+            wk->res.err = "out of memory";
+            goto out;
+        }
+        memcpy(rel[i], path, pn);
+        rel[i][pn] = 0;
+    }
+    memset(&in, 0, sizeof in);
+    in.root = wk->root;
+    in.root_n = wk->root_n;
+    in.rel = (const char *const *)rel;
+    in.n = (uint32_t)n;
+    in.max_bytes = wk->max_bytes;
+    in.out = wk->out;
+    in.lanes = wk->lanes;
+    in.cancel = &wk->cancel;
+    in.done = &wk->p->si_done;
+    wk->ok = wk->update ? rtx_si_update(&in, &wk->res) : rtx_si_build(&in, &wk->res);
+out:
+    free(rel);
+    if (pa.base) pa.destroy();
+    atomic_store_explicit(&wk->done, 1, memory_order_release);
+    return 1;
+}
+
+static RtxSiBuildWalk *rtx_sib_new(RtxProj *p) {
+    RtxSiBuildWalk *wk = (RtxSiBuildWalk *)calloc(1, sizeof(RtxSiBuildWalk));
+    if (!wk) return NULL;
+    wk->p = p;
+    wk->idx = p->cur;
+    memcpy(wk->root, p->root, p->root_n);
+    wk->root[p->root_n] = 0;
+    wk->root_n = p->root_n;
+    snprintf(wk->out, sizeof wk->out, "%s", p->si_path);
+    /* Index files a search may be told to read (--max-size) too: up to
+     * RTX_SI_FILE_MAX, or the search's cap when that is bigger. */
+    wk->max_bytes = p->ps.max_bytes ? p->ps.max_bytes : RTX_PROJ_SEARCH_MAX;
+    if (wk->max_bytes < (size_t)RTX_SI_FILE_MAX) wk->max_bytes = (size_t)RTX_SI_FILE_MAX;
+    atomic_store(&p->si_done, 0);
+    p->si_total = rtx_idx_nf(p->cur) * 2;
+    return wk;
+}
+
+/* Joined build: take its report; the next search loads the new file
+ * (the search arm is joined first: it may hold the old one). */
+static void rtx_sib_finish(RtxProj *p, RtxSiBuildWalk *wk) {
+    p->si_last = wk->res;
+    if (wk->ok) {
+        rtx_ps_drop_arm(p);
+        rtx_si_free(p->si);
+        p->si = NULL;
+        p->si_tried = 0;
+    }
+}
+
+static void rtx_sib_drop(RtxProj *p) {
+    RtxSiBuildWalk *wk = p ? (RtxSiBuildWalk *)p->sib : NULL;
+    if (!wk) return;
+    atomic_store_explicit(&wk->cancel, 1, memory_order_release);
+    if (wk->h.live()) {
+        if (wk->h.paused())
+            wk->h.resume() !>(e) { (void)e; };
+        wk->h.wait() !>(e) { (void)e; };
+    }
+    free(wk);
+    p->sib = NULL;
+}
+
+static void rtx_sib_join_done(RtxProj *p) {
+    RtxSiBuildWalk *wk = p ? (RtxSiBuildWalk *)p->sib : NULL;
+    if (!wk || !atomic_load_explicit(&wk->done, memory_order_acquire)) return;
+    if (wk->h.live()) wk->h.wait() !>(e) { (void)e; };
+    p->sib = NULL;
+    rtx_sib_finish(p, wk);
+    free(wk);
+}
+
+void !>(CCError) rtx_proj_index_kick_mode(RtxProj *p, int update) {
+    RtxSiBuildWalk *wk, *scan;
+    int noop = 0;
+    if (!p || !p->cur) return cc_err(CC_ERR_INVALID_ARG, "no project");
+    if (!p->si_path[0]) return cc_err(CC_ERR_INVALID_ARG, "no cache directory for the index");
+    if (p->sib) return cc_ok();
+    if (rtx_idx_walking(p->cur) || p->next) {
+        p->si_want = update ? 2 : 1; /* the pump kicks it once the walk is done */
+        return cc_ok();
+    }
+    p->si_want = 0;
+    wk = rtx_sib_new(p);
+    if (!wk) return cc_err(CC_ERR_OUT_OF_MEMORY, "search index");
+    wk->update = update;
+    p->sib = wk;
+    if (rtx_parallel_inline()) {
+        rtx_sib_run(wk);
+        rtx_sib_join_done(p);
+        return cc_ok();
+    }
+    scan = wk;
+    wk->h = @parallel {
+        @serial { noop = 0; }
+        rtx_sib_run(scan);
+    } !>;
+    return cc_ok();
+}
+
+void !>(CCError) rtx_proj_index_kick(RtxProj *p) {
+    rtx_proj_index_kick_mode(p, 0) !>(e) { return cc_err(e); };
+    return cc_ok();
+}
+
+void !>(CCError) rtx_proj_index_kick_update(RtxProj *p) {
+    rtx_proj_index_kick_mode(p, 1) !>(e) { return cc_err(e); };
+    return cc_ok();
+}
+
+int !>(CCError) rtx_proj_index_build_mode(RtxProj *p, int update, int lanes) {
+    RtxSiBuildWalk *wk;
+    int ok;
+    if (!p || !p->cur) return cc_err(CC_ERR_INVALID_ARG, "no project");
+    if (!p->si_path[0]) return cc_err(CC_ERR_INVALID_ARG, "no cache directory for the index");
+    rtx_sib_drop(p);
+    p->si_want = 0;
+    rtx_proj_finish(p) !>(e) { return cc_err(e); };
+    wk = rtx_sib_new(p);
+    if (!wk) return cc_err(CC_ERR_OUT_OF_MEMORY, "search index");
+    wk->update = update;
+    wk->lanes = lanes;
+    rtx_sib_run(wk);
+    rtx_sib_finish(p, wk);
+    ok = wk->ok;
+    free(wk);
+    return cc_ok(ok);
+}
+
+int !>(CCError) rtx_proj_index_build(RtxProj *p) {
+    int ok = rtx_proj_index_build_mode(p, 0, 0) !>(e) { return cc_err(e); };
+    return cc_ok(ok);
+}
+
+int !>(CCError) rtx_proj_index_update(RtxProj *p) {
+    int ok = rtx_proj_index_build_mode(p, 1, 0) !>(e) { return cc_err(e); };
+    return cc_ok(ok);
+}
+
+int rtx_proj_index_building(const RtxProj *p) {
+    return p && (p->sib != NULL || p->si_want);
+}
+
+int rtx_proj_index_pct(const RtxProj *p) {
+    size_t d;
+    if (!p || !p->si_total) return 0;
+    d = atomic_load(&((RtxProj *)p)->si_done);
+    return d >= p->si_total ? 99 : (int)(d * 100 / p->si_total);
+}
+
+void rtx_proj_index_dir(RtxProj *p, const char *dir) {
+    if (!p || !dir || !dir[0] || !rtx_si_enabled()) return;
+    if (!rtx_si_path(p->si_path, sizeof p->si_path, dir, p->root, p->root_n)) p->si_path[0] = 0;
+}
+
+void rtx_proj_keep_clear(RtxProj *p) {
+    if (p) p->nkeep = 0;
+}
+
+void rtx_proj_keep_add(RtxProj *p, const char *abs) {
+    struct stat st;
+    if (!p || !abs || p->nkeep >= RTX_SI_KEEP_MAX || stat(abs, &st) != 0) return;
+    p->keep[p->nkeep][0] = (uint64_t)st.st_dev;
+    p->keep[p->nkeep][1] = (uint64_t)st.st_ino;
+    p->nkeep++;
 }
 
 static void rtx_ps_drop_arm(RtxProj *p) {
@@ -2272,6 +2752,11 @@ static void !>(CCError) rtx_ps_kick(RtxProj *p) {
     wk->root[p->root_n] = 0;
     wk->root_n = p->root_n;
     wk->end = end;
+    wk->si = &p->si;
+    wk->si_path = p->si_path;
+    wk->si_tried = &p->si_tried;
+    wk->nkeep = p->nkeep;
+    if (p->nkeep) memcpy(wk->keep, p->keep, p->nkeep * sizeof p->keep[0]);
     ps->wk = wk;
     rtx_par_pool_up();
     if (rtx_parallel_inline()) {

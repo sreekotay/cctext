@@ -47,7 +47,7 @@ CC_TARGET rtx_nav obj core/nav.ccs
 CC_TARGET_INCLUDE rtx_nav .
 CC_TARGET_DEPS rtx_nav rtx_scope rtx_piece_tree
 
-CC_TARGET rtx_find obj core/find.ccs core/proj.ccs
+CC_TARGET rtx_find obj core/find.ccs core/proj.ccs core/sindex.ccs
 CC_TARGET_INCLUDE rtx_find .
 CC_TARGET_DEPS rtx_find rtx_piece_tree rtx_scope rtx_document rtx_rx
 
@@ -130,3 +130,7 @@ CC_TARGET_DEPS wb_perf rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse r
 CC_TARGET rx_conform exe tests/rx_conform.ccs
 CC_TARGET_INCLUDE rx_conform .
 CC_TARGET_DEPS rx_conform rtx_rx
+
+CC_TARGET sindex_smoke exe tests/sindex_smoke.ccs
+CC_TARGET_INCLUDE sindex_smoke .
+CC_TARGET_DEPS sindex_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui

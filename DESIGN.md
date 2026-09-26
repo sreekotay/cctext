@@ -40,9 +40,10 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Clip | `w.clip_a` (own heap arena) | next clip value (built on a fresh arena, then adopted); unchanged bytes skip the copy; close |
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
 | Project index | `RtxProjIdx.store` (fixed-size file / dir / name chunks that never move) + the walk's arena (jobs, kept ignore levels, visited set) | open / close; a re-walk builds a second index and swaps it in (search joined first); the walk arena dies at the join |
-| Project search | `RtxProj.ps.store` (query copy, program, hit / group / preview chunks) | a new query or option resets; the index swap re-runs it; close |
+| Project search | `RtxProj.ps.store` (query copy, program, hit / group / preview chunks, the index candidates) | a new query or option resets; the index swap re-runs it; close |
+| Search index | `RtxProj.si` (`RtxSi.a`: the file's bytes — filters included —, per-file identity + trust + first unit, the (dev, ino) table, per-unit word offsets and newline counts); the build's heap (per-file identities, per-segment unit lists, per-shard 2 MiB dedupe sets and read buffers, the file image) | loaded by the first search arm, kept for the session; a finished build frees it (the next search loads the new file); close |
 | Quick-open | `RtxProj.pick` a / b (ping-pong: this query's top list and candidates / the last query's) | each non-extending query resets one side |
-| Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | `RTXS` hist + `RTXC` state sidecar + `.b` base pin while dirty; `RTXW` workspace per project (`w/<hash of the git root, else cwd>`; the pre-v4 global leaf migrates once; the one open_files owes lands on the first safe_pump, after the first frame); each leaf is built in memory and written once before its fsync + rename; unknown ver / bad sum ignored; identity mismatch tosses clean hist, replays dirty hist onto its pin, else holds it; quit-`q` drops dirty journals |
+| Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | `RTXS` hist + `RTXC` state sidecar + `.b` base pin while dirty; `RTXW` workspace per project (`w/<hash of the git root, else cwd>`, and its `.si` sidecar: the search index, see Search index; the pre-v4 global leaf migrates once; the one open_files owes lands on the first safe_pump, after the first frame); each leaf is built in memory and written once before its fsync + rename; unknown ver / bad sum ignored; identity mismatch tosses clean hist, replays dirty hist onto its pin, else holds it; quit-`q` drops dirty journals |
 | TM | process `rtx_tm_store` (langs + rules + interned pattern strings + compiled regex programs) | first lookup scans the grammar dir for metadata (name / scopeName / fileTypes); a grammar's rules load + compile the first time a lookup hands it out (under a lock: browse previews open on a worker); process |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
 
@@ -375,7 +376,8 @@ field the worker is still storing into.
 | island | `isle_kick` (land / gap view) | dest-live wrapper; wait-for 2 MiB blocks | `isle_h.live()` | `isle_from` | — |
 | browse | `rtx_browse_kick` | dest-live wrapper; one `RTX_BROWSE_WAVE` of dir jobs; pump joins a finished arm then starts the next | `h.live()` | `jhead` | — |
 | proj walk | `rtx_proj_open` / `rtx_proj_rewalk` | one dest-live arm for the whole walk: waves of `RTX_PROJ_WAVE` dir jobs under `@parallel wait`; the stage appends dirs / files / child jobs and publishes `pub_nf` / `pub_nd` | `!pub_done` | — (a re-walk starts over) | — |
-| psearch | `rtx_proj_search_set` | dest-live arm over index ids `[next, pub_nf)` at kick, one `@parallel wait` with a ticket per `RTX_PS_CHUNK` files (the lane reads each file whole into its reused buffer and keeps the chunk's hits on its cache replica); the stage appends one group per file, in id order, and publishes once per chunk; the pump kicks the next arm while the walk grows | `ps.wk` / `!complete` | `next` | binary / over size: counted, skipped |
+| psearch | `rtx_proj_search_set` | dest-live arm over index ids `[next, pub_nf)` at kick, one `@parallel wait` with a ticket per `RTX_PS_CHUNK` files (the lane reads each file whole into its reused buffer and keeps the chunk's hits on its cache replica; with the search index it stats first, skips an indexed, unchanged, trusted file none of whose units pass, and reads a big one only around its passing chunks for a one-line pattern); the stage appends one group per file, in id order, and publishes once per chunk; the pump kicks the next arm while the walk grows; the query's first arm loads the index and computes the passing units | `ps.wk` / `!complete` | `next` | binary / over size: counted, skipped; index-ruled-out: counted (`n_idx_skip`, chunk reads `n_idx_chunk`) |
+| index build | "Build Search Index" / "Update Search Index" (`rtx_proj_index_kick_mode`; deferred while the walk runs) | one dest-live arm: two passes over the index files, each a `@parallel wait` over `lanes` shards taking walk-order segments from a counter, bits set straight into the file image, then write; an update stats the walk, re-reads dirty units as jobs and packs new files as a two-pass tail | `rtx_proj_index_building` | — (a rebuild / an update) | close and a re-walk swap cancel it (nothing written; a swap re-asks); the pump joins it while no search arm is live |
 | replace | `rtx_replace_kick` | `rtx_replace_step`: 1 MiB windows of starts on the UI thread, up to `RTX_LINE_ISLE_WORK_MS` or input; past the bulk threshold each site also feeds the bulk build (tree reads, staged add bytes) | `rtx_ui_repl_busy` | `pos` | long match / cap / an edit since kick → `RTX_REPL_FAIL`, nothing edited |
 
 The project walk and search copy the find / browse shape. A walk lane
@@ -503,6 +505,203 @@ the camera moved; help / find / jump paint as chrome on the last
 window. Tests call `finish` (wait). Do not drain the first screen
 before first paint. Tests that need a covered `line_of` call
 `rtx_line_scan_to` (or a pump) first.
+
+### Search index
+
+Project search reads every file, so a repeat search over a big tree costs
+what reading it costs. The search index (`core/sindex.ccs`) is one Bloom
+filter per 64 KiB of the project — a block of consecutive files, or a
+chunk of a big file — about 2 % of the indexed bytes, built only when
+asked ("Build Search Index" / "Update Search Index" in the palette; batch
+`project-index [--update]`). With no index file the search is exactly
+the plain scan: the plan, the loader and the lanes' stat never run
+(`rtx_si_work()` stays put; `sindex_smoke` asserts it). The model was
+picked by a simulation on the Linux tree (ripgrep's benchsuite queries
+plus a dozen identifiers): a truncated rare-trigram posting index (the
+previous design) read 100 % of the bytes at the median query at 1 %,
+because every trigram of a common identifier is in hundreds of files;
+per-block Bloom filters read 37 % (128 KiB blocks), 24.5 % at 64 KiB
+when a big file is read only where its chunks pass, 12.8 % at 2 %.
+Walk-order locality is what makes blocks work (shuffled: 63 %); k = 2,
+a per-file second-level filter, dropping common trigrams and 4-grams
+were all worse at the same size.
+
+Units. The indexed files — regular, not empty, up to 64 MiB
+(`RTX_SI_FILE_MAX`, or the search's size cap when bigger), no NUL in the
+first 8 KiB — in walk order (paths compared with `/` lowest, so a
+directory's files stay together) are packed greedily into blocks of up
+to 64 KiB. A file over 64 KiB is its own run of chunks: chunk j is
+`[j·64 KiB, (j+1)·64 KiB + 63)`. The 63-byte overlap is the longest
+literal the planner uses (64 bytes, `RTX_SI_WINS` + 2) less one, so any
+literal lies whole in some chunk. Each unit's filter holds its
+ASCII-folded trigrams with one hash (k = 1: `bit = h32 · bits >> 32`),
+sized in 64-bit words to the unit's distinct-trigram count so the
+filters together fill what the budget leaves after the fixed parts.
+
+Build: two reads of every indexed file. The walk order is cut into at
+most 256 segments (independent of the lane count: one lane and eight
+write the same file but for its build time); `lanes` shards in a
+`@parallel wait` take segments from an atomic counter. Pass 1 reads each
+file (identity from its fd), packs the segment's blocks, counts each
+unit's distinct trigrams (a 2^24-bit set per shard, cleared through its
+touched list) and each chunk's newlines. Then the budget
+(`search_index_pct`, default 2 % of the indexed bytes, capped at 256
+MiB) pays for header, root, device table, file table and unit directory;
+the rest is split over the units by distinct count (the directory's size
+depends on the word counts: sized twice). The file image is allocated
+once; pass 2 re-reads each file, checks its identity against pass 1 and
+sets the bits straight into the image (units own whole words: no
+atomics). A file that changed between the passes gets the dead bit in
+place (its stamp word keeps its size) and is always read.
+
+Identity and trust: (dev, ino, size, mtime ns, ctime ns) of the fd read
+in pass 1 — ctime because `touch -m` restores the mtime but not ctime.
+A file is trusted only if max(mtime, ctime) < build start − granularity
+(2 s when a stamp has no sub-second part, else 100 ms; git's
+racily-clean rule). Two paths on one inode (hard or symbolic links):
+neither is trusted by a search.
+
+Query: the regex engine's required literals (`rtx_rx_req_n` /
+`rtx_rx_req_lit`, the prefilter's set — every match holds one of them;
+ignore-case pairs and tiny classes as byte sets) become trigram windows
+of up to 27 folded alternatives. A unit passes when, for some literal,
+every window has an alternative whose bit is set (a literal under 3
+bytes, or no required literal: no pruning, the plain scan). The first
+arm computes the passing units once (a bit per unit; ~30k units on
+Linux, well under a millisecond per window). A lane then stats each file
+(`fstatat`) and, when its (dev, ino) maps to an indexed id whose
+identity is unchanged and trusted and it is not a dirty buffer's file
+(`rtx_proj_keep_add`):
+
+- no unit passes: skipped unread (`n_idx_skip`);
+- a big file with some but not all chunks passing, and a pattern no
+  match of which crosses a newline (`rtx_rx_one_line`: no consuming
+  instruction, look-around included, takes `\n`): read only there
+  (`n_idx_chunk`), after re-checking the identity on the opened fd;
+- otherwise read whole.
+
+Chunk reads. Runs of passing chunks merge (and runs whose padded ranges
+meet); each run `[cs, ce)` is read with 256 bytes of padding and widened
+until it holds the `\n` before `cs` and the `\n` at or after `ce − 1`,
+plus the byte after it — whole lines with one byte of real context on
+each side, so `^ $ \b \A \z \Z` and look-around (which cannot cross a
+`\n`) decide exactly as in the whole file; `\A` holds only at offset 0.
+Matches may start only inside the run's lines, and a later run never
+rescans what an earlier one did, so there are no duplicates. The line
+number at the run's start is the chunk's newline count from the index
+(`unl`, a varint per chunk in the unit directory) less the newlines
+between the line start and `cs`. Counting forward instead would read the
+bytes the chunk read skips; the stored counts cost 2 bytes a chunk.
+
+Update ("Update Search Index", `project-index --update`): load the index,
+`fstatat` every walked file and look its (dev, ino) up (one walk path
+per old entry; a shared inode's entries are matched one each). Unchanged
+and trusted by its stamps: kept, unread. Changed with the same shape
+(small, or the same chunk count): its unit is dirty — the whole block
+(≤ 64 KiB) or the whole chunk run is re-read and its filter rewritten at
+its fixed size (fresh newline counts too). Deleted: leaves the table
+(its bits stay; false positives only). New, or reshaped (small ↔ big,
+another chunk count): packed into new tail units, sized at the build's
+bits per trigram (in the header). More than 20 % of the units dirty or
+new (`RTX_SI_UPD_PCT`), no index, or an unreadable one: a full build,
+and the report says why. The new file's build time is the update's
+start: a kept file was trusted before, so it is still trusted. A budget
+change (`--pct`) needs a Build.
+
+File: `<safe>/w/<FNV-1a 64 of the root realpath>.si`, the RTXW leaf's
+sidecar, built in memory, written to `.tmp`, fsync'ed, renamed. 16
+header words ("RTXI" + version 2, build ns, granularity, file / device /
+unit counts, section sizes, block size and overlap, indexed bytes,
+budget, bits per trigram, the last full build's ms); the root path
+(checked on load); the device table; the file table; the unit
+directory; the filters; a 64-bit four-lane word checksum. File table,
+per file in unit order, no paths (lookups go by (dev, ino); the walk
+supplies paths): the device index only when there are several, the
+zigzag delta of the inode from the previous file's, the size, the
+zigzag delta of the ctime seconds from the previous file's, a u32 of
+ctime nanoseconds with `mtime == ctime` and dead flags in its top bits,
+and the zigzag mtime − ctime only when they differ. Unit directory: per
+run, `nfiles << 1` (a block) and its filter words; or
+`nchunks << 1 | 1` (the next file's chunks) and, per chunk, its words
+and its newlines. The loader checks every count against the bytes left,
+chunk counts against sizes, block members ≤ 64 KiB and the word total. A
+bad magic / version / root / size / sum: no index.
+
+Measured on Linux (torvalds/linux, depth 1: 95,986 files, 1.64 GB
+indexed; 4-core VM shared with other agents' builds, so times are
+noisy — best of 3, interleaved; page cache warm; whole `cctext --batch`
+processes, walk included; rg 14.1 `--hidden`; `bench/rg_suite.py`):
+
+| | |
+|---|---|
+| index | 32.7 MB = 1.99 % (budget 2 %): file table 0.785 MB, unit directory 0.095 MB, filters 31.8 MB |
+| units | 30,525 (15,313 blocks, 15,212 chunks), fill 0.32 |
+| file table | 0.048 % of the corpus = 2.4 % of the budget (8.2 B a file); the previous table (paths front-coded, full varint stamps) was 3.45 MB = 0.23 %, 23 % of a 1 % budget |
+| build, all lanes | 5.2 s (pass 1 2.2, pass 2 2.7, write 0.26), peak RSS 93 MiB |
+| build, one lane | 13.3 s (5.9 / 7.1 / 0.27), peak RSS 78 MiB |
+| update, 1 changed file | 0.51 s (stat 0.31, read 0.03, write 0.18): 1 unit re-read, 60 KB |
+| update, 100 changed files | 0.46–0.65 s: 84 units re-read, 4.3–6.4 MB |
+
+Bytes read per query, as a % of what the plain scan reads, against the
+simulation at 2 % (its chunk-read column; its tree excluded the eleven
+files over 8 MiB, which the bench also runs with `--max-size 8388608`
+to compare; with them read — they are indexed and chunk-read too — the
+bench's default run reads `PM_RESUME` at 24.4 %):
+
+| query | cctext | simulation |
+|---|---|---|
+| `PM_RESUME` (literal, `-i`, `-w`) | 27.0 % | 24.0 % |
+| `[A-Z]+_RESUME` | 47.7 % | 44.1 % |
+| `ERR_SYS\|PME_TURN_OFF\|LINK_REQ_RST\|CFG_BME_EVT` (and `-i`) | 36.9 % | 47.5 % |
+| `pthread_mutex_timedlock` | 0.7 % | 0.8 % |
+| `crc32c_le` / `regmap_update_bits_base` / `iommu_map_sg` | 2.3 / 2.3 / 2.3 % | 1.2 / 3.8 / 3.2 % |
+| `kfree_skb_list` / `hrtimer_forward_now` / `SLAB_HWCACHE_ALIGN` | 3.1 / 0.8 / 0.6 % | 4.5 / 1.9 / 0.9 % |
+| `kmalloc_array` / `copy_from_user` / `spin_lock_irqsave` | 12.3 / 14.1 / 13.7 % | 12.8 / 10.8 / 14.4 % |
+| "should never happen" / "for the time being" | 12.4 / 38.6 % | 16.6 / 33.3 % |
+| absent `flibbertigibbet` | 0.4 % | 0.3 % |
+| median of the 19 | 12.4 % | 12.8 % |
+
+(The "about 16 %" at 2 % is the simulation's whole-file median; its
+chunk-read median is 12.8 %. The alternation reads 10 points less than
+modelled; the rest are within 4 points.) Queries with no usable literal
+(`\p{Greek}` blocks, `\wAh`, `\w{5}\s+…`) are plain scans: 100 %.
+
+Warm wall time (whole processes; walk = the project walk, which a batch
+process pays each time and the editor once per session; lanes = time
+summed over 4 lanes):
+
+| query | rg | no index | index | walk / search ms | lanes stat / read+scan, index | lanes stat / read+scan, no index |
+|---|---|---|---|---|---|---|
+| linux_literal | 576 | 723 | 548 | 539 / 539 | 311 / 351 | 45 / 1364 |
+| linux_literal_casei | 644 | 858 | 739 | 731 / 729 | 359 / 447 | 53 / 1446 |
+| linux_re_literal_suffix | 744 | 1157 | 831 | 817 / 814 | 463 / 954 | 66 / 2034 |
+| linux_word | 841 | 1084 | 796 | 779 / 779 | 487 / 505 | 97 / 1875 |
+| linux_alternates | 958 | 1331 | 908 | 812 / 896 | 506 / 850 | 79 / 2679 |
+| linux_unicode_word (plain) | 542 | 719 | 719 | 628 / 709 | 46 / 1256 | 45 / 1302 |
+| linux_no_literal (plain) | 1669 | 3904 | 4288 | 2006 / 4254 | 120 / 13062 | 108 / 11930 |
+| pthread_mutex_timedlock | 547 | 712 | 443 | 434 / 435 | 256 / 11 | 42 / 1296 |
+| kmalloc_array | 583 | 738 | 483 | 471 / 472 | 286 / 157 | 50 / 1300 |
+| spin_lock_irqsave | 660 | 726 | 497 | 481 / 482 | 260 / 162 | 70 / 1326 |
+| flibbertigibbet | 924 | 1066 | 639 | 628 / 629 | 278 / 13 | 67 / 1697 |
+| all 24 queries | 19.7 s | 25.9 s | 20.7 s | | | |
+
+Reading: with the index, read + scan falls from ~1.3 s (summed) to
+10–500 ms, and the search finishes as soon as the walk does — the walk
+(0.4–0.8 s here, one `getdents` + `fstatat` pass) and one `fstatat` per
+file in the lanes are the floor. In the editor the walk is paid once, so
+the gain there is the read+scan column. Counts equal rg's except where
+the semantics differ (a symlinked file rg does not follow, `\p{Greek}`
+run as block classes, `\w` / `\s` past ASCII); with and without the
+index cctext's rows are identical for every query (the bench compares
+them).
+
+Limits: a changed file costs one re-read of its block (≤ 64 KiB) or of
+its whole run of chunks; updates never compact (deleted files' bits and
+tail units stay until a Build); shapes are fixed, so a file growing
+past 64 KiB moves to the tail. The residual risk of trusting stamps is
+a change that keeps size, mtime and ctime (a clock set back, a file
+system that does not move ctime, mmap stores never msync'ed), the same
+as git's.
 
 ## Surfaces
 

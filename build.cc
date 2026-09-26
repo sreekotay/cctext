@@ -61,7 +61,7 @@ CC_TARGET rtx_nav obj core/nav.ccs
 CC_TARGET_INCLUDE rtx_nav .
 CC_TARGET_DEPS rtx_nav rtx_scope rtx_piece_tree
 
-CC_TARGET rtx_find obj core/find.ccs core/proj.ccs
+CC_TARGET rtx_find obj core/find.ccs core/proj.ccs core/sindex.ccs
 CC_TARGET_INCLUDE rtx_find .
 CC_TARGET_DEPS rtx_find rtx_piece_tree rtx_scope rtx_document rtx_rx
 

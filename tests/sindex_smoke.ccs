@@ -1,0 +1,1092 @@
+/*
+ * Project search index (core/sindex.ccs): results with the index equal
+ * results without it, always.
+ *
+ *  1. Units: query plans (ignore case = lowercase, short literals and
+ *     patterns without required literals do not plan), racy stamps,
+ *     chunk geometry, which patterns stay on one line.
+ *  2. No index: a search hashes and stats nothing for it (rtx_si_work).
+ *  3. A generated tree (words with uneven topics, mixed case, UTF-8,
+ *     binaries, empty and big files: 64 KiB chunks); `rtx_proj_index_build`
+ *     writes <safe>/w/<hash>.si; searches prune with it.
+ *  3b. Chunks: tokens planted at chunk edges (across the edge, inside the
+ *     63-byte overlap, at the first and last byte), inside long lines
+ *     around an edge, and in CRLF text; each token's search reads only
+ *     some chunks and equals the plain scan (lines, columns, offsets).
+ *  4. Mutations the identity must catch: append; a same-size rewrite in
+ *     the same second with `touch -m` restoring the mtime; replace by
+ *     rename with the mtime restored; delete; create (maybe reusing the
+ *     inode); rename; a file changed within the granularity before the
+ *     build (racy: never trusted).
+ *  5. Differential: seeded random queries (literal, ignore case, whole
+ *     word, regex with required literals, alternations, classes, short
+ *     literals) on the indexed project and an index-off one, with random
+ *     same-size / mtime-restored edits and occasional rebuilds (update)
+ *     in between: sorted hit lists and binary counts are equal.
+ *  6. Update (rtx_proj_index_update): changed, new, deleted, grown
+ *     (small -> big), shrunk (big -> small) and same-size mtime-restored
+ *     files; it re-reads only the dirty blocks, falls back to a build
+ *     past its threshold, and every search after it equals the plain scan.
+ *  7. File: corrupt, old version, wrong root: no index; the background
+ *     build arm (kick + pump); a kept (dirty) file is never skipped.
+ */
+#include <ccc/std/prelude.cch>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include "../core/proj.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static void sleep_ms(long ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
+
+static uint64_t rnd(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 7;
+    g_rng ^= g_rng << 17;
+    return g_rng;
+}
+
+static unsigned rn(unsigned n) {
+    return n ? (unsigned)(rnd() % n) : 0;
+}
+
+/* ------------------------------------------------------------------ units */
+
+static void test_units(void) {
+    CCArena a = cc_arena_heap(kilobytes(256));
+    static RtxSiQ q, q2;
+    RtxRx *rx;
+    {
+        @errhandler(CCError er) {
+            fprintf(stderr, "FAIL: unit compile: %s\n", er.message ? er.message : "?");
+            fails++;
+            a.destroy();
+            return;
+        }
+        static const struct {
+            const char *q;
+            unsigned fl;
+            int plan; /* 1 plans, 0 does not, -1 either */
+        } cs[] = {
+            { "quick", RTX_RX_LITERAL, 1 },
+            { "QUICK", RTX_RX_LITERAL | RTX_RX_ICASE, 1 },
+            { "zebra|quack", 0, 1 },
+            { "ne+dle", 0, -1 },
+            { "fox\\s+jumps", 0, -1 },
+            { "qu", RTX_RX_LITERAL, 0 },
+            { "a|bcd", 0, 0 },
+            { "\\w+", 0, 0 },
+            { "(?i)LAZY\\s+DOG", 0, 1 },
+            { "[qx]uick", 0, 1 },
+        };
+        size_t i;
+        char msg[160];
+        for (i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+            unsigned n;
+            rx = rtx_rx_compile(cc_slice_cstr(cs[i].q), cs[i].fl, a) !>;
+            n = rtx_si_plan(rx, &q);
+            snprintf(msg, sizeof msg, "unit plan '%s': %u", cs[i].q, n);
+            if (cs[i].plan >= 0) expect((n > 0) == cs[i].plan, msg);
+        }
+        rx = rtx_rx_compile(cc_slice_cstr("needle"), RTX_RX_LITERAL, a) !>;
+        rtx_si_plan(rx, &q);
+        rx = rtx_rx_compile(cc_slice_cstr("NeEdLe"), RTX_RX_LITERAL | RTX_RX_ICASE, a) !>;
+        rtx_si_plan(rx, &q2);
+        expect(q.n == 1 && q2.n == 1 && q.lit[0].nw == 4 && q2.lit[0].nw == 4 &&
+                   !memcmp(&q.lit[0], &q2.lit[0], sizeof q.lit[0]),
+               "unit: ignore-case plan = lowercase plan");
+        expect(q.lit[0].wn[0] == 1 && q.lit[0].t[0][0] == (('n' << 16) | ('e' << 8) | 'e'),
+               "unit: the first window is 'nee'");
+        {
+            static const struct {
+                const char *q;
+                int one;
+            } ol[] = { { "foo", 1 },          { "foo.{0,40}bar", 1 }, { "foo[ ,]+bar", 1 },
+                       { "foo\\s+bar", 0 },  { "foo[^x]bar", 0 },    { "(?m)foo.bar", 0 },
+                       { "foo\\nbar", 0 },   { "^foo$", 1 },         { "foo(?=[^z]*bar)", 0 },
+                       { "(?<=a)foo\\b", 1 } };
+            for (i = 0; i < sizeof ol / sizeof ol[0]; i++) {
+                rx = rtx_rx_compile(cc_slice_cstr(ol[i].q), 0, a) !>;
+                snprintf(msg, sizeof msg, "unit one-line '%s'", ol[i].q);
+                expect(rtx_rx_one_line(rx) == ol[i].one, msg);
+            }
+        }
+    }
+    expect(rtx_si_nchunks(1) == 1 && rtx_si_nchunks(RTX_SI_BLK) == 1 &&
+               rtx_si_nchunks(RTX_SI_BLK + 1) == 2 && rtx_si_nchunks(3 * RTX_SI_BLK) == 3 &&
+               rtx_si_nchunks(3 * RTX_SI_BLK + 1) == 4,
+           "unit: chunk counts");
+    /* Racy stamps (git's rule): trusted only past the granularity; 2 s
+     * when a stamp has no sub-second part. */
+    {
+        RtxSiId id;
+        const int64_t S = 1000000000LL;
+        memset(&id, 0, sizeof id);
+        id.mtime_ns = 1700000000LL * S;
+        id.ctime_ns = 1700000000LL * S;
+        expect(!rtx_si_trusted(&id, id.mtime_ns + S / 2), "coarse: 0.5 s after is racy");
+        expect(!rtx_si_trusted(&id, id.mtime_ns + 2 * S), "coarse: 2 s after is racy");
+        expect(rtx_si_trusted(&id, id.mtime_ns + 2 * S + 1), "coarse: past 2 s is trusted");
+        id.mtime_ns += 123456789;
+        id.ctime_ns += 223456789;
+        expect(!rtx_si_trusted(&id, id.ctime_ns + 50 * 1000000LL), "ns: 50 ms after is racy");
+        expect(rtx_si_trusted(&id, id.ctime_ns + 150 * 1000000LL), "ns: 150 ms after is trusted");
+        id.ctime_ns = 1700000005LL * S; /* ctime whole second: coarse */
+        expect(!rtx_si_trusted(&id, id.ctime_ns + S), "coarse ctime: 1 s after is racy");
+        id.mtime_ns = 1700000000LL * S + 5;
+        id.ctime_ns = 1700000009LL * S + 5;
+        expect(!rtx_si_trusted(&id, 1700000009LL * S + 50 * 1000000LL), "max(mtime, ctime)");
+    }
+    a.destroy();
+}
+
+/* ------------------------------------------------------------------ tree */
+
+static char g_tmp[512], g_root[640], g_safe[640];
+static char g_words[400][24];
+static int g_nwords;
+static char g_files[600][96];
+static int g_nfiles;
+
+static void mkdirs(const char *path) {
+    char p[1024];
+    size_t i, n;
+    snprintf(p, sizeof p, "%s", path);
+    n = strlen(p);
+    for (i = 1; i < n; i++) {
+        if (p[i] != '/') continue;
+        p[i] = 0;
+        mkdir(p, 0755);
+        p[i] = '/';
+    }
+}
+
+static void put_file(const char *rel, const char *s, size_t n) {
+    char p[1024];
+    FILE *f;
+    snprintf(p, sizeof p, "%s/%s", g_root, rel);
+    mkdirs(p);
+    f = fopen(p, "wb");
+    if (!f) {
+        fprintf(stderr, "FAIL: write %s\n", p);
+        fails++;
+        return;
+    }
+    if (n) fwrite(s, 1, n, f);
+    fclose(f);
+}
+
+static char *read_file(const char *rel, size_t *n) {
+    char p[1024];
+    FILE *f;
+    char *b;
+    long sz;
+    snprintf(p, sizeof p, "%s/%s", g_root, rel);
+    f = fopen(p, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    b = (char *)malloc((size_t)sz + 1);
+    *n = fread(b, 1, (size_t)sz, f);
+    fclose(f);
+    return b;
+}
+
+static void make_words(void) {
+    static const char *uni[] = { "stra\xc3\x9f" "e", "\xce\xa9mega", "\xc3\x9c" "BER", "na\xc3\xafve",
+                                 "\xd0\x9c\xd0\xbe\xd1\x81\xd0\xba\xd0\xb2\xd0\xb0", "caf\xc3\xa9" };
+    int i;
+    for (i = 0; i < 6; i++) snprintf(g_words[i], sizeof g_words[i], "%s", uni[i]);
+    for (; i < 360; i++) {
+        unsigned len = 3 + rn(9), k;
+        for (k = 0; k < len; k++) {
+            unsigned r = rn(40);
+            char c = (char)('a' + rn(26));
+            if (r == 0) c = '_';
+            else if (r == 1) c = (char)('0' + rn(10));
+            else if (r < 5) c = (char)('A' + rn(26));
+            g_words[i][k] = c;
+        }
+        g_words[i][len] = 0;
+    }
+    g_nwords = i;
+}
+
+/* A file on a topic: words from a window of the vocabulary. */
+static void gen_body(char *out, size_t cap, size_t want, size_t *n) {
+    unsigned topic = rn((unsigned)g_nwords), span = 12 + rn(40);
+    size_t o = 0;
+    while (o + 40 < cap && o < want) {
+        const char *w = rn(20) ? g_words[(topic + rn(span)) % (unsigned)g_nwords]
+                               : g_words[rn((unsigned)g_nwords)];
+        size_t l = strlen(w), k;
+        unsigned cs = rn(8);
+        for (k = 0; k < l; k++) {
+            char c = w[k];
+            if (cs == 0 && c >= 'a' && c <= 'z') c -= 32;
+            else if (cs == 1 && k == 0 && c >= 'a' && c <= 'z') c -= 32;
+            out[o++] = c;
+        }
+        {
+            unsigned sep = rn(16);
+            out[o++] = sep == 0 ? '\n' : sep == 1 ? ',' : sep == 2 ? '(' : sep == 3 ? '\t' : ' ';
+            if (sep == 0 && rn(3) == 0) out[o++] = '\n';
+        }
+    }
+    *n = o;
+}
+
+/* ------------------------------------------------------------ big files */
+
+#define B ((size_t)RTX_SI_BLK)
+
+static void plant_at(char *body, size_t n, size_t at, const char *tok) {
+    size_t l = strlen(tok);
+    if (at + l <= n) memcpy(body + at, tok, l);
+}
+
+static void add_file(const char *rel) {
+    if (g_nfiles < (int)(sizeof g_files / sizeof g_files[0]))
+        snprintf(g_files[g_nfiles++], sizeof g_files[0], "%s", rel);
+}
+
+/* Tokens at chunk edges: across an edge, ending exactly at the overlap's
+ * end, crossing it, at the first and the last byte, inside long lines
+ * around an edge; CRLF text; one token in several chunks. */
+static void plant_big(void) {
+    static char body[6 * 65536 + 4096];
+    size_t n = 0, k;
+    gen_body(body, sizeof body, 5 * B + 1234, &n);
+    plant_at(body, n, 0, "qjxfirst");
+    plant_at(body, n, B - 4, "qjxedgeA");
+    plant_at(body, n, B + RTX_SI_OVL - 7, "qjxovlB");
+    plant_at(body, n, 2 * B + 60, "qjxovlC");
+    for (k = 3 * B - 3000; k < 3 * B + 3000 && k < n; k++) body[k] = (char)('a' + (k % 7));
+    plant_at(body, n, 3 * B + 10, "qjxlongF");
+    plant_at(body, n, 3 * B - 2000, "qjxlongG");
+    for (k = 4 * B - 90000 / 100; k < 4 * B - 10; k++) body[k] = 'z'; /* 890 bytes */
+    plant_at(body, n, 4 * B - 300, "qjxlongH");
+    plant_at(body, n, 4 * B + 2, "qjxedgeI");
+    plant_at(body, n, n - 7, "qjxlast");
+    put_file("big/edge.txt", body, n);
+    add_file("big/edge.txt");
+    /* CRLF lines */
+    {
+        size_t o = 0;
+        unsigned line = 0;
+        while (o + 64 < 2 * B + 5000) {
+            int m = snprintf(body + o, 64, "crlf line %u word%u\r\n", line, line % 97);
+            o += (size_t)m;
+            line++;
+        }
+        plant_at(body, o, B - 3, "qjxcrlf");
+        put_file("big/crlf.txt", body, o);
+        add_file("big/crlf.txt");
+    }
+    /* one token in chunks 0, 2, 3 and 5 (3 and the start of 4: a merge) */
+    gen_body(body, sizeof body, 6 * B - 100, &n);
+    plant_at(body, n, 100, "qjxmulti");
+    plant_at(body, n, 2 * B + 500, "qjxmulti");
+    plant_at(body, n, 4 * B - 40, "qjxmulti");
+    plant_at(body, n, 4 * B + 30, "qjxmulti");
+    plant_at(body, n, 5 * B + 9, "QJXMULTI");
+    put_file("big/multi.txt", body, n);
+    add_file("big/multi.txt");
+    /* exactly one block, and one byte more (two chunks) */
+    gen_body(body, sizeof body, B + 10, &n);
+    plant_at(body, n, B - 10, "qjxexact");
+    put_file("big/exact.txt", body, B);
+    put_file("big/exact1.txt", body, B + 1);
+    add_file("big/exact.txt");
+    add_file("big/exact1.txt");
+    /* one inode, three paths: a symlink and a hard link to a target */
+    {
+        char t[1024], l[1024];
+        put_file("links/target.txt", "linked qjxlinked text\n", 22);
+        snprintf(t, sizeof t, "%s/links/target.txt", g_root);
+        snprintf(l, sizeof l, "%s/links/sym.txt", g_root);
+        if (symlink("target.txt", l) != 0) fails++;
+        snprintf(l, sizeof l, "%s/links/hard.txt", g_root);
+        if (link(t, l) != 0) fails++;
+    }
+}
+
+#undef B
+
+static void make_tree(void) {
+    const char *td = getenv("TMPDIR");
+    static char body[300000];
+    int i;
+    snprintf(g_tmp, sizeof g_tmp, "%s/cctext_si_XXXXXX", td && td[0] ? td : "/tmp");
+    if (!mkdtemp(g_tmp)) {
+        fprintf(stderr, "FAIL: mkdtemp\n");
+        fails++;
+        g_tmp[0] = 0;
+        return;
+    }
+    snprintf(g_root, sizeof g_root, "%s/tree", g_tmp);
+    snprintf(g_safe, sizeof g_safe, "%s/safe", g_tmp);
+    mkdir(g_root, 0755);
+    mkdir(g_safe, 0755);
+    make_words();
+    g_nfiles = 0;
+    for (i = 0; i < 260; i++) {
+        size_t n = 0, want;
+        unsigned kind = rn(40);
+        snprintf(g_files[g_nfiles], sizeof g_files[0], "d%02u/s%u/f%03d.%s", rn(12), rn(3), i,
+                 rn(2) ? "c" : "txt");
+        want = kind == 0 ? 200000 + rn(60000) : kind < 4 ? rn(40) : 200 + rn(9000);
+        gen_body(body, sizeof body, want, &n);
+        if (kind == 5 && n > 100) body[50 + rn(50)] = 0; /* binary */
+        if (kind == 6) n = 0;                             /* empty */
+        put_file(g_files[g_nfiles], body, n);
+        g_nfiles++;
+    }
+    put_file(".gitignore", "*.o\n", 4);
+    plant_big();
+}
+
+static void drop_tree(void) {
+    char cmd[700];
+    if (!g_tmp[0]) return;
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", g_tmp);
+    if (system(cmd) != 0) fprintf(stderr, "sindex_smoke: could not remove %s\n", g_tmp);
+}
+
+/* ------------------------------------------------------------- compare */
+
+typedef struct {
+    char **rows;
+    size_t n;
+    size_t bin, skip, groups;
+} Res;
+
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static Res run_q(RtxProj *p, const char *q, unsigned opts) {
+    Res r;
+    size_t i;
+    memset(&r, 0, sizeof r);
+    {
+        @errhandler(CCError e) {
+            fprintf(stderr, "FAIL: search '%s': %s\n", q, e.message ? e.message : "?");
+            fails++;
+            return r;
+        }
+        rtx_proj_search_set(p, cc_slice_cstr(q), opts) !>;
+        rtx_proj_search_finish(p) !>;
+    }
+    r.n = rtx_proj_search_nh(p);
+    r.groups = rtx_proj_search_ng(p);
+    r.bin = p->ps.n_bin;
+    r.skip = p->ps.n_idx_skip;
+    r.rows = (char **)calloc(r.n + 1, sizeof(char *));
+    for (i = 0; i < r.n; i++) {
+        const RtxPsHit *h = rtx_proj_search_hit(p, i);
+        char path[RTX_PROJ_PATH], row[RTX_PROJ_PATH + 400];
+        rtx_proj_path(p, h->file, path, sizeof path);
+        snprintf(row, sizeof row, "%s:%u:%u:%u:%llu:%.*s", path, h->line, h->col, h->mlen,
+                 (unsigned long long)h->off, (int)h->pvn, rtx_proj_search_pv(p, h));
+        r.rows[i] = strdup(row);
+    }
+    qsort(r.rows, r.n, sizeof(char *), cmp_str);
+    return r;
+}
+
+static void res_drop(Res *r) {
+    size_t i;
+    for (i = 0; i < r->n; i++) free(r->rows[i]);
+    free(r->rows);
+}
+
+static int res_eq(const Res *a, const Res *b, const char *tag) {
+    size_t i;
+    char msg[400];
+    if (a->n != b->n || a->groups != b->groups || a->bin != b->bin) {
+        snprintf(msg, sizeof msg, "%s: %zu hits / %zu files / %zu bin (index) vs %zu / %zu / %zu", tag,
+                 a->n, a->groups, a->bin, b->n, b->groups, b->bin);
+        expect(0, msg);
+        return 0;
+    }
+    for (i = 0; i < a->n; i++) {
+        if (strcmp(a->rows[i], b->rows[i]) != 0) {
+            snprintf(msg, sizeof msg, "%s: row %zu: %.150s vs %.150s", tag, i, a->rows[i],
+                     b->rows[i]);
+            expect(0, msg);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static RtxProj *open_proj(int index, const char *safe) {
+    RtxProj *p = (RtxProj *)calloc(1, sizeof(RtxProj));
+    @errhandler(CCError e) {
+        fprintf(stderr, "FAIL: open: %s\n", e.message ? e.message : "?");
+        fails++;
+        return p;
+    }
+    rtx_si_set_enabled(index);
+    rtx_proj_open(p, cc_slice_cstr(g_root), 0) !>;
+    if (safe) rtx_proj_index_dir(p, safe);
+    rtx_si_set_enabled(1);
+    rtx_proj_finish(p) !>;
+    return p;
+}
+
+static void close_proj(RtxProj *p) {
+    rtx_proj_close(p);
+    free(p);
+}
+
+/* ------------------------------------------------------------ mutations */
+
+static void get_times(const char *rel, struct timespec ts[2]) {
+    char p[1024];
+    struct stat st;
+    snprintf(p, sizeof p, "%s/%s", g_root, rel);
+    memset(ts, 0, 2 * sizeof(struct timespec));
+    if (stat(p, &st) == 0) {
+        ts[0] = st.st_atim;
+        ts[1] = st.st_mtim;
+    }
+}
+
+static void set_times(const char *rel, const struct timespec ts[2]) {
+    char p[1024];
+    snprintf(p, sizeof p, "%s/%s", g_root, rel);
+    utimensat(AT_FDCWD, p, ts, 0);
+}
+
+/* Overwrite n bytes at off in place (same size); restore the times when
+ * asked (the mtime-only identity would miss it; ctime catches it). */
+static void poke(const char *rel, size_t off, const char *s, size_t n, int restore) {
+    char p[1024];
+    struct timespec ts[2];
+    int fd;
+    get_times(rel, ts);
+    snprintf(p, sizeof p, "%s/%s", g_root, rel);
+    fd = open(p, O_WRONLY);
+    if (fd < 0) return;
+    if (pwrite(fd, s, n, (off_t)off) != (ssize_t)n) fails++;
+    close(fd);
+    if (restore) set_times(rel, ts);
+}
+
+static int file_size(const char *rel) {
+    char p[1024];
+    struct stat st;
+    snprintf(p, sizeof p, "%s/%s", g_root, rel);
+    return stat(p, &st) == 0 ? (int)st.st_size : -1;
+}
+
+/* First text file (> 30 bytes, no NUL) at or after index k. */
+static int pick_text(int k) {
+    for (; k < g_nfiles; k++) {
+        size_t n = 0;
+        char *s;
+        if (file_size(g_files[k]) <= 30) continue;
+        s = read_file(g_files[k], &n);
+        if (s && !memchr(s, 0, n)) {
+            free(s);
+            return k;
+        }
+        free(s);
+    }
+    return 0;
+}
+
+/* A random same-size edit that plants `word` in a random text file. */
+static void random_edit(const char *word, int restore) {
+    int tries;
+    for (tries = 0; tries < 20; tries++) {
+        const char *rel = g_files[rn((unsigned)g_nfiles)];
+        int sz = file_size(rel);
+        size_t wl = strlen(word);
+        if (sz < (int)wl + 2) continue;
+        poke(rel, rn((unsigned)(sz - (int)wl)), word, wl, restore);
+        return;
+    }
+}
+
+/* ------------------------------------------------------------ the tests */
+
+static void rand_query(char *q, size_t cap, unsigned *opts) {
+    const char *w1 = g_words[rn((unsigned)g_nwords)];
+    const char *w2 = g_words[rn((unsigned)g_nwords)];
+    const char *w3 = g_words[rn((unsigned)g_nwords)];
+    unsigned kind = rn(10);
+    *opts = 0;
+    if (rn(6) == 0) *opts |= RTX_PS_WORD;
+    switch (kind) {
+    case 0:
+        snprintf(q, cap, "%s", w1);
+        break;
+    case 1: {
+        size_t k, l;
+        snprintf(q, cap, "%s", w1);
+        l = strlen(q);
+        for (k = 0; k < l; k++)
+            if (rn(2) && q[k] >= 'a' && q[k] <= 'z') q[k] -= 32;
+        *opts |= RTX_PS_ICASE;
+        break;
+    }
+    case 2: {
+        size_t l = strlen(w1), s, n = 2 + rn(5);
+        if (n > l) n = l;
+        s = rn((unsigned)(l - n + 1));
+        snprintf(q, cap, "%.*s", (int)n, w1 + s);
+        if (rn(2)) *opts |= RTX_PS_ICASE;
+        break;
+    }
+    case 3: {
+        unsigned k, n = 4 + rn(5);
+        for (k = 0; k < n; k++) q[k] = (char)('a' + rn(26));
+        q[n] = 0;
+        if (rn(2)) *opts |= RTX_PS_ICASE;
+        break;
+    }
+    case 4:
+        snprintf(q, cap, rn(2) ? "%s\\w*" : "\\b%s\\b", w1);
+        *opts |= RTX_PS_REGEX;
+        if (rn(3) == 0) *opts |= RTX_PS_ICASE;
+        break;
+    case 5:
+        snprintf(q, cap, "%s(%s|%s|%s)", rn(2) ? "(?i)" : "", w1, w2, w3);
+        *opts |= RTX_PS_REGEX;
+        break;
+    case 6:
+        snprintf(q, cap, "%s.{0,40}%s", w1, w2);
+        *opts |= RTX_PS_REGEX;
+        break;
+    case 7: {
+        /* one byte becomes a two-letter class, or a dot */
+        size_t l = strlen(w1), at = rn((unsigned)l), o = 0, k;
+        for (k = 0; k < l && o + 8 < cap; k++) {
+            if (k == at && (unsigned char)w1[k] < 0x80) {
+                if (rn(2)) {
+                    q[o++] = '[';
+                    q[o++] = w1[k];
+                    q[o++] = (char)('a' + rn(26));
+                    q[o++] = ']';
+                } else {
+                    q[o++] = '.';
+                }
+            } else {
+                q[o++] = w1[k];
+            }
+        }
+        q[o] = 0;
+        *opts |= RTX_PS_REGEX;
+        if (rn(2)) *opts |= RTX_PS_ICASE;
+        break;
+    }
+    case 8:
+        snprintf(q, cap, "%s|%.2s", w1, w2); /* a 2-byte branch: no skip */
+        *opts |= RTX_PS_REGEX;
+        break;
+    default:
+        snprintf(q, cap, "%s[ ,(]+%s", w1, w2);
+        *opts |= RTX_PS_REGEX | (rn(2) ? RTX_PS_ICASE : 0);
+        break;
+    }
+}
+
+static int build(RtxProj *p) {
+    @errhandler(CCError e) {
+        fprintf(stderr, "FAIL: build: %s\n", e.message ? e.message : "?");
+        fails++;
+        return 0;
+    }
+    int ok = rtx_proj_index_build(p) !>;
+    expect(ok, p->si_last.err ? p->si_last.err : "build");
+    return ok;
+}
+
+/* Update; want: 1 incremental, 0 a full build, -1 either. */
+static int update(RtxProj *p, int want) {
+    @errhandler(CCError e) {
+        fprintf(stderr, "FAIL: update: %s\n", e.message ? e.message : "?");
+        fails++;
+        return 0;
+    }
+    int ok = rtx_proj_index_update(p) !>;
+    char msg[160];
+    expect(ok, p->si_last.err ? p->si_last.err : "update");
+    snprintf(msg, sizeof msg, "update: %s (want %s)%s%s",
+             p->si_last.update ? "incremental" : "full", want ? "incremental" : "full",
+             p->si_last.why_full ? ": " : "", p->si_last.why_full ? p->si_last.why_full : "");
+    if (want >= 0) expect(p->si_last.update == want, msg);
+    return ok;
+}
+
+static const char *g_toks[] = { "qjxlinked", "qjxfirst", "qjxedgeA", "qjxovlB",  "qjxovlC",  "qjxlongF",
+                                "qjxlongG", "qjxlongH", "qjxedgeI", "qjxlast",  "qjxcrlf",
+                                "qjxmulti", "qjxexact" };
+
+/* Every planted token, as a literal, ignoring case, a whole word, and as
+ * one-line and multi-line regexes: equal to the plain scan. Returns the
+ * files read by chunks. */
+static size_t chunk_queries(RtxProj *b, RtxProj *c, const char *tag0, int need) {
+    size_t k, v, chunked = 0;
+    for (k = 0; k < sizeof g_toks / sizeof g_toks[0]; k++) {
+        for (v = 0; v < 6; v++) {
+            char q[96], tag[240];
+            unsigned o = 0;
+            Res ra, rb;
+            switch (v) {
+            case 0: snprintf(q, sizeof q, "%s", g_toks[k]); break;
+            case 1: snprintf(q, sizeof q, "%s", g_toks[k]); o = RTX_PS_ICASE; break;
+            case 2: snprintf(q, sizeof q, "%s", g_toks[k]); o = RTX_PS_WORD; break;
+            case 3: snprintf(q, sizeof q, "%s[a-zA-Z]?.{0,3}$", g_toks[k]); o = RTX_PS_REGEX; break;
+            case 4: snprintf(q, sizeof q, "\\b%.5s\\w*", g_toks[k] + 3); o = RTX_PS_REGEX; break;
+            default: snprintf(q, sizeof q, "%s\\s*\\S", g_toks[k]); o = RTX_PS_REGEX; break;
+            }
+            ra = run_q(b, q, o);
+            rb = run_q(c, q, o);
+            snprintf(tag, sizeof tag, "%s: token query '%s' opts %u", tag0, q, o);
+            res_eq(&ra, &rb, tag);
+            if (need && v == 0) expect(ra.n > 0, tag);
+            chunked += b->ps.n_idx_chunk;
+            res_drop(&ra);
+            res_drop(&rb);
+        }
+    }
+    return chunked;
+}
+
+static void test_index(void) {
+    RtxProj *b, *c;
+    Res ra, rb;
+    char q[256];
+    unsigned opts;
+    int i, seed;
+    size_t skipped = 0, queries = 0, pruned = 0;
+    char si_path[1024];
+    /* A granularity above any timestamp tick, short enough for a test
+     * (the default is RTX_SI_GRAN_MS; whole-second stamps use 2 s). */
+    rtx_si_test_gran_ms(40);
+    rtx_si_test_upd_pct(100); /* a tiny tree: exercise the incremental path */
+    /* A tiny tree: 8 % keeps the filters about half full (the default 2 %
+     * would fill them); rebuilds alternate with 20 %. */
+    rtx_si_set_pct(8);
+    sleep_ms(60);
+    /* 1. No index file: nothing is hashed or stat'ed for it. */
+    {
+        uint64_t w0 = rtx_si_work();
+        b = open_proj(1, g_safe);
+        c = open_proj(0, g_safe);
+        expect(b->si_path[0] && !c->si_path[0], "index path set only when on");
+        snprintf(si_path, sizeof si_path, "%s", b->si_path);
+        expect(strncmp(si_path, g_safe, strlen(g_safe)) == 0 && strstr(si_path, "/w/") &&
+                   strstr(si_path, ".si"),
+               "index file under <safe>/w/<hash>.si");
+        ra = run_q(b, "zzzqqq_absent", 0);
+        rb = run_q(b, "needle(s)?", RTX_PS_REGEX);
+        expect(rtx_si_work() == w0 && b->ps.si_state == 2 && b->ps.us_stat < 1000000,
+               "no index: plain scan, nothing hashed");
+        expect(ra.skip == 0 && rb.skip == 0, "no index: nothing skipped");
+        res_drop(&ra);
+        res_drop(&rb);
+        close_proj(c);
+    }
+    /* 2. Build; the next search prunes. */
+    expect(build(b), "build");
+    fprintf(stderr, "sindex_smoke: %u files, %llu B index of %llu B (%.2f%%; file table %llu B),"
+                    " %u units (%u blocks, %u chunks), fill %.2f, %ld ms, peak %.1f MiB\n",
+            b->si_last.files, (unsigned long long)b->si_last.bytes,
+            (unsigned long long)b->si_last.corpus,
+            100.0 * (double)b->si_last.bytes / (double)(b->si_last.corpus + 1),
+            (unsigned long long)b->si_last.ftab_bytes, b->si_last.units, b->si_last.blocks,
+            b->si_last.chunks, b->si_last.fill, b->si_last.ms, (double)b->si_last.peak / 1048576.0);
+    {
+        struct stat st;
+        expect(stat(si_path, &st) == 0 && st.st_size > 0, "index file written");
+        expect(b->si_last.bytes <= b->si_last.budget + 65536, "index within its budget");
+        expect(b->si_last.chunks >= 8 && b->si_last.blocks >= 4, "blocks and chunks");
+        expect(b->si_last.fill > 0.05 && b->si_last.fill < 0.95, "filters neither empty nor full");
+    }
+    ra = run_q(b, "zzzqqq_absent", 0);
+    expect(b->si && b->si->load_rc == 1, "the search loads the index");
+    expect(b->ps.si_state == 1 && ra.skip > (size_t)g_nfiles / 2,
+           "absent literal: most files skipped unread");
+    res_drop(&ra);
+    ra = run_q(b, "qu", 0);
+    expect(b->ps.si_state == 2 && ra.skip == 0, "2-byte query: plain scan");
+    res_drop(&ra);
+    {
+        RtxProj *c0 = open_proj(0, NULL);
+        size_t ch = chunk_queries(b, c0, "chunks", 1);
+        fprintf(stderr, "sindex_smoke: token queries read %zu files by chunks\n", ch);
+        expect(ch >= 20, "token queries read big files by chunks");
+        /* single-threaded build: the same file but for its build time */
+        {
+            @errhandler(CCError e) {
+                fprintf(stderr, "FAIL: lanes 1: %s\n", e.message ? e.message : "?");
+                fails++;
+            }
+            size_t n1 = 0, n2 = 0;
+            char *f1, *f2;
+            FILE *fp;
+            fp = fopen(si_path, "rb");
+            f1 = fp ? (char *)malloc(1 << 22) : NULL;
+            if (fp && f1) n1 = fread(f1, 1, 1 << 22, fp);
+            if (fp) fclose(fp);
+            sleep_ms(2);
+            rtx_proj_index_build_mode(b, 0, 1) !>;
+            fp = fopen(si_path, "rb");
+            f2 = fp ? (char *)malloc(1 << 22) : NULL;
+            if (fp && f2) n2 = fread(f2, 1, 1 << 22, fp);
+            if (fp) fclose(fp);
+            {
+                /* all but the build time (word 1), the build's ms (14)
+                 * and the checksum (the last word) */
+                int same = f1 && f2 && n1 == n2 && n1 > 256;
+                if (same) {
+                    memset(f1 + 8, 0, 8);
+                    memset(f2 + 8, 0, 8);
+                    memset(f1 + 14 * 8, 0, 8);
+                    memset(f2 + 14 * 8, 0, 8);
+                    same = !memcmp(f1, f2, n1 - 8);
+                }
+                expect(same, "one lane builds the same index as many");
+            }
+            free(f1);
+            free(f2);
+        }
+        close_proj(c0);
+    }
+    close_proj(b);
+    /* 3. Mutations. */
+    sleep_ms(20);
+    {
+        size_t n = 0;
+        char *s;
+        struct timespec ts[2];
+        char p1[1024], p2[1024];
+        s = read_file(g_files[3], &n);
+        if (s) {
+            s = (char *)realloc(s, n + 16);
+            memcpy(s + n, " qjxappendq", 11);
+            put_file(g_files[3], s, n + 11);
+            free(s);
+        }
+        random_edit("qjxsamesize", 1);
+        poke(g_files[pick_text(10)], 5, "qjxpoked", 8, 1);
+        {
+            int k = pick_text(20);
+            s = read_file(g_files[k], &n);
+            get_times(g_files[k], ts);
+            if (s && n > 20) {
+                FILE *f;
+                memcpy(s + 7, "qjxrenamed", 10);
+                snprintf(p1, sizeof p1, "%s/%s.new", g_root, g_files[k]);
+                snprintf(p2, sizeof p2, "%s/%s", g_root, g_files[k]);
+                f = fopen(p1, "wb");
+                if (f) {
+                    fwrite(s, 1, n, f);
+                    fclose(f);
+                }
+                rename(p1, p2);
+                set_times(g_files[k], ts);
+            }
+            free(s);
+        }
+        snprintf(p1, sizeof p1, "%s/%s", g_root, g_files[30]);
+        unlink(p1);
+        put_file("new/qjx_created.txt", "brand qjxcreated file\n", 22);
+        snprintf(p1, sizeof p1, "%s/%s", g_root, g_files[40]);
+        snprintf(p2, sizeof p2, "%s/%s.moved", g_root, g_files[40]);
+        rename(p1, p2);
+    }
+    b = open_proj(1, g_safe);
+    c = open_proj(0, NULL);
+    {
+        static const char *qs[] = { "qjxappendq", "qjxsamesize", "qjxpoked", "qjxrenamed",
+                                    "qjxcreated", "QJX", "qjx(append|poked|renamed)" };
+        size_t k;
+        for (k = 0; k < sizeof qs / sizeof qs[0]; k++) {
+            char tag[160];
+            unsigned o = k == 5 ? RTX_PS_ICASE : k == 6 ? RTX_PS_REGEX : 0;
+            ra = run_q(b, qs[k], o);
+            rb = run_q(c, qs[k], o);
+            snprintf(tag, sizeof tag, "mutation '%s'", qs[k]);
+            res_eq(&ra, &rb, tag);
+            expect(ra.n > 0, tag);
+            res_drop(&ra);
+            res_drop(&rb);
+        }
+    }
+    /* Same second, same size, `touch -m` restoring the mtime; and a file
+     * changed within the granularity before the build (racy). */
+    {
+        struct timespec ts[2];
+        char p1[1024];
+        struct stat st;
+        put_file("same/sec.txt", "alpha beta gamma delta\n", 23);
+        sleep_ms(60);
+        put_file("same/racy.txt", "alpha beta gamma delta\n", 23);
+        close_proj(b);
+        close_proj(c);
+        b = open_proj(1, g_safe);
+        c = open_proj(0, NULL);
+        expect(build(b), "rebuild (update)");
+        ra = run_q(b, "zzzqqq_absent", 0);
+        res_drop(&ra);
+        snprintf(p1, sizeof p1, "%s/same/sec.txt", g_root);
+        expect(stat(p1, &st) == 0 && b->si && rtx_si_find(b->si, &st) >= 0,
+               "sec.txt indexed and trusted");
+        snprintf(p1, sizeof p1, "%s/same/racy.txt", g_root);
+        expect(stat(p1, &st) == 0 && b->si && rtx_si_find(b->si, &st) < 0,
+               "racy.txt (changed just before the build) is not trusted");
+        get_times("same/sec.txt", ts);
+        poke("same/sec.txt", 12, "qjxsec", 6, 0); /* same size, same second */
+        ts[0].tv_nsec = UTIME_OMIT;
+        set_times("same/sec.txt", ts); /* touch -m -d <the old mtime> */
+        poke("same/racy.txt", 12, "qjxrcy", 6, 1);
+        ra = run_q(b, "qjxsec", 0);
+        rb = run_q(c, "qjxsec", 0);
+        res_eq(&ra, &rb, "same-second edit, mtime restored");
+        expect(ra.n == 1, "same-second edit found");
+        res_drop(&ra);
+        res_drop(&rb);
+        ra = run_q(b, "qjxrcy", 0);
+        expect(ra.n == 1, "racy file searched");
+        res_drop(&ra);
+    }
+    /* 4. Differential over random queries, edits and rebuilds between. */
+    for (seed = 1; seed <= 12; seed++) {
+        g_rng = 0x51ED5EEDull * (uint64_t)seed + 12345;
+        if (seed % 4 == 0) {
+            sleep_ms(45);
+            rtx_si_set_pct(seed % 8 ? 20 : 8);
+            if (seed % 8) build(b);
+            else update(b, -1); /* every edit so far is in the index */
+        }
+        for (i = 0; i < 40; i++) {
+            char tag[400];
+            rand_query(q, sizeof q, &opts);
+            ra = run_q(b, q, opts);
+            rb = run_q(c, q, opts);
+            snprintf(tag, sizeof tag, "seed %d query %d '%s' opts %u", seed, i, q, opts);
+            res_eq(&ra, &rb, tag);
+            skipped += ra.skip;
+            if (b->ps.si_state == 1) pruned++;
+            queries++;
+            res_drop(&ra);
+            res_drop(&rb);
+            if (rn(4) == 0) random_edit(g_words[rn((unsigned)g_nwords)], rn(2));
+        }
+    }
+    fprintf(stderr, "sindex_smoke: %zu queries (%zu pruned), %zu files skipped\n", queries,
+            pruned, skipped);
+    expect(skipped > queries, "the index skipped files");
+    expect(pruned > queries / 4, "many queries prune");
+    /* Keep: a dirty buffer's file is never skipped. */
+    {
+        char p1[1024];
+        Res k0, k1;
+        int k = pick_text(50);
+        k0 = run_q(b, "zzzqqq_absent", 0);
+        snprintf(p1, sizeof p1, "%s/%s", g_root, g_files[k]);
+        rtx_proj_keep_add(b, p1);
+        k1 = run_q(b, "zzzqqq_absent", 0);
+        expect(k1.skip + 1 == k0.skip || k0.skip == k1.skip, "kept file");
+        expect(k1.skip <= k0.skip, "kept file is read");
+        rtx_proj_keep_clear(b);
+        res_drop(&k0);
+        res_drop(&k1);
+    }
+    /* Update: changed, new, deleted, grown, shrunk, renamed, mtime-restored. */
+    {
+        size_t n = 0;
+        char *t, p1[1024], p2[1024];
+        static char big[160000];
+        int k;
+        sleep_ms(45);
+        build(b);
+        sleep_ms(45);
+        t = read_file(g_files[pick_text(60)], &n);
+        if (t) {
+            t = (char *)realloc(t, n + 16);
+            memcpy(t + n, " qjxupdA\n", 9);
+            put_file(g_files[pick_text(60)], t, n + 9);
+            free(t);
+        }
+        poke("big/multi.txt", 3 * RTX_SI_BLK + 77, "qjxupdB", 7, 1);
+        put_file("new2/f_upd.txt", "a brand new qjxupdC file\n", 25);
+        put_file("links/target.txt", "linked qjxlinked text, qjxupdG\n", 31);
+        snprintf(p1, sizeof p1, "%s/%s", g_root, g_files[pick_text(70)]);
+        unlink(p1);
+        k = pick_text(80);
+        gen_body(big, sizeof big, 150000, &n);
+        memcpy(big + n - 100, "qjxupdD", 7);
+        put_file(g_files[k], big, n); /* small -> big */
+        put_file("big/crlf.txt", "short now\nqjxupdE\n", 18); /* big -> small */
+        k = pick_text(90);
+        snprintf(p1, sizeof p1, "%s/%s", g_root, g_files[k]);
+        snprintf(p2, sizeof p2, "%s/renamed_%d.txt", g_root, k);
+        rename(p1, p2);
+        sleep_ms(45);
+        rtx_si_test_upd_pct(100);
+        close_proj(b);
+        close_proj(c);
+        b = open_proj(1, g_safe);
+        c = open_proj(0, NULL);
+        update(b, 1);
+        fprintf(stderr, "sindex_smoke: update: %u same, %u changed, %u new, %u gone;"
+                        " %u units re-read, %u new, %llu B read, %ld ms\n",
+                b->si_last.upd_same, b->si_last.upd_changed, b->si_last.upd_new,
+                b->si_last.upd_gone, b->si_last.upd_dirty, b->si_last.upd_tail,
+                (unsigned long long)b->si_last.upd_bytes, b->si_last.ms);
+        expect(b->si_last.upd_dirty >= 2 && b->si_last.upd_tail >= 2 &&
+                   b->si_last.upd_new >= 3 && b->si_last.upd_gone >= 1,
+               "update: dirty units re-read, tail units added");
+        expect(b->si_last.upd_bytes < b->si_last.corpus / 2, "update: reads far less than a build");
+        {
+            static const char *uq[] = { "qjxupdA", "qjxupdB", "qjxupdC", "qjxupdD", "qjxupdE",
+                                        "qjxupdG" };
+            size_t j;
+            for (j = 0; j < sizeof uq / sizeof uq[0]; j++) {
+                char tag[120];
+                ra = run_q(b, uq[j], 0);
+                rb = run_q(c, uq[j], 0);
+                snprintf(tag, sizeof tag, "after update: '%s'", uq[j]);
+                res_eq(&ra, &rb, tag);
+                expect(ra.n >= 1 && b->ps.si_state == 1 && ra.skip > 0, tag);
+                res_drop(&ra);
+                res_drop(&rb);
+            }
+        }
+        chunk_queries(b, c, "after update", 0);
+        for (i = 0; i < 60; i++) {
+            char tag[400];
+            rand_query(q, sizeof q, &opts);
+            ra = run_q(b, q, opts);
+            rb = run_q(c, q, opts);
+            snprintf(tag, sizeof tag, "after update: query %d '%s' opts %u", i, q, opts);
+            res_eq(&ra, &rb, tag);
+            res_drop(&ra);
+            res_drop(&rb);
+        }
+        /* nothing changed: nothing re-read */
+        update(b, 1);
+        expect(b->si_last.upd_changed == 0 && b->si_last.upd_dirty == 0 &&
+                   b->si_last.upd_tail == 0 && b->si_last.upd_new == 0,
+               "update with no change reads nothing");
+        /* past the threshold: a full build, and it says why */
+        rtx_si_test_upd_pct(0);
+        random_edit("qjxupdF", 0);
+        sleep_ms(45);
+        update(b, 0);
+        expect(b->si_last.why_full != NULL, "update fell back to a build");
+        rtx_si_test_upd_pct(100);
+        ra = run_q(b, "qjxupdF", 0);
+        rb = run_q(c, "qjxupdF", 0);
+        res_eq(&ra, &rb, "after the fallback build");
+        res_drop(&ra);
+        res_drop(&rb);
+    }
+    close_proj(b);
+    /* 5. The background build arm: kick, pump until done. */
+    {
+        int guard = 0;
+        b = open_proj(1, g_safe);
+        {
+            @errhandler(CCError e) {
+                (void)e;
+                fails++;
+            }
+            sleep_ms(45);
+            rtx_proj_index_kick(b) !>;
+            while (rtx_proj_index_building(b) && guard++ < 20000) {
+                sleep_ms(1);
+                rtx_proj_pump(b) !>;
+            }
+        }
+        expect(b->si_last.ok && !rtx_proj_index_building(b), "background build done");
+        ra = run_q(b, "zzzqqq_absent", 0);
+        rb = run_q(c, "zzzqqq_absent", 0);
+        res_eq(&ra, &rb, "after the background build");
+        expect(ra.skip > (size_t)g_nfiles / 2, "background build: the next search prunes");
+        res_drop(&ra);
+        res_drop(&rb);
+        close_proj(b);
+    }
+    /* 6. Corrupt, old version: no index. */
+    {
+        int fd;
+        struct stat st;
+        fd = open(si_path, O_RDWR);
+        expect(fd >= 0 && fstat(fd, &st) == 0, "index file exists");
+        if (fd >= 0) {
+            unsigned char x;
+            off_t at = st.st_size / 2;
+            if (pread(fd, &x, 1, at) == 1) {
+                x ^= 0x10;
+                if (pwrite(fd, &x, 1, at) != 1) fails++;
+            }
+            close(fd);
+        }
+        b = open_proj(1, g_safe);
+        ra = run_q(b, "qjxcreated", 0);
+        rb = run_q(c, "qjxcreated", 0);
+        expect(b->si && b->si->load_rc == -1 && b->ps.si_state == 2, "flipped byte: no index");
+        res_eq(&ra, &rb, "corrupt index");
+        res_drop(&ra);
+        res_drop(&rb);
+        expect(build(b), "rebuild after corruption");
+        close_proj(b);
+        fd = open(si_path, O_RDWR);
+        if (fd >= 0) {
+            uint32_t v = 99;
+            if (pwrite(fd, &v, 4, 4) != 4) fails++;
+            close(fd);
+        }
+        b = open_proj(1, g_safe);
+        ra = run_q(b, "qjxcreated", 0);
+        expect(b->si && b->si->load_rc == -1, "unknown version: no index");
+        res_drop(&ra);
+        close_proj(b);
+        /* switched off: no index path at all */
+        b = open_proj(0, g_safe);
+        expect(!b->si_path[0], "switch off: no index");
+        close_proj(b);
+    }
+    close_proj(c);
+}
+
+int main(void) {
+    test_units();
+    make_tree();
+    if (g_tmp[0]) test_index();
+    drop_tree();
+    if (fails) {
+        fprintf(stderr, "sindex_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("sindex_smoke: ok\n");
+    return 0;
+}

@@ -1,0 +1,1873 @@
+#!ccc ccs
+/*
+ * Project search index: one Bloom filter per 64 KiB block or chunk (see
+ * sindex.cch). Joins the rtx_find target beside proj.ccs (build.cc is at
+ * the 64-target cap).
+ */
+#include <ccc/std/prelude.cch>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include "sindex.cch"
+#include "lf.cch"
+#include "rtx_par.cch"
+
+/* Types first: the lowered @parallel thunks are hoisted above the
+ * functions. */
+
+/* A unit while building: a block of the files at positions [p0, p1)
+ * (the indexed ones among them), or chunk j of the file at p0. */
+typedef struct {
+    uint32_t p0, p1;
+    uint32_t x;             /* block: files; chunk: RTX_SI_CHUNK | j */
+    uint32_t nd;            /* distinct trigrams */
+    uint64_t nl;            /* chunk: newlines in [j * BLK, (j + 1) * BLK) */
+    uint64_t woff, words;   /* filter words (after sizing) */
+} RtxSiU;
+
+/* A segment of positions [p0, p1): one shard packs its blocks. */
+typedef struct {
+    uint32_t p0, p1;
+    RtxSiU *u;
+    uint32_t nu, cap;
+    int oom;
+} RtxSiSeg;
+
+/* Update: one unit to re-read at its fixed filter size. */
+typedef struct {
+    uint32_t nu;            /* units (a chunk run: its chunks) */
+    uint32_t nm;            /* members (a chunk run: 1) */
+    uint32_t *mrel;         /* member rel indices */
+    RtxSiId *mid;           /* member identities read (out) */
+    uint8_t *mok;           /* 1 read, 2 dead (out) */
+    uint64_t woff;          /* first filter word in the new image */
+    uint64_t *words;        /* per unit (nu) */
+    uint64_t *nl;           /* chunk run: per chunk (out) */
+    uint64_t bytes;
+} RtxSiJob;
+
+/* Shared build state. Positions index `ord` (rel indices, walk order). */
+typedef struct {
+    const RtxSiBuildIn *in;
+    int rootfd;
+    const uint32_t *ord;
+    uint32_t npos;
+    RtxSiId *ids;           /* per position */
+    uint8_t *ok;            /* per position: 0 no, 1 indexed, 2 dead */
+    RtxSiSeg *seg;
+    uint32_t nseg;
+    RtxSiJob *job;
+    uint32_t njob;
+    _Atomic uint32_t next;
+    uint64_t *filt;         /* pass 2 / jobs: the filter words */
+} RtxSiB;
+
+/* One lane. */
+typedef struct {
+    RtxSiB *b;
+    int pass;               /* 1 count, 2 set bits, 3 jobs */
+    uint64_t *seen;         /* 2^24-bit dedupe set, cleared per unit */
+    uint32_t *touch;
+    size_t ntouch, tcap;
+    char *buf;
+    size_t cap;
+    uint64_t bytes, work;
+    size_t peak;
+    int oom;
+} RtxSiShard;
+
+static _Atomic int g_si_on = 1;
+static _Atomic int g_si_env = -1;
+static _Atomic long g_si_pct = 0;
+static _Atomic long g_si_gran_ms = -1;
+static _Atomic uint64_t g_si_work = 0;
+static _Atomic long g_si_upd_pct = -1;
+
+void rtx_si_set_enabled(int on) {
+    atomic_store(&g_si_on, on ? 1 : 0);
+}
+
+int rtx_si_enabled(void) {
+    int env = atomic_load(&g_si_env);
+    if (env < 0) {
+        const char *s = getenv("RTX_SEARCH_INDEX");
+        env = !(s && (s[0] == '0' || s[0] == 'n' || s[0] == 'N' || s[0] == 'f' || s[0] == 'F'));
+        atomic_store(&g_si_env, env);
+    }
+    return env && atomic_load(&g_si_on);
+}
+
+void rtx_si_set_pct(long pct) {
+    atomic_store(&g_si_pct, pct);
+}
+
+long rtx_si_pct(void) {
+    long v = atomic_load(&g_si_pct);
+    if (v <= 0) {
+        const char *s = getenv("RTX_SEARCH_INDEX_PCT");
+        v = s && s[0] ? strtol(s, NULL, 10) : 0;
+    }
+    if (v <= 0) v = RTX_SI_PCT;
+    if (v > 50) v = 50;
+    return v;
+}
+
+void rtx_si_test_gran_ms(long ms) {
+    atomic_store(&g_si_gran_ms, ms);
+}
+
+void rtx_si_test_upd_pct(long pct) {
+    atomic_store(&g_si_upd_pct, pct);
+}
+
+uint64_t rtx_si_work(void) {
+    return atomic_load(&g_si_work);
+}
+
+static long rtx_si_mono_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static int64_t rtx_si_now_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+void rtx_si_id_of(const struct stat *st, RtxSiId *id) {
+    id->dev = (uint64_t)st->st_dev;
+    id->ino = (uint64_t)st->st_ino;
+    id->size = (uint64_t)st->st_size;
+#ifdef __APPLE__
+    id->mtime_ns = (int64_t)st->st_mtimespec.tv_sec * 1000000000LL + st->st_mtimespec.tv_nsec;
+    id->ctime_ns = (int64_t)st->st_ctimespec.tv_sec * 1000000000LL + st->st_ctimespec.tv_nsec;
+#else
+    id->mtime_ns = (int64_t)st->st_mtim.tv_sec * 1000000000LL + st->st_mtim.tv_nsec;
+    id->ctime_ns = (int64_t)st->st_ctim.tv_sec * 1000000000LL + st->st_ctim.tv_nsec;
+#endif
+}
+
+static int rtx_si_trusted_g(const RtxSiId *id, int64_t built_ns, long gran_ms) {
+    int64_t t = id->mtime_ns > id->ctime_ns ? id->mtime_ns : id->ctime_ns;
+    long ms = gran_ms;
+    /* No sub-second part: a whole-second (or unknown) file system. */
+    if (id->mtime_ns % 1000000000LL == 0 || id->ctime_ns % 1000000000LL == 0)
+        ms = RTX_SI_GRAN_COARSE_MS;
+    return t < built_ns - (int64_t)ms * 1000000LL;
+}
+
+static long rtx_si_gran(void) {
+    long ms = atomic_load(&g_si_gran_ms);
+    return ms < 0 ? RTX_SI_GRAN_MS : ms;
+}
+
+int rtx_si_trusted(const RtxSiId *id, int64_t built_ns) {
+    return rtx_si_trusted_g(id, built_ns, rtx_si_gran());
+}
+
+static inline uint32_t rtx_si_fold(uint32_t c) {
+    return c + ((uint32_t)(c - 'A' < 26u) << 5);
+}
+
+/* The filter hash of a trigram (the high half picks the bit: bit =
+ * h * bits >> 32, no division). */
+static inline uint32_t rtx_si_h(uint32_t t) {
+    uint64_t h = (uint64_t)t * 0x9E3779B97F4A7C15ull;
+    h ^= h >> 29;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 32;
+    return (uint32_t)h;
+}
+
+uint32_t rtx_si_nchunks(uint64_t size) {
+    if (size <= RTX_SI_BLK) return 1;
+    return (uint32_t)((size + RTX_SI_BLK - 1) / RTX_SI_BLK);
+}
+
+int rtx_si_path(char *dst, size_t n, const char *safe_dir, const char *root, size_t rn) {
+    /* The FNV-1a 64 of the root realpath: the RTXW leaf's name (safe.ccs). */
+    uint64_t h = 1469598103934665603ull;
+    size_t i;
+    char d[4096];
+    if (!dst || !safe_dir || !safe_dir[0] || !root) return 0;
+    for (i = 0; i < rn; i++) {
+        h ^= (unsigned char)root[i];
+        h *= 1099511628211ull;
+    }
+    if (snprintf(d, sizeof d, "%s/w", safe_dir) >= (int)sizeof d) return 0;
+    if (mkdir(d, 0700) != 0 && errno != EEXIST) return 0;
+    return snprintf(dst, n, "%s/%016llx.si", d, (unsigned long long)h) < (int)n;
+}
+
+/* ------------------------------------------------------------- varints */
+
+typedef struct {
+    uint8_t *p;
+    size_t n, cap;
+    int oom;
+} RtxSiBuf;
+
+static void rtx_si_grow(RtxSiBuf *b, size_t more) {
+    size_t c;
+    uint8_t *np;
+    if (b->oom || b->n + more <= b->cap) return;
+    c = b->cap ? b->cap * 2 : 65536;
+    while (c < b->n + more) c *= 2;
+    np = (uint8_t *)realloc(b->p, c);
+    if (!np) {
+        b->oom = 1;
+        return;
+    }
+    b->p = np;
+    b->cap = c;
+}
+
+static void rtx_si_put(RtxSiBuf *b, const void *s, size_t n) {
+    rtx_si_grow(b, n);
+    if (b->oom) return;
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+}
+
+static void rtx_si_vput(RtxSiBuf *b, uint64_t v) {
+    uint8_t t[10];
+    size_t k = 0;
+    while (v >= 0x80) {
+        t[k++] = (uint8_t)(v | 0x80);
+        v >>= 7;
+    }
+    t[k++] = (uint8_t)v;
+    rtx_si_put(b, t, k);
+}
+
+static inline uint64_t rtx_si_zz(int64_t v) {
+    return ((uint64_t)v << 1) ^ (uint64_t)(v >> 63);
+}
+
+static inline int64_t rtx_si_unzz(uint64_t v) {
+    return (int64_t)(v >> 1) ^ -(int64_t)(v & 1);
+}
+
+/* 0 = ran off the end (or a varint over 10 bytes). */
+static int rtx_si_vget(const uint8_t **pp, const uint8_t *e, uint64_t *v) {
+    const uint8_t *p = *pp;
+    uint64_t r = 0;
+    unsigned s = 0;
+    while (p < e && s < 70) {
+        uint8_t c = *p++;
+        r |= (uint64_t)(c & 0x7F) << s;
+        if (!(c & 0x80)) {
+            *v = r;
+            *pp = p;
+            return 1;
+        }
+        s += 7;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------ checksum */
+
+static inline uint64_t rtx_si_mix(uint64_t h, uint64_t w) {
+    h ^= w * 0x9E3779B97F4A7C15ull;
+    h = (h << 29) | (h >> 35);
+    return h * 0xBF58476D1CE4E5B9ull;
+}
+
+/* Words of an 8-aligned buffer, four independent lanes. */
+static uint64_t rtx_si_sum(const uint64_t *w, size_t n) {
+    uint64_t h0 = 0x243F6A8885A308D3ull, h1 = 0x13198A2E03707344ull;
+    uint64_t h2 = 0xA4093822299F31D0ull, h3 = 0x082EFA98EC4E6C89ull, h;
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        h0 = rtx_si_mix(h0, w[i]);
+        h1 = rtx_si_mix(h1, w[i + 1]);
+        h2 = rtx_si_mix(h2, w[i + 2]);
+        h3 = rtx_si_mix(h3, w[i + 3]);
+    }
+    for (; i < n; i++) h0 = rtx_si_mix(h0, w[i]);
+    h = rtx_si_mix((uint64_t)n, h0);
+    h = rtx_si_mix(h, h1);
+    h = rtx_si_mix(h, h2);
+    h = rtx_si_mix(h, h3);
+    return h ^ (h >> 32);
+}
+
+/* --------------------------------------------------------------- lanes */
+
+static int rtx_si_lanes(const RtxSiBuildIn *in) {
+    long n = in && in->lanes > 0 ? in->lanes : sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;
+    return (int)n;
+}
+
+static int rtx_si_cancelled(const RtxSiBuildIn *in) {
+    return in->cancel && atomic_load_explicit(in->cancel, memory_order_acquire);
+}
+
+/* Read `rel` whole into the lane buffer (8 KiB first: a binary costs one
+ * read). 1 = text read whole; its identity in *id. */
+static int rtx_si_read(RtxSiShard *sh, const char *rel, RtxSiId *id, size_t *len) {
+    const RtxSiBuildIn *in = sh->b->in;
+    struct stat st;
+    size_t size, got = 0;
+    int fd = openat(sh->b->rootfd, rel, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+    if (fd < 0) return 0;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (size_t)st.st_size > in->max_bytes) {
+        close(fd);
+        return 0;
+    }
+    size = (size_t)st.st_size;
+    if (sh->cap < size) {
+        size_t c = size < ((size_t)1 << 20) ? ((size_t)1 << 20) : size;
+        char *nb = (char *)realloc(sh->buf, c);
+        if (!nb) {
+            close(fd);
+            sh->oom = 1;
+            return 0;
+        }
+        sh->buf = nb;
+        sh->cap = c;
+        if (c > sh->peak) sh->peak = c;
+    }
+    while (got < size) {
+        size_t want = size - got;
+        ssize_t r;
+        if (got == 0 && want > 8192) want = 8192;
+        r = read(fd, sh->buf + got, want);
+        if (r <= 0) break;
+        got += (size_t)r;
+        if (got <= 8192 && memchr(sh->buf, 0, got)) break;
+    }
+    close(fd);
+    if (got != size || memchr(sh->buf, 0, got < 8192 ? got : 8192)) return 0;
+    rtx_si_id_of(&st, id);
+    *len = got;
+    sh->bytes += got;
+    return 1;
+}
+
+/* Add p[0, n)'s distinct folded trigrams to the lane's unit set. */
+static void rtx_si_count(RtxSiShard *sh, const char *s, size_t n) {
+    const unsigned char *p = (const unsigned char *)s;
+    uint32_t v;
+    size_t i;
+    if (n < 3) return;
+    v = (rtx_si_fold(p[0]) << 8) | rtx_si_fold(p[1]);
+    for (i = 2; i < n; i++) {
+        uint32_t t;
+        uint64_t m;
+        v = ((v << 8) | rtx_si_fold(p[i])) & 0xFFFFFFu;
+        t = v;
+        m = (uint64_t)1 << (t & 63);
+        if (sh->seen[t >> 6] & m) continue;
+        sh->seen[t >> 6] |= m;
+        if (sh->ntouch < sh->tcap) sh->touch[sh->ntouch++] = t;
+    }
+    sh->work += n - 2;
+}
+
+/* Close a unit's set: its distinct count, the set cleared. */
+static uint32_t rtx_si_close(RtxSiShard *sh) {
+    size_t i, n = sh->ntouch;
+    for (i = 0; i < n; i++) sh->seen[sh->touch[i] >> 6] = 0;
+    sh->ntouch = 0;
+    return (uint32_t)n;
+}
+
+/* Set p[0, n)'s trigram bits in a filter of `words` words at f. */
+static void rtx_si_set(RtxSiShard *sh, uint64_t *f, uint64_t words, const char *s, size_t n) {
+    const unsigned char *p = (const unsigned char *)s;
+    uint64_t bits = words * 64;
+    uint32_t v;
+    size_t i;
+    if (n < 3) return;
+    v = (rtx_si_fold(p[0]) << 8) | rtx_si_fold(p[1]);
+    for (i = 2; i < n; i++) {
+        uint64_t b;
+        v = ((v << 8) | rtx_si_fold(p[i])) & 0xFFFFFFu;
+        b = ((uint64_t)rtx_si_h(v) * bits) >> 32;
+        f[b >> 6] |= (uint64_t)1 << (b & 63);
+    }
+    sh->work += n - 2;
+}
+
+static int rtx_si_emit(RtxSiSeg *g, const RtxSiU *u) {
+    if (g->nu == g->cap) {
+        uint32_t c = g->cap ? g->cap * 2 : 64;
+        RtxSiU *nu = (RtxSiU *)realloc(g->u, c * sizeof(RtxSiU));
+        if (!nu) {
+            g->oom = 1;
+            return -1;
+        }
+        g->u = nu;
+        g->cap = c;
+    }
+    g->u[g->nu++] = *u;
+    return 0;
+}
+
+static void rtx_si_tick(RtxSiShard *sh) {
+    const RtxSiBuildIn *in = sh->b->in;
+    /* A fiber that never parks reads as a stall to the runtime's monitor,
+     * and holds its worker: yield between files. */
+    cc_yield();
+    if (in->done) atomic_fetch_add_explicit(in->done, 1, memory_order_relaxed);
+}
+
+/* Pass 1 of a segment: read, pack blocks, count each unit's distinct
+ * trigrams and each chunk's newlines. */
+static void rtx_si_seg1(RtxSiShard *sh, RtxSiSeg *g) {
+    RtxSiB *b = sh->b;
+    const RtxSiBuildIn *in = b->in;
+    uint32_t p, p0 = g->p0, nf = 0;
+    size_t cur = 0;
+    for (p = g->p0; p < g->p1; p++) {
+        RtxSiId id;
+        size_t len = 0;
+        if (rtx_si_cancelled(in) || g->oom) return;
+        rtx_si_tick(sh);
+        if (!rtx_si_read(sh, in->rel[b->ord[p]], &id, &len)) {
+            b->ok[p] = 0;
+            continue;
+        }
+        b->ids[p] = id;
+        b->ok[p] = 1;
+        if (len > RTX_SI_BLK) {
+            uint32_t j, nch = rtx_si_nchunks(len);
+            if (nf) {
+                RtxSiU u = { p0, p, nf, rtx_si_close(sh), 0, 0, 0 };
+                rtx_si_emit(g, &u);
+            }
+            for (j = 0; j < nch; j++) {
+                size_t s = (size_t)j * RTX_SI_BLK, e = s + RTX_SI_BLK + RTX_SI_OVL;
+                size_t ne = s + RTX_SI_BLK;
+                RtxSiU u;
+                if (e > len) e = len;
+                if (ne > len) ne = len;
+                rtx_si_count(sh, sh->buf + s, e - s);
+                u = (RtxSiU){ p, p + 1, RTX_SI_CHUNK | j, rtx_si_close(sh),
+                              rtx_count_lf(sh->buf + s, ne - s), 0, 0 };
+                rtx_si_emit(g, &u);
+            }
+            p0 = p + 1;
+            nf = 0;
+            cur = 0;
+            continue;
+        }
+        if (nf && cur + len > RTX_SI_BLK) {
+            RtxSiU u = { p0, p, nf, rtx_si_close(sh), 0, 0, 0 };
+            rtx_si_emit(g, &u);
+            p0 = p;
+            nf = 0;
+            cur = 0;
+        }
+        rtx_si_count(sh, sh->buf, len);
+        cur += len;
+        nf++;
+    }
+    if (nf) {
+        RtxSiU u = { p0, g->p1, nf, rtx_si_close(sh), 0, 0, 0 };
+        rtx_si_emit(g, &u);
+    }
+    rtx_si_close(sh);
+}
+
+static int rtx_si_same(const RtxSiId *a, const RtxSiId *b) {
+    return a->dev == b->dev && a->ino == b->ino && a->size == b->size &&
+           a->mtime_ns == b->mtime_ns && a->ctime_ns == b->ctime_ns;
+}
+
+/* Pass 2 of a segment: read again, check the identity, set the bits. */
+static void rtx_si_seg2(RtxSiShard *sh, RtxSiSeg *g) {
+    RtxSiB *b = sh->b;
+    const RtxSiBuildIn *in = b->in;
+    uint32_t k, p;
+    /* Positions the segment's units do not cover still count as read. */
+    for (k = 0; k < g->nu; k++) {
+        RtxSiU *u = &g->u[k];
+        if (rtx_si_cancelled(in)) return;
+        if (!(u->x & RTX_SI_CHUNK)) {
+            for (p = u->p0; p < u->p1; p++) {
+                RtxSiId id;
+                size_t len = 0;
+                rtx_si_tick(sh);
+                if (b->ok[p] != 1) continue;
+                if (!rtx_si_read(sh, in->rel[b->ord[p]], &id, &len) ||
+                    !rtx_si_same(&id, &b->ids[p])) {
+                    b->ok[p] = 2; /* changed between the passes: dead */
+                    continue;
+                }
+                rtx_si_set(sh, b->filt + u->woff, u->words, sh->buf, len);
+            }
+        } else if ((u->x & ~RTX_SI_CHUNK) == 0) {
+            /* The first chunk: read the file once for its run. */
+            RtxSiId id;
+            size_t len = 0;
+            uint32_t j, nch;
+            p = u->p0;
+            rtx_si_tick(sh);
+            nch = rtx_si_nchunks(b->ids[p].size);
+            if (b->ok[p] != 1) continue;
+            if (!rtx_si_read(sh, in->rel[b->ord[p]], &id, &len) ||
+                !rtx_si_same(&id, &b->ids[p])) {
+                b->ok[p] = 2;
+                continue;
+            }
+            for (j = 0; j < nch && k + j < g->nu; j++) {
+                RtxSiU *c = &g->u[k + j];
+                size_t s = (size_t)j * RTX_SI_BLK, e = s + RTX_SI_BLK + RTX_SI_OVL;
+                if (e > len) e = len;
+                rtx_si_set(sh, b->filt + c->woff, c->words, sh->buf + s, e - s);
+            }
+        }
+    }
+    /* Progress: files that were not indexed are "done" for pass 2 too. */
+    if (in->done)
+        for (p = g->p0; p < g->p1; p++)
+            if (!b->ok[p]) atomic_fetch_add_explicit(in->done, 1, memory_order_relaxed);
+}
+
+/* Update: re-read one unit (or a chunk run) into its fixed filter. */
+static void rtx_si_job(RtxSiShard *sh, RtxSiJob *jb) {
+    RtxSiB *b = sh->b;
+    const RtxSiBuildIn *in = b->in;
+    uint32_t m, j;
+    uint64_t w = 0;
+    for (j = 0; j < jb->nu; j++) w += jb->words[j];
+    memset(b->filt + jb->woff, 0, w * 8);
+    for (m = 0; m < jb->nm; m++) {
+        size_t len = 0;
+        rtx_si_tick(sh);
+        if (rtx_si_cancelled(in)) return;
+        jb->mok[m] = 2;
+        if (!rtx_si_read(sh, in->rel[jb->mrel[m]], &jb->mid[m], &len)) continue;
+        jb->bytes += len;
+        if (jb->nu == 1 && jb->nl == NULL) {
+            if (len > RTX_SI_BLK) continue; /* no longer a block member */
+            rtx_si_set(sh, b->filt + jb->woff, jb->words[0], sh->buf, len);
+        } else {
+            uint64_t off = jb->woff;
+            if (rtx_si_nchunks(len) != jb->nu) continue; /* its shape changed */
+            for (j = 0; j < jb->nu; j++) {
+                size_t s = (size_t)j * RTX_SI_BLK, e = s + RTX_SI_BLK + RTX_SI_OVL;
+                size_t ne = s + RTX_SI_BLK;
+                if (e > len) e = len;
+                if (ne > len) ne = len;
+                rtx_si_set(sh, b->filt + off, jb->words[j], sh->buf + s, e - s);
+                jb->nl[j] = rtx_count_lf(sh->buf + s, ne - s);
+                off += jb->words[j];
+            }
+        }
+        jb->mok[m] = 1;
+    }
+}
+
+static void rtx_si_shard(RtxSiShard *sh) {
+    RtxSiB *b = sh->b;
+    uint32_t k;
+    if (sh->pass == 3) {
+        while ((k = atomic_fetch_add(&b->next, 1u)) < b->njob) rtx_si_job(sh, &b->job[k]);
+        return;
+    }
+    while ((k = atomic_fetch_add(&b->next, 1u)) < b->nseg) {
+        if (sh->pass == 1) rtx_si_seg1(sh, &b->seg[k]);
+        else rtx_si_seg2(sh, &b->seg[k]);
+    }
+}
+
+static int rtx_si_run_shards(RtxSiShard *shards, int nsh) {
+    int k;
+    atomic_store(&shards[0].b->next, 0u);
+    if (nsh <= 1 || rtx_parallel_inline()) {
+        for (k = 0; k < nsh; k++) rtx_si_shard(&shards[k]);
+        return 0;
+    }
+    rtx_par_pool_up();
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            return -1;
+        }
+        bool fin;
+        CCArena ta = cc_arena_heap(kilobytes(64)) @destroy;
+        /* A wait-for over the shards, like the search lanes: the pool is
+         * up (rtx_par_pool_up) and each shard owns a worker; segments are
+         * handed out through b->next. */
+        CCTurnstile ts@(nsh, 1, ta) !> @destroy;
+        fin = @parallel wait (ts) for (k in 0..nsh) {
+            rtx_si_shard(&shards[k]);
+            @stage (ts, 0, k) {
+            }
+        } !>.wait()!>;
+        (void)fin;
+    }
+    return 0;
+}
+
+static RtxSiShard *rtx_si_shards(RtxSiB *b, int ns) {
+    RtxSiShard *sh = (RtxSiShard *)calloc((size_t)ns, sizeof(RtxSiShard));
+    int s;
+    if (!sh) return NULL;
+    for (s = 0; s < ns; s++) {
+        sh[s].b = b;
+        sh[s].seen = (uint64_t *)calloc((size_t)1 << 18, sizeof(uint64_t));
+        sh[s].tcap = RTX_SI_BLK + RTX_SI_OVL + 16;
+        sh[s].touch = (uint32_t *)malloc(sh[s].tcap * sizeof(uint32_t));
+        if (!sh[s].seen || !sh[s].touch) sh[s].oom = 1;
+    }
+    return sh;
+}
+
+static void rtx_si_shards_free(RtxSiShard *sh, int ns, uint64_t *work, size_t *peak) {
+    int s;
+    if (!sh) return;
+    for (s = 0; s < ns; s++) {
+        if (work) *work += sh[s].work;
+        if (peak) *peak += ((size_t)2 << 20) + sh[s].tcap * 4 + sh[s].peak;
+        free(sh[s].seen);
+        free(sh[s].touch);
+        free(sh[s].buf);
+    }
+    free(sh);
+}
+
+static int rtx_si_shards_ok(const RtxSiShard *sh, int ns) {
+    int s;
+    for (s = 0; s < ns; s++)
+        if (sh[s].oom) return 0;
+    return 1;
+}
+
+/* Paths in walk order: '/' sorts first, so a directory's files stay
+ * together (a sorted recursive walk). */
+typedef struct {
+    const char *p;
+    uint32_t i;
+} RtxSiOrd;
+
+static int rtx_si_ordcmp(const void *x, const void *y) {
+    const unsigned char *a = (const unsigned char *)((const RtxSiOrd *)x)->p;
+    const unsigned char *b = (const unsigned char *)((const RtxSiOrd *)y)->p;
+    for (;; a++, b++) {
+        unsigned c = *a == '/' ? 1u : *a, d = *b == '/' ? 1u : *b;
+        if (c != d || !c) return (int)c - (int)d;
+    }
+}
+
+/* rel indices sel[0..n) (or all when sel is NULL) in walk order. */
+static uint32_t *rtx_si_order(const RtxSiBuildIn *in, const uint32_t *sel, uint32_t n) {
+    RtxSiOrd *o = (RtxSiOrd *)malloc((n + 1) * sizeof(RtxSiOrd));
+    uint32_t *r = (uint32_t *)malloc((n + 1) * sizeof(uint32_t)), i;
+    if (!o || !r) {
+        free(o);
+        free(r);
+        return NULL;
+    }
+    for (i = 0; i < n; i++) {
+        o[i].i = sel ? sel[i] : i;
+        o[i].p = in->rel[o[i].i];
+    }
+    qsort(o, n, sizeof(RtxSiOrd), rtx_si_ordcmp);
+    for (i = 0; i < n; i++) r[i] = o[i].i;
+    free(o);
+    return r;
+}
+
+static int rtx_si_segs(RtxSiB *b, int ns) {
+    uint32_t nseg, per, s;
+    /* Independent of the lane count: one lane or eight build the same
+     * blocks (the same file, but for the build time). */
+    (void)ns;
+    nseg = b->npos / 64 + 1;
+    if (nseg > 256) nseg = 256;
+    per = (b->npos + nseg - 1) / nseg;
+    if (!per) per = 1;
+    b->seg = (RtxSiSeg *)calloc(nseg + 1, sizeof(RtxSiSeg));
+    if (!b->seg) return 0;
+    for (s = 0; s < nseg; s++) {
+        b->seg[s].p0 = s * per < b->npos ? s * per : b->npos;
+        b->seg[s].p1 = (s + 1) * per < b->npos ? (s + 1) * per : b->npos;
+    }
+    b->nseg = nseg;
+    return 1;
+}
+
+static void rtx_si_segs_free(RtxSiB *b) {
+    uint32_t s;
+    if (!b->seg) return;
+    for (s = 0; s < b->nseg; s++) free(b->seg[s].u);
+    free(b->seg);
+    b->seg = NULL;
+}
+
+/* ---------------------------------------------------------- the image */
+
+#define RTX_SI_MAGIC 0x49585452u /* "RTXI" */
+#define RTX_SI_HDR_W 16
+
+/* One file table row; *stamp_at: offset of its u32 (the dead bit). */
+typedef struct {
+    uint64_t ino, csec;
+} RtxSiPrev;
+
+static void rtx_si_frow(RtxSiBuf *ft, const RtxSiId *id, int dead, const uint64_t *devs,
+                        size_t ndev, RtxSiPrev *pv, size_t *stamp_at) {
+    int64_t csec = id->ctime_ns / 1000000000LL, cns = id->ctime_ns % 1000000000LL;
+    uint32_t w;
+    uint8_t wb[4];
+    if (cns < 0) {
+        cns += 1000000000LL;
+        csec--;
+    }
+    if (ndev > 1) {
+        size_t d;
+        for (d = 0; d < ndev && devs[d] != id->dev; d++) {
+        }
+        rtx_si_vput(ft, d < ndev ? d : 0); /* not in the table: dead */
+    }
+    rtx_si_vput(ft, rtx_si_zz((int64_t)(id->ino - pv->ino)));
+    rtx_si_vput(ft, id->size);
+    rtx_si_vput(ft, rtx_si_zz((int64_t)((uint64_t)csec - pv->csec)));
+    w = (uint32_t)cns | (id->mtime_ns == id->ctime_ns ? 1u << 30 : 0) | (dead ? 1u << 31 : 0);
+    wb[0] = (uint8_t)w;
+    wb[1] = (uint8_t)(w >> 8);
+    wb[2] = (uint8_t)(w >> 16);
+    wb[3] = (uint8_t)(w >> 24);
+    if (stamp_at) *stamp_at = ft->n;
+    rtx_si_put(ft, wb, 4);
+    if (id->mtime_ns != id->ctime_ns) rtx_si_vput(ft, rtx_si_zz(id->mtime_ns - id->ctime_ns));
+    pv->ino = id->ino;
+    pv->csec = (uint64_t)csec;
+}
+
+/* The unit directory of units[0..n) (in order). */
+static void rtx_si_udir(RtxSiBuf *ud, const RtxSiU *u, size_t n) {
+    size_t k = 0;
+    while (k < n) {
+        if (!(u[k].x & RTX_SI_CHUNK)) {
+            rtx_si_vput(ud, (uint64_t)u[k].x << 1);
+            rtx_si_vput(ud, u[k].words);
+            k++;
+            continue;
+        }
+        {
+            size_t e = k + 1, j;
+            while (e < n && (u[e].x & RTX_SI_CHUNK) && (u[e].x & ~RTX_SI_CHUNK) != 0) e++;
+            rtx_si_vput(ud, ((uint64_t)(e - k) << 1) | 1u);
+            for (j = k; j < e; j++) {
+                rtx_si_vput(ud, u[j].words);
+                rtx_si_vput(ud, u[j].nl);
+            }
+            k = e;
+        }
+    }
+}
+
+static size_t rtx_si_pad(size_t n) {
+    return (n + 7) & ~(size_t)7;
+}
+
+/* Filter words per unit: the bits left after the fixed parts, split by
+ * distinct count (at least one word). */
+static void rtx_si_size(RtxSiU *u, size_t n, uint64_t left_bytes, uint64_t distinct) {
+    size_t k;
+    double per = distinct ? (double)left_bytes * 8.0 / (double)distinct : 0;
+    for (k = 0; k < n; k++) {
+        uint64_t w = (uint64_t)(per * (double)u[k].nd) / 64;
+        u[k].words = w ? w : 1;
+    }
+}
+
+static int rtx_si_write(const char *out, const uint8_t *p, size_t n) {
+    char tmp[4200];
+    int fd;
+    size_t off = 0;
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", out) >= (int)sizeof tmp) return 0;
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return 0;
+    while (off < n) {
+        ssize_t r = write(fd, p + off, n - off);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            break;
+        }
+        off += (size_t)r;
+    }
+    if (off != n || fsync(fd) != 0) {
+        close(fd);
+        unlink(tmp);
+        return 0;
+    }
+    close(fd);
+    if (rename(tmp, out) != 0) {
+        unlink(tmp);
+        return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    int64_t built_ns;
+    long gran;
+    uint64_t nfiles, ndev, nunits, corpus, budget, bpt16;
+    long full_ms;
+} RtxSiHdr;
+
+/* Lay out header, root, devices, file table and unit directory at the
+ * front of a zeroed image with room for `fw` filter words and the sum. */
+static uint8_t *rtx_si_image(const RtxSiBuildIn *in, const RtxSiHdr *h, const uint64_t *devs,
+                             const RtxSiBuf *ft, const RtxSiBuf *ud, uint64_t fw, size_t *filt_at,
+                             size_t *total) {
+    size_t n = RTX_SI_HDR_W * 8 + rtx_si_pad(in->root_n) + h->ndev * 8 + rtx_si_pad(ft->n) +
+               rtx_si_pad(ud->n);
+    uint8_t *img;
+    uint64_t *w;
+    *filt_at = n;
+    n += fw * 8 + 8;
+    img = (uint8_t *)calloc(1, n);
+    if (!img) return NULL;
+    w = (uint64_t *)(void *)img;
+    w[0] = (uint64_t)RTX_SI_MAGIC | ((uint64_t)RTX_SI_VER << 32);
+    w[1] = (uint64_t)h->built_ns;
+    w[2] = (uint64_t)h->gran;
+    w[3] = h->nfiles;
+    w[4] = h->ndev;
+    w[5] = h->nunits;
+    w[6] = ft->n;
+    w[7] = ud->n;
+    w[8] = fw;
+    w[9] = (uint64_t)RTX_SI_BLK | ((uint64_t)RTX_SI_OVL << 32);
+    w[10] = h->corpus;
+    w[11] = in->root_n;
+    w[12] = h->budget;
+    w[13] = h->bpt16;
+    w[14] = (uint64_t)h->full_ms;
+    {
+        size_t o = RTX_SI_HDR_W * 8;
+        memcpy(img + o, in->root, in->root_n);
+        o += rtx_si_pad(in->root_n);
+        memcpy(img + o, devs, h->ndev * 8);
+        o += h->ndev * 8;
+        memcpy(img + o, ft->p, ft->n);
+        o += rtx_si_pad(ft->n);
+        memcpy(img + o, ud->p, ud->n);
+    }
+    *total = n;
+    return img;
+}
+
+static void rtx_si_seal(uint8_t *img, size_t n, long full_ms) {
+    uint64_t *w = (uint64_t *)(void *)img;
+    w[14] = (uint64_t)full_ms;
+    w[n / 8 - 1] = rtx_si_sum(w, n / 8 - 1);
+}
+
+static double rtx_si_fill(const uint64_t *f, uint64_t n) {
+    uint64_t i, s = 0;
+    for (i = 0; i < n; i++) s += (uint64_t)__builtin_popcountll(f[i]);
+    return n ? (double)s / (double)(n * 64) : 0;
+}
+
+/* --------------------------------------------------------------- build */
+
+static int rtx_si_devs(const RtxSiId *id, const uint8_t *ok, size_t n, uint64_t *devs,
+                       size_t *ndev, uint8_t *okw) {
+    size_t i, d;
+    for (i = 0; i < n; i++) {
+        if (!ok[i]) continue;
+        for (d = 0; d < *ndev && devs[d] != id[i].dev; d++) {
+        }
+        if (d == *ndev) {
+            if (*ndev == 64) {
+                if (okw) okw[i] = 2; /* the 65th device: dead (always read) */
+                continue;
+            }
+            devs[(*ndev)++] = id[i].dev;
+        }
+    }
+    return 1;
+}
+
+int rtx_si_build(const RtxSiBuildIn *in, RtxSiBuildOut *out) {
+    RtxSiB b;
+    RtxSiShard *sh = NULL;
+    int ns = rtx_si_lanes(in), ok = 0;
+    RtxSiU *u = NULL;
+    size_t nu = 0, k, peak = 0, filt_at = 0, total = 0;
+    uint32_t *stamp = NULL;
+    uint64_t devs[64];
+    size_t ndev = 0;
+    RtxSiBuf ft = {0}, ud = {0};
+    uint8_t *img = NULL;
+    int64_t t0 = rtx_si_now_ns();
+    long ms0 = rtx_si_mono_ms(), ms1 = 0, ms2 = 0;
+    uint64_t budget, distinct = 0, fw = 0, work = 0, fixed;
+    uint32_t nidx = 0, p, s;
+    RtxSiHdr h;
+    memset(out, 0, sizeof *out);
+    memset(&b, 0, sizeof b);
+    out->err = "out of memory";
+    if (!in || !in->out || !in->rel || in->n >= (1u << 30)) {
+        out->err = "bad input";
+        return 0;
+    }
+    b.in = in;
+    b.rootfd = open(in->root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (b.rootfd < 0) {
+        out->err = "cannot open the root";
+        return 0;
+    }
+    b.npos = in->n;
+    b.ord = rtx_si_order(in, NULL, in->n);
+    b.ids = (RtxSiId *)calloc(in->n + 1, sizeof(RtxSiId));
+    b.ok = (uint8_t *)calloc(in->n + 1, 1);
+    stamp = (uint32_t *)calloc(in->n + 1, sizeof(uint32_t));
+    if (!b.ord || !b.ids || !b.ok || !stamp || !rtx_si_segs(&b, ns)) goto done;
+    sh = rtx_si_shards(&b, ns);
+    if (!sh || !rtx_si_shards_ok(sh, ns)) goto done;
+    peak = (size_t)in->n * (sizeof(RtxSiId) + 13);
+    /* Pass 1: pack and count. */
+    for (s = 0; s < (uint32_t)ns; s++) sh[s].pass = 1;
+    rtx_si_run_shards(sh, ns);
+    if (rtx_si_cancelled(in)) {
+        out->err = "cancelled";
+        goto done;
+    }
+    if (!rtx_si_shards_ok(sh, ns)) goto done;
+    ms1 = rtx_si_mono_ms();
+    for (s = 0; s < b.nseg; s++) {
+        if (b.seg[s].oom) goto done;
+        nu += b.seg[s].nu;
+    }
+    for (s = 0; s < (uint32_t)ns; s++) out->corpus += sh[s].bytes;
+    u = (RtxSiU *)malloc((nu + 1) * sizeof(RtxSiU));
+    if (!u) goto done;
+    nu = 0;
+    for (s = 0; s < b.nseg; s++) {
+        memcpy(u + nu, b.seg[s].u, b.seg[s].nu * sizeof(RtxSiU));
+        nu += b.seg[s].nu;
+    }
+    for (k = 0; k < nu; k++) {
+        distinct += u[k].nd;
+        if (u[k].x & RTX_SI_CHUNK) out->chunks++;
+        else out->blocks++;
+    }
+    rtx_si_devs(b.ids, b.ok, in->n, devs, &ndev, b.ok);
+    /* The file table (position order = unit order). */
+    {
+        RtxSiPrev pv = {0, 0};
+        for (p = 0; p < in->n; p++) {
+            size_t at = 0;
+            if (!b.ok[p]) continue;
+            rtx_si_frow(&ft, &b.ids[p], b.ok[p] == 2, devs, ndev, &pv, &at);
+            stamp[p] = (uint32_t)at;
+            nidx++;
+        }
+    }
+    if (ft.oom) goto done;
+    /* Size the filters: the budget less the fixed parts (the unit
+     * directory's size depends on the word counts: twice). */
+    budget = out->corpus / 100 * (uint64_t)(in->pct ? in->pct : (unsigned)rtx_si_pct());
+    if (budget > (uint64_t)RTX_SI_CAP_MB << 20) budget = (uint64_t)RTX_SI_CAP_MB << 20;
+    fixed = RTX_SI_HDR_W * 8 + rtx_si_pad(in->root_n) + ndev * 8 + rtx_si_pad(ft.n) + 8 +
+            (uint64_t)nu * 3;
+    for (s = 0; s < 2; s++) {
+        rtx_si_size(u, nu, budget > fixed ? budget - fixed : 0, distinct);
+        ud.n = 0;
+        rtx_si_udir(&ud, u, nu);
+        fixed = RTX_SI_HDR_W * 8 + rtx_si_pad(in->root_n) + ndev * 8 + rtx_si_pad(ft.n) + 8 +
+                rtx_si_pad(ud.n);
+    }
+    if (ud.oom) goto done;
+    for (k = 0; k < nu; k++) {
+        u[k].woff = fw;
+        fw += u[k].words;
+    }
+    h.built_ns = t0;
+    h.gran = rtx_si_gran();
+    h.nfiles = nidx;
+    h.ndev = ndev;
+    h.nunits = nu;
+    h.corpus = out->corpus;
+    h.budget = budget;
+    h.bpt16 = distinct ? (uint64_t)((double)fw * 64.0 * 65536.0 / (double)distinct) : 65536;
+    h.full_ms = 0;
+    img = rtx_si_image(in, &h, devs, &ft, &ud, fw, &filt_at, &total);
+    if (!img) goto done;
+    /* Pass 2: the bits, straight into the image. */
+    b.filt = (uint64_t *)(void *)(img + filt_at);
+    {
+        size_t o = 0;
+        for (s = 0; s < b.nseg; s++) {
+            memcpy(b.seg[s].u, u + o, b.seg[s].nu * sizeof(RtxSiU));
+            o += b.seg[s].nu;
+        }
+    }
+    for (s = 0; s < (uint32_t)ns; s++) sh[s].pass = 2;
+    rtx_si_run_shards(sh, ns);
+    if (rtx_si_cancelled(in)) {
+        out->err = "cancelled";
+        goto done;
+    }
+    ms2 = rtx_si_mono_ms();
+    /* Files that changed between the passes: dead in place (the stamp
+     * word keeps its size). */
+    {
+        size_t o = RTX_SI_HDR_W * 8 + rtx_si_pad(in->root_n) + ndev * 8;
+        for (p = 0; p < in->n; p++)
+            if (b.ok[p] == 2) img[o + stamp[p] + 3] |= 0x80;
+    }
+    out->fill = rtx_si_fill(b.filt, fw);
+    rtx_si_seal(img, total, rtx_si_mono_ms() - ms0);
+    if (!rtx_si_write(in->out, img, total)) {
+        out->err = "cannot write the index";
+        goto done;
+    }
+    rtx_si_shards_free(sh, ns, &work, &peak);
+    sh = NULL;
+    atomic_fetch_add(&g_si_work, work);
+    peak += total + ft.cap + ud.cap + nu * sizeof(RtxSiU) * 2;
+    out->files = nidx;
+    out->budget = budget;
+    out->bytes = total;
+    out->ftab_bytes = ft.n;
+    out->udir_bytes = ud.n;
+    out->filt_bytes = fw * 8;
+    out->units = (uint32_t)nu;
+    out->distinct = distinct;
+    out->peak = peak;
+    out->ms_pass1 = ms1 - ms0;
+    out->ms_pass2 = ms2 - ms1;
+    out->ms_write = rtx_si_mono_ms() - ms2;
+    out->ms = rtx_si_mono_ms() - ms0;
+    out->full_ms = out->ms;
+    out->err = NULL;
+    out->ok = 1;
+    ok = 1;
+done:
+    if (b.rootfd >= 0) close(b.rootfd);
+    rtx_si_shards_free(sh, ns, NULL, NULL);
+    rtx_si_segs_free(&b);
+    free((void *)b.ord);
+    free(b.ids);
+    free(b.ok);
+    free(stamp);
+    free(u);
+    free(ft.p);
+    free(ud.p);
+    free(img);
+    return ok;
+}
+
+/* ---------------------------------------------------------------- load */
+
+static uint64_t rtx_si_key(uint64_t dev, uint64_t ino) {
+    uint64_t h = ino * 0x9E3779B97F4A7C15ull ^ (dev + 0x632BE59BD9B4E019ull);
+    h ^= h >> 31;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 29;
+    return h;
+}
+
+void rtx_si_free(RtxSi *si) {
+    if (!si) return;
+    if (si->a.base) si->a.destroy();
+    free(si);
+}
+
+RtxSi *rtx_si_load(const char *path, const char *root, size_t rn) {
+    RtxSi *si;
+    int fd;
+    struct stat st;
+    uint64_t *w;
+    size_t nw, got = 0, pos;
+    long t0 = rtx_si_mono_ms();
+    uint64_t nfiles, ndev, nunits, ftn, udn, fwn, rootn;
+    const uint64_t *devs;
+    si = (RtxSi *)calloc(1, sizeof(RtxSi));
+    if (!si) return NULL;
+    if (rn + 1 > sizeof si->root || !path || strlen(path) + 1 > sizeof si->path) {
+        si->load_rc = -1;
+        return si;
+    }
+    memcpy(si->root, root, rn);
+    si->root[rn] = 0;
+    si->root_n = rn;
+    snprintf(si->path, sizeof si->path, "%s", path);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return si; /* no index */
+    si->load_rc = -1;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)(RTX_SI_HDR_W * 8 + 8) || (st.st_size & 7) ||
+        (uint64_t)st.st_size > ((uint64_t)RTX_SI_CAP_MB << 21)) {
+        close(fd);
+        return si;
+    }
+    si->a = cc_arena_heap((size_t)st.st_size + megabytes(1));
+    nw = (size_t)st.st_size / 8;
+    w = si->a.base ? (uint64_t *)cc_arena_alloc(si->a, nw * 8, 16) : NULL;
+    if (!w) {
+        close(fd);
+        return si;
+    }
+    while (got < nw * 8) {
+        ssize_t r = read(fd, (char *)w + got, nw * 8 - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    if (got != nw * 8) return si;
+    if ((uint32_t)w[0] != RTX_SI_MAGIC || (uint32_t)(w[0] >> 32) != RTX_SI_VER) return si;
+    if (rtx_si_sum(w, nw - 1) != w[nw - 1]) return si;
+    nfiles = w[3];
+    ndev = w[4];
+    nunits = w[5];
+    ftn = w[6];
+    udn = w[7];
+    fwn = w[8];
+    rootn = w[11];
+    /* Every count against the bytes that remain, before any product. */
+    if (rootn != rn || ndev > 64 || nfiles >= (1u << 30) || nunits >= (1u << 30) ||
+        w[9] != ((uint64_t)RTX_SI_BLK | ((uint64_t)RTX_SI_OVL << 32)) || ftn > nw * 8 ||
+        udn > nw * 8 || fwn > nw || (nfiles && !ndev))
+        return si;
+    {
+        uint64_t need = RTX_SI_HDR_W + (rootn + 7) / 8 + ndev + (ftn + 7) / 8 + (udn + 7) / 8 +
+                        fwn + 1;
+        if (need != nw) return si;
+    }
+    if (memcmp(w + RTX_SI_HDR_W, root, rn) != 0) return si;
+    si->built_ns = (int64_t)w[1];
+    si->gran_ms = (long)w[2];
+    si->corpus = w[10];
+    si->budget = w[12];
+    si->bpt16 = w[13];
+    si->full_ms = (long)w[14];
+    pos = RTX_SI_HDR_W + (rootn + 7) / 8;
+    devs = w + pos;
+    pos += ndev;
+    si->nfiles = (uint32_t)nfiles;
+    si->id = (RtxSiId *)cc_arena_alloc(si->a, (nfiles + 1) * sizeof(RtxSiId), 8);
+    si->trust = (uint8_t *)cc_arena_alloc(si->a, nfiles + 1, 8);
+    si->dead = (uint8_t *)cc_arena_alloc(si->a, nfiles + 1, 8);
+    si->f2u = (uint32_t *)cc_arena_alloc(si->a, (nfiles + 1) * sizeof(uint32_t), 8);
+    si->tcap = 1024;
+    while (si->tcap < nfiles * 2) si->tcap <<= 1;
+    si->tab = (uint32_t *)cc_arena_alloc(si->a, si->tcap * sizeof(uint32_t), 8);
+    si->uoff = (uint64_t *)cc_arena_alloc(si->a, (nunits + 1) * sizeof(uint64_t), 8);
+    si->uf = (uint32_t *)cc_arena_alloc(si->a, (nunits + 1) * sizeof(uint32_t), 8);
+    si->ux = (uint32_t *)cc_arena_alloc(si->a, (nunits + 1) * sizeof(uint32_t), 8);
+    si->unl = (uint64_t *)cc_arena_alloc(si->a, (nunits + 1) * sizeof(uint64_t), 8);
+    si->ucnt = (uint32_t *)cc_arena_alloc(si->a, (nunits + 1) * sizeof(uint32_t), 8);
+    if (!si->id || !si->trust || !si->dead || !si->f2u || !si->tab || !si->uoff || !si->uf ||
+        !si->ux || !si->unl || !si->ucnt)
+        return si;
+    memset(si->tab, 0, si->tcap * sizeof(uint32_t));
+    {
+        const uint8_t *p = (const uint8_t *)(w + pos), *e = p + ftn;
+        uint64_t k, ino = 0, csec = 0;
+        for (k = 0; k < nfiles; k++) {
+            uint64_t d = 0, di, size, dc, mt = 0;
+            uint32_t sw;
+            RtxSiId *id = &si->id[k];
+            if (ndev > 1 && (!rtx_si_vget(&p, e, &d) || d >= ndev)) return si;
+            if (!rtx_si_vget(&p, e, &di) || !rtx_si_vget(&p, e, &size) ||
+                !rtx_si_vget(&p, e, &dc) || e - p < 4)
+                return si;
+            sw = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+                 ((uint32_t)p[3] << 24);
+            p += 4;
+            if ((sw & 0x3FFFFFFFu) >= 1000000000u) return si;
+            if (!(sw & (1u << 30)) && !rtx_si_vget(&p, e, &mt)) return si;
+            ino += (uint64_t)rtx_si_unzz(di);
+            csec += (uint64_t)rtx_si_unzz(dc);
+            id->dev = devs[d];
+            id->ino = ino;
+            id->size = size;
+            id->ctime_ns = (int64_t)csec * 1000000000LL + (int64_t)(sw & 0x3FFFFFFFu);
+            id->mtime_ns = id->ctime_ns + ((sw & (1u << 30)) ? 0 : rtx_si_unzz(mt));
+            si->dead[k] = (sw >> 31) & 1u;
+            si->trust[k] = !si->dead[k] && ino &&
+                           rtx_si_trusted_g(id, si->built_ns, si->gran_ms);
+            if (si->trust[k]) {
+                size_t m = si->tcap - 1, s = (size_t)rtx_si_key(id->dev, id->ino) & m;
+                while (si->tab[s]) {
+                    const RtxSiId *o = &si->id[si->tab[s] - 1];
+                    if (o->dev == id->dev && o->ino == id->ino) break;
+                    s = (s + 1) & m;
+                }
+                if (si->tab[s]) {
+                    /* two paths, one inode (a hard link): trust neither */
+                    si->trust[si->tab[s] - 1] = 0;
+                    si->trust[k] = 0;
+                } else {
+                    si->tab[s] = (uint32_t)(k + 1);
+                }
+            }
+        }
+        if (p != e) return si;
+        pos += (ftn + 7) / 8;
+    }
+    {
+        const uint8_t *p = (const uint8_t *)(w + pos), *e = p + udn;
+        uint64_t f = 0, un = 0, off = 0;
+        while (p < e) {
+            uint64_t x, words, nl, j;
+            if (!rtx_si_vget(&p, e, &x)) return si;
+            if (!(x & 1)) {
+                uint64_t nf = x >> 1, i;
+                if (!nf || nf > nfiles - f || un >= nunits || !rtx_si_vget(&p, e, &words) ||
+                    !words || words > fwn - off)
+                    return si;
+                for (i = 0; i < nf; i++) {
+                    if (si->id[f + i].size > RTX_SI_BLK) return si;
+                    si->f2u[f + i] = (uint32_t)un;
+                }
+                si->uf[un] = (uint32_t)f;
+                si->ux[un] = (uint32_t)nf;
+                si->unl[un] = 0;
+                si->ucnt[un] = 0;
+                si->uoff[un] = off;
+                off += words;
+                f += nf;
+                un++;
+                continue;
+            }
+            if (f >= nfiles || (x >> 1) != rtx_si_nchunks(si->id[f].size) || (x >> 1) < 2 ||
+                (x >> 1) > nunits - un)
+                return si;
+            si->f2u[f] = (uint32_t)un;
+            nl = 0;
+            for (j = 0; j < (x >> 1); j++) {
+                uint64_t c;
+                if (!rtx_si_vget(&p, e, &words) || !words || words > fwn - off ||
+                    !rtx_si_vget(&p, e, &c) || c > RTX_SI_BLK)
+                    return si;
+                si->ucnt[un] = (uint32_t)c;
+                si->uf[un] = (uint32_t)f;
+                si->ux[un] = RTX_SI_CHUNK | (uint32_t)j;
+                si->unl[un] = nl;
+                si->uoff[un] = off;
+                nl += c;
+                off += words;
+                un++;
+            }
+            f++;
+        }
+        if (f != nfiles || un != nunits || off != fwn) return si;
+        si->uoff[nunits] = off;
+        pos += (udn + 7) / 8;
+    }
+    si->nunits = (uint32_t)nunits;
+    si->filt = w + pos;
+    si->filt_words = fwn;
+    si->ftab_bytes = ftn;
+    si->udir_bytes = udn;
+    si->file_bytes = nw * 8;
+    si->load_rc = 1;
+    si->load_ms = rtx_si_mono_ms() - t0;
+    return si;
+}
+
+long rtx_si_find(const RtxSi *si, const struct stat *st) {
+    RtxSiId id;
+    size_t m, s;
+    uint32_t k;
+    if (!si || si->load_rc != 1 || !si->nfiles) return -1;
+    rtx_si_id_of(st, &id);
+    m = si->tcap - 1;
+    s = (size_t)rtx_si_key(id.dev, id.ino) & m;
+    while ((k = si->tab[s]) != 0) {
+        const RtxSiId *o = &si->id[k - 1];
+        if (o->dev == id.dev && o->ino == id.ino) {
+            if (o->size == id.size && o->mtime_ns == id.mtime_ns && o->ctime_ns == id.ctime_ns &&
+                si->trust[k - 1])
+                return (long)(k - 1);
+            return -1;
+        }
+        s = (s + 1) & m;
+    }
+    return -1;
+}
+
+uint32_t rtx_si_units(const RtxSi *si, long k, uint32_t *u0) {
+    if (!si || k < 0 || (uint64_t)k >= si->nfiles) return 0;
+    *u0 = si->f2u[k];
+    return rtx_si_nchunks(si->id[k].size);
+}
+
+/* ---------------------------------------------------------------- query */
+
+static unsigned rtx_si_fset(const uint8_t *set, uint8_t out[3]) {
+    unsigned b, n = 0, j;
+    for (b = 0; b < 256; b++) {
+        uint8_t f;
+        if (!(set[b >> 3] & (1u << (b & 7)))) continue;
+        f = (uint8_t)rtx_si_fold(b);
+        for (j = 0; j < n; j++)
+            if (out[j] == f) break;
+        if (j < n) continue;
+        if (n == 3) return 0; /* the prefilter keeps <= 3; be safe */
+        out[n++] = f;
+    }
+    return n;
+}
+
+unsigned rtx_si_plan(const RtxRx *rx, RtxSiQ *q) {
+    unsigned n, k;
+    memset(q, 0, sizeof *q);
+    n = rtx_rx_req_n(rx);
+    if (!n || n > RTX_SI_LITS) return 0;
+    for (k = 0; k < n; k++) {
+        size_t m = 0, i;
+        const uint8_t *sets = rtx_rx_req_lit(rx, k, &m);
+        RtxSiLit *L = &q->lit[k];
+        uint8_t f[64][3];
+        unsigned fn[64];
+        if (!sets || m < 3) return 0;
+        if (m > 64) m = 64;
+        for (i = 0; i < m; i++) {
+            fn[i] = rtx_si_fset(sets + 32 * i, f[i]);
+            if (!fn[i]) return 0;
+        }
+        for (i = 0; i + 3 <= m && L->nw < RTX_SI_WINS; i++) {
+            unsigned a, b, d, c = 0;
+            for (a = 0; a < fn[i]; a++)
+                for (b = 0; b < fn[i + 1]; b++)
+                    for (d = 0; d < fn[i + 2]; d++)
+                        L->t[L->nw][c++] = ((uint32_t)f[i][a] << 16) |
+                                           ((uint32_t)f[i + 1][b] << 8) | f[i + 2][d];
+            L->wn[L->nw++] = (uint8_t)c;
+        }
+        if (!L->nw) return 0;
+    }
+    q->n = n;
+    return n;
+}
+
+int rtx_si_cands(const RtxSi *si, const RtxSiQ *q, uint64_t *ucand, size_t *ncand) {
+    uint32_t (*hq)[RTX_SI_WINS][27];
+    uint32_t u, f;
+    unsigned k;
+    uint64_t work = 0;
+    if (ncand) *ncand = 0;
+    if (!si || si->load_rc != 1 || !q || !q->n) return 0;
+    hq = (uint32_t (*)[RTX_SI_WINS][27])malloc(sizeof(uint32_t) * RTX_SI_LITS * RTX_SI_WINS * 27);
+    if (!hq) return 0;
+    for (k = 0; k < q->n; k++) {
+        unsigned w, a;
+        for (w = 0; w < q->lit[k].nw; w++)
+            for (a = 0; a < q->lit[k].wn[w]; a++) hq[k][w][a] = rtx_si_h(q->lit[k].t[w][a]);
+    }
+    memset(ucand, 0, (((size_t)si->nunits + 63) / 64) * 8);
+    for (u = 0; u < si->nunits; u++) {
+        const uint64_t *fb = si->filt + si->uoff[u];
+        uint64_t bits = (si->uoff[u + 1] - si->uoff[u]) * 64;
+        int pass = 0;
+        for (k = 0; k < q->n && !pass; k++) {
+            const RtxSiLit *L = &q->lit[k];
+            unsigned w;
+            int all = 1;
+            for (w = 0; w < L->nw && all; w++) {
+                unsigned a;
+                int any = 0;
+                for (a = 0; a < L->wn[w]; a++) {
+                    uint64_t b = ((uint64_t)hq[k][w][a] * bits) >> 32;
+                    work++;
+                    if ((fb[b >> 6] >> (b & 63)) & 1u) {
+                        any = 1;
+                        break;
+                    }
+                }
+                if (!any) all = 0;
+            }
+            if (all) pass = 1;
+        }
+        if (pass) ucand[u >> 6] |= (uint64_t)1 << (u & 63);
+    }
+    free(hq);
+    atomic_fetch_add(&g_si_work, work);
+    if (ncand) {
+        for (f = 0; f < si->nfiles; f++) {
+            uint32_t u0 = si->f2u[f], n = rtx_si_nchunks(si->id[f].size), j;
+            for (j = 0; j < n; j++)
+                if ((ucand[(u0 + j) >> 6] >> ((u0 + j) & 63)) & 1u) {
+                    (*ncand)++;
+                    break;
+                }
+        }
+    }
+    return 1;
+}
+
+/* -------------------------------------------------------------- update */
+
+/* (dev, ino) -> the first old id + 1 over every live entry; nxt chains
+ * the entries of one inode (a hard link, or a symlink and its target:
+ * one path of the walk takes one of them). */
+typedef struct {
+    uint32_t *t;
+    uint32_t *nxt;
+    size_t cap;
+} RtxSiMap;
+
+static int rtx_si_map(RtxSiMap *m, const RtxSi *si) {
+    uint32_t k;
+    m->cap = 1024;
+    while (m->cap < (size_t)si->nfiles * 2) m->cap <<= 1;
+    m->t = (uint32_t *)calloc(m->cap, sizeof(uint32_t));
+    m->nxt = (uint32_t *)calloc((size_t)si->nfiles + 1, sizeof(uint32_t));
+    if (!m->t || !m->nxt) return 0;
+    for (k = 0; k < si->nfiles; k++) {
+        size_t s;
+        if (si->dead[k] || !si->id[k].ino) continue;
+        s = (size_t)rtx_si_key(si->id[k].dev, si->id[k].ino) & (m->cap - 1);
+        while (m->t[s]) {
+            const RtxSiId *o = &si->id[m->t[s] - 1];
+            if (o->dev == si->id[k].dev && o->ino == si->id[k].ino) break;
+            s = (s + 1) & (m->cap - 1);
+        }
+        if (m->t[s]) {
+            uint32_t j = m->t[s] - 1;
+            while (m->nxt[j]) j = m->nxt[j] - 1;
+            m->nxt[j] = k + 1;
+        } else {
+            m->t[s] = k + 1;
+        }
+    }
+    return 1;
+}
+
+/* An old id of (dev, ino) no walk path has taken yet (ost GONE), or -1. */
+static long rtx_si_map_get(const RtxSiMap *m, const RtxSi *si, const RtxSiId *id,
+                           const uint8_t *ost) {
+    size_t s = (size_t)rtx_si_key(id->dev, id->ino) & (m->cap - 1);
+    while (m->t[s]) {
+        const RtxSiId *o = &si->id[m->t[s] - 1];
+        if (o->dev == id->dev && o->ino == id->ino) {
+            uint32_t k = m->t[s];
+            while (k && ost[k - 1] != 0) k = m->nxt[k - 1];
+            return k ? (long)(k - 1) : -1;
+        }
+        s = (s + 1) & (m->cap - 1);
+    }
+    return -1;
+}
+
+/* Old file states. */
+enum { RTX_SI_GONE = 0, RTX_SI_SAME = 1, RTX_SI_CHANGED = 2, RTX_SI_MOVED = 3 };
+
+int rtx_si_update(const RtxSiBuildIn *in, RtxSiBuildOut *out) {
+    RtxSi *si = NULL;
+    RtxSiMap map = {0, 0, 0};
+    RtxSiB b;
+    RtxSiShard *sh = NULL;
+    int ns = rtx_si_lanes(in), ok = 0;
+    long ms0 = rtx_si_mono_ms(), ms1, ms2;
+    int64_t t0 = rtx_si_now_ns();
+    uint8_t *ost = NULL;      /* per old file: RTX_SI_* */
+    uint32_t *orel = NULL;    /* per old file: its rel index now */
+    RtxSiId *nid = NULL;      /* per old file: its identity now */
+    uint8_t *udirty = NULL;   /* per old unit */
+    uint32_t *newrel = NULL, nnew = 0;
+    RtxSiU *tu = NULL;        /* tail units */
+    size_t ntu = 0;
+    uint64_t *nfilt = NULL, fw = 0;
+    RtxSiU *ku = NULL;        /* kept units (old numbering in p0) */
+    size_t nku = 0;
+    uint32_t i, k, u, ndirty = 0;
+    uint64_t newbytes = 0;
+    const char *why = NULL;
+    RtxSiBuf ft = {0}, ud = {0};
+    uint8_t *img = NULL;
+    size_t filt_at = 0, total = 0;
+    memset(out, 0, sizeof *out);
+    memset(&b, 0, sizeof b);
+    out->err = "out of memory";
+    if (!in || !in->out || !in->rel) {
+        out->err = "bad input";
+        return 0;
+    }
+    si = rtx_si_load(in->out, in->root, in->root_n);
+    if (!si || si->load_rc != 1) {
+        why = !si || si->load_rc == 0 ? "no index yet" : "the index was not readable";
+        goto full;
+    }
+    b.in = in;
+    b.rootfd = open(in->root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (b.rootfd < 0) {
+        out->err = "cannot open the root";
+        goto done;
+    }
+    ost = (uint8_t *)calloc(si->nfiles + 1, 1);
+    orel = (uint32_t *)calloc(si->nfiles + 1, sizeof(uint32_t));
+    nid = (RtxSiId *)calloc(si->nfiles + 1, sizeof(RtxSiId));
+    udirty = (uint8_t *)calloc(si->nunits + 1, 1);
+    newrel = (uint32_t *)malloc(((size_t)in->n + 1) * sizeof(uint32_t));
+    if (!ost || !orel || !nid || !udirty || !newrel || !rtx_si_map(&map, si)) goto done;
+    /* The walk's files against the old table. */
+    for (i = 0; i < in->n; i++) {
+        struct stat st;
+        RtxSiId id;
+        long o;
+        if (rtx_si_cancelled(in)) {
+            out->err = "cancelled";
+            goto done;
+        }
+        if (in->done) atomic_fetch_add_explicit(in->done, 1, memory_order_relaxed);
+        if (fstatat(b.rootfd, in->rel[i], &st, 0) != 0 || !S_ISREG(st.st_mode) ||
+            st.st_size <= 0 || (size_t)st.st_size > in->max_bytes)
+            continue;
+        rtx_si_id_of(&st, &id);
+        o = rtx_si_map_get(&map, si, &id, ost);
+        if (o < 0) {
+            newrel[nnew++] = i;
+            newbytes += id.size;
+            continue;
+        }
+        orel[o] = i;
+        nid[o] = id;
+        /* trusted by its stamps (a shared inode is never trusted by a
+         * search, but its bits are right for either path) */
+        if (rtx_si_same(&id, &si->id[o]) && !si->dead[o] &&
+            rtx_si_trusted_g(&si->id[o], si->built_ns, si->gran_ms)) {
+            ost[o] = RTX_SI_SAME;
+            out->upd_same++;
+        } else if (rtx_si_nchunks(id.size) == rtx_si_nchunks(si->id[o].size)) {
+            ost[o] = RTX_SI_CHANGED;
+            out->upd_changed++;
+        } else {
+            ost[o] = RTX_SI_MOVED; /* small <-> big, or another chunk count */
+            out->upd_changed++;
+            newrel[nnew++] = i;
+            newbytes += id.size;
+        }
+    }
+    ms1 = rtx_si_mono_ms();
+    out->ms_stat = ms1 - ms0;
+    for (k = 0; k < si->nfiles; k++) {
+        uint32_t u0, n, j;
+        if (ost[k] == RTX_SI_GONE && !si->dead[k]) out->upd_gone++;
+        if (ost[k] != RTX_SI_CHANGED) continue;
+        n = rtx_si_units(si, (long)k, &u0);
+        for (j = 0; j < n; j++) udirty[u0 + j] = 1;
+    }
+    for (u = 0; u < si->nunits; u++) ndirty += udirty[u];
+    {
+        uint64_t est = ndirty + newbytes / RTX_SI_BLK + (nnew ? 1 : 0);
+        long lim = atomic_load(&g_si_upd_pct);
+        if (lim < 0) lim = RTX_SI_UPD_PCT;
+        if (est * 100 > (uint64_t)si->nunits * (uint64_t)lim) {
+            why = "too many changes";
+            goto full;
+        }
+    }
+    /* Kept units, in order: members that are still here; dirty ones get
+     * a job. p0 = the old unit; x = files kept (block) or the chunk. */
+    ku = (RtxSiU *)calloc(si->nunits + 1, sizeof(RtxSiU));
+    if (!ku) goto done;
+    for (u = 0; u < si->nunits; u++) {
+        uint32_t f0 = si->uf[u], x = si->ux[u], nf = 0, m;
+        if (x & RTX_SI_CHUNK) {
+            if (ost[f0] != RTX_SI_SAME && ost[f0] != RTX_SI_CHANGED) continue;
+            ku[nku] = (RtxSiU){ u, u + 1, x, 0, si->ucnt[u], 0,
+                                si->uoff[u + 1] - si->uoff[u] };
+            nku++;
+            continue;
+        }
+        for (m = 0; m < x; m++)
+            if (ost[f0 + m] == RTX_SI_SAME || ost[f0 + m] == RTX_SI_CHANGED) nf++;
+        if (!nf) continue; /* every file gone or moved */
+        ku[nku] = (RtxSiU){ u, u + 1, nf, 0, 0, 0, si->uoff[u + 1] - si->uoff[u] };
+        nku++;
+    }
+    /* Tail: new and moved files in walk order, packed like a build. */
+    {
+        uint32_t *ord = NULL;
+        if (nnew) {
+            ord = rtx_si_order(in, newrel, nnew);
+            if (!ord) goto done;
+        }
+        b.ord = ord;
+        b.npos = nnew;
+        b.ids = (RtxSiId *)calloc((size_t)nnew + 1, sizeof(RtxSiId));
+        b.ok = (uint8_t *)calloc((size_t)nnew + 1, 1);
+        if (!b.ids || !b.ok || !rtx_si_segs(&b, ns)) goto done;
+        sh = rtx_si_shards(&b, ns);
+        if (!sh || !rtx_si_shards_ok(sh, ns)) goto done;
+        if (nnew) {
+            for (i = 0; i < (uint32_t)ns; i++) sh[i].pass = 1;
+            rtx_si_run_shards(sh, ns);
+            if (rtx_si_cancelled(in)) {
+                out->err = "cancelled";
+                goto done;
+            }
+            for (i = 0; i < b.nseg; i++) {
+                if (b.seg[i].oom) goto done;
+                ntu += b.seg[i].nu;
+            }
+        }
+        tu = (RtxSiU *)malloc((ntu + 1) * sizeof(RtxSiU));
+        if (!tu) goto done;
+        ntu = 0;
+        for (i = 0; i < b.nseg; i++) {
+            memcpy(tu + ntu, b.seg[i].u, b.seg[i].nu * sizeof(RtxSiU));
+            ntu += b.seg[i].nu;
+        }
+    }
+    /* New word offsets: kept units, then the tail (sized at the build's
+     * bits per trigram). */
+    for (k = 0; k < nku; k++) {
+        ku[k].woff = fw;
+        fw += ku[k].words;
+    }
+    for (k = 0; k < ntu; k++) {
+        uint64_t wds = ((uint64_t)tu[k].nd * si->bpt16 >> 16) / 64;
+        tu[k].words = wds ? wds : 1;
+        tu[k].woff = fw;
+        fw += tu[k].words;
+    }
+    nfilt = (uint64_t *)calloc(fw + 1, 8);
+    if (!nfilt) goto done;
+    b.filt = nfilt;
+    for (k = 0; k < nku; k++)
+        if (!udirty[ku[k].p0])
+            memcpy(nfilt + ku[k].woff, si->filt + si->uoff[ku[k].p0], ku[k].words * 8);
+    /* Jobs: every dirty kept unit (a chunk run once). */
+    {
+        uint32_t nj = 0;
+        b.job = (RtxSiJob *)calloc(nku + 1, sizeof(RtxSiJob));
+        if (!b.job) goto done;
+        for (k = 0; k < nku; k++) {
+            uint32_t ou = ku[k].p0, f0 = si->uf[ou], m, e;
+            RtxSiJob *jb;
+            if (!udirty[ou]) continue;
+            if ((si->ux[ou] & RTX_SI_CHUNK) && (si->ux[ou] & ~RTX_SI_CHUNK)) continue;
+            jb = &b.job[nj++];
+            jb->woff = ku[k].woff;
+            if (si->ux[ou] & RTX_SI_CHUNK) {
+                jb->nu = rtx_si_nchunks(si->id[f0].size);
+                jb->nm = 1;
+            } else {
+                jb->nu = 1;
+                jb->nm = ku[k].x;
+            }
+            jb->mrel = (uint32_t *)calloc(jb->nm, sizeof(uint32_t));
+            jb->mid = (RtxSiId *)calloc(jb->nm, sizeof(RtxSiId));
+            jb->mok = (uint8_t *)calloc(jb->nm, 1);
+            jb->words = (uint64_t *)calloc(jb->nu, sizeof(uint64_t));
+            if (!jb->mrel || !jb->mid || !jb->mok || !jb->words) goto done;
+            for (e = 0; e < jb->nu; e++) jb->words[e] = ku[k + e].words;
+            if (si->ux[ou] & RTX_SI_CHUNK) {
+                jb->nl = (uint64_t *)calloc(jb->nu, sizeof(uint64_t));
+                if (!jb->nl) goto done;
+                jb->mrel[0] = orel[f0];
+            } else {
+                e = 0;
+                for (m = 0; m < si->ux[ou]; m++)
+                    if (ost[f0 + m] == RTX_SI_SAME || ost[f0 + m] == RTX_SI_CHANGED)
+                        jb->mrel[e++] = orel[f0 + m];
+            }
+        }
+        b.njob = nj;
+        out->upd_dirty = ndirty;
+    }
+    for (i = 0; i < (uint32_t)ns; i++) sh[i].pass = 3;
+    rtx_si_run_shards(sh, ns);
+    if (nnew) {
+        uint32_t o = 0;
+        for (i = 0; i < b.nseg; i++) {
+            memcpy(b.seg[i].u, tu + o, b.seg[i].nu * sizeof(RtxSiU));
+            o += b.seg[i].nu;
+        }
+        for (i = 0; i < (uint32_t)ns; i++) sh[i].pass = 2;
+        rtx_si_run_shards(sh, ns);
+    }
+    if (rtx_si_cancelled(in) || !rtx_si_shards_ok(sh, ns)) {
+        out->err = rtx_si_cancelled(in) ? "cancelled" : "out of memory";
+        goto done;
+    }
+    ms2 = rtx_si_mono_ms();
+    /* The new tables: kept files in unit order (re-read ones with the
+     * identity read), then the tail. */
+    {
+        uint64_t devs[64];
+        size_t ndev = 0;
+        RtxSiPrev pv = {0, 0};
+        RtxSiU *all = (RtxSiU *)malloc((nku + ntu + 1) * sizeof(RtxSiU));
+        RtxSiId *fid = (RtxSiId *)malloc(((size_t)si->nfiles + nnew + 1) * sizeof(RtxSiId));
+        uint8_t *fok = (uint8_t *)malloc((size_t)si->nfiles + nnew + 1);
+        uint32_t nf = 0, jk = 0;
+        RtxSiHdr h;
+        if (!all || !fid || !fok) {
+            free(all);
+            free(fid);
+            free(fok);
+            goto done;
+        }
+        for (k = 0; k < nku; k++) {
+            uint32_t ou = ku[k].p0, f0 = si->uf[ou], m;
+            RtxSiJob *jb = NULL;
+            all[k] = ku[k];
+            if (udirty[ou] && !((si->ux[ou] & RTX_SI_CHUNK) && (si->ux[ou] & ~RTX_SI_CHUNK)))
+                jb = &b.job[jk++];
+            if (si->ux[ou] & RTX_SI_CHUNK) {
+                uint32_t j = si->ux[ou] & ~RTX_SI_CHUNK, run = rtx_si_nchunks(si->id[f0].size);
+                if (udirty[ou]) {
+                    /* the job of this run sits at its first chunk */
+                    RtxSiJob *rj = jb ? jb : &b.job[jk - 1];
+                    all[k].nl = rj->nl[j];
+                    if (j == 0) {
+                        fid[nf] = rj->mok[0] == 1 ? rj->mid[0] : si->id[f0];
+                        fok[nf] = rj->mok[0] == 1 ? 1 : 2;
+                        nf++;
+                    }
+                } else if (j == 0) {
+                    fid[nf] = si->id[f0];
+                    fok[nf++] = 1;
+                }
+                (void)run;
+                continue;
+            }
+            {
+                uint32_t e = 0;
+                for (m = 0; m < si->ux[ou]; m++) {
+                    if (ost[f0 + m] != RTX_SI_SAME && ost[f0 + m] != RTX_SI_CHANGED) continue;
+                    if (jb) {
+                        fid[nf] = jb->mok[e] == 1 ? jb->mid[e] : nid[f0 + m];
+                        fok[nf] = jb->mok[e] == 1 ? 1 : 2;
+                    } else {
+                        fid[nf] = si->id[f0 + m];
+                        fok[nf] = 1;
+                    }
+                    nf++;
+                    e++;
+                }
+            }
+        }
+        for (k = 0; k < ntu; k++) all[nku + k] = tu[k];
+        for (i = 0; i < nnew; i++) {
+            if (!b.ok[i]) continue;
+            fid[nf] = b.ids[i];
+            fok[nf++] = b.ok[i];
+        }
+        rtx_si_devs(fid, fok, nf, devs, &ndev, fok);
+        for (i = 0; i < nf; i++) {
+            rtx_si_frow(&ft, &fid[i], fok[i] == 2, devs, ndev, &pv, NULL);
+            if (fok[i] == 1) out->corpus += fid[i].size;
+        }
+        rtx_si_udir(&ud, all, nku + ntu);
+        if (ft.oom || ud.oom) {
+            free(all);
+            free(fid);
+            free(fok);
+            goto done;
+        }
+        h.built_ns = t0;
+        h.gran = rtx_si_gran();
+        h.nfiles = nf;
+        h.ndev = ndev;
+        h.nunits = nku + ntu;
+        h.corpus = out->corpus;
+        h.budget = si->budget;
+        h.bpt16 = si->bpt16;
+        h.full_ms = si->full_ms;
+        img = rtx_si_image(in, &h, devs, &ft, &ud, fw, &filt_at, &total);
+        free(all);
+        free(fid);
+        free(fok);
+        if (!img) goto done;
+        memcpy(img + filt_at, nfilt, fw * 8);
+        out->fill = rtx_si_fill(nfilt, fw);
+        rtx_si_seal(img, total, si->full_ms);
+        if (!rtx_si_write(in->out, img, total)) {
+            out->err = "cannot write the index";
+            goto done;
+        }
+        out->files = nf;
+        out->units = (uint32_t)(nku + ntu);
+        for (k = 0; k < nku + ntu; k++) {
+            const RtxSiU *x = k < nku ? &ku[k] : &tu[k - nku];
+            if (x->x & RTX_SI_CHUNK) out->chunks++;
+            else out->blocks++;
+        }
+    }
+    {
+        uint64_t work = 0;
+        size_t peak = 0;
+        uint32_t s2;
+        /* every read: the jobs, and the tail's two passes */
+        for (s2 = 0; s2 < (uint32_t)ns; s2++) out->upd_bytes += sh[s2].bytes;
+        rtx_si_shards_free(sh, ns, &work, &peak);
+        sh = NULL;
+        atomic_fetch_add(&g_si_work, work);
+        out->peak = peak + total + si->file_bytes + fw * 8;
+    }
+    out->update = 1;
+    /* new files the tail indexed (a binary is looked at, not indexed) */
+    for (i = 0; i < nnew; i++) out->upd_new += b.ok[i] != 0;
+    out->upd_tail = (uint32_t)ntu;
+    out->budget = si->budget;
+    out->bytes = total;
+    out->ftab_bytes = ft.n;
+    out->udir_bytes = ud.n;
+    out->filt_bytes = fw * 8;
+    out->full_ms = si->full_ms;
+    out->ms_pass1 = ms1 - ms0;
+    out->ms_pass2 = ms2 - ms1;
+    out->ms_write = rtx_si_mono_ms() - ms2;
+    out->ms = rtx_si_mono_ms() - ms0;
+    out->err = NULL;
+    out->ok = 1;
+    ok = 1;
+    goto done;
+full:
+    rtx_si_free(si);
+    si = NULL;
+    ok = rtx_si_build(in, out);
+    out->why_full = why;
+    return ok;
+done:
+    if (b.rootfd > 0) close(b.rootfd);
+    rtx_si_shards_free(sh, ns, NULL, NULL);
+    rtx_si_segs_free(&b);
+    if (b.job) {
+        uint32_t j;
+        for (j = 0; j < b.njob; j++) {
+            free(b.job[j].mrel);
+            free(b.job[j].mid);
+            free(b.job[j].mok);
+            free(b.job[j].words);
+            free(b.job[j].nl);
+        }
+        free(b.job);
+    }
+    free((void *)b.ord);
+    free(b.ids);
+    free(b.ok);
+    free(map.t);
+    free(map.nxt);
+    free(ost);
+    free(orel);
+    free(nid);
+    free(udirty);
+    free(newrel);
+    free(tu);
+    free(ku);
+    free(nfilt);
+    free(ft.p);
+    free(ud.p);
+    free(img);
+    rtx_si_free(si);
+    return ok;
+}
