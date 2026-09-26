@@ -374,6 +374,9 @@ struct RtxWb {
     size_t ma_base, va_base; /* ... by the rebuild itself */
     int off;
     int need_rebuild;
+    int deferred;            /* a big workbook's reparse waits for a pause
+                              * (rtx_wb_idle); values hidden meanwhile */
+    long defer_at;           /* ms of the last edit while deferred */
     /* edits noted since the last sync (one union, like RtxEditSpan) */
     int pend;
     size_t p_lo, p_old, p_new;
@@ -419,6 +422,38 @@ struct RtxWb {
     uint32_t nxr, xrcap;
     RtxWbStats st;
 };
+
+/* ----------------------------------------------------------------- limits */
+
+static size_t g_wb_max = RTX_WB_MAX;
+static int32_t g_wb_rows_max = RTX_WB_ROWS_MAX;
+static size_t g_wb_defer = RTX_WB_DEFER_BYTES;
+
+void rtx_wb_limits(size_t max_bytes, size_t max_rows, size_t defer_bytes) {
+    if (max_bytes) g_wb_max = max_bytes < (size_t)UINT32_MAX - 1 ? max_bytes : (size_t)UINT32_MAX - 2;
+    if (max_rows) g_wb_rows_max = max_rows < (size_t)INT32_MAX / 2 ? (int32_t)max_rows : INT32_MAX / 2;
+    if (defer_bytes) g_wb_defer = defer_bytes;
+}
+
+void rtx_wb_limits_get(size_t *max_bytes, size_t *max_rows, size_t *defer_bytes) {
+    if (max_bytes) *max_bytes = g_wb_max;
+    if (max_rows) *max_rows = (size_t)g_wb_rows_max;
+    if (defer_bytes) *defer_bytes = g_wb_defer;
+}
+
+static long wb_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* "over 8 MiB" for the messages. */
+static void wb_cap_text(char *out, size_t cap) {
+    if (g_wb_max >= ((size_t)1 << 20) && g_wb_max % ((size_t)1 << 20) == 0)
+        snprintf(out, cap, "%zu MiB", g_wb_max >> 20);
+    else
+        snprintf(out, cap, "%zu bytes", g_wb_max);
+}
 
 /* ----------------------------------------------------------------- memory */
 
@@ -1705,9 +1740,12 @@ static Ex *bd(BCtx *c, Ex *e);
 
 static Ex *bd_table_ref(BCtx *c, Ex *e, int64_t tab) {
     WTab *t = &c->wb->tabs[tab];
-    if (t->big)
-        return bd_err(c, e, WE_REF, "%.*s has more than 10000 rows (W1 indexes it)%.*s",
-                      t->name, t->namen, "", 0);
+    if (t->big) {
+        char nb[24];
+        snprintf(nb, sizeof nb, "%ld", (long)g_wb_rows_max);
+        return bd_err(c, e, WE_REF, "%.*s has more than %.*s rows (W1 indexes it)", t->name,
+                      t->namen, nb, strlen(nb));
+    }
     return NULL;
 }
 
@@ -4309,7 +4347,7 @@ static int wb_table_build(RtxWb *wb, const char *buf, size_t len, const RtxMdTab
         nrows++;
         line = e + 1;
     }
-    if (nrows > RTX_WB_ROWS_MAX) {
+    if (nrows > g_wb_rows_max) {
         t->big = 1;
         nrows = 0;
     }
@@ -5140,7 +5178,7 @@ static void wb_rebuild(RtxWb *wb, const RtxDoc *d) {
     wb->off = 0;
     wb->chg_all = 1;
     wb->nchanged = 0;
-    if (len > RTX_WB_MAX) {
+    if (len > g_wb_max) {
         wb->off = 1;
         wb_count(wb);
         return;
@@ -5823,7 +5861,7 @@ static int wb_fast_rows(RtxWb *wb, const RtxDoc *d) {
     }
     if (!nk && a == b) return 0;
     n2 = n - (b - a) + (int32_t)nk;
-    if (n2 < 1 || n2 > RTX_WB_ROWS_MAX) return 0;
+    if (n2 < 1 || n2 > g_wb_rows_max) return 0;
     /* every row's start after the edit, before anything moves */
     abs = (size_t *)cc_arena_alloc(wb->sa, (size_t)(n2 + 1) * sizeof(size_t), 16);
     if (!abs) return 0;
@@ -6065,7 +6103,7 @@ static int wb_fast_rows(RtxWb *wb, const RtxDoc *d) {
 static int wb_fast(RtxWb *wb, const RtxDoc *d) {
     size_t len = RtxDoc_len(d), lo = wb->p_lo, old_n = wb->p_old;
     int64_t k;
-    if (len > RTX_WB_MAX) return 0;
+    if (len > g_wb_max) return 0;
     if (wb->doc_len < old_n || wb->doc_len - old_n + wb->p_new != len) return 0;
     if (lo + old_n > wb->doc_len) return 0;
     k = wb_node_at(wb, lo);
@@ -6091,11 +6129,15 @@ static int wb_fast(RtxWb *wb, const RtxDoc *d) {
     return 1;
 }
 
-void rtx_wb_sync(RtxWb *wb, const RtxDoc *d) {
+/* paint: a caller on the keystroke path (the derived hooks, the status
+ * line). A reparse of a workbook of g_wb_defer bytes or more is not done
+ * there: it waits for a pause in typing (rtx_wb_idle), values hidden. */
+static void wb_sync_ex(RtxWb *wb, const RtxDoc *d, int paint) {
     struct timespec t0, t1;
     int ok = 0;
     if (!wb || !d) return;
     if (!wb->pend && !wb->need_rebuild) return;
+    if (paint && wb->deferred) return;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     wb->nchanged = 0;
     wb->chg_all = 0;
@@ -6106,10 +6148,44 @@ void rtx_wb_sync(RtxWb *wb, const RtxDoc *d) {
         ok = wb_fast(wb, d);
     wb->pend = 0;
     wb->need_rebuild = 0;
+    if (!ok && paint && RtxDoc_len(d) >= g_wb_defer && RtxDoc_len(d) <= g_wb_max) {
+        /* the model may be half patched: nothing reads it until the reparse */
+        wb->need_rebuild = 1;
+        wb->deferred = 1;
+        wb->defer_at = wb_now_ms();
+        wb->chg_all = 1;
+        wb->sa.reset();
+        return;
+    }
+    wb->deferred = 0;
     if (!ok) wb_rebuild(wb, d);
     wb->sa.reset();
     clock_gettime(CLOCK_MONOTONIC, &t1);
     wb->st.last_us = (size_t)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
+}
+
+void rtx_wb_sync(RtxWb *wb, const RtxDoc *d) {
+    wb_sync_ex(wb, d, 0);
+}
+
+long rtx_wb_due_ms(const RtxDoc *d) {
+    RtxWb *wb = rtx_wb_of(d);
+    long left;
+    if (!wb || !wb->deferred) return -1;
+    left = wb->defer_at + (long)RTX_WB_DEFER_MS - wb_now_ms();
+    return left > 0 ? left : 0;
+}
+
+int rtx_wb_idle(const RtxDoc *d) {
+    RtxWb *wb = rtx_wb_of(d);
+    if (!wb || !wb->deferred || rtx_wb_due_ms(d) > 0) return 0;
+    wb_sync_ex(wb, d, 0);
+    return 1;
+}
+
+int rtx_wb_deferred(const RtxDoc *d) {
+    RtxWb *wb = rtx_wb_of(d);
+    return wb && wb->deferred;
 }
 
 void rtx_wb_recalc_all(RtxWb *wb, const RtxDoc *d) {
@@ -6123,6 +6199,7 @@ void rtx_wb_recalc_all(RtxWb *wb, const RtxDoc *d) {
 static void wb_hook_note(void *ctx, size_t at, size_t erased, size_t inserted) {
     RtxWb *wb = (RtxWb *)ctx;
     size_t lo, hi_cur, hi_old, cur_hi;
+    if (wb->deferred) wb->defer_at = wb_now_ms();
     if (!wb->pend) {
         wb->pend = 1;
         wb->p_lo = at;
@@ -6162,8 +6239,8 @@ static int wb_hook_at(void *ctx, const RtxDoc *d, size_t off, int incl, size_t *
     RtxWb *wb = (RtxWb *)ctx;
     int64_t k;
     const WNode *n;
-    rtx_wb_sync(wb, d);
-    if (wb->off || !wb->nderived) return 0;
+    wb_sync_ex(wb, d, 1);
+    if (wb->off || wb->deferred || !wb->nderived) return 0;
     k = wb_node_at(wb, off);
     if (k < 0) return 0;
     n = &wb->nodes[k];
@@ -6187,8 +6264,8 @@ static size_t wb_hook_edges(void *ctx, const RtxDoc *d, size_t lo, size_t hi, si
     int64_t k;
     size_t m = 0;
     uint32_t i;
-    rtx_wb_sync(wb, d);
-    if (wb->off || !wb->nderived) return 0;
+    wb_sync_ex(wb, d, 1);
+    if (wb->off || wb->deferred || !wb->nderived) return 0;
     k = wb_ord_find(wb, lo);
     if (k < 0) k = 0;
     for (i = (uint32_t)k; i < wb->nord; i++) {
@@ -6237,8 +6314,8 @@ static size_t wb_hook_changed(void *ctx, const RtxDoc *d, size_t *lo, size_t *hi
     RtxWb *wb = (RtxWb *)ctx;
     uint32_t i;
     size_t m = 0;
-    rtx_wb_sync(wb, d);
-    if (wb->off) return 0; /* nothing painted */
+    wb_sync_ex(wb, d, 1);
+    if (wb->off || wb->deferred) return 0; /* nothing painted */
     if (wb->chg_all) return (size_t)-1;
     for (i = 0; i < wb->nchanged; i++) {
         const WNode *n = &wb->nodes[wb->changed[i]];
@@ -6253,8 +6330,8 @@ static size_t wb_hook_changed(void *ctx, const RtxDoc *d, size_t *lo, size_t *hi
 
 static int wb_hook_any(void *ctx, const RtxDoc *d) {
     RtxWb *wb = (RtxWb *)ctx;
-    rtx_wb_sync(wb, d);
-    return !wb->off && wb->nderived > 0;
+    wb_sync_ex(wb, d, 1);
+    return !wb->off && !wb->deferred && wb->nderived > 0;
 }
 
 static void wb_hook_destroy(void *ctx) {
@@ -6838,7 +6915,10 @@ size_t !>(CCError) rtx_wb_rename(RtxDoc *d, size_t off, const char *name, size_t
     }
     rtx_wb_sync(wb, d);
     if (wb->off) {
-        wb_msg(msg, msgn, "workbook over 8 MiB: values are off");
+        char cb[40], mb[80];
+        wb_cap_text(cb, sizeof cb);
+        snprintf(mb, sizeof mb, "workbook over %s: values are off", cb);
+        wb_msg(msg, msgn, mb);
         return cc_ok((size_t)0);
     }
     if (!wb_target_at(wb, off, &t)) {
@@ -6976,9 +7056,15 @@ int rtx_wb_describe(RtxWb *wb, const RtxDoc *d, size_t off, char *out, size_t ca
     int32_t c;
     if (out && cap) out[0] = 0;
     if (!wb) return 0;
-    rtx_wb_sync(wb, d);
+    wb_sync_ex(wb, d, 1);
+    if (wb->deferred) {
+        wb_puts(out, cap, 0, "workbook: recalculating when typing pauses");
+        return 1;
+    }
     if (wb->off) {
-        wb_puts(out, cap, 0, "workbook over 8 MiB: values off");
+        char cb[40];
+        wb_cap_text(cb, sizeof cb);
+        snprintf(out, cap, "workbook over %s: values off", cb);
         return 1;
     }
     k = wb_node_at(wb, off);
@@ -7017,7 +7103,7 @@ int rtx_wb_describe(RtxWb *wb, const RtxDoc *d, size_t off, char *out, size_t ca
         }
         snprintf(out, cap, "table %.*s  (%d column%s, %d row%s)%s", (int)t->namen, t->name,
                  (int)t->ncols, t->ncols == 1 ? "" : "s", (int)t->nrows, t->nrows == 1 ? "" : "s",
-                 t->big ? "  over 10000 rows: refused (W1)" : "");
+                 t->big ? "  over the row cap: refused (W1)" : "");
         return 1;
     }
     return 0;

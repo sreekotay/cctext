@@ -1986,6 +1986,55 @@ def case_wb_annotation(exe, tmp):
           "wb: the file never holds the annotation", repr(disk[-40:]))
 
 
+def case_wb_deferred(exe, tmp):
+    """Workbook at scale (docs/workbook.md "W2 at scale"): in a workbook
+    over RTX_WB_DEFER_BYTES (1 MiB) a structural edit does not reparse on
+    the keystroke; values hide, the status says so, and the idle loop
+    reparses once typing pauses (RTX_WB_DEFER_MS), painting them again."""
+    if pyte is None:
+        print("skip: wb deferred (no pyte)")
+        return
+    rows = b"".join(b"| %d | =@a * 2 |\n" % i for i in range(1, 70001))
+    body = (b"# D\n\n```calc\ns = sum(T.a)\n```\n\nTable: T\n\n| a | b |\n|---|---|\n" +
+            rows)
+    t, path = open_tui(exe, tmp, "big.wb.md", body, settle=1.5)
+    res = {}
+
+    def calc_line():
+        for ln in (screen_text(t) or "").split("\n"):
+            if "s = " in ln:
+                return ln
+        return ""
+
+    try:
+        txt = screen_text(t) or ""
+        if "rich" not in txt.split("\n")[-1]:
+            t.send(b"\x04", 0.6)  # Ctrl-D: Rich on
+        res["before"] = calc_line()
+        t.send(b"\x1b[1;5H", 0.3)  # Ctrl-Home
+        t.send(b"\x1b[B\x1b[B\x1b[F", 0.3)  # the ```calc line, its end
+        # break the fence and mend it in one burst: a structural edit
+        t.send(b"x\x7f", 0.12)
+        txt = screen_text(t) or ""
+        res["mid"] = calc_line()
+        res["mid_status"] = txt.split("\n")[-1]
+        t.pump(1.2)
+        res["after"] = calc_line()
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    check("s = " in res["before"] and "sum(" not in res["before"],
+          "wb big: a calc line paints its value", repr(res["before"]))
+    check("sum(" in res["mid"],
+          "wb big: a structural edit hides the values (no reparse on the keystroke)",
+          repr(res["mid"]))
+    check("recalculating" in res["mid_status"],
+          "wb big: the status says the reparse waits", repr(res["mid_status"]))
+    check("s = " in res["after"] and "sum(" not in res["after"],
+          "wb big: the idle loop reparses and repaints", repr(res["after"]))
+
+
 CASES = {
     "present": case_present,
     "tabs_and_panes": case_tabs_and_panes,
@@ -2040,6 +2089,7 @@ CASES = {
     "quick_open": case_quick_open,
     "project_search": case_project_search,
     "wb_annotation": case_wb_annotation,
+    "wb_deferred": case_wb_deferred,
 }
 
 

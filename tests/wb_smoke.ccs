@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "../core/document.cch"
 #include "../core/layout.cch"
 #include "../core/wb.cch"
@@ -871,12 +872,13 @@ static void property(void) {
     RtxDoc_destroy(&d);
 }
 
-/* Over RTX_WB_MAX: values off, said so, nothing painted or relaid. */
+/* Over the byte cap (lowered to 8 MiB here; RTX_WB_MAX is 256 MiB):
+ * values off, said so, nothing painted or relaid. */
 static void too_big(void) {
     RtxDoc d = {0};
     RtxWb *wb;
     RtxWbStats st;
-    size_t n = RTX_WB_MAX + 4096, i, lo[4], hi[4];
+    size_t n = ((size_t)8 << 20) + 4096, i, lo[4], hi[4];
     char *p = (char *)malloc(n), msg[128];
     CCArena a = cc_arena_heap(n + 64);
     static const char head[] = "Table: T\n\n| a | b |\n|---|---|\n| 1 | =@a |\n\n";
@@ -888,6 +890,7 @@ static void too_big(void) {
         return;
     }
     if (!p) return;
+    rtx_wb_limits((size_t)8 << 20, 0, 0);
     for (i = 0; i < n; i++) p[i] = (i % 64 == 63) ? '\n' : 'x';
     memcpy(p, head, sizeof head - 1);
     {
@@ -904,6 +907,94 @@ static void too_big(void) {
     RtxDoc_destroy(&d);
     a.destroy();
     free(p);
+    rtx_wb_limits(RTX_WB_MAX, 0, 0);
+}
+
+/* The row cap (lowered here): a table over it is refused with a message
+ * naming the cap; a row insert that would cross it reparses and refuses. */
+static void rows_cap(void) {
+    RtxDoc d = {0};
+    CCArena keep_a = cc_arena_heap(8192) @destroy;
+    RtxWb *wb;
+    char buf[4096];
+    size_t n = 0, off;
+    int r;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    rtx_wb_limits(0, 40, 0);
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "Table: T\n\n| a | b |\n|---|---|\n");
+    for (r = 1; r <= 40; r++) n += (size_t)snprintf(buf + n, sizeof buf - n, "| %d | =@a * 2 |\n", r);
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "\n```calc\ns = sum(T.b)\n```\n");
+    {
+        char[:] src = cc_slice_from_buffer(buf, n);
+        char[:] keep = src.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    wb = rtx_wb_attach(&d);
+    check_eval(wb, &d, "s", "1640");
+    off = find_off(&d, "| 7 |", 0);
+    expect(rep(&d, off, 0, "| 41 | =@a * 2 |\n"), "row over the cap");
+    check_eval(wb, &d, "s", "#ref(T has more than 40 rows (W1 indexes it))");
+    expect(undo(&d), "undo the row");
+    check_eval(wb, &d, "s", "1640");
+    RtxDoc_destroy(&d);
+    rtx_wb_limits(0, RTX_WB_ROWS_MAX, 0);
+}
+
+/* A big workbook's reparse (lowered to 1 KiB here) waits for a pause:
+ * the keystroke path (hooks, status) hides the values, rtx_wb_idle
+ * reparses once due; an explicit query reparses at once. */
+static void deferred(void) {
+    RtxDoc d = {0};
+    CCArena keep_a = cc_arena_heap(8192) @destroy;
+    RtxWb *wb;
+    char buf[4096], msg[160];
+    size_t n = 0, off, lo = 0, hi = 0;
+    int r;
+    struct timespec ts = {0, 350 * 1000000L};
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    rtx_wb_limits(0, 0, 1024);
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "Table: T\n\n| a | b |\n|---|---|\n");
+    for (r = 1; r <= 80; r++) n += (size_t)snprintf(buf + n, sizeof buf - n, "| %d | =@a * 2 |\n", r);
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "\n```calc\ns = sum(T.b)\n```\n");
+    {
+        char[:] src = cc_slice_from_buffer(buf, n);
+        char[:] keep = src.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    wb = rtx_wb_attach(&d);
+    off = find_off(&d, "=@a * 2", 0);
+    expect(RtxDoc_derived_at(&d, off, 1, &lo, &hi, msg, sizeof msg, NULL) == 1, "defer: painted");
+    expect(rtx_wb_due_ms(&d) == -1, "defer: nothing owed");
+    /* a cell edit: the fast path, never deferred */
+    expect(rep(&d, off + 6, 1, "3"), "defer: cell edit");
+    expect(RtxDoc_derived_at(&d, off, 1, &lo, &hi, msg, sizeof msg, NULL) == 1 &&
+               !strcmp(msg, "3"), "defer: cell edit painted at once");
+    /* the header: a reparse, deferred on the keystroke path */
+    off = find_off(&d, "| a | b |", 0);
+    expect(rep(&d, off + 1, 0, " "), "defer: header edit");
+    expect(!RtxDoc_has_marks(&d), "defer: values hidden");
+    expect(rtx_wb_deferred(&d) && rtx_wb_due_ms(&d) > 0, "defer: owed, not due yet");
+    expect(rtx_wb_describe(wb, &d, off, msg, sizeof msg) && strstr(msg, "pauses"), "defer: said so");
+    expect(rtx_wb_idle(&d) == 0, "defer: idle before due does nothing");
+    nanosleep(&ts, NULL);
+    expect(rtx_wb_due_ms(&d) == 0 && rtx_wb_idle(&d) == 1, "defer: idle reparses once due");
+    expect(!rtx_wb_deferred(&d) && RtxDoc_has_marks(&d), "defer: values back");
+    check_eval(wb, &d, "s", "6481");
+    /* an explicit query reparses at once */
+    expect(rep(&d, off + 1, 1, ""), "defer: header back");
+    expect(!RtxDoc_has_marks(&d) && rtx_wb_deferred(&d), "defer: hidden again");
+    check_eval(wb, &d, "s", "6481");
+    expect(!rtx_wb_deferred(&d), "defer: a query reparsed");
+    RtxDoc_destroy(&d);
+    rtx_wb_limits(0, 0, RTX_WB_DEFER_BYTES);
 }
 
 /* ------------------------------------------------ W2: exact arithmetic */
@@ -1202,6 +1293,8 @@ int main(void) {
     rename_rt();
     property();
     too_big();
+    rows_cap();
+    deferred();
     xsum();
     counter_1000();
     groups_rows();
