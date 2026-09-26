@@ -121,6 +121,48 @@ void ui_os_fini(void) {
     g_area = NULL;
 }
 
+static NSWindow *ns_of(uiWindow *win) {
+    if (!win) return nil;
+    return (__bridge NSWindow *)(void *)uiControlHandle(uiControl(win));
+}
+
+int ui_os_frame_get(uiWindow *win, int *x, int *y, int *w, int *h) {
+    NSWindow *nw = ns_of(win);
+    NSRect f;
+    if (!nw || (nw.styleMask & NSWindowStyleMaskFullScreen)) return 0;
+    f = nw.frame;
+    *x = (int)f.origin.x;
+    *y = (int)f.origin.y;
+    *w = (int)f.size.width;
+    *h = (int)f.size.height;
+    return *w > 0 && *h > 0;
+}
+
+void ui_os_frame_set(uiWindow *win, int x, int y, int w, int h) {
+    NSWindow *nw = ns_of(win);
+    NSRect f = NSMakeRect(x, y, w, h), vis = NSZeroRect;
+    CGFloat best_a = 0, best_d = -1;
+    if (!nw || w <= 0 || h <= 0) return;
+    for (NSScreen *s in [NSScreen screens]) {
+        NSRect v = s.visibleFrame;
+        NSRect i = NSIntersectionRect(f, v);
+        CGFloat a = i.size.width * i.size.height;
+        CGFloat dx = NSMidX(f) - NSMidX(v), dy = NSMidY(f) - NSMidY(v);
+        CGFloat d = dx * dx + dy * dy;
+        if (a > best_a || (best_a == 0 && a == 0 && (best_d < 0 || d < best_d))) {
+            vis = v;
+            best_a = a;
+            best_d = d;
+        }
+    }
+    if (NSIsEmptyRect(vis)) return;
+    f.size.width = MAX(MIN(f.size.width, vis.size.width), MIN(400, vis.size.width));
+    f.size.height = MAX(MIN(f.size.height, vis.size.height), MIN(300, vis.size.height));
+    f.origin.x = MAX(vis.origin.x, MIN(f.origin.x, NSMaxX(vis) - f.size.width));
+    f.origin.y = MAX(vis.origin.y, MIN(f.origin.y, NSMaxY(vis) - f.size.height));
+    [nw setFrame:f display:NO];
+}
+
 int ui_os_typed_text(const uiAreaKeyEvent *e, int *out, int cap) {
     NSEvent *ev;
     NSString *chars;

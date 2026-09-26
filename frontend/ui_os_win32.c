@@ -36,6 +36,27 @@ void ui_os_fini(void) {
     g_area = NULL;
 }
 
+int ui_os_frame_get(uiWindow *win, int *x, int *y, int *w, int *h) {
+    /* TODO: GetWindowPlacement(hwnd) → rcNormalPosition (skip when
+     * showCmd is SW_SHOWMAXIMIZED). */
+    (void)win;
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+    return 0;
+}
+
+void ui_os_frame_set(uiWindow *win, int x, int y, int w, int h) {
+    /* TODO: MonitorFromRect(MONITOR_DEFAULTTONEAREST) → GetMonitorInfo
+     * rcWork; clamp into it; SetWindowPos(SWP_NOZORDER | SWP_NOACTIVATE). */
+    (void)win;
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+}
+
 int ui_os_typed_text(const uiAreaKeyEvent *e, int *out, int cap) {
     (void)e;
     (void)out;

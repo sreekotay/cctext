@@ -363,6 +363,55 @@ void ui_os_caret_show(int on, int fade_ms) {
     if (!g_fade_id) g_fade_id = g_timeout_add(16, caret_fade_tick, NULL);
 }
 
+static GtkWindow *gtk_of(uiWindow *win) {
+    GtkWidget *top = win ? GTK_WIDGET(uiControlHandle(uiControl(win))) : NULL;
+    return top && GTK_IS_WINDOW(top) ? GTK_WINDOW(top) : NULL;
+}
+
+int ui_os_frame_get(uiWindow *win, int *x, int *y, int *w, int *h) {
+    GtkWindow *gw = gtk_of(win);
+    GdkWindow *gdk;
+    if (!gw) return 0;
+    gdk = gtk_widget_get_window(GTK_WIDGET(gw));
+    if (gdk && (gdk_window_get_state(gdk) &
+                (GDK_WINDOW_STATE_FULLSCREEN | GDK_WINDOW_STATE_MAXIMIZED)))
+        return 0;
+    gtk_window_get_position(gw, x, y);
+    gtk_window_get_size(gw, w, h);
+    return *w > 0 && *h > 0;
+}
+
+void ui_os_frame_set(uiWindow *win, int x, int y, int w, int h) {
+    GtkWindow *gw = gtk_of(win);
+    GdkDisplay *dpy = gdk_display_get_default();
+    GdkRectangle f = {x, y, w, h}, vis = {0, 0, 0, 0};
+    long best_a = 0, best_d = -1;
+    int i, n;
+    if (!gw || !dpy || w <= 0 || h <= 0) return;
+    n = gdk_display_get_n_monitors(dpy);
+    for (i = 0; i < n; i++) {
+        GdkRectangle v, is;
+        long a = 0, dx, dy, d;
+        gdk_monitor_get_workarea(gdk_display_get_monitor(dpy, i), &v);
+        if (gdk_rectangle_intersect(&f, &v, &is)) a = (long)is.width * is.height;
+        dx = (long)(f.x + f.width / 2) - (v.x + v.width / 2);
+        dy = (long)(f.y + f.height / 2) - (v.y + v.height / 2);
+        d = dx * dx + dy * dy;
+        if (a > best_a || (best_a == 0 && a == 0 && (best_d < 0 || d < best_d))) {
+            vis = v;
+            best_a = a;
+            best_d = d;
+        }
+    }
+    if (vis.width <= 0 || vis.height <= 0) return;
+    f.width = MAX(MIN(f.width, vis.width), MIN(400, vis.width));
+    f.height = MAX(MIN(f.height, vis.height), MIN(300, vis.height));
+    f.x = MAX(vis.x, MIN(f.x, vis.x + vis.width - f.width));
+    f.y = MAX(vis.y, MIN(f.y, vis.y + vis.height - f.height));
+    gtk_window_resize(gw, f.width, f.height);
+    gtk_window_move(gw, f.x, f.y);
+}
+
 void ui_os_init(uiWindow *win, uiArea *area) {
     GtkWidget *top;
     g_win = win;

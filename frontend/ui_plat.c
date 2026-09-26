@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/stat.h>
 
 enum {
     UI_KEY_MAX = 512,
@@ -1596,6 +1597,47 @@ void SetConfigFlags(unsigned int flags) { g_flags = flags; }
 void SetExitKey(int key) { g_exit_key = key; }
 void SetTargetFPS(int fps) { g_fps = fps > 0 ? fps : 60; }
 
+int rtx_config_path(const char *name, char *dst, size_t n);
+
+/* Window frame across runs: "x y w h" in the config dir. Scripted runs
+ * (RTX_UI_SCRIPT) neither read nor write it. */
+static int frame_path(char *dst, size_t n) {
+    const char *s = getenv("RTX_UI_SCRIPT");
+    if (s && s[0]) return 0;
+    return rtx_config_path("window", dst, n);
+}
+
+static void frame_restore(void) {
+    char path[1024];
+    int x, y, w, h;
+    FILE *fp;
+    if (!g_window || !frame_path(path, sizeof path)) return;
+    fp = fopen(path, "r");
+    if (!fp) return;
+    if (fscanf(fp, "%d %d %d %d", &x, &y, &w, &h) == 4 && w > 0 && h > 0 &&
+        w < 100000 && h < 100000)
+        ui_os_frame_set(g_window, x, y, w, h);
+    fclose(fp);
+}
+
+static void frame_save(void) {
+    char path[1024];
+    char *sl;
+    int x, y, w, h;
+    FILE *fp;
+    if (!g_window || !frame_path(path, sizeof path)) return;
+    if (!ui_os_frame_get(g_window, &x, &y, &w, &h)) return;
+    for (sl = strchr(path + 1, '/'); sl; sl = strchr(sl + 1, '/')) {
+        *sl = 0;
+        mkdir(path, 0755);
+        *sl = '/';
+    }
+    fp = fopen(path, "w");
+    if (!fp) return;
+    fprintf(fp, "%d %d %d %d\n", x, y, w, h);
+    fclose(fp);
+}
+
 void InitWindow(int width, int height, const char *title) {
     uiInitOptions opt;
     const char *err;
@@ -1617,6 +1659,15 @@ void InitWindow(int width, int height, const char *title) {
     uiWindowSetMargined(g_window, 0);
     uiWindowOnClosing(g_window, on_closing, NULL);
     uiWindowOnContentSizeChanged(g_window, on_sized, NULL);
+    frame_restore();
+    {
+        int cw = 0, ch = 0;
+        uiWindowContentSize(g_window, &cw, &ch);
+        if (cw > 1 && ch > 1) {
+            g_ww = cw;
+            g_hh = ch;
+        }
+    }
     g_area = uiNewArea(&g_handler);
     uiWindowSetChild(g_window, uiControl(g_area));
     uiControlShow(uiControl(g_window));
@@ -1629,6 +1680,7 @@ void InitWindow(int width, int height, const char *title) {
 }
 
 void CloseWindow(void) {
+    frame_save();
     ui_os_fini();
     /* The cached layouts hold toolkit objects: free them before uiUninit. */
     run_drop();

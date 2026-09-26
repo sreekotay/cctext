@@ -26,6 +26,15 @@
 void ui_os_init(uiWindow *win, uiArea *area);
 void ui_os_fini(void);
 
+/* Outer window frame in the toolkit's own screen coordinates (only this
+ * OS reads them back). get returns 0 when there is nothing worth keeping
+ * (full screen, no window). set may run before the window is shown; it
+ * clamps the frame into the work area of the monitor holding most of it
+ * (the nearest monitor when none does), so a frame saved on a monitor
+ * that is gone never lands off screen. */
+int ui_os_frame_get(uiWindow *win, int *x, int *y, int *w, int *h);
+void ui_os_frame_set(uiWindow *win, int x, int y, int w, int h);
+
 /* Unicode scalars typed by the key event being dispatched right now
  * (layout, shift, dead keys / compose applied by the OS). Writes at most
  * cap, returns the count (0 = nothing typed, e.g. a dead key). Only
