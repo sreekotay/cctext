@@ -45,7 +45,7 @@ CC_TARGET rtx_batch obj core/batch.ccs
 CC_TARGET_INCLUDE rtx_batch .
 CC_TARGET_DEPS rtx_batch rtx_document rtx_workspace rtx_piece_tree rtx_nav rtx_find
 
-CC_TARGET rtx_document obj core/document.ccs core/slides.ccs core/wb.ccs
+CC_TARGET rtx_document obj core/document.ccs core/slides.ccs core/wb.ccs core/wb_num.ccs
 CC_TARGET_INCLUDE rtx_document .
 CC_TARGET_DEPS rtx_document rtx_piece_tree rtx_nav rtx_scope rtx_rx rtx_md_table
 

@@ -1,0 +1,335 @@
+#!ccc ccs
+/*
+ * Exact workbook arithmetic (see wb_num.cch). Integers of 32-bit digits
+ * held in int64 limbs: an add touches at most three limbs by less than
+ * 2^32 each, so carries wait; ln_norm makes every limb but the top one
+ * 0 .. 2^32-1 and the top one signed. No libm: doubles are taken apart
+ * and built from their bits.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdint.h>
+#include <string.h>
+#include "wb_num.cch"
+
+#define XS_NORM_EVERY (1u << 30)
+#define XM_LIMBS 74 /* RtxXs * 10^18 + RtxXd * 2^1074 */
+
+static const uint64_t g_p10[19] = {
+    1ull, 10ull, 100ull, 1000ull, 10000ull, 100000ull, 1000000ull, 10000000ull,
+    100000000ull, 1000000000ull, 10000000000ull, 100000000000ull,
+    1000000000000ull, 10000000000000ull, 100000000000000ull,
+    1000000000000000ull, 10000000000000000ull, 100000000000000000ull,
+    1000000000000000000ull};
+
+static void ln_norm(int64_t *c, int n) {
+    int i;
+    for (i = 0; i < n - 1; i++) {
+        int64_t carry = c[i] >> 32;
+        c[i] -= (int64_t)((uint64_t)carry << 32);
+        c[i + 1] += carry;
+    }
+}
+
+/* Normalised: -1 / 0 / 1. */
+static int ln_sign(const int64_t *c, int n) {
+    int i;
+    if (c[n - 1] < 0) return -1;
+    for (i = n - 1; i >= 0; i--)
+        if (c[i]) return 1;
+    return 0;
+}
+
+/* Normalised in, |value| normalised out; returns the sign. */
+static int ln_abs(int64_t *c, int n) {
+    int s = ln_sign(c, n), i;
+    if (s < 0) {
+        for (i = 0; i < n; i++) c[i] = -c[i];
+        ln_norm(c, n);
+    }
+    return s;
+}
+
+/* Bits [lo, lo + k) of a normalised non-negative integer, k <= 64. */
+static uint64_t ln_bits(const int64_t *c, int n, int lo, int k) {
+    uint64_t r = 0;
+    int i;
+    for (i = lo >> 5; i < n && i * 32 < lo + k; i++) {
+        uint64_t v = (uint64_t)c[i];
+        int off = i * 32 - lo;
+        if (off >= 64) break;
+        if (off >= 0) r |= v << off;
+        else r |= v >> (-off);
+    }
+    if (k < 64) r &= (1ull << k) - 1;
+    return r;
+}
+
+/* Any bit below position p. */
+static int ln_any_below(const int64_t *c, int p) {
+    int i, top = p >> 5;
+    for (i = 0; i < top; i++)
+        if (c[i]) return 1;
+    if (p & 31) return ((uint64_t)c[top] & ((1ull << (p & 31)) - 1)) != 0;
+    return 0;
+}
+
+/* |value| * 2^-1074 plus a tail R / dv (0 <= R < dv; dv 0: none), rounded
+ * to nearest, ties to even; `neg` sets the sign. */
+static double ln_round(const int64_t *c, int n, uint64_t R, uint64_t dv, int neg) {
+    int h = n - 1, msb, shift, rb = 0, st = 0;
+    uint64_t M, bits;
+    double out;
+    while (h >= 0 && c[h] == 0) h--;
+    msb = h < 0 ? -1 : 32 * h + 31 - __builtin_clz((uint32_t)c[h]);
+    shift = msb > 52 ? msb - 52 : 0;
+    M = msb < 0 ? 0 : ln_bits(c, n, shift, 53);
+    if (shift > 0) {
+        rb = (int)ln_bits(c, n, shift - 1, 1);
+        st = ln_any_below(c, shift - 1) || R != 0;
+    } else if (dv) {
+        unsigned __int128 two = (unsigned __int128)R * 2u;
+        rb = two >= dv;
+        st = rb ? two > dv : R != 0;
+    }
+    if (rb && (st || (M & 1))) M++;
+    if (shift == 0) {
+        bits = M; /* subnormal (or the first binade): the bits are M */
+    } else {
+        if (M >> 53) {
+            M >>= 1;
+            shift++;
+        }
+        if (shift + 1 >= 2047) bits = 0x7ff0000000000000ull;
+        else bits = ((uint64_t)(shift + 1) << 52) | (M & ((1ull << 52) - 1));
+    }
+    if (neg) bits |= 0x8000000000000000ull;
+    memcpy(&out, &bits, sizeof out);
+    return out;
+}
+
+/* ------------------------------------------------------------ floats */
+
+void rtx_xs_zero(RtxXs *x) {
+    memset(x, 0, sizeof *x);
+}
+
+void rtx_xs_add(RtxXs *x, double v, int sign) {
+    uint64_t bits, m;
+    int ex, p, i, s, neg;
+    unsigned __int128 w;
+    int64_t l0, l1, l2;
+    memcpy(&bits, &v, sizeof bits);
+    ex = (int)((bits >> 52) & 0x7ff);
+    if (ex == 0x7ff) return;
+    m = bits & ((1ull << 52) - 1);
+    if (ex) {
+        m |= 1ull << 52;
+        p = ex - 1;
+    } else {
+        p = 0;
+    }
+    if (!m) return;
+    neg = (int)(bits >> 63) ^ (sign < 0);
+    i = p >> 5;
+    s = p & 31;
+    w = (unsigned __int128)m << s;
+    l0 = (int64_t)(uint32_t)w;
+    l1 = (int64_t)(uint32_t)(w >> 32);
+    l2 = (int64_t)(w >> 64);
+    if (neg) {
+        x->c[i] -= l0;
+        x->c[i + 1] -= l1;
+        x->c[i + 2] -= l2;
+    } else {
+        x->c[i] += l0;
+        x->c[i + 1] += l1;
+        x->c[i + 2] += l2;
+    }
+    if (++x->adds >= XS_NORM_EVERY) {
+        ln_norm(x->c, RTX_XS_LIMBS);
+        x->adds = 0;
+    }
+}
+
+void rtx_xs_merge(RtxXs *x, const RtxXs *y, int sign) {
+    int64_t t[RTX_XS_LIMBS];
+    int i;
+    memcpy(t, y->c, sizeof t);
+    ln_norm(t, RTX_XS_LIMBS);
+    if (x->adds) {
+        ln_norm(x->c, RTX_XS_LIMBS);
+        x->adds = 0;
+    }
+    for (i = 0; i < RTX_XS_LIMBS; i++) x->c[i] += sign < 0 ? -t[i] : t[i];
+    x->adds = 2;
+}
+
+int rtx_xs_sign(const RtxXs *x) {
+    int64_t t[RTX_XS_LIMBS];
+    memcpy(t, x->c, sizeof t);
+    ln_norm(t, RTX_XS_LIMBS);
+    return ln_sign(t, RTX_XS_LIMBS);
+}
+
+int rtx_xs_eq(const RtxXs *a, const RtxXs *b) {
+    int64_t t[RTX_XS_LIMBS], u[RTX_XS_LIMBS];
+    memcpy(t, a->c, sizeof t);
+    memcpy(u, b->c, sizeof u);
+    ln_norm(t, RTX_XS_LIMBS);
+    ln_norm(u, RTX_XS_LIMBS);
+    return memcmp(t, u, sizeof t) == 0;
+}
+
+double rtx_xs_round(const RtxXs *x) {
+    int64_t t[RTX_XS_LIMBS];
+    int s;
+    memcpy(t, x->c, sizeof t);
+    ln_norm(t, RTX_XS_LIMBS);
+    s = ln_abs(t, RTX_XS_LIMBS);
+    if (!s) return 0.0;
+    return ln_round(t, RTX_XS_LIMBS, 0, 0, s < 0);
+}
+
+double rtx_xs_round_mixed(const RtxXs *x, const RtxXd *d) {
+    int64_t f[RTX_XS_LIMBS], dd[RTX_XD_LIMBS], X[XM_LIMBS], Q[XM_LIMBS];
+    const uint64_t p18 = g_p10[18];
+    __int128 carry = 0;
+    unsigned __int128 rem = 0;
+    int i, s;
+    memcpy(f, x->c, sizeof f);
+    memcpy(dd, d->c, sizeof dd);
+    ln_norm(f, RTX_XS_LIMBS);
+    ln_norm(dd, RTX_XD_LIMBS);
+    /* X = f * 10^18 (units 2^-1074 / 10^18) */
+    for (i = 0; i < RTX_XS_LIMBS; i++) {
+        carry += (__int128)f[i] * (__int128)p18;
+        X[i] = (int64_t)(carry & 0xffffffff);
+        carry >>= 32;
+    }
+    for (; i < XM_LIMBS - 1; i++) {
+        X[i] = (int64_t)(carry & 0xffffffff);
+        carry >>= 32;
+    }
+    X[XM_LIMBS - 1] = (int64_t)carry;
+    /* + d * 2^1074: 1074 = 33 * 32 + 18 */
+    for (i = 0; i < RTX_XD_LIMBS; i++) X[33 + i] += dd[i] * (int64_t)(1 << 18);
+    ln_norm(X, XM_LIMBS);
+    s = ln_abs(X, XM_LIMBS);
+    if (!s) return 0.0;
+    for (i = XM_LIMBS - 1; i >= 0; i--) {
+        unsigned __int128 cur = (rem << 32) | (uint64_t)X[i];
+        Q[i] = (int64_t)(uint64_t)(cur / p18);
+        rem = cur % p18;
+    }
+    return ln_round(Q, XM_LIMBS, (uint64_t)rem, p18, s < 0);
+}
+
+/* -------------------------------------------------------------- decs */
+
+void rtx_xd_zero(RtxXd *d) {
+    memset(d, 0, sizeof *d);
+}
+
+void rtx_xd_add(RtxXd *d, int64_t v, int sc, int sign) {
+    __int128 w;
+    int k;
+    if (sc < 0) sc = 0;
+    if (sc > 18) sc = 18;
+    w = (__int128)v * (__int128)g_p10[18 - sc];
+    if (sign < 0) w = -w;
+    for (k = 0; k < 4; k++) {
+        d->c[k] += (int64_t)(w & 0xffffffff);
+        w >>= 32;
+    }
+    d->c[4] += (int64_t)w;
+    if (++d->adds >= XS_NORM_EVERY) {
+        ln_norm(d->c, RTX_XD_LIMBS);
+        d->adds = 0;
+    }
+}
+
+void rtx_xd_merge(RtxXd *d, const RtxXd *y, int sign) {
+    int64_t t[RTX_XD_LIMBS];
+    int i;
+    memcpy(t, y->c, sizeof t);
+    ln_norm(t, RTX_XD_LIMBS);
+    if (d->adds) {
+        ln_norm(d->c, RTX_XD_LIMBS);
+        d->adds = 0;
+    }
+    for (i = 0; i < RTX_XD_LIMBS; i++) d->c[i] += sign < 0 ? -t[i] : t[i];
+    d->adds = 2;
+}
+
+int rtx_xd_get(const RtxXd *d, int sc, int64_t *out) {
+    int64_t t[RTX_XD_LIMBS];
+    unsigned __int128 m = 0;
+    __int128 v, p;
+    int s, k;
+    memcpy(t, d->c, sizeof t);
+    ln_norm(t, RTX_XD_LIMBS);
+    s = ln_abs(t, RTX_XD_LIMBS);
+    for (k = 4; k < RTX_XD_LIMBS; k++)
+        if (t[k]) return 0;
+    if (t[3] >= (int64_t)0x80000000ll) return 0;
+    for (k = 3; k >= 0; k--) m = (m << 32) | (uint64_t)t[k];
+    v = (__int128)m;
+    if (s < 0) v = -v;
+    if (sc < 0) sc = 0;
+    if (sc > 18) sc = 18;
+    p = (__int128)g_p10[18 - sc];
+    v /= p;
+    if (v > INT64_MAX || v < INT64_MIN) return 0;
+    *out = (int64_t)v;
+    return 1;
+}
+
+int rtx_num_cmp_dec_f(int64_t v, int sc, double f) {
+    int64_t X[72];
+    uint64_t bits, m;
+    unsigned __int128 mm;
+    __int128 w;
+    int ex, p, i, s, k, neg;
+    memcpy(&bits, &f, sizeof bits);
+    ex = (int)((bits >> 52) & 0x7ff);
+    if (ex == 0x7ff) {
+        if (bits & ((1ull << 52) - 1)) return 0; /* NaN: callers keep it out */
+        return (bits >> 63) ? 1 : -1;
+    }
+    if (sc < 0) sc = 0;
+    if (sc > 18) sc = 18;
+    memset(X, 0, sizeof X);
+    /* v * 2^1074 (units 2^-1074 / 10^sc) */
+    w = (__int128)v * (__int128)(1 << 18);
+    for (k = 0; k < 3; k++) {
+        X[33 + k] += (int64_t)(w & 0xffffffff);
+        w >>= 32;
+    }
+    X[36] += (int64_t)w;
+    /* - f * 10^sc */
+    m = bits & ((1ull << 52) - 1);
+    if (ex) {
+        m |= 1ull << 52;
+        p = ex - 1;
+    } else {
+        p = 0;
+    }
+    neg = (int)(bits >> 63);
+    if (m) {
+        mm = (unsigned __int128)m * g_p10[sc];
+        i = p >> 5;
+        s = p & 31;
+        {
+            int64_t l = (int64_t)(uint32_t)(mm << s);
+            X[i] += neg ? l : -l;
+        }
+        mm >>= (32 - s);
+        for (k = 1; k <= 4; k++) {
+            int64_t l = (int64_t)(uint32_t)mm;
+            X[i + k] += neg ? l : -l;
+            mm >>= 32;
+        }
+    }
+    ln_norm(X, 72);
+    return ln_sign(X, 72);
+}

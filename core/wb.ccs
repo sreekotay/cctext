@@ -25,6 +25,7 @@
 #include <time.h>
 #include <math.h>
 #include "wb.cch"
+#include "wb_num.cch"
 #include "md_table.cch"
 
 /* ------------------------------------------------------------------ values */
@@ -39,7 +40,8 @@ enum {
     WV_TEXT,
     WV_ERR,
     WV_ROW, /* lookup result: code = table, u.i = row */
-    WV_TAB  /* a table named as a value (count(T)) */
+    WV_TAB, /* a table named as a value (count(T)) */
+    WV_GRP  /* a group MA's result: u.i = MA index, n = content version */
 };
 
 enum {
@@ -244,7 +246,7 @@ static double wb_fmod(double x, double y) {
 
 /* ------------------------------------------------------------------ model */
 
-enum { NK_CELL = 1, NK_COL, NK_NAME, NK_LINE };
+enum { NK_CELL = 1, NK_COL, NK_NAME, NK_LINE, NK_MA, NK_DEAD };
 
 /* Literal kinds a column counts (type inference). */
 enum { LK_EMPTY = 0, LK_INT, LK_DEC, LK_FLOAT, LK_BOOL, LK_DATE, LK_TEXT, LK_FORMULA, LK__N };
@@ -263,7 +265,8 @@ typedef struct {
     uint8_t queued;
     uint8_t lk;     /* CELL: LK_* of its text */
     uint8_t lsc;    /* CELL: LK_DEC scale */
-    int32_t tab;    /* CELL / COL: table; NAME: sheet (-1 = params) */
+    uint8_t ovset;  /* recalc: `ov` holds the value before this recalc */
+    int32_t tab;    /* CELL / COL / MA: table; NAME: sheet (-1 = params) */
     int32_t col, row;
     size_t raw_lo, raw_hi; /* CELL: between the pipes; NAME / LINE: the line */
     size_t f_lo, f_hi;     /* painted span (formula), f_lo == f_hi: none */
@@ -276,11 +279,17 @@ typedef struct {
     Ex *ex;
     WVal v;
     WVal cv;               /* cycle member: its #cycle(path) */
+    WVal ov;               /* ovset: the value before this recalc (MA old rows) */
     uint32_t topo;
     uint32_t *deps;
     uint32_t ndeps;
+    uint32_t nsd;          /* MA: deps[0, nsd) are scalar inputs (a change
+                            * rebuilds it); the rest are its row columns */
     uint32_t rd0, rdn;     /* dependents in wb->rdeps */
     uint8_t clash;         /* NAME: duplicate / case clash */
+    uint32_t mai;          /* MA: index in wb->mas */
+    uint32_t *mal;         /* formula: its MA nodes in AST order (re-bind reuses them) */
+    uint32_t nmal;
 } WNode;
 
 typedef struct {
@@ -298,8 +307,20 @@ typedef struct {
     uint8_t *cclash;
     size_t *hlo, *hhi;     /* header cells, trimmed */
     size_t *row_lo, *row_hi; /* body lines (no NL) */
+    uint32_t *rowcell;     /* row position -> its first cell node (a row's
+                            * cells are consecutive; rows move, ids do not) */
+    uint32_t rowcap;
     WColStat *cs;
     uint8_t *ct, *csc;     /* inferred column type / dec scale */
+    /* MA leaves: consecutive runs of rows (the W1 counted-leaf shape) */
+    uint32_t *lvn;         /* rows per leaf */
+    uint32_t *lvlo;        /* first row of each leaf */
+    uint32_t *rleaf;       /* row -> leaf */
+    uint32_t nlv, lvcap;
+    uint32_t **cma;        /* per column: MAs that read it per row */
+    uint32_t *ncma;
+    uint32_t *tma;         /* every MA over this table */
+    uint32_t ntma;
 } WTab;
 
 typedef struct {
@@ -360,6 +381,14 @@ struct RtxWb {
     /* bind scratch */
     uint32_t *bdeps;
     uint32_t nbd, bdcap;
+    /* maintained aggregates */
+    struct WMa *mas;
+    uint32_t nma, macap;
+    /* recalc scratch that outlives a sync's arena (heap) */
+    struct WDirty *dirty;    /* per-MA row delta lists */
+    uint32_t ndirty, dirtycap;
+    uint32_t *ovl;           /* nodes with ovset */
+    uint32_t novl, ovlcap;
     RtxWbStats st;
 };
 
@@ -564,6 +593,9 @@ static size_t wv_fmt(const WVal *v, char *out, size_t cap, int full) {
         return wb_puts(out, cap, 0, "#type");
     case WV_TAB:
         return wb_puts(out, cap, 0, "#type");
+    case WV_GRP:
+        snprintf(b, sizeof b, "%u group%s", (unsigned)v->code, v->code == 1 ? "" : "s");
+        return wb_puts(out, cap, 0, b);
     }
     return 0;
 }
@@ -769,7 +801,7 @@ static void lx_next(Lex *L) {
         else if (a == '>' && b == '=') t->op = OP_GE;
         if (t->op != (unsigned char)s[i] || (a == '=' && b == '=')) t->hi = i + 2;
     }
-    if (!s[i] || !strchr("()[]{},.+-*/%&=<>@?!", s[i]) ||
+    if (!s[i] || !strchr("()[]{},.+-*/%&=<>@?!:", s[i]) ||
         (s[i] == '!' && t->op != OP_NE)) {
         lx_fail(L, "unexpected character", i);
         return;
@@ -817,7 +849,9 @@ enum {
     EX_LOOKUP,  /* tab [ b ]: one row */
     EX_FIELD,   /* a . col */
     EX_AGG,     /* fn over tab rows: args[0] [where] */
-    EX_FN       /* scalar function */
+    EX_FN,      /* scalar function */
+    EX_GROUP,   /* group tab by a { args[i]: agg (its name in id2) } */
+    EX_GLOOKUP  /* group G (node) [key = b] . output col */
 };
 
 enum {
@@ -829,6 +863,7 @@ enum {
 
 struct Ex {
     uint8_t op;
+    uint8_t isma;    /* EX_AGG / EX_GROUP: maintained (node = its MA node) */
     uint8_t fn;
     uint8_t q;       /* `sum?` skips errors */
     uint8_t tabtok;  /* the table token is written (rename) */
@@ -871,6 +906,78 @@ static void tok_name(const Lex *L, const Tok *t, const char **s, uint32_t *n) {
 }
 
 static Ex *p_expr(Lex *L);
+
+/* `group T by k { name: agg, ... }` (after the `group` token). */
+static Ex *p_group(Lex *L, uint32_t lo) {
+    Ex *e = ex_new(L, EX_GROUP, lo, lo);
+    uint32_t cap = 4;
+    if (!e) return NULL;
+    if (L->t.k != TK_ID) {
+        lx_fail(L, "group: expected a table", L->t.lo);
+        return NULL;
+    }
+    e->lo = L->t.lo;
+    e->hi = L->t.hi;
+    tok_name(L, &L->t, &e->id, &e->idn);
+    lx_next(L);
+    if (!lx_kw(L, "by")) {
+        lx_fail(L, "group: expected by", L->t.lo);
+        return NULL;
+    }
+    lx_next(L);
+    e->a = p_expr(L);
+    if (!e->a) return NULL;
+    if (!lx_op(L, '{')) {
+        lx_fail(L, "group: expected {", L->t.lo);
+        return NULL;
+    }
+    lx_next(L);
+    e->args = (Ex **)wb_ma(L->wb, cap * sizeof(Ex *));
+    if (!e->args) {
+        lx_fail(L, "out of memory", lo);
+        return NULL;
+    }
+    for (;;) {
+        Tok nt = L->t;
+        Ex *o;
+        if (nt.k != TK_ID) {
+            lx_fail(L, "group: expected an output name", nt.lo);
+            return NULL;
+        }
+        lx_next(L);
+        if (!lx_op(L, ':')) {
+            lx_fail(L, "group: expected : after the output name", L->t.lo);
+            return NULL;
+        }
+        lx_next(L);
+        o = p_expr(L);
+        if (!o) return NULL;
+        tok_name(L, &nt, &o->id2, &o->id2n);
+        o->lo2 = nt.lo;
+        o->hi2 = nt.hi;
+        if (e->nargs >= cap) {
+            Ex **na = (Ex **)wb_ma(L->wb, cap * 2 * sizeof(Ex *));
+            if (!na) {
+                lx_fail(L, "out of memory", lo);
+                return NULL;
+            }
+            memcpy(na, e->args, cap * sizeof(Ex *));
+            e->args = na;
+            cap *= 2;
+        }
+        e->args[e->nargs++] = o;
+        if (lx_op(L, ',')) {
+            lx_next(L);
+            continue;
+        }
+        if (lx_op(L, '}')) {
+            lx_next(L);
+            return e;
+        }
+        lx_fail(L, "group: expected , or }", L->t.lo);
+        return NULL;
+    }
+}
 
 static Ex *p_primary(Lex *L) {
     Tok t = L->t;
@@ -933,10 +1040,11 @@ static Ex *p_primary(Lex *L) {
             }
         }
         lx_next(L);
+        if (!t.bq && L->t.k == TK_ID && n == 5 && !memcmp(s, "group", 5)) return p_group(L, t.lo);
         if (!t.bq && L->t.k == TK_ID &&
-            ((n == 5 && !memcmp(s, "group", 5)) || (n == 4 && !memcmp(s, "join", 4)) ||
-             (n == 4 && !memcmp(s, "sort", 4)) || (n == 3 && !memcmp(s, "top", 3)))) {
-            lx_fail(L, "group / join / sort / top are views (workbook W2 / W4)", t.lo);
+            ((n == 4 && !memcmp(s, "join", 4)) || (n == 4 && !memcmp(s, "sort", 4)) ||
+             (n == 3 && !memcmp(s, "top", 3)))) {
+            lx_fail(L, "join / sort / top are views (workbook W4)", t.lo);
             return NULL;
         }
         if (!t.bq && (lx_op(L, '(') || lx_op(L, '?'))) {
@@ -1299,6 +1407,141 @@ static WVal wb_lit_value(RtxWb *wb, const WNode *n, int ct, int csc) {
     return wv_text(wb, n->src, n->srcn);
 }
 
+/* ------------------------------------------------- maintained aggregates
+ *
+ * Every aggregate in a formula (and every `group`) is an MA: a graph node
+ * whose state is exact partials over its table's rows, kept current by
+ * row deltas. Its inputs are the columns it reads per row (a changed cell
+ * queues that row: subtract its old contribution, add the new one) and
+ * scalar inputs (names, this row's cells, lookups, other aggregates: a
+ * change rebuilds the MA with one walk of its table).
+ *
+ * A row's contribution: skipped (where false / null, a null value, or
+ * an error under `?`), a stop (an error value, or a type error the
+ * aggregate cannot skip: the aggregate's value is the error of the first
+ * stop row in row order), or a value. The root partial is invertible
+ * (counts, the exact sums of wb_num, distinct's per-value counts); min /
+ * max keep one best row per leaf and a tree over the leaves. Leaves are
+ * runs of consecutive rows (the W1 counted-leaf shape): each carries its
+ * stop count so the first stop row is found without a walk.
+ *
+ * The state is a function of the rows only (no order, no history), so an
+ * MA maintained through any edits equals one built from scratch, bit for
+ * bit. The scan (rtx_wb_eval, an aggregate's static error) runs the same
+ * contribution and partial code over every row.
+ */
+
+#define WB_LEAF 64      /* rows per leaf at build / after a split */
+#define WB_LEAF_MAX 128 /* a leaf splits above this */
+#define WB_LEAF_MIN 16  /* ... and merges into a neighbour below this */
+#define WN32 UINT32_MAX
+
+enum { CN_SKIP = 0, CN_STOP, CN_VAL };
+
+typedef struct {
+    uint8_t k;
+    WVal v; /* VAL: the value (null for count(T)); STOP: the error */
+} WCon;
+
+typedef struct {
+    WVal v;
+    uint32_t rid; /* the row: its first cell node */
+    uint8_t has;
+} WBest;
+
+/* A value as a key (distinct, group): numbers by exact value (int 2,
+ * dec 2.00 and float 2.0 are one key; a float that is no decimal of
+ * scale <= 18 keys by its bits), text by bytes, dates, bools; one NaN. */
+enum { KY_NULL = 0, KY_NUM, KY_FLT, KY_NAN, KY_TEXT, KY_DATE, KY_BOOL };
+
+typedef struct {
+    uint64_t h;
+    int64_t i;
+    const char *s;
+    uint32_t n;
+    uint8_t t, sc;
+} WKey;
+
+typedef struct {
+    WKey k;
+    uint32_t cnt;
+    uint8_t used;
+} WDEnt;
+
+typedef struct {
+    WDEnt *e;
+    uint32_t cap, used, live;
+    CCArena ar;
+} WDMap;
+
+typedef struct {
+    uint32_t cnt;       /* value rows */
+    uint32_t stop;      /* rows that make the aggregate an error */
+    uint32_t nsc[19];   /* int (scale 0) / dec(p) values per scale */
+    uint32_t nflt, nnan, npinf, nninf;
+    uint32_t ncls[4];   /* min / max: number, text, date, bool values */
+    uint32_t nt, nf;    /* any / all */
+    RtxXd dx;           /* exact int / dec sum */
+    RtxXs *fx;          /* exact float sum (sum / avg) */
+    WDMap *dm;          /* distinct */
+} WAcc;
+
+/* One aggregate: fn over tab rows of arg [where p]. */
+typedef struct {
+    const Ex *arg, *where;
+    uint8_t fn, q, crow; /* crow: count(T) counts rows */
+    uint8_t bad;         /* a table argument other than count(T) */
+} WOut;
+
+typedef struct {
+    WKey k;
+    uint32_t rows;
+    WAcc *acc;   /* one per output */
+    WBest *best; /* min / max outputs */
+    uint8_t *bst; /* best row left: recompute at the pop */
+    uint8_t used;
+} WGEnt;
+
+typedef struct {
+    WGEnt *e;
+    uint32_t cap, used, live;
+} WGMap;
+
+typedef struct WMa {
+    uint32_t node, owner;
+    int32_t tab;
+    uint8_t live, grp;
+    uint8_t full;    /* rebuild with a walk at the next pop */
+    uint8_t stale;   /* state not valid (never built, a cycle member) */
+    uint8_t pending; /* W1: built over a prefix only (embedded tables: never) */
+    uint8_t lvok;    /* leaf arrays mirror the table's leaves */
+    uint8_t segok, anyresc, gstale;
+    uint16_t rowmask;
+    const Ex *ex;
+    WOut o;          /* plain MA */
+    WAcc a;          /* plain: the root; group: key stops in a.stop */
+    uint32_t *lstop; /* per leaf */
+    WBest *lbest;    /* per leaf (min / max) */
+    uint8_t *lresc;  /* per leaf: rescan at the next pop */
+    uint32_t lcap;
+    WBest *seg;      /* min / max: tree over the leaves, root at 1 */
+    uint32_t segp;
+    uint32_t dhead;  /* row deltas queued for the next pop */
+    /* group */
+    const Ex *key;
+    WOut *outs;
+    uint32_t nout;
+    WGMap gm;
+    uint32_t gver;
+} WMa;
+
+typedef struct WDirty {
+    uint32_t rid;
+    uint32_t next;
+    uint8_t isnew;
+} WDirty;
+
+
 /* ------------------------------------------------------------------ binder */
 
 typedef struct {
@@ -1309,7 +1552,18 @@ typedef struct {
     int32_t it_tab;
     int any_sheet;          /* eval: an unqualified name may live on any sheet */
     int nodeps;
+    uint32_t ma;            /* MA node whose rows this binding reads (WN32: none) */
+    int nest;               /* lookups entered inside that MA */
+    int grp_ok;             /* at the formula's root: a group may stand here */
+    const uint32_t *oldmal; /* re-bind: the formula's MA nodes, reused in order */
+    uint32_t noldmal, usedmal;
+    uint32_t *mal;          /* the MA nodes of this binding */
+    uint32_t nmal, malcap;
+    int reshape;            /* an MA was made, dropped or moved table / inputs */
 } BCtx;
+
+static int wb_u32_cmp(const void *a, const void *b);
+static uint32_t wb_node_new(RtxWb *wb, int kind);
 
 static const char *const g_fn_name[] = {
     "", "sum", "count", "avg", "min", "max", "distinct", "any", "all",
@@ -1354,7 +1608,7 @@ static int wb_col_of(const WTab *t, const char *s, size_t n) {
 }
 
 static uint32_t wb_cell_id(const WTab *t, int row, int col) {
-    return t->cell0 + (uint32_t)row * (uint32_t)t->ncols + (uint32_t)col;
+    return t->rowcell[row] + (uint32_t)col;
 }
 
 static int64_t wb_name_lookup(BCtx *c, const char *s, size_t n) {
@@ -1390,8 +1644,100 @@ static Ex *bd_col(BCtx *c, Ex *e, int64_t tab, const char *cs, size_t cn) {
     e->op = EX_COL;
     e->tab = (int32_t)tab;
     e->col = col;
+    if (c->ma != WN32 && c->nest == 0) {
+        WMa *m = &c->wb->mas[c->wb->nodes[c->ma].mai];
+        if (m->tab == (int32_t)tab) {
+            m->rowmask = (uint16_t)(m->rowmask | (1u << col));
+            return e;
+        }
+    }
     bd_dep(c, t->col0 + (uint32_t)col);
     return e;
+}
+
+/* Open MA node for aggregate / group `e` over table `it`: the formula's
+ * next MA from its last binding when there is one (its id, and so the
+ * graph, can stay), else a new node. Its state rebuilds at the next pop. */
+static uint32_t bd_ma_open(BCtx *c, Ex *e, int32_t it, int grp) {
+    RtxWb *wb = c->wb;
+    uint32_t id = WN32, mi;
+    WMa *m;
+    while (c->usedmal < c->noldmal) {
+        uint32_t o = c->oldmal[c->usedmal++];
+        if (o < wb->nn && wb->nodes[o].kind == NK_MA) {
+            id = o;
+            break;
+        }
+    }
+    if (id == WN32) {
+        id = wb_node_new(wb, NK_MA);
+        if (id == WN32) return WN32;
+        if (!wb_grow(wb, (void **)&wb->mas, &wb->macap, wb->nma + 1, sizeof(WMa))) return WN32;
+        mi = wb->nma++;
+        memset(&wb->mas[mi], 0, sizeof(WMa));
+        wb->mas[mi].node = id;
+        wb->mas[mi].dhead = WN32;
+        wb->nodes[id].mai = mi;
+        c->reshape = 1;
+    }
+    mi = wb->nodes[id].mai;
+    m = &wb->mas[mi];
+    if (m->tab != it || m->grp != (uint8_t)grp || !m->live) c->reshape = 1;
+    m->live = 1;
+    m->owner = c->self;
+    m->tab = it;
+    m->grp = (uint8_t)grp;
+    m->ex = e;
+    m->full = 1;
+    m->rowmask = 0;
+    m->dhead = WN32;
+    wb->nodes[id].tab = it;
+    if (c->nmal >= c->malcap) {
+        uint32_t nc = c->malcap ? c->malcap * 2 : 8;
+        uint32_t *nm = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nc * sizeof(uint32_t), 16);
+        if (!nm) return WN32;
+        if (c->nmal) memcpy(nm, c->mal, c->nmal * sizeof(uint32_t));
+        c->mal = nm;
+        c->malcap = nc;
+    }
+    c->mal[c->nmal++] = id;
+    return id;
+}
+
+/* Close MA `id`: its scalar inputs are the deps bound since `base`, its
+ * row columns follow them; the enclosing formula depends on the MA. */
+static void bd_ma_close(BCtx *c, uint32_t id, uint32_t base) {
+    RtxWb *wb = c->wb;
+    WNode *n;
+    WMa *m;
+    uint32_t k, ns = 0, cnt, *nd;
+    int32_t col;
+    if (wb->nbd > base) {
+        uint32_t *d = wb->bdeps + base, len = wb->nbd - base;
+        qsort(d, len, sizeof(uint32_t), wb_u32_cmp);
+        for (k = 0; k < len; k++)
+            if (!k || d[k] != d[ns - 1]) d[ns++] = d[k];
+    }
+    n = &wb->nodes[id];
+    m = &wb->mas[n->mai];
+    cnt = ns;
+    for (col = 0; col < RTX_WB_COLS_MAX; col++)
+        if (m->rowmask & (1u << col)) cnt++;
+    nd = (uint32_t *)wb_ma(wb, (size_t)(cnt ? cnt : 1) * sizeof(uint32_t));
+    n = &wb->nodes[id];
+    if (nd) {
+        const WTab *t = &wb->tabs[m->tab];
+        if (ns) memcpy(nd, wb->bdeps + base, ns * sizeof(uint32_t));
+        for (col = 0, k = ns; col < RTX_WB_COLS_MAX; col++)
+            if (m->rowmask & (1u << col)) nd[k++] = t->col0 + (uint32_t)col;
+        if (cnt != n->ndeps || ns != n->nsd || (cnt && memcmp(nd, n->deps, cnt * sizeof(uint32_t))))
+            c->reshape = 1;
+        n->deps = nd;
+        n->ndeps = cnt;
+        n->nsd = ns;
+    }
+    wb->nbd = base;
+    bd_dep(c, id);
 }
 
 static Ex *bd_ident(BCtx *c, Ex *e) {
@@ -1495,6 +1841,38 @@ static Ex *bd_call(BCtx *c, Ex *e) {
                           "", 0);
         bad = bd_table_ref(c, e, it);
         if (bad) return bad;
+        if (!c->nodeps && c->self != UINT32_MAX) {
+            /* a maintained aggregate: its own node */
+            uint32_t id = bd_ma_open(c, e, (int32_t)it, 0), save_ma = c->ma, base = c->wb->nbd;
+            int save_nest = c->nest;
+            if (id != WN32) {
+                WMa *m;
+                c->ma = id;
+                c->nest = 0;
+                c->it_tab = (int32_t)it;
+                e->args[0] = bd(c, e->args[0]);
+                if (e->where) e->where = bd(c, e->where);
+                c->it_tab = save;
+                c->ma = save_ma;
+                c->nest = save_nest;
+                e->op = EX_AGG;
+                e->fn = (uint8_t)fn;
+                e->tab = (int32_t)it;
+                e->isma = 1;
+                e->node = id;
+                m = &c->wb->mas[c->wb->nodes[id].mai];
+                memset(&m->o, 0, sizeof m->o);
+                m->o.arg = e->args[0];
+                m->o.where = e->where;
+                m->o.fn = (uint8_t)fn;
+                m->o.q = e->q;
+                m->o.crow = e->args[0]->op == EX_TABREF && e->args[0]->tab == (int32_t)it &&
+                            fn == FN_COUNT;
+                m->o.bad = e->args[0]->op == EX_TABREF && !m->o.crow;
+                bd_ma_close(c, id, base);
+                return e;
+            }
+        }
         c->it_tab = (int32_t)it;
         e->args[0] = bd(c, e->args[0]);
         if (e->where) e->where = bd(c, e->where);
@@ -1540,10 +1918,113 @@ static Ex *bd_call(BCtx *c, Ex *e) {
     return e;
 }
 
+/* The unbound group a name defines (`g = group T by k { ... }`), else NULL. */
+static const Ex *wb_group_sig(RtxWb *wb, uint32_t nd) {
+    const WNode *n = &wb->nodes[nd];
+    uint32_t i = 0;
+    const Ex *x;
+    if (n->kind != NK_NAME || !n->form || !n->src || n->clash) return NULL;
+    while (i < n->srcn && (n->src[i] == ' ' || n->src[i] == '\t')) i++;
+    if (n->srcn - i < 6 || memcmp(n->src + i, "group", 5) != 0 || wb_id1(n->src[i + 5])) return NULL;
+    x = wb_parse(wb, n->src, n->srcn);
+    return x && x->op == EX_GROUP ? x : NULL;
+}
+
+/* G[key = v]: a group's row by its key. */
+static Ex *bd_glookup(BCtx *c, Ex *e, uint32_t nd, const Ex *sig) {
+    Ex *b = e->a, *cond = e->b;
+    const Ex *k = sig->a;
+    if (!cond || cond->op != EX_BIN || cond->bin != '=' || !cond->a || cond->a->op != EX_IDENT ||
+        !k || k->op != EX_IDENT || cond->a->idn != k->idn || memcmp(cond->a->id, k->id, k->idn))
+        return bd_err(c, e, WE_TYPE, "%.*s[%.*s = value]: a group row is found by its key", b->id,
+                      b->idn, k && k->op == EX_IDENT ? k->id : "key",
+                      k && k->op == EX_IDENT ? k->idn : 3);
+    e->op = EX_GLOOKUP;
+    e->node = nd;
+    e->lo = e->lo2 = b->lo;
+    e->hi = e->hi2 = b->hi;
+    e->b = bd(c, cond->b);
+    e->a = (Ex *)sig;
+    e->col = -1;
+    bd_dep(c, nd);
+    return e;
+}
+
+/* `group T by k { out: agg, ... }` at a name's root: one group MA. */
+static Ex *bd_group(BCtx *c, Ex *e) {
+    RtxWb *wb = c->wb;
+    int64_t tab = wb_map_get(&wb->map, SC_TABLE, e->id, e->idn);
+    uint32_t id, base, save_ma = c->ma, i;
+    int32_t save_it = c->it_tab;
+    int save_nest = c->nest;
+    WMa *m;
+    WOut *outs;
+    if (tab < 0) return bd_err(c, e, WE_REF, "group: no table %.*s%.*s", e->id, e->idn, "", 0);
+    {
+        Ex *bad = bd_table_ref(c, e, tab);
+        if (bad) return bad;
+    }
+    if (!e->a || e->a->op != EX_IDENT || wb_col_of(&wb->tabs[tab], e->a->id, e->a->idn) < 0)
+        return bd_err(c, e, WE_TYPE, "group %.*s by a column of %.*s", e->id, e->idn, e->id, e->idn);
+    for (i = 0; i < e->nargs; i++) {
+        const Ex *o = e->args[i];
+        int fn = o->op == EX_CALL ? wb_fn_of(o->id, o->idn) : FN_NONE;
+        if (!wb_fn_agg(fn) || o->nargs > 1 || (!o->nargs && fn != FN_COUNT))
+            return bd_err(c, e, WE_TYPE, "group output %.*s: an aggregate of %.*s columns",
+                          o->id2, o->id2n, e->id, e->idn);
+    }
+    outs = (WOut *)wb_ma(wb, (size_t)(e->nargs ? e->nargs : 1) * sizeof(WOut));
+    if (!outs) return bd_err(c, e, WE_NUM, "out of memory%.*s%.*s", "", 0, "", 0);
+    id = bd_ma_open(c, e, (int32_t)tab, 1);
+    if (id == WN32) return bd_err(c, e, WE_NUM, "out of memory%.*s%.*s", "", 0, "", 0);
+    base = wb->nbd;
+    c->ma = id;
+    c->nest = 0;
+    c->it_tab = (int32_t)tab;
+    e->a = bd(c, e->a);
+    for (i = 0; i < e->nargs; i++) {
+        Ex *o = e->args[i];
+        int fn = wb_fn_of(o->id, o->idn);
+        if (o->nargs) o->args[0] = bd(c, o->args[0]);
+        if (o->where) o->where = bd(c, o->where);
+        o->op = EX_AGG;
+        o->fn = (uint8_t)fn;
+        o->tab = (int32_t)tab;
+        outs[i].arg = o->nargs ? o->args[0] : NULL;
+        outs[i].where = o->where;
+        outs[i].fn = (uint8_t)fn;
+        outs[i].q = o->q;
+        outs[i].crow = !o->nargs || (o->args[0]->op == EX_TABREF && o->args[0]->tab == (int32_t)tab &&
+                                     fn == FN_COUNT);
+        outs[i].bad = o->nargs && o->args[0]->op == EX_TABREF && !outs[i].crow;
+    }
+    c->it_tab = save_it;
+    c->ma = save_ma;
+    c->nest = save_nest;
+    m = &wb->mas[wb->nodes[id].mai];
+    if (m->nout != e->nargs) c->reshape = 1;
+    m->key = e->a;
+    m->outs = outs;
+    m->nout = e->nargs;
+    e->tab = (int32_t)tab;
+    e->isma = 1;
+    e->node = id;
+    bd_ma_close(c, id, base);
+    return e;
+}
+
 static Ex *bd(BCtx *c, Ex *e) {
     RtxWb *wb = c->wb;
+    int gok = c->grp_ok;
     if (!e) return e;
+    c->grp_ok = 0;
     switch (e->op) {
+    case EX_GROUP:
+        if (!gok || c->nodeps || c->self == UINT32_MAX)
+            return bd_err(c, e, WE_TYPE,
+                          "group is a derived table: name it (g = group T by k { ... })%.*s%.*s", "",
+                          0, "", 0);
+        return bd_group(c, e);
     case EX_LIT:
     case EX_ERR:
         return e;
@@ -1596,6 +2077,18 @@ static Ex *bd(BCtx *c, Ex *e) {
             }
         }
         e->a = bd(c, b);
+        if (e->a && e->a->op == EX_GLOOKUP && e->a->col < 0) {
+            const Ex *sig = e->a->a;
+            uint16_t i;
+            for (i = 0; i < sig->nargs; i++) {
+                const Ex *o = sig->args[i];
+                if (o->id2n == e->id2n && !memcmp(o->id2, e->id2, e->id2n)) {
+                    e->a->col = i;
+                    return e->a;
+                }
+            }
+            return bd_err(c, e, WE_REF, "the group has no output %.*s%.*s", e->id2, e->id2n, "", 0);
+        }
         if (e->a && e->a->op == EX_LOOKUP) {
             WTab *t = &wb->tabs[e->a->tab];
             int col = wb_col_of(t, e->id2, e->id2n);
@@ -1621,6 +2114,11 @@ static Ex *bd(BCtx *c, Ex *e) {
         int64_t id = -1;
         int32_t save;
         if (b && b->op == EX_IDENT) id = wb_map_get(&wb->map, SC_TABLE, b->id, b->idn);
+        if (id < 0 && b && b->op == EX_IDENT && !c->nodeps) {
+            int64_t nd = wb_name_lookup(c, b->id, b->idn);
+            const Ex *sig = nd >= 0 ? wb_group_sig(wb, (uint32_t)nd) : NULL;
+            if (sig) return bd_glookup(c, e, (uint32_t)nd, sig);
+        }
         if (id < 0) return bd_err(c, e, WE_TYPE, "[ ] needs a table%.*s%.*s", "", 0, "", 0);
         {
             Ex *bad = bd_table_ref(c, e, id);
@@ -1650,7 +2148,9 @@ static Ex *bd(BCtx *c, Ex *e) {
         }
         save = c->it_tab;
         c->it_tab = (int32_t)id;
+        c->nest++;
         e->b = bd(c, e->b);
+        c->nest--;
         c->it_tab = save;
         e->op = EX_LOOKUP;
         return e;
@@ -1699,24 +2199,64 @@ static int wb_bind_node(RtxWb *wb, uint32_t id) {
     } else if (n->kind == NK_NAME) {
         c.sheet = n->tab;
     }
+    c.ma = WN32;
+    c.oldmal = n->mal;
+    c.noldmal = n->nmal;
+    c.grp_ok = n->kind == NK_NAME;
     n->deps = NULL;
     n->ndeps = 0;
+    n->nsd = 0;
     n->ex = NULL;
+    n->mal = NULL;
+    n->nmal = 0;
     if (n->form && n->src) {
         wb->nbd = 0;
         n->ex = wb_parse(wb, n->src, n->srcn);
-        n->ex = bd(&c, n->ex);
+        {
+            Ex *x = bd(&c, n->ex);
+            n = &wb->nodes[id];
+            n->ex = x;
+        }
         if (wb->nbd) {
             qsort(wb->bdeps, wb->nbd, sizeof(uint32_t), wb_u32_cmp);
             for (k = 1, m = 1; k < wb->nbd; k++)
                 if (wb->bdeps[k] != wb->bdeps[m - 1]) wb->bdeps[m++] = wb->bdeps[k];
-            n->deps = (uint32_t *)wb_ma(wb, m * sizeof(uint32_t));
+            {
+                uint32_t *dp = (uint32_t *)wb_ma(wb, m * sizeof(uint32_t));
+                n = &wb->nodes[id];
+                n->deps = dp;
+            }
             if (n->deps) {
                 memcpy(n->deps, wb->bdeps, m * sizeof(uint32_t));
                 n->ndeps = m;
+                n->nsd = m;
             }
         }
     }
+    /* the MAs of the last binding this one did not reuse */
+    for (k = c.usedmal; k < c.noldmal; k++) {
+        uint32_t o = c.oldmal[k];
+        WNode *x;
+        if (o >= wb->nn || wb->nodes[o].kind != NK_MA) continue;
+        x = &wb->nodes[o];
+        wb->mas[x->mai].live = 0;
+        wb->mas[x->mai].dhead = WN32;
+        x->kind = NK_DEAD;
+        x->deps = NULL;
+        x->ndeps = x->nsd = 0;
+        x->v = wv_null();
+        c.reshape = 1;
+    }
+    if (c.nmal) {
+        uint32_t *ml = (uint32_t *)wb_ma(wb, c.nmal * sizeof(uint32_t));
+        n = &wb->nodes[id];
+        if (ml) {
+            memcpy(ml, c.mal, c.nmal * sizeof(uint32_t));
+            n->mal = ml;
+            n->nmal = c.nmal;
+        }
+    }
+    if (c.reshape) return 1;
     if (oldn != n->ndeps) return 1;
     return oldn && memcmp(old, n->deps, oldn * sizeof(uint32_t)) != 0;
 }
@@ -1728,7 +2268,14 @@ typedef struct {
     uint32_t self;
     int32_t own_tab, own_row;
     int32_t it_tab, it_row;
+    int old; /* read each node's value from before this recalc (MA: a row's old contribution) */
 } ECtx;
+
+/* A node's value as this context sees it. */
+static const WVal *wb_nv(const ECtx *c, uint32_t id) {
+    const WNode *n = &c->wb->nodes[id];
+    return c->old && n->ovset ? &n->ov : &n->v;
+}
 
 static WVal ev(ECtx *c, const Ex *e);
 
@@ -1772,6 +2319,8 @@ static int wv_same(const WVal *a, const WVal *b) {
         return a->code == b->code && a->n == b->n && (!a->n || memcmp(a->u.s, b->u.s, a->n) == 0);
     case WV_ROW:
         return a->code == b->code && a->u.i == b->u.i;
+    case WV_GRP:
+        return a->u.i == b->u.i && a->n == b->n && a->code == b->code;
     default:
         return 1;
     }
@@ -1811,8 +2360,8 @@ static int wv_cmp(const WVal *a, const WVal *b, int *ok) {
 
 static const char *wv_kind(const WVal *v) {
     static const char *const k[] = {"null", "int", "dec", "float", "bool", "date", "text",
-                                    "error", "row", "table"};
-    return v->t <= WV_TAB ? k[v->t] : "?";
+                                    "error", "row", "table", "group"};
+    return v->t <= WV_GRP ? k[v->t] : "?";
 }
 
 static WVal wv_fit(ECtx *c, __int128 x, int sc) {
@@ -1931,226 +2480,1095 @@ static WVal ev_bin(ECtx *c, const Ex *e) {
     return wv_arith(c, op, &a, &b);
 }
 
-static const WVal *wb_cellv(const RtxWb *wb, int32_t tab, int32_t row, int32_t col) {
-    const WTab *t = &wb->tabs[tab];
-    return &wb->nodes[wb_cell_id(t, row, col)].v;
+static const WVal *wb_cellv(const ECtx *c, int32_t tab, int32_t row, int32_t col) {
+    const WTab *t = &c->wb->tabs[tab];
+    return wb_nv(c, wb_cell_id(t, row, col));
 }
 
-/* Exact sum: ints / decs in an i128 at the widest scale seen, floats as
- * Shewchuk partials (python fsum): one rounding at the end, the same
- * result in any order. */
-typedef struct {
-    int n, isf, sc, big;
-    __int128 acc;
-    double p[64];
-    int np;
-    double inf;
-} WSum;
+static WVal ev_err(ECtx *c, int code, const char *what);
+static WVal wv_row_err(ECtx *c, const WVal *v);
 
-static void ws_float(WSum *s, double x) {
-    int i = 0, j;
-    for (j = 0; j < s->np; j++) {
-        double y = s->p[j], hi, lo;
-        if (fabs(x) < fabs(y)) {
-            double t = x;
-            x = y;
-            y = t;
+/* ---- keys */
+
+static uint64_t wk_mix(uint64_t h, uint64_t x) {
+    h ^= x + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return h * 1099511628211ull;
+}
+
+static void wb_key_of(const WVal *v, WKey *k) {
+    memset(k, 0, sizeof *k);
+    switch (v->t) {
+    case WV_INT:
+    case WV_DEC: {
+        int64_t i = v->u.i;
+        int sc = v->t == WV_DEC ? v->sc : 0;
+        while (sc > 0 && i % 10 == 0) {
+            i /= 10;
+            sc--;
         }
-        hi = x + y;
-        lo = y - (hi - x);
-        if (lo != 0.0) s->p[i++] = lo;
-        x = hi;
+        k->t = KY_NUM;
+        k->i = i;
+        k->sc = (uint8_t)sc;
+        break;
     }
-    if (i < 64) s->p[i++] = x;
-    s->np = i;
-}
-
-static double ws_round(const WSum *s) {
-    int n = s->np;
-    double hi = 0, lo = 0, x, y, yr;
-    if (n <= 0) return 0.0;
-    n--;
-    hi = s->p[n];
-    while (n > 0) {
-        x = hi;
-        n--;
-        y = s->p[n];
-        hi = x + y;
-        yr = hi - x;
-        lo = y - yr;
-        if (lo != 0.0) break;
-    }
-    if (n > 0 && ((lo < 0 && s->p[n - 1] < 0) || (lo > 0 && s->p[n - 1] > 0))) {
-        y = lo * 2;
-        x = hi + y;
-        yr = x - hi;
-        if (y == yr) hi = x;
-    }
-    return hi;
-}
-
-static void ws_add(WSum *s, const WVal *v) {
-    s->n++;
-    if (v->t == WV_FLOAT) {
-        s->isf = 1;
-        if (!isfinite(v->u.f)) {
-            s->big = 2;
-            s->inf += v->u.f;
-            return;
+    case WV_FLOAT: {
+        double f = v->u.f;
+        uint64_t bits, m;
+        int ex, e2, tz;
+        if (f != f) {
+            k->t = KY_NAN;
+            break;
         }
-        ws_float(s, v->u.f);
-        return;
+        if (f == 0) {
+            k->t = KY_NUM;
+            break;
+        }
+        memcpy(&bits, &f, sizeof bits);
+        ex = (int)((bits >> 52) & 0x7ff);
+        k->t = KY_FLT;
+        k->i = (int64_t)bits;
+        if (ex == 0x7ff) break;
+        m = bits & ((1ull << 52) - 1);
+        if (ex) {
+            m |= 1ull << 52;
+            e2 = ex - 1075;
+        } else {
+            e2 = -1074;
+        }
+        tz = __builtin_ctzll(m);
+        m >>= tz;
+        e2 += tz;
+        if (e2 >= 0) {
+            if (e2 < 62 && (m >> (62 - e2)) == 0) {
+                k->t = KY_NUM;
+                k->i = (int64_t)(m << e2);
+                if (bits >> 63) k->i = -k->i;
+                k->sc = 0;
+            }
+        } else if (-e2 <= 18) {
+            unsigned __int128 x = m;
+            int s = -e2, j;
+            for (j = 0; j < s; j++) x *= 5u;
+            if (x <= (unsigned __int128)INT64_MAX) {
+                k->t = KY_NUM;
+                k->i = (int64_t)x;
+                if (bits >> 63) k->i = -k->i;
+                k->sc = (uint8_t)s;
+            }
+        }
+        break;
+    }
+    case WV_TEXT:
+        k->t = KY_TEXT;
+        k->s = v->u.s;
+        k->n = v->n;
+        break;
+    case WV_DATE:
+        k->t = KY_DATE;
+        k->i = v->u.i;
+        break;
+    case WV_BOOL:
+        k->t = KY_BOOL;
+        k->i = v->u.i;
+        break;
+    default:
+        k->t = KY_NULL;
+        break;
     }
     {
-        int vs = v->t == WV_DEC ? v->sc : 0;
-        __int128 x = v->u.i;
-        __int128 lim = (__int128)1 << 120;
-        if (vs > s->sc) {
-            s->acc *= g_pow10[vs - s->sc];
-            s->sc = vs;
-        } else if (vs < s->sc) {
-            x *= g_pow10[s->sc - vs];
+        uint64_t h = 1469598103934665603ull ^ k->t;
+        if (k->t == KY_TEXT) {
+            uint32_t j;
+            for (j = 0; j < k->n; j++) h = (h ^ (unsigned char)k->s[j]) * 1099511628211ull;
+        } else {
+            h = wk_mix(h, (uint64_t)k->i);
+            h = wk_mix(h, k->sc);
         }
-        s->acc += x;
-        if (s->acc > lim || s->acc < -lim) s->big = 1;
+        k->h = h ? h : 1;
     }
 }
 
-static WVal ws_value(ECtx *c, const WSum *s) {
-    if (s->big == 2) return wv_float(s->inf);
-    if (s->big) return ev_err(c, WE_NUM, "sum too large");
-    if (s->isf) {
-        WSum t = *s;
-        if (t.acc) {
-            __int128 p = g_pow10[t.sc];
-            ws_float(&t, (double)(t.acc / p));
-            if (t.acc % p) ws_float(&t, (double)(t.acc % p) / (double)p);
-        }
-        return wv_float(ws_round(&t));
-    }
-    if (s->acc > INT64_MAX || s->acc < INT64_MIN) return ev_err(c, WE_NUM, "sum too large");
-    return wv_dec((int64_t)s->acc, s->sc);
+static int wb_key_eq(const WKey *a, const WKey *b) {
+    if (a->h != b->h || a->t != b->t) return 0;
+    if (a->t == KY_TEXT) return a->n == b->n && (!a->n || !memcmp(a->s, b->s, a->n));
+    return a->i == b->i && a->sc == b->sc;
 }
 
-static int wb_val_order(const void *pa, const void *pb) {
-    const WVal *a = (const WVal *)pa, *b = (const WVal *)pb;
-    int ok, r;
-    r = wv_cmp(a, b, &ok);
-    if (ok) return r;
+/* The key as a value (canonical: 2.50 shows as 2.5). */
+static WVal wb_key_val(const WKey *k) {
+    WVal v = wv_null();
+    switch (k->t) {
+    case KY_NUM:
+        return wv_dec(k->i, k->sc);
+    case KY_FLT: {
+        double f;
+        uint64_t b = (uint64_t)k->i;
+        memcpy(&f, &b, sizeof f);
+        return wv_float(f);
+    }
+    case KY_NAN: {
+        double f;
+        uint64_t b = 0x7ff8000000000000ull;
+        memcpy(&f, &b, sizeof f);
+        return wv_float(f);
+    }
+    case KY_TEXT:
+        v.t = WV_TEXT;
+        v.u.s = k->s;
+        v.n = k->n;
+        return v;
+    case KY_DATE:
+        return wv_date(k->i);
+    case KY_BOOL:
+        return wv_bool((int)k->i);
+    default:
+        return v;
+    }
+}
+
+/* ---- exact value order (min / max, group listing) */
+
+static int wb_vclass(const WVal *v) {
+    switch (v->t) {
+    case WV_INT:
+    case WV_DEC:
+    case WV_FLOAT:
+        return 0;
+    case WV_TEXT:
+        return 1;
+    case WV_DATE:
+        return 2;
+    default:
+        return 3;
+    }
+}
+
+/* Class, then value: numbers exactly (a dec against a float too), text
+ * by bytes. NaN never reaches it. */
+static int wb_vcmp(const WVal *a, const WVal *b) {
+    int ca = wb_vclass(a), cb = wb_vclass(b);
+    if (ca != cb) return ca < cb ? -1 : 1;
+    if (ca == 0) {
+        if (a->t == WV_FLOAT && b->t == WV_FLOAT) return a->u.f < b->u.f ? -1 : a->u.f > b->u.f;
+        if (a->t == WV_FLOAT) return -rtx_num_cmp_dec_f(b->u.i, b->t == WV_DEC ? b->sc : 0, a->u.f);
+        if (b->t == WV_FLOAT) return rtx_num_cmp_dec_f(a->u.i, a->t == WV_DEC ? a->sc : 0, b->u.f);
+        {
+            int sa = a->t == WV_DEC ? a->sc : 0, sb = b->t == WV_DEC ? b->sc : 0;
+            int s = sa > sb ? sa : sb;
+            __int128 x = (__int128)a->u.i * g_pow10[s - sa];
+            __int128 y = (__int128)b->u.i * g_pow10[s - sb];
+            return x < y ? -1 : x > y;
+        }
+    }
+    if (ca == 1) {
+        size_t m = a->n < b->n ? a->n : b->n;
+        int r = m ? memcmp(a->u.s, b->u.s, m) : 0;
+        if (r) return r < 0 ? -1 : 1;
+        return a->n < b->n ? -1 : a->n > b->n;
+    }
+    return a->u.i < b->u.i ? -1 : a->u.i > b->u.i;
+}
+
+static int wb_key_cmp(const WKey *a, const WKey *b) {
+    WVal x = wb_key_val(a), y = wb_key_val(b);
+    if (a->t == KY_NULL || b->t == KY_NULL) return (a->t != KY_NULL) - (b->t != KY_NULL);
+    if (a->t == KY_NAN || b->t == KY_NAN) return (a->t == KY_NAN) - (b->t == KY_NAN);
+    {
+        int r = wb_vcmp(&x, &y);
+        if (r) return r;
+    }
     return a->t < b->t ? -1 : a->t > b->t;
 }
+
+static int wv_isnan(const WVal *v) {
+    return v->t == WV_FLOAT && v->u.f != v->u.f;
+}
+
+/* ---- distinct: per-value counts */
+
+static WDEnt *wd_find(WDMap *m, const WKey *k) {
+    uint32_t i;
+    if (!m->cap) return NULL;
+    i = (uint32_t)k->h & (m->cap - 1);
+    while (m->e[i].used) {
+        if (wb_key_eq(&m->e[i].k, k)) return &m->e[i];
+        i = (i + 1) & (m->cap - 1);
+    }
+    return &m->e[i];
+}
+
+static int wd_grow(WDMap *m) {
+    uint32_t nc = m->cap ? m->cap * 2 : 16, i;
+    WDEnt *old = m->e, *ne;
+    uint32_t oc = m->cap;
+    ne = (WDEnt *)wb_alloc(m->ar, (size_t)nc * sizeof(WDEnt));
+    if (!ne) return 0;
+    m->e = ne;
+    m->cap = nc;
+    m->used = 0;
+    for (i = 0; i < oc; i++) {
+        WDEnt *s;
+        if (!old[i].used || !old[i].cnt) continue;
+        s = wd_find(m, &old[i].k);
+        *s = old[i];
+        m->used++;
+    }
+    return 1;
+}
+
+static void wd_add(WDMap *m, const WVal *v, int sign) {
+    WKey k;
+    WDEnt *e;
+    wb_key_of(v, &k);
+    if ((m->used + 1) * 4 >= m->cap * 3 && !wd_grow(m)) return;
+    e = wd_find(m, &k);
+    if (!e) return;
+    if (!e->used) {
+        if (sign < 0) return;
+        e->used = 1;
+        e->k = k;
+        if (k.t == KY_TEXT && k.n) {
+            char *p = (char *)cc_arena_alloc(m->ar, k.n, 1);
+            if (p) memcpy(p, k.s, k.n);
+            e->k.s = p ? p : "";
+        }
+        e->cnt = 0;
+        m->used++;
+    }
+    if (sign > 0) {
+        if (e->cnt++ == 0) m->live++;
+    } else if (e->cnt) {
+        if (--e->cnt == 0) m->live--;
+    }
+}
+
+/* ---- the partial */
+
+static void acc_reset(WAcc *a) {
+    RtxXs *fx = a->fx;
+    WDMap *dm = a->dm;
+    memset(a, 0, sizeof *a);
+    a->fx = fx;
+    a->dm = dm;
+    if (fx) rtx_xs_zero(fx);
+    if (dm) {
+        dm->e = NULL;
+        dm->cap = dm->used = dm->live = 0;
+    }
+}
+
+/* Storage the output's kind needs (sum / avg: the float sum; distinct: a
+ * map), from `ar`. 0 on out of memory. */
+static int acc_need(WAcc *a, const WOut *o, CCArena ar) {
+    if ((o->fn == FN_SUM || o->fn == FN_AVG) && !a->fx) {
+        a->fx = (RtxXs *)wb_alloc(ar, sizeof(RtxXs));
+        if (!a->fx) return 0;
+    }
+    if (o->fn == FN_DISTINCT && !a->dm) {
+        a->dm = (WDMap *)wb_alloc(ar, sizeof(WDMap));
+        if (!a->dm) return 0;
+        a->dm->ar = ar;
+    }
+    return 1;
+}
+
+static void acc_apply(WAcc *a, const WOut *o, const WCon *k, int sign) {
+    const WVal *v = &k->v;
+    if (k->k == CN_STOP) {
+        a->stop += (uint32_t)sign;
+        return;
+    }
+    if (k->k != CN_VAL) return;
+    a->cnt += (uint32_t)sign;
+    if (o->crow) return;
+    switch (o->fn) {
+    case FN_SUM:
+    case FN_AVG:
+        if (v->t == WV_FLOAT) {
+            double f = v->u.f;
+            a->nflt += (uint32_t)sign;
+            if (f != f) a->nnan += (uint32_t)sign;
+            else if (f == 1.0 / 0.0) a->npinf += (uint32_t)sign;
+            else if (f == -1.0 / 0.0) a->nninf += (uint32_t)sign;
+            else if (a->fx) rtx_xs_add(a->fx, f, sign);
+        } else {
+            int sc = v->t == WV_DEC ? v->sc : 0;
+            a->nsc[sc] += (uint32_t)sign;
+            rtx_xd_add(&a->dx, v->u.i, sc, sign);
+        }
+        break;
+    case FN_MIN:
+    case FN_MAX:
+        a->ncls[wb_vclass(v)] += (uint32_t)sign;
+        if (wv_isnan(v)) a->nnan += (uint32_t)sign;
+        break;
+    case FN_DISTINCT:
+        if (a->dm) wd_add(a->dm, v, sign);
+        break;
+    case FN_ANY:
+    case FN_ALL:
+        if (v->u.i) a->nt += (uint32_t)sign;
+        else a->nf += (uint32_t)sign;
+        break;
+    default:
+        break;
+    }
+}
+
+static WVal wv_nan(void) {
+    double f;
+    uint64_t b = 0x7ff8000000000000ull;
+    memcpy(&f, &b, sizeof f);
+    return wv_float(f);
+}
+
+/* The exact sum: int / dec at the widest scale present; with any float,
+ * the exact real sum of every value rounded once (NaN / inf by count). */
+static WVal acc_sum(ECtx *c, const WAcc *a) {
+    int s, maxsc = 0, anyd = 0;
+    for (s = 0; s < 19; s++)
+        if (a->nsc[s]) {
+            maxsc = s;
+            anyd = 1;
+        }
+    if (a->nflt) {
+        if (a->nnan || (a->npinf && a->nninf)) return wv_nan();
+        if (a->npinf) return wv_float(1.0 / 0.0);
+        if (a->nninf) return wv_float(-1.0 / 0.0);
+        if (!a->fx) return wv_float(0.0);
+        return wv_float(anyd ? rtx_xs_round_mixed(a->fx, &a->dx) : rtx_xs_round(a->fx));
+    }
+    {
+        int64_t out;
+        if (!rtx_xd_get(&a->dx, maxsc, &out)) return ev_err(c, WE_NUM, "sum too large");
+        return wv_dec(out, maxsc);
+    }
+}
+
+/* The value of a partial with no stop row (callers answer stops). */
+static WVal acc_value(ECtx *c, const WOut *o, const WAcc *a, const WBest *best) {
+    if (o->bad) return ev_err(c, WE_TYPE, "a table aggregates as count(T) only");
+    switch (o->fn) {
+    case FN_SUM:
+        return acc_sum(c, a);
+    case FN_COUNT:
+        return wv_int((int64_t)a->cnt);
+    case FN_AVG: {
+        WVal tot;
+        if (!a->cnt) return wv_null();
+        tot = acc_sum(c, a);
+        if (tot.t == WV_ERR) return tot;
+        return wv_float(wv_tod(&tot) / (double)a->cnt);
+    }
+    case FN_MIN:
+    case FN_MAX: {
+        int k, cls = 0;
+        for (k = 0; k < 4; k++) cls += a->ncls[k] > 0;
+        if (cls > 1) return ev_err(c, WE_TYPE, "min / max over mixed kinds");
+        if (!a->cnt) return wv_null();
+        if (a->nnan) return wv_nan();
+        return best && best->has ? best->v : wv_null();
+    }
+    case FN_DISTINCT:
+        return wv_int(a->dm ? (int64_t)a->dm->live : 0);
+    case FN_ANY:
+        return wv_bool(a->nt > 0);
+    case FN_ALL:
+        return wv_bool(a->nf == 0);
+    default:
+        return wv_null();
+    }
+}
+
+/* ---- a row's contribution */
+
+/* `base`: the formula's context with it_tab set (old: before this recalc). */
+static void wb_con(ECtx *base, const WOut *o, int32_t row, WCon *out) {
+    RtxWb *wb = base->wb;
+    const WTab *t = &wb->tabs[base->it_tab];
+    ECtx r = *base;
+    WVal v;
+    r.it_row = row;
+    out->k = CN_SKIP;
+    out->v = wv_null();
+    wb->st.ma_rows++;
+    if (o->bad) return;
+    if (o->where) {
+        WVal p = ev(&r, o->where);
+        if (p.t == WV_ERR) {
+            if (!o->q) {
+                out->k = CN_STOP;
+                out->v = p;
+            }
+            return;
+        }
+        if (p.t == WV_NULL) return;
+        if (p.t != WV_BOOL) {
+            out->k = CN_STOP;
+            out->v = ev_err(base, WE_TYPE, "where needs true / false");
+            return;
+        }
+        if (!p.u.i) return;
+    }
+    if (o->crow) {
+        out->k = CN_VAL;
+        return;
+    }
+    v = ev(&r, o->arg);
+    if (v.t == WV_ERR) {
+        if (!o->q) {
+            out->k = CN_STOP;
+            out->v = v;
+        }
+        return;
+    }
+    if (v.t == WV_NULL) return;
+    if (v.t == WV_ROW || v.t == WV_TAB || v.t == WV_GRP) {
+        out->k = CN_STOP;
+        out->v = wv_row_err(base, &v);
+        return;
+    }
+    switch (o->fn) {
+    case FN_SUM:
+    case FN_AVG:
+        if (!wv_num(&v)) {
+            char msg[128];
+            snprintf(msg, sizeof msg, "%s over %s (%.*s row %d)", g_fn_name[o->fn], wv_kind(&v),
+                     (int)t->namen, t->name, (int)row + 1);
+            out->k = CN_STOP;
+            out->v = ev_err(base, WE_TYPE, msg);
+            return;
+        }
+        break;
+    case FN_ANY:
+    case FN_ALL:
+        if (v.t != WV_BOOL) {
+            out->k = CN_STOP;
+            out->v = ev_err(base, WE_TYPE, "any / all need true / false");
+            return;
+        }
+        break;
+    default:
+        break;
+    }
+    out->k = CN_VAL;
+    out->v = v;
+}
+
+static int con_same(const WCon *a, const WCon *b) {
+    if (a->k != b->k) return 0;
+    if (a->k == CN_SKIP) return 1;
+    if (a->k == CN_STOP) return 1; /* the count is what the partial holds */
+    return wv_same(&a->v, &b->v);
+}
+
+/* `a` beats `b` for min / max (ties: the earlier row). */
+static int wb_better(const RtxWb *wb, int fn, const WBest *a, const WBest *b) {
+    int r;
+    if (!a->has) return 0;
+    if (!b->has) return 1;
+    r = wb_vcmp(&a->v, &b->v);
+    if (fn == FN_MAX) r = -r;
+    if (r) return r < 0;
+    return wb->nodes[a->rid].row < wb->nodes[b->rid].row;
+}
+
+/* The formula's context for MA m's rows. */
+static void ma_ctx(RtxWb *wb, const WMa *m, ECtx *c, int old) {
+    const WNode *own = &wb->nodes[m->owner];
+    memset(c, 0, sizeof *c);
+    c->wb = wb;
+    c->self = m->owner;
+    c->own_tab = own->kind == NK_CELL ? own->tab : -1;
+    c->own_row = own->kind == NK_CELL ? own->row : -1;
+    c->it_tab = m->tab;
+    c->it_row = -1;
+    c->old = old;
+}
+
+/* ---- leaves (per table; every MA over it mirrors them) */
+
+static void wb_lv_index(WTab *t) {
+    uint32_t j, r, at = 0;
+    for (j = 0; j < t->nlv; j++) {
+        t->lvlo[j] = at;
+        for (r = 0; r < t->lvn[j]; r++) t->rleaf[at + r] = j;
+        at += t->lvn[j];
+    }
+}
+
+static int wb_lv_init(RtxWb *wb, WTab *t) {
+    uint32_t n = (uint32_t)t->nrows, j;
+    t->nlv = (n + WB_LEAF - 1) / WB_LEAF;
+    t->lvcap = t->nlv + 16;
+    t->lvn = (uint32_t *)wb_ma(wb, (size_t)t->lvcap * sizeof(uint32_t));
+    t->lvlo = (uint32_t *)wb_ma(wb, (size_t)t->lvcap * sizeof(uint32_t));
+    if (!t->lvn || !t->lvlo) return 0;
+    for (j = 0; j < t->nlv; j++) t->lvn[j] = j + 1 < t->nlv ? WB_LEAF : n - j * WB_LEAF;
+    wb_lv_index(t);
+    return 1;
+}
+
+static int ma_needs_best(const WMa *m) {
+    return !m->grp && (m->o.fn == FN_MIN || m->o.fn == FN_MAX);
+}
+
+/* Leaf arrays sized to the table's leaf capacity (contents kept). */
+static int ma_lv_fit(RtxWb *wb, WMa *m, const WTab *t) {
+    uint32_t cap = t->lvcap;
+    if (m->lcap >= cap && m->lstop) return 1;
+    {
+        uint32_t *ls = (uint32_t *)wb_ma(wb, (size_t)cap * sizeof(uint32_t));
+        uint8_t *lr = (uint8_t *)wb_ma(wb, cap);
+        WBest *lb = ma_needs_best(m) ? (WBest *)wb_ma(wb, (size_t)cap * sizeof(WBest)) : NULL;
+        if (!ls || !lr || (ma_needs_best(m) && !lb)) return 0;
+        if (m->lstop && m->lcap) {
+            memcpy(ls, m->lstop, m->lcap * sizeof(uint32_t));
+            memcpy(lr, m->lresc, m->lcap);
+            if (lb && m->lbest) memcpy(lb, m->lbest, m->lcap * sizeof(WBest));
+        }
+        m->lstop = ls;
+        m->lresc = lr;
+        m->lbest = lb;
+        m->lcap = cap;
+    }
+    return 1;
+}
+
+static void ma_seg_build(RtxWb *wb, WMa *m, const WTab *t) {
+    uint32_t p = 1, i;
+    while (p < t->nlv) p *= 2;
+    if (!m->seg || m->segp < p) {
+        m->seg = (WBest *)wb_ma(wb, (size_t)p * 2 * sizeof(WBest));
+        if (!m->seg) {
+            m->segp = 0;
+            m->segok = 0;
+            return;
+        }
+    }
+    m->segp = p;
+    for (i = 0; i < p; i++) {
+        if (i < t->nlv) m->seg[p + i] = m->lbest[i];
+        else m->seg[p + i].has = 0;
+    }
+    for (i = p - 1; i >= 1; i--) {
+        const WBest *l = &m->seg[2 * i], *r = &m->seg[2 * i + 1];
+        m->seg[i] = wb_better(wb, m->o.fn, r, l) ? *r : *l;
+    }
+    m->segok = 1;
+}
+
+static void ma_seg_set(RtxWb *wb, WMa *m, uint32_t j) {
+    uint32_t i;
+    if (!m->segok || j >= m->segp) {
+        m->segok = 0;
+        return;
+    }
+    i = m->segp + j;
+    m->seg[i] = m->lbest[j];
+    for (i /= 2; i >= 1; i /= 2) {
+        const WBest *l = &m->seg[2 * i], *r = &m->seg[2 * i + 1];
+        m->seg[i] = wb_better(wb, m->o.fn, r, l) ? *r : *l;
+    }
+}
+
+/* Recount leaf j: its stop rows and best row. */
+static void ma_leaf_scan(RtxWb *wb, WMa *m, uint32_t j) {
+    const WTab *t = &wb->tabs[m->tab];
+    ECtx c;
+    uint32_t r, lo = t->lvlo[j], hi = lo + t->lvn[j];
+    WBest b;
+    ma_ctx(wb, m, &c, 0);
+    m->lstop[j] = 0;
+    b.has = 0;
+    wb->st.ma_rescan++;
+    for (r = lo; r < hi; r++) {
+        WCon k;
+        wb_con(&c, &m->o, (int32_t)r, &k);
+        if (k.k == CN_STOP) m->lstop[j]++;
+        else if (m->lbest && k.k == CN_VAL && !wv_isnan(&k.v)) {
+            WBest x;
+            x.v = k.v;
+            x.rid = t->rowcell[r];
+            x.has = 1;
+            if (wb_better(wb, m->o.fn, &x, &b)) b = x;
+        }
+    }
+    if (m->lbest) m->lbest[j] = b;
+    m->lresc[j] = 0;
+}
+
+/* ---- group partials */
+
+static WGEnt *wg_find(WGMap *m, const WKey *k) {
+    uint32_t i;
+    if (!m->cap) return NULL;
+    i = (uint32_t)k->h & (m->cap - 1);
+    while (m->e[i].used) {
+        if (wb_key_eq(&m->e[i].k, k)) return &m->e[i];
+        i = (i + 1) & (m->cap - 1);
+    }
+    return &m->e[i];
+}
+
+static WGEnt *wg_get(RtxWb *wb, WMa *m, const WKey *k, int make) {
+    WGMap *g = &m->gm;
+    WGEnt *e;
+    uint32_t j;
+    if (make && (g->used + 1) * 4 >= g->cap * 3) {
+        uint32_t nc = g->cap ? g->cap * 2 : 16, oc = g->cap, i;
+        WGEnt *old = g->e, *ne = (WGEnt *)wb_ma(wb, (size_t)nc * sizeof(WGEnt));
+        if (!ne) return NULL;
+        g->e = ne;
+        g->cap = nc;
+        g->used = 0;
+        for (i = 0; i < oc; i++) {
+            WGEnt *s;
+            if (!old[i].used || !old[i].rows) continue;
+            s = wg_find(g, &old[i].k);
+            *s = old[i];
+            g->used++;
+        }
+    }
+    e = wg_find(g, k);
+    if (!e || e->used || !make) return e && e->used ? e : NULL;
+    e->used = 1;
+    e->k = *k;
+    if (k->t == KY_TEXT && k->n) {
+        char *p = (char *)wb_ma(wb, k->n);
+        if (p) memcpy(p, k->s, k->n);
+        e->k.s = p ? p : "";
+    }
+    e->rows = 0;
+    e->acc = (WAcc *)wb_ma(wb, (size_t)m->nout * sizeof(WAcc));
+    e->best = (WBest *)wb_ma(wb, (size_t)m->nout * sizeof(WBest));
+    e->bst = (uint8_t *)wb_ma(wb, m->nout);
+    if (!e->acc || !e->best || !e->bst) return NULL;
+    for (j = 0; j < m->nout; j++)
+        if (!acc_need(&e->acc[j], &m->outs[j], wb->ma)) return NULL;
+    g->used++;
+    return e;
+}
+
+typedef struct {
+    uint8_t stop;  /* the key is an error */
+    WVal kerr;
+    WKey key;
+    WCon *oc;      /* per output */
+} WGRow;
+
+static void wg_con(ECtx *base, const WMa *m, int32_t row, WGRow *out) {
+    ECtx r = *base;
+    WVal kv;
+    uint32_t j;
+    r.it_row = row;
+    out->stop = 0;
+    kv = ev(&r, m->key);
+    base->wb->st.ma_rows++;
+    if (kv.t == WV_ERR || kv.t == WV_ROW || kv.t == WV_TAB || kv.t == WV_GRP) {
+        out->stop = 1;
+        out->kerr = kv.t == WV_ERR ? kv : wv_row_err(base, &kv);
+        return;
+    }
+    wb_key_of(&kv, &out->key);
+    for (j = 0; j < m->nout; j++) wb_con(base, &m->outs[j], row, &out->oc[j]);
+}
+
+/* Add / remove one row's contribution to a group. */
+static void wg_apply(RtxWb *wb, WMa *m, const WGRow *g, uint32_t rid, int sign) {
+    WGEnt *e;
+    uint32_t j;
+    if (g->stop) {
+        m->a.stop += (uint32_t)sign;
+        return;
+    }
+    e = wg_get(wb, m, &g->key, sign > 0);
+    if (!e) return;
+    e->rows += (uint32_t)sign;
+    if (e->rows == 0 && sign < 0) m->gm.live--;
+    if (e->rows == 1 && sign > 0) m->gm.live++;
+    for (j = 0; j < m->nout; j++) {
+        const WOut *o = &m->outs[j];
+        const WCon *k = &g->oc[j];
+        acc_apply(&e->acc[j], o, k, sign);
+        if ((o->fn == FN_MIN || o->fn == FN_MAX) && k->k == CN_VAL && !wv_isnan(&k->v)) {
+            if (sign < 0) {
+                if (e->best[j].has && e->best[j].rid == rid) {
+                    e->bst[j] = 1;
+                    m->gstale = 1;
+                }
+            } else if (!e->bst[j]) {
+                WBest x;
+                x.v = k->v;
+                x.rid = rid;
+                x.has = 1;
+                if (wb_better(wb, o->fn, &x, &e->best[j])) e->best[j] = x;
+            }
+        }
+    }
+}
+
+static int wg_row_alloc(RtxWb *wb, const WMa *m, WGRow *g) {
+    g->oc = (WCon *)cc_arena_alloc(wb->sa, (size_t)(m->nout ? m->nout : 1) * sizeof(WCon), 16);
+    return g->oc != NULL;
+}
+
+/* Every key whose min / max row left: recompute those outputs with one
+ * walk of the table. */
+static void wg_restale(RtxWb *wb, WMa *m) {
+    const WTab *t = &wb->tabs[m->tab];
+    ECtx c;
+    WGRow g;
+    uint32_t i, j;
+    int32_t r;
+    if (!m->gstale) return;
+    for (i = 0; i < m->gm.cap; i++) {
+        WGEnt *e = &m->gm.e[i];
+        if (!e->used) continue;
+        for (j = 0; j < m->nout; j++)
+            if (e->bst[j]) e->best[j].has = 0;
+    }
+    if (!wg_row_alloc(wb, m, &g)) return;
+    ma_ctx(wb, m, &c, 0);
+    wb->st.ma_rescan++;
+    for (r = 0; r < t->nrows; r++) {
+        WGEnt *e;
+        wg_con(&c, m, r, &g);
+        if (g.stop) continue;
+        e = wg_get(wb, m, &g.key, 0);
+        if (!e) continue;
+        for (j = 0; j < m->nout; j++) {
+            const WOut *o = &m->outs[j];
+            if (!e->bst[j] || g.oc[j].k != CN_VAL || wv_isnan(&g.oc[j].v)) continue;
+            {
+                WBest x;
+                x.v = g.oc[j].v;
+                x.rid = t->rowcell[r];
+                x.has = 1;
+                if (wb_better(wb, o->fn, &x, &e->best[j])) e->best[j] = x;
+            }
+        }
+    }
+    for (i = 0; i < m->gm.cap; i++) {
+        WGEnt *e = &m->gm.e[i];
+        if (!e->used) continue;
+        for (j = 0; j < m->nout; j++) e->bst[j] = 0;
+    }
+    m->gstale = 0;
+}
+
+/* ---- build, deltas, value */
+
+static void ma_build(RtxWb *wb, WMa *m) {
+    WTab *t = &wb->tabs[m->tab];
+    ECtx c;
+    uint32_t j, r;
+    WGRow g;
+    wb->st.ma_full++;
+    acc_reset(&m->a);
+    if (!m->grp && !acc_need(&m->a, &m->o, wb->ma)) return;
+    if (!ma_lv_fit(wb, m, t)) return;
+    m->lvok = 1;
+    m->segok = 0;
+    m->anyresc = 0;
+    m->stale = 0;
+    m->full = 0;
+    if (m->grp) {
+        memset(&m->gm, 0, sizeof m->gm);
+        m->gver++;
+        m->gstale = 0;
+        if (!wg_row_alloc(wb, m, &g)) return;
+    }
+    ma_ctx(wb, m, &c, 0);
+    for (j = 0; j < t->nlv; j++) {
+        uint32_t lo = t->lvlo[j], hi = lo + t->lvn[j];
+        WBest b;
+        b.has = 0;
+        m->lstop[j] = 0;
+        m->lresc[j] = 0;
+        for (r = lo; r < hi; r++) {
+            if (m->grp) {
+                wg_con(&c, m, (int32_t)r, &g);
+                if (g.stop) m->lstop[j]++;
+                wg_apply(wb, m, &g, t->rowcell[r], 1);
+                continue;
+            }
+            {
+                WCon k;
+                wb_con(&c, &m->o, (int32_t)r, &k);
+                acc_apply(&m->a, &m->o, &k, 1);
+                if (k.k == CN_STOP) m->lstop[j]++;
+                else if (m->lbest && k.k == CN_VAL && !wv_isnan(&k.v)) {
+                    WBest x;
+                    x.v = k.v;
+                    x.rid = t->rowcell[r];
+                    x.has = 1;
+                    if (wb_better(wb, m->o.fn, &x, &b)) b = x;
+                }
+            }
+        }
+        if (m->lbest) m->lbest[j] = b;
+    }
+    if (m->lbest) ma_seg_build(wb, m, t);
+}
+
+static int wb_dirty_cmp(const void *a, const void *b) {
+    const WDirty *x = (const WDirty *)a, *y = (const WDirty *)b;
+    return x->rid < y->rid ? -1 : x->rid > y->rid;
+}
+
+/* Queue row `rid` of MA mi for the next pop (isnew: it had no contribution). */
+static void ma_dirty(RtxWb *wb, uint32_t mi, uint32_t rid, int isnew) {
+    WMa *m = &wb->mas[mi];
+    if (m->full || m->stale) return;
+    if (wb->ndirty >= wb->dirtycap) {
+        uint32_t nc = wb->dirtycap ? wb->dirtycap * 2 : 1024;
+        WDirty *nd = (WDirty *)realloc(wb->dirty, (size_t)nc * sizeof(WDirty));
+        if (!nd) {
+            m->full = 1;
+            return;
+        }
+        wb->dirty = nd;
+        wb->dirtycap = nc;
+    }
+    wb->dirty[wb->ndirty].rid = rid;
+    wb->dirty[wb->ndirty].isnew = (uint8_t)isnew;
+    wb->dirty[wb->ndirty].next = m->dhead;
+    m->dhead = wb->ndirty++;
+}
+
+/* Apply the queued rows: subtract each old contribution, add the new. */
+static void ma_apply(RtxWb *wb, WMa *m) {
+    WTab *t = &wb->tabs[m->tab];
+    ECtx co, cn;
+    uint32_t n = 0, i, k, j;
+    WDirty *rows;
+    WGRow go, gn;
+    for (i = m->dhead; i != WN32; i = wb->dirty[i].next) n++;
+    if (!n && !m->anyresc && !m->gstale) return;
+    rows = (WDirty *)cc_arena_alloc(wb->sa, (size_t)(n ? n : 1) * sizeof(WDirty), 16);
+    if (!rows) {
+        m->dhead = WN32;
+        ma_build(wb, m);
+        return;
+    }
+    for (i = m->dhead, k = 0; i != WN32; i = wb->dirty[i].next) rows[k++] = wb->dirty[i];
+    m->dhead = WN32;
+    qsort(rows, n, sizeof(WDirty), wb_dirty_cmp);
+    for (i = 0, k = 0; i < n; i++) {
+        if (k && rows[k - 1].rid == rows[i].rid) {
+            rows[k - 1].isnew |= rows[i].isnew;
+            continue;
+        }
+        rows[k++] = rows[i];
+    }
+    n = k;
+    ma_ctx(wb, m, &co, 1);
+    ma_ctx(wb, m, &cn, 0);
+    if (m->grp && (!wg_row_alloc(wb, m, &go) || !wg_row_alloc(wb, m, &gn))) {
+        ma_build(wb, m);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t rid = rows[i].rid;
+        int32_t pos = wb->nodes[rid].row;
+        uint32_t lf = t->rleaf[pos];
+        if (m->grp) {
+            int same = 0;
+            wg_con(&cn, m, pos, &gn);
+            if (!rows[i].isnew) {
+                wg_con(&co, m, pos, &go);
+                if (go.stop == gn.stop && (go.stop || wb_key_eq(&go.key, &gn.key))) {
+                    same = 1;
+                    for (j = 0; j < m->nout && same; j++) same = con_same(&go.oc[j], &gn.oc[j]);
+                }
+                if (same) continue;
+                wg_apply(wb, m, &go, rid, -1);
+                if (go.stop) m->lstop[lf]--;
+            }
+            wb->st.ma_delta++;
+            wg_apply(wb, m, &gn, rid, 1);
+            if (gn.stop) m->lstop[lf]++;
+            m->gver++;
+            continue;
+        }
+        {
+            WCon ko, kn;
+            wb_con(&cn, &m->o, pos, &kn);
+            if (!rows[i].isnew) {
+                wb_con(&co, &m->o, pos, &ko);
+                if (con_same(&ko, &kn)) continue;
+                acc_apply(&m->a, &m->o, &ko, -1);
+                if (ko.k == CN_STOP) m->lstop[lf]--;
+                if (m->lbest && ko.k == CN_VAL && m->lbest[lf].has && m->lbest[lf].rid == rid) {
+                    m->lresc[lf] = 1;
+                    m->anyresc = 1;
+                }
+            }
+            wb->st.ma_delta++;
+            acc_apply(&m->a, &m->o, &kn, 1);
+            if (kn.k == CN_STOP) m->lstop[lf]++;
+            if (m->lbest && kn.k == CN_VAL && !wv_isnan(&kn.v) && !m->lresc[lf]) {
+                WBest x;
+                x.v = kn.v;
+                x.rid = rid;
+                x.has = 1;
+                if (wb_better(wb, m->o.fn, &x, &m->lbest[lf])) {
+                    m->lbest[lf] = x;
+                    ma_seg_set(wb, m, lf);
+                }
+            }
+        }
+    }
+    if (m->anyresc) {
+        for (j = 0; j < t->nlv; j++) {
+            if (!m->lresc[j]) continue;
+            ma_leaf_scan(wb, m, j);
+            if (m->lbest) ma_seg_set(wb, m, j);
+        }
+        m->anyresc = 0;
+    }
+    if (m->grp) wg_restale(wb, m);
+    if (m->lbest && !m->segok) ma_seg_build(wb, m, t);
+}
+
+/* The error of the first stop row (row order): the leaf counts find it. */
+static WVal ma_first_stop(RtxWb *wb, WMa *m) {
+    const WTab *t = &wb->tabs[m->tab];
+    ECtx c;
+    uint32_t j, r;
+    WGRow g;
+    ma_ctx(wb, m, &c, 0);
+    if (m->grp && !wg_row_alloc(wb, m, &g)) return ev_err(&c, WE_NUM, "out of memory");
+    for (j = 0; j < t->nlv; j++) {
+        if (!m->lstop[j]) continue;
+        for (r = t->lvlo[j]; r < t->lvlo[j] + t->lvn[j]; r++) {
+            if (m->grp) {
+                wg_con(&c, m, (int32_t)r, &g);
+                if (g.stop) return g.kerr;
+            } else {
+                WCon k;
+                wb_con(&c, &m->o, (int32_t)r, &k);
+                if (k.k == CN_STOP) return k.v;
+            }
+        }
+    }
+    return ev_err(&c, WE_NUM, "aggregate state lost its stop row");
+}
+
+static WVal ma_value(RtxWb *wb, WMa *m) {
+    ECtx c;
+    ma_ctx(wb, m, &c, 0);
+    if (m->a.stop) return ma_first_stop(wb, m);
+    if (m->grp) {
+        WVal v = wv_null();
+        v.t = WV_GRP;
+        v.u.i = (int64_t)(m - wb->mas);
+        v.n = m->gver;
+        v.code = (uint16_t)(m->gm.live > 65535 ? 65535 : m->gm.live);
+        return v;
+    }
+    return acc_value(&c, &m->o, &m->a, m->lbest && m->segok ? &m->seg[1] : NULL);
+}
+
+/* Pop of an MA node: rebuild or apply its row deltas; its value. */
+static WVal ma_update(RtxWb *wb, uint32_t id) {
+    WNode *n = &wb->nodes[id];
+    WMa *m = &wb->mas[n->mai];
+    if (m->full || m->stale || !m->lvok) {
+        m->dhead = WN32;
+        ma_build(wb, m);
+    } else {
+        ma_apply(wb, m);
+    }
+    return ma_value(wb, m);
+}
+
+/* ---- one group output for a key (lookups into a group) */
+
+static WVal wg_out_value(ECtx *c, WMa *m, WGEnt *e, uint32_t j) {
+    RtxWb *wb = c->wb;
+    if (e->acc[j].stop) {
+        /* the first stop row of this key for this output */
+        const WTab *t = &wb->tabs[m->tab];
+        ECtx b;
+        WGRow g;
+        int32_t r;
+        ma_ctx(wb, m, &b, 0);
+        if (!wg_row_alloc(wb, m, &g)) return ev_err(c, WE_NUM, "out of memory");
+        for (r = 0; r < t->nrows; r++) {
+            wg_con(&b, m, r, &g);
+            if (!g.stop && wb_key_eq(&g.key, &e->k) && g.oc[j].k == CN_STOP) return g.oc[j].v;
+        }
+    }
+    {
+        ECtx b;
+        ma_ctx(wb, m, &b, 0);
+        return acc_value(&b, &m->outs[j], &e->acc[j], &e->best[j]);
+    }
+}
+
+static WVal ev_glookup(ECtx *c, const Ex *e) {
+    RtxWb *wb = c->wb;
+    const WVal *gv = wb_nv(c, e->node);
+    WVal kv;
+    WKey k;
+    WMa *m;
+    WGEnt *g;
+    if (gv->t == WV_ERR) return *gv;
+    if (gv->t != WV_GRP) return ev_err(c, WE_TYPE, "not a group");
+    if (e->col < 0) return ev_err(c, WE_TYPE, "a group row is not a value (add .output)");
+    kv = ev(c, e->b);
+    if (kv.t == WV_ERR) return kv;
+    m = &wb->mas[gv->u.i];
+    wb_key_of(&kv, &k);
+    g = wg_get(wb, m, &k, 0);
+    if (!g || !g->rows) return wv_null();
+    return wg_out_value(c, m, g, (uint32_t)e->col);
+}
+
+/* ---- the scan: the same contributions and partials over every row */
 
 static WVal ev_agg(ECtx *c, const Ex *e) {
     RtxWb *wb = c->wb;
     const WTab *t = &wb->tabs[e->tab];
     ECtx r = *c;
-    WSum s;
-    WVal best = wv_null(), v;
+    WOut o;
+    WAcc a;
+    RtxXs fx;
+    WDMap dm;
+    WBest best;
     int32_t row;
-    int fn = e->fn;
-    int count_rows = e->args[0]->op == EX_TABREF && e->args[0]->tab == e->tab;
-    size_t cnt = 0, nt = 0, nf = 0, nv = 0;
-    WVal *vals = NULL;
-    memset(&s, 0, sizeof s);
-    if (e->args[0]->op == EX_TABREF && (!count_rows || fn != FN_COUNT))
-        return ev_err(c, WE_TYPE, "a table aggregates as count(T) only");
-    if (fn == FN_DISTINCT) {
-        vals = (WVal *)cc_arena_alloc(wb->sa, (size_t)(t->nrows ? t->nrows : 1) * sizeof(WVal), 16);
-        if (!vals) return ev_err(c, WE_NUM, "out of memory");
-    }
+    memset(&o, 0, sizeof o);
+    memset(&a, 0, sizeof a);
+    memset(&dm, 0, sizeof dm);
+    o.arg = e->args[0];
+    o.where = e->where;
+    o.fn = e->fn;
+    o.q = e->q;
+    o.crow = e->args[0]->op == EX_TABREF && e->args[0]->tab == e->tab && e->fn == FN_COUNT;
+    o.bad = e->args[0]->op == EX_TABREF && !o.crow;
+    if (o.bad) return acc_value(c, &o, &a, NULL);
+    rtx_xs_zero(&fx);
+    a.fx = &fx;
+    dm.ar = wb->sa;
+    a.dm = &dm;
+    best.has = 0;
     r.it_tab = e->tab;
     for (row = 0; row < t->nrows; row++) {
-        r.it_row = row;
-        if (e->where) {
-            WVal p = ev(&r, e->where);
-            if (p.t == WV_ERR) {
-                if (e->q) continue;
-                return p;
-            }
-            if (p.t == WV_NULL) continue;
-            if (p.t != WV_BOOL) return ev_err(c, WE_TYPE, "where needs true / false");
-            if (!p.u.i) continue;
-        }
-        if (count_rows) {
-            cnt++;
-            continue;
-        }
-        v = ev(&r, e->args[0]);
-        if (v.t == WV_ERR) {
-            if (e->q) continue;
-            return v;
-        }
-        if (v.t == WV_NULL) continue;
-        if (v.t == WV_ROW || v.t == WV_TAB) return wv_row_err(c, &v);
-        cnt++;
-        switch (fn) {
-        case FN_SUM:
-        case FN_AVG:
-            if (!wv_num(&v)) {
-                char msg[128];
-                snprintf(msg, sizeof msg, "%s over %s (%.*s row %d)", g_fn_name[fn], wv_kind(&v),
-                         (int)t->namen, t->name, (int)row + 1);
-                return ev_err(c, WE_TYPE, msg);
-            }
-            ws_add(&s, &v);
-            break;
-        case FN_MIN:
-        case FN_MAX: {
-            int ok = 1, k;
-            if (cnt == 1) {
-                best = v;
-                break;
-            }
-            k = wv_cmp(&v, &best, &ok);
-            if (!ok) return ev_err(c, WE_TYPE, "min / max over mixed kinds");
-            if ((fn == FN_MIN && k < 0) || (fn == FN_MAX && k > 0)) best = v;
-            break;
-        }
-        case FN_DISTINCT:
-            vals[nv++] = v;
-            break;
-        case FN_ANY:
-        case FN_ALL:
-            if (v.t != WV_BOOL) return ev_err(c, WE_TYPE, "any / all need true / false");
-            if (v.u.i) nt++;
-            else nf++;
-            break;
-        default:
-            break;
+        WCon k;
+        wb_con(&r, &o, row, &k);
+        if (k.k == CN_STOP) return k.v;
+        acc_apply(&a, &o, &k, 1);
+        if ((o.fn == FN_MIN || o.fn == FN_MAX) && k.k == CN_VAL && !wv_isnan(&k.v)) {
+            WBest x;
+            x.v = k.v;
+            x.rid = t->rowcell[row];
+            x.has = 1;
+            if (wb_better(wb, o.fn, &x, &best)) best = x;
         }
     }
-    switch (fn) {
-    case FN_SUM:
-        return ws_value(c, &s);
-    case FN_COUNT:
-        return wv_int((int64_t)cnt);
-    case FN_AVG: {
-        WVal tot;
-        if (!cnt) return wv_null();
-        tot = ws_value(c, &s);
-        if (tot.t == WV_ERR) return tot;
-        return wv_float(wv_tod(&tot) / (double)cnt);
-    }
-    case FN_MIN:
-    case FN_MAX:
-        return best;
-    case FN_DISTINCT: {
-        size_t i, u = 0;
-        if (nv) {
-            qsort(vals, nv, sizeof(WVal), wb_val_order);
-            u = 1;
-            for (i = 1; i < nv; i++)
-                if (wb_val_order(&vals[i], &vals[i - 1]) != 0) u++;
-        }
-        return wv_int((int64_t)u);
-    }
-    case FN_ANY:
-        return wv_bool(nt > 0);
-    case FN_ALL:
-        return wv_bool(nf == 0);
-    default:
-        return wv_null();
-    }
+    return acc_value(c, &o, &a, &best);
 }
 
 static WVal ev_lookup(ECtx *c, const Ex *e) {
@@ -2309,11 +3727,11 @@ static WVal ev(ECtx *c, const Ex *e) {
     case EX_ERR:
         return e->v;
     case EX_NAMEREF:
-        return wb->nodes[e->node].v;
+        return *wb_nv(c, e->node);
     case EX_ATCELL:
-        return *wb_cellv(wb, e->tab, c->own_row, e->col);
+        return *wb_cellv(c, e->tab, c->own_row, e->col);
     case EX_COL:
-        if (c->it_tab == e->tab) return *wb_cellv(wb, e->tab, c->it_row, e->col);
+        if (c->it_tab == e->tab) return *wb_cellv(c, e->tab, c->it_row, e->col);
         {
             const WTab *t = &wb->tabs[e->tab];
             char msg[160];
@@ -2334,10 +3752,16 @@ static WVal ev(ECtx *c, const Ex *e) {
         WVal r = ev(c, e->a);
         if (r.t == WV_ERR || r.t == WV_NULL) return r;
         if (r.t != WV_ROW) return ev_err(c, WE_TYPE, ".column needs a row");
-        return *wb_cellv(wb, e->tab, (int32_t)r.u.i, e->col);
+        return *wb_cellv(c, e->tab, (int32_t)r.u.i, e->col);
     }
     case EX_AGG:
+        if (e->isma) return *wb_nv(c, e->node);
         return ev_agg(c, e);
+    case EX_GROUP:
+        if (e->isma) return *wb_nv(c, e->node);
+        return ev_err(c, WE_TYPE, "group is a derived table: name it (g = group T by k { ... })");
+    case EX_GLOOKUP:
+        return ev_glookup(c, e);
     case EX_FN:
         return ev_fn(c, e);
     case EX_UN: {
@@ -2371,7 +3795,8 @@ static WVal wb_eval_node(RtxWb *wb, uint32_t id) {
     WNode *n = &wb->nodes[id];
     ECtx c;
     WVal v;
-    if (n->kind == NK_COL || n->kind == NK_LINE) return wv_null();
+    if (n->kind == NK_COL || n->kind == NK_LINE || n->kind == NK_MA || n->kind == NK_DEAD)
+        return n->kind == NK_MA ? n->v : wv_null();
     if (n->kind == NK_CELL && !n->form) {
         const WTab *t = &wb->tabs[n->tab];
         return wb_lit_value(wb, n, t->ct[n->col], t->csc[n->col]);
@@ -2671,11 +4096,17 @@ static int wb_table_build(RtxWb *wb, const char *buf, size_t len, const RtxMdTab
     t->cs = (WColStat *)wb_ma(wb, (size_t)(ncols + 1) * sizeof(WColStat));
     t->ct = (uint8_t *)wb_ma(wb, (size_t)(ncols + 1));
     t->csc = (uint8_t *)wb_ma(wb, (size_t)(ncols + 1));
-    t->row_lo = (size_t *)wb_ma(wb, (size_t)(nrows + 1) * sizeof(size_t));
-    t->row_hi = (size_t *)wb_ma(wb, (size_t)(nrows + 1) * sizeof(size_t));
+    t->rowcap = (uint32_t)nrows + 16;
+    t->row_lo = (size_t *)wb_ma(wb, (size_t)t->rowcap * sizeof(size_t));
+    t->row_hi = (size_t *)wb_ma(wb, (size_t)t->rowcap * sizeof(size_t));
+    t->rowcell = (uint32_t *)wb_ma(wb, (size_t)t->rowcap * sizeof(uint32_t));
+    t->rleaf = (uint32_t *)wb_ma(wb, (size_t)t->rowcap * sizeof(uint32_t));
+    t->cma = (uint32_t **)wb_ma(wb, (size_t)(ncols + 1) * sizeof(uint32_t *));
+    t->ncma = (uint32_t *)wb_ma(wb, (size_t)(ncols + 1) * sizeof(uint32_t));
     if (!t->cname || !t->cnamen || !t->cclash || !t->hlo || !t->hhi || !t->cs || !t->ct ||
-        !t->csc || !t->row_lo || !t->row_hi)
+        !t->csc || !t->row_lo || !t->row_hi || !t->rowcell || !t->rleaf || !t->cma || !t->ncma)
         return 0;
+    if (!wb_lv_init(wb, t)) return 0;
     /* header: the column names */
     hl_e = mt->lo;
     while (hl_e < mt->sep_lo && buf[hl_e] != '\n') hl_e++;
@@ -2706,6 +4137,7 @@ static int wb_table_build(RtxWb *wb, const char *buf, size_t len, const RtxMdTab
     t->cell0 = wb->nn;
     for (i = 0; i < (uint32_t)(nrows * ncols); i++)
         if (wb_node_new(wb, NK_CELL) == UINT32_MAX) return 0;
+    for (r = 0; r < nrows; r++) t->rowcell[r] = t->cell0 + (uint32_t)r * (uint32_t)ncols;
     t->col0 = wb->nn;
     for (c = 0; c < (size_t)ncols; c++) {
         uint32_t id = wb_node_new(wb, NK_COL);
@@ -2970,19 +4402,35 @@ static uint32_t wb_heap_pop(RtxWb *wb) {
     return top;
 }
 
+/* A changed node: what reads it. An MA that reads it as a scalar input
+ * rebuilds; an MA that reads its column per row gets this row's delta. */
 static void wb_push_dependents(RtxWb *wb, uint32_t id) {
     const WNode *n = &wb->nodes[id];
     uint32_t k;
-    for (k = 0; k < n->rdn; k++) wb_heap_push(wb, wb->rdeps[n->rd0 + k]);
-    if (n->kind == NK_CELL) wb_heap_push(wb, wb->tabs[n->tab].col0 + (uint32_t)n->col);
+    for (k = 0; k < n->rdn; k++) {
+        uint32_t w = wb->rdeps[n->rd0 + k];
+        if (wb->nodes[w].kind == NK_MA) wb->mas[wb->nodes[w].mai].full = 1;
+        wb_heap_push(wb, w);
+        n = &wb->nodes[id];
+    }
+    if (n->kind == NK_CELL) {
+        const WTab *t = &wb->tabs[n->tab];
+        uint32_t col = (uint32_t)n->col, rid = id - col;
+        wb_heap_push(wb, t->col0 + col);
+        for (k = 0; t->cma && k < t->ncma[col]; k++) {
+            uint32_t mi = t->cma[col][k];
+            ma_dirty(wb, mi, rid, 0);
+            wb_heap_push(wb, wb->mas[mi].node);
+        }
+    }
 }
 
 /* A cycle through `s` inside its SCC (comp): `a → b → a`. */
 static void wb_cycle_path(RtxWb *wb, uint32_t s, const uint32_t *comp, uint32_t *par,
                           uint32_t *queue, char *out, size_t cap) {
     uint32_t qh = 0, qt = 0, v, k, last = UINT32_MAX;
-    uint32_t path[9];
-    int np = 0, i;
+    uint32_t path[17];
+    int np = 0, i, first = -1;
     size_t at = 0;
     char lb[96];
     par[s] = s;
@@ -3003,7 +4451,7 @@ static void wb_cycle_path(RtxWb *wb, uint32_t s, const uint32_t *comp, uint32_t 
     }
     /* s → ... → last → s: walk parents back from last */
     v = last;
-    while (v != UINT32_MAX && np < 8) {
+    while (v != UINT32_MAX && np < 16) {
         path[np++] = v;
         if (v == s) break;
         v = par[v];
@@ -3011,14 +4459,59 @@ static void wb_cycle_path(RtxWb *wb, uint32_t s, const uint32_t *comp, uint32_t 
     for (k = 0; k < qt; k++) par[queue[k]] = UINT32_MAX;
     out[0] = 0;
     at = 0;
+    /* MA nodes are internal: the path names the cells and names */
     for (i = np - 1; i >= 0; i--) {
+        if (wb->nodes[path[i]].kind == NK_MA) continue;
+        if (first < 0) first = i;
         wb_node_label(wb, path[i], lb, sizeof lb);
         at = wb_puts(out, cap, at, lb);
         at = wb_puts(out, cap, at, " \xe2\x86\x92 ");
     }
-    if (np >= 8 && path[np - 1] != s) at = wb_puts(out, cap, at, "\xe2\x80\xa6 \xe2\x86\x92 ");
-    wb_node_label(wb, s, lb, sizeof lb);
+    if (np >= 16 && path[np - 1] != s) at = wb_puts(out, cap, at, "\xe2\x80\xa6 \xe2\x86\x92 ");
+    if (wb->nodes[s].kind != NK_MA || first < 0) wb_node_label(wb, s, lb, sizeof lb);
+    else wb_node_label(wb, path[first], lb, sizeof lb);
     at = wb_puts(out, cap, at, lb);
+}
+
+/* Per table: every live MA over it, and per column the MAs that read
+ * that column per row (a changed cell queues its row on those). */
+static int wb_ma_lists(RtxWb *wb) {
+    uint32_t i, c;
+    for (i = 0; i < wb->ntab; i++) {
+        WTab *t = &wb->tabs[i];
+        t->ntma = 0;
+        for (c = 0; c < (uint32_t)t->ncols; c++) t->ncma[c] = 0;
+    }
+    for (i = 0; i < wb->nma; i++) {
+        const WMa *m = &wb->mas[i];
+        WTab *t;
+        if (!m->live || m->tab < 0 || (uint32_t)m->tab >= wb->ntab) continue;
+        t = &wb->tabs[m->tab];
+        t->ntma++;
+        for (c = 0; c < (uint32_t)t->ncols; c++)
+            if (m->rowmask & (1u << c)) t->ncma[c]++;
+    }
+    for (i = 0; i < wb->ntab; i++) {
+        WTab *t = &wb->tabs[i];
+        t->tma = t->ntma ? (uint32_t *)wb_ma(wb, t->ntma * sizeof(uint32_t)) : NULL;
+        if (t->ntma && !t->tma) return 0;
+        t->ntma = 0;
+        for (c = 0; c < (uint32_t)t->ncols; c++) {
+            t->cma[c] = t->ncma[c] ? (uint32_t *)wb_ma(wb, t->ncma[c] * sizeof(uint32_t)) : NULL;
+            if (t->ncma[c] && !t->cma[c]) return 0;
+            t->ncma[c] = 0;
+        }
+    }
+    for (i = 0; i < wb->nma; i++) {
+        const WMa *m = &wb->mas[i];
+        WTab *t;
+        if (!m->live || m->tab < 0 || (uint32_t)m->tab >= wb->ntab) continue;
+        t = &wb->tabs[m->tab];
+        t->tma[t->ntma++] = i;
+        for (c = 0; c < (uint32_t)t->ncols; c++)
+            if (m->rowmask & (1u << c)) t->cma[c][t->ncma[c]++] = i;
+    }
+    return 1;
 }
 
 /* Dependents table, Tarjan SCC order (dependencies first) and cycles.
@@ -3047,8 +4540,11 @@ static int wb_regraph(RtxWb *wb, int seed) {
         n->cyc = 0;
         index[v] = UINT32_MAX;
         if (n->kind == NK_COL) continue;
-        for (k = 0; k < n->ndeps; k++) cnt[n->deps[k]]++;
-        total += n->ndeps;
+        {
+            uint32_t nd = n->kind == NK_MA ? n->nsd : n->ndeps;
+            for (k = 0; k < nd; k++) cnt[n->deps[k]]++;
+            total += nd;
+        }
     }
     wb->rdeps = (uint32_t *)wb_ma(wb, (total ? total : 1) * sizeof(uint32_t));
     if (!wb->rdeps) return 0;
@@ -3063,12 +4559,15 @@ static int wb_regraph(RtxWb *wb, int seed) {
     }
     for (v = 0; v < nn; v++) {
         WNode *n = &wb->nodes[v];
+        uint32_t nd;
         if (n->kind == NK_COL) continue;
-        for (k = 0; k < n->ndeps; k++) {
+        nd = n->kind == NK_MA ? n->nsd : n->ndeps;
+        for (k = 0; k < nd; k++) {
             WNode *d = &wb->nodes[n->deps[k]];
             wb->rdeps[d->rd0 + d->rdn++] = v;
         }
     }
+    if (!wb_ma_lists(wb)) return 0;
     /* Tarjan, iterative */
     for (v = 0; v < nn; v++) {
         if (index[v] != UINT32_MAX) continue;
@@ -3148,6 +4647,32 @@ static void wb_note_changed(RtxWb *wb, uint32_t id) {
     else wb->chg_all = 1;
 }
 
+static void wb_ov_save(RtxWb *wb, uint32_t id) {
+    WNode *n = &wb->nodes[id];
+    if (n->ovset) return;
+    if (wb->novl >= wb->ovlcap) {
+        uint32_t nc = wb->ovlcap ? wb->ovlcap * 2 : 1024;
+        uint32_t *nl = (uint32_t *)realloc(wb->ovl, (size_t)nc * sizeof(uint32_t));
+        if (!nl) return;
+        wb->ovl = nl;
+        wb->ovlcap = nc;
+    }
+    n->ov = n->v;
+    n->ovset = 1;
+    wb->ovl[wb->novl++] = id;
+}
+
+/* End of a recalc: old values and queued rows are spent. */
+static void wb_recalc_done(RtxWb *wb) {
+    uint32_t i;
+    for (i = 0; i < wb->novl; i++) wb->nodes[wb->ovl[i]].ovset = 0;
+    wb->novl = 0;
+    if (wb->ndirty) {
+        for (i = 0; i < wb->nma; i++) wb->mas[i].dhead = WN32;
+        wb->ndirty = 0;
+    }
+}
+
 static void wb_recalc(RtxWb *wb) {
     size_t visited = 0;
     while (wb->nheap) {
@@ -3159,13 +4684,27 @@ static void wb_recalc(RtxWb *wb) {
             wb_push_dependents(wb, id);
             continue;
         }
-        nv = n->cyc ? n->cv : wb_eval_node(wb, id);
+        if (n->kind == NK_DEAD || n->kind == NK_LINE) continue;
+        if (n->kind == NK_MA) {
+            WMa *m = &wb->mas[n->mai];
+            if (n->cyc) {
+                m->dhead = WN32;
+                m->stale = 1;
+                nv = n->cv;
+            } else {
+                nv = ma_update(wb, id);
+            }
+        } else {
+            nv = n->cyc ? n->cv : wb_eval_node(wb, id);
+        }
         n = &wb->nodes[id];
         if (wv_same(&nv, &n->v)) continue;
+        wb_ov_save(wb, id);
         n->v = nv;
         wb_note_changed(wb, id);
         wb_push_dependents(wb, id);
     }
+    wb_recalc_done(wb);
     wb->st.visited = visited;
     wb->st.visited_total += visited;
 }
@@ -3183,7 +4722,20 @@ static void wb_calc_all(RtxWb *wb) {
     for (v = 0; v < wb->nn; v++) {
         uint32_t id = order[v];
         WNode *n = &wb->nodes[id];
-        if (n->kind == NK_COL || n->kind == NK_LINE) continue;
+        if (n->kind == NK_COL || n->kind == NK_LINE || n->kind == NK_DEAD) continue;
+        if (n->kind == NK_MA) {
+            WMa *m = &wb->mas[n->mai];
+            if (n->cyc) {
+                m->stale = 1;
+                n->v = n->cv;
+            } else {
+                WVal x;
+                ma_build(wb, m);
+                x = ma_value(wb, m);
+                wb->nodes[id].v = x;
+            }
+            continue;
+        }
         if (n->cyc) n->v = n->cv;
         else {
             WVal x = wb_eval_node(wb, id);
@@ -3201,8 +4753,13 @@ static void wb_count(RtxWb *wb) {
     wb->st.cells = 0;
     wb->st.names = 0;
     wb->st.edges = 0;
+    wb->st.nodes = 0;
+    wb->st.mas = 0;
     for (i = 0; i < wb->nn; i++) {
         const WNode *n = &wb->nodes[i];
+        if (n->kind == NK_DEAD) continue;
+        wb->st.nodes++;
+        if (n->kind == NK_MA) wb->st.mas++;
         if (wb_has_f(n)) wb->nderived++;
         if (n->form) wb->st.formulas++;
         if (n->kind == NK_CELL) wb->st.cells++;
@@ -3210,7 +4767,6 @@ static void wb_count(RtxWb *wb) {
         wb->st.edges += wb_ndeps(wb, i);
     }
     wb->st.tables = wb->ntab;
-    wb->st.nodes = wb->nn;
 }
 
 static void wb_reset_model(RtxWb *wb) {
@@ -3237,6 +4793,10 @@ static void wb_reset_model(RtxWb *wb) {
     wb->nheap = wb->heapcap = 0;
     wb->bdeps = NULL;
     wb->nbd = wb->bdcap = 0;
+    wb->mas = NULL;
+    wb->nma = wb->macap = 0;
+    wb->ndirty = 0;
+    wb->novl = 0;
 }
 
 static size_t wb_read(const RtxDoc *d, size_t off, char *dst, size_t n) {
@@ -3368,6 +4928,17 @@ static char *wb_read_tmp(RtxWb *wb, const RtxDoc *d, size_t lo, size_t n) {
     return p;
 }
 
+/* A re-bound formula's MAs build again (before it: topological order). */
+static void wb_push_mas(RtxWb *wb, uint32_t id) {
+    uint32_t k;
+    for (k = 0; k < wb->nodes[id].nmal; k++) {
+        uint32_t m = wb->nodes[id].mal[k];
+        if (wb->nodes[m].kind != NK_MA) continue;
+        wb->mas[wb->nodes[m].mai].full = 1;
+        wb_heap_push(wb, m);
+    }
+}
+
 /* A cell edit: re-read that cell, re-bind at most its formula, recalc its
  * dependents. 0 = not a cell-local edit (the caller rebuilds). */
 static int wb_fast_cell(RtxWb *wb, const RtxDoc *d, uint32_t id) {
@@ -3413,6 +4984,7 @@ static int wb_fast_cell(RtxWb *wb, const RtxDoc *d, uint32_t id) {
     if (had != wb_has_f(n)) wb->nderived += had ? (uint32_t)-1 : 1u;
     if (oform != n->form) wb->st.formulas += n->form ? 1 : (size_t)-1;
     if (regraph && !wb_regraph(wb, 1)) return 0;
+    wb_push_mas(wb, id);
     wb_heap_push(wb, id);
     if (t->ct[col] != ot || t->csc[col] != osc) {
         int32_t r;
@@ -3481,6 +5053,7 @@ static int wb_fast_line(RtxWb *wb, const RtxDoc *d, uint32_t id) {
     if (wb_ex_literal(n->ex)) n->f_lo = n->f_hi = WNONE;
     if (had != wb_has_f(n)) wb->nderived += had ? (uint32_t)-1 : 1u;
     if (regraph && !wb_regraph(wb, 1)) return 0;
+    wb_push_mas(wb, id);
     wb_heap_push(wb, id);
     wb_recalc(wb);
     return 1;
@@ -3686,6 +5259,8 @@ static void wb_hook_destroy(void *ctx) {
     CCArena own;
     if (!wb) return;
     own = wb->own;
+    free(wb->dirty);
+    free(wb->ovl);
     wb->ma.destroy();
     wb->va.destroy();
     wb->sa.destroy();
@@ -3790,6 +5365,47 @@ int rtx_wb_eval(RtxWb *wb, const RtxDoc *d, const char *expr, size_t n, char *ou
     return 1;
 }
 
+static int wb_gent_cmp(const void *a, const void *b) {
+    const WGEnt *x = *(const WGEnt *const *)a, *y = *(const WGEnt *const *)b;
+    return wb_key_cmp(&x->k, &y->k);
+}
+
+/* A group's rows in key order: `{k: out=v, ...; k2: ...}`. */
+static size_t wb_group_text(RtxWb *wb, const WVal *v, char *out, size_t cap) {
+    WMa *m;
+    WGEnt **rows;
+    uint32_t i, n = 0, j;
+    size_t at;
+    char vb[256];
+    if (v->t != WV_GRP || v->u.i < 0 || (uint32_t)v->u.i >= wb->nma) return wv_fmt(v, out, cap, 1);
+    m = &wb->mas[v->u.i];
+    rows = (WGEnt **)cc_arena_alloc(wb->sa, (size_t)(m->gm.cap ? m->gm.cap : 1) * sizeof(WGEnt *), 16);
+    if (!rows) return wv_fmt(v, out, cap, 1);
+    for (i = 0; i < m->gm.cap; i++)
+        if (m->gm.e[i].used && m->gm.e[i].rows) rows[n++] = &m->gm.e[i];
+    qsort(rows, n, sizeof(WGEnt *), wb_gent_cmp);
+    at = wb_puts(out, cap, 0, "{");
+    for (i = 0; i < n; i++) {
+        WVal kv = wb_key_val(&rows[i]->k);
+        if (i) at = wb_puts(out, cap, at, "; ");
+        wb_fmt_dump(&kv, vb, sizeof vb);
+        at = wb_puts(out, cap, at, vb);
+        at = wb_puts(out, cap, at, ":");
+        for (j = 0; j < m->nout; j++) {
+            ECtx c;
+            WVal ov;
+            ma_ctx(wb, m, &c, 0);
+            ov = wg_out_value(&c, m, rows[i], j);
+            at = wb_puts(out, cap, at, j ? ", " : " ");
+            at = wb_put(out, cap, at, m->ex->args[j]->id2, m->ex->args[j]->id2n);
+            at = wb_puts(out, cap, at, "=");
+            wb_fmt_dump(&ov, vb, sizeof vb);
+            at = wb_puts(out, cap, at, vb);
+        }
+    }
+    return wb_puts(out, cap, at, "}");
+}
+
 size_t rtx_wb_dump(RtxWb *wb, const RtxDoc *d, char *out, size_t cap) {
     size_t at = 0;
     uint32_t i;
@@ -3802,7 +5418,8 @@ size_t rtx_wb_dump(RtxWb *wb, const RtxDoc *d, char *out, size_t cap) {
         const WNode *n = &wb->nodes[i];
         if (n->kind != NK_CELL && n->kind != NK_NAME) continue;
         wb_node_label(wb, i, lb, sizeof lb);
-        wb_fmt_dump(&n->v, vb, sizeof vb);
+        if (n->v.t == WV_GRP) wb_group_text(wb, &n->v, vb, sizeof vb);
+        else wb_fmt_dump(&n->v, vb, sizeof vb);
         at = wb_puts(out, cap, at, lb);
         at = wb_puts(out, cap, at, " = ");
         at = wb_puts(out, cap, at, vb);
@@ -3838,10 +5455,18 @@ size_t rtx_wb_reach(RtxWb *wb, const RtxDoc *d, size_t off) {
             }
         }
         if (x->kind == NK_CELL) {
-            uint32_t w = wb->tabs[x->tab].col0 + (uint32_t)x->col;
+            const WTab *t = &wb->tabs[x->tab];
+            uint32_t w = t->col0 + (uint32_t)x->col;
             if (!seen[w]) {
                 seen[w] = 1;
                 queue[qt++] = w;
+            }
+            for (j = 0; t->cma && j < t->ncma[x->col]; j++) {
+                w = wb->mas[t->cma[x->col][j]].node;
+                if (!seen[w]) {
+                    seen[w] = 1;
+                    queue[qt++] = w;
+                }
             }
         }
     }
@@ -3926,8 +5551,17 @@ static void ren_walk(WRen *r, const WNode *n, const Ex *e) {
         ren_tok(r, n, RT_COL, e->tab, e->col, 0, e->lo2, e->hi2);
         return;
     case EX_AGG:
-        ren_walk(r, n, e->args[0]);
+        if (e->nargs) ren_walk(r, n, e->args[0]);
         ren_walk(r, n, e->where);
+        return;
+    case EX_GROUP:
+        ren_tok(r, n, RT_TAB, e->tab, -1, 0, e->lo, e->hi);
+        ren_walk(r, n, e->a);
+        for (i = 0; i < e->nargs; i++) ren_walk(r, n, e->args[i]);
+        return;
+    case EX_GLOOKUP:
+        ren_tok(r, n, RT_NAME, -1, -1, e->node, e->lo, e->hi);
+        ren_walk(r, n, e->b);
         return;
     case EX_FN:
         for (i = 0; i < e->nargs; i++) ren_walk(r, n, e->args[i]);
