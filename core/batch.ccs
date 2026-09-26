@@ -323,6 +323,68 @@ static int rtx_batch_flag(const char *s, const char *name) {
     return !strncmp(s, name, n) && (!s[n] || s[n] == ' ' || s[n] == '\t' || s[n] == '\r');
 }
 
+/* find [--regex] [--icase] [--word] [--] QUERY
+ * The find list, one hit per line: 1-based line, byte offset, length
+ * (tab-separated), then `# N matches` and what the list does not cover:
+ * "capped", matches over 64 KiB, or "search incomplete: pattern too
+ * complex at line L" (the regex could not decide a start there; the list
+ * stops before it). */
+static int rtx_batch_find(RtxWs *w, const char *arg, FILE *out, FILE *err) {
+    RtxBuf *b = rtx_batch_buf(w);
+    RtxDoc *d;
+    char q[RTX_FIND_QMAX + 1];
+    size_t qn = 0, i, nh;
+    unsigned opts = 0;
+    int bad = 0;
+    const char *rest = arg;
+    if (!b) return rtx_batch_fail(err, "no buffer");
+    d = &b->doc;
+    for (;;) {
+        const char *s = rtx_batch_skip_ws(rest);
+        if (rtx_batch_flag(s, "--regex")) {
+            opts |= RTX_FIND_REGEX;
+            rest = s + 7;
+        } else if (rtx_batch_flag(s, "--icase")) {
+            opts |= RTX_FIND_ICASE;
+            rest = s + 7;
+        } else if (rtx_batch_flag(s, "--word")) {
+            opts |= RTX_FIND_WORD;
+            rest = s + 6;
+        } else if (rtx_batch_flag(s, "--")) {
+            rest = s + 2;
+            break;
+        } else {
+            break;
+        }
+    }
+    if (!rtx_batch_arg(rest, q, sizeof(q), &qn, &rest, &bad) || qn == 0 || bad)
+        return rtx_batch_fail(err, "find [--regex] [--icase] [--word] QUERY");
+    if (rest && rest[0]) return rtx_batch_fail(err, "find: extra args (quote them)");
+    {
+        @errhandler(CCError e) {
+            return rtx_batch_fail(err, e.message ? e.message : "find");
+        }
+        d->find_set_opt(cc_slice_from_buffer(q, qn), opts) !>;
+        d->find_finish() !>;
+    }
+    if (d->find.err) return rtx_batch_fail(err, d->find.err);
+    nh = rtx_find_hits_n(&d->find);
+    for (i = 0; i < nh; i++)
+        fprintf(out, "%zu\t%zu\t%zu\n", d->find.hits.data[i].line + 1, d->find.hits.data[i].off,
+                d->find.hits.data[i].len);
+    fprintf(out, "# %zu matches", nh);
+    if (d->find.truncated) fprintf(out, "; capped");
+    if (d->find.long_n)
+        fprintf(out, "; %zu over %d KiB from byte %zu", (size_t)d->find.long_n,
+                (int)(RTX_FIND_SPAN / 1024), (size_t)d->find.long_off);
+    if (d->find.indet)
+        fprintf(out, "; search incomplete: pattern too complex at line %zu (byte %zu)",
+                d->find.indet_line + 1, d->find.indet_off);
+    fputc('\n', out);
+    fflush(out);
+    return RTX_BATCH_OK;
+}
+
 /* replace [--all] [--regex] [--icase] [--word] [--] FIND REPL
  * One: the first match at or after the caret (one undo step); the next
  * match is then selected. --all: every match as one edit group. */
@@ -386,6 +448,16 @@ static int rtx_batch_replace(RtxWs *w, const char *arg, FILE *out, FILE *err) {
         nh = rtx_find_hits_n(&d->find);
         for (i = 0; i < nh; i++)
             if (d->find.hits.data[i].off >= d->caret) break;
+        if (i == nh && d->find.indet) {
+            /* The list ends where the regex could not decide: a match past
+             * the caret may exist; never replace a guess. */
+            char msg[160];
+            snprintf(msg, sizeof msg,
+                     "replace: search incomplete: pattern too complex at line %zu; no decided "
+                     "match at or after the caret",
+                     d->find.indet_line + 1);
+            return rtx_batch_fail(err, msg);
+        }
         if (i == nh) return rtx_batch_fail(err, "replace: no match at or after the caret");
         d->find_goto(i);
         hit = d->replace_hit(rs, &why) !>;
@@ -893,15 +965,21 @@ void rtx_batch_write_stats_json(FILE *fp, const RtxBuf *b) {
     }
     fputc('}', fp);
     if (d && d->find.query.len) {
-        if (d->find.done) findst = d->find.truncated ? "trunc" : "done";
+        if (d->find.done)
+            findst = d->find.truncated ? "trunc" : d->find.indet ? "incomplete" : "done";
         fprintf(fp,
                 ",\"find\":{\"hits\":%zu,\"scan_off\":%zu,\"done\":%s,"
                 "\"truncated\":%s,\"state\":\"%s\",\"opts\":%u,\"long\":%zu,"
-                "\"long_off\":%zu,\"err\":%s}",
+                "\"long_off\":%zu,\"err\":%s",
                 rtx_find_hits_n(&d->find), d->find.scan_off, d->find.done ? "true" : "false",
                 d->find.truncated ? "true" : "false", findst, d->find.opts,
                 (size_t)d->find.long_n, (size_t)d->find.long_off,
                 d->find.err ? "true" : "false");
+        if (d->find.indet)
+            fprintf(fp, ",\"incomplete\":{\"off\":%zu,\"line\":%zu}}", d->find.indet_off,
+                    d->find.indet_line + 1);
+        else
+            fputs(",\"incomplete\":null}", fp);
     } else {
         fputs(",\"find\":null", fp);
     }
@@ -990,6 +1068,7 @@ int rtx_batch_exec(RtxWs *w, const char *line, FILE *out, FILE *err) {
         if (c.eq_cstr("insert")) return rtx_batch_insert(w, rest, err);
         if (c.eq_cstr("save")) return rtx_batch_save(w, err);
         if (c.eq_cstr("replace")) return rtx_batch_replace(w, rest, out, err);
+        if (c.eq_cstr("find")) return rtx_batch_find(w, rest, out, err);
         if (c.eq_cstr("undo")) return rtx_batch_undo(w, 0, err);
         if (c.eq_cstr("redo")) return rtx_batch_undo(w, 1, err);
         if (c.eq_cstr("project-files")) return rtx_batch_project_files(w, rest, out, err);
