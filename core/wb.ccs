@@ -269,7 +269,7 @@ typedef struct {
     uint8_t lsc;    /* CELL: LK_DEC scale */
     uint8_t ovset;  /* recalc: `ov` holds the value before this recalc */
     int32_t tab;    /* CELL / COL / MA: table; NAME: sheet (-1 = params) */
-    int32_t col, row;
+    int32_t col, row; /* CELL: row is the row's id (t->rpos: its position) */
     /* Offsets: a CELL's are relative to its row's start (wb_nbase: rows
      * are relative to their leaf, a leaf's start is absolute), so an edit
      * moves O(leaves) numbers, not every cell after it. NAME / LINE:
@@ -286,7 +286,9 @@ typedef struct {
     WVal v;
     WVal cv;               /* cycle member: its #cycle(path) */
     WVal ov;               /* ovset: the value before this recalc (MA old rows) */
-    uint32_t topo;
+    uint64_t topo;         /* evaluation order: Tarjan's position << 16, so
+                            * a node can be placed between two without a regraph */
+    uint32_t xr;           /* dependents added since the last regraph (wb->xrp list) */
     uint32_t *deps;
     uint32_t ndeps;
     uint32_t nsd;          /* MA: deps[0, nsd) are scalar inputs (a change
@@ -316,7 +318,12 @@ typedef struct {
     uint32_t *rlen;        /* row bytes (no NL) */
     uint32_t *rowcell;     /* row position -> its first cell node (a row's
                             * cells are consecutive; rows move, ids do not) */
-    uint32_t rowcap;
+    uint32_t *prid;        /* row position -> row id */
+    uint32_t *rpos;        /* row id -> position (a row insert rewrites the
+                            * positions after it, not every cell's) */
+    uint32_t rowcap, nrid, ridcap;
+    uint32_t nferr;        /* at least the formula cells holding an error
+                            * (their text names their row); 0: none */
     WColStat *cs;
     uint8_t *ct, *csc;     /* inferred column type / dec scale */
     /* MA leaves: consecutive runs of rows (the W1 counted-leaf shape) */
@@ -398,6 +405,8 @@ struct RtxWb {
     uint32_t ndirty, dirtycap;
     uint32_t *ovl;           /* nodes with ovset */
     uint32_t novl, ovlcap;
+    struct WXr *xrp;         /* dependents added since the last regraph */
+    uint32_t nxr, xrcap;
     RtxWbStats st;
 };
 
@@ -609,6 +618,8 @@ static size_t wv_fmt(const WVal *v, char *out, size_t cap, int full) {
     return 0;
 }
 
+static int32_t wb_cpos(const RtxWb *wb, const WNode *n);
+
 static size_t wb_node_label(const RtxWb *wb, uint32_t id, char *out, size_t cap) {
     const WNode *n = &wb->nodes[id];
     char b[48];
@@ -620,7 +631,7 @@ static size_t wb_node_label(const RtxWb *wb, uint32_t id, char *out, size_t cap)
         at = wb_puts(out, cap, at, ".");
         at = wb_put(out, cap, at, t->cname[n->col], t->cnamen[n->col]);
         if (n->kind == NK_CELL) {
-            snprintf(b, sizeof b, "[%d]", (int)n->row + 1);
+            snprintf(b, sizeof b, "[%d]", (int)wb_cpos(wb, n) + 1);
             at = wb_puts(out, cap, at, b);
         }
         return at;
@@ -1551,6 +1562,10 @@ typedef struct WDirty {
     uint8_t isnew;
 } WDirty;
 
+typedef struct WXr {
+    uint32_t w, next;
+} WXr;
+
 
 /* ------------------------------------------------------------------ binder */
 
@@ -1625,13 +1640,18 @@ static size_t wb_row_lo(const WTab *t, int32_t r) {
     return t->lvb[t->rleaf[r]] + t->rrel[r];
 }
 
+/* A cell's row position. */
+static int32_t wb_cpos(const RtxWb *wb, const WNode *n) {
+    return n->row < 0 ? -1 : (int32_t)wb->tabs[n->tab].rpos[n->row];
+}
+
 static size_t wb_row_hi(const WTab *t, int32_t r) {
     return wb_row_lo(t, r) + t->rlen[r];
 }
 
 /* A node's offset base: its row's start for a cell, 0 (absolute) else. */
 static size_t wb_nbase(const RtxWb *wb, const WNode *n) {
-    return n->kind == NK_CELL && n->row >= 0 ? wb_row_lo(&wb->tabs[n->tab], n->row) : 0;
+    return n->kind == NK_CELL && n->row >= 0 ? wb_row_lo(&wb->tabs[n->tab], wb_cpos(wb, n)) : 0;
 }
 
 static size_t wb_abs(const RtxWb *wb, const WNode *n, size_t x) {
@@ -2248,7 +2268,7 @@ static int wb_bind_node(RtxWb *wb, uint32_t id) {
     c.sheet = -1;
     if (n->kind == NK_CELL) {
         c.own_tab = n->tab;
-        c.own_row = n->row;
+        c.own_row = wb_cpos(wb, n);
         c.sheet = wb->tabs[n->tab].sheet;
     } else if (n->kind == NK_NAME) {
         c.sheet = n->tab;
@@ -3028,7 +3048,7 @@ static int wb_better(const RtxWb *wb, int fn, const WBest *a, const WBest *b) {
     r = wb_vcmp(&a->v, &b->v);
     if (fn == FN_MAX) r = -r;
     if (r) return r < 0;
-    return wb->nodes[a->rid].row < wb->nodes[b->rid].row;
+    return wb_cpos(wb, &wb->nodes[a->rid]) < wb_cpos(wb, &wb->nodes[b->rid]);
 }
 
 /* The formula's context for MA m's rows. */
@@ -3038,7 +3058,7 @@ static void ma_ctx(RtxWb *wb, const WMa *m, ECtx *c, int old) {
     c->wb = wb;
     c->self = m->owner;
     c->own_tab = own->kind == NK_CELL ? own->tab : -1;
-    c->own_row = own->kind == NK_CELL ? own->row : -1;
+    c->own_row = own->kind == NK_CELL ? wb_cpos(wb, own) : -1;
     c->it_tab = m->tab;
     c->it_row = -1;
     c->old = old;
@@ -3444,7 +3464,7 @@ static void ma_apply(RtxWb *wb, WMa *m) {
     }
     for (i = 0; i < n; i++) {
         uint32_t rid = rows[i].rid;
-        int32_t pos = wb->nodes[rid].row;
+        int32_t pos = wb_cpos(wb, &wb->nodes[rid]);
         uint32_t lf = t->rleaf[pos];
         if (m->grp) {
             int same = 0;
@@ -3886,7 +3906,7 @@ static WVal wb_eval_node(RtxWb *wb, uint32_t id) {
     c.wb = wb;
     c.self = id;
     c.own_tab = n->kind == NK_CELL ? n->tab : -1;
-    c.own_row = n->kind == NK_CELL ? n->row : -1;
+    c.own_row = n->kind == NK_CELL ? wb_cpos(wb, n) : -1;
     c.it_tab = -1;
     c.it_row = -1;
     v = ev(&c, n->ex);
@@ -3907,6 +3927,7 @@ static uint32_t wb_node_new(RtxWb *wb, int kind) {
     n = &wb->nodes[wb->nn];
     memset(n, 0, sizeof *n);
     n->kind = (uint8_t)kind;
+    n->xr = WN32;
     n->tab = n->col = n->row = -1;
     n->raw_lo = n->raw_hi = n->f_lo = n->f_hi = n->n_lo = n->n_hi = n->src_lo = WNONE;
     return wb->nn++;
@@ -4181,10 +4202,14 @@ static int wb_table_build(RtxWb *wb, const char *buf, size_t len, const RtxMdTab
     t->rlen = (uint32_t *)wb_ma(wb, (size_t)t->rowcap * sizeof(uint32_t));
     t->rowcell = (uint32_t *)wb_ma(wb, (size_t)t->rowcap * sizeof(uint32_t));
     t->rleaf = (uint32_t *)wb_ma(wb, (size_t)t->rowcap * sizeof(uint32_t));
+    t->prid = (uint32_t *)wb_ma(wb, (size_t)t->rowcap * sizeof(uint32_t));
+    t->ridcap = t->rowcap;
+    t->rpos = (uint32_t *)wb_ma(wb, (size_t)t->ridcap * sizeof(uint32_t));
     t->cma = (uint32_t **)wb_ma(wb, (size_t)(ncols + 1) * sizeof(uint32_t *));
     t->ncma = (uint32_t *)wb_ma(wb, (size_t)(ncols + 1) * sizeof(uint32_t));
     if (!t->cname || !t->cnamen || !t->cclash || !t->hlo || !t->hhi || !t->cs || !t->ct ||
-        !t->csc || !t->rrel || !t->rlen || !t->rowcell || !t->rleaf || !t->cma || !t->ncma)
+        !t->csc || !t->rrel || !t->rlen || !t->rowcell || !t->rleaf || !t->cma || !t->ncma ||
+        !t->prid || !t->rpos)
         return 0;
     if (!wb_lv_init(wb, t)) return 0;
     /* header: the column names */
@@ -4217,7 +4242,11 @@ static int wb_table_build(RtxWb *wb, const char *buf, size_t len, const RtxMdTab
     t->cell0 = wb->nn;
     for (i = 0; i < (uint32_t)(nrows * ncols); i++)
         if (wb_node_new(wb, NK_CELL) == UINT32_MAX) return 0;
-    for (r = 0; r < nrows; r++) t->rowcell[r] = t->cell0 + (uint32_t)r * (uint32_t)ncols;
+    for (r = 0; r < nrows; r++) {
+        t->rowcell[r] = t->cell0 + (uint32_t)r * (uint32_t)ncols;
+        t->prid[r] = t->rpos[r] = (uint32_t)r;
+    }
+    t->nrid = (uint32_t)nrows;
     t->col0 = wb->nn;
     for (c = 0; c < (size_t)ncols; c++) {
         uint32_t id = wb_node_new(wb, NK_COL);
@@ -4469,7 +4498,7 @@ static uint32_t wb_heap_pop(RtxWb *wb) {
     uint32_t n = wb->nheap;
     while (n) {
         uint32_t l = 2 * i + 1, r = l + 1, m = i;
-        uint32_t mt = wb->nodes[last].topo;
+        uint64_t mt = wb->nodes[last].topo;
         if (l < n && wb->nodes[wb->heap[l]].topo < mt) {
             m = l;
             mt = wb->nodes[wb->heap[l]].topo;
@@ -4495,12 +4524,19 @@ static void wb_push_dependents(RtxWb *wb, uint32_t id) {
         wb_heap_push(wb, w);
         n = &wb->nodes[id];
     }
+    for (k = n->xr; k != WN32; k = wb->xrp[k].next) {
+        uint32_t w = wb->xrp[k].w;
+        if (wb->nodes[w].kind == NK_MA) wb->mas[wb->nodes[w].mai].full = 1;
+        wb_heap_push(wb, w);
+    }
+    n = &wb->nodes[id];
     if (n->kind == NK_CELL) {
         const WTab *t = &wb->tabs[n->tab];
         uint32_t col = (uint32_t)n->col, rid = id - col;
         wb_heap_push(wb, t->col0 + col);
         for (k = 0; t->cma && k < t->ncma[col]; k++) {
             uint32_t mi = t->cma[col][k];
+            if (!wb->mas[mi].live) continue;
             ma_dirty(wb, mi, rid, 0);
             wb_heap_push(wb, wb->mas[mi].node);
         }
@@ -4663,10 +4699,12 @@ static int wb_regraph(RtxWb *wb, int seed) {
     on = (uint8_t *)wb_alloc(wb->sa, nn);
     was = (uint8_t *)wb_alloc(wb->sa, nn);
     if (!cnt || !index || !low || !stk || !fv || !fi || !comp || !on || !was) return 0;
+    wb->nxr = 0;
     for (v = 0; v < nn; v++) {
         WNode *n = &wb->nodes[v];
         was[v] = n->cyc;
         n->cyc = 0;
+        n->xr = WN32;
         index[v] = UINT32_MAX;
         if (n->kind == NK_COL) continue;
         {
@@ -4728,7 +4766,7 @@ static int wb_regraph(RtxWb *wb, int seed) {
                     w = stk[--sp];
                     on[w] = 0;
                     comp[w] = first;
-                    wb->nodes[w].topo = topo++;
+                    wb->nodes[w].topo = ((uint64_t)topo++ + 1) << 16;
                     size++;
                 } while (w != x);
                 if (size == 1) {
@@ -4833,6 +4871,7 @@ static void wb_recalc(RtxWb *wb) {
             }
         } else {
             nv = n->cyc ? n->cv : wb_eval_node(wb, id);
+            if (nv.t == WV_ERR && n->kind == NK_CELL && n->form) wb->tabs[n->tab].nferr++;
         }
         n = &wb->nodes[id];
         if (wv_same(&nv, &n->v)) continue;
@@ -4855,7 +4894,7 @@ static void wb_calc_all(RtxWb *wb) {
     }
     order = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)wb->nn * sizeof(uint32_t), 16);
     if (!order) return;
-    for (v = 0; v < wb->nn; v++) order[wb->nodes[v].topo] = v;
+    for (v = 0; v < wb->nn; v++) order[(wb->nodes[v].topo >> 16) - 1] = v;
     for (v = 0; v < wb->nn; v++) {
         uint32_t id = order[v];
         WNode *n = &wb->nodes[id];
@@ -4878,6 +4917,8 @@ static void wb_calc_all(RtxWb *wb) {
             WVal x = wb_eval_node(wb, id);
             wb->nodes[id].v = x;
         }
+        n = &wb->nodes[id];
+        if (n->kind == NK_CELL && n->form && n->v.t == WV_ERR) wb->tabs[n->tab].nferr++;
     }
     wb->st.visited = wb->nn;
     wb->st.visited_total += wb->nn;
@@ -5120,6 +5161,63 @@ static char *wb_read_tmp(RtxWb *wb, const RtxDoc *d, size_t lo, size_t n) {
     return p;
 }
 
+/* Add dependent w of d without a regraph. */
+static int wb_xr_add(RtxWb *wb, uint32_t d, uint32_t w) {
+    if (wb->nxr >= wb->xrcap) {
+        uint32_t nc = wb->xrcap ? wb->xrcap * 2 : 256;
+        WXr *np = (WXr *)realloc(wb->xrp, (size_t)nc * sizeof(WXr));
+        if (!np) return 0;
+        wb->xrp = np;
+        wb->xrcap = nc;
+    }
+    wb->xrp[wb->nxr].w = w;
+    wb->xrp[wb->nxr].next = wb->nodes[d].xr;
+    wb->nodes[d].xr = wb->nxr++;
+    return 1;
+}
+
+/* A re-bound formula whose inputs all come before it in the order (and
+ * no cycle anywhere): place its MAs between their inputs and it, add the
+ * new edges — no Tarjan over the whole graph. 0: the caller regraphs. */
+static int wb_graph_local(RtxWb *wb, uint32_t id) {
+    WNode *n = &wb->nodes[id];
+    uint64_t top = n->topo;
+    int32_t k;
+    uint32_t j;
+    if (wb->st.cycles || n->cyc || !top) return 0;
+    /* inner MAs first: bd_ma_open made the outer one before them */
+    for (k = (int32_t)n->nmal - 1; k >= 0; k--) {
+        WNode *m = &wb->nodes[n->mal[k]];
+        uint64_t lo = 0;
+        if (m->kind != NK_MA) continue;
+        for (j = 0; j < m->ndeps; j++)
+            if (wb->nodes[m->deps[j]].topo > lo) lo = wb->nodes[m->deps[j]].topo;
+        if (m->topo <= lo || m->topo >= top) {
+            if (top - lo < 2) return 0;
+            m->topo = lo + (top - lo) / 2;
+        }
+    }
+    for (j = 0; j < n->ndeps; j++)
+        if (wb->nodes[n->deps[j]].topo >= top) return 0;
+    for (k = 0; k < (int32_t)n->nmal; k++) {
+        WNode *m = &wb->nodes[n->mal[k]];
+        if (m->kind != NK_MA) continue;
+        for (j = 0; j < m->ndeps; j++)
+            if (wb->nodes[m->deps[j]].topo >= m->topo) return 0;
+    }
+    /* the new edges */
+    for (j = 0; j < n->ndeps; j++)
+        if (!wb_xr_add(wb, n->deps[j], id)) return 0;
+    for (k = 0; k < (int32_t)n->nmal; k++) {
+        uint32_t mid = n->mal[k];
+        WNode *m = &wb->nodes[mid];
+        if (m->kind != NK_MA) continue;
+        for (j = 0; j < m->nsd; j++)
+            if (!wb_xr_add(wb, wb->nodes[mid].deps[j], mid)) return 0;
+    }
+    return wb_ma_lists(wb);
+}
+
 /* A re-bound formula's MAs build again (before it: topological order). */
 static void wb_push_mas(RtxWb *wb, uint32_t id) {
     uint32_t k;
@@ -5176,7 +5274,7 @@ static int wb_fast_cell(RtxWb *wb, const RtxDoc *d, uint32_t id) {
     n = &wb->nodes[id];
     if (had != wb_has_f(n)) wb->nderived += had ? (uint32_t)-1 : 1u;
     if (oform != n->form) wb->st.formulas += n->form ? 1 : (size_t)-1;
-    if (regraph && !wb_regraph(wb, 1)) return 0;
+    if (regraph && !wb_graph_local(wb, id) && !wb_regraph(wb, 1)) return 0;
     wb_push_mas(wb, id);
     wb_heap_push(wb, id);
     if (t->ct[col] != ot || t->csc[col] != osc) {
@@ -5248,7 +5346,7 @@ static int wb_fast_line(RtxWb *wb, const RtxDoc *d, uint32_t id) {
     n = &wb->nodes[id];
     if (wb_ex_literal(n->ex)) n->f_lo = n->f_hi = WNONE;
     if (had != wb_has_f(n)) wb->nderived += had ? (uint32_t)-1 : 1u;
-    if (regraph && !wb_regraph(wb, 1)) return 0;
+    if (regraph && !wb_graph_local(wb, id) && !wb_regraph(wb, 1)) return 0;
     wb_push_mas(wb, id);
     wb_heap_push(wb, id);
     wb_recalc(wb);
@@ -5464,7 +5562,8 @@ static void rows_retract(RtxWb *wb, WTab *t, int32_t a, int32_t b) {
     }
 }
 
-/* Kill a node and the MAs of its formula. 1 if the graph must change. */
+/* Kill a node and the MAs of its formula. 2: MAs died (the MA lists
+ * change), 1: a formula died, 0: a literal. */
 static int rows_kill(RtxWb *wb, uint32_t id) {
     WNode *n = &wb->nodes[id];
     uint32_t k;
@@ -5475,7 +5574,7 @@ static int rows_kill(RtxWb *wb, uint32_t id) {
         wb->mas[wb->nodes[o].mai].live = 0;
         wb->nodes[o].kind = NK_DEAD;
         wb->nodes[o].ndeps = wb->nodes[o].nsd = 0;
-        g = 1;
+        g = 2;
     }
     n = &wb->nodes[id];
     n->kind = NK_DEAD;
@@ -5538,8 +5637,8 @@ static int wb_fast_rows(RtxWb *wb, const RtxDoc *d) {
     int32_t a, b, n, n2, r, c;
     size_t w0, w1, wn, pos, *abs;
     char *buf;
-    int graph = 0;
-    uint32_t *nrowcell, *nrleaf, *nrrel, *nrlen;
+    int graph = 0, kill_ma = 0;
+    uint32_t *nrowcell, *nrleaf, *nrrel, *nrlen, *nprid;
     uint32_t *newcells = NULL, nnew = 0;
     uint8_t ot[RTX_WB_COLS_MAX], osc[RTX_WB_COLS_MAX];
     for (ti = 0; ti < wb->ntab; ti++) {
@@ -5607,7 +5706,7 @@ static int wb_fast_rows(RtxWb *wb, const RtxDoc *d) {
             wb_cs_add(&t->cs[c], x->lk, x->lsc, -1);
             if (wb_has_f(x)) wb->nderived--;
             if (x->form) wb->st.formulas--;
-            if (rows_kill(wb, id)) graph = 1;
+            if (rows_kill(wb, id) == 2) kill_ma = 1;
         }
     }
     /* leaves: the deleted rows leave their leaves (old indexing) */
@@ -5618,13 +5717,25 @@ static int wb_fast_rows(RtxWb *wb, const RtxDoc *d) {
     nrlen = cap2 == t->rowcap ? t->rlen : (uint32_t *)wb_ma(wb, cap2 * sizeof(uint32_t));
     nrowcell = cap2 == t->rowcap ? t->rowcell : (uint32_t *)wb_ma(wb, cap2 * sizeof(uint32_t));
     nrleaf = cap2 == t->rowcap ? t->rleaf : (uint32_t *)wb_ma(wb, cap2 * sizeof(uint32_t));
-    if (!nrrel || !nrlen || !nrowcell || !nrleaf) return 0;
+    nprid = cap2 == t->rowcap ? t->prid : (uint32_t *)wb_ma(wb, cap2 * sizeof(uint32_t));
+    if (!nrrel || !nrlen || !nrowcell || !nrleaf || !nprid) return 0;
+    if (t->nrid + nk > t->ridcap) {
+        uint32_t rc = (t->nrid + nk) + (t->nrid + nk) / 4 + 64;
+        uint32_t *nr = (uint32_t *)wb_ma(wb, (size_t)rc * sizeof(uint32_t));
+        if (!nr) return 0;
+        memcpy(nr, t->rpos, (size_t)t->nrid * sizeof(uint32_t));
+        t->rpos = nr;
+        t->ridcap = rc;
+    }
     if (cap2 != t->rowcap) {
         memcpy(nrlen, t->rlen, (size_t)a * sizeof(uint32_t));
         memcpy(nrowcell, t->rowcell, (size_t)a * sizeof(uint32_t));
+        memcpy(nprid, t->prid, (size_t)a * sizeof(uint32_t));
     }
     memmove(nrlen + a + nk, t->rlen + b, (size_t)(n - b) * sizeof(uint32_t));
     memmove(nrowcell + a + nk, t->rowcell + b, (size_t)(n - b) * sizeof(uint32_t));
+    memmove(nprid + a + nk, t->prid + b, (size_t)(n - b) * sizeof(uint32_t));
+    t->prid = nprid;
     t->rrel = nrrel;
     t->rlen = nrlen;
     t->rowcell = nrowcell;
@@ -5649,12 +5760,14 @@ static int wb_fast_rows(RtxWb *wb, const RtxDoc *d) {
         t = &wb->tabs[ti];
         t->rowcell[a + (int32_t)k] = base;
         t->rlen[a + (int32_t)k] = (uint32_t)(e - pos);
+        t->prid[a + (int32_t)k] = t->nrid;
+        t->rpos[t->nrid] = (uint32_t)(a + (int32_t)k);
         nc = rtx_md_row_split(buf + pos, ce - pos, cells, RTX_MD_TABLE_COLS);
         for (c = 0; c < t->ncols; c++) {
             uint32_t id = base + (uint32_t)c;
             WNode *x = &wb->nodes[id];
             x->tab = (int32_t)ti;
-            x->row = a + (int32_t)k;
+            x->row = (int32_t)t->prid[a + (int32_t)k];
             x->col = c;
             if ((size_t)c >= nc) {
                 x->lk = LK_EMPTY;
@@ -5666,18 +5779,15 @@ static int wb_fast_rows(RtxWb *wb, const RtxDoc *d) {
             wb_cell_set(wb, id, buf + pos + cells[c].lo, cells[c].hi - cells[c].lo, x->raw_lo);
             x = &wb->nodes[id];
             wb_cs_add(&t->cs[c], x->lk, x->lsc, 1);
-            if (x->form) {
-                graph = 1;
-                wb->st.formulas++;
-            }
+            if (x->form) wb->st.formulas++;
             if (wb_has_f(x)) wb->nderived++;
             newcells[nnew++] = id;
         }
+        t->nrid++;
         pos = e + 1;
     }
-    /* row positions after the window */
-    for (r = a + (int32_t)nk; r < n2; r++)
-        for (c = 0; c < t->ncols; c++) wb->nodes[t->rowcell[r] + (uint32_t)c].row = r;
+    /* row positions after the window (ids stay: one write per row) */
+    for (r = a + (int32_t)nk; r < n2; r++) t->rpos[t->prid[r]] = (uint32_t)r;
     /* leaves: drop empties, take the new rows, split / merge */
     for (i = 0; i < t->nlv;) {
         if (t->lvn[i] == 0) lv_del(wb, t, i);
@@ -5724,8 +5834,48 @@ static int wb_fast_rows(RtxWb *wb, const RtxDoc *d) {
     for (i = 0; i < nnew; i++)
         if (wb->nodes[newcells[i]].form) (void)wb_bind_node(wb, newcells[i]);
     t = &wb->tabs[ti];
-    /* a cycle's path names rows by position: recompute it too */
-    if ((graph || wb->st.cycles) && !wb_regraph(wb, 1)) return 0;
+    /* The graph: new rows whose formulas read only their own row (`=@a *
+     * @b`) go first in the order (nothing else reads them but their
+     * column), each after its row's inputs; anything else, or a cycle
+     * anywhere (its path names rows by position), regraphs. */
+    graph = wb->st.cycles != 0;
+    for (k = 0; k < nk && !graph; k++) {
+        uint32_t rid = t->rowcell[a + (int32_t)k], pass, depth[RTX_WB_COLS_MAX];
+        int moved = 1;
+        for (c = 0; c < t->ncols; c++) {
+            const WNode *x = &wb->nodes[rid + (uint32_t)c];
+            depth[c] = 0;
+            if (!x->form) continue;
+            if (x->nmal) graph = 1;
+            for (i = 0; i < x->ndeps; i++)
+                if (x->deps[i] < rid || x->deps[i] >= rid + (uint32_t)t->ncols) graph = 1;
+        }
+        for (pass = 0; moved && !graph; pass++) {
+            if (pass > (uint32_t)t->ncols) graph = 1; /* a cycle inside the row */
+            moved = 0;
+            for (c = 0; c < t->ncols && !graph; c++) {
+                const WNode *x = &wb->nodes[rid + (uint32_t)c];
+                for (i = 0; i < x->ndeps; i++) {
+                    uint32_t dc = x->deps[i] - rid;
+                    if (depth[dc] + 1 > depth[c]) {
+                        depth[c] = depth[dc] + 1;
+                        moved = 1;
+                    }
+                }
+            }
+        }
+        for (c = 0; c < t->ncols && !graph; c++) {
+            WNode *x = &wb->nodes[rid + (uint32_t)c];
+            x->topo = depth[c];
+            for (i = 0; i < x->ndeps; i++)
+                if (!wb_xr_add(wb, x->deps[i], rid + (uint32_t)c)) graph = 1;
+        }
+    }
+    if (graph) {
+        if (!wb_regraph(wb, 1)) return 0;
+    } else if (kill_ma && !wb_ma_lists(wb)) {
+        return 0;
+    }
     t = &wb->tabs[ti];
     /* seeds: new cells (and their MAs), each MA over t (new rows queued),
      * every column (lookups, scalar readers), error cells whose row moved,
@@ -5742,11 +5892,17 @@ static int wb_fast_rows(RtxWb *wb, const RtxDoc *d) {
     for (i = 0; i < t->ntma; i++)
         if (wb->mas[t->tma[i]].live) wb_heap_push(wb, wb->mas[t->tma[i]].node);
     for (c = 0; c < t->ncols; c++) wb_heap_push(wb, t->col0 + (uint32_t)c);
-    for (r = a + (int32_t)nk; r < n2; r++)
-        for (c = 0; c < t->ncols; c++) {
-            uint32_t id = t->rowcell[r] + (uint32_t)c;
-            if (wb->nodes[id].form && wb->nodes[id].v.t == WV_ERR) wb_heap_push(wb, id);
-        }
+    if (t->nferr) {
+        uint32_t ne = 0;
+        for (r = 0; r < n2; r++)
+            for (c = 0; c < t->ncols; c++) {
+                uint32_t id = t->rowcell[r] + (uint32_t)c;
+                if (!wb->nodes[id].form || wb->nodes[id].v.t != WV_ERR) continue;
+                ne++;
+                if (r >= a + (int32_t)nk) wb_heap_push(wb, id);
+            }
+        t->nferr = ne;
+    }
     for (c = 0; c < t->ncols; c++) {
         if (t->ct[c] == ot[c] && t->csc[c] == osc[c]) continue;
         for (r = 0; r < n2; r++) {
@@ -5965,6 +6121,7 @@ static void wb_hook_destroy(void *ctx) {
     own = wb->own;
     free(wb->dirty);
     free(wb->ovl);
+    free(wb->xrp);
     wb->ma.destroy();
     wb->va.destroy();
     wb->sa.destroy();
@@ -6208,6 +6365,13 @@ size_t rtx_wb_reach(RtxWb *wb, const RtxDoc *d, size_t off) {
         const WNode *x = &wb->nodes[queue[qh++]];
         for (j = 0; j < x->rdn; j++) {
             uint32_t w = wb->rdeps[x->rd0 + j];
+            if (!seen[w]) {
+                seen[w] = 1;
+                queue[qt++] = w;
+            }
+        }
+        for (j = x->xr; j != WN32; j = wb->xrp[j].next) {
+            uint32_t w = wb->xrp[j].w;
             if (!seen[w]) {
                 seen[w] = 1;
                 queue[qt++] = w;
