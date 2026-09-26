@@ -127,6 +127,10 @@ CC_TARGET wb_prop_smoke exe tests/wb_prop_smoke.ccs
 CC_TARGET_INCLUDE wb_prop_smoke .
 CC_TARGET_DEPS wb_prop_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout rtx_rx rtx_page_store
 
+CC_TARGET wb_scale_smoke exe tests/wb_scale_smoke.ccs
+CC_TARGET_INCLUDE wb_scale_smoke .
+CC_TARGET_DEPS wb_scale_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout rtx_rx rtx_page_store
+
 CC_TARGET wb_scale_perf exe tests/wb_scale_perf.ccs
 CC_TARGET_INCLUDE wb_scale_perf .
 CC_TARGET_DEPS wb_scale_perf rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui rtx_ui_help

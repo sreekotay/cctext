@@ -1,0 +1,355 @@
+#!ccc ccs
+/*
+ * Workbook W2 at scale (docs/workbook.md "W2 at scale"): a generated
+ * workbook of 100k rows (tests/wb_gen.cch; 20k under a sanitizer) takes a
+ * storm of 10k random steps — cell edits in typed columns, row inserts
+ * and deletes, undo / redo, param flips, calc-line and row-formula edits
+ * — through the incremental paths only (no reparse), each step's
+ * counters asserted (what it may visit, that no MA walks its table
+ * again), and every 3334 steps (and at the end) every value and every MA is compared bit
+ * for bit (floats as raw bits) with a workbook built from scratch.
+ *
+ *   ./bin/wb_scale_smoke [rows [steps]]
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "../core/document.cch"
+#include "../core/wb.cch"
+#include "wb_gen.cch"
+
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define SCALE_ROWS 20000
+#else
+#define SCALE_ROWS 100000
+#endif
+#define SCALE_STEPS 10000
+#define SCALE_CMP_EVERY 3334
+#define DUMP_CAP ((size_t)160 << 20)
+
+static int fails = 0;
+static uint64_t rng = 0x9e3779b97f4a7c15ull;
+
+#define expect(c, what)                                                     \
+    do {                                                                    \
+        if (!(c)) {                                                         \
+            fprintf(stderr, "FAIL: step %d: %s\n", g_step, what);           \
+            fails++;                                                        \
+        }                                                                   \
+    } while (0)
+
+static int g_step;
+
+static uint64_t rnd(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+}
+
+static size_t rnd_n(size_t n) {
+    return n ? (size_t)(rnd() % n) : 0;
+}
+
+static double mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static int rep(RtxDoc *d, size_t off, size_t n, const char *s, size_t sn) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    d->replace(off, n, sn ? cc_slice_from_buffer((char *)s, sn) : cc_slice_empty()) !>;
+    return 1;
+}
+
+static char *doc_bytes(RtxDoc *d, size_t *out_n) {
+    size_t n = d->len();
+    char *p = (char *)malloc(n + 1);
+    *out_n = 0;
+    if (!p) return NULL;
+    if (n && (d->read_at(0, cc_slice_from_buffer(p, n)) ?> 0) != n) {
+        free(p);
+        return NULL;
+    }
+    p[n] = 0;
+    *out_n = n;
+    return p;
+}
+
+static const char *const g_cvals[] = {"0.1", "1e-300", "-2.5e10", "1e300", "3.14159", "-0.5",
+                                      "7e-5", "2.5", "-1e-10", "123456.789"};
+
+static char g_a[DUMP_CAP];
+static char g_b[DUMP_CAP];
+
+static void compare(RtxDoc *d, RtxWb *wb) {
+    int flags = RTX_WB_DUMP_BITS | RTX_WB_DUMP_MAS | RTX_WB_DUMP_SPANS;
+    size_t n = 0, la, lb;
+    char *p = doc_bytes(d, &n);
+    RtxDoc x = {0};
+    RtxWb *xw;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        free(p);
+        return;
+    }
+    if (!p) {
+        expect(0, "doc bytes");
+        return;
+    }
+    la = rtx_wb_dump_ex(wb, d, flags, g_a, sizeof g_a);
+    {
+        CCArena sa = cc_arena_heap(n + 64) @destroy;
+        char[:] sl = cc_slice_from_buffer(p, n);
+        char[:] keep = sl.clone_into(sa) !>;
+        x.from_buffer(keep) !>;
+        xw = rtx_wb_attach(&x);
+        lb = rtx_wb_dump_ex(xw, &x, flags, g_b, sizeof g_b);
+        RtxDoc_destroy(&x);
+    }
+    expect(la + 1 < sizeof g_a, "dump fits");
+    if (la != lb || memcmp(g_a, g_b, la) != 0) {
+        size_t i = 0, ls = 0;
+        while (i < la && i < lb && g_a[i] == g_b[i]) {
+            if (g_a[i] == '\n') ls = i + 1;
+            i++;
+        }
+        fprintf(stderr, "FAIL: step %d: incremental != scratch\n  inc:     %.120s\n  scratch: %.120s\n",
+                g_step, g_a + ls, g_b + ls);
+        fails++;
+    }
+    free(p);
+}
+
+/* [lo, hi) trimmed of blanks. */
+static void trim(RtxDoc *d, size_t *lo, size_t *hi) {
+    char b[256];
+    size_t n = *hi - *lo, a = 0, e;
+    if (n > sizeof b) n = sizeof b;
+    n = d->read_at(*lo, cc_slice_from_buffer(b, n)) ?> 0;
+    e = n;
+    while (a < e && b[a] == ' ') a++;
+    while (e > a && b[e - 1] == ' ') e--;
+    *hi = *lo + e;
+    *lo += a;
+}
+
+/* The first `needle` in [from, from + span): its offset, or -1. */
+static size_t find_in(RtxDoc *d, size_t from, size_t span, const char *needle) {
+    char *p;
+    char *hit;
+    size_t n = d->len(), got, off = (size_t)-1;
+    if (from >= n) return off;
+    if (span > n - from) span = n - from;
+    p = (char *)malloc(span + 1);
+    if (!p) return off;
+    got = d->read_at(from, cc_slice_from_buffer(p, span)) ?> 0;
+    p[got] = 0;
+    hit = strstr(p, needle);
+    if (hit) off = from + (size_t)(hit - p);
+    free(p);
+    return off;
+}
+
+int main(int argc, char **argv) {
+    WbGen g = {0};
+    size_t n = 0, off, k_off;
+    char *src;
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats s0, s1;
+    char val[64], rowbuf[256];
+    long next_id;
+    int steps = SCALE_STEPS, ncmp = 0;
+    size_t n_cell = 0, n_ins = 0, n_del = 0, n_undo = 0, n_redo = 0, n_param = 0, n_calc = 0,
+           n_form = 0, max_vis_e = 0, max_vis = 0;
+    double t0 = mono_ms(), t_open;
+    CCArena keep_a;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    g.rows = argc > 1 ? atoi(argv[1]) : SCALE_ROWS;
+    if (argc > 2) steps = atoi(argv[2]);
+    g.nagg_a = 20;
+    g.nagg_b = 10;
+    g.chain = 10;
+    src = wbgen(&g, &n);
+    if (!src) return 1;
+    keep_a = cc_arena_heap(n + 64);
+    {
+        char[:] sl = cc_slice_from_buffer(src, n);
+        char[:] keep = sl.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    free(src);
+    wb = rtx_wb_attach(&d);
+    if (!wb) return 1;
+    rtx_wb_stats(wb, &d, &s0);
+    t_open = mono_ms() - t0;
+    expect(!s0.off && s0.rebuilds == 1, "opened, one parse");
+    /* `k = 500`: before the table, so its offset never moves */
+    k_off = find_in(&d, 0, 4096, "\nk = ");
+    expect(k_off != (size_t)-1, "param k");
+    k_off += 5;
+    next_id = (long)g.rows + 1;
+    for (g_step = 0; g_step < steps; g_step++) {
+        size_t lo = 0, hi = 0, r, nrows = rtx_wb_rows(wb, &d, "Big");
+        int op = (int)rnd_n(100);
+        r = rnd_n(nrows);
+        rtx_wb_counters(wb, &d, &s0);
+        if (op < 45) {
+            /* a literal: a (int), b (dec 2), c (float), e (int) */
+            static const int cols[] = {2, 3, 4, 6};
+            int col = cols[rnd_n(4)];
+            if (!rtx_wb_cell_at(wb, &d, "Big", r, col, &lo, &hi)) {
+                expect(0, "cell");
+                continue;
+            }
+            trim(&d, &lo, &hi);
+            if (col == 3)
+                snprintf(val, sizeof val, "%d.%02d", (int)rnd_n(10000), (int)rnd_n(100));
+            else if (col == 4)
+                snprintf(val, sizeof val, "%s", g_cvals[rnd_n(10)]);
+            else
+                snprintf(val, sizeof val, "%d", (int)rnd_n(col == 2 ? 1000 : 97));
+            expect(rep(&d, lo, hi - lo, val, strlen(val)), "cell edit");
+            rtx_wb_counters(wb, &d, &s1);
+            expect(s1.rebuilds == s0.rebuilds && s1.fast_cell == s0.fast_cell + 1, "cell: cell path");
+            expect(s1.ma_full == s0.ma_full, "cell: no MA walks its table");
+            if (col == 6) {
+                if (s1.visited > max_vis_e) max_vis_e = s1.visited;
+                expect(s1.visited <= 8, "cell e: visits its one aggregate");
+            } else {
+                if (s1.visited > max_vis) max_vis = s1.visited;
+                expect(s1.visited <= 200, "cell: visits its readers only");
+            }
+            n_cell++;
+        } else if (op < 55) {
+            size_t rn = wbgen_row(rowbuf, sizeof rowbuf, next_id++);
+            if (!rtx_wb_cell_at(wb, &d, "Big", r, 0, &lo, &hi)) {
+                expect(0, "row");
+                continue;
+            }
+            expect(rep(&d, lo - 1, 0, rowbuf, rn), "row insert");
+            rtx_wb_counters(wb, &d, &s1);
+            expect(s1.rebuilds == s0.rebuilds && s1.fast_rows == s0.fast_rows + 1, "insert: row path");
+            expect(s1.ma_full == s0.ma_full && s1.regraphs == s0.regraphs,
+                   "insert: no MA walk, no regraph");
+            n_ins++;
+        } else if (op < 65) {
+            size_t lo2 = 0, hi2 = 0;
+            if (nrows < 1000 || r + 1 >= nrows) continue;
+            if (!rtx_wb_cell_at(wb, &d, "Big", r, 0, &lo, &hi) ||
+                !rtx_wb_cell_at(wb, &d, "Big", r + 1, 0, &lo2, &hi2)) {
+                expect(0, "rows");
+                continue;
+            }
+            expect(rep(&d, lo - 1, lo2 - lo, "", 0), "row delete");
+            rtx_wb_counters(wb, &d, &s1);
+            expect(s1.rebuilds == s0.rebuilds && s1.fast_rows == s0.fast_rows + 1, "delete: row path");
+            expect(s1.ma_full == s0.ma_full, "delete: no MA walk");
+            n_del++;
+        } else if (op < 74) {
+            if (d.can_undo()) {
+                d.undo() !>;
+                rtx_wb_counters(wb, &d, &s1);
+                expect(s1.rebuilds == s0.rebuilds, "undo: no reparse");
+                n_undo++;
+            }
+        } else if (op < 78) {
+            if (d.can_redo()) {
+                d.redo() !>;
+                rtx_wb_counters(wb, &d, &s1);
+                expect(s1.rebuilds == s0.rebuilds, "redo: no reparse");
+                n_redo++;
+            }
+        } else if (op < 80) {
+            /* k: only `n_big = count(Big where a > k)` walks, once */
+            char kb[16];
+            size_t e = 0;
+            n = d.read_at(k_off, cc_slice_from_buffer(kb, sizeof kb - 1)) ?> 0;
+            kb[n] = 0;
+            while (kb[e] >= '0' && kb[e] <= '9') e++;
+            snprintf(val, sizeof val, "%d", 400 + (int)rnd_n(200));
+            expect(e > 0 && rep(&d, k_off, e, val, strlen(val)), "param");
+            rtx_wb_counters(wb, &d, &s1);
+            expect(s1.rebuilds == s0.rebuilds && s1.fast_line == s0.fast_line + 1, "param: line path");
+            expect(s1.ma_full <= s0.ma_full + 1, "param: at most the one MA reading k walks");
+            n_param++;
+        } else if (op < 90) {
+            /* chainN = chain(N-1) + N: its constant */
+            int c = 1 + (int)rnd_n((size_t)g.chain - 1);
+            char want[32], kb[16];
+            size_t at, e = 0;
+            if (!rtx_wb_cell_at(wb, &d, "Big", nrows - 1, 0, &lo, &hi)) {
+                expect(0, "last row");
+                continue;
+            }
+            snprintf(want, sizeof want, "\nchain%d = chain%d + ", c, c - 1);
+            at = find_in(&d, lo, 1u << 16, want);
+            if (at == (size_t)-1) {
+                expect(0, "chain line");
+                continue;
+            }
+            at += strlen(want);
+            n = d.read_at(at, cc_slice_from_buffer(kb, sizeof kb - 1)) ?> 0;
+            kb[n] = 0;
+            while (kb[e] >= '0' && kb[e] <= '9') e++;
+            snprintf(val, sizeof val, "%d", (int)rnd_n(1000));
+            expect(e > 0 && rep(&d, at, e, val, strlen(val)), "calc edit");
+            rtx_wb_counters(wb, &d, &s1);
+            expect(s1.rebuilds == s0.rebuilds && s1.fast_line == s0.fast_line + 1, "calc: line path");
+            expect(s1.ma_full == s0.ma_full && s1.visited <= 16, "calc: its chain only");
+            n_calc++;
+        } else {
+            /* f1 of a row: `=@a * @b` <-> `=@a + @b` */
+            char fb[16];
+            if (!rtx_wb_cell_at(wb, &d, "Big", r, 7, &lo, &hi)) {
+                expect(0, "f1");
+                continue;
+            }
+            trim(&d, &lo, &hi);
+            n = d.read_at(lo, cc_slice_from_buffer(fb, sizeof fb - 1)) ?> 0;
+            fb[n] = 0;
+            if (hi - lo != 8 || strncmp(fb, "=@a ", 4)) {
+                expect(0, "f1 text");
+                continue;
+            }
+            expect(rep(&d, lo + 4, 1, fb[4] == '*' ? "+" : "*", 1), "row formula edit");
+            rtx_wb_counters(wb, &d, &s1);
+            expect(s1.rebuilds == s0.rebuilds && s1.fast_cell == s0.fast_cell + 1, "f1: cell path");
+            expect(s1.ma_full == s0.ma_full && s1.visited <= 200, "f1: its readers only");
+            n_form++;
+        }
+        if ((g_step + 1) % SCALE_CMP_EVERY == 0 || g_step + 1 == steps) {
+            compare(&d, wb);
+            ncmp++;
+        }
+        if (fails > 20) break;
+    }
+    rtx_wb_counters(wb, &d, &s1);
+    printf("wb_scale_smoke: %d rows, %d steps (cell %zu, insert %zu, delete %zu, undo %zu, redo %zu, "
+           "param %zu, calc %zu, row formula %zu), %d scratch compares, max visits %zu (e) / %zu, "
+           "rebuilds %zu, open %.0f ms, total %.0f ms\n",
+           g.rows, g_step, n_cell, n_ins, n_del, n_undo, n_redo, n_param, n_calc, n_form, ncmp,
+           max_vis_e, max_vis, s1.rebuilds, t_open, mono_ms() - t0);
+    expect(s1.rebuilds == 1, "the storm never reparsed");
+    RtxDoc_destroy(&d);
+    keep_a.destroy();
+    if (fails) {
+        fprintf(stderr, "wb_scale_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("wb_scale_smoke: ok\n");
+    return 0;
+}
