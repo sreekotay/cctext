@@ -2,8 +2,10 @@
 /*
  * Regex engine smoke: a pattern / subject / expected table (search and
  * anchored), the old engine's defects, UTF-8, Onig syntax, compile
- * errors, pathological patterns (must finish inside the budget), and a
- * randomized three-way differential (lazy DFA vs Pike VM vs backtracker).
+ * errors, pathological patterns (must finish inside the budget), a
+ * randomized three-way differential (lazy DFA vs Pike VM vs backtracker),
+ * and the reverse inner search (which patterns take it, a differential
+ * against the plain DFA and the Pike VM, linear time on adversarial text).
  */
 #include <ccc/std/prelude.cch>
 #include <ccc/stdio.cch>
@@ -260,8 +262,9 @@ static void run_cases(void) {
         in.n = n;
         in.gpos = RTX_RX_UNSET;
         in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
-        for (force = 0; force <= 2; force++) {
+        for (force = 0; force <= 4; force++) {
             char what[96];
+            if (force == 3) continue; /* 4: the reverse inner search where built */
             if (force == 1 && rtx_rx_mode(rx) == RTX_RX_BACKTRACK) continue;
             in.force = (unsigned)force;
             ms = me = 0;
@@ -899,6 +902,306 @@ static void run_dfa_cache(void) {
     a.destroy();
 }
 
+/* Reverse inner: which patterns take it (compile's safety proofs), and
+ * answers on short subjects with it forced (force 4). */
+typedef struct {
+    const char *pat;
+    unsigned fl;
+    int inner; /* 1: compile builds the reverse inner search */
+} RiShape;
+
+static const RiShape ri_shapes[] = {
+    {"\\w+\\s+Holmes\\s+\\w+", 0, 1},       /* sep: \s+ vs \w+ and 'H' */
+    {"\\w+\\s+\xD0\xA5\xD0\xBE\xD0\xBB\xD0\xBC\xD1\x81\\s+\\w+", 0, 1},
+    {"\\w+\\s+(?:Holmes|Watson)", 0, 1},     /* a literal set */
+    {"[a-z_]+\\s*=\\s*NULL", 0, 1},          /* byte: P never takes 'N' */
+    {"\\w+\\s*Holmes", 0, 1},               /* chain: C0+ C1* */
+    {"(?s).*TODO", 0, 1},                   /* chain: one run, across newlines */
+    {"\\b\\w{2,}\\s*Holmes", 0, 0},          /* chain needs C0{0,1} before C1* */
+    {"\\w+\\s*\\w+Holmes", 0, 0},            /* no proof: P may hold the literal */
+    {"\\s*\\w*\\s+\\w+Holmes", 0, 0},
+    {"\\w+Holmes", 0, 0},                 /* \w takes no newline: the line prefilter */
+    {"[a-z]+_send\\(", 0, 0},               /* the line prefilter already takes it */
+    {"\\bxylo\\w*", 0, 0},                  /* prefix literal: the prefilter */
+    {NULL, 0, 0},
+};
+
+typedef struct {
+    const char *pat;
+    const char *subj;
+    int ms;
+    int me;
+} RiCase;
+
+static const RiCase ri_cases[] = {
+    {"\\w+\\s+Holmes\\s+\\w+", "Mr Holmes. Dr\n  Holmes said", 11, 27},
+    {"\\w+\\s+Holmes\\s+\\w+", "Holmes Holmes Holmes", 0, 20},
+    {"\\w+\\s+Holmes", "HolmesHolmes Holmes", 0, 19},
+    {"\\w+\\s+Holmes", "a\n\n\nHolmes", 0, 10},
+    {"\\w+\\s*Holmes", "xHolmesHolmes!", 0, 13},
+    {"\\w+\\s*Holmes!", "xHolmesHolmes yHolmes!", 14, 22},
+    {"(?s).*TODO", "a\nb TODO c TODO\nd", 0, 15},
+    {"[a-z_]+\\s*=\\s*NULL", "x = 1; y_z =\n NULL;", 7, 18},
+    {"[a-z_]+\\s*=\\s*NULL", "A = NULL", -1, 0},
+    {"\\w+\\s+(?:Holmes|Watson)", "Dr. Watson, Mr Holmes", 12, 21},
+    {"\\w+\\s+Holmes", "\xC3\xA9t\xC3\xA9 Holmes", 0, 12},
+    {"\\w+\\s+Holmes", "\xE4\xB8 Holmes", -1, 0},  /* a stray lead is not \w */
+    {"\\w+\\s+Holmes", "\xE4\xB8\xAD\xC2\xA0Holmes", 0, 11}, /* U+00A0 is \s */
+    {NULL, NULL, 0, 0},
+};
+
+static void run_ri_cases(void) {
+    CCArena a = cc_arena_heap(megabytes(4));
+    RtxRxScratch s = {0};
+    size_t i;
+    int f;
+    for (i = 0; ri_shapes[i].pat; i++) {
+        RtxRx *rx = try_compile(ri_shapes[i].pat, ri_shapes[i].fl, a, NULL);
+        char what[128];
+        snprintf(what, sizeof(what), "reverse inner built = %d", ri_shapes[i].inner);
+        expect(rx && rtx_rx_has_inner(rx) == ri_shapes[i].inner, what, ri_shapes[i].pat, "");
+    }
+    for (i = 0; ri_cases[i].pat; i++) {
+        const RiCase *c = &ri_cases[i];
+        RtxRx *rx = try_compile(c->pat, 0, a, NULL);
+        RtxRxIn in = {0};
+        size_t n = strlen(c->subj);
+        if (!rx) {
+            expect(0, "compile", c->pat, c->subj);
+            continue;
+        }
+        expect(rtx_rx_has_inner(rx), "reverse inner built", c->pat, c->subj);
+        in.s = c->subj;
+        in.n = n;
+        in.gpos = RTX_RX_UNSET;
+        in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+        for (f = 0; f < 3; f++) {
+            size_t ms = 0, me = 0;
+            char what[128];
+            int r;
+            in.force = f == 0 ? 4u : f == 1 ? 3u : 1u;
+            r = rtx_rx_search(rx, &in, 0, n + 1, 1, &s, &ms, &me);
+            snprintf(what, sizeof(what), "ri case %zu force %u (got %d [%zu,%zu))", i, in.force,
+                     r, ms, me);
+            if (c->ms < 0) expect(r == RTX_RX_NONE, what, c->pat, c->subj);
+            else
+                expect(r == RTX_RX_MATCH && ms == (size_t)c->ms && me == (size_t)c->me, what,
+                       c->pat, c->subj);
+        }
+    }
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
+/* Reverse inner differential: X+ sep literal Y shapes (the literal after
+ * an unbounded part that may take a newline) on haystacks with newlines,
+ * broken UTF-8 and literal pieces. Every hit list from lo, and every cut
+ * window (partial answers at a window that is not the text end), must
+ * equal the plain DFA (force 3) and the Pike VM, with the reverse inner
+ * search forced (force 4) and in auto. */
+static void run_ri_fuzz(void) {
+    static const char *xs[] = {"\\w", "[a-c]", "[a-z]", "\\S", "\\d", "[^\\n]", ".", "[^x]",
+                               "[ab]", "\\w\\w", "[a-z\xC3\xA9]", "(?:ab|a)", "\\D", "[^ ]",
+                               "(?s:.)", "\\W", "[\xD0\xB0-\xD1\x8F]"};
+    static const char *qs[] = {"+", "*", "+?", "{2,}", "{1,3}", "", "*?"};
+    static const char *seps[] = {"\\s+", "\\s*", " ", "\\s", "\\s+\\b", "[ \\n]+", "\\W+", "-",
+                                 "", "\\s{1,2}", "(?:\\s|,)+", "[^a-z]+", "\\s+?"};
+    static const char *lits[] = {"Holmes", "ab", "abab", "aab", "xy", "_x\\(", "\xC3\xA9",
+                                 "\xD0\xB6\xD0\xB6", "\xE4\xB8\xAD", "Ab", "x", "(?:ab|ba)",
+                                 "(?:Holmes|Watson)", "(?i:hol)", "b\\n", "a-", "\\(\\)"};
+    static const char *ys[] = {"", "\\w*", "\\s+\\w+", "[0-9]+", "x?", "\\b", "$", "(?:ab)*",
+                               ".*", "\\s*\\w{2}", "\\z"};
+    static const char *alpha[] = {"a", "b", "c", "x", "y", " ", " ", "\n", "\n", "-", "_", "(",
+                                  ",", "1", "9", "\xC3\xA9", "\xD0\xB6", "\xE4\xB8\xAD", "A",
+                                  "H", "Holmes", "Watson", "ab", "ba", "hol", "HOL", "xy",
+                                  "_x(", "()", "\xE4", "\x80", "\xE4\xB8", "\xC2\xAB",
+                                  "\xC2\xA0"};
+    CCArena a = cc_arena_heap(megabytes(16));
+    RtxRxScratch s = {0};
+    int it, bad = 0, iters = 2500, inner = 0, k, f;
+    const char *ev = getenv("RX_RI_N");
+    static char subj[8192];
+    if (ev && ev[0]) iters = atoi(ev);
+    for (it = 0; it < iters; it++) {
+        char pat[256];
+        RtxRxIn in = {0};
+        RtxRx *rx;
+        size_t n, len, lo;
+        uint32_t hsh[4];
+        int cnt[4];
+        unsigned fl = rnd(8) == 0 ? RTX_RX_ICASE : 0u;
+        const char *pre = rnd(4) ? "" : rnd(2) ? "^" : "\\b";
+        const char *opt = rnd(7) ? "" : rnd(2) ? "(?m)" : "(?s)";
+        snprintf(pat, sizeof(pat), "%s%s%s%s%s", opt, pre, xs[rnd(17)], qs[rnd(7)], seps[rnd(13)]);
+        if (rnd(4) == 0) {
+            strcat(pat, xs[rnd(17)]);
+            strcat(pat, qs[rnd(7)]);
+        }
+        strcat(pat, lits[rnd(17)]);
+        strcat(pat, ys[rnd(11)]);
+        rx = try_compile(pat, fl, a, NULL);
+        if (!rx || !rtx_rx_has_inner(rx)) continue;
+        inner++;
+        len = rnd(4) ? rnd(120) : 200 + rnd(3000);
+        subj[0] = 0;
+        n = 0;
+        while (n < len) {
+            const char *c = alpha[rnd(34)];
+            strcat(subj, c);
+            n += strlen(c);
+        }
+        in.s = subj;
+        in.n = n;
+        in.gpos = RTX_RX_UNSET;
+        in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+        lo = rnd(4) || !n ? 0 : rnd((uint32_t)n);
+        /* every hit from lo: 4 reverse inner forced, 0 auto, 3 plain DFA, 1 Pike */
+        for (f = 0; f < 4; f++) {
+            static const unsigned fo[4] = {4, 0, 3, 1};
+            size_t p = lo;
+            in.force = fo[f];
+            cnt[f] = 0;
+            hsh[f] = 2166136261u;
+            while (p <= n && cnt[f] < 4000) {
+                size_t ms = 0, me = 0;
+                int r = rtx_rx_search(rx, &in, p, n + 1, 1, &s, &ms, &me);
+                if (r != RTX_RX_MATCH) break;
+                cnt[f]++;
+                hsh[f] = (hsh[f] ^ (uint32_t)ms) * 16777619u;
+                hsh[f] = (hsh[f] ^ (uint32_t)me) * 16777619u;
+                p = me > ms ? me : ms + 1;
+            }
+        }
+        if (cnt[0] != cnt[2] || hsh[0] != hsh[2] || cnt[1] != cnt[2] || hsh[1] != hsh[2] ||
+            cnt[3] != cnt[2] || hsh[3] != hsh[2]) {
+            char eb[1200];
+            if (bad < 12)
+                fprintf(stderr, "RI MISMATCH /%s/%s on \"%s\" lo=%zu: ri %d auto %d dfa %d pike %d hits\n",
+                        pat, fl ? "i" : "", esc(subj, eb, sizeof(eb)), lo, cnt[0], cnt[1], cnt[2],
+                        cnt[3]);
+            bad++;
+            continue;
+        }
+        /* cut windows (not the text end), and eof searches that stop early */
+        for (k = 0; k < 8; k++) {
+            size_t cut = rnd((uint32_t)n + 1), stop, l0, ms[4] = {0, 0, 0, 0}, me[4] = {0, 0, 0, 0};
+            int r[4], eof = k >= 6;
+            static const unsigned fo[4] = {4, 0, 3, 1};
+            if (cut == 0) continue;
+            stop = 1 + rnd((uint32_t)cut);
+            l0 = rnd((uint32_t)stop);
+            in.n = eof ? n : cut;
+            for (f = 0; f < 4; f++) {
+                in.force = fo[f];
+                r[f] = rtx_rx_search(rx, &in, l0, stop, eof, &s, &ms[f], &me[f]);
+            }
+            in.n = n;
+            for (f = 0; f < 4; f++) {
+                if (f == 2) continue;
+                if (r[f] != r[2] || (r[2] != RTX_RX_NONE && ms[f] != ms[2]) ||
+                    (r[2] == RTX_RX_MATCH && me[f] != me[2])) {
+                    char eb[1200];
+                    if (bad < 12)
+                        fprintf(stderr, "RI WINDOW MISMATCH /%s/%s on \"%s\" n=%zu lo=%zu stop=%zu eof=%d: dfa %d [%zu,%zu) %s %d [%zu,%zu)\n",
+                                pat, fl ? "i" : "", esc(subj, eb, sizeof(eb)), eof ? n : cut, l0,
+                                stop, eof, r[2], ms[2], me[2],
+                                f == 0 ? "ri" : f == 1 ? "auto" : "pike", r[f], ms[f], me[f]);
+                    bad++;
+                    break;
+                }
+            }
+        }
+    }
+    checks++;
+    if (bad) fails++;
+    expect(inner > iters / 5, "reverse inner fuzz: enough patterns take it", "", "");
+    printf("ri fuzz: %d patterns (%d with reverse inner), %d mismatches, ri work %zu bytes, %zu bails\n",
+           iters, inner, bad, s.ri_work, s.ri_bails);
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
+/* Reverse inner stays linear: inputs where a naive reverse scan from every
+ * literal hit (or a forward scan from every start) is quadratic. The bytes
+ * it reads stay within a constant factor of the text, the answer is the
+ * plain DFA's and the time stays in line with it. */
+static void run_ri_linear(void) {
+    static const struct {
+        const char *pat;
+        const char *unit; /* repeated to fill the text */
+        const char *tail; /* at the very end */
+    } adv[] = {
+        /* one \w run, the literal every 7 bytes, no match */
+        {"\\w+\\s+Holmes", "abHolmes", ""},
+        {"\\w+\\s*Holmes!", "xHolmes", ""},
+        /* every hit reverse-scans back to the start of the run, then the
+         * forward confirm runs to its end: n^2 without the guards */
+        {"[a-zQ\\s]+Q\\d", "Q", ""},
+        {"[a-zQ\\s]+Q\\d", "a\nQ", "Q1"},
+        /* the literal every 9 bytes, each confirm fails after it */
+        {"\\w+\\s+Holmes\\d", "a Holmes ", ""},
+        /* a P start at every hit, the confirm fails at once */
+        {"\\w+\\s+Holmes\\s+\\w+", "x Holmes.", "x Holmes y"},
+        /* long runs of P between hits */
+        {"(?s).*TODO\\d", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaTODO\n", ""},
+    };
+    CCArena a = cc_arena_heap(megabytes(4));
+    RtxRxScratch s = {0};
+    size_t n = (size_t)1 << 20, k;
+    char *t = (char *)malloc(n + 64);
+    if (!t) return;
+    for (k = 0; k < sizeof(adv) / sizeof(adv[0]); k++) {
+        RtxRx *rx = try_compile(adv[k].pat, 0, a, NULL);
+        RtxRxIn in = {0};
+        size_t ul = strlen(adv[k].unit), tl = strlen(adv[k].tail), m = 0, w0, b0, hits[2] = {0, 0};
+        double tm[2] = {0, 0};
+        int f;
+        if (!rx) {
+            expect(0, "compile", adv[k].pat, "");
+            continue;
+        }
+        expect(rtx_rx_has_inner(rx), "reverse inner built", adv[k].pat, "");
+        while (m + ul + tl <= n) {
+            memcpy(t + m, adv[k].unit, ul);
+            m += ul;
+        }
+        memcpy(t + m, adv[k].tail, tl);
+        m += tl;
+        in.s = t;
+        in.n = m;
+        in.gpos = RTX_RX_UNSET;
+        in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+        w0 = s.ri_work;
+        b0 = s.ri_bails;
+        /* 0 auto (reverse inner, guards and rest), 1 plain DFA; every
+         * match, as find walks them, then a cut window */
+        for (f = 0; f < 2; f++) {
+            size_t p = 0, ms = 0, me = 0;
+            double t0 = now_ms();
+            in.force = f == 0 ? 0u : 3u;
+            while (p < m && rtx_rx_search(rx, &in, p, m, 1, &s, &ms, &me) == RTX_RX_MATCH) {
+                hits[f]++;
+                p = me > ms ? me : ms + 1;
+            }
+            in.n = m - 5;
+            (void)rtx_rx_search(rx, &in, m / 2, m / 2 + 4096, 0, &s, &ms, &me);
+            in.n = m;
+            tm[f] = now_ms() - t0;
+        }
+        printf("ri linear: /%s/ on %zu bytes: %zu hits, ri work %zu bytes (%.2fx), %zu bails, %.2f ms vs plain %.2f ms\n",
+               adv[k].pat, m, hits[0], s.ri_work - w0, (double)(s.ri_work - w0) / (double)m,
+               s.ri_bails - b0, tm[0], tm[1]);
+        expect(hits[0] == hits[1], "reverse inner: same hits as the plain DFA", adv[k].pat, "");
+        expect(s.ri_work - w0 <= 4 * m + ((size_t)64 << 10), "reverse inner: linear byte work",
+               adv[k].pat, "");
+        expect(tm[0] <= 4.0 * tm[1] + 20.0, "reverse inner: time in line with the plain DFA",
+               adv[k].pat, "");
+    }
+    free(t);
+    rtx_rx_scratch_drop(&s);
+    a.destroy();
+}
+
 /* rx_smoke --one PATTERN SUBJECT LO [EOFCUT]: print each engine's answer
  * (a hook for shrinking a fuzz mismatch by hand). */
 static int run_one(int argc, char **argv) {
@@ -925,7 +1228,7 @@ static int run_one(int argc, char **argv) {
         eof = 0;
         stop = (size_t)atoi(argv[5]);
     }
-    for (f = 0; f < 4; f++) {
+    for (f = 0; f < 5; f++) {
         in.force = (unsigned)f;
         ms = me = 0;
         r = rtx_rx_search(rx, &in, lo, stop, eof, &s, &ms, &me);
@@ -944,6 +1247,9 @@ int main(int argc, char **argv) {
     run_patho();
     run_fuzz();
     run_pf_fuzz();
+    run_ri_cases();
+    run_ri_fuzz();
+    run_ri_linear();
     run_dfa_cache();
     if (fails) {
         fprintf(stderr, "rx_smoke: %d of %d checks failed\n", fails, checks);

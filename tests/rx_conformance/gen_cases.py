@@ -7,6 +7,9 @@ Writes `name \\t pattern \\t haystack` lines (\\xNN escapes) on stdout.
                                          with (?m) / (?i) / (?s)
     gen_cases.py fuzz SEED COUNT         random patterns in the syntax both
                                          engines share, random haystacks
+    gen_cases.py inner SEED COUNT        reverse inner shapes (X+ \\s+ lit Y*,
+                                         X+lit, .*lit) on haystacks with
+                                         newlines and planted literals
 
 Pipeline (see bench/../README in tests/rx_conformance/convert.py):
 
@@ -115,12 +118,48 @@ def fuzz(seed, count):
         print('fuzz/%d-%d\t%s\t%s' % (seed, k, esc(p), esc(h)))
 
 
+# Reverse inner / reverse suffix shapes: an unbounded prefix (that may
+# take a newline) before a required literal, e.g. `\w+\s+Holmes\s+\w+`,
+# `[a-z]+_x\(`, `.*ab`, on longer haystacks with newlines and planted
+# literals (overlapping ones too).
+INNER_X = ['\\w', '[a-c]', '[a-z]', '\\S', '\\d', '[^\\n]', '.', '[^x]', '[ab]', '\\w\\w',
+           '[a-zé]', '(?:ab|a)', '\\D', '[^ ]']
+INNER_SEP = ['\\s+', '\\s*', ' ', '\\s', '\\s+\\b', '[ \\n]+', '\\W+', '-', '', '\\s{1,2}',
+             '(?:\\s|,)+', '[^a-z]+']
+INNER_LIT = ['Holmes', 'ab', 'abab', 'aab', 'xy', '_x\\(', 'é', 'δΔ', '中', 'Ab', 'x',
+             '(?:ab|ba)', '(?:Holmes|Watson)', '(?i:hol)', 'b\\n', 'a-']
+INNER_Y = ['', '\\w*', '\\s+\\w+', '[0-9]+', 'x?', '\\b', '$', '(?:ab)*', '.*', '\\s*\\w{2}']
+INNER_Q = ['+', '*', '+?', '{2,}', '{1,3}', '', '*?']
+INNER_TEXT = ['a', 'b', 'c', 'x', 'y', ' ', ' ', '\n', '\n', '-', '_', '(', ',', '1', '9', 'é',
+              'δ', 'Δ', '中', 'A', 'H', 'Holmes', 'Watson', 'ab', 'ba', 'hol', 'HOL', 'xy', '_x(']
+
+
+def inner(seed, count):
+    r = random.Random(seed)
+    for k in range(count):
+        x = r.choice(INNER_X) + r.choice(INNER_Q)
+        if r.random() < 0.3:
+            x = r.choice(['^', '\\b', '(', '(?:']) + x
+            if x[0] == '(':
+                x += ')'
+        sep = r.choice(INNER_SEP)
+        if r.random() < 0.25:
+            sep = sep + r.choice(INNER_X) + r.choice(INNER_Q)
+        p = x + sep + r.choice(INNER_LIT) + r.choice(INNER_Y)
+        if r.random() < 0.15:
+            p = r.choice(['(?i)', '(?m)', '(?s)']) + p
+        h = ''.join(r.choice(INNER_TEXT) for _ in range(r.randint(0, 60)))
+        print('inner/%d-%d\t%s\t%s' % (seed, k, esc(p), esc(h)))
+
+
 def main():
     a = sys.argv[1:]
     if len(a) == 2 and a[0] == 're2':
         re2(a[1])
     elif len(a) == 3 and a[0] == 'fuzz':
         fuzz(int(a[1]), int(a[2]))
+    elif len(a) == 3 and a[0] == 'inner':
+        inner(int(a[1]), int(a[2]))
     else:
         sys.stderr.write(__doc__)
         return 2
