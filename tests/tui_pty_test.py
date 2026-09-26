@@ -1897,6 +1897,95 @@ def case_present(exe, tmp):
           repr(out.stdout[:200] + out.stderr[:200]))
 
 
+def case_wb_annotation(exe, tmp):
+    """Workbook (docs/workbook.md "Live value"): the caret in a formula
+    shows ` → value` after it, dimmed, changing with every keystroke (an
+    error while half-typed), in Rich and Source; the cursor stays at the
+    formula's end, before the annotation; the file never holds it."""
+    if pyte is None:
+        print("skip: wb annotation (no pyte)")
+        return
+    body = (b"# S\n\nTable: T\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | =@a * 2 |\n\n"
+            b"```calc\ns = sum(T.a)\n```\n")
+    t, path = open_tui(exe, tmp, "w.wb.md", body)
+    res = {}
+
+    def calc_line():
+        for ln in (screen_text(t) or "").split("\n"):
+            if "s = " in ln:
+                return ln
+        return ""
+
+    try:
+        txt = screen_text(t) or ""
+        if "rich" not in txt.split("\n")[-1]:
+            t.send(b"\x04", 0.4)  # Ctrl-D: Rich on
+        res["before"] = calc_line()
+        t.send(b"\x1b[1;5F", 0.3)  # Ctrl-End
+        t.send(b"\x1b[A\x1b[A\x1b[F", 0.4)  # Up, Up, End: after `)`
+        res["on"] = calc_line()
+        res["dim"] = None
+        sc = t.screen()
+        for y in range(t.rows):
+            row = "".join(sc.buffer[y][x].data for x in range(t.cols))
+            if "s = sum" in row and "\u2192" in row:
+                x = row.index("\u2192")
+                res["dim"] = (sc.buffer[y][x].fg, sc.buffer[y][row.index("s = ")].fg)
+        c = cursor_at(t)
+        res["cur"] = (c, cell_char(t, c[0] - 1, c[1]) if c else None)
+        steps = []
+        for key, want in ((b"+", "#parse"), (b"1", "5"), (b"0", "14")):
+            t.send(key, 0.35)
+            steps.append((key, want, calc_line()))
+        res["steps"] = steps
+        t.send(b"\x7f" * 4, 0.5)  # back to `s = sum(T.a`: half-typed
+        res["half"] = calc_line()
+        t.send(b"\x04", 0.4)  # Ctrl-D: Source
+        res["source"] = calc_line()
+        t.send(b")", 0.3)
+        t.send(b"\x1b[A", 0.4)  # the caret leaves the formula
+        res["off"] = calc_line()
+        t.send(b"\x04", 0.4)  # Ctrl-D: Rich again
+        # the table cell `=@a * 2`: from the end, up to its row; End, Left
+        # past `|` and ` `
+        t.send(b"\x1b[1;5F", 0.3)
+        t.send(b"\x1b[A\x1b[A\x1b[A\x1b[A\x1b[F\x1b[D\x1b[D", 0.5)
+        res["cell"] = [ln for ln in (screen_text(t) or "").split("\n") if "=@a" in ln]
+        c = cursor_at(t)
+        res["cellcur"] = (c, cell_char(t, c[0] - 1, c[1]) if c else None)
+        t.send(b"\x13", 0.4)  # Ctrl-S
+        t.send(b"\x11", 0.2)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    with open(path, "rb") as f:
+        disk = f.read()
+    arrow = "→"
+    check(arrow not in res["before"] and "s = 4" in res["before"],
+          "wb: a calc line paints its value", repr(res["before"]))
+    check(("s = sum(T.a) " + arrow + " 4 ") in res["on"],
+          "wb: caret in the formula: the formula, then its value", repr(res["on"]))
+    check(bool(res["dim"]) and res["dim"][0] != res["dim"][1],
+          "wb: the annotation paints in its own (dim) colour", repr(res["dim"]))
+    check(bool(res["cur"][0]) and res["cur"][1] == ")",
+          "wb: the cursor sits at the formula's end, before the annotation",
+          repr(res["cur"]))
+    for key, want, line in res["steps"]:
+        check((arrow + " " + want) in line,
+              "wb: keystroke %r: annotation %s" % (key, want), repr(line))
+    check((arrow + " #parse(") in res["half"],
+          "wb: a half-typed formula shows its error", repr(res["half"]))
+    check(("s = sum(T.a " + arrow + " #parse(") in res["source"],
+          "wb: Source view shows the annotation too", repr(res["source"]))
+    check(arrow not in res["off"], "wb: the caret leaves: no annotation", repr(res["off"]))
+    check(bool(res["cell"]) and ("=@a * 2 " + arrow + " 6") in res["cell"][0],
+          "wb: a table cell formula shows its value after it", repr(res["cell"]))
+    check(bool(res["cellcur"][0]) and res["cellcur"][1] == "2",
+          "wb: in the cell, the cursor sits before the annotation", repr(res["cellcur"]))
+    check(arrow.encode() not in disk and b"s = sum(T.a)\n" in disk,
+          "wb: the file never holds the annotation", repr(disk[-40:]))
+
+
 CASES = {
     "present": case_present,
     "tabs_and_panes": case_tabs_and_panes,
@@ -1950,6 +2039,7 @@ CASES = {
     "settings_file": case_settings_file,
     "quick_open": case_quick_open,
     "project_search": case_project_search,
+    "wb_annotation": case_wb_annotation,
 }
 
 

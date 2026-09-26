@@ -5,6 +5,7 @@
  */
 #include <ccc/std/prelude.cch>
 #include <stdlib.h>
+#include <string.h>
 #include "utf8.cch"
 #include "document.cch"
 #include "layout.cch"
@@ -595,6 +596,45 @@ int rtx_layout_hint_vis(const RtxLayout *L, RtxDocLayout d, size_t off,
     return rtx_layout_hint_vis_cur(L, d, NULL, off, row, rel, row_n, out);
 }
 
+/* The formula annotation's stand-in at the formula's last cluster. */
+static int rtx_layout_inlay_vis(const RtxLayout *L, RtxDocLayout d, size_t off,
+                                const char *row, size_t rel, size_t row_n,
+                                RtxHintVis *out) {
+    size_t n = L->inl_off - L->inl_lo, dlo, dhi, vn = 0, k;
+    char val[RTX_HINT_STANDIN_MAX];
+    static const char arrow[] = " \xe2\x86\x92 "; /* " → " */
+    if (!row || rel + n > row_n || n > 16) return 0;
+    if (!d->derived_at(off, 2, &dlo, &dhi, val, sizeof val, &vn) || dhi != L->inl_off) return 0;
+    memcpy(out->g, row + rel, n);
+    k = n;
+    memcpy(out->g + k, arrow, sizeof arrow - 1);
+    k += sizeof arrow - 1;
+    if (vn > sizeof out->g - k) vn = sizeof out->g - k;
+    memcpy(out->g + k, val, vn);
+    out->gn = k + vn;
+    out->ann = n;
+    out->skip = n;
+    return 1;
+}
+
+RtxStyle rtx_layout_annot_style(void) {
+    static RtxScope sc;
+    static int once;
+    RtxStyle st = {0};
+    if (!once) {
+        once = 1;
+        if (!rtx_scope_put(&sc, "comment.annotation.workbook")) sc = RTX_SCOPE_NONE;
+    }
+    st.scope = sc;
+    return st;
+}
+
+double rtx_layout_annot_w(const RtxMeasure *m, const RtxHintVis *hv, RtxSectionKind sec) {
+    if (!hv || !hv->ann || hv->ann >= hv->gn || !m || !m->measure) return 0;
+    return m->measure(m->ctx, cc_slice_from_buffer((char *)hv->g + hv->ann, hv->gn - hv->ann),
+                      rtx_layout_annot_style(), sec);
+}
+
 int rtx_layout_hint_vis_cur(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
                             size_t off, const char *row, size_t rel, size_t row_n,
                             RtxHintVis *out) {
@@ -602,7 +642,11 @@ int rtx_layout_hint_vis_cur(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
     if (!out) return 0;
     out->skip = 0;
     out->gn = 0;
-    if (!L || !L->has_marks) return 0;
+    out->ann = 0;
+    if (!L) return 0;
+    if (L->inl_on && off == L->inl_lo && rtx_layout_inlay_vis(L, d, off, row, rel, row_n, out))
+        return 1;
+    if (!L->has_marks) return 0;
     to = hc ? rtx_layout_hidden_cur(L, d, hc, off) : rtx_layout_hidden_to(L, d, off);
     if (!to) return 0;
     n = row_n > rel ? row_n - rel : 0;
@@ -626,6 +670,9 @@ int rtx_layout_hint_vis_cur(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
 static double rtx_layout_standin_w(const RtxMeasure *m, const RtxHintVis *hv,
                                    RtxStyle st, RtxSectionKind sec) {
     if (!hv || !hv->gn || !m || !m->measure) return 0;
+    if (hv->ann && hv->ann < hv->gn)
+        return m->measure(m->ctx, cc_slice_from_buffer((char *)hv->g, hv->ann), st, sec) +
+               rtx_layout_annot_w(m, hv, sec);
     return m->measure(m->ctx, cc_slice_from_buffer((char *)hv->g, hv->gn), st, sec);
 }
 
@@ -819,6 +866,41 @@ int rtx_layout_reveal(RtxLayout *L, RtxDocLayout d, size_t caret, size_t anchor)
             if (mhi > hi) hi = mhi;
         }
     }
+    {
+        /* The caret in a formula: its annotation (both views). */
+        int on = 0;
+        size_t ilo = 0, ioff = 0;
+        if (L->view != RTX_VIEW_GRID && L->view != RTX_VIEW_HEX &&
+            d->derived_at(caret, 1, &mlo, &mhi, NULL, 0, NULL) && mhi > mlo) {
+            char tail[8];
+            size_t tn = mhi - mlo < sizeof tail ? mhi - mlo : sizeof tail, k;
+            @errhandler(CCError e) {
+                (void)e;
+                tn = 0;
+            }
+            tn = d->read_at(mhi - tn, cc_slice_from_buffer(tail, tn)) !>;
+            /* the last UTF-8 cluster start (continuation bytes are 10xxxxxx) */
+            k = tn;
+            while (k > 0) {
+                k--;
+                if (((unsigned char)tail[k] & 0xC0) != 0x80) break;
+            }
+            if (tn) {
+                on = 1;
+                ioff = mhi;
+                ilo = mhi - (tn - k);
+            }
+        }
+        if (on != L->inl_on || ilo != L->inl_lo || ioff != L->inl_off) {
+            L->inl_on = on;
+            L->inl_lo = ilo;
+            L->inl_off = ioff;
+            L->reveal_lo = lo;
+            L->reveal_hi = hi;
+            L->reveal_derived = der;
+            return 1;
+        }
+    }
     if (lo == L->reveal_lo && hi == L->reveal_hi && der == L->reveal_derived) return 0;
     L->reveal_lo = lo;
     L->reveal_hi = hi;
@@ -973,6 +1055,29 @@ static double rtx_layout_md_measure_c(const RtxLayout *L, RtxDocLayout d,
         }
     }
     return w;
+}
+
+/* The caret at the formula's end (row-relative `rel`) sits before its
+ * annotation: the annotation's cells / width to take back off an x that
+ * counted the whole stand-in. */
+static int rtx_layout_inlay_cols_at(const RtxLayout *L, RtxDocLayout d, size_t base,
+                                    char[:] bytes, size_t rel) {
+    RtxHintVis hv;
+    if (!L || !L->inl_on || base + rel != L->inl_off || L->inl_lo < base) return 0;
+    if (!rtx_layout_hint_vis(L, d, L->inl_lo, bytes.ptr, L->inl_lo - base, bytes.len, &hv) ||
+        !hv.ann)
+        return 0;
+    return rtx_hint_standin_cols(hv.g + hv.ann, hv.gn - hv.ann);
+}
+
+static double rtx_layout_inlay_px_at(const RtxLayout *L, RtxDocLayout d, const RtxMeasure *m,
+                                     size_t base, char[:] bytes, size_t rel,
+                                     RtxSectionKind sec) {
+    RtxHintVis hv;
+    if (!L || !L->inl_on || base + rel != L->inl_off || L->inl_lo < base) return 0;
+    if (!rtx_layout_hint_vis(L, d, L->inl_lo, bytes.ptr, L->inl_lo - base, bytes.len, &hv))
+        return 0;
+    return rtx_layout_annot_w(m, &hv, sec);
 }
 
 static double rtx_layout_md_unit(const RtxMeasure *m, RtxSectionKind sec) {
@@ -1583,15 +1688,18 @@ static int rtx_layout_md_x_cols_row(const RtxLayout *L, RtxDocLayout d,
             pad = rtx_md_align_pad((int)t->align[c], cw[c], cell_w);
             x = rtx_md_col_origin(cw, ncols, c) + pad;
             if (rel <= slo) return x;
-            if (rel >= shi) return x + cell_w;
-            return x + rtx_layout_md_vis(L, d, r->byte_start, bytes, slo, rel);
+            if (rel >= shi)
+                return x + cell_w - rtx_layout_inlay_cols_at(L, d, r->byte_start, bytes, rel);
+            return x + rtx_layout_md_vis(L, d, r->byte_start, bytes, slo, rel) -
+                   rtx_layout_inlay_cols_at(L, d, r->byte_start, bytes, rel);
         }
         cell_w = rtx_layout_md_vis(L, d, r->byte_start, bytes, lo, hi);
         pad = rtx_md_align_pad((int)t->align[c], cw[c], cell_w);
         x = rtx_md_col_origin(cw, ncols, c) + pad;
         if (rel <= lo) return x;
-        if (rel >= hi) return x + cell_w;
-        return x + rtx_layout_md_vis(L, d, r->byte_start, bytes, lo, rel);
+        if (rel >= hi) return x + cell_w - rtx_layout_inlay_cols_at(L, d, r->byte_start, bytes, rel);
+        return x + rtx_layout_md_vis(L, d, r->byte_start, bytes, lo, rel) -
+               rtx_layout_inlay_cols_at(L, d, r->byte_start, bytes, rel);
     }
 }
 
@@ -1836,9 +1944,12 @@ static double rtx_layout_md_x_px_row(const RtxLayout *L, RtxDocLayout d,
                                            (int)(cell_px + 0.999));
             x = (double)rtx_md_px_origin(cpx, ncols, c) + pad;
             if (rel <= slo) return x;
-            if (rel >= shi) return x + cell_px;
+            if (rel >= shi)
+                return x + cell_px -
+                       rtx_layout_inlay_px_at(L, d, m, r->byte_start, bytes, rel, r->sec);
             return x + rtx_layout_md_measure_span(L, d, m, r->byte_start, bytes,
-                                                  slo, rel, r->sec);
+                                                  slo, rel, r->sec) -
+                   rtx_layout_inlay_px_at(L, d, m, r->byte_start, bytes, rel, r->sec);
         }
         cell_px = rtx_layout_md_measure_span(L, d, m, r->byte_start, bytes, lo,
                                              hi, r->sec);
@@ -1846,9 +1957,11 @@ static double rtx_layout_md_x_px_row(const RtxLayout *L, RtxDocLayout d,
                                        (int)(cell_px + 0.999));
         x = (double)rtx_md_px_origin(cpx, ncols, c) + pad;
         if (rel <= lo) return x;
-        if (rel >= hi) return x + cell_px;
+        if (rel >= hi)
+            return x + cell_px - rtx_layout_inlay_px_at(L, d, m, r->byte_start, bytes, rel, r->sec);
         return x + rtx_layout_md_measure_span(L, d, m, r->byte_start, bytes, lo,
-                                              rel, r->sec);
+                                              rel, r->sec) -
+               rtx_layout_inlay_px_at(L, d, m, r->byte_start, bytes, rel, r->sec);
     }
 }
 
@@ -2256,7 +2369,12 @@ static size_t rtx_layout_md_hit_px(const RtxLayout *L, const RtxVisRow *r,
                 size_t step = 1;
                 double pw = rtx_layout_md_step_px(L, d, m, r->byte_start, bytes,
                                                   i, shi, r->sec, &step);
-                if (local < pw) return r->byte_start + i;
+                if (local < pw) {
+                    double aw = rtx_layout_inlay_px_at(L, d, m, r->byte_start, bytes, i + step,
+                                                       r->sec);
+                    if (aw > 0 && local >= (pw - aw) / 2.0) return r->byte_start + i + step;
+                    return r->byte_start + i;
+                }
                 local -= pw;
                 i += step;
             }
@@ -2359,7 +2477,11 @@ static size_t rtx_layout_md_hit_row(const RtxLayout *L, const RtxVisRow *r,
                 int vis = 0;
                 rtx_layout_md_step(L, d, NULL, r->byte_start, bytes, i, shi, &step,
                                    &vis);
-                if (local < vis) return r->byte_start + i;
+                if (local < vis) {
+                    int ac = rtx_layout_inlay_cols_at(L, d, r->byte_start, bytes, i + step);
+                    if (ac > 0 && local >= (vis - ac + 1) / 2) return r->byte_start + i + step;
+                    return r->byte_start + i;
+                }
                 local -= vis;
                 i += step;
             }
@@ -2386,6 +2508,7 @@ static size_t rtx_layout_style_edge(const RtxLayout *L, RtxDocLayout d,
         size_t hn = d->hint_next(from + i, from + nxt) - from;
         if (hn < nxt) nxt = hn;
     }
+    if (L->inl_on && L->inl_lo > from + i && L->inl_lo < from + nxt) nxt = L->inl_lo - from;
     if (nxt > hi) nxt = hi;
     if (nxt <= i) nxt = i + 1;
     return nxt;
@@ -2866,6 +2989,9 @@ static size_t !>(CCError) rtx_layout_hit_bytes(const RtxLayout *L, const RtxVisR
                                                     r->sec);
                     if (x < cx + gw) {
                         hit = r->byte_start + k + hv.skip;
+                        /* the formula's last cluster: its left half is before it */
+                        if (hv.ann && x < cx + (gw - rtx_layout_annot_w(m, &hv, r->sec)) / 2.0)
+                            hit = r->byte_start + k;
                         break;
                     }
                     cx += gw;
@@ -2953,6 +3079,8 @@ static double rtx_layout_x_of_bytes(const RtxLayout *L, const RtxVisRow *r,
                                     bytes.len, &hv)) {
                 x += rtx_layout_standin_w(m, &hv, d->style_cur(&sc, r->byte_start + k),
                                           r->sec);
+                if (hv.ann && r->byte_start + k + hv.skip == off)
+                    x -= rtx_layout_annot_w(m, &hv, r->sec);
                 k += hv.skip;
                 continue;
             }
