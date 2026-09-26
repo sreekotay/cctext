@@ -1,0 +1,544 @@
+#!ccc ccs
+/*
+ * Markdown link reference definitions (linked TU; see md_refs.cch).
+ */
+#include <ccc/std/prelude.cch>
+#include <stdlib.h>
+#include <string.h>
+#include "md_refs.cch"
+
+/* ---- label normalization ---- */
+
+static int mdref_ws(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/* Fold one code point (simple case folding for the common alphabets). */
+static uint32_t mdref_fold(uint32_t cp) {
+    if (cp < 0x80) return (cp >= 'A' && cp <= 'Z') ? cp + 32 : cp;
+    if ((cp >= 0xC0 && cp <= 0xDE && cp != 0xD7)) return cp + 32;
+    if (cp >= 0x100 && cp <= 0x17F) {
+        /* Latin Extended-A: mostly upper/lower pairs on even/odd. */
+        if ((cp >= 0x139 && cp <= 0x148) || (cp >= 0x179 && cp <= 0x17E))
+            return (cp & 1) ? cp + 1 : cp;
+        if (cp == 0x178) return 0xFF;
+        if (cp == 0x130 || cp == 0x131 || cp == 0x138 || cp == 0x149 || cp == 0x17F)
+            return cp;
+        return (cp & 1) ? cp : cp + 1;
+    }
+    if (cp >= 0x391 && cp <= 0x3A9 && cp != 0x3A2) return cp + 32;
+    if (cp == 0x3C2) return 0x3C3; /* final sigma */
+    if (cp >= 0x410 && cp <= 0x42F) return cp + 32;
+    if (cp >= 0x400 && cp <= 0x40F) return cp + 80;
+    return cp;
+}
+
+/* Decode one UTF-8 sequence at s[i] (< n); *len its bytes. Invalid bytes
+ * decode as themselves (one byte). */
+static uint32_t mdref_cp(const unsigned char *s, size_t i, size_t n, size_t *len) {
+    unsigned char c = s[i];
+    if (c < 0x80) {
+        *len = 1;
+        return c;
+    }
+    if ((c & 0xE0) == 0xC0 && i + 1 < n && (s[i + 1] & 0xC0) == 0x80) {
+        *len = 2;
+        return ((uint32_t)(c & 0x1F) << 6) | (s[i + 1] & 0x3F);
+    }
+    *len = 1;
+    return 0x110000u + c; /* opaque byte (3- and 4-byte sequences too) */
+}
+
+static uint64_t mdref_mix(uint64_t h, uint32_t v) {
+    int k;
+    for (k = 0; k < 4; k++) {
+        h ^= (v >> (8 * k)) & 0xFF;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+uint64_t rtx_mdref_hash(const char *s0, size_t n) {
+    const unsigned char *s = (const unsigned char *)s0;
+    uint64_t h = 1469598103934665603ull;
+    size_t i = 0, e = n;
+    int any = 0, gap = 0;
+    if (!s) return 0;
+    while (i < e && mdref_ws(s[i])) i++;
+    while (e > i && mdref_ws(s[e - 1])) e--;
+    while (i < e) {
+        size_t len;
+        uint32_t cp;
+        if (mdref_ws(s[i])) {
+            gap = 1;
+            i++;
+            continue;
+        }
+        if (gap) {
+            h = mdref_mix(h, ' ');
+            gap = 0;
+        }
+        cp = mdref_cp(s, i, e, &len);
+        if (cp == 0xDF) {
+            /* ß folds to "ss" */
+            h = mdref_mix(h, 's');
+            h = mdref_mix(h, 's');
+        } else {
+            h = mdref_mix(h, mdref_fold(cp));
+        }
+        i += len;
+        any = 1;
+    }
+    if (!any) return 0;
+    return h ? h : 1;
+}
+
+/* ---- label table ---- */
+
+static size_t mdref_slot(const RtxMdRefs *m, uint64_t h) {
+    size_t mask = m->tcap - 1, i = (size_t)(h ^ (h >> 29)) & mask;
+    while (m->key[i] && m->key[i] != h) i = (i + 1) & mask;
+    return i;
+}
+
+int rtx_mdref_has(const RtxMdRefs *m, uint64_t h) {
+    size_t i;
+    if (!m || !h || !m->tcap) return 0;
+    i = mdref_slot(m, h);
+    return m->key[i] == h && m->cnt[i] > 0;
+}
+
+int rtx_mdref_staged(const RtxMdRefs *m, uint64_t h) {
+    size_t k;
+    if (!m || !h || m->sn > 256) return 0;
+    for (k = 0; k < m->sn; k++)
+        if (m->stage[k].h == h) return 1;
+    return 0;
+}
+
+static void mdref_pend(RtxMdRefs *m, uint64_t h, int was) {
+    unsigned k;
+    for (k = 0; k < m->npend; k++)
+        if (m->pend[k] == h) return;
+    if (m->npend >= RTX_MDREF_PEND) {
+        m->over = 1;
+        return;
+    }
+    m->pend[m->npend] = h;
+    m->was[m->npend] = (unsigned char)was;
+    m->npend++;
+}
+
+static int mdref_rehash(RtxMdRefs *m, size_t want) {
+    size_t cap = 64, i;
+    uint64_t *key;
+    uint32_t *cnt;
+    while (cap < 2 * want + 16) cap *= 2;
+    key = (uint64_t *)calloc(cap, sizeof *key);
+    cnt = (uint32_t *)calloc(cap, sizeof *cnt);
+    if (!key || !cnt) {
+        free(key);
+        free(cnt);
+        return 0;
+    }
+    free(m->key);
+    free(m->cnt);
+    m->key = key;
+    m->cnt = cnt;
+    m->tcap = cap;
+    m->tused = 0;
+    for (i = 0; i < m->n; i++) {
+        size_t s = mdref_slot(m, m->e[i].h);
+        if (!m->key[s]) {
+            m->key[s] = m->e[i].h;
+            m->tused++;
+        }
+        m->cnt[s]++;
+    }
+    return 1;
+}
+
+static void mdref_count(RtxMdRefs *m, uint64_t h, int d) {
+    size_t s;
+    if (!m->tcap) return;
+    s = mdref_slot(m, h);
+    if (!m->key[s]) {
+        if (d < 0) return;
+        m->key[s] = h;
+        m->tused++;
+    }
+    if (d > 0) {
+        if (m->cnt[s]++ == 0) mdref_pend(m, h, 0);
+    } else if (m->cnt[s] > 0) {
+        if (--m->cnt[s] == 0) mdref_pend(m, h, 1);
+    }
+}
+
+const RtxMdRef *rtx_mdref_get(const RtxMdRefs *m, uint64_t h) {
+    size_t i;
+    if (!rtx_mdref_has(m, h)) return NULL;
+    for (i = 0; i < m->n; i++)
+        if (m->e[i].h == h && !m->e[i].limbo) return &m->e[i];
+    return NULL;
+}
+
+void rtx_mdref_see(RtxMdRefs *m, uint64_t h) {
+    if (!m || !h) return;
+    m->seen[(h >> 6) % RTX_MDREF_SEEN_WORDS] |= 1ull << (h & 63);
+}
+
+int rtx_mdref_seen(const RtxMdRefs *m, uint64_t h) {
+    if (!m || !h) return 0;
+    return (m->seen[(h >> 6) % RTX_MDREF_SEEN_WORDS] >> (h & 63)) & 1;
+}
+
+/* ---- edits ---- */
+
+static void mdref_ck_shift(RtxMdRefs *m, size_t at, size_t erased, size_t inserted) {
+    size_t i, w = 0, hi;
+    for (i = 0; i < m->nck; i++) {
+        RtxMdRefCk c = m->ck[i];
+        if (c.off > at) {
+            if (c.off <= at + erased) continue;
+            c.off = c.off - erased + inserted;
+        }
+        m->ck[w++] = c;
+    }
+    m->nck = w;
+    if (!m->dirty) {
+        m->dirty = 1;
+        m->dirty_lo = at;
+        m->dirty_hi = at + inserted;
+        return;
+    }
+    hi = m->dirty_hi;
+    if (hi >= at + erased) hi = hi - erased + inserted;
+    else if (hi > at) hi = at + inserted;
+    if (hi < at + inserted) hi = at + inserted;
+    m->dirty_hi = hi;
+    if (at < m->dirty_lo) m->dirty_lo = at;
+}
+
+void rtx_mdref_shift(RtxMdRefs *m, size_t at, size_t erased, size_t inserted) {
+    size_t i, w = 0;
+    if (!m) return;
+    if (m->sweep_on) mdref_ck_shift(m, at, erased, inserted);
+    if (!m->n) return;
+    for (i = 0; i < m->n; i++) {
+        RtxMdRef r = m->e[i];
+        size_t end = r.line + r.llen; /* its newline */
+        if (end < at) {
+            m->e[w++] = r;
+            continue;
+        }
+        if (r.line > at + erased) {
+            r.line = r.line - erased + inserted;
+            m->e[w++] = r;
+            continue;
+        }
+        if (r.line > at) r.line = at;
+        if (!r.limbo) m->nlimbo++;
+        r.limbo = 1;
+        m->e[w++] = r;
+    }
+    m->n = w;
+}
+
+/* ---- stage / commit ---- */
+
+void rtx_mdref_stage_reset(RtxMdRefs *m) {
+    if (m) m->sn = 0;
+}
+
+void rtx_mdref_stage_add(RtxMdRefs *m, const RtxMdRef *r) {
+    if (!m || !r || !r->h) return;
+    while (m->sn && m->stage[m->sn - 1].line >= r->line) m->sn--;
+    if (m->sn == m->scap) {
+        size_t cap = m->scap ? 2 * m->scap : 64;
+        RtxMdRef *p = (RtxMdRef *)realloc(m->stage, cap * sizeof *p);
+        if (!p) {
+            m->oom = 1;
+            return;
+        }
+        m->stage = p;
+        m->scap = cap;
+    }
+    m->stage[m->sn++] = *r;
+}
+
+/* First entry with line >= x. */
+static size_t mdref_lower(const RtxMdRefs *m, size_t x) {
+    size_t lo = 0, hi = m->n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (m->e[mid].line < x) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+void rtx_mdref_commit(RtxMdRefs *m, size_t lo, size_t hi) {
+    size_t a, b, k, add = 0, need;
+    if (!m || hi <= lo) return;
+    for (k = 0; k < m->sn; k++)
+        if (m->stage[k].line >= lo && m->stage[k].line < hi) add++;
+    a = mdref_lower(m, lo);
+    b = mdref_lower(m, hi);
+    if (a == b && add == 0) {
+        m->sn = 0;
+        return;
+    }
+    need = m->n - (b - a) + add;
+    if (need > m->cap) {
+        size_t cap = m->cap ? m->cap : 64;
+        RtxMdRef *p;
+        while (cap < need) cap *= 2;
+        p = (RtxMdRef *)realloc(m->e, cap * sizeof *p);
+        if (!p) {
+            m->oom = 1;
+            m->sn = 0;
+            return;
+        }
+        m->e = p;
+        m->cap = cap;
+    }
+    if (!m->tcap || 2 * (m->tused + add) + 16 > m->tcap) {
+        if (!mdref_rehash(m, m->n + add + m->tused / 2)) {
+            m->oom = 1;
+            m->sn = 0;
+            return;
+        }
+    }
+    /* Count the new ones in before the old ones out: a label the range
+     * still defines never passes through 0 (no pending change). */
+    for (k = 0; k < m->sn; k++) {
+        if (m->stage[k].line < lo || m->stage[k].line >= hi) continue;
+        mdref_count(m, m->stage[k].h, +1);
+    }
+    for (k = a; k < b; k++) {
+        mdref_count(m, m->e[k].h, -1);
+        if (m->e[k].limbo && m->nlimbo) m->nlimbo--;
+    }
+    memmove(m->e + a + add, m->e + b, (m->n - b) * sizeof *m->e);
+    m->n = m->n - (b - a) + add;
+    for (k = 0; k < m->sn; k++) {
+        if (m->stage[k].line < lo || m->stage[k].line >= hi) continue;
+        m->e[a] = m->stage[k];
+        m->e[a++].limbo = 0;
+    }
+    m->sn = 0;
+}
+
+/* ---- the sweep ---- */
+
+void rtx_mdref_stage_line(RtxMdRefs *m, const RtxMdbLine *L, const char *buf,
+                          size_t line, size_t eol, size_t base) {
+    int s;
+    if (!m || !L || !L->nsp || eol - line >= 0xFFFFFFFFu) return;
+    for (s = 0; s < L->nsp; s++) {
+        const RtxMdbSpan *p = &L->sp[s];
+        RtxMdRef r;
+        int t;
+        if (p->kind != RTX_MDB_S_REF_LABEL || p->hi < p->lo + 3) continue;
+        r.line = base + line;
+        r.llen = (uint32_t)(eol - line);
+        r.h = rtx_mdref_hash(buf + p->lo + 1, p->hi - p->lo - 3);
+        r.dlo = r.dhi = 0;
+        for (t = s + 1; t < L->nsp; t++) {
+            if (L->sp[t].kind == RTX_MDB_S_REF_DEST) {
+                r.dlo = (uint32_t)(L->sp[t].lo - line);
+                r.dhi = (uint32_t)(L->sp[t].hi - line);
+                break;
+            }
+        }
+        rtx_mdref_stage_add(m, &r);
+        return;
+    }
+}
+
+int rtx_mdref_sweep_begin(RtxMdRefs *m, RtxMdRefSweep *s, int full) {
+    size_t k;
+    memset(s, 0, sizeof *s);
+    if (!m) return 0;
+    if (!full && (!m->sweep_on || !m->dirty)) return 0;
+    s->full = full;
+    rtx_mdb_init(&s->st, 1, 0, 0);
+    if (full) {
+        m->nck = 0;
+        m->dirty = 0;
+    } else {
+        /* The last checkpoint at or before the first edit: its state is
+         * the bytes before it, which no edit touched. */
+        k = m->nck;
+        while (k > 0 && m->ck[k - 1].off > m->dirty_lo) k--;
+        if (k > 0) {
+            s->start = m->ck[k - 1].off;
+            s->st = m->ck[k - 1].st;
+        }
+        s->j = k;
+    }
+    s->at = s->start;
+    s->last_ck = s->start;
+    rtx_mdref_stage_reset(m);
+    return 1;
+}
+
+static void mdref_nk_push(RtxMdRefs *m, RtxMdRefSweep *s, size_t off) {
+    if (s->nn == s->ncap) {
+        size_t cap = s->ncap ? 2 * s->ncap : 64;
+        RtxMdRefCk *p = (RtxMdRefCk *)realloc(s->nk, cap * sizeof *p);
+        if (!p) {
+            m->oom = 1;
+            return;
+        }
+        s->nk = p;
+        s->ncap = cap;
+    }
+    s->nk[s->nn].off = off;
+    s->nk[s->nn].st = s->st;
+    s->nn++;
+}
+
+size_t rtx_mdref_sweep_feed(RtxMdRefs *m, RtxMdRefSweep *s, const char *buf, size_t n,
+                            int last) {
+    size_t i = 0, base = s->at;
+    RtxMdbLine L;
+    if (!m || !buf || s->done) return 0;
+    while (i < n) {
+        const char *nl = (const char *)memchr(buf + i, '\n', n - i);
+        size_t eol = nl ? (size_t)(nl - buf) : n, at = base + i;
+        if (!nl && !last) break;
+        if (at > s->start) {
+            if (!s->full && m->dirty) {
+                while (s->j < m->nck && m->ck[s->j].off < at) s->j++;
+                if (at > m->dirty_hi && s->j < m->nck && m->ck[s->j].off == at &&
+                    rtx_mdb_eq(&m->ck[s->j].st, &s->st)) {
+                    s->done = 1;
+                    s->stop = at;
+                    break;
+                }
+            }
+            if (at - s->last_ck >= RTX_MDREF_CK_STRIDE) {
+                mdref_nk_push(m, s, at);
+                s->last_ck = at;
+            }
+        }
+        rtx_mdb_line(&s->st, buf, i, eol, &L);
+        if (L.nsp) rtx_mdref_stage_line(m, &L, buf, i, eol, base);
+        i = nl ? eol + 1 : n;
+    }
+    s->at = base + i;
+    return i;
+}
+
+void rtx_mdref_sweep_end(RtxMdRefs *m, RtxMdRefSweep *s, size_t len) {
+    size_t stop = s->done ? s->stop : len + 1, a, b, k, need;
+    if (!m) return;
+    rtx_mdref_commit(m, s->start, stop);
+    /* Checkpoints: (start, stop) are this sweep's; the rest stand. */
+    a = 0;
+    while (a < m->nck && m->ck[a].off <= s->start) a++;
+    b = a;
+    while (b < m->nck && m->ck[b].off < stop) b++;
+    need = m->nck - (b - a) + s->nn;
+    if (need > m->ckcap) {
+        size_t cap = m->ckcap ? m->ckcap : 64;
+        RtxMdRefCk *p;
+        while (cap < need) cap *= 2;
+        p = (RtxMdRefCk *)realloc(m->ck, cap * sizeof *p);
+        if (!p) {
+            m->oom = 1;
+            m->nck = a; /* keep the prefix: a later sweep starts there */
+            free(s->nk);
+            s->nk = NULL;
+            m->dirty = 0;
+            return;
+        }
+        m->ck = p;
+        m->ckcap = cap;
+    }
+    memmove(m->ck + a + s->nn, m->ck + b, (m->nck - b) * sizeof *m->ck);
+    for (k = 0; k < s->nn; k++) m->ck[a + k] = s->nk[k];
+    m->nck = need;
+    free(s->nk);
+    s->nk = NULL;
+    s->nn = s->ncap = 0;
+    m->dirty = 0;
+    if (s->full) m->sweep_on = 1;
+}
+
+void rtx_mdref_sweep_off(RtxMdRefs *m) {
+    if (!m) return;
+    free(m->ck);
+    m->ck = NULL;
+    m->nck = m->ckcap = 0;
+    m->dirty = 0;
+    m->sweep_on = 0;
+}
+
+/* ---- settle ---- */
+
+int rtx_mdref_settle(RtxMdRefs *m) {
+    unsigned k;
+    if (!m) return 0;
+    if (m->nlimbo) {
+        size_t i, w = 0;
+        for (i = 0; i < m->n; i++) {
+            if (m->e[i].limbo) {
+                mdref_count(m, m->e[i].h, -1);
+                continue;
+            }
+            m->e[w++] = m->e[i];
+        }
+        m->n = w;
+        m->nlimbo = 0;
+    }
+    if (m->over) {
+        /* Too many labels changed to list: stale if the lex asked any. */
+        for (k = 0; k < RTX_MDREF_SEEN_WORDS; k++) {
+            if (m->seen[k]) {
+                m->stale = 1;
+                break;
+            }
+        }
+        m->over = 0;
+    }
+    for (k = 0; k < m->npend; k++) {
+        uint64_t h = m->pend[k];
+        if (rtx_mdref_has(m, h) != (int)m->was[k] && rtx_mdref_seen(m, h)) m->stale = 1;
+    }
+    m->npend = 0;
+    return m->stale;
+}
+
+void rtx_mdref_relexed(RtxMdRefs *m) {
+    if (!m) return;
+    memset(m->seen, 0, sizeof m->seen);
+    m->stale = 0;
+    m->npend = 0;
+    m->over = 0;
+}
+
+void rtx_mdref_free(RtxMdRefs *m) {
+    if (!m) return;
+    free(m->e);
+    free(m->key);
+    free(m->cnt);
+    free(m->stage);
+    free(m->ck);
+    memset(m, 0, sizeof *m);
+}
+
+int rtx_mdref_dest(const RtxMdRef *r, const char *s, size_t n, size_t *lo, size_t *hi) {
+    size_t a, b;
+    if (!r || !s || r->dhi <= r->dlo || r->dhi > n) return 0;
+    a = r->dlo;
+    b = r->dhi;
+    if (b - a >= 2 && s[a] == '<' && s[b - 1] == '>') {
+        a++;
+        b--;
+    }
+    if (lo) *lo = a;
+    if (hi) *hi = b;
+    return 1;
+}

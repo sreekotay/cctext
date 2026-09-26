@@ -5,7 +5,7 @@
                                    [--shots DIR] [--only NAME]
 
 For each fixture (a C file, a Markdown file in Rich view, a file of long
-lines) the GUI opens it, the caret moves into the text, and xdotool types
+lines, a 400-row Rich table whose cells wrap) the GUI opens it, the caret moves into the text, and xdotool types
 N characters. RTX_UI_FRAME_LOG (frontend/ui_plat.c) logs one line per
 input frame: total / input+layout / paint microseconds and the toolkit
 text layouts made. Prints p50 / p95 / max of the typed frames and the mean
@@ -64,10 +64,19 @@ def fixtures(tmp):
         word = "alpha beta gamma delta epsilon zeta eta theta iota kappa "
         for i in range(60):
             f.write("%d " % i + word * 40 + "\n")
+    table = os.path.join(tmp, "table.md")
+    with open(table, "w") as f:
+        # A big Rich table whose long cells fit-and-wrap to the pane.
+        f.write("# Table\n\n| command | id | notes |\n|---|---|---|\n")
+        for i in range(400):
+            f.write("| `cmd.%d.run` | **id_%d** | %s |\n" % (
+                i, i, "wraps inside its cell when the pane is narrow " * 3))
     # name, path, keys to place the caret before typing
     return [("code", code, ["Down"] * 12 + ["End"]),
             ("markdown", md, ["Down"] * 6 + ["End"]),
-            ("longline", long_, ["Down"] * 3)]
+            ("longline", long_, ["Down"] * 3),
+            ("table", table, ["Down"] * 8 + ["End"]),
+            ("table_nw", table, ["ctrl+shift+m"] + ["Down"] * 8 + ["End"])]
 
 
 def pct(xs, p):

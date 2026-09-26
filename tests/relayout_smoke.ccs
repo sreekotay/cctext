@@ -193,12 +193,15 @@ static void !>(CCError) check_fresh(RtxLayout *L, RtxDoc *d, const RtxMeasure *m
 
 /* One wrap oracle: every table record's stored lines are what
  * rtx_layout_md_cell_wrap returns, and height, wrap_li, col_at, cell_span
- * and x_of -> hit all read that same wrap. */
+ * and x_of -> hit all read that same wrap. Tables fit the pane with soft
+ * wrap on or off (`wrap`), so both modes wrap cells. */
 static size_t n_cells_checked = 0;
 static size_t n_hits_checked = 0;
 
+static size_t n_tall_rows = 0;
+
 static void !>(CCError) md_consumers(const char *path, const RtxMeasure *m,
-                                     double width, double lh) {
+                                     double width, double lh, int wrap) {
     RtxBuf b = {0} @destroy;
     RtxLayout *L = &b.layout;
     size_t i;
@@ -212,10 +215,20 @@ static void !>(CCError) md_consumers(const char *path, const RtxMeasure *m,
     }
     b.doc.from_path(cc_slice_cstr(path)) !>;
     L->rich = 1;
-    L->wrap = 1;
+    L->wrap = wrap;
     rtx_line_scan_to(&b.doc.tree, b.doc.len()) !>;
     b.ensure_view((RtxMeasure *)m, width, 60) !>;
     expect(L->md_ntab > 0, "md consumers: fixture has tables");
+    for (i = 0; i < L->rows.len; i++) {
+        /* Fit: no table row wider than the pane (these tables' hard floors
+         * fit), wrap on or off. */
+        const RtxVisRow *r = &L->rows.data[i];
+        if (rtx_layout_md_index(L, r->byte_start) < 0) continue;
+        snprintf(msg, sizeof msg, "%s wrap %d: table row %zu width %.0f fits %.0f",
+                 path, wrap, r->byte_start, r->width, width);
+        expect(r->width <= width, msg);
+        if (r->height > lh) n_tall_rows++;
+    }
     for (i = 0; i < L->rows.len; i++, y0 += L->rows.data[i - 1].height) {
         const RtxVisRow *r = &L->rows.data[i];
         const RtxMdRec *rec;
@@ -283,6 +296,72 @@ static void !>(CCError) md_consumers(const char *path, const RtxMeasure *m,
             }
         }
         frame.destroy();
+    }
+    return cc_ok();
+}
+
+/* Fit + resize: a wide pane keeps natural widths; a pane resized
+ * narrower refits (rows wrap taller, none wider than the pane), wrap on or
+ * off; resized back, the rows are what they were. Typing in a wrapped
+ * cell at the narrow width patches exactly as a fresh fill lays out. */
+static void !>(CCError) md_fit_resize(const RtxMeasure *m, double lh) {
+    const char *path = "testdata/generated/relayout_fit.md";
+    const double unit = lh > 1.0 ? 8.0 : 1.0;
+    int wr;
+    char msg[256];
+    FILE *fp;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    (void)!system("mkdir -p testdata/generated");
+    fp = fopen(path, "w");
+    if (!fp) return cc_err(CC_ERR_IO, "fit fixture");
+    fprintf(fp, "# Fit\n\n| command | id |\n|---|---|\n");
+    fprintf(fp, "| `palette.open` | opens the command palette from anywhere, with "
+                "**fuzzy** matching over every command id and its keys |\n");
+    fprintf(fp, "| `go.line` | jump to a line |\n");
+    fprintf(fp, "| `workspace.search_next_result_in_the_project_list` | next hit |\n\n");
+    fprintf(fp, "after\n");
+    fclose(fp);
+    for (wr = 0; wr < 2; wr++) {
+        RtxBuf b = {0} @destroy;
+        RtxLayout *L = &b.layout;
+        double widths[3] = {400.0 * unit, 80.0 * unit, 400.0 * unit};
+        double tall[3] = {0, 0, 0};
+        int k;
+        size_t at = 0, s, got;
+        char buf[512];
+        b.doc.from_path(cc_slice_cstr(path)) !>;
+        L->rich = 1;
+        L->wrap = wr;
+        for (k = 0; k < 3; k++) {
+            size_t i, over = 0;
+            b.ensure_view((RtxMeasure *)m, widths[k], 40) !>;
+            for (i = 0; i < L->rows.len; i++) {
+                const RtxVisRow *r = &L->rows.data[i];
+                if (rtx_layout_md_index(L, r->byte_start) < 0) continue;
+                if (r->width > widths[k]) over++;
+                tall[k] += r->height;
+            }
+            snprintf(msg, sizeof msg, "fit resize wrap %d lh %.0f: pane %.0f, %zu rows wider",
+                     wr, lh, widths[k], over);
+            expect(over == 0, msg);
+        }
+        snprintf(msg, sizeof msg,
+                 "fit resize wrap %d lh %.0f: narrower pane wraps rows (%.0f -> %.0f -> %.0f)",
+                 wr, lh, tall[0], tall[1], tall[2]);
+        expect(tall[1] > tall[0] && tall[2] == tall[0], msg);
+        b.ensure_view((RtxMeasure *)m, widths[1], 40) !>;
+        got = b.doc.read_at(0, cc_slice_from_buffer(buf, sizeof buf)) !>;
+        for (s = 0; s + 5 < got; s++)
+            if (!memcmp(buf + s, "fuzzy", 5)) at = s;
+        expect(at > 0, "fit resize: fixture has the long cell");
+        for (s = 0; s < 12 && at; s++) {
+            b.doc.caret = b.doc.sel_anchor = at + s;
+            b.doc.insert(at + s, cc_slice_cstr("w")) !>;
+            b.after_edit((RtxMeasure *)m, widths[1], 40) !>;
+            check_fresh(L, &b.doc, m, widths[1], "fit resize edit", s) !>;
+        }
     }
     return cc_ok();
 }
@@ -672,12 +751,20 @@ int main(void) {
     run_split("testdata/rich/md/README.md", &cm, 40.0, 8, steps, 0, 0) !>;
     run_split("testdata/rich/code/embeds.c", &cm, 40.0, 8, steps, 0, 1) !>;
 
-    md_consumers("testdata/rich/md/tables.md", &cm, 40.0, 1.0) !>;
-    md_consumers("testdata/rich/md/tables.md", &pm, 320.0, 16.0) !>;
-    md_consumers("testdata/rich/md/edge_utf8.md", &cm, 40.0, 1.0) !>;
-    md_consumers("testdata/rich/md/edge_utf8.md", &pm, 320.0, 16.0) !>;
-    md_consumers("testdata/rich/md/mixed_doc.md", &cm, 30.0, 1.0) !>;
+    {
+        int wr;
+        for (wr = 0; wr < 2; wr++) {
+            md_consumers("testdata/rich/md/tables.md", &cm, 40.0, 1.0, wr) !>;
+            md_consumers("testdata/rich/md/tables.md", &pm, 320.0, 16.0, wr) !>;
+            md_consumers("testdata/rich/md/edge_utf8.md", &cm, 40.0, 1.0, wr) !>;
+            md_consumers("testdata/rich/md/edge_utf8.md", &pm, 320.0, 16.0, wr) !>;
+            md_consumers("testdata/rich/md/mixed_doc.md", &cm, 30.0, 1.0, wr) !>;
+        }
+    }
+    md_fit_resize(&cm, 1.0) !>;
+    md_fit_resize(&pm, 16.0) !>;
     expect(n_hits_checked > 50, "md consumers: round trips ran");
+    expect(n_tall_rows > 0, "md consumers: some fitted rows wrap (tall)");
     expect(n_patched * 4 > n_edits, "patch absorbs most edits (not every one refills)");
     expect(n_seek_patched > 0, "a seeking camera patches too");
     if (fails) {

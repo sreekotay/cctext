@@ -1,0 +1,4317 @@
+#!ccc ccs
+/*
+ * Workbook W0 (linked TU; see wb.cch, docs/workbook.md).
+ *
+ * Model: tables (named GFM tables), their typed columns and body cells,
+ * `params` / `calc` names. Graph nodes are cells, columns and names; an
+ * edge runs from a dependency to the formula that reads it. A column
+ * node depends on every cell of the column (implicit edges, by layout).
+ * Tarjan SCC over that graph gives the evaluation order (dependencies
+ * first) and the cycles. A recalc is a min-heap over that order seeded
+ * with the changed nodes: a node whose new value equals the old one does
+ * not push its dependents (early cutoff).
+ *
+ * Arenas: `ma` holds the model (nodes, tables, ASTs, names), `va` the
+ * values' text / error bytes, `sa` scratch for one operation. A rebuild
+ * resets all three; incremental edits allocate a little into ma / va,
+ * and once that garbage passes a bound the next sync rebuilds.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+#include "wb.cch"
+#include "md_table.cch"
+
+/* ------------------------------------------------------------------ values */
+
+enum {
+    WV_NULL = 0,
+    WV_INT,
+    WV_DEC,
+    WV_FLOAT,
+    WV_BOOL,
+    WV_DATE,
+    WV_TEXT,
+    WV_ERR,
+    WV_ROW, /* lookup result: code = table, u.i = row */
+    WV_TAB  /* a table named as a value (count(T)) */
+};
+
+enum {
+    WE_DIV0 = 1,
+    WE_REF,
+    WE_NAME,
+    WE_TYPE,
+    WE_CYCLE,
+    WE_DUP,
+    WE_NUM,
+    WE_PARSE
+};
+
+static const char *const g_we_tag[] = {"#err",  "#div0", "#ref", "#name", "#type",
+                                       "#cycle", "#dup", "#num", "#parse"};
+
+typedef struct {
+    uint8_t t;
+    uint8_t sc;    /* WV_DEC scale */
+    uint16_t code; /* WV_ERR code; WV_ROW table */
+    uint32_t n;    /* WV_TEXT / WV_ERR bytes */
+    union {
+        int64_t i;
+        double f;
+        const char *s;
+    } u;
+} WVal;
+
+static WVal wv_null(void) {
+    WVal v;
+    memset(&v, 0, sizeof v);
+    return v;
+}
+
+static WVal wv_int(int64_t i) {
+    WVal v = wv_null();
+    v.t = WV_INT;
+    v.u.i = i;
+    return v;
+}
+
+static WVal wv_dec(int64_t i, int sc) {
+    WVal v = wv_null();
+    v.t = sc ? WV_DEC : WV_INT;
+    v.sc = (uint8_t)sc;
+    v.u.i = i;
+    return v;
+}
+
+static WVal wv_float(double f) {
+    WVal v = wv_null();
+    v.t = WV_FLOAT;
+    v.u.f = f;
+    return v;
+}
+
+static WVal wv_bool(int b) {
+    WVal v = wv_null();
+    v.t = WV_BOOL;
+    v.u.i = b ? 1 : 0;
+    return v;
+}
+
+static WVal wv_date(int64_t days) {
+    WVal v = wv_null();
+    v.t = WV_DATE;
+    v.u.i = days;
+    return v;
+}
+
+static const int64_t g_pow10[19] = {
+    1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL,
+    100000000LL, 1000000000LL, 10000000000LL, 100000000000LL,
+    1000000000000LL, 10000000000000LL, 100000000000000LL,
+    1000000000000000LL, 10000000000000000LL, 100000000000000000LL,
+    1000000000000000000LL};
+
+/* Civil date <-> days since 1970-01-01 (proleptic Gregorian). */
+static int64_t wb_days_from_civil(int64_t y, unsigned m, unsigned d) {
+    int64_t era;
+    unsigned yoe, doy, doe;
+    y -= m <= 2;
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = (unsigned)(y - era * 400);
+    doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static void wb_civil_from_days(int64_t z, int64_t *y, unsigned *m, unsigned *d) {
+    int64_t era;
+    unsigned doe, yoe, doy, mp;
+    z += 719468;
+    era = (z >= 0 ? z : z - 146096) / 146097;
+    doe = (unsigned)(z - era * 146097);
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    *y = (int64_t)yoe + era * 400;
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *m = mp < 10 ? mp + 3 : mp - 9;
+    *y += *m <= 2;
+}
+
+/* `YYYY-MM-DD` exactly (n == 10), a real day. */
+static int wb_parse_date(const char *s, size_t n, int64_t *out) {
+    int64_t y;
+    unsigned m, d, mdays;
+    static const unsigned dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    size_t i;
+    if (n != 10 || s[4] != '-' || s[7] != '-') return 0;
+    for (i = 0; i < 10; i++) {
+        if (i == 4 || i == 7) continue;
+        if (s[i] < '0' || s[i] > '9') return 0;
+    }
+    y = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
+    m = (unsigned)((s[5] - '0') * 10 + (s[6] - '0'));
+    d = (unsigned)((s[8] - '0') * 10 + (s[9] - '0'));
+    if (m < 1 || m > 12 || d < 1) return 0;
+    mdays = dim[m - 1];
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) mdays = 29;
+    if (d > mdays) return 0;
+    *out = wb_days_from_civil(y, m, d);
+    return 1;
+}
+
+/* A number literal: `-?digits(.digits)?(e[+-]?digits)?`. kind 1 int, 2 dec
+ * (scale *sc), 3 float. 0 = not a number (or out of range). */
+static int wb_parse_num(const char *s, size_t n, int64_t *iv, int *sc, double *fv) {
+    size_t i = 0, dig = 0, frac = 0;
+    int neg = 0, dot = 0, ex = 0;
+    __int128 acc = 0;
+    char tmp[64];
+    if (!n) return 0;
+    if (s[0] == '-' || s[0] == '+') {
+        neg = s[0] == '-';
+        i = 1;
+    }
+    for (; i < n; i++) {
+        char c = s[i];
+        if (c >= '0' && c <= '9') {
+            if (ex) continue;
+            dig++;
+            if (dot) frac++;
+            if (acc < ((__int128)1 << 100)) acc = acc * 10 + (c - '0');
+            continue;
+        }
+        if (c == '.' && !dot && !ex) {
+            dot = 1;
+            continue;
+        }
+        if ((c == 'e' || c == 'E') && !ex && dig) {
+            ex = 1;
+            if (i + 1 < n && (s[i + 1] == '+' || s[i + 1] == '-')) i++;
+            if (i + 1 >= n || s[i + 1] < '0' || s[i + 1] > '9') return 0;
+            continue;
+        }
+        return 0;
+    }
+    if (!dig) return 0;
+    if (dot && frac == 0 && !ex) return 0; /* `12.` is text */
+    if (ex || frac > 18) {
+        if (n >= sizeof tmp) return 0;
+        memcpy(tmp, s, n);
+        tmp[n] = 0;
+        *fv = strtod(tmp, NULL);
+        return 3;
+    }
+    if (acc > (__int128)INT64_MAX) return 0;
+    *iv = neg ? -(int64_t)acc : (int64_t)acc;
+    *sc = (int)frac;
+    return dot ? 2 : 1;
+}
+
+/* No libm in the link: the few rounding helpers, exact for |x| < 2^52. */
+static double wb_trunc(double x) {
+    if (!(x > -4503599627370496.0 && x < 4503599627370496.0)) return x;
+    return (double)(int64_t)x;
+}
+
+static double wb_floor(double x) {
+    double t = wb_trunc(x);
+    return t > x ? t - 1.0 : t;
+}
+
+static double wb_ceil(double x) {
+    double t = wb_trunc(x);
+    return t < x ? t + 1.0 : t;
+}
+
+/* Half away from zero. */
+static double wb_round(double x) {
+    double t = wb_trunc(x);
+    if (x - t >= 0.5) return t + 1.0;
+    if (t - x >= 0.5) return t - 1.0;
+    return t;
+}
+
+static double wb_fmod(double x, double y) {
+    return x - y * wb_trunc(x / y);
+}
+
+/* ------------------------------------------------------------------ model */
+
+enum { NK_CELL = 1, NK_COL, NK_NAME, NK_LINE };
+
+/* Literal kinds a column counts (type inference). */
+enum { LK_EMPTY = 0, LK_INT, LK_DEC, LK_FLOAT, LK_BOOL, LK_DATE, LK_TEXT, LK_FORMULA, LK__N };
+
+typedef struct {
+    uint32_t k[LK__N];
+    uint32_t sc[19]; /* LK_DEC cells per scale */
+} WColStat;
+
+typedef struct Ex Ex;
+
+typedef struct {
+    uint8_t kind;
+    uint8_t form;   /* formula (else literal / empty) */
+    uint8_t cyc;    /* in a cycle: value fixed at #cycle(path) */
+    uint8_t queued;
+    uint8_t lk;     /* CELL: LK_* of its text */
+    uint8_t lsc;    /* CELL: LK_DEC scale */
+    int32_t tab;    /* CELL / COL: table; NAME: sheet (-1 = params) */
+    int32_t col, row;
+    size_t raw_lo, raw_hi; /* CELL: between the pipes; NAME / LINE: the line */
+    size_t f_lo, f_hi;     /* painted span (formula), f_lo == f_hi: none */
+    size_t n_lo, n_hi;     /* NAME: the defined name token */
+    size_t src_lo;         /* AST spans are relative to this */
+    const char *src;       /* literal text (unescaped) / formula text */
+    uint32_t srcn;
+    const char *name;      /* NAME */
+    uint32_t namen;
+    Ex *ex;
+    WVal v;
+    WVal cv;               /* cycle member: its #cycle(path) */
+    uint32_t topo;
+    uint32_t *deps;
+    uint32_t ndeps;
+    uint32_t rd0, rdn;     /* dependents in wb->rdeps */
+    uint8_t clash;         /* NAME: duplicate / case clash */
+} WNode;
+
+typedef struct {
+    const char *name;
+    uint32_t namen;
+    int32_t sheet;
+    int big;               /* over RTX_WB_ROWS_MAX rows: refused */
+    int clash;
+    size_t lo, hi;         /* caption line .. table end */
+    size_t cap_lo, cap_hi; /* the name in the caption (backticks incl.) */
+    int32_t ncols, nrows;
+    uint32_t cell0, col0;
+    const char **cname;
+    uint32_t *cnamen;
+    uint8_t *cclash;
+    size_t *hlo, *hhi;     /* header cells, trimmed */
+    size_t *row_lo, *row_hi; /* body lines (no NL) */
+    WColStat *cs;
+    uint8_t *ct, *csc;     /* inferred column type / dec scale */
+} WTab;
+
+typedef struct {
+    size_t lo, hi;         /* structural bytes */
+    size_t ext_lo, ext_hi; /* plus the line before and after */
+} WBlk;
+
+typedef struct {
+    int32_t scope;         /* -3 sheets, -2 tables, -1 params, >= 0 sheet */
+    const char *s;
+    uint32_t n;
+    uint32_t id;
+    uint8_t used;
+} WMapEnt;
+
+typedef struct {
+    WMapEnt *e;
+    uint32_t cap;
+} WMap;
+
+enum { SC_SHEET = -3, SC_TABLE = -2, SC_PARAM = -1 };
+
+struct RtxWb {
+    RtxDerived hook;
+    RtxDoc *doc;
+    CCArena own;
+    CCArena ma, va, sa;
+    size_t ma_mark, va_mark; /* bytes allocated since the rebuild */
+    size_t ma_base, va_base; /* ... by the rebuild itself */
+    int off;
+    int need_rebuild;
+    /* edits noted since the last sync (one union, like RtxEditSpan) */
+    int pend;
+    size_t p_lo, p_old, p_new;
+    size_t doc_len;          /* length the model describes */
+    /* model */
+    WNode *nodes;
+    uint32_t nn, ncap;
+    uint32_t *ord;           /* spanned nodes in byte order */
+    uint32_t nord, ordcap;
+    WTab *tabs;
+    uint32_t ntab, tabcap;
+    WBlk *blks;
+    uint32_t nblk, blkcap;
+    const char **sheets;
+    uint32_t *sheetn;
+    uint32_t nsheet, sheetcap;
+    WMap map;
+    uint32_t *rdeps;
+    size_t nrd;
+    uint32_t nderived;       /* nodes with a painted span */
+    /* recalc */
+    uint32_t *heap;
+    uint32_t nheap, heapcap;
+    uint32_t changed[RTX_WB_CHANGED_MAX];
+    uint32_t nchanged;
+    int chg_all;
+    /* bind scratch */
+    uint32_t *bdeps;
+    uint32_t nbd, bdcap;
+    RtxWbStats st;
+};
+
+/* ----------------------------------------------------------------- memory */
+
+static void *wb_alloc(CCArena a, size_t n) {
+    void *p = cc_arena_alloc(a, n ? n : 1, 16);
+    if (p) memset(p, 0, n ? n : 1);
+    return p;
+}
+
+static void *wb_ma(RtxWb *wb, size_t n) {
+    wb->ma_mark += n;
+    return wb_alloc(wb->ma, n);
+}
+
+static char *wb_strdup(RtxWb *wb, const char *s, size_t n) {
+    char *p = (char *)wb_ma(wb, n + 1);
+    if (!p) return NULL;
+    if (n) memcpy(p, s, n);
+    p[n] = 0;
+    return p;
+}
+
+/* Grow *pp (elements of `el` bytes) to hold `need`; model arena. */
+static int wb_grow(RtxWb *wb, void **pp, uint32_t *cap, uint32_t need, size_t el) {
+    uint32_t nc;
+    void *np;
+    if (need <= *cap) return 1;
+    nc = *cap ? *cap * 2 : 64;
+    while (nc < need) nc *= 2;
+    np = wb_ma(wb, (size_t)nc * el);
+    if (!np) return 0;
+    if (*pp && *cap) memcpy(np, *pp, (size_t)*cap * el);
+    *pp = np;
+    *cap = nc;
+    return 1;
+}
+
+static WVal wv_text(RtxWb *wb, const char *s, size_t n) {
+    WVal v = wv_null();
+    char *p = (char *)wb_alloc(wb->va, n + 1);
+    wb->va_mark += n + 1;
+    v.t = WV_TEXT;
+    if (!p) {
+        v.u.s = "";
+        return v;
+    }
+    if (n) memcpy(p, s, n);
+    v.u.s = p;
+    v.n = (uint32_t)n;
+    return v;
+}
+
+static WVal wv_err(RtxWb *wb, int code, const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    int k;
+    WVal v;
+    va_start(ap, fmt);
+    k = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (k < 0) k = 0;
+    if ((size_t)k >= sizeof buf) k = (int)sizeof buf - 1;
+    v = wv_text(wb, buf, (size_t)k);
+    v.t = WV_ERR;
+    v.code = (uint16_t)code;
+    return v;
+}
+
+/* ------------------------------------------------------------ name lookup */
+
+static uint64_t wb_hash(int32_t scope, const char *s, size_t n, int fold) {
+    uint64_t h = 1469598103934665603ull ^ (uint64_t)(uint32_t)scope;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (fold && c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static int wb_ieq(const char *a, const char *b, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        unsigned char x = (unsigned char)a[i], y = (unsigned char)b[i];
+        if (x >= 'A' && x <= 'Z') x = (unsigned char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (unsigned char)(y + 32);
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
+static int wb_map_init(RtxWb *wb, WMap *m, uint32_t n) {
+    uint32_t cap = 64;
+    while (cap < n * 2 + 16) cap *= 2;
+    m->e = (WMapEnt *)wb_ma(wb, (size_t)cap * sizeof(WMapEnt));
+    m->cap = m->e ? cap : 0;
+    return m->e != NULL;
+}
+
+/* Case-folded probe: the entry spelled like `s` ignoring case, or NULL.
+ * Keys are unique ignoring case (a clash is recorded, not inserted). */
+static WMapEnt *wb_map_find(const WMap *m, int32_t scope, const char *s, size_t n) {
+    uint32_t i;
+    if (!m->cap) return NULL;
+    i = (uint32_t)wb_hash(scope, s, n, 1) & (m->cap - 1);
+    while (m->e[i].used) {
+        const WMapEnt *e = &m->e[i];
+        if (e->scope == scope && e->n == n && wb_ieq(e->s, s, n)) return &m->e[i];
+        i = (i + 1) & (m->cap - 1);
+    }
+    return NULL;
+}
+
+/* Exact lookup: id, or -1 (absent or only a case variant exists). */
+static int64_t wb_map_get(const WMap *m, int32_t scope, const char *s, size_t n) {
+    const WMapEnt *e = wb_map_find(m, scope, s, n);
+    if (!e || memcmp(e->s, s, n) != 0) return -1;
+    return (int64_t)e->id;
+}
+
+/* Insert; returns the existing entry on a (case-folded) clash, else NULL. */
+static WMapEnt *wb_map_put(WMap *m, int32_t scope, const char *s, size_t n, uint32_t id) {
+    uint32_t i;
+    WMapEnt *hit = wb_map_find(m, scope, s, n);
+    if (hit) return hit;
+    if (!m->cap) return NULL;
+    i = (uint32_t)wb_hash(scope, s, n, 1) & (m->cap - 1);
+    while (m->e[i].used) i = (i + 1) & (m->cap - 1);
+    m->e[i].used = 1;
+    m->e[i].scope = scope;
+    m->e[i].s = s;
+    m->e[i].n = (uint32_t)n;
+    m->e[i].id = id;
+    return NULL;
+}
+
+/* -------------------------------------------------------------- formatting */
+
+static size_t wb_put(char *out, size_t cap, size_t at, const char *s, size_t n) {
+    size_t k;
+    if (!out || !cap || at + 1 >= cap) return at;
+    k = n;
+    if (at + k + 1 > cap) k = cap - 1 - at;
+    memcpy(out + at, s, k);
+    out[at + k] = 0;
+    return at + k;
+}
+
+static size_t wb_puts(char *out, size_t cap, size_t at, const char *s) {
+    return wb_put(out, cap, at, s, strlen(s));
+}
+
+/* Value text: numbers plain, dec with its scale, float shortest-ish
+ * (%.15g), dates ISO, errors `#code` (full: `#code(message)`). */
+static size_t wv_fmt(const WVal *v, char *out, size_t cap, int full) {
+    char b[64];
+    size_t at = 0;
+    if (out && cap) out[0] = 0;
+    switch (v->t) {
+    case WV_NULL:
+        return 0;
+    case WV_INT:
+        snprintf(b, sizeof b, "%lld", (long long)v->u.i);
+        return wb_puts(out, cap, 0, b);
+    case WV_DEC: {
+        uint64_t mag = v->u.i < 0 ? (uint64_t)(-(v->u.i + 1)) + 1 : (uint64_t)v->u.i;
+        uint64_t p = (uint64_t)g_pow10[v->sc];
+        snprintf(b, sizeof b, "%s%llu.%0*llu", v->u.i < 0 ? "-" : "",
+                 (unsigned long long)(mag / p), (int)v->sc,
+                 (unsigned long long)(mag % p));
+        return wb_puts(out, cap, 0, b);
+    }
+    case WV_FLOAT:
+        if (isnan(v->u.f)) return wb_puts(out, cap, 0, "nan");
+        if (isinf(v->u.f)) return wb_puts(out, cap, 0, v->u.f < 0 ? "-inf" : "inf");
+        snprintf(b, sizeof b, "%.15g", v->u.f);
+        return wb_puts(out, cap, 0, b);
+    case WV_BOOL:
+        return wb_puts(out, cap, 0, v->u.i ? "true" : "false");
+    case WV_DATE: {
+        int64_t y;
+        unsigned m, d;
+        wb_civil_from_days(v->u.i, &y, &m, &d);
+        snprintf(b, sizeof b, "%04lld-%02u-%02u", (long long)y, m, d);
+        return wb_puts(out, cap, 0, b);
+    }
+    case WV_TEXT:
+        return wb_put(out, cap, 0, v->u.s, v->n);
+    case WV_ERR:
+        at = wb_puts(out, cap, 0, g_we_tag[v->code < 9 ? v->code : 0]);
+        if (full && v->n) {
+            at = wb_puts(out, cap, at, "(");
+            at = wb_put(out, cap, at, v->u.s, v->n);
+            at = wb_puts(out, cap, at, ")");
+        }
+        return at;
+    case WV_ROW:
+        return wb_puts(out, cap, 0, "#type");
+    case WV_TAB:
+        return wb_puts(out, cap, 0, "#type");
+    }
+    return 0;
+}
+
+static size_t wb_node_label(const RtxWb *wb, uint32_t id, char *out, size_t cap) {
+    const WNode *n = &wb->nodes[id];
+    char b[48];
+    size_t at = 0;
+    if (out && cap) out[0] = 0;
+    if (n->kind == NK_CELL || n->kind == NK_COL) {
+        const WTab *t = &wb->tabs[n->tab];
+        at = wb_put(out, cap, at, t->name, t->namen);
+        at = wb_puts(out, cap, at, ".");
+        at = wb_put(out, cap, at, t->cname[n->col], t->cnamen[n->col]);
+        if (n->kind == NK_CELL) {
+            snprintf(b, sizeof b, "[%d]", (int)n->row + 1);
+            at = wb_puts(out, cap, at, b);
+        }
+        return at;
+    }
+    if (n->kind == NK_NAME) {
+        if (n->tab > 0 && (uint32_t)n->tab < wb->nsheet) {
+            at = wb_put(out, cap, at, wb->sheets[n->tab], wb->sheetn[n->tab]);
+            at = wb_puts(out, cap, at, ".");
+        }
+        return wb_put(out, cap, at, n->name, n->namen);
+    }
+    return wb_puts(out, cap, at, "(line)");
+}
+
+/* ---------------------------------------------------------------- lexer */
+
+enum { TK_END = 0, TK_NUM, TK_STR, TK_DATE, TK_DUR, TK_ID, TK_OP, TK_BAD };
+enum { OP_NE = 256, OP_LE, OP_GE };
+
+typedef struct {
+    uint8_t k;
+    uint8_t bq;   /* backtick identifier */
+    int op;
+    uint32_t lo, hi;
+    WVal v;       /* NUM / STR / DATE / DUR */
+} Tok;
+
+typedef struct {
+    RtxWb *wb;
+    const char *s;
+    uint32_t n;
+    uint32_t pos;
+    Tok t;
+    const char *err;
+    uint32_t err_at;
+} Lex;
+
+static int wb_id0(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+static int wb_id1(char c) {
+    return wb_id0(c) || (c >= '0' && c <= '9');
+}
+
+static void lx_fail(Lex *L, const char *msg, uint32_t at) {
+    if (!L->err) {
+        L->err = msg;
+        L->err_at = at;
+    }
+    L->t.k = TK_BAD;
+}
+
+static void lx_next(Lex *L) {
+    const char *s = L->s;
+    uint32_t n = L->n, i = L->pos, lo;
+    Tok *t = &L->t;
+    memset(t, 0, sizeof *t);
+    while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+    lo = i;
+    t->lo = lo;
+    if (i >= n) {
+        t->k = TK_END;
+        t->hi = n;
+        L->pos = n;
+        return;
+    }
+    if (s[i] >= '0' && s[i] <= '9') {
+        uint32_t j = i;
+        int64_t d;
+        while (j < n && ((s[j] >= '0' && s[j] <= '9') || s[j] == '-')) j++;
+        if (j - i >= 10 && wb_parse_date(s + i, 10, &d) &&
+            (i + 10 >= n || !(wb_id1(s[i + 10])))) {
+            t->k = TK_DATE;
+            t->v = wv_date(d);
+            t->hi = i + 10;
+            L->pos = i + 10;
+            return;
+        }
+        j = i;
+        while (j < n && s[j] >= '0' && s[j] <= '9') j++;
+        if (j < n && s[j] == '.' && j + 1 < n && s[j + 1] >= '0' && s[j + 1] <= '9') {
+            j++;
+            while (j < n && s[j] >= '0' && s[j] <= '9') j++;
+        }
+        if (j < n && (s[j] == 'e' || s[j] == 'E')) {
+            uint32_t k = j + 1;
+            if (k < n && (s[k] == '+' || s[k] == '-')) k++;
+            if (k < n && s[k] >= '0' && s[k] <= '9') {
+                while (k < n && s[k] >= '0' && s[k] <= '9') k++;
+                j = k;
+            }
+        }
+        {
+            int64_t iv = 0;
+            int sc = 0;
+            double fv = 0;
+            int kind = wb_parse_num(s + i, j - i, &iv, &sc, &fv);
+            if (!kind) {
+                lx_fail(L, "number out of range", i);
+                return;
+            }
+            if (j < n && s[j] == 'd' && (j + 1 >= n || !wb_id1(s[j + 1]))) {
+                if (kind != 1) {
+                    lx_fail(L, "a duration is whole days", i);
+                    return;
+                }
+                t->k = TK_DUR;
+                t->v = wv_int(iv);
+                t->hi = j + 1;
+                L->pos = j + 1;
+                return;
+            }
+            if (j < n && wb_id1(s[j])) {
+                lx_fail(L, "bad number", i);
+                return;
+            }
+            t->k = TK_NUM;
+            t->v = kind == 3 ? wv_float(fv) : wv_dec(iv, kind == 2 ? sc : 0);
+            t->hi = j;
+            L->pos = j;
+            return;
+        }
+    }
+    if (wb_id0(s[i])) {
+        uint32_t j = i + 1;
+        while (j < n && wb_id1(s[j])) j++;
+        t->k = TK_ID;
+        t->hi = j;
+        L->pos = j;
+        return;
+    }
+    if (s[i] == '`') {
+        uint32_t j = i + 1;
+        while (j < n && s[j] != '`') j++;
+        if (j >= n || j == i + 1) {
+            lx_fail(L, "unclosed `name`", i);
+            return;
+        }
+        t->k = TK_ID;
+        t->bq = 1;
+        t->hi = j + 1;
+        L->pos = j + 1;
+        return;
+    }
+    if (s[i] == '"') {
+        uint32_t j = i + 1, k = 0;
+        char *buf;
+        while (j < n && s[j] != '"') {
+            if (s[j] == '\\' && j + 1 < n) j++;
+            j++;
+        }
+        if (j >= n) {
+            lx_fail(L, "unclosed string", i);
+            return;
+        }
+        buf = (char *)wb_ma(L->wb, j - i);
+        if (!buf) {
+            lx_fail(L, "out of memory", i);
+            return;
+        }
+        {
+            uint32_t q = i + 1;
+            while (q < j) {
+                if (s[q] == '\\' && q + 1 < j) q++;
+                buf[k++] = s[q++];
+            }
+        }
+        t->k = TK_STR;
+        t->v = wv_null();
+        t->v.t = WV_TEXT;
+        t->v.u.s = buf;
+        t->v.n = k;
+        t->hi = j + 1;
+        L->pos = j + 1;
+        return;
+    }
+    t->k = TK_OP;
+    t->op = (unsigned char)s[i];
+    t->hi = i + 1;
+    if (i + 1 < n) {
+        char a = s[i], b = s[i + 1];
+        if (a == '=' && b == '=') t->op = '=';
+        else if (a == '!' && b == '=') t->op = OP_NE;
+        else if (a == '<' && b == '>') t->op = OP_NE;
+        else if (a == '<' && b == '=') t->op = OP_LE;
+        else if (a == '>' && b == '=') t->op = OP_GE;
+        if (t->op != (unsigned char)s[i] || (a == '=' && b == '=')) t->hi = i + 2;
+    }
+    if (!s[i] || !strchr("()[]{},.+-*/%&=<>@?!", s[i]) ||
+        (s[i] == '!' && t->op != OP_NE)) {
+        lx_fail(L, "unexpected character", i);
+        return;
+    }
+    L->pos = t->hi;
+}
+
+static int lx_kw(const Lex *L, const char *kw) {
+    size_t n = strlen(kw);
+    return L->t.k == TK_ID && !L->t.bq && L->t.hi - L->t.lo == n &&
+           memcmp(L->s + L->t.lo, kw, n) == 0;
+}
+
+static int lx_op(const Lex *L, int op) {
+    return L->t.k == TK_OP && L->t.op == op;
+}
+
+static int wb_is_kw(const char *s, size_t n) {
+    static const char *const kws[] = {"and", "or", "not", "if", "then", "else", "where",
+                                      "true", "false", "null", NULL};
+    size_t i;
+    for (i = 0; kws[i]; i++)
+        if (strlen(kws[i]) == n && memcmp(kws[i], s, n) == 0) return 1;
+    return 0;
+}
+
+/* ----------------------------------------------------------------- parser */
+
+enum {
+    EX_LIT = 1,
+    EX_IDENT,   /* id */
+    EX_AT,      /* @id2 */
+    EX_DOT,     /* a . id2 */
+    EX_INDEX,   /* a [ b ] */
+    EX_CALL,    /* id ( args [where] ) */
+    EX_UN,      /* bin: '-' / '!' (not) */
+    EX_BIN,
+    EX_IF,      /* a ? b : c */
+    /* bound */
+    EX_ERR,
+    EX_COL,     /* tab.col (a value only while iterating tab) */
+    EX_ATCELL,  /* this row's cell (col) */
+    EX_NAMEREF, /* node */
+    EX_TABREF,  /* tab */
+    EX_LOOKUP,  /* tab [ b ]: one row */
+    EX_FIELD,   /* a . col */
+    EX_AGG,     /* fn over tab rows: args[0] [where] */
+    EX_FN       /* scalar function */
+};
+
+enum {
+    FN_NONE = 0,
+    FN_SUM, FN_COUNT, FN_AVG, FN_MIN, FN_MAX, FN_DISTINCT, FN_ANY, FN_ALL,
+    FN_ABS, FN_ROUND, FN_FLOOR, FN_CEIL, FN_COALESCE, FN_LEN, FN_LOWER, FN_UPPER,
+    FN_ISERROR, FN_IFERROR, FN_FIRST, FN_IF, FN_MIN2, FN_MAX2
+};
+
+struct Ex {
+    uint8_t op;
+    uint8_t fn;
+    uint8_t q;       /* `sum?` skips errors */
+    uint8_t tabtok;  /* the table token is written (rename) */
+    uint8_t first;   /* lookup through first(...) */
+    uint8_t sheettok;
+    int bin;
+    uint16_t nargs;
+    int32_t tab, col;
+    uint32_t node;
+    uint32_t lo, hi;   /* primary token (table / name / whole) */
+    uint32_t lo2, hi2; /* member token (column / name after a sheet) */
+    const char *id;
+    uint32_t idn;
+    const char *id2;
+    uint32_t id2n;
+    WVal v;
+    Ex *a, *b, *c;
+    Ex **args;
+    Ex *where;
+};
+
+static Ex *ex_new(Lex *L, int op, uint32_t lo, uint32_t hi) {
+    Ex *e = (Ex *)wb_ma(L->wb, sizeof(Ex));
+    if (!e) {
+        lx_fail(L, "out of memory", lo);
+        return NULL;
+    }
+    e->op = (uint8_t)op;
+    e->lo = lo;
+    e->hi = hi;
+    e->tab = -1;
+    e->col = -1;
+    return e;
+}
+
+/* The identifier's name bytes (backticks stripped). */
+static void tok_name(const Lex *L, const Tok *t, const char **s, uint32_t *n) {
+    *s = L->s + t->lo + t->bq;
+    *n = t->hi - t->lo - 2u * t->bq;
+}
+
+static Ex *p_expr(Lex *L);
+
+static Ex *p_primary(Lex *L) {
+    Tok t = L->t;
+    Ex *e;
+    if (t.k == TK_BAD) return NULL;
+    if (t.k == TK_NUM || t.k == TK_STR || t.k == TK_DATE || t.k == TK_DUR) {
+        e = ex_new(L, EX_LIT, t.lo, t.hi);
+        if (!e) return NULL;
+        e->v = t.v;
+        lx_next(L);
+        return e;
+    }
+    if (lx_op(L, '(')) {
+        lx_next(L);
+        e = p_expr(L);
+        if (!e) return NULL;
+        if (!lx_op(L, ')')) {
+            lx_fail(L, "expected )", L->t.lo);
+            return NULL;
+        }
+        lx_next(L);
+        return e;
+    }
+    if (lx_op(L, '@')) {
+        uint32_t lo = t.lo;
+        lx_next(L);
+        if (L->t.k != TK_ID) {
+            lx_fail(L, "expected a column after @", L->t.lo);
+            return NULL;
+        }
+        e = ex_new(L, EX_AT, lo, L->t.hi);
+        if (!e) return NULL;
+        e->lo2 = L->t.lo;
+        e->hi2 = L->t.hi;
+        tok_name(L, &L->t, &e->id2, &e->id2n);
+        lx_next(L);
+        return e;
+    }
+    if (t.k == TK_ID) {
+        const char *s;
+        uint32_t n;
+        tok_name(L, &t, &s, &n);
+        if (!t.bq) {
+            if (lx_kw(L, "true") || lx_kw(L, "false")) {
+                e = ex_new(L, EX_LIT, t.lo, t.hi);
+                if (!e) return NULL;
+                e->v = wv_bool(lx_kw(L, "true"));
+                lx_next(L);
+                return e;
+            }
+            if (lx_kw(L, "null")) {
+                e = ex_new(L, EX_LIT, t.lo, t.hi);
+                if (!e) return NULL;
+                lx_next(L);
+                return e;
+            }
+            if (wb_is_kw(s, n)) {
+                lx_fail(L, "unexpected keyword", t.lo);
+                return NULL;
+            }
+        }
+        lx_next(L);
+        if (!t.bq && L->t.k == TK_ID &&
+            ((n == 5 && !memcmp(s, "group", 5)) || (n == 4 && !memcmp(s, "join", 4)) ||
+             (n == 4 && !memcmp(s, "sort", 4)) || (n == 3 && !memcmp(s, "top", 3)))) {
+            lx_fail(L, "group / join / sort / top are views (workbook W2 / W4)", t.lo);
+            return NULL;
+        }
+        if (!t.bq && (lx_op(L, '(') || lx_op(L, '?'))) {
+            uint32_t cap = 4;
+            int q = 0;
+            if (lx_op(L, '?')) {
+                q = 1;
+                lx_next(L);
+                if (!lx_op(L, '(')) {
+                    lx_fail(L, "expected ( after ?", L->t.lo);
+                    return NULL;
+                }
+            }
+            e = ex_new(L, EX_CALL, t.lo, t.hi);
+            if (!e) return NULL;
+            e->id = s;
+            e->idn = n;
+            e->q = (uint8_t)q;
+            e->args = (Ex **)wb_ma(L->wb, cap * sizeof(Ex *));
+            lx_next(L);
+            if (lx_op(L, ')')) {
+                lx_next(L);
+                return e;
+            }
+            for (;;) {
+                Ex *a = p_expr(L);
+                if (!a) return NULL;
+                if (e->nargs >= cap) {
+                    Ex **na = (Ex **)wb_ma(L->wb, cap * 2 * sizeof(Ex *));
+                    if (!na) {
+                        lx_fail(L, "out of memory", t.lo);
+                        return NULL;
+                    }
+                    memcpy(na, e->args, cap * sizeof(Ex *));
+                    e->args = na;
+                    cap *= 2;
+                }
+                e->args[e->nargs++] = a;
+                if (lx_kw(L, "where")) {
+                    lx_next(L);
+                    e->where = p_expr(L);
+                    if (!e->where) return NULL;
+                    if (!lx_op(L, ')')) {
+                        lx_fail(L, "expected ) after where", L->t.lo);
+                        return NULL;
+                    }
+                }
+                if (lx_op(L, ')')) {
+                    lx_next(L);
+                    return e;
+                }
+                if (!lx_op(L, ',')) {
+                    lx_fail(L, "expected , or )", L->t.lo);
+                    return NULL;
+                }
+                lx_next(L);
+            }
+        }
+        e = ex_new(L, EX_IDENT, t.lo, t.hi);
+        if (!e) return NULL;
+        e->id = s;
+        e->idn = n;
+        return e;
+    }
+    if (t.k == TK_END) lx_fail(L, "unexpected end", t.lo);
+    else lx_fail(L, "unexpected token", t.lo);
+    return NULL;
+}
+
+static Ex *p_post(Lex *L) {
+    Ex *e = p_primary(L);
+    while (e) {
+        if (lx_op(L, '.')) {
+            Ex *d;
+            lx_next(L);
+            if (L->t.k != TK_ID) {
+                lx_fail(L, "expected a name after .", L->t.lo);
+                return NULL;
+            }
+            d = ex_new(L, EX_DOT, e->lo, L->t.hi);
+            if (!d) return NULL;
+            d->a = e;
+            d->lo2 = L->t.lo;
+            d->hi2 = L->t.hi;
+            tok_name(L, &L->t, &d->id2, &d->id2n);
+            lx_next(L);
+            e = d;
+            continue;
+        }
+        if (lx_op(L, '[')) {
+            Ex *x;
+            lx_next(L);
+            x = ex_new(L, EX_INDEX, e->lo, e->hi);
+            if (!x) return NULL;
+            x->a = e;
+            x->b = p_expr(L);
+            if (!x->b) return NULL;
+            if (!lx_op(L, ']')) {
+                lx_fail(L, "expected ]", L->t.lo);
+                return NULL;
+            }
+            x->hi = L->t.hi;
+            lx_next(L);
+            e = x;
+            continue;
+        }
+        break;
+    }
+    return e;
+}
+
+static Ex *p_unary(Lex *L) {
+    if (lx_op(L, '-') || lx_op(L, '+')) {
+        uint32_t lo = L->t.lo;
+        int neg = lx_op(L, '-');
+        Ex *e, *a;
+        lx_next(L);
+        a = p_unary(L);
+        if (!a || !neg) return a;
+        e = ex_new(L, EX_UN, lo, a->hi);
+        if (!e) return NULL;
+        e->bin = '-';
+        e->a = a;
+        return e;
+    }
+    return p_post(L);
+}
+
+static Ex *p_binop(Lex *L, Ex *a, int op, Ex *(*rhs)(Lex *)) {
+    Ex *e, *b;
+    lx_next(L);
+    b = rhs(L);
+    if (!b) return NULL;
+    e = ex_new(L, EX_BIN, a->lo, b->hi);
+    if (!e) return NULL;
+    e->bin = op;
+    e->a = a;
+    e->b = b;
+    return e;
+}
+
+static Ex *p_mul(Lex *L) {
+    Ex *e = p_unary(L);
+    while (e && (lx_op(L, '*') || lx_op(L, '/') || lx_op(L, '%')))
+        e = p_binop(L, e, L->t.op, p_unary);
+    return e;
+}
+
+static Ex *p_add(Lex *L) {
+    Ex *e = p_mul(L);
+    while (e && (lx_op(L, '+') || lx_op(L, '-'))) e = p_binop(L, e, L->t.op, p_mul);
+    return e;
+}
+
+static Ex *p_cat(Lex *L) {
+    Ex *e = p_add(L);
+    while (e && lx_op(L, '&')) e = p_binop(L, e, '&', p_add);
+    return e;
+}
+
+static Ex *p_cmp(Lex *L) {
+    Ex *e = p_cat(L);
+    if (e && (lx_op(L, '=') || lx_op(L, OP_NE) || lx_op(L, '<') || lx_op(L, OP_LE) ||
+              lx_op(L, '>') || lx_op(L, OP_GE)))
+        e = p_binop(L, e, L->t.op, p_cat);
+    return e;
+}
+
+static Ex *p_not(Lex *L) {
+    if (lx_kw(L, "not")) {
+        uint32_t lo = L->t.lo;
+        Ex *e, *a;
+        lx_next(L);
+        a = p_not(L);
+        if (!a) return NULL;
+        e = ex_new(L, EX_UN, lo, a->hi);
+        if (!e) return NULL;
+        e->bin = '!';
+        e->a = a;
+        return e;
+    }
+    return p_cmp(L);
+}
+
+static Ex *p_and(Lex *L) {
+    Ex *e = p_not(L);
+    while (e && lx_kw(L, "and")) e = p_binop(L, e, 'a', p_not);
+    return e;
+}
+
+static Ex *p_or(Lex *L) {
+    Ex *e = p_and(L);
+    while (e && lx_kw(L, "or")) e = p_binop(L, e, 'o', p_and);
+    return e;
+}
+
+static Ex *p_expr(Lex *L) {
+    if (lx_kw(L, "if")) {
+        uint32_t lo = L->t.lo, hi = L->t.hi;
+        Ex *e;
+        lx_next(L);
+        if (lx_op(L, '(')) {
+            /* if(c, a, b): the function form */
+            Ex *c = ex_new(L, EX_CALL, lo, hi);
+            if (!c) return NULL;
+            c->id = L->s + lo;
+            c->idn = 2;
+            c->args = (Ex **)wb_ma(L->wb, 3 * sizeof(Ex *));
+            if (!c->args) {
+                lx_fail(L, "out of memory", lo);
+                return NULL;
+            }
+            lx_next(L);
+            while (c->nargs < 3) {
+                Ex *a = p_expr(L);
+                if (!a) return NULL;
+                c->args[c->nargs++] = a;
+                if (c->nargs < 3) {
+                    if (!lx_op(L, ',')) {
+                        lx_fail(L, "if(c, a, b) takes three arguments", L->t.lo);
+                        return NULL;
+                    }
+                    lx_next(L);
+                }
+            }
+            if (!lx_op(L, ')')) {
+                lx_fail(L, "expected )", L->t.lo);
+                return NULL;
+            }
+            lx_next(L);
+            return c;
+        }
+        e = ex_new(L, EX_IF, lo, lo);
+        if (!e) return NULL;
+        e->a = p_expr(L);
+        if (!e->a) return NULL;
+        if (!lx_kw(L, "then")) {
+            lx_fail(L, "expected then", L->t.lo);
+            return NULL;
+        }
+        lx_next(L);
+        e->b = p_expr(L);
+        if (!e->b) return NULL;
+        if (!lx_kw(L, "else")) {
+            lx_fail(L, "expected else", L->t.lo);
+            return NULL;
+        }
+        lx_next(L);
+        e->c = p_expr(L);
+        if (!e->c) return NULL;
+        e->hi = e->c->hi;
+        return e;
+    }
+    return p_or(L);
+}
+
+/* Parse `s` (a formula without its `=`). A syntax error is an EX_ERR root
+ * holding #parse(message at column). */
+static Ex *wb_parse(RtxWb *wb, const char *s, uint32_t n) {
+    Lex L;
+    Ex *e;
+    memset(&L, 0, sizeof L);
+    L.wb = wb;
+    L.s = s;
+    L.n = n;
+    lx_next(&L);
+    e = p_expr(&L);
+    if (e && !L.err && L.t.k != TK_END) lx_fail(&L, "unexpected text after the formula", L.t.lo);
+    if (!e || L.err) {
+        Ex *x = (Ex *)wb_ma(wb, sizeof(Ex));
+        if (!x) return NULL;
+        x->op = EX_ERR;
+        x->lo = 0;
+        x->hi = n;
+        x->v = wv_err(wb, WE_PARSE, "%s at column %u", L.err ? L.err : "syntax error",
+                      (unsigned)L.err_at + 1);
+        return x;
+    }
+    return e;
+}
+
+/* ------------------------------------------------------- literal typing */
+
+static int wb_lit_kind(const char *s, size_t n, int *sc) {
+    int64_t iv;
+    double fv;
+    int k;
+    *sc = 0;
+    if (!n) return LK_EMPTY;
+    if ((n == 4 && !memcmp(s, "true", 4)) || (n == 5 && !memcmp(s, "false", 5)))
+        return LK_BOOL;
+    if (n == 10 && wb_parse_date(s, n, &iv)) return LK_DATE;
+    k = wb_parse_num(s, n, &iv, sc, &fv);
+    if (k == 1) return LK_INT;
+    if (k == 2) return LK_DEC;
+    if (k == 3) return LK_FLOAT;
+    *sc = 0;
+    return LK_TEXT;
+}
+
+static void wb_cs_add(WColStat *cs, int lk, int sc, int dir) {
+    if (!cs || lk <= LK_EMPTY || lk >= LK_FORMULA) return;
+    cs->k[lk] = (uint32_t)((int)cs->k[lk] + dir);
+    if (lk == LK_DEC && sc >= 0 && sc < 19) cs->sc[sc] = (uint32_t)((int)cs->sc[sc] + dir);
+}
+
+/* int ⊂ dec ⊂ float ⊂ text; a column mixing numbers, dates and bools is text. */
+static void wb_col_type(const WColStat *s, uint8_t *t, uint8_t *sc) {
+    int num = s->k[LK_INT] + s->k[LK_DEC] + s->k[LK_FLOAT] > 0;
+    int classes = num + (s->k[LK_BOOL] > 0) + (s->k[LK_DATE] > 0);
+    int i;
+    *sc = 0;
+    if (s->k[LK_TEXT] || classes > 1) *t = WV_TEXT;
+    else if (num && s->k[LK_FLOAT]) *t = WV_FLOAT;
+    else if (num && s->k[LK_DEC]) {
+        *t = WV_DEC;
+        for (i = 18; i > 0; i--)
+            if (s->sc[i]) {
+                *sc = (uint8_t)i;
+                break;
+            }
+    } else if (num) *t = WV_INT;
+    else if (s->k[LK_BOOL]) *t = WV_BOOL;
+    else if (s->k[LK_DATE]) *t = WV_DATE;
+    else *t = WV_TEXT;
+}
+
+/* A literal cell's value under its column's type. */
+static WVal wb_lit_value(RtxWb *wb, const WNode *n, int ct, int csc) {
+    int64_t iv = 0;
+    int sc = 0;
+    double fv = 0;
+    int k;
+    if (n->lk == LK_EMPTY) return wv_null();
+    switch (ct) {
+    case WV_INT:
+    case WV_DEC:
+        k = wb_parse_num(n->src, n->srcn, &iv, &sc, &fv);
+        if (k != 1 && k != 2) break;
+        if (csc > sc) {
+            __int128 x = (__int128)iv * g_pow10[csc - sc];
+            if (x > INT64_MAX || x < INT64_MIN)
+                return wv_err(wb, WE_NUM, "%.*s does not fit dec(%d)", (int)n->srcn, n->src, csc);
+            iv = (int64_t)x;
+        }
+        return wv_dec(iv, csc);
+    case WV_FLOAT:
+        k = wb_parse_num(n->src, n->srcn, &iv, &sc, &fv);
+        if (k == 3) return wv_float(fv);
+        if (k == 1 || k == 2) return wv_float((double)iv / (double)g_pow10[sc]);
+        break;
+    case WV_BOOL:
+        return wv_bool(n->srcn == 4);
+    case WV_DATE:
+        if (wb_parse_date(n->src, n->srcn, &iv)) return wv_date(iv);
+        break;
+    default:
+        break;
+    }
+    return wv_text(wb, n->src, n->srcn);
+}
+
+/* ------------------------------------------------------------------ binder */
+
+typedef struct {
+    RtxWb *wb;
+    uint32_t self;          /* node being bound (UINT32_MAX: eval) */
+    int32_t own_tab, own_row;
+    int32_t sheet;
+    int32_t it_tab;
+    int any_sheet;          /* eval: an unqualified name may live on any sheet */
+    int nodeps;
+} BCtx;
+
+static const char *const g_fn_name[] = {
+    "", "sum", "count", "avg", "min", "max", "distinct", "any", "all",
+    "abs", "round", "floor", "ceil", "coalesce", "len", "lower", "upper",
+    "iserror", "iferror", "first", "if", NULL};
+
+static int wb_fn_of(const char *s, size_t n) {
+    int i;
+    for (i = 1; g_fn_name[i]; i++)
+        if (strlen(g_fn_name[i]) == n && !memcmp(g_fn_name[i], s, n)) return i;
+    return FN_NONE;
+}
+
+static int wb_fn_agg(int fn) {
+    return fn >= FN_SUM && fn <= FN_ALL;
+}
+
+static void bd_dep(BCtx *c, uint32_t id) {
+    RtxWb *wb = c->wb;
+    if (c->nodeps) return;
+    if (!wb_grow(wb, (void **)&wb->bdeps, &wb->bdcap, wb->nbd + 1, sizeof(uint32_t))) return;
+    wb->bdeps[wb->nbd++] = id;
+}
+
+static Ex *bd_err(BCtx *c, Ex *e, int code, const char *fmt, const char *a, size_t an,
+                  const char *b, size_t bn) {
+    char msg[200];
+    snprintf(msg, sizeof msg, fmt, (int)an, a ? a : "", (int)bn, b ? b : "");
+    e->op = EX_ERR;
+    e->v = wv_err(c->wb, code, "%s", msg);
+    return e;
+}
+
+/* Column `s` of table t: index, -1 absent, -2 ambiguous (a duplicate or
+ * a case clash in the header). */
+static int wb_col_of(const WTab *t, const char *s, size_t n) {
+    int i;
+    for (i = 0; i < t->ncols; i++) {
+        if (t->cnamen[i] == n && !memcmp(t->cname[i], s, n)) return t->cclash[i] ? -2 : i;
+    }
+    return -1;
+}
+
+static uint32_t wb_cell_id(const WTab *t, int row, int col) {
+    return t->cell0 + (uint32_t)row * (uint32_t)t->ncols + (uint32_t)col;
+}
+
+static int64_t wb_name_lookup(BCtx *c, const char *s, size_t n) {
+    RtxWb *wb = c->wb;
+    int64_t id = -1;
+    uint32_t i;
+    if (c->sheet >= 0) id = wb_map_get(&wb->map, c->sheet, s, n);
+    if (id < 0) id = wb_map_get(&wb->map, SC_PARAM, s, n);
+    if (id < 0 && c->any_sheet)
+        for (i = 0; i < wb->nsheet && id < 0; i++) id = wb_map_get(&wb->map, (int32_t)i, s, n);
+    return id;
+}
+
+static Ex *bd(BCtx *c, Ex *e);
+
+static Ex *bd_table_ref(BCtx *c, Ex *e, int64_t tab) {
+    WTab *t = &c->wb->tabs[tab];
+    if (t->big)
+        return bd_err(c, e, WE_REF, "%.*s has more than 10000 rows (W1 indexes it)%.*s",
+                      t->name, t->namen, "", 0);
+    return NULL;
+}
+
+static Ex *bd_col(BCtx *c, Ex *e, int64_t tab, const char *cs, size_t cn) {
+    WTab *t = &c->wb->tabs[tab];
+    int col = wb_col_of(t, cs, cn);
+    Ex *bad = bd_table_ref(c, e, tab);
+    if (bad) return bad;
+    if (col == -2)
+        return bd_err(c, e, WE_DUP, "%.*s.%.*s names two columns", t->name, t->namen, cs, cn);
+    if (col < 0)
+        return bd_err(c, e, WE_REF, "%.*s has no column %.*s", t->name, t->namen, cs, cn);
+    e->op = EX_COL;
+    e->tab = (int32_t)tab;
+    e->col = col;
+    bd_dep(c, t->col0 + (uint32_t)col);
+    return e;
+}
+
+static Ex *bd_ident(BCtx *c, Ex *e) {
+    RtxWb *wb = c->wb;
+    int64_t id;
+    if (c->it_tab >= 0) {
+        WTab *t = &wb->tabs[c->it_tab];
+        int col = wb_col_of(t, e->id, e->idn);
+        if (col != -1) {
+            e->lo2 = e->lo;
+            e->hi2 = e->hi;
+            e->tabtok = 0;
+            return bd_col(c, e, c->it_tab, e->id, e->idn);
+        }
+    }
+    id = wb_name_lookup(c, e->id, e->idn);
+    if (id >= 0) {
+        e->op = EX_NAMEREF;
+        e->node = (uint32_t)id;
+        e->lo2 = e->lo;
+        e->hi2 = e->hi;
+        bd_dep(c, (uint32_t)id);
+        return e;
+    }
+    id = wb_map_get(&wb->map, SC_TABLE, e->id, e->idn);
+    if (id >= 0) {
+        Ex *bad = bd_table_ref(c, e, id);
+        if (bad) return bad;
+        e->op = EX_TABREF;
+        e->tab = (int32_t)id;
+        e->tabtok = 1;
+        return e;
+    }
+    if (wb_map_get(&wb->map, SC_SHEET, e->id, e->idn) >= 0)
+        return bd_err(c, e, WE_TYPE, "sheet %.*s is a namespace: write %.*s.name",
+                      e->id, e->idn, e->id, e->idn);
+    if (c->own_tab >= 0 && wb_col_of(&wb->tabs[c->own_tab], e->id, e->idn) >= 0)
+        return bd_err(c, e, WE_NAME, "unknown name %.*s (this row's column is @%.*s)",
+                      e->id, e->idn, e->id, e->idn);
+    return bd_err(c, e, WE_NAME, "unknown name %.*s%.*s", e->id, e->idn, "", 0);
+}
+
+/* Table the aggregate argument iterates: the first `T.col` / `T` in it
+ * (not inside a nested aggregate or lookup). -1 if none. */
+static int64_t bd_iter_tab(BCtx *c, const Ex *e) {
+    int64_t t;
+    uint16_t i;
+    if (!e) return -1;
+    switch (e->op) {
+    case EX_IDENT:
+        if (c->it_tab >= 0 && wb_col_of(&c->wb->tabs[c->it_tab], e->id, e->idn) != -1)
+            return -1;
+        return wb_map_get(&c->wb->map, SC_TABLE, e->id, e->idn);
+    case EX_DOT:
+        if (e->a && e->a->op == EX_IDENT) {
+            t = wb_map_get(&c->wb->map, SC_TABLE, e->a->id, e->a->idn);
+            if (t >= 0) return t;
+            return -1;
+        }
+        return bd_iter_tab(c, e->a);
+    case EX_CALL: {
+        int fn = wb_fn_of(e->id, e->idn);
+        if (wb_fn_agg(fn) && !((fn == FN_MIN || fn == FN_MAX) && e->nargs > 1)) return -1;
+        for (i = 0; i < e->nargs; i++) {
+            t = bd_iter_tab(c, e->args[i]);
+            if (t >= 0) return t;
+        }
+        return -1;
+    }
+    case EX_UN:
+        return bd_iter_tab(c, e->a);
+    case EX_BIN:
+        t = bd_iter_tab(c, e->a);
+        return t >= 0 ? t : bd_iter_tab(c, e->b);
+    case EX_IF:
+        t = bd_iter_tab(c, e->a);
+        if (t < 0) t = bd_iter_tab(c, e->b);
+        return t >= 0 ? t : bd_iter_tab(c, e->c);
+    default:
+        return -1;
+    }
+}
+
+static Ex *bd_call(BCtx *c, Ex *e) {
+    int fn = wb_fn_of(e->id, e->idn);
+    uint16_t i;
+    if (fn == FN_NONE)
+        return bd_err(c, e, WE_NAME, "unknown function %.*s%.*s", e->id, e->idn, "", 0);
+    if ((fn == FN_MIN || fn == FN_MAX) && e->nargs > 1 && !e->where)
+        fn = fn == FN_MIN ? FN_MIN2 : FN_MAX2;
+    if (wb_fn_agg(fn)) {
+        int64_t it;
+        int32_t save = c->it_tab;
+        Ex *bad;
+        if (e->nargs != 1)
+            return bd_err(c, e, WE_TYPE, "%.*s takes one column (T.col) or table%.*s", e->id,
+                          e->idn, "", 0);
+        it = bd_iter_tab(c, e->args[0]);
+        if (it < 0)
+            return bd_err(c, e, WE_REF, "%.*s needs a table column (T.col)%.*s", e->id, e->idn,
+                          "", 0);
+        bad = bd_table_ref(c, e, it);
+        if (bad) return bad;
+        c->it_tab = (int32_t)it;
+        e->args[0] = bd(c, e->args[0]);
+        if (e->where) e->where = bd(c, e->where);
+        c->it_tab = save;
+        e->op = EX_AGG;
+        e->fn = (uint8_t)fn;
+        e->tab = (int32_t)it;
+        return e;
+    }
+    if (e->where)
+        return bd_err(c, e, WE_TYPE, "where belongs to an aggregate, not %.*s%.*s", e->id, e->idn,
+                      "", 0);
+    for (i = 0; i < e->nargs; i++) e->args[i] = bd(c, e->args[i]);
+    if (fn == FN_FIRST) {
+        Ex *a = e->nargs == 1 ? e->args[0] : NULL;
+        if (!a || a->op != EX_LOOKUP)
+            return bd_err(c, e, WE_TYPE, "first(T[condition]) takes a lookup%.*s%.*s", "", 0, "", 0);
+        a->first = 1;
+        return a;
+    }
+    if (fn == FN_IF) {
+        if (e->nargs != 3)
+            return bd_err(c, e, WE_TYPE, "if takes three arguments%.*s%.*s", "", 0, "", 0);
+        e->op = EX_IF;
+        e->a = e->args[0];
+        e->b = e->args[1];
+        e->c = e->args[2];
+        return e;
+    }
+    {
+        int lo = 1, hi = 1;
+        if (fn == FN_ROUND) hi = 2;
+        if (fn == FN_IFERROR) lo = hi = 2;
+        if (fn == FN_COALESCE || fn == FN_MIN2 || fn == FN_MAX2) {
+            lo = 1;
+            hi = 64;
+        }
+        if (e->nargs < lo || e->nargs > hi)
+            return bd_err(c, e, WE_TYPE, "%.*s: wrong number of arguments%.*s", e->id, e->idn, "", 0);
+    }
+    e->op = EX_FN;
+    e->fn = (uint8_t)fn;
+    return e;
+}
+
+static Ex *bd(BCtx *c, Ex *e) {
+    RtxWb *wb = c->wb;
+    if (!e) return e;
+    switch (e->op) {
+    case EX_LIT:
+    case EX_ERR:
+        return e;
+    case EX_IDENT:
+        return bd_ident(c, e);
+    case EX_AT: {
+        WTab *t;
+        int col;
+        if (c->own_tab < 0 || c->own_row < 0)
+            return bd_err(c, e, WE_REF, "@%.*s needs a table row%.*s", e->id2, e->id2n, "", 0);
+        t = &wb->tabs[c->own_tab];
+        col = wb_col_of(t, e->id2, e->id2n);
+        if (col == -2)
+            return bd_err(c, e, WE_DUP, "@%.*s names two columns%.*s", e->id2, e->id2n, "", 0);
+        if (col < 0)
+            return bd_err(c, e, WE_REF, "%.*s has no column %.*s", t->name, t->namen, e->id2,
+                          e->id2n);
+        e->op = EX_ATCELL;
+        e->col = col;
+        e->tab = c->own_tab;
+        bd_dep(c, wb_cell_id(t, c->own_row, col));
+        return e;
+    }
+    case EX_DOT: {
+        Ex *b = e->a;
+        if (b && b->op == EX_IDENT) {
+            int64_t id;
+            int is_col = c->it_tab >= 0 &&
+                         wb_col_of(&wb->tabs[c->it_tab], b->id, b->idn) != -1;
+            id = is_col ? -1 : wb_map_get(&wb->map, SC_TABLE, b->id, b->idn);
+            if (id >= 0) {
+                e->tabtok = 1;
+                e->lo = b->lo;
+                e->hi = b->hi;
+                return bd_col(c, e, id, e->id2, e->id2n);
+            }
+            id = is_col ? -1 : wb_map_get(&wb->map, SC_SHEET, b->id, b->idn);
+            if (id >= 0 && wb_name_lookup(c, b->id, b->idn) < 0) {
+                int64_t nd = wb_map_get(&wb->map, (int32_t)id, e->id2, e->id2n);
+                if (nd < 0)
+                    return bd_err(c, e, WE_NAME, "sheet %.*s has no name %.*s", b->id, b->idn,
+                                  e->id2, e->id2n);
+                e->op = EX_NAMEREF;
+                e->node = (uint32_t)nd;
+                e->sheettok = 1;
+                e->lo = b->lo;
+                e->hi = b->hi;
+                bd_dep(c, (uint32_t)nd);
+                return e;
+            }
+        }
+        e->a = bd(c, b);
+        if (e->a && e->a->op == EX_LOOKUP) {
+            WTab *t = &wb->tabs[e->a->tab];
+            int col = wb_col_of(t, e->id2, e->id2n);
+            if (col < 0)
+                return bd_err(c, e, col == -2 ? WE_DUP : WE_REF, "%.*s has no column %.*s",
+                              t->name, t->namen, e->id2, e->id2n);
+            e->op = EX_FIELD;
+            e->tab = e->a->tab;
+            e->col = col;
+            bd_dep(c, t->col0 + (uint32_t)col);
+            return e;
+        }
+        if (e->a && e->a->op == EX_ERR) {
+            e->op = EX_ERR;
+            e->v = e->a->v;
+            return e;
+        }
+        return bd_err(c, e, WE_TYPE, ".%.*s needs a table or a row (T[condition])%.*s", e->id2,
+                      e->id2n, "", 0);
+    }
+    case EX_INDEX: {
+        Ex *b = e->a;
+        int64_t id = -1;
+        int32_t save;
+        if (b && b->op == EX_IDENT) id = wb_map_get(&wb->map, SC_TABLE, b->id, b->idn);
+        if (id < 0) return bd_err(c, e, WE_TYPE, "[ ] needs a table%.*s%.*s", "", 0, "", 0);
+        {
+            Ex *bad = bd_table_ref(c, e, id);
+            if (bad) return bad;
+        }
+        e->lo = b->lo;
+        e->hi = b->hi;
+        e->tabtok = 1;
+        e->tab = (int32_t)id;
+        if (e->b && e->b->op == EX_AT) {
+            /* T[@col]: this row of this table */
+            WTab *t = &wb->tabs[id];
+            int col;
+            if (c->own_tab != (int32_t)id || c->own_row < 0)
+                return bd_err(c, e, WE_REF, "%.*s[@%.*s] names this row only inside the table",
+                              t->name, t->namen, e->b->id2, e->b->id2n);
+            col = wb_col_of(t, e->b->id2, e->b->id2n);
+            if (col < 0)
+                return bd_err(c, e, WE_REF, "%.*s has no column %.*s", t->name, t->namen,
+                              e->b->id2, e->b->id2n);
+            e->op = EX_ATCELL;
+            e->col = col;
+            e->lo2 = e->b->lo2;
+            e->hi2 = e->b->hi2;
+            bd_dep(c, wb_cell_id(t, c->own_row, col));
+            return e;
+        }
+        save = c->it_tab;
+        c->it_tab = (int32_t)id;
+        e->b = bd(c, e->b);
+        c->it_tab = save;
+        e->op = EX_LOOKUP;
+        return e;
+    }
+    case EX_CALL:
+        return bd_call(c, e);
+    case EX_UN:
+        e->a = bd(c, e->a);
+        return e;
+    case EX_BIN:
+        e->a = bd(c, e->a);
+        e->b = bd(c, e->b);
+        return e;
+    case EX_IF:
+        e->a = bd(c, e->a);
+        e->b = bd(c, e->b);
+        e->c = bd(c, e->c);
+        return e;
+    default:
+        return e;
+    }
+}
+
+static int wb_u32_cmp(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* Parse + bind node `id`'s formula; its deps land on the node. Returns 1
+ * when the dependency set changed. */
+static int wb_bind_node(RtxWb *wb, uint32_t id) {
+    WNode *n = &wb->nodes[id];
+    BCtx c;
+    uint32_t *old = n->deps, oldn = n->ndeps, k, m;
+    memset(&c, 0, sizeof c);
+    c.wb = wb;
+    c.self = id;
+    c.own_tab = -1;
+    c.own_row = -1;
+    c.it_tab = -1;
+    c.sheet = -1;
+    if (n->kind == NK_CELL) {
+        c.own_tab = n->tab;
+        c.own_row = n->row;
+        c.sheet = wb->tabs[n->tab].sheet;
+    } else if (n->kind == NK_NAME) {
+        c.sheet = n->tab;
+    }
+    n->deps = NULL;
+    n->ndeps = 0;
+    n->ex = NULL;
+    if (n->form && n->src) {
+        wb->nbd = 0;
+        n->ex = wb_parse(wb, n->src, n->srcn);
+        n->ex = bd(&c, n->ex);
+        if (wb->nbd) {
+            qsort(wb->bdeps, wb->nbd, sizeof(uint32_t), wb_u32_cmp);
+            for (k = 1, m = 1; k < wb->nbd; k++)
+                if (wb->bdeps[k] != wb->bdeps[m - 1]) wb->bdeps[m++] = wb->bdeps[k];
+            n->deps = (uint32_t *)wb_ma(wb, m * sizeof(uint32_t));
+            if (n->deps) {
+                memcpy(n->deps, wb->bdeps, m * sizeof(uint32_t));
+                n->ndeps = m;
+            }
+        }
+    }
+    if (oldn != n->ndeps) return 1;
+    return oldn && memcmp(old, n->deps, oldn * sizeof(uint32_t)) != 0;
+}
+
+/* --------------------------------------------------------------- evaluator */
+
+typedef struct {
+    RtxWb *wb;
+    uint32_t self;
+    int32_t own_tab, own_row;
+    int32_t it_tab, it_row;
+} ECtx;
+
+static WVal ev(ECtx *c, const Ex *e);
+
+static const char *wb_self_label(ECtx *c, char *b, size_t n) {
+    if (c->self == UINT32_MAX || c->self >= c->wb->nn) return "eval";
+    wb_node_label(c->wb, c->self, b, n);
+    return b;
+}
+
+static WVal ev_err(ECtx *c, int code, const char *what) {
+    char lb[96];
+    return wv_err(c->wb, code, "%s in %s", what, wb_self_label(c, lb, sizeof lb));
+}
+
+static int wv_num(const WVal *v) {
+    return v->t == WV_INT || v->t == WV_DEC || v->t == WV_FLOAT;
+}
+
+static double wv_tod(const WVal *v) {
+    if (v->t == WV_FLOAT) return v->u.f;
+    if (v->t == WV_DEC) return (double)v->u.i / (double)g_pow10[v->sc];
+    return (double)v->u.i;
+}
+
+static int wv_same(const WVal *a, const WVal *b) {
+    if (a->t != b->t) return 0;
+    switch (a->t) {
+    case WV_NULL:
+        return 1;
+    case WV_INT:
+    case WV_BOOL:
+    case WV_DATE:
+        return a->u.i == b->u.i;
+    case WV_DEC:
+        return a->sc == b->sc && a->u.i == b->u.i;
+    case WV_FLOAT:
+        return memcmp(&a->u.f, &b->u.f, sizeof(double)) == 0;
+    case WV_TEXT:
+        return a->n == b->n && (!a->n || memcmp(a->u.s, b->u.s, a->n) == 0);
+    case WV_ERR:
+        return a->code == b->code && a->n == b->n && (!a->n || memcmp(a->u.s, b->u.s, a->n) == 0);
+    case WV_ROW:
+        return a->code == b->code && a->u.i == b->u.i;
+    default:
+        return 1;
+    }
+}
+
+/* -1 / 0 / 1; *ok = 0 when the two do not compare (different kinds). */
+static int wv_cmp(const WVal *a, const WVal *b, int *ok) {
+    *ok = 1;
+    if (wv_num(a) && wv_num(b)) {
+        if (a->t == WV_FLOAT || b->t == WV_FLOAT) {
+            double x = wv_tod(a), y = wv_tod(b);
+            return x < y ? -1 : x > y;
+        }
+        {
+            int sa = a->t == WV_DEC ? a->sc : 0, sb = b->t == WV_DEC ? b->sc : 0;
+            int s = sa > sb ? sa : sb;
+            __int128 x = (__int128)a->u.i * g_pow10[s - sa];
+            __int128 y = (__int128)b->u.i * g_pow10[s - sb];
+            return x < y ? -1 : x > y;
+        }
+    }
+    if (a->t != b->t) {
+        *ok = 0;
+        return 0;
+    }
+    if (a->t == WV_TEXT) {
+        size_t m = a->n < b->n ? a->n : b->n;
+        int r = m ? memcmp(a->u.s, b->u.s, m) : 0;
+        if (r) return r < 0 ? -1 : 1;
+        return a->n < b->n ? -1 : a->n > b->n;
+    }
+    if (a->t == WV_DATE || a->t == WV_BOOL) return a->u.i < b->u.i ? -1 : a->u.i > b->u.i;
+    if (a->t == WV_NULL) return 0;
+    *ok = 0;
+    return 0;
+}
+
+static const char *wv_kind(const WVal *v) {
+    static const char *const k[] = {"null", "int", "dec", "float", "bool", "date", "text",
+                                    "error", "row", "table"};
+    return v->t <= WV_TAB ? k[v->t] : "?";
+}
+
+static WVal wv_fit(ECtx *c, __int128 x, int sc) {
+    while (sc > 12) {
+        __int128 q = x / 10, r = x % 10;
+        if (r >= 5) q++;
+        else if (r <= -5) q--;
+        x = q;
+        sc--;
+    }
+    if (x > INT64_MAX || x < INT64_MIN) return ev_err(c, WE_NUM, "number too large");
+    return wv_dec((int64_t)x, sc);
+}
+
+static WVal wv_arith(ECtx *c, int op, const WVal *a, const WVal *b) {
+    char msg[96];
+    if (a->t == WV_NULL || b->t == WV_NULL) return wv_null();
+    if (a->t == WV_DATE || b->t == WV_DATE) {
+        if (op == '+' && a->t == WV_DATE && b->t == WV_INT) return wv_date(a->u.i + b->u.i);
+        if (op == '+' && a->t == WV_INT && b->t == WV_DATE) return wv_date(a->u.i + b->u.i);
+        if (op == '-' && a->t == WV_DATE && b->t == WV_INT) return wv_date(a->u.i - b->u.i);
+        if (op == '-' && a->t == WV_DATE && b->t == WV_DATE) return wv_int(a->u.i - b->u.i);
+        snprintf(msg, sizeof msg, "%s %c %s", wv_kind(a), op, wv_kind(b));
+        return ev_err(c, WE_TYPE, msg);
+    }
+    if (!wv_num(a) || !wv_num(b)) {
+        snprintf(msg, sizeof msg, "%s %c %s", wv_kind(a), op, wv_kind(b));
+        return ev_err(c, WE_TYPE, msg);
+    }
+    if (op == '/') {
+        double y = wv_tod(b);
+        if (y == 0) return ev_err(c, WE_DIV0, "division by zero");
+        return wv_float(wv_tod(a) / y);
+    }
+    if (a->t == WV_FLOAT || b->t == WV_FLOAT) {
+        double x = wv_tod(a), y = wv_tod(b);
+        if (op == '+') return wv_float(x + y);
+        if (op == '-') return wv_float(x - y);
+        if (op == '*') return wv_float(x * y);
+        if (y == 0) return ev_err(c, WE_DIV0, "division by zero");
+        return wv_float(wb_fmod(x, y));
+    }
+    {
+        int sa = a->t == WV_DEC ? a->sc : 0, sb = b->t == WV_DEC ? b->sc : 0;
+        int s = sa > sb ? sa : sb;
+        __int128 x = (__int128)a->u.i * g_pow10[s - sa];
+        __int128 y = (__int128)b->u.i * g_pow10[s - sb];
+        if (op == '+') return wv_fit(c, x + y, s);
+        if (op == '-') return wv_fit(c, x - y, s);
+        if (op == '*') return wv_fit(c, (__int128)a->u.i * b->u.i, sa + sb);
+        if (y == 0) return ev_err(c, WE_DIV0, "division by zero");
+        return wv_fit(c, x % y, s);
+    }
+}
+
+static WVal wv_concat(ECtx *c, const WVal *a, const WVal *b) {
+    char x[256], y[256], buf[512];
+    size_t xn = wv_fmt(a, x, sizeof x, 0), yn = wv_fmt(b, y, sizeof y, 0);
+    memcpy(buf, x, xn);
+    memcpy(buf + xn, y, yn);
+    return wv_text(c->wb, buf, xn + yn);
+}
+
+static WVal wv_row_err(ECtx *c, const WVal *v) {
+    if (v->t == WV_ROW) return ev_err(c, WE_TYPE, "a row is not a value (add .column)");
+    return ev_err(c, WE_TYPE, "a table is not a value (count it, or T[condition].column)");
+}
+
+static WVal ev_bin(ECtx *c, const Ex *e) {
+    WVal a, b;
+    int op = e->bin;
+    if (op == 'a' || op == 'o') {
+        a = ev(c, e->a);
+        if (a.t == WV_ERR) return a;
+        if (a.t != WV_BOOL && a.t != WV_NULL)
+            return ev_err(c, WE_TYPE, "and / or need true / false");
+        if (op == 'a' && a.t == WV_BOOL && !a.u.i) return wv_bool(0);
+        if (op == 'o' && a.t == WV_BOOL && a.u.i) return wv_bool(1);
+        b = ev(c, e->b);
+        if (b.t == WV_ERR) return b;
+        if (b.t != WV_BOOL && b.t != WV_NULL)
+            return ev_err(c, WE_TYPE, "and / or need true / false");
+        return wv_bool(b.t == WV_BOOL && b.u.i);
+    }
+    a = ev(c, e->a);
+    if (a.t == WV_ERR) return a;
+    b = ev(c, e->b);
+    if (b.t == WV_ERR) return b;
+    if (a.t == WV_ROW || a.t == WV_TAB) return wv_row_err(c, &a);
+    if (b.t == WV_ROW || b.t == WV_TAB) return wv_row_err(c, &b);
+    if (op == '&') return wv_concat(c, &a, &b);
+    if (op == '=' || op == OP_NE || op == '<' || op == OP_LE || op == '>' || op == OP_GE) {
+        int ok, r;
+        if (a.t == WV_NULL || b.t == WV_NULL) return wv_null();
+        r = wv_cmp(&a, &b, &ok);
+        if (!ok) {
+            char msg[64];
+            snprintf(msg, sizeof msg, "cannot compare %s with %s", wv_kind(&a), wv_kind(&b));
+            return ev_err(c, WE_TYPE, msg);
+        }
+        switch (op) {
+        case '=':
+            return wv_bool(r == 0);
+        case OP_NE:
+            return wv_bool(r != 0);
+        case '<':
+            return wv_bool(r < 0);
+        case OP_LE:
+            return wv_bool(r <= 0);
+        case '>':
+            return wv_bool(r > 0);
+        default:
+            return wv_bool(r >= 0);
+        }
+    }
+    return wv_arith(c, op, &a, &b);
+}
+
+static const WVal *wb_cellv(const RtxWb *wb, int32_t tab, int32_t row, int32_t col) {
+    const WTab *t = &wb->tabs[tab];
+    return &wb->nodes[wb_cell_id(t, row, col)].v;
+}
+
+/* Exact sum: ints / decs in an i128 at the widest scale seen, floats as
+ * Shewchuk partials (python fsum): one rounding at the end, the same
+ * result in any order. */
+typedef struct {
+    int n, isf, sc, big;
+    __int128 acc;
+    double p[64];
+    int np;
+    double inf;
+} WSum;
+
+static void ws_float(WSum *s, double x) {
+    int i = 0, j;
+    for (j = 0; j < s->np; j++) {
+        double y = s->p[j], hi, lo;
+        if (fabs(x) < fabs(y)) {
+            double t = x;
+            x = y;
+            y = t;
+        }
+        hi = x + y;
+        lo = y - (hi - x);
+        if (lo != 0.0) s->p[i++] = lo;
+        x = hi;
+    }
+    if (i < 64) s->p[i++] = x;
+    s->np = i;
+}
+
+static double ws_round(const WSum *s) {
+    int n = s->np;
+    double hi = 0, lo = 0, x, y, yr;
+    if (n <= 0) return 0.0;
+    n--;
+    hi = s->p[n];
+    while (n > 0) {
+        x = hi;
+        n--;
+        y = s->p[n];
+        hi = x + y;
+        yr = hi - x;
+        lo = y - yr;
+        if (lo != 0.0) break;
+    }
+    if (n > 0 && ((lo < 0 && s->p[n - 1] < 0) || (lo > 0 && s->p[n - 1] > 0))) {
+        y = lo * 2;
+        x = hi + y;
+        yr = x - hi;
+        if (y == yr) hi = x;
+    }
+    return hi;
+}
+
+static void ws_add(WSum *s, const WVal *v) {
+    s->n++;
+    if (v->t == WV_FLOAT) {
+        s->isf = 1;
+        if (!isfinite(v->u.f)) {
+            s->big = 2;
+            s->inf += v->u.f;
+            return;
+        }
+        ws_float(s, v->u.f);
+        return;
+    }
+    {
+        int vs = v->t == WV_DEC ? v->sc : 0;
+        __int128 x = v->u.i;
+        __int128 lim = (__int128)1 << 120;
+        if (vs > s->sc) {
+            s->acc *= g_pow10[vs - s->sc];
+            s->sc = vs;
+        } else if (vs < s->sc) {
+            x *= g_pow10[s->sc - vs];
+        }
+        s->acc += x;
+        if (s->acc > lim || s->acc < -lim) s->big = 1;
+    }
+}
+
+static WVal ws_value(ECtx *c, const WSum *s) {
+    if (s->big == 2) return wv_float(s->inf);
+    if (s->big) return ev_err(c, WE_NUM, "sum too large");
+    if (s->isf) {
+        WSum t = *s;
+        if (t.acc) {
+            __int128 p = g_pow10[t.sc];
+            ws_float(&t, (double)(t.acc / p));
+            if (t.acc % p) ws_float(&t, (double)(t.acc % p) / (double)p);
+        }
+        return wv_float(ws_round(&t));
+    }
+    if (s->acc > INT64_MAX || s->acc < INT64_MIN) return ev_err(c, WE_NUM, "sum too large");
+    return wv_dec((int64_t)s->acc, s->sc);
+}
+
+static int wb_val_order(const void *pa, const void *pb) {
+    const WVal *a = (const WVal *)pa, *b = (const WVal *)pb;
+    int ok, r;
+    r = wv_cmp(a, b, &ok);
+    if (ok) return r;
+    return a->t < b->t ? -1 : a->t > b->t;
+}
+
+static WVal ev_agg(ECtx *c, const Ex *e) {
+    RtxWb *wb = c->wb;
+    const WTab *t = &wb->tabs[e->tab];
+    ECtx r = *c;
+    WSum s;
+    WVal best = wv_null(), v;
+    int32_t row;
+    int fn = e->fn;
+    int count_rows = e->args[0]->op == EX_TABREF && e->args[0]->tab == e->tab;
+    size_t cnt = 0, nt = 0, nf = 0, nv = 0;
+    WVal *vals = NULL;
+    memset(&s, 0, sizeof s);
+    if (e->args[0]->op == EX_TABREF && (!count_rows || fn != FN_COUNT))
+        return ev_err(c, WE_TYPE, "a table aggregates as count(T) only");
+    if (fn == FN_DISTINCT) {
+        vals = (WVal *)cc_arena_alloc(wb->sa, (size_t)(t->nrows ? t->nrows : 1) * sizeof(WVal), 16);
+        if (!vals) return ev_err(c, WE_NUM, "out of memory");
+    }
+    r.it_tab = e->tab;
+    for (row = 0; row < t->nrows; row++) {
+        r.it_row = row;
+        if (e->where) {
+            WVal p = ev(&r, e->where);
+            if (p.t == WV_ERR) {
+                if (e->q) continue;
+                return p;
+            }
+            if (p.t == WV_NULL) continue;
+            if (p.t != WV_BOOL) return ev_err(c, WE_TYPE, "where needs true / false");
+            if (!p.u.i) continue;
+        }
+        if (count_rows) {
+            cnt++;
+            continue;
+        }
+        v = ev(&r, e->args[0]);
+        if (v.t == WV_ERR) {
+            if (e->q) continue;
+            return v;
+        }
+        if (v.t == WV_NULL) continue;
+        if (v.t == WV_ROW || v.t == WV_TAB) return wv_row_err(c, &v);
+        cnt++;
+        switch (fn) {
+        case FN_SUM:
+        case FN_AVG:
+            if (!wv_num(&v)) {
+                char msg[128];
+                snprintf(msg, sizeof msg, "%s over %s (%.*s row %d)", g_fn_name[fn], wv_kind(&v),
+                         (int)t->namen, t->name, (int)row + 1);
+                return ev_err(c, WE_TYPE, msg);
+            }
+            ws_add(&s, &v);
+            break;
+        case FN_MIN:
+        case FN_MAX: {
+            int ok = 1, k;
+            if (cnt == 1) {
+                best = v;
+                break;
+            }
+            k = wv_cmp(&v, &best, &ok);
+            if (!ok) return ev_err(c, WE_TYPE, "min / max over mixed kinds");
+            if ((fn == FN_MIN && k < 0) || (fn == FN_MAX && k > 0)) best = v;
+            break;
+        }
+        case FN_DISTINCT:
+            vals[nv++] = v;
+            break;
+        case FN_ANY:
+        case FN_ALL:
+            if (v.t != WV_BOOL) return ev_err(c, WE_TYPE, "any / all need true / false");
+            if (v.u.i) nt++;
+            else nf++;
+            break;
+        default:
+            break;
+        }
+    }
+    switch (fn) {
+    case FN_SUM:
+        return ws_value(c, &s);
+    case FN_COUNT:
+        return wv_int((int64_t)cnt);
+    case FN_AVG: {
+        WVal tot;
+        if (!cnt) return wv_null();
+        tot = ws_value(c, &s);
+        if (tot.t == WV_ERR) return tot;
+        return wv_float(wv_tod(&tot) / (double)cnt);
+    }
+    case FN_MIN:
+    case FN_MAX:
+        return best;
+    case FN_DISTINCT: {
+        size_t i, u = 0;
+        if (nv) {
+            qsort(vals, nv, sizeof(WVal), wb_val_order);
+            u = 1;
+            for (i = 1; i < nv; i++)
+                if (wb_val_order(&vals[i], &vals[i - 1]) != 0) u++;
+        }
+        return wv_int((int64_t)u);
+    }
+    case FN_ANY:
+        return wv_bool(nt > 0);
+    case FN_ALL:
+        return wv_bool(nf == 0);
+    default:
+        return wv_null();
+    }
+}
+
+static WVal ev_lookup(ECtx *c, const Ex *e) {
+    const WTab *t = &c->wb->tabs[e->tab];
+    ECtx r = *c;
+    int32_t row, hit = -1;
+    r.it_tab = e->tab;
+    for (row = 0; row < t->nrows; row++) {
+        WVal p;
+        r.it_row = row;
+        p = ev(&r, e->b);
+        if (p.t == WV_ERR) return p;
+        if (p.t == WV_NULL) continue;
+        if (p.t != WV_BOOL) return ev_err(c, WE_TYPE, "T[condition] needs true / false");
+        if (!p.u.i) continue;
+        if (hit >= 0) {
+            char msg[128];
+            snprintf(msg, sizeof msg, "%.*s[...] matches rows %d and %d (first(...) takes one)",
+                     (int)t->namen, t->name, (int)hit + 1, (int)row + 1);
+            return ev_err(c, WE_DUP, msg);
+        }
+        hit = row;
+        if (e->first) break;
+    }
+    if (hit < 0) return wv_null();
+    {
+        WVal v = wv_null();
+        v.t = WV_ROW;
+        v.code = (uint16_t)e->tab;
+        v.u.i = hit;
+        return v;
+    }
+}
+
+static size_t wb_utf8_count(const char *s, size_t n) {
+    size_t i, k = 0;
+    for (i = 0; i < n; i++)
+        if (((unsigned char)s[i] & 0xC0) != 0x80) k++;
+    return k;
+}
+
+static WVal ev_fn(ECtx *c, const Ex *e) {
+    WVal a;
+    uint16_t i;
+    int fn = e->fn;
+    if (fn == FN_COALESCE) {
+        for (i = 0; i < e->nargs; i++) {
+            a = ev(c, e->args[i]);
+            if (a.t != WV_NULL) return a;
+        }
+        return wv_null();
+    }
+    if (fn == FN_MIN2 || fn == FN_MAX2) {
+        WVal best = wv_null();
+        for (i = 0; i < e->nargs; i++) {
+            int ok, k;
+            a = ev(c, e->args[i]);
+            if (a.t == WV_ERR) return a;
+            if (a.t == WV_NULL) continue;
+            if (best.t == WV_NULL) {
+                best = a;
+                continue;
+            }
+            k = wv_cmp(&a, &best, &ok);
+            if (!ok) return ev_err(c, WE_TYPE, "min / max over mixed kinds");
+            if ((fn == FN_MIN2 && k < 0) || (fn == FN_MAX2 && k > 0)) best = a;
+        }
+        return best;
+    }
+    if (fn == FN_ISERROR) {
+        a = ev(c, e->args[0]);
+        return wv_bool(a.t == WV_ERR);
+    }
+    if (fn == FN_IFERROR) {
+        a = ev(c, e->args[0]);
+        return a.t == WV_ERR ? ev(c, e->args[1]) : a;
+    }
+    a = ev(c, e->args[0]);
+    if (a.t == WV_ERR || a.t == WV_NULL) return a;
+    if (a.t == WV_ROW || a.t == WV_TAB) return wv_row_err(c, &a);
+    switch (fn) {
+    case FN_ABS:
+        if (!wv_num(&a)) return ev_err(c, WE_TYPE, "abs needs a number");
+        if (a.t == WV_FLOAT) return wv_float(fabs(a.u.f));
+        if (a.u.i == INT64_MIN) return ev_err(c, WE_NUM, "number too large");
+        a.u.i = a.u.i < 0 ? -a.u.i : a.u.i;
+        return a;
+    case FN_ROUND: {
+        int64_t nd = 0;
+        if (!wv_num(&a)) return ev_err(c, WE_TYPE, "round needs a number");
+        if (e->nargs > 1) {
+            WVal b = ev(c, e->args[1]);
+            if (b.t == WV_ERR) return b;
+            if (b.t != WV_INT || b.u.i < 0 || b.u.i > 12)
+                return ev_err(c, WE_NUM, "round digits are 0..12");
+            nd = b.u.i;
+        }
+        if (a.t == WV_FLOAT) {
+            double p = (double)g_pow10[nd];
+            return wv_float(wb_round(a.u.f * p) / p);
+        }
+        {
+            int sc = a.t == WV_DEC ? a.sc : 0;
+            __int128 x = a.u.i;
+            if (nd >= sc) return wv_fit(c, x * g_pow10[nd - sc], (int)nd);
+            {
+                int64_t p = g_pow10[sc - nd];
+                __int128 q = x / p, r = x % p;
+                if (r * 2 >= p) q++;
+                else if (r * 2 <= -p) q--;
+                return wv_fit(c, q, (int)nd);
+            }
+        }
+    }
+    case FN_FLOOR:
+    case FN_CEIL:
+        if (!wv_num(&a)) return ev_err(c, WE_TYPE, "floor / ceil need a number");
+        if (a.t == WV_FLOAT) {
+            double f = fn == FN_FLOOR ? wb_floor(a.u.f) : wb_ceil(a.u.f);
+            if (f >= -9.2e18 && f <= 9.2e18) return wv_int((int64_t)f);
+            return wv_float(f);
+        }
+        if (a.t == WV_DEC) {
+            int64_t p = g_pow10[a.sc], q = a.u.i / p, r = a.u.i % p;
+            if (fn == FN_FLOOR && r < 0) q--;
+            if (fn == FN_CEIL && r > 0) q++;
+            return wv_int(q);
+        }
+        return a;
+    case FN_LEN:
+        if (a.t != WV_TEXT) return ev_err(c, WE_TYPE, "len needs text");
+        return wv_int((int64_t)wb_utf8_count(a.u.s, a.n));
+    case FN_LOWER:
+    case FN_UPPER: {
+        char *p;
+        uint32_t k;
+        if (a.t != WV_TEXT) return ev_err(c, WE_TYPE, "lower / upper need text");
+        a = wv_text(c->wb, a.u.s, a.n);
+        p = (char *)a.u.s;
+        for (k = 0; k < a.n; k++) {
+            if (fn == FN_LOWER && p[k] >= 'A' && p[k] <= 'Z') p[k] = (char)(p[k] + 32);
+            if (fn == FN_UPPER && p[k] >= 'a' && p[k] <= 'z') p[k] = (char)(p[k] - 32);
+        }
+        return a;
+    }
+    default:
+        return ev_err(c, WE_NAME, "unknown function");
+    }
+}
+
+static WVal ev(ECtx *c, const Ex *e) {
+    RtxWb *wb = c->wb;
+    if (!e) return wv_null();
+    switch (e->op) {
+    case EX_LIT:
+    case EX_ERR:
+        return e->v;
+    case EX_NAMEREF:
+        return wb->nodes[e->node].v;
+    case EX_ATCELL:
+        return *wb_cellv(wb, e->tab, c->own_row, e->col);
+    case EX_COL:
+        if (c->it_tab == e->tab) return *wb_cellv(wb, e->tab, c->it_row, e->col);
+        {
+            const WTab *t = &wb->tabs[e->tab];
+            char msg[160];
+            snprintf(msg, sizeof msg, "%.*s.%.*s is a column: aggregate it (sum, count, ...)%s",
+                     (int)t->namen, t->name, (int)t->cnamen[e->col], t->cname[e->col],
+                     c->own_tab == e->tab ? " or use @column" : "");
+            return ev_err(c, WE_TYPE, msg);
+        }
+    case EX_TABREF: {
+        WVal v = wv_null();
+        v.t = WV_TAB;
+        v.code = (uint16_t)e->tab;
+        return v;
+    }
+    case EX_LOOKUP:
+        return ev_lookup(c, e);
+    case EX_FIELD: {
+        WVal r = ev(c, e->a);
+        if (r.t == WV_ERR || r.t == WV_NULL) return r;
+        if (r.t != WV_ROW) return ev_err(c, WE_TYPE, ".column needs a row");
+        return *wb_cellv(wb, e->tab, (int32_t)r.u.i, e->col);
+    }
+    case EX_AGG:
+        return ev_agg(c, e);
+    case EX_FN:
+        return ev_fn(c, e);
+    case EX_UN: {
+        WVal a = ev(c, e->a);
+        if (a.t == WV_ERR || a.t == WV_NULL) return a;
+        if (e->bin == '!') {
+            if (a.t != WV_BOOL) return ev_err(c, WE_TYPE, "not needs true / false");
+            return wv_bool(!a.u.i);
+        }
+        if (a.t == WV_FLOAT) return wv_float(-a.u.f);
+        if (!wv_num(&a)) return ev_err(c, WE_TYPE, "- needs a number");
+        if (a.u.i == INT64_MIN) return ev_err(c, WE_NUM, "number too large");
+        a.u.i = -a.u.i;
+        return a;
+    }
+    case EX_BIN:
+        return ev_bin(c, e);
+    case EX_IF: {
+        WVal p = ev(c, e->a);
+        if (p.t == WV_ERR) return p;
+        if (p.t != WV_BOOL && p.t != WV_NULL) return ev_err(c, WE_TYPE, "if needs true / false");
+        return ev(c, p.t == WV_BOOL && p.u.i ? e->b : e->c);
+    }
+    default:
+        return ev_err(c, WE_PARSE, "unbound formula");
+    }
+}
+
+/* Node value from scratch (its inputs are current). */
+static WVal wb_eval_node(RtxWb *wb, uint32_t id) {
+    WNode *n = &wb->nodes[id];
+    ECtx c;
+    WVal v;
+    if (n->kind == NK_COL || n->kind == NK_LINE) return wv_null();
+    if (n->kind == NK_CELL && !n->form) {
+        const WTab *t = &wb->tabs[n->tab];
+        return wb_lit_value(wb, n, t->ct[n->col], t->csc[n->col]);
+    }
+    if (n->kind == NK_NAME && n->clash) return n->v;
+    memset(&c, 0, sizeof c);
+    c.wb = wb;
+    c.self = id;
+    c.own_tab = n->kind == NK_CELL ? n->tab : -1;
+    c.own_row = n->kind == NK_CELL ? n->row : -1;
+    c.it_tab = -1;
+    c.it_row = -1;
+    v = ev(&c, n->ex);
+    if (v.t == WV_ROW || v.t == WV_TAB) v = wv_row_err(&c, &v);
+    return v;
+}
+
+/* ------------------------------------------------------------------ build */
+
+#define WNONE ((size_t)-1)
+#define WB_SCAN_BACK 4096
+#define WB_LINE_MAX (256u * 1024u)
+#define WB_GARBAGE_MIN (16u << 20)
+
+static uint32_t wb_node_new(RtxWb *wb, int kind) {
+    WNode *n;
+    if (!wb_grow(wb, (void **)&wb->nodes, &wb->ncap, wb->nn + 1, sizeof(WNode))) return UINT32_MAX;
+    n = &wb->nodes[wb->nn];
+    memset(n, 0, sizeof *n);
+    n->kind = (uint8_t)kind;
+    n->tab = n->col = n->row = -1;
+    n->raw_lo = n->raw_hi = n->f_lo = n->f_hi = n->n_lo = n->n_hi = n->src_lo = WNONE;
+    return wb->nn++;
+}
+
+static int wb_ord_push(RtxWb *wb, uint32_t id) {
+    if (!wb_grow(wb, (void **)&wb->ord, &wb->ordcap, wb->nord + 1, sizeof(uint32_t))) return 0;
+    wb->ord[wb->nord++] = id;
+    return 1;
+}
+
+static int wb_has_f(const WNode *n) {
+    return n->f_lo != WNONE && n->f_hi != WNONE && n->f_hi > n->f_lo;
+}
+
+static int wb_ex_literal(const Ex *e) {
+    return e && (e->op == EX_LIT || (e->op == EX_UN && e->bin == '-' && e->a && e->a->op == EX_LIT));
+}
+
+static int wb_ws(char c) {
+    return c == ' ' || c == '\t';
+}
+
+/* Structure a line can start: a fence (``` / ~~~), an ATX H1 (a sheet),
+ * a `Table:` caption. `info` gets the fence info word. */
+enum { WL_NONE = 0, WL_FENCE, WL_H1, WL_CAPTION };
+
+static int wb_line_kind(const char *s, size_t n, char *fch, size_t *frun, size_t *ilo,
+                        size_t *ihi) {
+    size_t i = 0, j;
+    while (i < n && i < 4 && s[i] == ' ') i++;
+    if (i >= 4) return WL_NONE;
+    if (i < n && (s[i] == '`' || s[i] == '~')) {
+        char c = s[i];
+        j = i;
+        while (j < n && s[j] == c) j++;
+        if (j - i >= 3) {
+            size_t a = j, b = n;
+            while (a < b && wb_ws(s[a])) a++;
+            while (b > a && (wb_ws(s[b - 1]) || s[b - 1] == '\r')) b--;
+            if (c == '`') {
+                size_t k;
+                for (k = a; k < b; k++)
+                    if (s[k] == '`') return WL_NONE;
+            }
+            if (fch) *fch = c;
+            if (frun) *frun = j - i;
+            if (ilo) *ilo = a;
+            if (ihi) *ihi = b;
+            return WL_FENCE;
+        }
+        return WL_NONE;
+    }
+    if (i < n && s[i] == '#' && (i + 1 >= n || wb_ws(s[i + 1]) || s[i + 1] == '\r')) {
+        if (ilo) *ilo = i + 1;
+        if (ihi) *ihi = n;
+        return WL_H1;
+    }
+    if (n - i >= 6 && !memcmp(s + i, "Table:", 6)) {
+        if (ilo) *ilo = i + 6;
+        if (ihi) *ihi = n;
+        return WL_CAPTION;
+    }
+    return WL_NONE;
+}
+
+static int wb_blank(const char *s, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (!wb_ws(s[i]) && s[i] != '\r') return 0;
+    return 1;
+}
+
+static void wb_trim(const char *s, size_t *lo, size_t *hi) {
+    while (*lo < *hi && (wb_ws(s[*lo]) || s[*lo] == '\r')) (*lo)++;
+    while (*hi > *lo && (wb_ws(s[*hi - 1]) || s[*hi - 1] == '\r')) (*hi)--;
+}
+
+static int wb_blk_add(RtxWb *wb, const char *buf, size_t len, size_t lo, size_t hi) {
+    WBlk *b;
+    size_t p;
+    if (!wb_grow(wb, (void **)&wb->blks, &wb->blkcap, wb->nblk + 1, sizeof(WBlk))) return 0;
+    b = &wb->blks[wb->nblk++];
+    b->lo = lo;
+    b->hi = hi;
+    b->ext_lo = lo;
+    if (lo > 0) {
+        p = lo - 1;
+        while (p > 0 && buf[p - 1] != '\n') p--;
+        b->ext_lo = p;
+    }
+    b->ext_hi = hi;
+    if (hi < len) {
+        p = hi;
+        while (p < len && buf[p] != '\n') p++;
+        b->ext_hi = p < len ? p + 1 : p;
+    }
+    return 1;
+}
+
+static int32_t wb_sheet_add(RtxWb *wb, const char *s, size_t n) {
+    if (!wb_grow(wb, (void **)&wb->sheets, &wb->sheetcap, wb->nsheet + 1, sizeof(char *))) return 0;
+    {
+        uint32_t cap = wb->sheetcap;
+        uint32_t *nn = (uint32_t *)wb_ma(wb, (size_t)cap * sizeof(uint32_t));
+        if (!nn) return 0;
+        if (wb->sheetn && wb->nsheet) memcpy(nn, wb->sheetn, wb->nsheet * sizeof(uint32_t));
+        wb->sheetn = nn;
+    }
+    wb->sheets[wb->nsheet] = wb_strdup(wb, s, n);
+    wb->sheetn[wb->nsheet] = (uint32_t)n;
+    return (int32_t)wb->nsheet++;
+}
+
+/* `name = expr` (a backticked name allowed); `# ...` ends the line. Spans
+ * are relative to s. */
+static int wb_def_parse(const char *s, size_t n, size_t *nlo, size_t *nhi, size_t *elo,
+                        size_t *ehi) {
+    size_t i = 0, j, k, a, b;
+    char inq = 0;
+    while (i < n && wb_ws(s[i])) i++;
+    if (i < n && s[i] == '`') {
+        j = i + 1;
+        while (j < n && s[j] != '`') j++;
+        if (j >= n || j == i + 1) return 0;
+        *nlo = i;
+        *nhi = j + 1;
+        i = j + 1;
+    } else if (i < n && wb_id0(s[i])) {
+        j = i + 1;
+        while (j < n && wb_id1(s[j])) j++;
+        if (wb_is_kw(s + i, j - i)) return 0;
+        *nlo = i;
+        *nhi = j;
+        i = j;
+    } else {
+        return 0;
+    }
+    while (i < n && wb_ws(s[i])) i++;
+    if (i >= n || s[i] != '=' || (i + 1 < n && s[i + 1] == '=')) return 0;
+    i++;
+    for (k = i; k < n; k++) {
+        char c = s[k];
+        if (inq) {
+            if (c == '\\' && inq == '"' && k + 1 < n) {
+                k++;
+                continue;
+            }
+            if (c == inq) inq = 0;
+            continue;
+        }
+        if (c == '"' || c == '`') inq = c;
+        else if (c == '#') break;
+    }
+    a = i;
+    b = k;
+    wb_trim(s, &a, &b);
+    if (a >= b) return 0;
+    *elo = a;
+    *ehi = b;
+    return 1;
+}
+
+/* Cell text: `\|` is a pipe. Formulas keep their bytes (AST spans are
+ * byte offsets into them). */
+static const char *wb_cell_copy(RtxWb *wb, const char *s, size_t n, int unesc, uint32_t *outn) {
+    char *p = (char *)wb_ma(wb, n + 1);
+    size_t i, k = 0;
+    if (!p) {
+        *outn = 0;
+        return "";
+    }
+    for (i = 0; i < n; i++) {
+        if (unesc && s[i] == '\\' && i + 1 < n && s[i + 1] == '|') continue;
+        p[k++] = s[i];
+    }
+    p[k] = 0;
+    *outn = (uint32_t)k;
+    return p;
+}
+
+/* Set a cell from its raw bytes (between the pipes) at raw_lo. Leaves
+ * column stats, deps and value to the caller. */
+static void wb_cell_set(RtxWb *wb, uint32_t id, const char *raw, size_t rawn, size_t raw_lo) {
+    WNode *n = &wb->nodes[id];
+    size_t lo = 0, hi = rawn;
+    int sc = 0;
+    wb_trim(raw, &lo, &hi);
+    n->f_lo = n->f_hi = n->src_lo = WNONE;
+    if (hi - lo >= 3 && raw[lo] == '`' && raw[lo + 1] == '=' && raw[hi - 1] == '`') {
+        /* `=formula` as a code span: GitHub shows it as code */
+        n->form = 1;
+        n->lk = LK_FORMULA;
+        n->lsc = 0;
+        n->f_lo = raw_lo + lo;
+        n->f_hi = raw_lo + hi;
+        n->src_lo = raw_lo + lo + 2;
+        n->src = wb_cell_copy(wb, raw + lo + 2, hi - lo - 3, 0, &n->srcn);
+        return;
+    }
+    if (hi > lo && raw[lo] == '=') {
+        n->form = 1;
+        n->lk = LK_FORMULA;
+        n->lsc = 0;
+        n->f_lo = raw_lo + lo;
+        n->f_hi = raw_lo + hi;
+        n->src_lo = raw_lo + lo + 1;
+        n->src = wb_cell_copy(wb, raw + lo + 1, hi - lo - 1, 0, &n->srcn);
+        return;
+    }
+    n->form = 0;
+    n->src = wb_cell_copy(wb, raw + lo, hi - lo, 1, &n->srcn);
+    n->lk = (uint8_t)wb_lit_kind(n->src, n->srcn, &sc);
+    n->lsc = (uint8_t)sc;
+}
+
+static void wb_name_copy(const char *s, size_t lo, size_t hi, const char **p, size_t *n) {
+    if (hi - lo >= 2 && s[lo] == '`' && s[hi - 1] == '`') {
+        lo++;
+        hi--;
+    }
+    *p = s + lo;
+    *n = hi - lo;
+}
+
+static int wb_table_build(RtxWb *wb, const char *buf, size_t len, const RtxMdTable *mt,
+                          size_t cap_bol, size_t cap_lo, size_t cap_hi, int32_t sheet) {
+    WTab *t;
+    RtxMdCell cells[RTX_MD_TABLE_COLS];
+    size_t line, hl_e, nc, c;
+    int32_t ncols, nrows = 0, r;
+    uint32_t i;
+    const char *nm;
+    size_t nmn;
+    (void)len;
+    if (!wb_grow(wb, (void **)&wb->tabs, &wb->tabcap, wb->ntab + 1, sizeof(WTab))) return 0;
+    t = &wb->tabs[wb->ntab];
+    memset(t, 0, sizeof *t);
+    wb_name_copy(buf, cap_lo, cap_hi, &nm, &nmn);
+    t->name = wb_strdup(wb, nm, nmn);
+    t->namen = (uint32_t)nmn;
+    t->sheet = sheet;
+    t->lo = cap_bol;
+    t->hi = mt->hi;
+    t->cap_lo = cap_lo;
+    t->cap_hi = cap_hi;
+    ncols = mt->ncols;
+    if (ncols > RTX_WB_COLS_MAX) ncols = RTX_WB_COLS_MAX;
+    t->ncols = ncols;
+    line = mt->body_lo;
+    while (line < mt->hi) {
+        size_t e = line;
+        while (e < mt->hi && buf[e] != '\n') e++;
+        nrows++;
+        line = e + 1;
+    }
+    if (nrows > RTX_WB_ROWS_MAX) {
+        t->big = 1;
+        nrows = 0;
+    }
+    t->nrows = nrows;
+    t->cname = (const char **)wb_ma(wb, (size_t)(ncols + 1) * sizeof(char *));
+    t->cnamen = (uint32_t *)wb_ma(wb, (size_t)(ncols + 1) * sizeof(uint32_t));
+    t->cclash = (uint8_t *)wb_ma(wb, (size_t)(ncols + 1));
+    t->hlo = (size_t *)wb_ma(wb, (size_t)(ncols + 1) * sizeof(size_t));
+    t->hhi = (size_t *)wb_ma(wb, (size_t)(ncols + 1) * sizeof(size_t));
+    t->cs = (WColStat *)wb_ma(wb, (size_t)(ncols + 1) * sizeof(WColStat));
+    t->ct = (uint8_t *)wb_ma(wb, (size_t)(ncols + 1));
+    t->csc = (uint8_t *)wb_ma(wb, (size_t)(ncols + 1));
+    t->row_lo = (size_t *)wb_ma(wb, (size_t)(nrows + 1) * sizeof(size_t));
+    t->row_hi = (size_t *)wb_ma(wb, (size_t)(nrows + 1) * sizeof(size_t));
+    if (!t->cname || !t->cnamen || !t->cclash || !t->hlo || !t->hhi || !t->cs || !t->ct ||
+        !t->csc || !t->row_lo || !t->row_hi)
+        return 0;
+    /* header: the column names */
+    hl_e = mt->lo;
+    while (hl_e < mt->sep_lo && buf[hl_e] != '\n') hl_e++;
+    nc = rtx_md_row_split(buf + mt->lo, hl_e - mt->lo, cells, RTX_MD_TABLE_COLS);
+    for (c = 0; c < (size_t)ncols; c++) {
+        size_t lo, hi;
+        if (c >= nc) {
+            t->cname[c] = "";
+            t->hlo[c] = t->hhi[c] = WNONE;
+            continue;
+        }
+        lo = cells[c].lo;
+        hi = cells[c].hi;
+        rtx_md_span_trim(buf + mt->lo, &lo, &hi);
+        t->hlo[c] = mt->lo + lo;
+        t->hhi[c] = mt->lo + hi;
+        wb_name_copy(buf + mt->lo, lo, hi, &nm, &nmn);
+        t->cname[c] = wb_strdup(wb, nm, nmn);
+        t->cnamen[c] = (uint32_t)nmn;
+    }
+    for (c = 0; c < (size_t)ncols; c++) {
+        size_t k;
+        for (k = c + 1; k < (size_t)ncols; k++)
+            if (t->cnamen[c] == t->cnamen[k] && wb_ieq(t->cname[c], t->cname[k], t->cnamen[c]))
+                t->cclash[c] = t->cclash[k] = 1;
+    }
+    /* body cells, row-major, then the column nodes */
+    t->cell0 = wb->nn;
+    for (i = 0; i < (uint32_t)(nrows * ncols); i++)
+        if (wb_node_new(wb, NK_CELL) == UINT32_MAX) return 0;
+    t->col0 = wb->nn;
+    for (c = 0; c < (size_t)ncols; c++) {
+        uint32_t id = wb_node_new(wb, NK_COL);
+        if (id == UINT32_MAX) return 0;
+        wb->nodes[id].tab = (int32_t)wb->ntab;
+        wb->nodes[id].col = (int32_t)c;
+    }
+    line = mt->body_lo;
+    for (r = 0; r < nrows; r++) {
+        size_t e = line, ce;
+        while (e < mt->hi && buf[e] != '\n') e++;
+        ce = e;
+        if (ce > line && buf[ce - 1] == '\r') ce--;
+        t->row_lo[r] = line;
+        t->row_hi[r] = e;
+        nc = rtx_md_row_split(buf + line, ce - line, cells, RTX_MD_TABLE_COLS);
+        for (c = 0; c < (size_t)ncols; c++) {
+            uint32_t id = wb_cell_id(t, r, (int)c);
+            WNode *n = &wb->nodes[id];
+            n->tab = (int32_t)wb->ntab;
+            n->row = r;
+            n->col = (int32_t)c;
+            if (c >= nc) {
+                n->lk = LK_EMPTY;
+                n->src = "";
+                continue;
+            }
+            n->raw_lo = line + cells[c].lo;
+            n->raw_hi = line + cells[c].hi;
+            wb_cell_set(wb, id, buf + n->raw_lo, n->raw_hi - n->raw_lo, n->raw_lo);
+            n = &wb->nodes[id];
+            wb_cs_add(&t->cs[c], n->lk, n->lsc, 1);
+            if (!wb_ord_push(wb, id)) return 0;
+        }
+        line = e + 1;
+    }
+    for (c = 0; c < (size_t)ncols; c++) wb_col_type(&t->cs[c], &t->ct[c], &t->csc[c]);
+    wb->ntab++;
+    return 1;
+}
+
+static int wb_def_line(RtxWb *wb, const char *buf, size_t bol, size_t le, int32_t scope) {
+    size_t nlo, nhi, elo, ehi;
+    uint32_t id;
+    WNode *n;
+    int def = wb_def_parse(buf + bol, le - bol, &nlo, &nhi, &elo, &ehi);
+    id = wb_node_new(wb, def ? NK_NAME : NK_LINE);
+    if (id == UINT32_MAX) return 0;
+    n = &wb->nodes[id];
+    n->tab = scope;
+    n->raw_lo = bol;
+    n->raw_hi = le;
+    if (def) {
+        const char *nm;
+        size_t nmn;
+        wb_name_copy(buf + bol, nlo, nhi, &nm, &nmn);
+        n->name = wb_strdup(wb, nm, nmn);
+        n = &wb->nodes[id];
+        n->namen = (uint32_t)nmn;
+        n->n_lo = bol + nlo;
+        n->n_hi = bol + nhi;
+        n->form = 1;
+        n->f_lo = bol + elo;
+        n->f_hi = bol + ehi;
+        n->src_lo = bol + elo;
+        n->src = wb_cell_copy(wb, buf + bol + elo, ehi - elo, 0, &n->srcn);
+    }
+    return wb_ord_push(wb, id);
+}
+
+enum { FK_OTHER = 0, FK_PARAMS, FK_CALC, FK_TABLE };
+
+/* One pass over the workbook bytes: sheets, fences, captions, tables. */
+static int wb_scan(RtxWb *wb, const char *buf, size_t len) {
+    size_t pos = 0;
+    int32_t sheet;
+    int fence = 0, fkind = 0;
+    char fch = 0;
+    size_t frun = 0, fbol = 0, fnext = 0;
+    int cap = 0;
+    size_t cap_bol = 0, cap_lo = 0, cap_hi = 0;
+    sheet = wb_sheet_add(wb, "", 0);
+    while (pos < len) {
+        size_t bol = pos, eol = pos, le, next;
+        char ch = 0;
+        size_t run = 0, ilo = 0, ihi = 0;
+        int kind;
+        while (eol < len && buf[eol] != '\n') eol++;
+        next = eol < len ? eol + 1 : eol;
+        le = eol;
+        if (le > bol && buf[le - 1] == '\r') le--;
+        pos = next;
+        if (fence) {
+            kind = wb_line_kind(buf + bol, le - bol, &ch, &run, &ilo, &ihi);
+            if (kind == WL_FENCE && ch == fch && run >= frun && ilo == ihi) {
+                if (fkind == FK_OTHER) {
+                    if (!wb_blk_add(wb, buf, len, fbol, fnext)) return 0;
+                    if (!wb_blk_add(wb, buf, len, bol, next)) return 0;
+                } else if (!wb_blk_add(wb, buf, len, fbol, next)) {
+                    return 0;
+                }
+                fence = 0;
+                continue;
+            }
+            if (fkind == FK_PARAMS || fkind == FK_CALC) {
+                if (!wb_def_line(wb, buf, bol, le, fkind == FK_PARAMS ? SC_PARAM : sheet)) return 0;
+            }
+            continue;
+        }
+        kind = wb_line_kind(buf + bol, le - bol, &ch, &run, &ilo, &ihi);
+        if (kind != WL_NONE && cap) {
+            if (!wb_blk_add(wb, buf, len, cap_bol, bol)) return 0;
+            cap = 0;
+        }
+        if (kind == WL_FENCE) {
+            size_t w = ilo;
+            while (w < ihi && !wb_ws(buf[bol + w])) w++;
+            fence = 1;
+            fch = ch;
+            frun = run;
+            fbol = bol;
+            fnext = next;
+            fkind = FK_OTHER;
+            if (w - ilo == 6 && !memcmp(buf + bol + ilo, "params", 6)) fkind = FK_PARAMS;
+            else if (w - ilo == 4 && !memcmp(buf + bol + ilo, "calc", 4)) fkind = FK_CALC;
+            else if (w - ilo == 5 && !memcmp(buf + bol + ilo, "table", 5)) fkind = FK_TABLE;
+            continue;
+        }
+        if (kind == WL_H1) {
+            size_t a = ilo, b = ihi;
+            wb_trim(buf + bol, &a, &b);
+            /* closing #s: a run after a space */
+            {
+                size_t k = b;
+                while (k > a && buf[bol + k - 1] == '#') k--;
+                if (k < b && (k == a || wb_ws(buf[bol + k - 1]))) {
+                    b = k;
+                    wb_trim(buf + bol, &a, &b);
+                }
+            }
+            {
+                const char *nm;
+                size_t nmn;
+                wb_name_copy(buf + bol, a, b, &nm, &nmn);
+                sheet = wb_sheet_add(wb, nm, nmn);
+            }
+            if (!wb_blk_add(wb, buf, len, bol, next)) return 0;
+            continue;
+        }
+        if (kind == WL_CAPTION) {
+            size_t a = ilo, b = ihi;
+            wb_trim(buf + bol, &a, &b);
+            if (a < b) {
+                cap = 1;
+                cap_bol = bol;
+                cap_lo = bol + a;
+                cap_hi = bol + b;
+            } else if (!wb_blk_add(wb, buf, len, bol, next)) {
+                return 0;
+            }
+            continue;
+        }
+        if (rtx_md_line_pipe(buf + bol, le - bol)) {
+            RtxMdTable mt;
+            if (rtx_md_table_at(buf, len, bol, &mt)) {
+                if (cap) {
+                    if (!wb_table_build(wb, buf, len, &mt, cap_bol, cap_lo, cap_hi, sheet)) return 0;
+                    if (!wb_blk_add(wb, buf, len, cap_bol, mt.hi)) return 0;
+                    cap = 0;
+                }
+                pos = mt.hi;
+                continue;
+            }
+        }
+        if (wb_blank(buf + bol, le - bol)) continue;
+        if (cap) {
+            if (!wb_blk_add(wb, buf, len, cap_bol, bol)) return 0;
+            cap = 0;
+        }
+    }
+    if (cap && !wb_blk_add(wb, buf, len, cap_bol, len)) return 0;
+    if (fence && !wb_blk_add(wb, buf, len, fbol, len)) return 0;
+    return 1;
+}
+
+/* Name tables: sheets, tables, params, calc names. A name that differs
+ * from another only in case, or repeats it, is an error on both. */
+static int wb_names(RtxWb *wb) {
+    uint32_t i, total = wb->nsheet + wb->ntab + wb->nn;
+    if (!wb_map_init(wb, &wb->map, total)) return 0;
+    for (i = 1; i < wb->nsheet; i++)
+        (void)wb_map_put(&wb->map, SC_SHEET, wb->sheets[i], wb->sheetn[i], i);
+    for (i = 0; i < wb->ntab; i++) {
+        WMapEnt *hit = wb_map_put(&wb->map, SC_TABLE, wb->tabs[i].name, wb->tabs[i].namen, i);
+        if (hit) {
+            wb->tabs[i].clash = 1;
+            wb->tabs[hit->id].clash = 1;
+        }
+    }
+    for (i = 0; i < wb->nn; i++) {
+        WNode *n = &wb->nodes[i];
+        WMapEnt *hit;
+        if (n->kind != NK_NAME) continue;
+        hit = wb_map_put(&wb->map, n->tab, n->name, n->namen, i);
+        if (hit) {
+            WNode *o = &wb->nodes[hit->id];
+            n->clash = o->clash = 1;
+            n->v = wv_err(wb, WE_DUP, "%.*s is defined twice (names differ in case at most)",
+                          (int)n->namen, n->name);
+            o->v = n->v;
+        }
+    }
+    return 1;
+}
+
+/* ------------------------------------------------------------------ graph */
+
+static uint32_t wb_ndeps(const RtxWb *wb, uint32_t v) {
+    const WNode *n = &wb->nodes[v];
+    if (n->kind == NK_COL) return (uint32_t)wb->tabs[n->tab].nrows;
+    return n->ndeps;
+}
+
+static uint32_t wb_dep(const RtxWb *wb, uint32_t v, uint32_t i) {
+    const WNode *n = &wb->nodes[v];
+    if (n->kind == NK_COL) return wb_cell_id(&wb->tabs[n->tab], (int)i, n->col);
+    return n->deps[i];
+}
+
+static void wb_heap_push(RtxWb *wb, uint32_t id) {
+    uint32_t i;
+    if (wb->nodes[id].queued) return;
+    if (!wb_grow(wb, (void **)&wb->heap, &wb->heapcap, wb->nheap + 1, sizeof(uint32_t))) return;
+    wb->nodes[id].queued = 1;
+    i = wb->nheap++;
+    while (i > 0) {
+        uint32_t p = (i - 1) / 2;
+        if (wb->nodes[wb->heap[p]].topo <= wb->nodes[id].topo) break;
+        wb->heap[i] = wb->heap[p];
+        i = p;
+    }
+    wb->heap[i] = id;
+}
+
+static uint32_t wb_heap_pop(RtxWb *wb) {
+    uint32_t top = wb->heap[0], last = wb->heap[--wb->nheap], i = 0;
+    uint32_t n = wb->nheap;
+    while (n) {
+        uint32_t l = 2 * i + 1, r = l + 1, m = i;
+        uint32_t mt = wb->nodes[last].topo;
+        if (l < n && wb->nodes[wb->heap[l]].topo < mt) {
+            m = l;
+            mt = wb->nodes[wb->heap[l]].topo;
+        }
+        if (r < n && wb->nodes[wb->heap[r]].topo < mt) m = r;
+        if (m == i) break;
+        wb->heap[i] = wb->heap[m];
+        i = m;
+    }
+    if (n) wb->heap[i] = last;
+    wb->nodes[top].queued = 0;
+    return top;
+}
+
+static void wb_push_dependents(RtxWb *wb, uint32_t id) {
+    const WNode *n = &wb->nodes[id];
+    uint32_t k;
+    for (k = 0; k < n->rdn; k++) wb_heap_push(wb, wb->rdeps[n->rd0 + k]);
+    if (n->kind == NK_CELL) wb_heap_push(wb, wb->tabs[n->tab].col0 + (uint32_t)n->col);
+}
+
+/* A cycle through `s` inside its SCC (comp): `a → b → a`. */
+static void wb_cycle_path(RtxWb *wb, uint32_t s, const uint32_t *comp, uint32_t *par,
+                          uint32_t *queue, char *out, size_t cap) {
+    uint32_t qh = 0, qt = 0, v, k, last = UINT32_MAX;
+    uint32_t path[9];
+    int np = 0, i;
+    size_t at = 0;
+    char lb[96];
+    par[s] = s;
+    queue[qt++] = s;
+    while (qh < qt && last == UINT32_MAX) {
+        v = queue[qh++];
+        for (k = 0; k < wb_ndeps(wb, v); k++) {
+            uint32_t w = wb_dep(wb, v, k);
+            if (comp[w] != comp[s]) continue;
+            if (w == s) {
+                last = v;
+                break;
+            }
+            if (par[w] != UINT32_MAX) continue;
+            par[w] = v;
+            queue[qt++] = w;
+        }
+    }
+    /* s → ... → last → s: walk parents back from last */
+    v = last;
+    while (v != UINT32_MAX && np < 8) {
+        path[np++] = v;
+        if (v == s) break;
+        v = par[v];
+    }
+    for (k = 0; k < qt; k++) par[queue[k]] = UINT32_MAX;
+    out[0] = 0;
+    at = 0;
+    for (i = np - 1; i >= 0; i--) {
+        wb_node_label(wb, path[i], lb, sizeof lb);
+        at = wb_puts(out, cap, at, lb);
+        at = wb_puts(out, cap, at, " \xe2\x86\x92 ");
+    }
+    if (np >= 8 && path[np - 1] != s) at = wb_puts(out, cap, at, "\xe2\x80\xa6 \xe2\x86\x92 ");
+    wb_node_label(wb, s, lb, sizeof lb);
+    at = wb_puts(out, cap, at, lb);
+}
+
+/* Dependents table, Tarjan SCC order (dependencies first) and cycles.
+ * Seeds the heap with every node whose cycle state changed. */
+static int wb_regraph(RtxWb *wb, int seed) {
+    uint32_t nn = wb->nn, v, k, idx = 0, topo = 0, sp = 0, fp = 0;
+    uint32_t *cnt, *index, *low, *stk, *fv, *fi, *comp, *par = NULL, *queue = NULL;
+    uint8_t *on, *was;
+    size_t total = 0;
+    wb->st.regraphs++;
+    wb->st.cycles = 0;
+    if (!nn) return 1;
+    cnt = (uint32_t *)wb_alloc(wb->sa, (size_t)(nn + 1) * sizeof(uint32_t));
+    index = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
+    low = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
+    stk = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
+    fv = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
+    fi = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
+    comp = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
+    on = (uint8_t *)wb_alloc(wb->sa, nn);
+    was = (uint8_t *)wb_alloc(wb->sa, nn);
+    if (!cnt || !index || !low || !stk || !fv || !fi || !comp || !on || !was) return 0;
+    for (v = 0; v < nn; v++) {
+        WNode *n = &wb->nodes[v];
+        was[v] = n->cyc;
+        n->cyc = 0;
+        index[v] = UINT32_MAX;
+        if (n->kind == NK_COL) continue;
+        for (k = 0; k < n->ndeps; k++) cnt[n->deps[k]]++;
+        total += n->ndeps;
+    }
+    wb->rdeps = (uint32_t *)wb_ma(wb, (total ? total : 1) * sizeof(uint32_t));
+    if (!wb->rdeps) return 0;
+    wb->nrd = total;
+    {
+        uint32_t acc = 0;
+        for (v = 0; v < nn; v++) {
+            wb->nodes[v].rd0 = acc;
+            wb->nodes[v].rdn = 0;
+            acc += cnt[v];
+        }
+    }
+    for (v = 0; v < nn; v++) {
+        WNode *n = &wb->nodes[v];
+        if (n->kind == NK_COL) continue;
+        for (k = 0; k < n->ndeps; k++) {
+            WNode *d = &wb->nodes[n->deps[k]];
+            wb->rdeps[d->rd0 + d->rdn++] = v;
+        }
+    }
+    /* Tarjan, iterative */
+    for (v = 0; v < nn; v++) {
+        if (index[v] != UINT32_MAX) continue;
+        fv[fp] = v;
+        fi[fp] = 0;
+        fp++;
+        index[v] = low[v] = idx++;
+        stk[sp++] = v;
+        on[v] = 1;
+        while (fp) {
+            uint32_t x = fv[fp - 1];
+            if (fi[fp - 1] < wb_ndeps(wb, x)) {
+                uint32_t w = wb_dep(wb, x, fi[fp - 1]++);
+                if (index[w] == UINT32_MAX) {
+                    index[w] = low[w] = idx++;
+                    stk[sp++] = w;
+                    on[w] = 1;
+                    fv[fp] = w;
+                    fi[fp] = 0;
+                    fp++;
+                } else if (on[w] && index[w] < low[x]) {
+                    low[x] = index[w];
+                }
+                continue;
+            }
+            if (low[x] == index[x]) {
+                uint32_t w, first = topo, size = 0, j;
+                do {
+                    w = stk[--sp];
+                    on[w] = 0;
+                    comp[w] = first;
+                    wb->nodes[w].topo = topo++;
+                    size++;
+                } while (w != x);
+                if (size == 1) {
+                    for (j = 0; j < wb_ndeps(wb, x); j++)
+                        if (wb_dep(wb, x, j) == x) size = 2;
+                }
+                if (size > 1) {
+                    char path[400];
+                    WVal cv;
+                    if (!par) {
+                        par = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
+                        queue = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
+                        if (!par || !queue) return 0;
+                        memset(par, 0xff, (size_t)nn * sizeof(uint32_t));
+                    }
+                    wb->st.cycles++;
+                    wb_cycle_path(wb, x, comp, par, queue, path, sizeof path);
+                    cv = wv_err(wb, WE_CYCLE, "%s", path);
+                    /* the SCC's members sit just above sp */
+                    for (j = sp; j < sp + (topo - first); j++) {
+                        wb->nodes[stk[j]].cyc = 1;
+                        wb->nodes[stk[j]].cv = cv;
+                    }
+                }
+            }
+            fp--;
+            if (fp) {
+                uint32_t p = fv[fp - 1];
+                if (low[x] < low[p]) low[p] = low[x];
+            }
+        }
+    }
+    if (seed) {
+        for (v = 0; v < nn; v++)
+            if (wb->nodes[v].cyc || was[v]) wb_heap_push(wb, v);
+    }
+    return 1;
+}
+
+/* --------------------------------------------------------------- recalc */
+
+static void wb_note_changed(RtxWb *wb, uint32_t id) {
+    if (!wb_has_f(&wb->nodes[id])) return;
+    if (wb->nchanged < RTX_WB_CHANGED_MAX) wb->changed[wb->nchanged++] = id;
+    else wb->chg_all = 1;
+}
+
+static void wb_recalc(RtxWb *wb) {
+    size_t visited = 0;
+    while (wb->nheap) {
+        uint32_t id = wb_heap_pop(wb);
+        WNode *n = &wb->nodes[id];
+        WVal nv;
+        visited++;
+        if (n->kind == NK_COL) {
+            wb_push_dependents(wb, id);
+            continue;
+        }
+        nv = n->cyc ? n->cv : wb_eval_node(wb, id);
+        n = &wb->nodes[id];
+        if (wv_same(&nv, &n->v)) continue;
+        n->v = nv;
+        wb_note_changed(wb, id);
+        wb_push_dependents(wb, id);
+    }
+    wb->st.visited = visited;
+    wb->st.visited_total += visited;
+}
+
+/* Every node in dependency order (after a rebuild). */
+static void wb_calc_all(RtxWb *wb) {
+    uint32_t *order, v;
+    if (!wb->nn) {
+        wb->st.visited = 0;
+        return;
+    }
+    order = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)wb->nn * sizeof(uint32_t), 16);
+    if (!order) return;
+    for (v = 0; v < wb->nn; v++) order[wb->nodes[v].topo] = v;
+    for (v = 0; v < wb->nn; v++) {
+        uint32_t id = order[v];
+        WNode *n = &wb->nodes[id];
+        if (n->kind == NK_COL || n->kind == NK_LINE) continue;
+        if (n->cyc) n->v = n->cv;
+        else {
+            WVal x = wb_eval_node(wb, id);
+            wb->nodes[id].v = x;
+        }
+    }
+    wb->st.visited = wb->nn;
+    wb->st.visited_total += wb->nn;
+}
+
+static void wb_count(RtxWb *wb) {
+    uint32_t i;
+    wb->nderived = 0;
+    wb->st.formulas = 0;
+    wb->st.cells = 0;
+    wb->st.names = 0;
+    wb->st.edges = 0;
+    for (i = 0; i < wb->nn; i++) {
+        const WNode *n = &wb->nodes[i];
+        if (wb_has_f(n)) wb->nderived++;
+        if (n->form) wb->st.formulas++;
+        if (n->kind == NK_CELL) wb->st.cells++;
+        if (n->kind == NK_NAME) wb->st.names++;
+        wb->st.edges += wb_ndeps(wb, i);
+    }
+    wb->st.tables = wb->ntab;
+    wb->st.nodes = wb->nn;
+}
+
+static void wb_reset_model(RtxWb *wb) {
+    wb->ma.reset();
+    wb->va.reset();
+    wb->sa.reset();
+    wb->ma_mark = wb->va_mark = 0;
+    wb->nodes = NULL;
+    wb->nn = wb->ncap = 0;
+    wb->ord = NULL;
+    wb->nord = wb->ordcap = 0;
+    wb->tabs = NULL;
+    wb->ntab = wb->tabcap = 0;
+    wb->blks = NULL;
+    wb->nblk = wb->blkcap = 0;
+    wb->sheets = NULL;
+    wb->sheetn = NULL;
+    wb->nsheet = wb->sheetcap = 0;
+    memset(&wb->map, 0, sizeof wb->map);
+    wb->rdeps = NULL;
+    wb->nrd = 0;
+    wb->nderived = 0;
+    wb->heap = NULL;
+    wb->nheap = wb->heapcap = 0;
+    wb->bdeps = NULL;
+    wb->nbd = wb->bdcap = 0;
+}
+
+static size_t wb_read(const RtxDoc *d, size_t off, char *dst, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        size_t k = RtxDoc_read_at(d, off + got, cc_slice_from_buffer(dst + got, n - got)) ?> 0;
+        if (!k) break;
+        got += k;
+    }
+    return got;
+}
+
+static void wb_rebuild(RtxWb *wb, const RtxDoc *d) {
+    size_t len = RtxDoc_len(d);
+    char *buf;
+    uint32_t i;
+    wb_reset_model(wb);
+    wb->st.rebuilds++;
+    wb->doc_len = len;
+    wb->off = 0;
+    wb->chg_all = 1;
+    wb->nchanged = 0;
+    if (len > RTX_WB_MAX) {
+        wb->off = 1;
+        wb_count(wb);
+        return;
+    }
+    buf = (char *)cc_arena_alloc(wb->sa, len + 1, 16);
+    if (!buf || wb_read(d, 0, buf, len) != len) {
+        wb->off = 1;
+        return;
+    }
+    buf[len] = 0;
+    if (!wb_scan(wb, buf, len) || !wb_names(wb)) {
+        wb_reset_model(wb);
+        wb->off = 1;
+        return;
+    }
+    for (i = 0; i < wb->nn; i++) {
+        WNode *n = &wb->nodes[i];
+        if (!n->form || (n->kind == NK_NAME && n->clash)) continue;
+        (void)wb_bind_node(wb, i);
+        n = &wb->nodes[i];
+        if (n->kind == NK_NAME && wb_ex_literal(n->ex)) n->f_lo = n->f_hi = WNONE;
+    }
+    if (!wb_regraph(wb, 0)) {
+        wb_reset_model(wb);
+        wb->off = 1;
+        return;
+    }
+    wb_calc_all(wb);
+    wb_count(wb);
+    wb->ma_base = wb->ma_mark;
+    wb->va_base = wb->va_mark;
+}
+
+/* ----------------------------------------------------------------- shifts */
+
+static size_t wb_shx(size_t x, size_t at, size_t old_n, ptrdiff_t delta, int end) {
+    size_t e = at + old_n;
+    if (x == WNONE) return x;
+    if (x > e || (x == e && (end || old_n))) return (size_t)((ptrdiff_t)x + delta);
+    return x;
+}
+
+/* Last ord index whose raw_lo <= off, or -1. */
+static int64_t wb_ord_find(const RtxWb *wb, size_t off) {
+    uint32_t lo = 0, hi = wb->nord;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (wb->nodes[wb->ord[mid]].raw_lo <= off) lo = mid + 1;
+        else hi = mid;
+    }
+    return (int64_t)lo - 1;
+}
+
+static void wb_shift(RtxWb *wb, size_t at, size_t old_n, ptrdiff_t delta, uint32_t skip) {
+    int64_t k;
+    uint32_t i, c;
+    int32_t r;
+    if (!delta) return;
+    k = wb_ord_find(wb, at);
+    if (k < 0) k = 0;
+    for (i = (uint32_t)k; i < wb->nord; i++) {
+        WNode *n = &wb->nodes[wb->ord[i]];
+        if (wb->ord[i] == skip) continue;
+        n->raw_lo = wb_shx(n->raw_lo, at, old_n, delta, 0);
+        n->raw_hi = wb_shx(n->raw_hi, at, old_n, delta, 1);
+        n->f_lo = wb_shx(n->f_lo, at, old_n, delta, 0);
+        n->f_hi = wb_shx(n->f_hi, at, old_n, delta, 1);
+        n->n_lo = wb_shx(n->n_lo, at, old_n, delta, 0);
+        n->n_hi = wb_shx(n->n_hi, at, old_n, delta, 1);
+        n->src_lo = wb_shx(n->src_lo, at, old_n, delta, 0);
+    }
+    for (i = 0; i < wb->ntab; i++) {
+        WTab *t = &wb->tabs[i];
+        if (t->hi < at) continue;
+        t->lo = wb_shx(t->lo, at, old_n, delta, 0);
+        t->hi = wb_shx(t->hi, at, old_n, delta, 0);
+        t->cap_lo = wb_shx(t->cap_lo, at, old_n, delta, 0);
+        t->cap_hi = wb_shx(t->cap_hi, at, old_n, delta, 1);
+        for (c = 0; c < (uint32_t)t->ncols; c++) {
+            t->hlo[c] = wb_shx(t->hlo[c], at, old_n, delta, 0);
+            t->hhi[c] = wb_shx(t->hhi[c], at, old_n, delta, 1);
+        }
+        for (r = 0; r < t->nrows; r++) {
+            t->row_lo[r] = wb_shx(t->row_lo[r], at, old_n, delta, 0);
+            t->row_hi[r] = wb_shx(t->row_hi[r], at, old_n, delta, 1);
+        }
+    }
+    for (i = 0; i < wb->nblk; i++) {
+        WBlk *b = &wb->blks[i];
+        if (b->ext_hi < at) continue;
+        b->lo = wb_shx(b->lo, at, old_n, delta, 0);
+        b->hi = wb_shx(b->hi, at, old_n, delta, 0);
+        b->ext_lo = wb_shx(b->ext_lo, at, old_n, delta, 0);
+        b->ext_hi = wb_shx(b->ext_hi, at, old_n, delta, 0);
+    }
+}
+
+/* ---------------------------------------------------------- incremental */
+
+static char *wb_read_tmp(RtxWb *wb, const RtxDoc *d, size_t lo, size_t n) {
+    char *p;
+    if (n > WB_LINE_MAX) return NULL;
+    p = (char *)cc_arena_alloc(wb->sa, n + 1, 16);
+    if (!p || wb_read(d, lo, p, n) != n) return NULL;
+    p[n] = 0;
+    return p;
+}
+
+/* A cell edit: re-read that cell, re-bind at most its formula, recalc its
+ * dependents. 0 = not a cell-local edit (the caller rebuilds). */
+static int wb_fast_cell(RtxWb *wb, const RtxDoc *d, uint32_t id) {
+    WNode *n = &wb->nodes[id];
+    WTab *t = &wb->tabs[n->tab];
+    size_t lo = wb->p_lo, old_n = wb->p_old, new_n = wb->p_new;
+    ptrdiff_t delta = (ptrdiff_t)new_n - (ptrdiff_t)old_n;
+    size_t nhi = (size_t)((ptrdiff_t)n->raw_hi + delta), rn, i;
+    char *raw;
+    int esc = 0, oform = n->form, olk = n->lk, olsc = n->lsc, had = wb_has_f(n), regraph = 0;
+    int32_t col = n->col;
+    uint8_t ot = t->ct[col], osc = t->csc[col];
+    const char *osrc = n->src;
+    uint32_t osrcn = n->srcn;
+    if (nhi < n->raw_lo) return 0;
+    rn = nhi - n->raw_lo;
+    raw = wb_read_tmp(wb, d, n->raw_lo, rn);
+    if (!raw) return 0;
+    for (i = 0; i < rn; i++) {
+        if (esc) {
+            esc = 0;
+            continue;
+        }
+        if (raw[i] == '\\') esc = 1;
+        else if (raw[i] == '|' || raw[i] == '\n' || raw[i] == '\r') return 0;
+    }
+    if (esc) return 0;
+    (void)lo;
+    wb_shift(wb, wb->p_lo, old_n, delta, id);
+    n = &wb->nodes[id];
+    n->raw_hi = nhi;
+    wb_cell_set(wb, id, raw, rn, n->raw_lo);
+    n = &wb->nodes[id];
+    wb->st.fast_cell++;
+    if (n->form == oform && n->srcn == osrcn && (!osrcn || !memcmp(n->src, osrc, osrcn)))
+        return 1; /* padding only */
+    t = &wb->tabs[n->tab];
+    wb_cs_add(&t->cs[col], olk, olsc, -1);
+    wb_cs_add(&t->cs[col], n->lk, n->lsc, 1);
+    wb_col_type(&t->cs[col], &t->ct[col], &t->csc[col]);
+    if (oform || n->form) regraph = wb_bind_node(wb, id);
+    n = &wb->nodes[id];
+    if (had != wb_has_f(n)) wb->nderived += had ? (uint32_t)-1 : 1u;
+    if (oform != n->form) wb->st.formulas += n->form ? 1 : (size_t)-1;
+    if (regraph && !wb_regraph(wb, 1)) return 0;
+    wb_heap_push(wb, id);
+    if (t->ct[col] != ot || t->csc[col] != osc) {
+        int32_t r;
+        for (r = 0; r < t->nrows; r++) {
+            uint32_t c = wb_cell_id(t, r, col);
+            if (!wb->nodes[c].form) wb_heap_push(wb, c);
+        }
+    }
+    wb_recalc(wb);
+    return 1;
+}
+
+/* A params / calc line edit that keeps the line's name. */
+static int wb_fast_line(RtxWb *wb, const RtxDoc *d, uint32_t id) {
+    WNode *n = &wb->nodes[id];
+    size_t old_n = wb->p_old, new_n = wb->p_new;
+    ptrdiff_t delta = (ptrdiff_t)new_n - (ptrdiff_t)old_n;
+    size_t nhi = (size_t)((ptrdiff_t)n->raw_hi + delta), rn, i;
+    size_t nlo, nhi2, elo, ehi;
+    char *raw;
+    int def, had = wb_has_f(n), regraph;
+    if (nhi < n->raw_lo) return 0;
+    rn = nhi - n->raw_lo;
+    raw = wb_read_tmp(wb, d, n->raw_lo, rn);
+    if (!raw) return 0;
+    for (i = 0; i < rn; i++)
+        if (raw[i] == '\n') return 0;
+    if (rn && raw[rn - 1] == '\r') rn--;
+    def = wb_def_parse(raw, rn, &nlo, &nhi2, &elo, &ehi);
+    if (n->kind == NK_LINE) {
+        if (def) return 0;
+        {
+            char ch;
+            size_t run, a, b;
+            if (wb_line_kind(raw, rn, &ch, &run, &a, &b) == WL_FENCE) return 0;
+        }
+        wb_shift(wb, wb->p_lo, old_n, delta, id);
+        wb->nodes[id].raw_hi = nhi;
+        wb->st.fast_line++;
+        return 1;
+    }
+    if (!def) return 0;
+    {
+        const char *nm;
+        size_t nmn;
+        wb_name_copy(raw, nlo, nhi2, &nm, &nmn);
+        if (nmn != n->namen || memcmp(nm, n->name, nmn) != 0) return 0;
+    }
+    wb_shift(wb, wb->p_lo, old_n, delta, id);
+    n = &wb->nodes[id];
+    n->raw_hi = nhi;
+    n->n_lo = n->raw_lo + nlo;
+    n->n_hi = n->raw_lo + nhi2;
+    n->src_lo = n->raw_lo + elo;
+    n->f_lo = n->raw_lo + elo;
+    n->f_hi = n->raw_lo + ehi;
+    wb->st.fast_line++;
+    if (n->clash) return 1;
+    if (ehi - elo == n->srcn && !memcmp(raw + elo, n->src, n->srcn)) {
+        if (wb_ex_literal(n->ex)) n->f_lo = n->f_hi = WNONE;
+        return 1;
+    }
+    n->src = wb_cell_copy(wb, raw + elo, ehi - elo, 0, &n->srcn);
+    regraph = wb_bind_node(wb, id);
+    n = &wb->nodes[id];
+    if (wb_ex_literal(n->ex)) n->f_lo = n->f_hi = WNONE;
+    if (had != wb_has_f(n)) wb->nderived += had ? (uint32_t)-1 : 1u;
+    if (regraph && !wb_regraph(wb, 1)) return 0;
+    wb_heap_push(wb, id);
+    wb_recalc(wb);
+    return 1;
+}
+
+/* An edit clear of every block (and of the line before / after each):
+ * offsets shift, nothing recalcs — unless the new lines start structure. */
+static int wb_fast_prose(RtxWb *wb, const RtxDoc *d) {
+    size_t lo = wb->p_lo, old_n = wb->p_old, new_n = wb->p_new, len = RtxDoc_len(d);
+    ptrdiff_t delta = (ptrdiff_t)new_n - (ptrdiff_t)old_n;
+    uint32_t a = 0, b = wb->nblk;
+    size_t ls, le, back, fwd, i;
+    char *s;
+    while (a < b) {
+        uint32_t m = a + (b - a) / 2;
+        if (wb->blks[m].ext_hi <= lo) a = m + 1;
+        else b = m;
+    }
+    if (a < wb->nblk && wb->blks[a].ext_lo <= lo + old_n) return 0;
+    /* the new lines around the edit */
+    back = lo < WB_SCAN_BACK ? lo : WB_SCAN_BACK;
+    fwd = len - (lo + new_n) < WB_SCAN_BACK ? len - (lo + new_n) : WB_SCAN_BACK;
+    if (back + new_n + fwd > WB_LINE_MAX) return 0;
+    s = wb_read_tmp(wb, d, lo - back, back + new_n + fwd);
+    if (!s) return 0;
+    ls = back;
+    while (ls > 0 && s[ls - 1] != '\n') ls--;
+    if (ls == 0 && lo - back > 0) return 0;
+    le = back + new_n;
+    while (le < back + new_n + fwd && s[le] != '\n') le++;
+    if (le == back + new_n + fwd && lo + new_n + fwd < len) return 0;
+    for (i = ls; i < le;) {
+        size_t e = i;
+        char ch;
+        size_t run, x, y;
+        while (e < le && s[e] != '\n') e++;
+        if (wb_line_kind(s + i, e - i, &ch, &run, &x, &y) != WL_NONE) return 0;
+        i = e + 1;
+    }
+    wb_shift(wb, lo, old_n, delta, UINT32_MAX);
+    wb->st.fast_prose++;
+    return 1;
+}
+
+static int wb_fast(RtxWb *wb, const RtxDoc *d) {
+    size_t len = RtxDoc_len(d), lo = wb->p_lo, old_n = wb->p_old;
+    int64_t k;
+    if (len > RTX_WB_MAX) return 0;
+    if (wb->doc_len < old_n || wb->doc_len - old_n + wb->p_new != len) return 0;
+    if (lo + old_n > wb->doc_len) return 0;
+    k = wb_ord_find(wb, lo);
+    if (k >= 0) {
+        uint32_t id = wb->ord[k];
+        const WNode *n = &wb->nodes[id];
+        if (n->raw_hi != WNONE && lo + old_n <= n->raw_hi) {
+            int ok = n->kind == NK_CELL ? wb_fast_cell(wb, d, id) : wb_fast_line(wb, d, id);
+            if (ok) wb->doc_len = len;
+            return ok;
+        }
+    }
+    if (!wb_fast_prose(wb, d)) return 0;
+    wb->doc_len = len;
+    return 1;
+}
+
+void rtx_wb_sync(RtxWb *wb, const RtxDoc *d) {
+    struct timespec t0, t1;
+    int ok = 0;
+    if (!wb || !d) return;
+    if (!wb->pend && !wb->need_rebuild) return;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    wb->nchanged = 0;
+    wb->chg_all = 0;
+    wb->st.visited = 0;
+    if (!wb->need_rebuild && !wb->off &&
+        wb->ma_mark - wb->ma_base < (wb->ma_base > WB_GARBAGE_MIN ? wb->ma_base : WB_GARBAGE_MIN) &&
+        wb->va_mark - wb->va_base < (wb->va_base > WB_GARBAGE_MIN ? wb->va_base : WB_GARBAGE_MIN))
+        ok = wb_fast(wb, d);
+    wb->pend = 0;
+    wb->need_rebuild = 0;
+    if (!ok) wb_rebuild(wb, d);
+    wb->sa.reset();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    wb->st.last_us = (size_t)((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L);
+}
+
+void rtx_wb_recalc_all(RtxWb *wb, const RtxDoc *d) {
+    if (!wb || !d) return;
+    wb->need_rebuild = 1;
+    rtx_wb_sync(wb, d);
+}
+
+/* ------------------------------------------------------------------ hooks */
+
+static void wb_hook_note(void *ctx, size_t at, size_t erased, size_t inserted) {
+    RtxWb *wb = (RtxWb *)ctx;
+    size_t lo, hi_cur, hi_old, cur_hi;
+    if (!wb->pend) {
+        wb->pend = 1;
+        wb->p_lo = at;
+        wb->p_old = erased;
+        wb->p_new = inserted;
+        return;
+    }
+    cur_hi = wb->p_lo + wb->p_new;
+    lo = at < wb->p_lo ? at : wb->p_lo;
+    hi_cur = cur_hi > at + erased ? cur_hi : at + erased;
+    hi_old = wb->p_lo + wb->p_old + (hi_cur - cur_hi);
+    wb->p_old = hi_old - lo;
+    wb->p_new = hi_cur - erased + inserted - lo;
+    wb->p_lo = lo;
+}
+
+static size_t wb_value_text(const WVal *v, char *g, size_t cap) {
+    char tmp[256];
+    size_t n = wv_fmt(v, tmp, sizeof tmp, 0);
+    if (!g || !cap) return 0;
+    if (n + 1 > cap) {
+        size_t k = cap >= 4 ? cap - 4 : 0;
+        while (k > 0 && ((unsigned char)tmp[k] & 0xC0) == 0x80) k--;
+        memcpy(g, tmp, k);
+        memcpy(g + k, "\xe2\x80\xa6", cap - 1 - k >= 3 ? 3 : 0);
+        n = k + (cap - 1 - k >= 3 ? 3 : 0);
+        g[n] = 0;
+        return n;
+    }
+    memcpy(g, tmp, n + 1);
+    return n;
+}
+
+static int wb_hook_at(void *ctx, const RtxDoc *d, size_t off, int incl, size_t *lo, size_t *hi,
+                      char *g, size_t cap, size_t *gn) {
+    RtxWb *wb = (RtxWb *)ctx;
+    int64_t k;
+    const WNode *n;
+    rtx_wb_sync(wb, d);
+    if (wb->off || !wb->nderived) return 0;
+    k = wb_ord_find(wb, off);
+    if (k < 0) return 0;
+    n = &wb->nodes[wb->ord[k]];
+    if (!wb_has_f(n) || off < n->f_lo || off > n->f_hi || (off == n->f_hi && !incl)) return 0;
+    if (lo) *lo = n->f_lo;
+    if (hi) *hi = n->f_hi;
+    if (g && cap) {
+        size_t w = wb_value_text(&n->v, g, cap);
+        if (gn) *gn = w;
+    }
+    return 1;
+}
+
+static size_t wb_hook_edges(void *ctx, const RtxDoc *d, size_t lo, size_t hi, size_t *out,
+                            size_t cap) {
+    RtxWb *wb = (RtxWb *)ctx;
+    int64_t k;
+    size_t m = 0;
+    uint32_t i;
+    rtx_wb_sync(wb, d);
+    if (wb->off || !wb->nderived) return 0;
+    k = wb_ord_find(wb, lo);
+    if (k < 0) k = 0;
+    for (i = (uint32_t)k; i < wb->nord; i++) {
+        const WNode *n = &wb->nodes[wb->ord[i]];
+        if (n->raw_lo != WNONE && n->raw_lo > hi) break;
+        if (!wb_has_f(n)) continue;
+        if (n->f_lo > lo && n->f_lo < hi) {
+            if (m >= cap) return (size_t)-1;
+            out[m++] = n->f_lo;
+        }
+        if (n->f_hi > lo && n->f_hi < hi) {
+            if (m >= cap) return (size_t)-1;
+            out[m++] = n->f_hi;
+        }
+    }
+    return m;
+}
+
+static size_t wb_hook_changed(void *ctx, const RtxDoc *d, size_t *lo, size_t *hi, size_t cap) {
+    RtxWb *wb = (RtxWb *)ctx;
+    uint32_t i;
+    size_t m = 0;
+    rtx_wb_sync(wb, d);
+    if (wb->off) return 0; /* nothing painted */
+    if (wb->chg_all) return (size_t)-1;
+    for (i = 0; i < wb->nchanged; i++) {
+        const WNode *n = &wb->nodes[wb->changed[i]];
+        if (!wb_has_f(n)) continue;
+        if (m >= cap) return (size_t)-1;
+        lo[m] = n->f_lo;
+        hi[m] = n->f_hi;
+        m++;
+    }
+    return m;
+}
+
+static int wb_hook_any(void *ctx, const RtxDoc *d) {
+    RtxWb *wb = (RtxWb *)ctx;
+    rtx_wb_sync(wb, d);
+    return !wb->off && wb->nderived > 0;
+}
+
+static void wb_hook_destroy(void *ctx) {
+    RtxWb *wb = (RtxWb *)ctx;
+    CCArena own;
+    if (!wb) return;
+    own = wb->own;
+    wb->ma.destroy();
+    wb->va.destroy();
+    wb->sa.destroy();
+    own.destroy();
+}
+
+/* -------------------------------------------------------------------- API */
+
+int rtx_wb_path(const char *path, size_t n) {
+    return path && n >= 6 && !memcmp(path + n - 6, ".wb.md", 6);
+}
+
+RtxWb *rtx_wb_of(const RtxDoc *d) {
+    if (!d || !d->derived || d->derived->note != wb_hook_note) return NULL;
+    return (RtxWb *)d->derived->ctx;
+}
+
+RtxWb *rtx_wb_attach(RtxDoc *d) {
+    CCArena own;
+    RtxWb *wb;
+    if (!d || d->derived) return NULL;
+    own = cc_arena_heap(sizeof(RtxWb) + 1024);
+    if (!own.base) return NULL;
+    wb = (RtxWb *)wb_alloc(own, sizeof(RtxWb));
+    if (!wb) {
+        own.destroy();
+        return NULL;
+    }
+    wb->own = own;
+    wb->ma = cc_arena_heap(1u << 20);
+    wb->va = cc_arena_heap(256u << 10);
+    wb->sa = cc_arena_heap(1u << 20);
+    if (!wb->ma.base || !wb->va.base || !wb->sa.base) {
+        wb_hook_destroy(wb);
+        return NULL;
+    }
+    wb->doc = d;
+    wb->hook.ctx = wb;
+    wb->hook.note = wb_hook_note;
+    wb->hook.at = wb_hook_at;
+    wb->hook.edges = wb_hook_edges;
+    wb->hook.changed = wb_hook_changed;
+    wb->hook.any = wb_hook_any;
+    wb->hook.destroy = wb_hook_destroy;
+    d->derived = &wb->hook;
+    wb_rebuild(wb, d);
+    wb->sa.reset();
+    return wb;
+}
+
+void rtx_wb_stats(RtxWb *wb, const RtxDoc *d, RtxWbStats *out) {
+    uint32_t i;
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    if (!wb) return;
+    rtx_wb_sync(wb, d);
+    wb_count(wb);
+    wb->st.errors = 0;
+    for (i = 0; i < wb->nn; i++)
+        if (wb->nodes[i].v.t == WV_ERR) wb->st.errors++;
+    wb->st.off = wb->off;
+    *out = wb->st;
+}
+
+static size_t wb_fmt_dump(const WVal *v, char *out, size_t cap) {
+    size_t at = 0;
+    if (v->t == WV_NULL) return wb_puts(out, cap, 0, "null");
+    if (v->t == WV_TEXT) {
+        at = wb_puts(out, cap, 0, "\"");
+        at = wb_put(out, cap, at, v->u.s, v->n);
+        return wb_puts(out, cap, at, "\"");
+    }
+    return wv_fmt(v, out, cap, 1);
+}
+
+int rtx_wb_eval(RtxWb *wb, const RtxDoc *d, const char *expr, size_t n, char *out, size_t cap) {
+    BCtx c;
+    ECtx e;
+    Ex *x;
+    WVal v;
+    if (out && cap) out[0] = 0;
+    if (!wb) return 0;
+    rtx_wb_sync(wb, d);
+    if (wb->off) return 0;
+    memset(&c, 0, sizeof c);
+    c.wb = wb;
+    c.self = UINT32_MAX;
+    c.own_tab = c.own_row = c.it_tab = -1;
+    c.sheet = 0;
+    c.any_sheet = 1;
+    c.nodeps = 1;
+    x = wb_parse(wb, wb_cell_copy(wb, expr, n, 0, &(uint32_t){0}), (uint32_t)n);
+    x = bd(&c, x);
+    memset(&e, 0, sizeof e);
+    e.wb = wb;
+    e.self = UINT32_MAX;
+    e.own_tab = e.own_row = e.it_tab = e.it_row = -1;
+    v = ev(&e, x);
+    if (v.t == WV_ROW || v.t == WV_TAB) v = wv_row_err(&e, &v);
+    wb_fmt_dump(&v, out, cap);
+    wb->sa.reset();
+    return 1;
+}
+
+size_t rtx_wb_dump(RtxWb *wb, const RtxDoc *d, char *out, size_t cap) {
+    size_t at = 0;
+    uint32_t i;
+    char lb[160], vb[512];
+    if (out && cap) out[0] = 0;
+    if (!wb) return 0;
+    rtx_wb_sync(wb, d);
+    if (wb->off) return wb_puts(out, cap, 0, "(off)\n");
+    for (i = 0; i < wb->nn; i++) {
+        const WNode *n = &wb->nodes[i];
+        if (n->kind != NK_CELL && n->kind != NK_NAME) continue;
+        wb_node_label(wb, i, lb, sizeof lb);
+        wb_fmt_dump(&n->v, vb, sizeof vb);
+        at = wb_puts(out, cap, at, lb);
+        at = wb_puts(out, cap, at, " = ");
+        at = wb_puts(out, cap, at, vb);
+        at = wb_puts(out, cap, at, "\n");
+    }
+    return at;
+}
+
+size_t rtx_wb_reach(RtxWb *wb, const RtxDoc *d, size_t off) {
+    int64_t k;
+    uint32_t id, *queue, qh = 0, qt = 0, j;
+    uint8_t *seen;
+    size_t n;
+    if (!wb) return 0;
+    rtx_wb_sync(wb, d);
+    if (wb->off) return 0;
+    k = wb_ord_find(wb, off);
+    if (k < 0) return 0;
+    id = wb->ord[k];
+    if (wb->nodes[id].raw_hi == WNONE || off > wb->nodes[id].raw_hi) return 0;
+    seen = (uint8_t *)wb_alloc(wb->sa, wb->nn);
+    queue = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)wb->nn * sizeof(uint32_t), 16);
+    if (!seen || !queue) return 0;
+    seen[id] = 1;
+    queue[qt++] = id;
+    while (qh < qt) {
+        const WNode *x = &wb->nodes[queue[qh++]];
+        for (j = 0; j < x->rdn; j++) {
+            uint32_t w = wb->rdeps[x->rd0 + j];
+            if (!seen[w]) {
+                seen[w] = 1;
+                queue[qt++] = w;
+            }
+        }
+        if (x->kind == NK_CELL) {
+            uint32_t w = wb->tabs[x->tab].col0 + (uint32_t)x->col;
+            if (!seen[w]) {
+                seen[w] = 1;
+                queue[qt++] = w;
+            }
+        }
+    }
+    n = qt;
+    wb->sa.reset();
+    return n;
+}
+
+/* ---------------------------------------------------------------- rename */
+
+enum { RT_NONE = 0, RT_TAB, RT_COL, RT_NAME };
+
+typedef struct {
+    int kind;
+    int32_t tab, col;
+    uint32_t node;
+} WTarget;
+
+typedef struct {
+    RtxWb *wb;
+    WTarget want;
+    size_t at;
+    int find;
+    WTarget got;
+    int found;
+    size_t *lo, *hi;
+    size_t n, cap;
+} WRen;
+
+static int wt_eq(const WTarget *a, const WTarget *b) {
+    if (a->kind != b->kind) return 0;
+    if (a->kind == RT_TAB) return a->tab == b->tab;
+    if (a->kind == RT_COL) return a->tab == b->tab && a->col == b->col;
+    return a->node == b->node;
+}
+
+static void ren_tok(WRen *r, const WNode *n, int kind, int32_t tab, int32_t col, uint32_t node,
+                    uint32_t lo, uint32_t hi) {
+    WTarget t;
+    size_t alo = n->src_lo + lo, ahi = n->src_lo + hi;
+    t.kind = kind;
+    t.tab = tab;
+    t.col = col;
+    t.node = node;
+    if (r->find) {
+        if (!r->found && r->at >= alo && r->at <= ahi) {
+            r->got = t;
+            r->found = 1;
+        }
+        return;
+    }
+    if (!wt_eq(&t, &r->want) || r->n >= r->cap) return;
+    r->lo[r->n] = alo;
+    r->hi[r->n] = ahi;
+    r->n++;
+}
+
+static void ren_walk(WRen *r, const WNode *n, const Ex *e) {
+    uint16_t i;
+    if (!e) return;
+    switch (e->op) {
+    case EX_COL:
+        if (e->tabtok) ren_tok(r, n, RT_TAB, e->tab, -1, 0, e->lo, e->hi);
+        ren_tok(r, n, RT_COL, e->tab, e->col, 0, e->lo2, e->hi2);
+        return;
+    case EX_ATCELL:
+        if (e->tabtok) ren_tok(r, n, RT_TAB, e->tab, -1, 0, e->lo, e->hi);
+        ren_tok(r, n, RT_COL, e->tab, e->col, 0, e->lo2, e->hi2);
+        return;
+    case EX_NAMEREF:
+        ren_tok(r, n, RT_NAME, -1, -1, e->node, e->lo2, e->hi2);
+        return;
+    case EX_TABREF:
+        ren_tok(r, n, RT_TAB, e->tab, -1, 0, e->lo, e->hi);
+        return;
+    case EX_LOOKUP:
+        ren_tok(r, n, RT_TAB, e->tab, -1, 0, e->lo, e->hi);
+        ren_walk(r, n, e->b);
+        return;
+    case EX_FIELD:
+        ren_walk(r, n, e->a);
+        ren_tok(r, n, RT_COL, e->tab, e->col, 0, e->lo2, e->hi2);
+        return;
+    case EX_AGG:
+        ren_walk(r, n, e->args[0]);
+        ren_walk(r, n, e->where);
+        return;
+    case EX_FN:
+        for (i = 0; i < e->nargs; i++) ren_walk(r, n, e->args[i]);
+        return;
+    case EX_UN:
+        ren_walk(r, n, e->a);
+        return;
+    case EX_BIN:
+        ren_walk(r, n, e->a);
+        ren_walk(r, n, e->b);
+        return;
+    case EX_IF:
+        ren_walk(r, n, e->a);
+        ren_walk(r, n, e->b);
+        ren_walk(r, n, e->c);
+        return;
+    default:
+        return;
+    }
+}
+
+/* The table / column / name at `off`. */
+static int wb_target_at(RtxWb *wb, size_t off, WTarget *out) {
+    uint32_t i;
+    int32_t c;
+    int64_t k;
+    memset(out, 0, sizeof *out);
+    for (i = 0; i < wb->ntab; i++) {
+        const WTab *t = &wb->tabs[i];
+        if (off >= t->cap_lo && off <= t->cap_hi) {
+            out->kind = RT_TAB;
+            out->tab = (int32_t)i;
+            return 1;
+        }
+        for (c = 0; c < t->ncols; c++) {
+            if (t->hlo[c] != WNONE && off >= t->hlo[c] && off <= t->hhi[c]) {
+                out->kind = RT_COL;
+                out->tab = (int32_t)i;
+                out->col = c;
+                return 1;
+            }
+        }
+    }
+    k = wb_ord_find(wb, off);
+    if (k < 0) return 0;
+    {
+        uint32_t id = wb->ord[k];
+        const WNode *n = &wb->nodes[id];
+        if (n->kind == NK_NAME && off >= n->n_lo && off <= n->n_hi) {
+            out->kind = RT_NAME;
+            out->node = id;
+            return 1;
+        }
+        if (n->form && n->ex && n->src_lo != WNONE && off >= n->src_lo) {
+            WRen r;
+            memset(&r, 0, sizeof r);
+            r.wb = wb;
+            r.find = 1;
+            r.at = off;
+            ren_walk(&r, n, n->ex);
+            if (r.found) {
+                *out = r.got;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static size_t wb_target_name(const RtxWb *wb, const WTarget *t, char *out, size_t cap) {
+    if (t->kind == RT_TAB) return wb_put(out, cap, 0, wb->tabs[t->tab].name, wb->tabs[t->tab].namen);
+    if (t->kind == RT_COL)
+        return wb_put(out, cap, 0, wb->tabs[t->tab].cname[t->col], wb->tabs[t->tab].cnamen[t->col]);
+    if (t->kind == RT_NAME) return wb_put(out, cap, 0, wb->nodes[t->node].name, wb->nodes[t->node].namen);
+    if (out && cap) out[0] = 0;
+    return 0;
+}
+
+int rtx_wb_rename_target(RtxWb *wb, const RtxDoc *d, size_t off, char *out, size_t cap) {
+    WTarget t;
+    if (out && cap) out[0] = 0;
+    if (!wb) return 0;
+    rtx_wb_sync(wb, d);
+    if (wb->off || !wb_target_at(wb, off, &t)) return 0;
+    wb_target_name(wb, &t, out, cap);
+    return 1;
+}
+
+/* A new name is free in its own scope: no other table (or sheet) for a
+ * table, no other column of that table for a column, no other name of
+ * that sheet (or param) for a name — ignoring case. Capture across scopes
+ * (a column named like a calc name a `where` reads) is caught after the
+ * edit: every binding must be the same (wb_snapshot). */
+static int wb_name_taken(const RtxWb *wb, const WTarget *t, const char *s, size_t n) {
+    uint32_t i;
+    int32_t c;
+    if (t->kind == RT_TAB) {
+        for (i = 0; i < wb->nsheet; i++)
+            if (wb->sheetn[i] == n && wb_ieq(wb->sheets[i], s, n)) return 1;
+        for (i = 0; i < wb->ntab; i++)
+            if ((int32_t)i != t->tab && wb->tabs[i].namen == n && wb_ieq(wb->tabs[i].name, s, n))
+                return 1;
+        return 0;
+    }
+    if (t->kind == RT_COL) {
+        const WTab *tb = &wb->tabs[t->tab];
+        for (c = 0; c < tb->ncols; c++)
+            if (c != t->col && tb->cnamen[c] == n && wb_ieq(tb->cname[c], s, n)) return 1;
+        return 0;
+    }
+    for (i = 0; i < wb->nn; i++) {
+        const WNode *x = &wb->nodes[i];
+        if (i == t->node || x->kind != NK_NAME || x->namen != n || !wb_ieq(x->name, s, n)) continue;
+        if (x->tab == wb->nodes[t->node].tab || x->tab == SC_PARAM ||
+            wb->nodes[t->node].tab == SC_PARAM)
+            return 1;
+    }
+    return 0;
+}
+
+static int wb_is_ident(const char *s, size_t n) {
+    size_t i;
+    if (!n || !wb_id0(s[0])) return 0;
+    for (i = 1; i < n; i++)
+        if (!wb_id1(s[i])) return 0;
+    return !wb_is_kw(s, n);
+}
+
+static void wb_msg(char *msg, size_t n, const char *s) {
+    if (msg && n) snprintf(msg, n, "%s", s);
+}
+
+typedef struct {
+    size_t lo, hi;
+    int plain; /* 1: header cell text (never backticked) */
+} WSite;
+
+static int wb_site_cmp(const void *a, const void *b) {
+    const WSite *x = (const WSite *)a, *y = (const WSite *)b;
+    return x->lo < y->lo ? -1 : x->lo > y->lo;
+}
+
+/* Values as text (error code only: messages name the renamed things). */
+static char *wb_snapshot(RtxWb *wb, CCArena a, size_t *outn) {
+    size_t cap = (size_t)wb->nn * 32 + 64, at = 0;
+    char *buf = (char *)cc_arena_alloc(a, cap, 16);
+    uint32_t i;
+    char vb[256];
+    if (!buf) return NULL;
+    for (i = 0; i < wb->nn; i++) {
+        const WVal *v = &wb->nodes[i].v;
+        size_t k = v->t == WV_ERR ? wb_puts(vb, sizeof vb, 0, g_we_tag[v->code < 9 ? v->code : 0])
+                                  : wv_fmt(v, vb, sizeof vb, 0);
+        if (at + k + 4 >= cap) {
+            char *nb = (char *)cc_arena_alloc(a, cap * 2 + k, 16);
+            if (!nb) return NULL;
+            memcpy(nb, buf, at);
+            buf = nb;
+            cap = cap * 2 + k;
+        }
+        buf[at++] = (char)('0' + wb->nodes[i].v.t);
+        memcpy(buf + at, vb, k);
+        at += k;
+        buf[at++] = '\n';
+        /* the bindings: a rename must not move any */
+        {
+            const WNode *x = &wb->nodes[i];
+            size_t need = (size_t)x->ndeps * 11 + 4;
+            uint32_t j;
+            if (at + need >= cap) {
+                char *nb = (char *)cc_arena_alloc(a, cap * 2 + need, 16);
+                if (!nb) return NULL;
+                memcpy(nb, buf, at);
+                buf = nb;
+                cap = cap * 2 + need;
+            }
+            for (j = 0; j < x->ndeps; j++) at += (size_t)snprintf(buf + at, cap - at, "%u,", x->deps[j]);
+            buf[at++] = '\n';
+        }
+    }
+    *outn = at;
+    return buf;
+}
+
+size_t !>(CCError) rtx_wb_rename(RtxDoc *d, size_t off, const char *name, size_t n, char *msg,
+                                 size_t msgn) {
+    RtxWb *wb = rtx_wb_of(d);
+    WTarget t;
+    WRen r;
+    WSite *sites;
+    RtxEdit *eds;
+    size_t ns = 0, i, k, cap, snap_n = 0, snap2_n = 0;
+    uint32_t id;
+    char old[128];
+    char *bq, *snap, *snap2;
+    CCArena a;
+    wb_msg(msg, msgn, "");
+    if (!wb) {
+        wb_msg(msg, msgn, "not a workbook");
+        return cc_ok((size_t)0);
+    }
+    rtx_wb_sync(wb, d);
+    if (wb->off) {
+        wb_msg(msg, msgn, "workbook over 8 MiB: values are off");
+        return cc_ok((size_t)0);
+    }
+    if (!wb_target_at(wb, off, &t)) {
+        wb_msg(msg, msgn, "no table, column or name at the caret");
+        return cc_ok((size_t)0);
+    }
+    wb_target_name(wb, &t, old, sizeof old);
+    if (!n || n > 120) {
+        wb_msg(msg, msgn, "rename: empty or too long");
+        return cc_ok((size_t)0);
+    }
+    for (i = 0; i < n; i++) {
+        if (name[i] == '`' || name[i] == '|' || name[i] == '\n' || name[i] == '\r' ||
+            name[i] == '#' || name[i] == '"') {
+            wb_msg(msg, msgn, "rename: a name has no ` | # \" or newline");
+            return cc_ok((size_t)0);
+        }
+    }
+    if (wb_ws(name[0]) || wb_ws(name[n - 1])) {
+        wb_msg(msg, msgn, "rename: no leading or trailing blanks");
+        return cc_ok((size_t)0);
+    }
+    if (strlen(old) == n && !memcmp(old, name, n)) {
+        wb_msg(msg, msgn, "rename: same name");
+        return cc_ok((size_t)0);
+    }
+    if (wb_name_taken(wb, &t, name, n)) {
+        if (msg && msgn) snprintf(msg, msgn, "rename: %.*s is taken", (int)n, name);
+        return cc_ok((size_t)0);
+    }
+    a = cc_arena_heap(64u << 10);
+    if (!a.base) return cc_err(CC_ERR_OUT_OF_MEMORY, "rename");
+    cap = 16;
+    for (id = 0; id < wb->nn; id++) cap += wb->nodes[id].form ? 8 : 0;
+    sites = (WSite *)cc_arena_alloc(a, cap * sizeof(WSite), 16);
+    memset(&r, 0, sizeof r);
+    r.lo = (size_t *)cc_arena_alloc(a, cap * sizeof(size_t), 16);
+    r.hi = (size_t *)cc_arena_alloc(a, cap * sizeof(size_t), 16);
+    r.cap = cap;
+    r.wb = wb;
+    r.want = t;
+    if (!sites || !r.lo || !r.hi) {
+        a.destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "rename");
+    }
+    /* the definition */
+    if (t.kind == RT_TAB) {
+        sites[ns].lo = wb->tabs[t.tab].cap_lo;
+        sites[ns].hi = wb->tabs[t.tab].cap_hi;
+        sites[ns++].plain = 0;
+    } else if (t.kind == RT_COL) {
+        sites[ns].lo = wb->tabs[t.tab].hlo[t.col];
+        sites[ns].hi = wb->tabs[t.tab].hhi[t.col];
+        sites[ns++].plain = 1;
+    } else {
+        sites[ns].lo = wb->nodes[t.node].n_lo;
+        sites[ns].hi = wb->nodes[t.node].n_hi;
+        sites[ns++].plain = 0;
+    }
+    /* every reference */
+    for (id = 0; id < wb->nn; id++) {
+        const WNode *x = &wb->nodes[id];
+        size_t before = r.n;
+        if (!x->form || !x->ex || x->src_lo == WNONE) continue;
+        ren_walk(&r, x, x->ex);
+        if (r.n >= r.cap) {
+            a.destroy();
+            wb_msg(msg, msgn, "rename: too many references in one formula");
+            return cc_ok((size_t)0);
+        }
+        for (k = before; k < r.n && ns < cap; k++) {
+            sites[ns].lo = r.lo[k];
+            sites[ns].hi = r.hi[k];
+            sites[ns++].plain = 0;
+        }
+        r.n = 0;
+    }
+    qsort(sites, ns, sizeof(WSite), wb_site_cmp);
+    for (i = 1, k = 1; i < ns; i++)
+        if (sites[i].lo != sites[k - 1].lo) sites[k++] = sites[i];
+    ns = ns ? k : 0;
+    for (i = 1; i < ns; i++) {
+        if (sites[i].lo < sites[i - 1].hi) {
+            a.destroy();
+            wb_msg(msg, msgn, "rename: overlapping sites");
+            return cc_ok((size_t)0);
+        }
+    }
+    bq = (char *)cc_arena_alloc(a, n + 3, 16);
+    eds = (RtxEdit *)cc_arena_alloc(a, (ns ? ns : 1) * sizeof(RtxEdit), 16);
+    if (!bq || !eds) {
+        a.destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "rename");
+    }
+    bq[0] = '`';
+    memcpy(bq + 1, name, n);
+    bq[n + 1] = '`';
+    for (i = 0; i < ns; i++) {
+        int plain = sites[i].plain || wb_is_ident(name, n);
+        eds[i].off = sites[i].lo;
+        eds[i].n = sites[i].hi - sites[i].lo;
+        eds[i].ins = cc_slice_from_buffer(plain ? (char *)name : bq, plain ? n : n + 2);
+    }
+    snap = wb_snapshot(wb, a, &snap_n);
+    if (!snap) {
+        a.destroy();
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "rename");
+    }
+    RtxDoc_replace_batch(d, eds, ns) !>(e) {
+        a.destroy();
+        return cc_err(e);
+    };
+    rtx_wb_sync(wb, d);
+    snap2 = wb_snapshot(wb, a, &snap2_n);
+    if (!snap2 || snap2_n != snap_n || memcmp(snap, snap2, snap_n) != 0) {
+        a.destroy();
+        RtxDoc_undo(d) !>(e) { return cc_err(e); };
+        rtx_wb_sync(wb, d);
+        wb_msg(msg, msgn, "rename would capture another reference: undone");
+        return cc_ok((size_t)0);
+    }
+    a.destroy();
+    if (msg && msgn)
+        snprintf(msg, msgn, "renamed %s to %.*s: %zu site%s, one undo step", old, (int)n, name, ns,
+                 ns == 1 ? "" : "s");
+    return cc_ok(ns);
+}
+
+/* ---------------------------------------------------------------- status */
+
+int rtx_wb_describe(RtxWb *wb, const RtxDoc *d, size_t off, char *out, size_t cap) {
+    int64_t k;
+    char lb[160], vb[320];
+    uint32_t i;
+    int32_t c;
+    if (out && cap) out[0] = 0;
+    if (!wb) return 0;
+    rtx_wb_sync(wb, d);
+    if (wb->off) {
+        wb_puts(out, cap, 0, "workbook over 8 MiB: values off");
+        return 1;
+    }
+    k = wb_ord_find(wb, off);
+    if (k >= 0) {
+        uint32_t id = wb->ord[k];
+        const WNode *n = &wb->nodes[id];
+        if (n->kind != NK_LINE && n->raw_hi != WNONE && off <= n->raw_hi) {
+            wb_node_label(wb, id, lb, sizeof lb);
+            wv_fmt(&n->v, vb, sizeof vb, 1);
+            if (n->v.t == WV_ERR) {
+                snprintf(out, cap, "%s %s", lb, vb);
+            } else if (n->kind == NK_CELL && !n->form) {
+                snprintf(out, cap, "%s = %s  (%s)", lb, n->v.t == WV_NULL ? "(empty)" : vb,
+                         wv_kind(&n->v));
+            } else {
+                snprintf(out, cap, "%s = %s  (%s; %u input%s, %u dependent%s)", lb,
+                         n->v.t == WV_NULL ? "(empty)" : vb, wv_kind(&n->v), (unsigned)n->ndeps,
+                         n->ndeps == 1 ? "" : "s", (unsigned)(n->rdn + (n->kind == NK_CELL)),
+                         n->rdn + (n->kind == NK_CELL) == 1 ? "" : "s");
+            }
+            return 1;
+        }
+    }
+    for (i = 0; i < wb->ntab; i++) {
+        const WTab *t = &wb->tabs[i];
+        if (off < t->lo || off > t->hi) continue;
+        for (c = 0; c < t->ncols; c++) {
+            if (t->hlo[c] != WNONE && off >= t->hlo[c] && off <= t->hhi[c]) {
+                WVal z = wv_null();
+                z.t = t->ct[c];
+                snprintf(out, cap, "column %.*s.%.*s  (%s%s)", (int)t->namen, t->name,
+                         (int)t->cnamen[c], t->cname[c], t->cclash[c] ? "#dup " : "",
+                         wv_kind(&z));
+                return 1;
+            }
+        }
+        snprintf(out, cap, "table %.*s  (%d column%s, %d row%s)%s", (int)t->namen, t->name,
+                 (int)t->ncols, t->ncols == 1 ? "" : "s", (int)t->nrows, t->nrows == 1 ? "" : "s",
+                 t->big ? "  over 10000 rows: refused (W1)" : "");
+        return 1;
+    }
+    return 0;
+}

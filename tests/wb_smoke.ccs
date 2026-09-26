@@ -1,0 +1,816 @@
+#!ccc ccs
+/*
+ * Workbook W0 (docs/workbook.md):
+ *   - fixtures: every cell and calc value of testdata/wb/*.wb.md against
+ *     its .expect (types, errors with provenance, scopes, cycles + path)
+ *   - a file that is not a workbook never gets the derived hook
+ *   - counter: one cell edit visits only its dependents (exact count),
+ *     early cutoff stops at unchanged values; fast paths (cell / line /
+ *     prose) vs rebuild
+ *   - Rich lens: derived spans, painted value text, edges, changed spans
+ *   - rename: table / column / name, from the definition or a reference,
+ *     one undo step, refusals, round trip to the original bytes
+ *   - property: random edits (cells, formulas, calc lines, prose, rows,
+ *     undo / redo) — incremental recalc == a from-scratch workbook
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/wb.cch"
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static uint64_t rng = 0x9E3779B97F4A7C15ull;
+
+static uint64_t rnd(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+}
+
+static size_t rnd_n(size_t n) {
+    return n ? (size_t)(rnd() % n) : 0;
+}
+
+static char *read_file(const char *path, size_t *out_n) {
+    FILE *f = fopen(path, "rb");
+    char *p;
+    long sz;
+    *out_n = 0;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    p = (char *)malloc((size_t)sz + 1);
+    if (p && fread(p, 1, (size_t)sz, f) != (size_t)sz) {
+        free(p);
+        p = NULL;
+    }
+    fclose(f);
+    if (p) {
+        p[sz] = 0;
+        *out_n = (size_t)sz;
+    }
+    return p;
+}
+
+static char *doc_bytes(RtxDoc *d, size_t *out_n) {
+    size_t n = d->len();
+    char *p = (char *)malloc(n + 1);
+    *out_n = 0;
+    if (!p) return NULL;
+    if (n) {
+        size_t got = d->read_at(0, cc_slice_from_buffer(p, n)) ?> 0;
+        if (got != n) {
+            free(p);
+            return NULL;
+        }
+    }
+    p[n] = 0;
+    *out_n = n;
+    return p;
+}
+
+static size_t find_off(RtxDoc *d, const char *needle, int nth) {
+    size_t n = 0, off = (size_t)-1;
+    char *p = doc_bytes(d, &n);
+    char *hit = p;
+    int k;
+    if (!p) return off;
+    for (k = 0; hit && k <= nth; k++) {
+        hit = strstr(k ? hit + 1 : hit, needle);
+    }
+    if (hit) off = (size_t)(hit - p);
+    free(p);
+    return off;
+}
+
+static int rep(RtxDoc *d, size_t off, size_t n, const char *s) {
+    size_t sn = strlen(s);
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    d->replace(off, n, sn ? cc_slice_from_buffer((char *)s, sn) : cc_slice_empty()) !>;
+    return 1;
+}
+
+static int undo(RtxDoc *d) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    if (!d->can_undo()) return 0;
+    d->undo() !>;
+    return 1;
+}
+
+static int redo(RtxDoc *d) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    if (!d->can_redo()) return 0;
+    d->redo() !>;
+    return 1;
+}
+
+#define DUMP_CAP (1u << 20)
+static char g_dump[DUMP_CAP];
+static char g_dump2[DUMP_CAP];
+
+static const char *eval(RtxWb *wb, RtxDoc *d, const char *expr) {
+    static char out[512];
+    rtx_wb_eval(wb, d, expr, strlen(expr), out, sizeof out);
+    return out;
+}
+
+static void check_eval(RtxWb *wb, RtxDoc *d, const char *expr, const char *want) {
+    const char *got = eval(wb, d, expr);
+    if (strcmp(got, want) != 0) {
+        fprintf(stderr, "FAIL: eval %s = %s (want %s)\n", expr, got, want);
+        fails++;
+    }
+}
+
+/* ---------------------------------------------------------------- fixtures */
+
+static void fixture(const char *name) {
+    char path[256], epath[256];
+    RtxDoc d = {0};
+    RtxWb *wb;
+    size_t en = 0, gn;
+    char *want;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    snprintf(path, sizeof path, "testdata/wb/%s.wb.md", name);
+    snprintf(epath, sizeof epath, "testdata/wb/%s.expect", name);
+    d.from_path(cc_slice_cstr(path)) !>;
+    wb = rtx_wb_of(&d);
+    expect(wb != NULL, "fixture opens as a workbook");
+    want = read_file(epath, &en);
+    expect(want != NULL, "fixture .expect");
+    if (wb && want) {
+        gn = rtx_wb_dump(wb, &d, g_dump, sizeof g_dump);
+        if (gn != en || memcmp(g_dump, want, en) != 0) {
+            size_t i = 0, line = 1;
+            while (i < gn && i < en && g_dump[i] == want[i]) {
+                if (want[i] == '\n') line++;
+                i++;
+            }
+            fprintf(stderr, "FAIL: %s: dump differs at line %zu\n--- got\n%s\n", name, line, g_dump);
+            fails++;
+        }
+    }
+    free(want);
+    RtxDoc_destroy(&d);
+}
+
+/* ---------------------------------------------------------- zero cost */
+
+static void not_a_workbook(void) {
+    RtxDoc d = {0};
+    size_t lo, hi, gn;
+    char g[48];
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    d.from_path(cc_slice_cstr("testdata/rich/md/tables.md")) !>;
+    expect(d.derived == NULL, "a plain .md gets no derived hook");
+    expect(rtx_wb_of(&d) == NULL, "a plain .md is not a workbook");
+    expect(!RtxDoc_derived_at(&d, 10, 1, &lo, &hi, g, sizeof g, &gn), "no derived span");
+    expect(RtxDoc_derived_changed(&d, &lo, &hi, 1) == 0, "no derived changes");
+    RtxDoc_destroy(&d);
+    /* The same workbook bytes under a `.md` name: no hook. */
+    d.from_path(cc_slice_cstr("testdata/wb/revenue.expect")) !>;
+    expect(d.derived == NULL, "path decides: not *.wb.md");
+    RtxDoc_destroy(&d);
+    expect(rtx_wb_path("a.wb.md", 7) && !rtx_wb_path("a.md", 4) && !rtx_wb_path("wb.md", 5),
+           "rtx_wb_path suffix");
+}
+
+/* ------------------------------------------------------------ counter */
+
+static void counter(void) {
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats s0, s1;
+    size_t off, reach, lo[16], hi[16], nch, gn, flo, fhi;
+    char g[48];
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    d.from_path(cc_slice_cstr("testdata/wb/revenue.wb.md")) !>;
+    wb = rtx_wb_of(&d);
+    if (!wb) {
+        expect(0, "revenue workbook");
+        return;
+    }
+    rtx_wb_stats(wb, &d, &s0);
+    expect(s0.rebuilds == 1 && s0.cycles == 0, "one parse at open, no cycles");
+    expect(s0.tables == 2 && s0.formulas == 25, "2 tables, 25 formulas (11 cells + 14 names)");
+    /* Sales.amount[2]: 300.50 → 310.50 */
+    off = find_off(&d, "300.50", 0);
+    reach = rtx_wb_reach(wb, &d, off);
+    expect(reach == 19, "amount[2] reaches 19 nodes");
+    expect(rep(&d, off, 6, "310.50"), "edit a cell");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.rebuilds == 1, "a cell edit does not reparse the workbook");
+    expect(s1.fast_cell == s0.fast_cell + 1, "cell fast path");
+    expect(s1.regraphs == s0.regraphs, "a literal edit keeps the graph");
+    if (s1.visited != 15)
+        fprintf(stderr, "FAIL: visited %zu (want 15 of reach %zu, %zu nodes)\n", s1.visited,
+                reach, s1.nodes);
+    expect(s1.visited == 15, "recalc visits exactly the changed path (cutoff at unchanged)");
+    expect(s1.visited <= reach && s1.visited * 4 < s1.nodes, "visits only dependents");
+    check_eval(wb, &d, "Targets[region = \"US\"].actual", "355.60");
+    check_eval(wb, &d, "Targets[region = \"US\"].gap", "-44.40");
+    check_eval(wb, &d, "eu_total", "219.99");
+    check_eval(wb, &d, "recent_mgn", "215.24");
+    /* changed spans: margin[2], actual[2], gap[2], avg_amt, recent_mgn */
+    nch = RtxDoc_derived_changed(&d, lo, hi, 16);
+    expect(nch == 5, "five painted values changed");
+    /* painted value of Targets.gap[2] */
+    off = find_off(&d, "`=@actual - @target`", 1);
+    expect(RtxDoc_derived_at(&d, off + 3, 0, &flo, &fhi, g, sizeof g, &gn) && flo == off &&
+               fhi == off + 20 && gn == 6 && !memcmp(g, "-44.40", 6),
+           "gap[2] paints -44.40 over its formula");
+    expect(RtxDoc_derived_at(&d, off + 20, 1, &flo, &fhi, NULL, 0, NULL), "inclusive end reveals");
+    expect(!RtxDoc_derived_at(&d, off + 20, 0, &flo, &fhi, NULL, 0, NULL), "exclusive end");
+    {
+        size_t e[64];
+        size_t ne = RtxDoc_mark_edges(&d, off - 1, off + 30, e, 64);
+        int has_lo = 0, has_hi = 0;
+        size_t i;
+        for (i = 0; ne != (size_t)-1 && i < ne; i++) {
+            if (e[i] == off) has_lo = 1;
+            if (e[i] == off + 20) has_hi = 1;
+        }
+        /* -1: the run order is not proven yet (the hide cursor falls back
+         * to per-byte queries); else both span edges are listed. */
+        expect(ne == (size_t)-1 || (has_lo && has_hi), "derived span edges feed the hide cursor");
+    }
+    expect(RtxDoc_has_marks(&d), "a workbook with formulas has marks (Rich gate)");
+    /* A literal-only calc line has no painted span; an expression does. */
+    off = find_off(&d, "2026-09-22", 0);
+    expect(!RtxDoc_derived_at(&d, off, 1, &flo, &fhi, NULL, 0, NULL), "literal param: no span");
+    off = find_off(&d, "count(Sales)", 0);
+    expect(RtxDoc_derived_at(&d, off, 0, &flo, &fhi, g, sizeof g, &gn) && gn == 1 && g[0] == '5',
+           "calc expression paints its value");
+
+    /* Type change: cust becomes text; nothing reads it. */
+    rtx_wb_stats(wb, &d, &s0);
+    off = find_off(&d, "| 11   |", 0);
+    expect(rep(&d, off + 2, 2, "x1"), "cust text");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.fast_cell == s0.fast_cell + 1 && s1.rebuilds == s0.rebuilds, "retype is a cell edit");
+    check_eval(wb, &d, "Sales[order_id = 1].cust", "\"10\"");
+    expect(undo(&d), "undo retype");
+    check_eval(wb, &d, "Sales[order_id = 1].cust", "10");
+
+    /* A formula edit re-binds that one cell. */
+    rtx_wb_stats(wb, &d, &s0);
+    off = find_off(&d, "`=@actual - @target`", 0);
+    expect(rep(&d, off + 10, 9, "* 2"), "formula edit");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.fast_cell == s0.fast_cell + 1 && s1.rebuilds == s0.rebuilds, "formula edit: cell path");
+    expect(s1.regraphs == s0.regraphs + 1, "deps changed: one regraph");
+    check_eval(wb, &d, "Targets[region = \"EU\"].gap", "439.98");
+    expect(undo(&d), "undo formula");
+    check_eval(wb, &d, "Targets[region = \"EU\"].gap", "19.99");
+
+    /* Prose: shift only. */
+    rtx_wb_stats(wb, &d, &s0);
+    off = find_off(&d, "A workbook is Markdown", 0);
+    expect(rep(&d, off, 0, "Hello.\nMore prose here. "), "prose edit");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.fast_prose == s0.fast_prose + 1 && s1.rebuilds == s0.rebuilds &&
+               s1.visited == 0,
+           "prose edit: offsets shift, nothing recalcs");
+    off = find_off(&d, "`=@actual - @target`", 1);
+    expect(RtxDoc_derived_at(&d, off, 0, &flo, &fhi, g, sizeof g, &gn) && flo == off &&
+               gn == 6 && !memcmp(g, "-44.40", 6),
+           "spans shifted with the prose edit");
+
+    /* A calc line: same name, new expression; then a cycle through it. */
+    rtx_wb_stats(wb, &d, &s0);
+    off = find_off(&d, "Targets[region = \"EU\"].actual", 0);
+    expect(rep(&d, off + 29, 0, " + label"), "calc edit makes a cycle");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.fast_line == s0.fast_line + 1 && s1.rebuilds == s0.rebuilds, "calc line path");
+    expect(s1.cycles == 1, "one cycle");
+    check_eval(wb, &d, "eu_total",
+               "#cycle(Revenue.eu_total \xe2\x86\x92 Revenue.label \xe2\x86\x92 Revenue.eu_total)");
+    check_eval(wb, &d, "eu_eur",
+               "#cycle(Revenue.eu_total \xe2\x86\x92 Revenue.label \xe2\x86\x92 Revenue.eu_total)");
+    expect(undo(&d), "undo cycle");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.cycles == 0, "cycle gone");
+    check_eval(wb, &d, "eu_eur", "219.990000");
+
+    /* Structure: a new row reparses. */
+    rtx_wb_stats(wb, &d, &s0);
+    off = find_off(&d, "| APAC   | 900", 0);
+    expect(rep(&d, off, 0, "| LATAM  | 50     | =sum(Sales.amount where region = @region) | =@actual - @target |\n"),
+           "insert a row");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.rebuilds == s0.rebuilds + 1, "a new row reparses");
+    check_eval(wb, &d, "Targets[region = \"LATAM\"].gap", "-50");
+    check_eval(wb, &d, "count(Targets)", "4");
+    RtxDoc_destroy(&d);
+}
+
+/* ---------------------------------------------------------- Rich lens */
+
+static double m_bytes(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return (double)bytes.len;
+}
+
+static double m_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 1.0;
+}
+
+/* Table columns are as wide as the values the lens paints, not the
+ * formulas; a recalc in another table relays this one (patch, no refill);
+ * the caret in a formula reveals it. */
+static void rich_lens(void) {
+    RtxDoc d = {0};
+    RtxLayout L = {0};
+    RtxMeasure m = {0};
+    size_t toff, off, patched;
+    int ti;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    m.measure = m_bytes;
+    m.line_height = m_lh;
+    d.from_path(cc_slice_cstr("testdata/wb/revenue.wb.md")) !>;
+    L.rich = 1;
+    L.wrap = 0;
+    RtxLayout_lines(&L, &d, &m, 400.0, 0, 200) !>;
+    toff = find_off(&d, "| region | target", 0);
+    ti = rtx_layout_md_index(&L, toff);
+    expect(ti >= 0 && L.md_tab[ti].ncols == 4, "Targets is a Rich table");
+    if (ti >= 0) {
+        expect(L.md_colw[ti][2] == 7, "actual column: widest value 1000.00");
+        expect(L.md_colw[ti][3] == 6, "gap column: widest value -54.40");
+    }
+    /* Sales.amount[2] → 99300.50: Targets.actual[2] = 99345.60 */
+    off = find_off(&d, "300.50", 0);
+    patched = L.patched;
+    expect(rep(&d, off, 0, "99"), "edit Sales");
+    RtxLayout_after_edit(&L, &d, &m, 400.0) !>;
+    expect(L.patched == patched + 1, "a recalc elsewhere still patches");
+    ti = rtx_layout_md_index(&L, toff);
+    if (ti >= 0) expect(L.md_colw[ti][2] == 8, "Targets re-measured for 99345.60");
+    /* reveal on entry */
+    off = find_off(&d, "`=@actual - @target`", 1);
+    expect(rtx_layout_hidden_to(&L, &d, off + 2) == off + 20, "formula hidden");
+    d.caret = off + 3;
+    d.sel_anchor = off + 3;
+    expect(rtx_layout_reveal(&L, &d, d.caret, d.sel_anchor) && L.reveal_lo == off &&
+               L.reveal_hi == off + 20,
+           "caret in a formula reveals it");
+    expect(rtx_layout_hidden_to(&L, &d, off + 2) == 0, "revealed formula shows its bytes");
+    /* In a calc fence: the caret on a name reveals the fence, not the
+     * expressions; on an expression, only that one. */
+    {
+        size_t e1 = find_off(&d, "Targets[region = \"EU\"].actual", 0);
+        size_t e2 = find_off(&d, "count(Sales)", 0);
+        size_t nm = find_off(&d, "eu_total   =", 0);
+        rtx_layout_reveal(&L, &d, nm + 1, nm + 1);
+        expect(rtx_layout_hidden_to(&L, &d, e1) > e1, "caret on the name: expression hidden");
+        rtx_layout_reveal(&L, &d, e1 + 3, e1 + 3);
+        expect(L.reveal_derived && rtx_layout_hidden_to(&L, &d, e1) == 0,
+               "caret in the expression: revealed");
+        expect(rtx_layout_hidden_to(&L, &d, e2) > e2, "the next calc line keeps its value");
+    }
+    {
+        RtxHintVis hv;
+        char row[4];
+        row[0] = '`';
+        d.caret = 0;
+        d.sel_anchor = 0;
+        rtx_layout_reveal(&L, &d, 0, 0);
+        expect(rtx_layout_hint_vis(&L, &d, off, row, 0, 1, &hv) && hv.gn == 8 &&
+                   !memcmp(hv.g, "98945.60", 8),
+               "stand-in is the value");
+    }
+    RtxLayout_destroy(&L);
+    RtxDoc_destroy(&d);
+}
+
+/* ------------------------------------------------------------- rename */
+
+static size_t ren(RtxDoc *d, size_t off, const char *name, char *msg, size_t msgn) {
+    size_t k;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    k = rtx_wb_rename(d, off, name, strlen(name), msg, msgn) !>;
+    return k;
+}
+
+static void rename_rt(void) {
+    RtxDoc d = {0};
+    RtxWb *wb;
+    char msg[200], tgt[64];
+    size_t n0 = 0, n1 = 0, off, k;
+    char *orig, *now;
+    RtxWbStats s0, s1;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    d.from_path(cc_slice_cstr("testdata/wb/revenue.wb.md")) !>;
+    wb = rtx_wb_of(&d);
+    if (!wb) {
+        expect(0, "rename workbook");
+        return;
+    }
+    orig = doc_bytes(&d, &n0);
+    rtx_wb_dump(wb, &d, g_dump, sizeof g_dump);
+
+    /* Column from its header cell: Sales.region → area. */
+    off = find_off(&d, "| region | cust", 0) + 2;
+    expect(rtx_wb_rename_target(wb, &d, off, tgt, sizeof tgt) && !strcmp(tgt, "region"),
+           "header cell is the rename target");
+    rtx_wb_stats(wb, &d, &s0);
+    k = ren(&d, off, "area", msg, sizeof msg);
+    if (k != 6) fprintf(stderr, "FAIL: rename region: %zu sites (%s)\n", k, msg);
+    expect(k == 6, "Sales.region: header + 5 references");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(undo(&d), "undo the rename");
+    now = doc_bytes(&d, &n1);
+    expect(now && n1 == n0 && !memcmp(now, orig, n0), "one undo step restores every site");
+    free(now);
+    expect(redo(&d), "redo the rename");
+    check_eval(wb, &d, "distinct(Sales.area)", "3");
+    check_eval(wb, &d, "Targets[region = \"US\"].actual", "345.60");
+    expect(find_off(&d, "where area = @region", 0) != (size_t)-1, "iteration column renamed, @col not");
+    /* and back: the original bytes */
+    off = find_off(&d, "| area | cust", 0) + 2;
+    k = ren(&d, off, "region", msg, sizeof msg);
+    expect(k == 6, "rename back");
+    now = doc_bytes(&d, &n1);
+    expect(now && n1 == n0 && !memcmp(now, orig, n0), "rename round-trips to the original bytes");
+    free(now);
+    rtx_wb_dump(wb, &d, g_dump2, sizeof g_dump2);
+    expect(!strcmp(g_dump, g_dump2), "values and labels identical after the round trip");
+    expect(undo(&d) && undo(&d), "two undos");
+    now = doc_bytes(&d, &n1);
+    expect(now && n1 == n0 && !memcmp(now, orig, n0), "undo restores the bytes");
+    free(now);
+
+    /* Table from its caption; a non-identifier name is backticked. */
+    off = find_off(&d, "Table: Sales", 0) + 8;
+    k = ren(&d, off, "Sales 2026", msg, sizeof msg);
+    expect(k == 13, "Sales: caption + 12 references");
+    if (k != 13) fprintf(stderr, "  (%zu: %s)\n", k, msg);
+    expect(find_off(&d, "Table: `Sales 2026`", 0) != (size_t)-1, "caption backticked");
+    expect(find_off(&d, "sum(`Sales 2026`.amount where region = @region)", 0) != (size_t)-1,
+           "reference backticked");
+    check_eval(wb, &d, "count(`Sales 2026`)", "5");
+    off = find_off(&d, "`Sales 2026`.margin", 0) + 3;
+    k = ren(&d, off, "Sales", msg, sizeof msg);
+    expect(k == 13, "rename back from a reference");
+    now = doc_bytes(&d, &n1);
+    expect(now && n1 == n0 && !memcmp(now, orig, n0), "table round trip");
+    free(now);
+
+    /* A name from a reference inside another formula. */
+    off = find_off(&d, "& eu_total", 0) + 4;
+    expect(rtx_wb_rename_target(wb, &d, off, tgt, sizeof tgt) && !strcmp(tgt, "eu_total"),
+           "reference is the rename target");
+    k = ren(&d, off, "eu_sum", msg, sizeof msg);
+    expect(k == 3, "eu_total: definition + 2 references");
+    check_eval(wb, &d, "eu_sum", "219.99");
+    check_eval(wb, &d, "label", "\"EU: 219.99\"");
+
+    /* Refusals: nothing edits. */
+    {
+        size_t head = d.hist.head;
+        off = find_off(&d, "eu_sum", 0) + 1;
+        expect(ren(&d, off, "max_amt", msg, sizeof msg) == 0 && strstr(msg, "taken"), "name taken");
+        {
+            size_t na = 0, nb = 0, aoff = find_off(&d, "asof   =", 0);
+            char *before = doc_bytes(&d, &na), *after;
+            /* `where date >= asof - 90d` would read Sales.date: refused */
+            expect(ren(&d, aoff + 1, "date", msg, sizeof msg) == 0 && strstr(msg, "capture"),
+                   "a rename that captures a reference is undone");
+            after = doc_bytes(&d, &nb);
+            expect(before && after && na == nb && !memcmp(before, after, na), "capture: bytes kept");
+            free(before);
+            free(after);
+            check_eval(wb, &d, "recent_mgn", "205.24");
+        }
+        expect(ren(&d, off, "a|b", msg, sizeof msg) == 0, "no pipes");
+        expect(ren(&d, off, "eu_sum", msg, sizeof msg) == 0, "same name");
+        expect(ren(&d, 0, "x", msg, sizeof msg) == 0, "nothing at the caret");
+        expect(d.hist.head == head, "refusals edit nothing");
+    }
+    free(orig);
+    RtxDoc_destroy(&d);
+}
+
+/* ----------------------------------------------------------- property */
+
+static const char g_prop_src[] =
+    "# P\n"
+    "\n"
+    "Intro prose line one.\n"
+    "\n"
+    "```params\n"
+    "k = 3\n"
+    "```\n"
+    "\n"
+    "Table: A\n"
+    "\n"
+    "| id | v | w | f          |\n"
+    "|----|---|---|------------|\n"
+    "| 1  | 5 | 2 | =@v * @w   |\n"
+    "| 2  | 1 | 4 | =@v + @w   |\n"
+    "| 3  | 7 | 1 | =@f        |\n"
+    "| 4  | 2 | 9 | =sum(A.v)  |\n"
+    "| 5  | 3 | 3 | =@v / @w   |\n"
+    "| 6  | 8 | 5 | =u         |\n"
+    "\n"
+    "More prose between.\n"
+    "\n"
+    "```calc\n"
+    "s = sum(A.v)\n"
+    "t = sum(A.f where w > k)\n"
+    "u = s + t\n"
+    "m = max(A.w)\n"
+    "c = count(A where v > 2)\n"
+    "```\n"
+    "\n"
+    "Tail prose.\n";
+
+static const char *const g_cells[] = {
+    "1", "2", "10", "0", "-3", "2.5", "x", "", "true", "2026-01-02",
+    "=@v + 1", "=@w * @v", "=sum(A.v)", "=@f", "=u", "=@v / 0", "=bad",
+    "=A[id = 1].v", "=@v & \"x\"", "=s + @w", "=max(A.w)", "=count(A where v > @w)",
+    "`=@v - @w`", "=(", "=@id"};
+
+static const char *const g_exprs[] = {
+    "sum(A.w)", "u + 1", "s * k", "t", "m - c", "count(A)", "v", "A[id = 2].f",
+    "sum?(A.f)", "avg(A.v)", "1 / 0", "s + m", "k", "min(A.v where w > 1)", "(1 +"};
+
+/* Row lines of table A in `p`: [lo, hi) of each (no NL). */
+static size_t prop_rows(const char *p, size_t n, size_t *lo, size_t *hi, size_t cap) {
+    const char *t = strstr(p, "Table: A\n");
+    const char *sep;
+    size_t k = 0, at;
+    (void)n;
+    if (!t) return 0;
+    sep = strstr(t, "|----");
+    if (!sep) return 0;
+    at = (size_t)(strchr(sep, '\n') - p) + 1;
+    while (at < n && p[at] == '|' && k < cap) {
+        size_t e = at;
+        while (e < n && p[e] != '\n') e++;
+        lo[k] = at;
+        hi[k] = e;
+        k++;
+        at = e + 1;
+    }
+    return k;
+}
+
+/* Calc lines (between ```calc and ```). */
+static size_t prop_calc(const char *p, size_t n, size_t *lo, size_t *hi, size_t cap) {
+    const char *t = strstr(p, "```calc\n");
+    size_t k = 0, at;
+    if (!t) return 0;
+    at = (size_t)(t - p) + 8;
+    while (at < n && k < cap && strncmp(p + at, "```", 3) != 0) {
+        size_t e = at;
+        while (e < n && p[e] != '\n') e++;
+        lo[k] = at;
+        hi[k] = e;
+        k++;
+        at = e + 1;
+    }
+    return k;
+}
+
+static int prop_step(RtxDoc *d, int step) {
+    size_t n = 0, lo[64], hi[64], nr, i;
+    char *p = doc_bytes(d, &n);
+    int kind = (int)rnd_n(100), ok = 1;
+    char buf[160];
+    if (!p) return 0;
+    nr = prop_rows(p, n, lo, hi, 64);
+    if (kind < 35 && nr) {
+        /* replace a cell's content */
+        size_t r = rnd_n(nr), c = 1 + rnd_n(4), at = lo[r], k = 0;
+        size_t clo = 0, chi = 0;
+        for (i = lo[r]; i < hi[r]; i++) {
+            if (p[i] == '|') {
+                if (k == c) {
+                    chi = i;
+                    break;
+                }
+                k++;
+                if (k == c) clo = i + 1;
+            }
+        }
+        (void)at;
+        if (chi > clo) {
+            snprintf(buf, sizeof buf, " %s ", g_cells[rnd_n(sizeof g_cells / sizeof g_cells[0])]);
+            ok = rep(d, clo, chi - clo, buf);
+        }
+    } else if (kind < 50 && nr) {
+        /* keystroke: one char into a random cell position */
+        size_t r = rnd_n(nr), at = lo[r] + 1 + rnd_n(hi[r] - lo[r] - 1);
+        static const char keys[] = "0123456789 .-x@v+";
+        char ch[2];
+        ch[0] = keys[rnd_n(sizeof keys - 1)];
+        ch[1] = 0;
+        if (p[at] == '|' || p[at - 1] == '|') at = lo[r] + 2;
+        ok = rep(d, at, 0, ch);
+    } else if (kind < 60 && nr) {
+        /* backspace inside a row */
+        size_t r = rnd_n(nr), at = lo[r] + 1 + rnd_n(hi[r] - lo[r] - 1);
+        if (p[at] != '|') ok = rep(d, at, 1, "");
+    } else if (kind < 70) {
+        size_t cl[16], ch[16], nc = prop_calc(p, n, cl, ch, 16);
+        if (nc) {
+            size_t r = rnd_n(nc);
+            const char *eq = memchr(p + cl[r], '=', ch[r] - cl[r]);
+            if (eq) {
+                size_t e0 = (size_t)(eq - p) + 1;
+                snprintf(buf, sizeof buf, " %s", g_exprs[rnd_n(sizeof g_exprs / sizeof g_exprs[0])]);
+                ok = rep(d, e0, ch[r] - e0, buf);
+            }
+        }
+    } else if (kind < 78) {
+        /* prose: into a prose line, sometimes a newline */
+        static const char *const marks[] = {"Intro", "More", "Tail"};
+        const char *pr = strstr(p, marks[rnd_n(3)]);
+        if (pr) {
+            size_t at = (size_t)(pr - p) + 1, e = at;
+            while (e < n && p[e] != '\n') e++;
+            at += rnd_n(e - at + 1);
+            if (rnd_n(4) == 0 && at < e) ok = rep(d, at, 1, "");
+            else ok = rep(d, at, 0, rnd_n(3) ? "zz " : "q\nw ");
+        }
+    } else if (kind < 83 && nr) {
+        size_t r = rnd_n(nr);
+        snprintf(buf, sizeof buf, "| %d  | %d | %d | %s |\n", 10 + step % 50, (int)rnd_n(9),
+                 (int)rnd_n(9), g_cells[rnd_n(sizeof g_cells / sizeof g_cells[0])]);
+        ok = rep(d, lo[r], 0, buf);
+    } else if (kind < 86 && nr > 2) {
+        size_t r = rnd_n(nr);
+        ok = rep(d, lo[r], hi[r] - lo[r] + 1, "");
+    } else if (kind < 95) {
+        (void)undo(d);
+    } else {
+        (void)redo(d);
+    }
+    free(p);
+    return ok;
+}
+
+static void property(void) {
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats st;
+    int step, bad = 0;
+    const int steps = 1500;
+    CCArena keep_a = cc_arena_heap(sizeof g_prop_src + 64) @destroy;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    {
+        char[:] src = cc_slice_from_buffer((char *)g_prop_src, sizeof g_prop_src - 1);
+        char[:] keep = src.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    wb = rtx_wb_attach(&d);
+    expect(wb != NULL, "attach to a buffer");
+    if (!wb) return;
+    for (step = 0; step < steps && bad < 3; step++) {
+        size_t n = 0, a, b;
+        char *p;
+        RtxDoc s = {0};
+        RtxWb *sw;
+        if (!prop_step(&d, step)) {
+            expect(0, "property edit");
+            bad++;
+            continue;
+        }
+        p = doc_bytes(&d, &n);
+        a = rtx_wb_dump(wb, &d, g_dump, sizeof g_dump);
+        {
+            CCArena sa = cc_arena_heap(n + 64);
+            char[:] src = cc_slice_from_buffer(p, n);
+            char[:] keep = src.clone_into(sa) !>;
+            s.from_buffer(keep) !>;
+            sw = rtx_wb_attach(&s);
+            b = rtx_wb_dump(sw, &s, g_dump2, sizeof g_dump2);
+            RtxDoc_destroy(&s);
+            sa.destroy();
+        }
+        if (a != b || memcmp(g_dump, g_dump2, a) != 0) {
+            fprintf(stderr, "FAIL: step %d incremental != scratch\n--- doc\n%s\n--- inc\n%s\n--- scratch\n%s\n",
+                    step, p, g_dump, g_dump2);
+            fails++;
+            bad++;
+        }
+        free(p);
+    }
+    rtx_wb_stats(wb, &d, &st);
+    printf("wb_smoke property: %d steps, rebuilds %zu, cell %zu, line %zu, prose %zu, regraphs %zu\n",
+           steps, st.rebuilds, st.fast_cell, st.fast_line, st.fast_prose, st.regraphs);
+    expect(st.fast_cell > 200 && st.fast_line > 20 && st.fast_prose > 10,
+           "property exercised every fast path");
+    RtxDoc_destroy(&d);
+}
+
+/* Over RTX_WB_MAX: values off, said so, nothing painted or relaid. */
+static void too_big(void) {
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats st;
+    size_t n = RTX_WB_MAX + 4096, i, lo[4], hi[4];
+    char *p = (char *)malloc(n), msg[128];
+    CCArena a = cc_arena_heap(n + 64);
+    static const char head[] = "Table: T\n\n| a | b |\n|---|---|\n| 1 | =@a |\n\n";
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        free(p);
+        a.destroy();
+        return;
+    }
+    if (!p) return;
+    for (i = 0; i < n; i++) p[i] = (i % 64 == 63) ? '\n' : 'x';
+    memcpy(p, head, sizeof head - 1);
+    {
+        char[:] src = cc_slice_from_buffer(p, n);
+        char[:] keep = src.clone_into(a) !>;
+        d.from_buffer(keep) !>;
+    }
+    wb = rtx_wb_attach(&d);
+    rtx_wb_stats(wb, &d, &st);
+    expect(st.off == 1 && st.nodes == 0, "over 8 MiB: off");
+    expect(!RtxDoc_has_marks(&d) || d.runs_marks, "off: no derived marks");
+    expect(RtxDoc_derived_changed(&d, lo, hi, 4) == 0, "off: no relayout");
+    expect(rtx_wb_describe(wb, &d, 0, msg, sizeof msg) && strstr(msg, "8 MiB"), "off: said so");
+    RtxDoc_destroy(&d);
+    a.destroy();
+    free(p);
+}
+
+int main(void) {
+    fixture("revenue");
+    fixture("checks");
+    fixture("cycles");
+    fixture("scopes");
+    not_a_workbook();
+    counter();
+    rich_lens();
+    rename_rt();
+    property();
+    too_big();
+    if (fails) {
+        fprintf(stderr, "wb_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("wb_smoke: ok\n");
+    return 0;
+}

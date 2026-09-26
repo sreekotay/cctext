@@ -375,6 +375,106 @@ def case_tabs_panes(exe, env, tmp):
           "tabs: Don't Save closes the buffer, the panes stay", repr(lines[-2:]))
 
 
+MD_CHROME = (132, 138, 152)   # gui_md_stroke in frontend/gui_draw.ccs
+MD_FILLS = ((42, 46, 60), (32, 34, 42))  # header / body band
+
+
+def shot_pixels(env, tmp, name):
+    """Root-window pixels as {(x, y): (r, g, b)} rows, or None."""
+    if not shutil.which("import") or not shutil.which("convert"):
+        return None
+    shot = os.path.join(tmp, name)
+    subprocess.run(["import", "-window", "root", shot], env=env,
+                   capture_output=True)
+    out = subprocess.run(["convert", shot, "-depth", "8", "txt:-"],
+                         capture_output=True, text=True).stdout
+    px = {}
+    for line in out.splitlines():
+        m = re.match(r"(\d+),(\d+): \((\d+),(\d+),(\d+)", line)
+        if m:
+            x, y, r, g, b = (int(v) for v in m.groups())
+            px[(x, y)] = (r, g, b)
+    return px
+
+
+def table_right_edge(px, y0, y1, x_hi):
+    """Rightmost table rule x over rows [y0, y1) and whether table fill
+    runs on past it (a clipped, overflowing table) — (x, runs_on)."""
+    rules = {}
+    rows = 0
+    for y in range(y0, y1):
+        seen = False
+        for x in range(0, x_hi):
+            if px.get((x, y)) == MD_CHROME:
+                rules[x] = rules.get(x, 0) + 1
+                seen = True
+        rows += seen
+    if not rows:
+        return None, False
+    cols = [x for x, n in rules.items() if n * 2 >= rows]
+    if not cols:
+        return None, False
+    xr = max(cols)
+    runs_on = 0
+    for y in range(y0, y1):
+        if px.get((xr + 3, y)) in MD_FILLS:
+            runs_on += 1
+    return xr, runs_on * 4 >= (y1 - y0)
+
+
+FIT_W, FIT_H = 1260, 760  # the window is resized to this first (a refit)
+
+
+def case_md_table_fit(exe, env, tmp):
+    """README.md's command table in Rich view, soft wrap off: it is fitted
+    to the window (cells wrap), so its right border is drawn inside the
+    text area and no table fill runs on under the clip edge. The window
+    is resized first, so the fit is the resized pane's."""
+    if not shutil.which("xdotool"):
+        print("skip: table fit (no xdotool)")
+        return
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "README.md"), "rb") as f:
+        body = f.read()
+    lines = body.split(b"\n")
+    hdr = next((i for i, l in enumerate(lines)
+                if l.startswith(b"| Command | id |")), None)
+    if hdr is None:
+        check(False, "table fit: README has the command table")
+        return
+    p, log = launch(exe, env, tmp, "README.md", body)
+    px = None
+    try:
+        time.sleep(2.5)
+        win = xdo(env, "search", "--onlyvisible", "--pid", str(p.pid))
+        if not win:
+            print("skip: table fit (window not found)")
+            return
+        xdo(env, "windowsize", "--sync", win[0], str(FIT_W), str(FIT_H))
+        time.sleep(0.8)
+        xdo(env, "windowfocus", "--sync", win[0])
+        time.sleep(0.3)
+        # Wrap off (Ctrl-Shift-M), then Go to Line: the header near the top.
+        for k in ["ctrl+shift+m", "ctrl+g"] + list(str(hdr)) + ["Return"]:
+            xdo(env, "key", "--window", win[0], k)
+            time.sleep(0.08)
+        time.sleep(1.0)
+        px = shot_pixels(env, tmp, "fit.png")
+    finally:
+        stop(p)
+    if px is None:
+        print("skip: table fit (no import / convert)")
+        return
+    # Pane text area: below the menu, above the status bar, left of the rail.
+    xr, runs_on = table_right_edge(px, 60, FIT_H - 60, FIT_W)
+    check(xr is not None, "table fit: the command table is on screen")
+    if xr is None:
+        return
+    check(not runs_on and xr < FIT_W - 4,
+          "table fit: README command table fits the window (wrap off)",
+          "right rule x=%d runs_on=%s" % (xr, runs_on))
+
+
 def main(argv):
     exe = os.path.abspath(argv[1] if len(argv) > 1 else "bin/cctext-ui")
     if not os.path.exists(exe):
@@ -395,6 +495,7 @@ def main(argv):
             case_blink_cell(exe, env, tmp)
             case_blink_unfocused(exe, env, tmp)
             case_tabs_panes(exe, env, tmp)
+            case_md_table_fit(exe, env, tmp)
     finally:
         if xvfb:
             xvfb.terminate()

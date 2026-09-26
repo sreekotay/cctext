@@ -20,6 +20,7 @@
 #include "keymap.cch"
 #include "palette.cch"
 #include "slides.cch"
+#include "wb.cch"
 
 const char *rtx_help_line(size_t i);
 /* Regenerate the help lines from the command table + keymap. */
@@ -43,6 +44,7 @@ void rtx_ui_clear_jump(RtxUi *ui) {
     ui->jump = 0;
     ui->jump_len = 0;
     ui->jump_buf[0] = 0;
+    ui->jump_kind = RTX_JUMP_LINE;
 }
 
 void rtx_ui_cancel_jump(RtxUi *ui, RtxDoc *d) {
@@ -175,12 +177,24 @@ void rtx_ui_start_jump(RtxUi *ui, RtxDoc *d) {
     ui->jump = 1;
     ui->jump_len = 0;
     ui->jump_buf[0] = 0;
+    ui->jump_kind = RTX_JUMP_LINE;
     rtx_ui_blink_show(ui);
+}
+
+/* The jump box's title (cctext-ui draws it over the field). */
+const char *rtx_ui_jump_title(const RtxUi *ui) {
+    if (ui && ui->jump_kind == RTX_JUMP_RENAME) return "rename across the workbook";
+    return "jump to line or N%";
 }
 
 void rtx_ui_jump_header(const RtxUi *ui, const RtxDoc *d, char *dst, size_t n) {
     int pct;
     if (!dst || n == 0) return;
+    if (ui && ui->jump_kind == RTX_JUMP_RENAME) {
+        snprintf(dst, n, "rename to: %s%s  Enter rename  Esc cancel", ui->jump_buf,
+                 rtx_ui_prompt_caret(ui));
+        return;
+    }
     pct = d ? rtx_line_want_pct(&d->tree) : -1;
     if (pct >= 0) {
         snprintf(dst, n, "jump line or N%%: %s  scanning... %d%%",
@@ -851,6 +865,18 @@ int !>(RtxIndexErr) rtx_ui_apply_jump(RtxUi *ui, RtxBuf *b, int vis) {
         return cc_err(e);
     }
     d = b ? &b->doc : NULL;
+    if (ui && d && ui->jump_kind == RTX_JUMP_RENAME) {
+        /* Workbook rename (docs/workbook.md): one edit group. */
+        size_t k = rtx_wb_rename(d, ui->jump_at, ui->jump_buf, ui->jump_len, ui->jump_msg,
+                                 sizeof(ui->jump_msg)) !>(e) {
+            snprintf(ui->jump_msg, sizeof(ui->jump_msg), "rename: %s",
+                     e.message ? e.message : "failed");
+            rtx_ui_clear_jump(ui);
+            return cc_ok(0);
+        };
+        rtx_ui_clear_jump(ui);
+        return cc_ok(k ? 1 : 0);
+    }
     if (!ui || !d || ui->jump_len == 0) {
         rtx_ui_clear_jump(ui);
         return cc_ok(0);
@@ -1182,12 +1208,42 @@ int !>(CCError) rtx_ui_xact_answer(RtxUi *ui, RtxWs *w, int choice) {
 void rtx_ui_jump_backspace(RtxUi *ui, RtxDoc *d) {
     if (d) rtx_line_want_cancel(&d->tree);
     if (!ui || ui->jump_len == 0) return;
-    ui->jump_buf[--ui->jump_len] = 0;
+    /* one whole UTF-8 scalar (rename names are text) */
+    do {
+        ui->jump_buf[--ui->jump_len] = 0;
+    } while (ui->jump_len > 0 &&
+             ((unsigned char)ui->jump_buf[ui->jump_len] & 0xC0) == 0x80);
 }
 
 int rtx_ui_jump_char(RtxUi *ui, RtxDoc *d, int ch) {
     if (!ui || !ui->jump) return 0;
     if (d) rtx_line_want_cancel(&d->tree);
+    if (ui->jump_kind == RTX_JUMP_RENAME) {
+        char u[4];
+        size_t k = 0;
+        uint32_t cp = (uint32_t)ch;
+        if (cp < 0x20 || cp == 0x7f || cp > 0x10ffff) return 0;
+        if (cp < 0x80) {
+            u[k++] = (char)cp;
+        } else if (cp < 0x800) {
+            u[k++] = (char)(0xC0 | (cp >> 6));
+            u[k++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            u[k++] = (char)(0xE0 | (cp >> 12));
+            u[k++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            u[k++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            u[k++] = (char)(0xF0 | (cp >> 18));
+            u[k++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            u[k++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            u[k++] = (char)(0x80 | (cp & 0x3F));
+        }
+        if (ui->jump_len + k + 1 > sizeof(ui->jump_buf)) return 0;
+        memcpy(ui->jump_buf + ui->jump_len, u, k);
+        ui->jump_len += k;
+        ui->jump_buf[ui->jump_len] = 0;
+        return 1;
+    }
     if (ch == '#' && ui->jump_len == 0) {
         /* `#N`: a slide number (Marp deck). */
         ui->jump_buf[ui->jump_len++] = '#';
@@ -1589,6 +1645,106 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
     return 0;
 }
 
+/* ---- workbook (docs/workbook.md) -------------------------------------- */
+
+/* Status fragment for the caret in a workbook: the cell / name there and
+ * its value, or its error with the message ("" elsewhere). */
+void rtx_status_wb(const RtxBuf *b, char *dst, size_t n) {
+    RtxWb *wb;
+    char tmp[240];
+    if (!dst || !n) return;
+    dst[0] = 0;
+    if (!b) return;
+    wb = rtx_wb_of(&b->doc);
+    if (!wb || !rtx_wb_describe(wb, &b->doc, b->doc.caret, tmp, sizeof tmp)) return;
+    snprintf(dst, n, "  %s", tmp);
+}
+
+int rtx_ui_wb_enabled(const RtxCmdCtx *c) {
+    const RtxBuf *b = c ? (const RtxBuf *)c->act : NULL;
+    return b && rtx_wb_of(&b->doc) != NULL;
+}
+
+/* "workbook.rename": the jump prompt, prefilled with the name at the
+ * caret; Enter renames it everywhere (rtx_ui_apply_jump). */
+int rtx_ui_wb_rename_run(RtxCmdCtx *c) {
+    RtxUi *ui = c ? (RtxUi *)c->ui : NULL;
+    RtxBuf *b = c ? (RtxBuf *)c->act : NULL;
+    RtxWb *wb = b ? rtx_wb_of(&b->doc) : NULL;
+    char name[64];
+    if (!ui || !b) return 0;
+    if (!wb) {
+        snprintf(c->status, sizeof c->status, "rename: not a workbook (*.wb.md)");
+        return 1;
+    }
+    if (!rtx_wb_rename_target(wb, &b->doc, b->doc.caret, name, sizeof name)) {
+        snprintf(c->status, sizeof c->status,
+                 "rename: put the caret on a table, column or name");
+        return 1;
+    }
+    rtx_ui_start_jump(ui, &b->doc);
+    ui->jump_kind = RTX_JUMP_RENAME;
+    ui->jump_at = b->doc.caret;
+    ui->jump_msg[0] = 0;
+    snprintf(ui->jump_buf, sizeof ui->jump_buf, "%s", name);
+    ui->jump_len = strlen(ui->jump_buf);
+    return 1;
+}
+
+/* "workbook.recalc": reparse and recalc everything; report the shape. */
+int rtx_ui_wb_recalc_run(RtxCmdCtx *c) {
+    RtxBuf *b = c ? (RtxBuf *)c->act : NULL;
+    RtxWb *wb = b ? rtx_wb_of(&b->doc) : NULL;
+    RtxWbStats st;
+    if (!wb) {
+        if (c) snprintf(c->status, sizeof c->status, "recalc: not a workbook (*.wb.md)");
+        return 1;
+    }
+    rtx_wb_recalc_all(wb, &b->doc);
+    rtx_wb_stats(wb, &b->doc, &st);
+    if (st.off) {
+        snprintf(c->status, sizeof c->status, "workbook over 8 MiB: values off");
+    } else {
+        snprintf(c->status, sizeof c->status,
+                 "workbook: %zu tables, %zu formulas, %zu nodes, %zu cycles, %zu errors (%.2f ms)",
+                 st.tables, st.formulas, st.nodes, st.cycles, st.errors,
+                 (double)st.last_us / 1000.0);
+    }
+    return 1;
+}
+
+/* Workbook rows join the command table once per process. */
+void rtx_ui_wb_register(void) {
+    static int done;
+    RtxCmdDef row;
+    if (done) return;
+    done = 1;
+    memset(&row, 0, sizeof row);
+    row.id = "workbook.rename";
+    row.title = "Workbook: Rename";
+    row.cat = "Edit";
+    row.cmd = CMD_NONE;
+    row.tui = "f2";
+    row.gui = "f2";
+    row.need = RTX_CTX_DOC;
+    row.deny = RTX_CTX_BROWSE;
+    row.menu = "Edit";
+    row.notes = "  table / column / name at the caret: every reference, one undo";
+    row.enabled = rtx_ui_wb_enabled;
+    row.run = rtx_ui_wb_rename_run;
+    (void)rtx_cmd_register(&row);
+    memset(&row, 0, sizeof row);
+    row.id = "workbook.recalc";
+    row.title = "Workbook: Recalculate";
+    row.cat = "Edit";
+    row.cmd = CMD_NONE;
+    row.need = RTX_CTX_DOC;
+    row.deny = RTX_CTX_BROWSE;
+    row.enabled = rtx_ui_wb_enabled;
+    row.run = rtx_ui_wb_recalc_run;
+    (void)rtx_cmd_register(&row);
+}
+
 /* Host start: settings that live outside RtxCli (rich default), the
  * keymap for this host, and the help lines. Trouble with either file goes
  * to `status` (the status bar), never a failure. */
@@ -1597,6 +1753,7 @@ void rtx_cli_setup_keys(RtxCli *cli, int host, char *status, size_t status_n) {
     kerr[0] = 0;
     if (!cli) return;
     if (cli->rich >= 0) rtx_safe_set_rich_default(cli->rich);
+    rtx_ui_wb_register();
     rtx_keymap_setup(host, cli->keys_path, kerr, sizeof kerr);
     rtx_help_rebuild();
     if (!status || !status_n) return;

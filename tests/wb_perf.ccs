@@ -1,0 +1,307 @@
+#!ccc ccs
+/*
+ * Workbook W0 perf (docs/workbook.md): a generated workbook with ~10k
+ * formula cells over a few thousand rows.
+ *
+ *   ./bin/wb_perf [rows]        (default 3000)
+ *
+ * RESULT lines:
+ *   open        attach: parse + bind + Tarjan + full calc
+ *   edit_a      one literal edit (Big.a[k]) → sync (recalc of dependents)
+ *   edit_f      one formula edit (Big.f1[k]) → sync (re-bind + regraph)
+ *   edit_prose  one prose keystroke → sync (offset shift only)
+ *   edit_row    a new row → sync (structural: reparse)
+ *   agg_heavy   the same literal edit with 1000 calc aggregates reading
+ *               the column (W0 rescans each aggregate: W2 MAs remove it)
+ *   key_wb / key_md   keystroke latency (type + Rich relayout) in a cell
+ *               of the big table: the workbook vs the same bytes as .md
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/wb.cch"
+
+#define PERF_W 120.0
+#define PERF_VIS 50
+
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return (double)rtx_utf8_cols(bytes);
+}
+
+static double cell_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 1.0;
+}
+
+static double mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static int dcmp(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void report(const char *op, double *v, int n, const char *extra) {
+    double sum = 0;
+    int i;
+    for (i = 0; i < n; i++) sum += v[i];
+    qsort(v, (size_t)n, sizeof(double), dcmp);
+    printf("RESULT op=%s n=%d mean_ms=%.4f p50_ms=%.4f p95_ms=%.4f max_ms=%.4f %s\n", op, n,
+           sum / n, v[n / 2], v[(n * 95) / 100], v[n - 1], extra ? extra : "");
+    fflush(stdout);
+}
+
+/* The workbook text: prose, a Big table (id, a, b, c literals; f1..f3
+ * row formulas), and `naggs` calc aggregates over it. */
+static char *gen(int rows, int naggs, size_t *out_n) {
+    size_t cap = (size_t)rows * 120 + (size_t)naggs * 80 + 4096, n = 0;
+    char *p = (char *)malloc(cap);
+    int r;
+    if (!p) return NULL;
+    n += (size_t)snprintf(p + n, cap - n,
+                          "# Perf\n\nGenerated workbook: one table, row formulas, aggregates.\n\n"
+                          "```params\nk = 5\n```\n\nTable: Big\n\n"
+                          "| id | a | b | c | f1 | f2 | f3 |\n"
+                          "|----|---|---|---|----|----|----|\n");
+    for (r = 0; r < rows; r++) {
+        n += (size_t)snprintf(p + n, cap - n,
+                              "| %d | %d | %d.%02d | %d | =@a * @b | =@f1 + @c | =@f2 - @a |\n",
+                              r + 1, (r * 7) % 100, (r * 13) % 10, (r * 31) % 100, (r * 17) % 1000);
+    }
+    n += (size_t)snprintf(p + n, cap - n,
+                          "\nSome prose between the table and the names.\n\n```calc\n"
+                          "total = sum(Big.f3)\n"
+                          "big_a = count(Big where a > 50)\n"
+                          "avg_b = avg(Big.b)\n"
+                          "top = max(Big.f2)\n"
+                          "low = min(Big.f1 where c > k)\n"
+                          "spread = top - low\n"
+                          "first_f3 = Big[id = 1].f3\n"
+                          "ratio = total / count(Big)\n"
+                          "flag = any(Big.f3 > 100000)\n"
+                          "distinct_a = distinct(Big.a)\n");
+    for (r = 0; r < naggs; r++)
+        n += (size_t)snprintf(p + n, cap - n, "s%d = sum(Big.f3 where id > %d)\n", r,
+                              (r * 3) % (rows ? rows : 1));
+    n += (size_t)snprintf(p + n, cap - n, "```\n\nTail prose.\n");
+    *out_n = n;
+    return p;
+}
+
+static int write_file(const char *path, const char *p, size_t n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    if (fwrite(p, 1, n, f) != n) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
+static size_t find_off(RtxDoc *d, const char *needle) {
+    size_t n = d->len(), off = (size_t)-1;
+    char *p = (char *)malloc(n + 1);
+    char *hit;
+    if (!p) return off;
+    if ((d->read_at(0, cc_slice_from_buffer(p, n)) ?> 0) != n) {
+        free(p);
+        return off;
+    }
+    p[n] = 0;
+    hit = strstr(p, needle);
+    if (hit) off = (size_t)(hit - p);
+    free(p);
+    return off;
+}
+
+static void !>(CCError) engine(const char *dir, int rows, int naggs, const char *tag) {
+    char path[512], needle[64], extra[200];
+    size_t n = 0, off;
+    char *src = gen(rows, naggs, &n);
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats st;
+    double t0, v[64];
+    int i;
+    @errhandler(CCError e) {
+        free(src);
+        return cc_err(e);
+    }
+    snprintf(path, sizeof path, "%s/%s.wb.md", dir, tag);
+    if (!src || !write_file(path, src, n)) return cc_err(CC_ERR_IO, "write workbook");
+    t0 = mono_ms();
+    d.from_path(cc_slice_cstr(path)) !>;
+    wb = rtx_wb_of(&d);
+    if (!wb) return cc_err(CC_ERR_INVALID_ARG, "not a workbook");
+    rtx_wb_stats(wb, &d, &st);
+    v[0] = mono_ms() - t0;
+    snprintf(extra, sizeof extra, "bytes=%zu rows=%d formulas=%zu nodes=%zu edges=%zu", n, rows,
+             st.formulas, st.nodes, st.edges);
+    printf("RESULT op=open_%s ms=%.3f %s\n", tag, v[0], extra);
+    /* literal edit in column a, row rows/2: toggles a digit */
+    snprintf(needle, sizeof needle, "| %d | %d |", rows / 2 + 1, ((rows / 2) * 7) % 100);
+    off = find_off(&d, needle);
+    if (off == (size_t)-1) return cc_err(CC_ERR_INVALID_ARG, "row");
+    off += strlen(needle) - 2; /* after the value */
+    for (i = 0; i < 40; i++) {
+        t0 = mono_ms();
+        if (i % 2 == 0) d.replace(off, 0, cc_slice_from_buffer((char *)"7", 1)) !>;
+        else d.replace(off, 1, cc_slice_empty()) !>;
+        rtx_wb_sync(wb, &d);
+        v[i] = mono_ms() - t0;
+    }
+    rtx_wb_stats(wb, &d, &st);
+    snprintf(extra, sizeof extra, "visited=%zu rebuilds=%zu fast_cell=%zu", st.visited, st.rebuilds,
+             st.fast_cell);
+    report(naggs ? "agg_heavy" : "edit_a", v, 40, extra);
+    if (naggs) {
+        RtxDoc_destroy(&d);
+        free(src);
+        return cc_ok();
+    }
+    /* formula edit: f1 of that row, `* @b` ↔ `* @c` */
+    off = find_off(&d, needle);
+    {
+        size_t k = find_off(&d, needle);
+        (void)k;
+    }
+    {
+        size_t base = off, f;
+        char buf[256];
+        size_t got = d.read_at(base, cc_slice_from_buffer(buf, sizeof buf - 1)) !>;
+        char *hit;
+        buf[got] = 0;
+        hit = strstr(buf, "=@a * @b");
+        if (!hit) return cc_err(CC_ERR_INVALID_ARG, "f1");
+        f = base + (size_t)(hit - buf) + 7;
+        for (i = 0; i < 40; i++) {
+            t0 = mono_ms();
+            d.replace(f, 1, cc_slice_from_buffer((char *)(i % 2 ? "b" : "c"), 1)) !>;
+            rtx_wb_sync(wb, &d);
+            v[i] = mono_ms() - t0;
+        }
+    }
+    rtx_wb_stats(wb, &d, &st);
+    snprintf(extra, sizeof extra, "visited=%zu regraphs=%zu", st.visited, st.regraphs);
+    report("edit_f", v, 40, extra);
+    /* prose keystroke */
+    off = find_off(&d, "Some prose");
+    for (i = 0; i < 40; i++) {
+        t0 = mono_ms();
+        if (i % 2 == 0) d.replace(off + 2, 0, cc_slice_from_buffer((char *)"x", 1)) !>;
+        else d.replace(off + 2, 1, cc_slice_empty()) !>;
+        rtx_wb_sync(wb, &d);
+        v[i] = mono_ms() - t0;
+    }
+    rtx_wb_stats(wb, &d, &st);
+    snprintf(extra, sizeof extra, "fast_prose=%zu rebuilds=%zu", st.fast_prose, st.rebuilds);
+    report("edit_prose", v, 40, extra);
+    /* a new row: structural */
+    off = find_off(&d, needle);
+    for (i = 0; i < 10; i++) {
+        static const char row[] = "| 0 | 1 | 2 | 3 | =@a | =@b | =@c |\n";
+        t0 = mono_ms();
+        if (i % 2 == 0) d.replace(off, 0, cc_slice_from_buffer((char *)row, sizeof row - 1)) !>;
+        else d.replace(off, sizeof row - 1, cc_slice_empty()) !>;
+        rtx_wb_sync(wb, &d);
+        v[i] = mono_ms() - t0;
+    }
+    rtx_wb_stats(wb, &d, &st);
+    snprintf(extra, sizeof extra, "rebuilds=%zu", st.rebuilds);
+    report("edit_row", v, 10, extra);
+    RtxDoc_destroy(&d);
+    free(src);
+    return cc_ok();
+}
+
+/* Keystrokes into a Big.a cell on screen: type + Rich relayout. */
+static void !>(CCError) keys(const char *path, const char *op) {
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    size_t off, line;
+    double v[200], t0;
+    int k;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    m.measure = cell_meas;
+    m.line_height = cell_lh;
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.rich = 1;
+    b.layout.wrap = 1;
+    rtx_line_scan_to(&b.doc.tree, b.doc.len()) !>;
+    off = find_off(&b.doc, "| 1501 | ");
+    if (off == (size_t)-1) off = find_off(&b.doc, "| 11 | ");
+    if (off == (size_t)-1) return cc_err(CC_ERR_INVALID_ARG, "row");
+    line = b.doc.line_of(off) !>;
+    b.top = line > 10 ? line - 10 : 0;
+    b.ensure_view(&m, PERF_W, PERF_VIS) !>;
+    off += 9; /* inside the a cell, after its first digit */
+    b.doc.caret = off;
+    b.doc.sel_anchor = off;
+    for (k = 0; k < 200; k++) {
+        t0 = mono_ms();
+        if (k % 2 == 0) b.type_cp((uint32_t)('1' + k % 9)) !>;
+        else b.backspace() !>;
+        b.after_edit(&m, PERF_W, PERF_VIS) !>;
+        v[k] = mono_ms() - t0;
+    }
+    report(op, v, 200, b.doc.derived ? "workbook=1" : "workbook=0");
+    return cc_ok();
+}
+
+int main(int argc, char **argv) {
+    int rows = argc > 1 ? atoi(argv[1]) : 3000;
+    char dir[] = "/tmp/wb_perf_XXXXXX";
+    char wbp[256], mdp[256];
+    size_t n = 0;
+    char *src;
+    @errhandler(CCError e) {
+        fprintf(stderr, "wb_perf: %s\n", e.message ? e.message : "error");
+        return 1;
+    }
+    if (rows < 10) rows = 10;
+    if (!mkdtemp(dir)) return 1;
+    engine(dir, rows, 0, "big") !>;
+    engine(dir, rows, 1000, "aggs") !>;
+    src = gen(rows, 0, &n);
+    snprintf(wbp, sizeof wbp, "%s/keys.wb.md", dir);
+    snprintf(mdp, sizeof mdp, "%s/keys.md", dir);
+    if (!src || !write_file(wbp, src, n) || !write_file(mdp, src, n)) return 1;
+    free(src);
+    keys(mdp, "key_md") !>;
+    keys(wbp, "key_wb") !>;
+    keys(mdp, "key_md") !>;
+    keys(wbp, "key_wb") !>;
+    unlink(wbp);
+    unlink(mdp);
+    {
+        char p1[256], p2[256];
+        snprintf(p1, sizeof p1, "%s/big.wb.md", dir);
+        snprintf(p2, sizeof p2, "%s/aggs.wb.md", dir);
+        unlink(p1);
+        unlink(p2);
+    }
+    rmdir(dir);
+    return 0;
+}

@@ -159,6 +159,7 @@ void cctext_style(RtxStyle st, int sel, int here) {
     if (st.strike) fputs("\x1b[9m", stdout);
     if (rtx_scope_is_underline(st.scope)) fputs("\x1b[4m", stdout);
     if (sel) fputs("\x1b[44m", stdout);
+    else if (st.hl) fputs(rtx_theme_hl().ansi, stdout);
     if (here) fputs("\x1b[7m", stdout);
 }
 
@@ -200,7 +201,7 @@ static void cctext_rb_puts(CctextRb *o, const char *s) {
 typedef struct {
     const char *fg;   /* theme SGR (ESC [ .. m), NULL = default colour */
     unsigned char bold, italic, ul, rev, strike;
-    unsigned char bg; /* 0 default, 1 selection, 2 pair */
+    unsigned char bg; /* 0 default, 1 selection, 2 pair, 3 `==highlight==` */
 } CctextSgr;
 
 typedef struct {
@@ -208,14 +209,14 @@ typedef struct {
     CctextSgr cur;
     /* Last style asked for: the delta is built only when it moves. */
     RtxScope scope;
-    int bold, italic, strike, sel, here, pair;
+    int bold, italic, strike, hl, sel, here, pair;
 } CctextPen;
 
 static void cctext_pen_init(CctextPen *pen, CctextRb *o) {
     *pen = (CctextPen){0};
     pen->o = o;
     pen->scope = (RtxScope)-1;
-    pen->bold = pen->italic = pen->strike = pen->sel = pen->here = pen->pair = -1;
+    pen->bold = pen->italic = pen->strike = pen->hl = pen->sel = pen->here = pen->pair = -1;
 }
 
 /* Parameter bytes of a one-sequence SGR string (ESC [ p m → p). */
@@ -241,12 +242,13 @@ static void cctext_pen_style(CctextPen *pen, RtxStyle st, int sel, int here,
     size_t n = 0;
     if (st.scope == pen->scope && (int)st.bold == pen->bold &&
         (int)st.italic == pen->italic && (int)st.strike == pen->strike &&
-        sel == pen->sel && here == pen->here && pair == pen->pair)
+        (int)st.hl == pen->hl && sel == pen->sel && here == pen->here && pair == pen->pair)
         return;
     pen->scope = st.scope;
     pen->bold = (int)st.bold;
     pen->italic = (int)st.italic;
     pen->strike = (int)st.strike;
+    pen->hl = (int)st.hl;
     pen->sel = sel;
     pen->here = here;
     pen->pair = pair;
@@ -259,7 +261,7 @@ static void cctext_pen_style(CctextPen *pen, RtxStyle st, int sel, int here,
     w.strike = st.strike;
     w.ul = rtx_scope_is_underline(st.scope) ? 1 : 0;
     w.rev = here ? 1 : 0;
-    w.bg = sel ? 1 : (pair ? 2 : 0);
+    w.bg = sel ? 1 : (pair ? 2 : (st.hl ? 3 : 0));
     if (w.fg != pen->cur.fg) {
         if (w.fg) cctext_sgr_param(buf, &n, w.fg);
         else cctext_sgr_lit(buf, &n, "39");
@@ -271,6 +273,7 @@ static void cctext_pen_style(CctextPen *pen, RtxStyle st, int sel, int here,
     if (w.bg != pen->cur.bg) {
         if (w.bg == 1) cctext_sgr_lit(buf, &n, "44");
         else if (w.bg == 2) cctext_sgr_param(buf, &n, rtx_theme_pair().ansi);
+        else if (w.bg == 3) cctext_sgr_param(buf, &n, rtx_theme_hl().ansi);
         else cctext_sgr_lit(buf, &n, "49");
     }
     if (w.rev != pen->cur.rev) cctext_sgr_lit(buf, &n, w.rev ? "7" : "27");
@@ -384,7 +387,7 @@ static size_t cctext_style_sig(RtxBuf *b, RtxStyleCur *c, size_t lo, size_t hi) 
     while (off < hi) {
         RtxStyle st = b->doc.style_cur(c, off);
         size_t nxt = b->doc.style_cur_next(c, off, hi);
-        size_t w = ((size_t)st.scope << 8) | ((size_t)st.strike << 3) |
+        size_t w = ((size_t)st.scope << 8) | ((size_t)st.hl << 4) | ((size_t)st.strike << 3) |
                    ((size_t)st.bold << 2) | ((size_t)st.italic << 1) | (size_t)st.mono;
         h = (h ^ w) * 1099511628211ull;
         h = (h ^ (nxt - lo)) * 1099511628211ull;
@@ -856,7 +859,7 @@ static size_t cctext_draw_md_row(RtxLayout *L, RtxDoc *d, size_t left_col,
         }
         llo = lo;
         lhi = hi;
-        if (L->wrap && hi > lo && lines && rc->nl) {
+        if (hi > lo && lines && rc->nl) {
             nl = rc->nl;
             if (wrap_li >= nl) {
                 /* Shorter than the tallest cell: blank, do not repeat last. */
@@ -1129,7 +1132,10 @@ void cctext_draw_pane(RtxBuf *b, const RtxUi *ui, int focused, int vis,
             size_t virt = 0;
             size_t line = row->line;
             size_t rlo = row->byte_start, rhi = row->byte_start + row->byte_len;
-            int show_ln = (idx == 0 || b->layout.rows.data[idx - 1].line != line);
+            /* A Rich table's delimiter line is a rule: no number (the GUI
+             * band is too short for one; both frontends match). */
+            int show_ln = (idx == 0 || b->layout.rows.data[idx - 1].line != line) &&
+                          !rtx_layout_md_sep_row(&b->layout, row);
             int end_at = b->doc.caret == row->byte_start + row->byte_len;
             int caret_end = rtx_ui_here(ui, focused, end_at) &&
                             cctext_row_hard_end(b, row);
@@ -3132,7 +3138,10 @@ static void cctext_paint_chrome(RtxWs *w, RtxUi *ui, RtxBuf *act, int rows,
     } else {
         char pos[48];
         char slide[40];
+        char wbs[256], wbs_b[512];
         rtx_status_line_pos(act, pos, sizeof(pos)) !>;
+        /* workbook: the cell / name at the caret, its value or error */
+        rtx_status_wb(act, wbs, sizeof(wbs));
         /* Marp deck: "  slide 3/12" (docs/slides.md). */
         slide[0] = 0;
         if (act && rtx_slides_status(&act->doc, act->doc.caret, slide + 2, sizeof(slide) - 2)) {
@@ -3140,11 +3149,12 @@ static void cctext_paint_chrome(RtxWs *w, RtxUi *ui, RtxBuf *act, int rows,
             slide[1] = ' ';
         }
         fprintf(stdout,
-                "\x1b[%d;1H\x1b[7m%s%s  %s%s%s%s%s  Esc help  g jump  f find  %s\x1b[0m\x1b[K",
+                "\x1b[%d;1H\x1b[7m%s%s  %s%s%s%s%s%s  Esc help  g jump  f find  %s\x1b[0m\x1b[K",
                 rows, star, path, pos, slide,
                 (act && act->layout.rich) ? "  rich" : "",
                 (act && act->layout.wrap) ? "  wrap" : "",
-                (act && act->unlock) ? "  unlock" : "", status);
+                (act && act->unlock) ? "  unlock" : "",
+                status[0] ? "" : cctext_safe(wbs, wbs_b, sizeof(wbs_b)), status);
     }
     g_hw_in_chrome = 0;
 }

@@ -16,7 +16,7 @@ CC_TARGET_INCLUDE rtx_hex .
 CC_TARGET rtx_grid obj core/grid.ccs
 CC_TARGET_INCLUDE rtx_grid .
 
-CC_TARGET rtx_md_table obj core/md_table.ccs core/md_block.ccs
+CC_TARGET rtx_md_table obj core/md_table.ccs core/md_block.ccs core/md_refs.ccs
 CC_TARGET_INCLUDE rtx_md_table .
 
 CC_TARGET rtx_browse obj core/browse.ccs
@@ -31,7 +31,7 @@ CC_TARGET rtx_batch obj core/batch.ccs
 CC_TARGET_INCLUDE rtx_batch .
 CC_TARGET_DEPS rtx_batch rtx_document rtx_workspace rtx_piece_tree rtx_nav rtx_find
 
-CC_TARGET rtx_document obj core/document.ccs core/slides.ccs
+CC_TARGET rtx_document obj core/document.ccs core/slides.ccs core/wb.ccs
 CC_TARGET_INCLUDE rtx_document .
 CC_TARGET_DEPS rtx_document rtx_piece_tree rtx_nav rtx_scope rtx_rx rtx_md_table
 
@@ -118,3 +118,15 @@ CC_TARGET_DEPS scroll_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_bro
 CC_TARGET rx_perf exe tests/rx_perf.ccs
 CC_TARGET_INCLUDE rx_perf .
 CC_TARGET_DEPS rx_perf rtx_rx
+
+CC_TARGET wb_smoke exe tests/wb_smoke.ccs
+CC_TARGET_INCLUDE wb_smoke .
+CC_TARGET_DEPS wb_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout rtx_rx rtx_page_store
+
+CC_TARGET wb_perf exe tests/wb_perf.ccs
+CC_TARGET_INCLUDE wb_perf .
+CC_TARGET_DEPS wb_perf rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui rtx_ui_help
+
+CC_TARGET rx_conform exe tests/rx_conform.ccs
+CC_TARGET_INCLUDE rx_conform .
+CC_TARGET_DEPS rx_conform rtx_rx

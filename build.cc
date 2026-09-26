@@ -30,7 +30,7 @@ CC_TARGET_INCLUDE rtx_hex .
 CC_TARGET rtx_grid obj core/grid.ccs
 CC_TARGET_INCLUDE rtx_grid .
 
-CC_TARGET rtx_md_table obj core/md_table.ccs core/md_block.ccs
+CC_TARGET rtx_md_table obj core/md_table.ccs core/md_block.ccs core/md_refs.ccs
 CC_TARGET_INCLUDE rtx_md_table .
 
 CC_TARGET rtx_browse obj core/browse.ccs
@@ -45,7 +45,7 @@ CC_TARGET rtx_batch obj core/batch.ccs
 CC_TARGET_INCLUDE rtx_batch .
 CC_TARGET_DEPS rtx_batch rtx_document rtx_workspace rtx_piece_tree rtx_nav rtx_find
 
-CC_TARGET rtx_document obj core/document.ccs core/slides.ccs
+CC_TARGET rtx_document obj core/document.ccs core/slides.ccs core/wb.ccs
 CC_TARGET_INCLUDE rtx_document .
 CC_TARGET_DEPS rtx_document rtx_piece_tree rtx_nav rtx_scope rtx_rx rtx_md_table
 

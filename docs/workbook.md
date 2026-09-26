@@ -1,6 +1,6 @@
 # Workbooks: named tables, dependency recalc, giant data
 
-**Status: draft design — not implemented.** Open questions in §9.
+**Status: W0 (Names) landed** — see [W0 as built](#w0-as-built): embedded named tables, `params` / `calc`, the formula language, the DAG with Tarjan and cutoff recalc on edit deltas, values in the Rich lens, rename. W1–W5 are design. Open questions in §9 (decisions for W0 there).
 
 TODO.md: *"spreadsheets / cell references — NOT normal reference — named,
 and dependencies based."* This note answers that. A **workbook** is a
@@ -499,9 +499,9 @@ like the md_view wedges.
 
 1. ~~Rename over many sites~~ — decided: hist *groups* (one command,
    one undo step; see DESIGN [Edit groups](../DESIGN.md#edit-groups)).
-2. Should embedded-table type inference be locked into the text
-   (`types:` written on first bind) so that a later value cannot
-   re-type a column silently?
+2. ~~Should embedded-table type inference be locked into the text?~~ —
+   W0: no; re-inferred per edit, a retype surfaces as a dependent's
+   `#type` (see [W0 as built](#w0-as-built)).
 3. Should leaf size be per-table (wide rows need bigger leaves) or
    fixed at `RTX_PAGE_SIZE`?
 4. Is TSV/pipe parity enough, or are fixed-width and JSONL sources in
@@ -536,6 +536,196 @@ like the md_view wedges.
 - **Named, static, deterministic dependencies**: no A1, no volatiles,
   exact arithmetic, so every value is reproducible from bytes. All of
   it is local, with a few MB of RSS over the page cache.
+
+## W0 as built
+
+W0 (Names) landed: embedded tables, `params` / `calc`, the formula
+language, the dependency graph, incremental recalc, the Rich lens and
+rename. W1–W5 (external tables, the counted B+tree index, materialized
+aggregates, views) are not built. Code: `core/wb.cch` / `core/wb.ccs`
+(the engine, linked into the document target), the `RtxDerived` hook on
+`RtxDoc` (`core/document.cch`), the layout's hint path
+(`core/layout.ccs`), the status fragment and commands (`core/ui.cch`).
+
+**Zero cost when unused.** `RtxDoc.derived` is set only by
+`RtxDoc_from_path` / `from_base` for a `*.wb.md` path (or an explicit
+`rtx_wb_attach`, as the tests do). Every hook site — the edit note in
+`rtx_doc_span_note`, `has_marks`, `mark_edges`, the layout's
+`hidden_to` / `hint_vis` / `reveal` and the edit patch — is one NULL
+compare on any other file (`wb_smoke` asserts a `.md` and the same bytes
+under another name get no hook).
+
+**File format.**
+
+- A sheet is an ATX H1 (`# Revenue`); text before the first H1 is an
+  unnamed sheet. Setext headings are not sheets.
+- `Table: Name` on its own line, then (blank lines allowed) a GFM table:
+  a **named table**. Header cells are the column names (`` `list price` ``
+  keeps spaces; backticks are dropped). A caption name may be backticked
+  too (`` Table: `Price List` ``). A GFM table with no caption is plain
+  Markdown and not part of the workbook. Columns stop at the lens's 16;
+  a table over `RTX_WB_ROWS_MAX` (10 000) rows is refused: references to
+  it are `#ref(… W1 indexes it)`.
+- A body cell whose trimmed text starts with `=` is a formula; so is a
+  code span `` `=…` `` (GitHub shows the formula as code). Anything else
+  is a literal.
+- ```` ```params ```` and ```` ```calc ```` fences hold `name = expr`
+  lines; `#` starts a comment; other lines are inert. Params are global,
+  calc names belong to their sheet. A ```` ```table ```` fence (an
+  external table) is reserved for W1: it is structure, not a table yet.
+- Nothing is ever written into the file; values live in the derived
+  state and are rebuilt from bytes.
+
+**Types.** A column's type is inferred from its literal cells (formula
+cells do not vote): `int` ⊂ `dec(p)` (p = the most decimals seen) ⊂
+`float` ⊂ `text`; `true` / `false` is `bool`, `YYYY-MM-DD` is `date`; a
+column mixing numbers, dates and bools is `text`, and so is an empty one.
+The counts per kind are kept per column, so an edit re-infers in O(1)
+and re-types the column's literals only when the type moves.
+Arithmetic: `int` and `dec` are exact (i128 inside, `#num` on
+overflow); `*` adds scales (rounded half away from zero past 12); `/` is
+`float` (`#div0` on zero); anything with a `float` is `float`. `date ±
+int` days, `date - date` is days, `Nd` is N days. `&` concatenates as
+text. A blank cell is `null`: arithmetic and comparisons with `null` give
+`null`, aggregates skip it, `where` treats it as false,
+`coalesce(a, b, …)` replaces it. Comparing different kinds is `#type`.
+
+**Names.** Inside an aggregate's argument / `where`, or a lookup's
+condition, a bare name is first a column of the table iterated; then a
+calc name of the formula's sheet, a param, a table, and a sheet (only as
+`Sheet.name`). `@col` is this row's cell (cells only); `T[@col]` is the
+same written with the table. `T.col` is a column: a value only while
+iterating `T`, else `#type(… aggregate it …)`. Names are case-sensitive;
+two names in one scope that differ only in case (or repeat) are both
+`#dup`.
+
+**Formulas.** `sum` `count` `avg` `min` `max` `distinct` `any` `all`
+over `T.col` or an expression of it, with an optional `where`
+(`sum(Sales.amount where region = @region)`, `count(Sales where …)`,
+`count(T)`); the table iterated is the first `T.col` / `T` in the
+argument. `sum?(…)` (any aggregate + `?`) skips errors. `T[cond].col` is
+a keyed lookup: 0 rows is `null`, 2+ rows `#dup` unless
+`first(T[cond]).col`. `if c then a else b` (also `if(c, a, b)`),
+`and` / `or` / `not`, `= != <> < <= > >=`, `+ - * / %`, and `abs`
+`round(x[, n])` `floor` `ceil` `coalesce` `len` `lower` `upper`
+`iserror` `iferror(x, y)` and `min` / `max` of two or more values.
+`group` / `join` / `sort` / `top` parse to `#parse(… W2 / W4)`. No
+volatile functions: time is a param (`asof`).
+
+**Errors are values** with provenance: `#div0(division by zero in
+Targets.gap[2])`, `#name(unknown name nope)`, `#ref(T has no column zz)`,
+`#type(text + int in T.f[4])`, `#dup(Orders[...] matches rows 1 and 2
+(first(...) takes one) in South.many)`, `#num`, `#parse(unexpected end
+at column 5)`, `#cycle(Loop.a → Loop.b → Loop.c → Loop.a)`. An error
+operand propagates unchanged, so a dependent shows where it came from.
+The Rich lens paints the code (`#div0`); the status bar shows the
+message.
+
+**Graph and recalc.** Nodes are body cells, one node per column, and
+calc / param names. A formula's edges come from binding (sorted, unique
+node ids); a column node depends on each of its cells (implicit edges,
+no storage). Tarjan SCC over those edges (iterative) gives the order —
+dependencies first — and the cycles: every member of an SCC of two or
+more nodes, or of a self-loop, is `#cycle(path)`, the path a shortest
+walk from the SCC's root back to it. Recalc is a min-heap on that order
+seeded with the changed nodes; a node whose new value equals the old one
+(same kind, scale, bits) does not push its dependents. The order is
+rebuilt (`regraph`, O(nodes + edges)) only when a formula's edges change.
+
+**Edits are deltas.** The hook notes every replace (the same union as the
+edit span). The next query syncs:
+
+- **cell**: the union lies inside one body cell (between its pipes): that
+  cell's bytes are re-read, rejected if a pipe, newline or trailing
+  escape appeared; its literal is re-typed or its formula re-parsed and
+  re-bound; regraph only if the edges changed; then the heap recalc.
+- **line**: the union lies inside one calc / params line and the line
+  still defines the same name: re-parse and re-bind that expression.
+- **prose**: the union touches no block (a named table with its caption,
+  a params / calc fence, another fence's opener or closer, an H1, a
+  dangling caption) nor the line before or after one, and the new lines
+  start no fence, H1 or caption: offsets shift, nothing recalcs.
+- anything else — a new row, a header or separator edit, a new name, a
+  fence — reparses the workbook (capped at `RTX_WB_MAX`, 8 MiB; over it
+  values are off and the status says so). So does garbage from many
+  incremental edits (model / value arenas past 16 MiB or 2× the build).
+
+**Rich lens.** A formula span (a cell's trimmed `=…`, a calc
+expression that is not a plain literal) is a hint whose stand-in is the
+value: `hidden_to` / `hint_vis` read `RtxDoc_derived_at`, so table
+widths, paint, `x_of` and hit follow in both frontends, and span edges
+feed the hide cursor. The caret (or anchor) in a formula reveals that
+formula alone — not the fence or code span around it — so the calc lines
+beside it keep their values. A recalc's changed values relay their lines
+in the edit patch and re-measure their tables; a reparse refills. In a
+terminal a table cell that fits by what it paints stays one line.
+
+**UI.** The status bar (both frontends) describes the workbook element
+at the caret: `Targets.gap[2] = -54.40  (dec; 2 inputs, 1 dependent)`,
+an error with its message, a column (`column Sales.amount (dec)`) or a
+table. `F2` / **Workbook: Rename** (palette, Edit menu) opens the jump
+prompt with the table / column / name at the caret — its definition or
+any reference — and Enter renames it. **Workbook: Recalculate** reparses
+and reports tables, formulas, nodes, cycles, errors and the time. No
+formula bar yet (W4); no hover (the status is the message).
+
+**Rename.** The definition (caption name, header cell, calc / param
+name) plus every reference token the binder recorded (spans relative to
+each formula), written as one `RtxDoc_replace_batch` group — one undo
+step. A name that is not an identifier is backticked in formulas and the
+caption. Refused, with nothing edited: an empty name, `` ` | # " `` or a
+newline, the same name, or a name taken in its scope (another table or
+sheet; another column of the table; another name of the sheet, or a
+param). Capture across scopes (a param renamed to a column a `where`
+reads) is caught after the edit: every node's bindings and values must
+be unchanged, else the group is undone and the rename refused.
+
+**Decisions on §9 and on what the design left open.**
+
+- *Q2 (lock inferred types into the text):* no. Types are re-inferred on
+  every edit (O(1)); a retype that breaks a dependent shows as that
+  dependent's `#type`, never a silent coercion. A `types:` line lands
+  with W1's schema syntax.
+- *Q3–Q5:* not reached (W1 / W5). W0 persists nothing: values are
+  recomputed at open (43 ms for 3000 rows / 9 000 formulas).
+- *Division* is `float`; `dec` stays exact for `+ - *`.
+- *Lookups* with no row are `null` (the design says "0 or 1 row").
+- *Params are global, calc names per sheet*, resolved as above.
+- *Cells hold formulas two ways* (`=x`, `` `=x` ``); both paint values.
+
+**Tests.** `wb_smoke` (in `@smoke` / `@smoke_inline`): four fixtures in
+`testdata/wb/` — `revenue` (the §2 example, embedded), `checks` (types,
+errors, the scalar language), `cycles`, `scopes` (sheets, params,
+qualified names, lookups, `first`, `#dup`, backticked names) — each
+asserts every cell and name against its `.expect`; a counter test (one
+cell edit reaches 19 nodes and visits exactly 15: cutoff stops at the
+unchanged ones); the fast paths (cell, retype, formula, prose, calc line
+with a cycle and its undo, a new row); the Rich lens (widths from values,
+a recalc in another table patched, reveal); rename round trips (column,
+table with a backticked name, a name from a reference, refusals, a
+capture undone); and a 1500-step random-edit property test comparing the
+incremental workbook with one built from scratch after every step.
+`wb_perf` times the engine and keystrokes.
+
+**Perf** (`wb_perf`, release, x86-64 shared host, p50): a workbook of
+3000 rows × 7 columns with 9 000 row formulas and 10 calc aggregates
+(185 KB, 21 018 nodes, 39 014 edges).
+
+| Op | Time | Notes |
+|---|---|---|
+| open (parse, bind, Tarjan, full calc) | 43 ms | once per open |
+| one literal edit → recalc | 0.66 ms | visits 11 nodes; the 10 aggregates rescan 3000 rows (no MAs in W0) |
+| one formula edit (edges change) | 1.9 ms | re-bind + regraph |
+| one prose keystroke | 0.003 ms | offset shift |
+| a new row (structural) | 7.8 ms | reparse |
+| literal edit, 1000 aggregates over the column | 47 ms | each aggregate rescans: W2's materialized aggregates remove this |
+| keystroke in a table cell, type + Rich relayout | 1.93–2.10 ms | the same bytes as a plain `.md`: 1.25–1.28 ms |
+
+**Limits (W0).** Aggregates rescan their table (no leaf partials); a
+where-filter per row of another table is O(rows²) on edit. Structural
+edits reparse the whole workbook. Values are not colored by kind or
+error in the lens. Sheet rename, `types:`, `uses` imports, formula bar
+and hover are later phases.
 
 ## Locks
 

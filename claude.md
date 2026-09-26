@@ -160,3 +160,23 @@ APFS rejects file names that are not valid UTF-8 (`EILSEQ`), so
 `term_safe_smoke` skips that fixture there. macOS `TMPDIR` is under
 `/var` → `/private/var`; compare against `realpath` output
 (`proj_smoke` canonicalizes its root).
+
+## Static functions in a face's file-scope initializer (2026-09-26)
+
+A file-scope `static const RtxCmdDef rows[] = { …, my_static_fn }` in a
+`.cch` face whose `my_static_fn` is `static` in the same face fails the
+host compile: `'my_static_fn' undeclared here (not in a function)` — the
+lowered header keeps the table but not the static bodies. Make the
+functions non-static (the face's owner `.ccs` links them) and fill the
+row inside a function (`rtx_ui_wb_register`).
+
+## No libm in the link (2026-09-26)
+
+Targets link without `-lm`: `floor` / `ceil` / `round` / `fmod` are
+undefined references at link time (`fabs`, `isnan`, `isfinite` are
+builtins and fine). `core/wb.ccs` carries its own `wb_floor` & co.
+
+`RtxDoc_from_buffer` keeps the slice as the original buffer (no copy)
+and refuses an untracked one (`cc_slice_from_buffer` → `untracked
+buffer`): tests clone into an arena that outlives the doc
+(`src.clone_into(a)`, as edit_group_smoke does).

@@ -1258,6 +1258,57 @@ def case_md_autopair(exe, tmp):
     check(got == b"f(x", "txt: no pairs", repr(got))
 
 
+def case_md_highlight(exe, tmp):
+    """`==mark==`: Rich hides the markers and paints the text on the
+    highlight background; Source shows the markers on it too; a shortcut
+    reference `[ref]` with a definition is a link in Rich."""
+    if pyte is None:
+        print("skip: md highlight (no pyte)")
+        return
+    body = b"a ==mark== b [ref] c\n\n[ref]: https://x.io\n"
+    t, _ = open_tui(exe, tmp, "hl.md", body)
+    res = {}
+    try:
+        txt = screen_text(t) or ""
+        if "rich" not in txt.split("\n")[-1]:
+            t.send(b"\x04", 0.4)  # Ctrl-D: Rich on
+        t.send(b"\x1b[B\x1b[B", 0.3)  # caret off the line: every mark hidden
+        cells = screen_cells(t)
+        line0 = (screen_text(t) or "").split("\n")[0]
+        res["rich"] = (line0, cells[0][:14] if cells else None)
+        t.send(b"\x04", 0.4)  # Source
+        t.send(b"\x1b[A\x1b[A", 0.3)
+        cells = screen_cells(t)
+        lines = (screen_text(t) or "").split("\n")
+        y = next((i for i, l in enumerate(lines) if "==mark" in l), 0)
+        res["src"] = (lines[y] if lines else "", cells[y][:16] if cells else None)
+        t.send(b"\x11", 0.2)
+        t.send(b"q", 0.2)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+    def bg_at(row, text, needle, k=0):
+        at = text.find(needle)
+        if at < 0 or row is None or at + k >= len(row):
+            return None
+        return row[at + k][2]
+
+    line, row = res["rich"]
+    gut = len(line) - len(line.lstrip(" 0123456789"))
+    body_txt = line[gut:] if gut else line
+    check(body_txt.startswith("a mark b ref c"),
+          "rich: ==mark== and [ref] markers hidden", repr(line))
+    mark_bg = bg_at(row, line, "mark")
+    a_bg = bg_at(row, line, "a mark")
+    check(mark_bg not in (None, "default") and a_bg == "default",
+          "rich: ==mark== on the highlight background", repr((mark_bg, a_bg)))
+    line, row = res["src"]
+    eq_bg = bg_at(row, line, "==mark")
+    check("==mark==" in line and eq_bg not in (None, "default"),
+          "source: == markers shown, styled with the mark", repr((line, eq_bg)))
+
+
 def case_md_smart_paste(exe, tmp):
     left4 = b"\x1b[1;2D" * 4
     paste = b"\x1b[200~https://x.io\x1b[201~"
@@ -1284,6 +1335,97 @@ def case_md_table_col_delete(exe, tmp):
     got, _ = edit_session(exe, tmp, to_x + [b"\x1b.", b"x", b"\x1a"], body=TBL,
                           name="tblu.md")
     check(got == TBL, "md: column delete is one undo step", repr(got))
+
+
+FIT_CELLS = [
+    ("`palette.open`", "Opens the command palette from anywhere: every command "
+     "with its **keys**, fuzzy matched as you type, and runs the one you pick"),
+    ("`workspace.search_next_result_in_project`", "Steps to the next hit of "
+     "the project search and opens its file at that line"),
+    ("`go.line`", "short"),
+]
+
+
+def fit_expected(s):
+    """Cell text as Rich paints it: backticks and ** hidden."""
+    return s.replace("`", "").replace("**", "")
+
+
+def fit_records(t):
+    """Table records on screen: [[col0 text, col1 text], ...]. A record
+    starts on the screen row with a gutter number; its wrap lines follow
+    (rails `│`, gutter blank). Also returns the table's screen rows."""
+    recs, rows = [], []
+    txt = (screen_text(t) or "").split("\n")
+    for line in txt[:-1]:
+        i = line.find("│")
+        if i < 0 or "├" in line:
+            continue
+        rows.append(line)
+        gutter, body = line[:i], line[i:]
+        parts = body.split("│")[1:-1]
+        if gutter.strip():
+            recs.append([[] for _ in parts])
+        if not recs:
+            continue
+        for c, p in enumerate(parts[:len(recs[-1])]):
+            if p.strip():
+                recs[-1][c].append(p.strip())
+    return recs, rows
+
+
+def case_md_table_fit(exe, tmp):
+    """An 80-column terminal, Rich, a 2-column table with long cells, soft
+    wrap off (Alt-M) and on (the default): the table fits the pane — every
+    table row ends with its right rail inside 80 columns — the cells wrap,
+    and all the cell text is on screen (hidden marks drop out)."""
+    if pyte is None:
+        print("skip: md table fit (no pyte)")
+        return
+    body = b"# Fit\n\n| command | id |\n|---|---|\n"
+    for a, b in FIT_CELLS:
+        body += ("| %s | %s |\n" % (a, b)).encode()
+    body += b"\nafter the table\n"
+    for wrap, tag in ((0, "wrap off"), (1, "wrap on")):
+        t, _ = open_tui(exe, tmp, "fit_%d.md" % wrap, body)
+        try:
+            txt = screen_text(t) or ""
+            status = txt.split("\n")[-1]
+            if "rich" not in status:
+                t.send(b"\x04", 0.4)  # Ctrl-D: Rich on
+            if (" unwr" in status) == bool(wrap):
+                t.send(b"\x1bm", 0.4)  # Alt-M: wrap on / off
+            status = (screen_text(t) or "").split("\n")[-1]
+            recs, rows = fit_records(t)
+            t.send(b"\x11", 0.2)
+            t.send(b"q", 0.2)
+            t.wait_exit(5.0)
+        finally:
+            t.kill()
+        check((" unwr" in status) != bool(wrap),
+              "md table fit (%s): the pane is in that mode" % tag, status)
+        check(len(recs) == 1 + len(FIT_CELLS),
+              "md table fit (%s): header and every record on screen" % tag,
+              repr(rows))
+        ends = [r.rstrip() for r in rows]
+        check(bool(ends) and all(e.endswith("│") and len(e) <= COLS for e in ends),
+              "md table fit (%s): every table row fits 80 columns" % tag,
+              repr(ends))
+        check(any(len(r) > 1 and any(len(c) > 1 for c in r) for r in recs),
+              "md table fit (%s): long cells wrap" % tag, repr(recs))
+        ok, why = True, ""
+        for k, (a, b) in enumerate(FIT_CELLS):
+            if k + 1 >= len(recs):
+                ok, why = False, "record %d missing" % k
+                break
+            got0 = "".join(recs[k + 1][0])
+            got1 = " ".join(recs[k + 1][1]) if len(recs[k + 1]) > 1 else ""
+            if got0 != fit_expected(a):
+                ok, why = False, "col 0 %r != %r" % (got0, fit_expected(a))
+            want1 = fit_expected(b).split()
+            if got1.split() != want1 and got1.replace(" ", "") != "".join(want1):
+                ok, why = False, "col 1 %r != %r" % (got1, fit_expected(b))
+        check(ok, "md table fit (%s): all cell text is on screen" % tag, why)
 
 
 # Command palette and keymap (README: Keys and commands).
@@ -1797,8 +1939,10 @@ CASES = {
     "md_enter_empty_exits": case_md_enter_empty_exits,
     "md_tab_indent": case_md_tab_indent,
     "md_autopair": case_md_autopair,
+    "md_highlight": case_md_highlight,
     "md_smart_paste": case_md_smart_paste,
     "md_table_col_delete": case_md_table_col_delete,
+    "md_table_fit": case_md_table_fit,
     "palette_run": case_palette_run,
     "palette_chords": case_palette_chords,
     "keymap_file": case_keymap_file,

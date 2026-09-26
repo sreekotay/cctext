@@ -1,0 +1,164 @@
+#!ccc cch
+/*
+ * Markdown link reference definitions: the label → definition map that
+ * resolves shortcut `[foo]` (and follows `[foo][]` / `[foo][bar]`).
+ *
+ * Entries are the block pass's own `[label]: dest` lines (md_block.cch,
+ * RTX_MDB_S_REF_LABEL), keyed by the line's document offset, with the
+ * label's CommonMark normalization hashed (case-folded, whitespace runs
+ * collapsed, trimmed). Nothing here reads a document. Who stages them:
+ *
+ *  - a document the lex covers whole (<= RTX_HL_FULL_MAX): the Markdown
+ *    lex walk stages the definitions of the lines it classified and
+ *    commits them over the range it lexed (an edit relexes to where the
+ *    lex converges, so the range is exactly what can have changed);
+ *  - a larger one up to RTX_MDREF_SWEEP_MAX: a **sweep** — the block pass
+ *    alone, classify only, from the first byte — with its state kept every
+ *    RTX_MDREF_CK_STRIDE bytes. An edit marks a dirty range; the next
+ *    settle re-sweeps from the checkpoint before it to the first
+ *    checkpoint past it whose state is unchanged (a keystroke: a few KiB;
+ *    a fence opened: to its close or the end, once);
+ *  - past that: the lexed windows (a definition no window has lexed is
+ *    unknown: `[foo]` stays text — leftover, never a wrong link).
+ *
+ * An edit shifts entries and puts the ones whose line it touched in limbo:
+ * still counted (the relex that follows the edit resolves what it planted
+ * before with them), replaced by the relex / re-sweep that covers their
+ * line, dropped at the settle if none did. A keystroke costs one pass over
+ * the entries, never a scan of the file.
+ *
+ * `seen` is a 4096-bit filter of the labels the lex asked about (resolved
+ * or not). A label that appears or disappears (count 0 <-> 1) is pending
+ * until `settle`; when its bit is seen the map is `stale`: runs planted
+ * from the old answer are wrong and the caller relexes. A label nobody
+ * references never costs a relex.
+ *
+ * Bodies in md_refs.ccs (linked with md_block.ccs in rtx_md_table).
+ */
+#ifndef RTX_MD_REFS_H
+#define RTX_MD_REFS_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "md_block.cch"
+
+typedef struct {
+    size_t line;   /* document offset of the definition's line start */
+    uint32_t llen; /* line bytes, no newline */
+    uint32_t dlo;  /* destination bytes relative to `line` (`<…>` kept) */
+    uint32_t dhi;
+    uint32_t limbo; /* an edit touched its line: counted until the relex /
+                     * re-sweep over it (or the settle) decides */
+    uint64_t h;    /* rtx_mdref_hash of the label, never 0 */
+} RtxMdRef;
+
+/* Sweep checkpoint: the block state before the line at `off`. */
+typedef struct {
+    size_t off;
+    RtxMdb st;
+} RtxMdRefCk;
+
+#define RTX_MDREF_SEEN_WORDS 64 /* 4096 bits */
+#define RTX_MDREF_PEND 128
+/* The sweep runs on documents over RTX_HL_FULL_MAX up to this size. */
+#define RTX_MDREF_SWEEP_MAX (4u << 20)
+#define RTX_MDREF_CK_STRIDE 4096
+
+typedef struct {
+    RtxMdRef *e;        /* by line */
+    size_t n, cap;
+    uint64_t *key;      /* open addressing: label hash, 0 = empty slot */
+    uint32_t *cnt;      /* live definitions of that label (0 = tombstone) */
+    size_t tcap, tused;
+    RtxMdRef *stage;    /* one walk's (or sweep's) finds, by line */
+    size_t sn, scap;
+    RtxMdRefCk *ck;     /* sweep checkpoints, by offset (sweep_on) */
+    size_t nck, ckcap;
+    size_t nlimbo;      /* entries in limbo */
+    size_t dirty_lo;    /* edits since the last sweep: [lo, hi) now */
+    size_t dirty_hi;
+    uint64_t seen[RTX_MDREF_SEEN_WORDS];
+    uint64_t pend[RTX_MDREF_PEND];
+    unsigned char was[RTX_MDREF_PEND];
+    unsigned npend;
+    unsigned char dirty;
+    unsigned char over;     /* pend overflowed: settle says stale */
+    unsigned char stale;    /* a seen label came or went: relex */
+    unsigned char swept;    /* the sweep was tried at this size */
+    unsigned char sweep_on; /* the sweep owns the entries (checkpoints live) */
+    unsigned char oom;      /* an allocation failed */
+} RtxMdRefs;
+
+/* CommonMark label normalization, hashed: trim, collapse runs of
+ * space / tab / CR / LF to one space, fold case (ASCII, Latin-1, Latin
+ * Extended-A pairs, Greek, Cyrillic; other scripts compare as bytes).
+ * 0 for a blank label. */
+uint64_t rtx_mdref_hash(const char *s, size_t n);
+
+int rtx_mdref_has(const RtxMdRefs *m, uint64_t h);
+/* Staged by the walk in progress (a definition below its reference in the
+ * same lex); only a short stage is searched — past it the settle relexes. */
+int rtx_mdref_staged(const RtxMdRefs *m, uint64_t h);
+/* First definition of the label in document order (CommonMark: the first
+ * wins), NULL when none. */
+const RtxMdRef *rtx_mdref_get(const RtxMdRefs *m, uint64_t h);
+/* The lex asked about this label. */
+void rtx_mdref_see(RtxMdRefs *m, uint64_t h);
+int rtx_mdref_seen(const RtxMdRefs *m, uint64_t h);
+
+/* Document edit (old [at, at + erased) -> inserted bytes): entries past it
+ * shift; one whose line (newline included) the edit touches goes to limbo.
+ * Sweep checkpoints shift the same way; the edit joins `dirty`. */
+void rtx_mdref_shift(RtxMdRefs *m, size_t at, size_t erased, size_t inserted);
+
+/* Stage: a walk's finds, then commit them over [lo, hi) (entries with a
+ * line there are replaced). An add at or before the last staged line
+ * drops those first (a walk that rewound classifies them again). */
+void rtx_mdref_stage_reset(RtxMdRefs *m);
+void rtx_mdref_stage_add(RtxMdRefs *m, const RtxMdRef *r);
+void rtx_mdref_commit(RtxMdRefs *m, size_t lo, size_t hi);
+/* The definitions of one classified line (buffer offsets; the line starts
+ * at buf[line], `base` is buf[0]'s document offset) → stage. */
+void rtx_mdref_stage_line(RtxMdRefs *m, const RtxMdbLine *L, const char *buf,
+                          size_t line, size_t eol, size_t base);
+
+/* ---- the sweep ----
+ * begin (full: from the first byte, dropping every checkpoint; else from
+ * the last checkpoint at or before the dirty range), feed whole lines in
+ * document order from `sw.at`, end. Feed returns the bytes it consumed
+ * (whole lines, or all when `last`: buf ends the document) and sets
+ * `done` when the state met an unchanged checkpoint past the dirty range. */
+typedef struct {
+    RtxMdb st;
+    size_t start;     /* first line swept */
+    size_t at;        /* next line to feed (document offset) */
+    size_t last_ck;   /* offset of the last checkpoint planted */
+    size_t j;         /* old checkpoint cursor */
+    size_t stop;      /* converged here (done) */
+    RtxMdRefCk *nk;   /* checkpoints planted by this sweep */
+    size_t nn, ncap;
+    int done;
+    int full;
+} RtxMdRefSweep;
+
+/* 0 when nothing is dirty (no sweep needed). */
+int rtx_mdref_sweep_begin(RtxMdRefs *m, RtxMdRefSweep *s, int full);
+size_t rtx_mdref_sweep_feed(RtxMdRefs *m, RtxMdRefSweep *s, const char *buf, size_t n,
+                            int last);
+/* Commit the staged definitions and splice the checkpoints over
+ * [start, stop) (`len`: the document's length when the feed ran out). */
+void rtx_mdref_sweep_end(RtxMdRefs *m, RtxMdRefSweep *s, size_t len);
+/* Drop the sweep (checkpoints, dirty); the entries stay. */
+void rtx_mdref_sweep_off(RtxMdRefs *m);
+
+/* Limbo entries go, then pending label changes -> `stale` (returned). */
+int rtx_mdref_settle(RtxMdRefs *m);
+/* Forget what the lex asked (a full relex asks again) and `stale`. */
+void rtx_mdref_relexed(RtxMdRefs *m);
+void rtx_mdref_free(RtxMdRefs *m);
+
+/* The definition `r` on its line bytes `s` (n bytes): destination
+ * [*lo, *hi) relative to the line, `<>` stripped. 0 if none. */
+int rtx_mdref_dest(const RtxMdRef *r, const char *s, size_t n, size_t *lo, size_t *hi);
+
+#endif

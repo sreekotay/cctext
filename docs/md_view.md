@@ -35,8 +35,11 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | Inline spans stay on one line: `"cctext": {"inline": true}` drops an unclosed span at EOL (opener is text, CommonMark unmatched delimiter); `"flank": true` rejects an opener before whitespace and a closer after it (`2 * 3` is plain). Bold / italic / code declare `inline`; bold / italic add `flank`. Under the Markdown block pass the **paragraph** bounds them instead (multi-line emphasis / code spans), and flanking is CommonMark's on the whole delimiter run | `RtxTmRule.inl` / `flank`, `rtx_tm_span_advance`, `markdown.tmLanguage.json` | done |
 | Markdown block pass: a windowed, checkpointed CommonMark / GFM block scan (containers, fences, indented code, ATX / setext, thematic breaks, HTML blocks 1-7, `$$` math, front matter, tables, definitions) plants the block runs; the grammar's inline rules lex paragraph / heading / cell content (see **Markdown block pass**) | `core/md_block.ccs`, `rtx_md_lex_walk`, `"blocks": "commonmark"` | done |
 | Fence + injection: `cctext.info` + `scopeName`; guest lex at depth 2; `RTX_RUN_INJECT`; nested `#italic` / `#bold` / `#code`; Python `"""` / `'''`; closer always first; `style_at` walk-back does not stop at a sibling | `RtxTmRule.info` / `embed_scope`, `rtx_tm_rt_for_scope`, `rtx_tm_lex`, `rtx_doc_run_first` | done; HTML `<script>`/`<style>` `RE_SPAN` landed |
+| `==highlight==`: a pair with the `hl` style bit (default map `markup.highlight`, or sidecar `"highlight": true`); TUI paints a background (`rtx_theme_hl`, SGR 48;5;94), GUI a rect under the glyph (pane, table cell, preview); Rich hides the `==` like any pair hint, Source paints them with the mark | `RtxStyle.hl`, `RTX_SBIT_HL`, `frontend/cctext_draw.ccs`, `gui_draw.ccs` | done |
+| Reference links: shortcut `[foo]` / `![foo]` resolve through the document's definitions (a label → definition map, not a lex of the file); `[foo][]` / `[x][foo]` / `[foo]` follow to the definition's URL | `core/md_refs.ccs`, `rtx_md_shortcut`, `RtxDoc_link_target` / `RtxDoc_ref_target` (see **Reference definitions**) | done |
+| Editing reads the block pass: inside a fence, indented code, HTML block, math block or front matter Enter / Tab / auto-pairs / paste are plain; no pairs inside `` `code` `` / `$math$` | `RtxDoc_md_leaf_at` / `md_code_leaves` / `md_code_span_at`, `rtx_me_mark_code` | done (see **Editing**) |
 | Fixtures with line‑numbered expectations | `testdata/rich/md/`, `testdata/rich/code/` | in tree; table classify smoke written |
-| MD table child: classify + whole-table geom (header and every row, read up to `RTX_MARKUP_LOOKBACK` past the fill, so widths do not move as the pane scrolls); Rich aligns cells, hides `|`; TUI paints `│` rails and the sep as a `├─┼─┤` rule; GUI is a clipped stroked grid (pixel col widths, no box-drawing); Source stays raw; `x_of` / hit through cells; motion skips the rule (never lands on the separator line; a caret left there moves as from the first body byte), steps a wrapped cell line by line (up / down pass the cell's wrap lines under the goal x, then leave the record; up enters on the cell's last line), and classifies every table its scratch fill touches — PageUp / PageDown land where n `move_vert` do (`scroll_smoke` table walks); `|` and cell pad are not a caret landing (`rtx_layout_md_snap`); classify is window + `RTX_MARKUP_LOOKBACK` so a header above the fill still keeps body rows as a table; wrap-on fits columns to the pane and wraps cells (GUI and TUI grow row height; paint every wrap line); paint / hit / `x_of` / caret share `rtx_layout_md_cell_wrap` | `rtx_md_table_*`, `RtxLayout.md_*`, TUI/GUI paint | done this cut; no invented top/bottom box |
+| MD table child: classify + whole-table geom (header and every row, read up to `RTX_MARKUP_LOOKBACK` past the fill, so widths do not move as the pane scrolls); Rich aligns cells, hides `|`; TUI paints `│` rails and the sep as a `├─┼─┤` rule; GUI is a clipped stroked grid (pixel col widths, no box-drawing); Source stays raw; `x_of` / hit through cells; motion skips the rule (never lands on the separator line; a caret left there moves as from the first body byte), steps a wrapped cell line by line (up / down pass the cell's wrap lines under the goal x, then leave the record; up enters on the cell's last line), and classifies every table its scratch fill touches — PageUp / PageDown land where n `move_vert` do (`scroll_smoke` table walks); `|` and cell pad are not a caret landing (`rtx_layout_md_snap`); classify is window + `RTX_MARKUP_LOOKBACK` so a header above the fill still keeps body rows as a table; every table **fits the pane, soft wrap on or off** (see **Table fit**) and wraps its cells (GUI and TUI grow row height; paint every wrap line); Up / Down / Page step a wrapped cell unwrapped too; the delimiter line has no gutter number; paint / hit / `x_of` / caret share `rtx_layout_md_cell_wrap` | `rtx_md_fit_cols`, `rtx_md_table_*`, `RtxLayout.md_*`, TUI/GUI paint | done this cut; no invented top/bottom box |
 | TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
 | Mark arity (pair / prefix / path): headings and links share the lens, not the pair-join | [docs/mark_arity.md](mark_arity.md) | prefix + path two-run plant + named apply table landed |
 
@@ -107,7 +110,8 @@ Two sources, sidecar wins:
    "mono":true, "apply":"bold"}` — already parsed.
 2. **Default scope→style map** beside the theme map in `core/scope.ccs`:
    `markup.bold → bold`, `markup.italic → italic`, `markup.raw → mono`,
-   `markup.heading → bold`. Third‑party grammars dropped into
+   `markup.heading → bold`, `markup.strikethrough → strike`,
+   `markup.highlight → hl`. Third‑party grammars dropped into
    `testdata/grammars/` never carry a sidecar; this makes them useful.
    Consulted at plant time only.
 
@@ -209,12 +213,19 @@ motion, selection, delete, wrap and hit — motion post‑steps the way
 ## Editing
 
 Markdown editing policy sits on `replace` / edit groups like apply and
-join: every command below is one undo step, and none of it reads the
-lexer. Context is the line's own bytes (`rtx_md_line_parse`: quote
-markers, list marker, task box, heading, fence) over a window of whole
-lines — `RTX_MARKUP_LOOKBACK` above, 64 KiB below (`RTX_ME_AHEAD`). A
-list or fence that starts above the window is a leftover (no
-continuation, no renumber past the window), never a wrong edit. Active
+join: every command below is one undo step. Context is the line's own
+bytes (`rtx_md_line_parse`: quote markers, list marker, task box,
+heading, fence) over a window of whole lines — `RTX_MARKUP_LOOKBACK`
+above, 64 KiB below (`RTX_ME_AHEAD`) — plus the **block pass** where it
+has lexed (the whole document, the live window lex, or a section lexed
+whole): `RtxDoc_md_code_leaves` names the code leaves (fence, indented
+code, HTML block, `$$` math, front matter) over the window, so a fence
+opened far above the window (found by the lex's anchor) is still code,
+and `>` inside a leaf is a quote only where the pass planted one. A line
+in a leaf whose list marker / `#` sits inside it is no item and no
+heading. Where the block pass has not lexed, the lines' own fences decide
+(a list or fence that starts above the window is a leftover: no
+continuation, no renumber past the window — never a wrong edit). Active
 in documents whose path grammar is `kind: markup`; Source and Rich alike.
 
 | Key | Effect |
@@ -223,17 +234,17 @@ in documents whose path grammar is `kind: markup`; Source and Rich alike.
 | Enter in a quote | new line with the same `>` prefix (nested, `> - item`) |
 | Enter on an empty item | nested: outdent (Shift-Tab); top level: remove the marker (a quote keeps its `> `) |
 | Enter on an empty quote line | drop the innermost `>` |
-| Enter in a fence (or on its opener) | newline + the line's quote prefix and indent; no markers |
+| Enter in code (fence — or its opener —, indented code, HTML block, math block, front matter) | newline + the line's quote prefix and indent (a list item that opens a fence: its content column); no markers |
 | Enter on a heading / paragraph | plain newline |
 | Shift-Enter (Alt-Enter in the TUI) | newline + quote prefix + spaces to the item's content column, no marker |
 | Tab / Shift-Tab on list items | the caret line, or every non-blank line of a selection with an item: indent to the previous sibling's content column (fallback 2, or the ordered marker width) / back to the parent's indent |
 | Tab elsewhere | tab byte, or `--tab-spaces=N` spaces; Shift-Tab removes one indent (a tab, or N / 4 spaces) from the line; grid and Rich table Tab keep cell motion |
 | Typed opener | auto-pair (below) |
-| Paste | URL over a one-line selection → `[sel](url)`; multi-line on a quote line keeps `> ` on each line |
+| Paste | URL over a one-line selection → `[sel](url)` (not in code or a code span); multi-line on a quote line keeps `> ` on each line |
 | Apply menu in a table | row above / below, delete row, column left / right, delete column, move column left / right (keys `a b d l r x < >`; GUI **Apply → Table**) |
 
 Ordered lists renumber in the same group: each level counts on from its
-previous sibling (by indent and marker kind, fences skipped, a paragraph
+previous sibling (by indent and marker kind, code lines skipped, a paragraph
 after a blank line ends the list). A level whose first two original items
 share a number is lazy (`1.` `1.` `1.`) and keeps it. An item Tab moved
 into a new level starts it at `1.`.
@@ -241,8 +252,11 @@ into a new level starts it at `1.`.
 **Auto-pairs.** The table is the grammar's (`"cctext": {"pairs": "()[]"}`
 or a VS Code `autoClosingPairs` array; single-byte pairs), else built in:
 Markdown `` ` `` `*` `_` `"` `[`, and `(` only after `]` (a link dest);
-code `(` `[` `{` `"` `'` `` ` ``; grammarless prose none. Inside a fence
-the code table applies. A pair is inserted when the next byte is
+code `(` `[` `{` `"` `'` `` ` ``; grammarless prose none. Inside a code
+leaf (block pass, else the window's fences) the code table applies;
+inside an inline code span or `$math$` (`RtxDoc_md_code_span_at`:
+after its opener, at or before its closer) nothing pairs — the closer an
+auto pair typed still steps over. A pair is inserted when the next byte is
 whitespace / EOL / a closing bracket, and — for a symmetric pair — the
 previous byte is whitespace / BOL / an opening bracket, and for `*` / `_`
 the caret is not at a line's marker position (only blanks and `>` before
@@ -289,7 +303,7 @@ raw.
 | HTML block kinds 1-7 | a frame (`html`) with the HTML guest; ends on its marker line (1-5) or a blank line (6-7) |
 | `$$` math, front matter `---` / `+++` at BOF | frames (`math` raw, `front` YAML guest), `$$` / `---` hints |
 | GFM table | header = the paragraph's last line when the delimiter row's cell count matches; rows lexed cell by cell |
-| `[label]: dest "title"`, `[^x]:` | `ref` / `ref_dest`, `foot` |
+| `[label]: dest "title"`, `[^x]:` | `ref` / `ref_dest`, `foot`; the definition feeds the reference map (below) |
 
 **Checkpoints and converge.** The block state rides in `RtxTmCkpt.mdb`,
 planted only at a line start. Multi-line leaves are frames, so seed /
@@ -331,10 +345,47 @@ section — up to the next heading of the same or a higher level.
 `RtxDoc_outline` lists the headings (level, title bytes) of the runs the
 window lex planted — the iterator a TOC pane reads; no file-wide index.
 
-Coverage is `tests/md_block_smoke` (240 CommonMark / GFM spec examples by
-construct, 3 known gaps printed), and `incr_smoke` holds every edit relex
-equal to a full lex on Markdown with fences, lists, setext, quotes,
-tables, HTML, math and front matter.
+**Reference definitions** (`core/md_refs.ccs`). A shortcut `[foo]`
+is a link only when the document defines `foo`, anywhere — above or
+below, far outside the window. The map is label → definition line:
+CommonMark normalization (trim, whitespace runs to one space, case fold
+for ASCII / Latin-1 / Latin Extended-A / Greek / Cyrillic; other scripts
+compare as bytes) hashed; the first definition wins. Who fills it, by
+size, never a file lex per frame:
+
+- **≤ `RTX_HL_FULL_MAX`**: the lex walk stages the `[label]:` lines it
+  classifies (from a sure state only: no `SOFT` / `UNSURE`) and commits
+  them over the range it lexed; an edit's relex runs to where it
+  converges, so it restages exactly what can have changed.
+- **≤ `RTX_MDREF_SWEEP_MAX` (4 MiB)**: a **sweep** — the block pass
+  alone, classify only, from the first byte (4 MiB ≈ 8–15 ms, once),
+  with its state checkpointed every 4 KiB. An edit marks a dirty range;
+  the next settle re-sweeps from the checkpoint before it to the first
+  checkpoint past it with an unchanged state (a keystroke: a few KiB; a
+  typed ```` ``` ```` that opens a fence: to its close or the end, once).
+- **larger**: the definitions of the windows lexed so far (a shortcut
+  whose definition no window has seen is text — leftover, never a wrong
+  link).
+
+An edit shifts entries and puts those whose line it touched in *limbo*
+(still counted, so the relex that follows resolves as before), until the
+relex / re-sweep over that line restages or drops them. The walk
+resolves at the label's abort (`]` with no `(` / `[` after it): a known
+label plants the label run plus a one-byte `][` dest face on the `]`, so
+Rich hides both brackets, `Backspace` unwraps and the pair join refuses
+exactly as for `[foo][]`. Every label the lex asks about is set in a
+4096-bit `seen` filter; a label that comes or goes (count 0 ↔ 1, a new
+definition counted in before the replaced ones go) relexes the window
+only when it was asked — typing a definition nobody references costs
+nothing. Collapsed and full references keep painting as links (a
+missing definition makes them unfollowable, not text: leftover).
+
+Coverage is `tests/md_block_smoke` (CommonMark / GFM spec examples by
+construct, 2 known gaps printed: a table row without a pipe, ex 202, and
+a definition split over lines, ex 193; the reference map, highlight and
+sweep), and `incr_smoke` holds every edit relex equal to a full lex on
+Markdown with fences, lists, setext, quotes, tables, HTML, math, front
+matter, references and definitions.
 
 ## Code embeds and injection
 
@@ -395,6 +446,54 @@ Locked shape (unchanged from the first cut):
 | Opaque render (mermaid, math, dot, image) | fence body / `![]()` | one vis row of height H at fill time; content from a **Scan‑table row** (start / step / live / resume / deny) like find / island / browse; cached on layout epoch keyed (span hash, width); GUI only | TUI ASCII art (source or fixed box); blocking the frame; fetch on the layout thread |
 | Derived value (formula in a cell) | `=SUM(A1:A3)` literal | paint value in place of content, formula is the hint; layout‑epoch, read‑only, one record in window | editing the value; cross‑window refs; persisted values |
 
+### Table fit
+
+A Rich table is laid out to the pane's text width whether soft wrap is on
+or off (`rtx_layout_md_fit` over `rtx_md_fit_cols`, `core/md_table.ccs`),
+in cells (TUI) or pixels (GUI). The room W is the pane less the table's
+chrome (TUI: two rails and a gap per inner column; GUI: a line per edge
+and 2 × `RTX_MD_PX_PAD` per cell).
+
+1. **Natural widths** are the widest cell of each column over the header
+   and every row (the whole-table measure the table always had, to
+   `RTX_MARKUP_LOOKBACK` past the fill). Width is what paints: hidden
+   marks (`**`, backticks, `==`) are zero, a stand-in its own cells.
+2. If the natural widths fit W, they are the widths.
+3. Else each column's floor is **min(natural, W / 4)**; every column
+   starts at its floor and the rest of W is shared in proportion to
+   (natural − floor), whole units, the leftover to the largest
+   remainders (CSS auto table layout with a 25% min-width).
+4. When the floors alone are wider than W — five or more wide columns
+   (four 25% floors already fill it) — they give way the same way down
+   to a hard floor of min(natural, 6 cells / 48 px). Only when the hard
+   floors do not fit does that table keep them and overflow (the pane's
+   horizontal scroll); other tables and rows are not affected. (The
+   first cut of the spec let a table overflow as soon as its 25% floors
+   did not fit; README's five-column command table then never fit at any
+   window width, so the floors give way first.)
+
+Cells wrap at word breaks (after a blank, `-` or `/`) and break a word
+or identifier that is wider than its column where they must
+(`rtx_layout_md_wrap_px`; `m == NULL` walks cells). A record is as tall
+as its tallest cell; separators, rails and the GUI grid stay. Rows are
+fitted per fill, so a pane resize or split (a width change) refits. An
+edit re-measures only a table it touches (as before) and relays the
+table's rows only when a fitted width moved; the width walk shares one
+hide / style cursor over the whole table (a 400-row table: ~4 ms layout
+per key in cctext-ui, wrap on or off, down from 10.4 / 6.7 ms).
+
+Motion reads the same record in both wrap modes: Up / Down pass the
+wrap lines of the cell under the goal x and leave the record from its
+last (first) line; entering from below lands on the cell's last line;
+PageUp / PageDown in a Rich unwrapped pane walk rows like soft wrap, so
+a page lands where n Up / Down do. The camera counts a record's height
+in lines (`rtx_layout_row_lines`), so a tall record does not throw the
+caret's row to the top of a GUI pane.
+
+The delimiter line (`|---|`, hidden in Rich: a `├─┼─┤` rule in the TUI,
+a thin band in the GUI) prints no gutter number in either frontend: the
+GUI band is shorter than a number and drew it over the header's.
+
 Grid vs MD table: `l` cycles default → wrap → hex → grid and **grid stays
 the CSV / TSV / pipe lens**. MD tables appear under default / wrap on a
 MARKUP doc, never by binding `|` as a CSV delimiter. Reuse from grid: width
@@ -423,6 +522,7 @@ next heading is outside the window.
 | Hidden hints, atoms, apply | yes | yes |
 | Bold / italic | SGR 1 / 3 | libui font faces — Core Text on macOS, Pango on Linux (done) |
 | Strikethrough (`strike` bit) | SGR 9 | a stroke through the glyph middle |
+| Highlight (`hl` bit) | background SGR 48;5;94 | a rect under the glyph (`rtx_theme_hl`) |
 | Prose vs mono face | no (one cell grid) | yes, by section kind + `st.mono` |
 | Table cells | aligned in columns | proportional, per‑cell child |
 | Opaque renders | source or fixed‑height box | rendered child |
@@ -442,7 +542,7 @@ Each wedge is zero‑cost when unused and ships behind `@smoke` +
 | 2 | Style bits from sidecar or default scope map, copied at plant; `markdown.tmLanguage.json` declares `kind: markup`; prose scanner gated to PROSE sub‑ranges | **done** |
 | 3 | Rich pane: `has_marks` per fill; hint skip in wrap / `x_of` / hit / paint; reveal‑on‑entry; `rich` toggle key; TUI + GUI paint; atom step, unwrap, selection join rule | **done** |
 | 4 | Fence + injection: `cctext.bol` + `cctext.info`; `scopeName` / `rtx_tm_rt_for_scope()` / `rtx_tm_rt_for_info()`; depth‑2 guest lex; `RTX_RUN_INJECT`; nested inline marks; HTML `<script>`/`<style>` `RE_SPAN` | **done** |
-| 5 | MD table child | **done this cut**: classify, whole-table geom, `│` rails + sep rule chrome, aligned Rich paint / hit; Source raw; window + `RTX_MARKUP_LOOKBACK` classify; **paint-time cell wrap** when pane wrap is on (fit columns to pane; taller GUI + TUI rows); wrap-aware `x_of` / hit / caret share `rtx_layout_md_cell_wrap` |
+| 5 | MD table child | **done this cut**: classify, whole-table geom, `│` rails + sep rule chrome, aligned Rich paint / hit; Source raw; window + `RTX_MARKUP_LOOKBACK` classify; **table fit + cell wrap in both wrap modes** (25% floors, CSS-auto share; taller GUI + TUI rows); wrap-aware `x_of` / hit / caret / motion share `rtx_layout_md_cell_wrap` |
 | 6 | Apply / toolbar via one `replace`; toggle‑off by rule id; prefix apply from `insert`/`max` | prefix + pair named apply + grammar table + rule id / toggle‑off **landed** |
 | 6b | Path faces: two runs (label + dest); dest hide; `replace_join` refuses dest↔label; unwrap keeps the label | two-run plant + dest hide + join refuse + unwrap + wrap **landed** |
 | 7 | Blocks as folds — after the three blockers above | heading sections (setext levels) |
@@ -464,9 +564,10 @@ geometry) once its wedge lands.
 | Nesting | Stack is live (wedge 4). Join stays pair-only; path is two runs |
 | Apply | One `replace`, one hist record; cap at `RTX_HL_WIN_MAX`. Table is the path grammar, not the caret. Kind is derived. Link unwrap is apply, not join |
 | Nav | `Ctrl-K/P` = discover (`hint_a > 0` in the window). Apply = transform. Do not hard-code keyword scopes as marks; a `.c` file has none |
-| Sidecar | One `cctext` object. Recognition (`bol` / `inline` / `flank` / `exact` / `abort` / `lit` / `info` / `block`) ≠ topology (`arity` / `face` / `wrap`) ≠ transform (`apply` / `insert` / `max`) ≠ paint (`bold` / `italic` / `mono` / `strike`). A new key answers one of those. |
+| Sidecar | One `cctext` object. Recognition (`bol` / `inline` / `flank` / `exact` / `abort` / `lit` / `info` / `block`) ≠ topology (`arity` / `face` / `wrap`) ≠ transform (`apply` / `insert` / `max`) ≠ paint (`bold` / `italic` / `mono` / `strike` / `highlight`). A new key answers one of those. |
 | Markdown blocks | A windowed, checkpointed block pass (`md_block.cch`) owns block structure; the grammar lexes inline content. Window + lookback + an anchor ≤ 256 KiB back; state in the checkpoint; an edit relexes to where stack and block state converge; zero cost for a grammar without `blocks`; leftover, never wrong at window edges. (Replaces "grammar-only, no block index" — still no file-wide index.) |
-| Leftover marks | Shortcut reference `[x]` (needs a definition index), images-as-opaque, a setext / table decided past the lex end |
+| Leftover marks | images-as-opaque, a setext / table decided past the lex end; a shortcut `[x]` whose definition lies in an unlexed part of a file over 4 MiB; a collapsed / full reference with no definition still paints as a link |
+| Reference map | Label → definition line, staged by the block pass (lex walk, or a checkpointed sweep ≤ 4 MiB), shifted by edits; a relex only when a label the lex asked about comes or goes. Not a file-wide lex, not per frame |
 | Children | Layout‑epoch scratch, not an arity. Paint‑time recursion; one wrap oracle (`cell_wrap`) for paint / hit / `x_of` / caret; window classify; leftover, never wrong |
 | Renders | Opaque vis row of height H; Scan‑table job; epoch cache; GUI only |
 | Derived values | Layout‑epoch, read‑only, one record in window |

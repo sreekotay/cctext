@@ -16,6 +16,7 @@
 #include "md_table.cch"
 #include "nav.cch"
 #include "lf.cch"
+#include "wb.cch"
 
 
 static int rtx_cstr_eq(const char *a, const char *b) {
@@ -34,6 +35,7 @@ static int rtx_cstr_eq_lit(const char *a, const char *lit) {
 }
 
 static void !>(CCError) rtx_doc_highlight(RtxDoc *d);
+static void rtx_doc_hl_abort(RtxDoc *d);
 static void rtx_doc_ident_stamp(RtxDoc *d, char[:0] path);
 static int rtx_doc_add_section(RtxDoc *d, size_t start, RtxSectionKind kind);
 static RtxSectionKind rtx_doc_path_kind(const RtxDoc *d);
@@ -456,11 +458,14 @@ void RtxDoc_destroy(RtxDoc *d) {
     /* Find lanes read the tree: join them before it goes. The tree
      * joins its island first thing in its own destroy. */
     rtx_find_handle_stop(&d->find);
+    if (d->derived && d->derived->destroy) d->derived->destroy(d->derived->ctx);
+    d->derived = NULL;
     d->tree.destroy();
     rtx_hist_clear(&d->hist);
     if (d->session.base) d->session.destroy();
     rtx_doc_unbind_analysis(d);
     if (d->analysis.base) d->analysis.destroy();
+    rtx_mdref_free(&d->mdref);
     /* Always run — overflow slabs can outlive `.base` after a reset. */
     if (d->find.store.base) d->find.store.reset();
     d->find.store.destroy();
@@ -1020,6 +1025,7 @@ static void rtx_doc_span_note(RtxDoc *d, size_t at, size_t erased, size_t insert
     RtxEditSpan *s;
     size_t lo, hi_cur, hi_old;
     if (!d) return;
+    if (d->derived) d->derived->note(d->derived->ctx, at, erased, inserted);
     s = &d->span;
     if (!s->live) {
         s->lo = at;
@@ -1092,6 +1098,7 @@ static void rtx_doc_shift_intervals(RtxDoc *d, size_t at, size_t erased, size_t 
             d->hl_cov.live = 0;
     }
     rtx_tm_ckpt_shift(d, at, erased, inserted);
+    rtx_mdref_shift(&d->mdref, at, erased, inserted);
     rtx_doc_fold_shift(d, at, erased, inserted);
     for (i = 0; i < d->secs.len; i++) {
         size_t s = d->secs.data[i].start;
@@ -1706,6 +1713,106 @@ static void !>(CCError) rtx_doc_scan_markup(RtxDoc *d) {
     return cc_ok();
 }
 
+/* ---- Markdown link definitions (md_refs.cch) ----
+ *
+ * The map a shortcut `[foo]` resolves through is staged by the lex walk
+ * (the definitions of the lines it classified) and shifted by edits. A
+ * document between RTX_HL_FULL_MAX and RTX_MDREF_SWEEP_MAX is swept once
+ * (the block pass alone, classify only) so a definition below the window
+ * resolves too; a larger one knows the definitions its windows lexed.
+ * When a label the lex asked about comes or goes, the runs it planted
+ * from the old answer are wrong: relex (a small document whole, a large
+ * one around `off`; the next fill lexes its window). */
+
+/* Sweep (full: the whole document; else the dirty range, to where the
+ * block state meets an unchanged checkpoint). Reads 1 MiB at a time. */
+static void !>(CCError) rtx_doc_mdref_sweep(RtxDoc *d, int full) {
+    RtxMdRefs *m = &d->mdref;
+    RtxMdRefSweep sw;
+    size_t n = d->len(), chunk = (size_t)1 << 20;
+    CCArena frame;
+    if (!rtx_mdref_sweep_begin(m, &sw, full)) return cc_ok();
+    frame = cc_arena_heap(chunk + 64);
+    if (!frame.base) {
+        rtx_mdref_sweep_off(m);
+        return cc_err(CC_ERR_OUT_OF_MEMORY, "md refs sweep");
+    }
+    while (sw.at < n && !sw.done) {
+        size_t take = n - sw.at < chunk ? n - sw.at : chunk, used;
+        int last;
+        char[:] bytes;
+        frame.reset();
+        bytes = d->scratch_span(sw.at, take, frame) !>(e) {
+            frame.destroy();
+            free(sw.nk);
+            rtx_mdref_stage_reset(m);
+            rtx_mdref_sweep_off(m);
+            return cc_err(e);
+        };
+        last = sw.at + bytes.len >= n;
+        used = rtx_mdref_sweep_feed(m, &sw, bytes.ptr, bytes.len, last);
+        /* A line longer than a chunk: classify what fits as one line. */
+        if (used == 0 && !sw.done) used = rtx_mdref_sweep_feed(m, &sw, bytes.ptr, bytes.len, 1);
+        if (used == 0) break;
+    }
+    frame.destroy();
+    rtx_mdref_sweep_end(m, &sw, n);
+    return cc_ok();
+}
+
+/* The sweep owns the map of a document in (RTX_HL_FULL_MAX,
+ * RTX_MDREF_SWEEP_MAX]: start it once, re-sweep what edits dirtied; out
+ * of that range the lex's own definitions stand. */
+static void !>(CCError) rtx_doc_mdref_update(RtxDoc *d) {
+    RtxMdRefs *m = &d->mdref;
+    size_t n = d->len();
+    if (n > RTX_HL_FULL_MAX && n <= RTX_MDREF_SWEEP_MAX) {
+        if (m->sweep_on) {
+            if (m->dirty) return rtx_doc_mdref_sweep(d, 0);
+        } else if (!m->swept) {
+            const RtxTmRt *rt = rtx_tm_for_path(d->path.ptr);
+            m->swept = 1;
+            if (rt && rt->blocks) return rtx_doc_mdref_sweep(d, 1);
+        }
+        return cc_ok();
+    }
+    if (m->sweep_on || m->swept) {
+        rtx_mdref_sweep_off(m);
+        m->swept = 0;
+    }
+    return cc_ok();
+}
+
+static void rtx_doc_mdref_drop(RtxDoc *d) {
+    rtx_mdref_relexed(&d->mdref);
+    rtx_doc_hl_abort(d);
+    d->hl_cov.live = 0;
+}
+
+static void !>(CCError) rtx_doc_ensure_hl_once(RtxDoc *d, RtxHlWin w);
+
+/* After a lex: a label the lex asked about came or went → relex. `lex`:
+ * a large document relexes around `off` here (an edit: the patch diffs
+ * the runs), else the caller's window lex does it. */
+static void !>(CCError) rtx_doc_mdref_fix(RtxDoc *d, size_t off, int lex) {
+    size_t n;
+    if (!d || !rtx_mdref_settle(&d->mdref)) return cc_ok();
+    n = d->len();
+    rtx_doc_mdref_drop(d);
+    if (n <= RTX_HL_FULL_MAX) {
+        rtx_doc_highlight(d) !>(e) { return cc_err(e); };
+        d->hl_full = 1;
+    } else if (lex) {
+        size_t lo = off > (size_t)RTX_MARKUP_LOOKBACK ? off - (size_t)RTX_MARKUP_LOOKBACK : 0;
+        size_t hi = off + (size_t)RTX_HL_WIN_MAX / 4;
+        if (hi > n) hi = n;
+        rtx_doc_ensure_hl_once(d, rtx_hl_span(lo, hi)) !>(e) { return cc_err(e); };
+    }
+    rtx_doc_sort_runs(d);
+    (void)rtx_mdref_settle(&d->mdref);
+    return cc_ok();
+}
+
 void !>(CCError) RtxDoc_reparse(RtxDoc *d) {
     size_t n;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
@@ -1718,7 +1825,8 @@ void !>(CCError) RtxDoc_reparse(RtxDoc *d) {
         d->hl_full = 0;
     }
     rtx_doc_sort_runs(d);
-    return cc_ok();
+    rtx_doc_mdref_update(d) !>(e) { return cc_err(e); };
+    return rtx_doc_mdref_fix(d, 0, 0);
 }
 
 /* Bytes from `src`, named `path` (grammar, save, journal key). The caller
@@ -1751,18 +1859,26 @@ static void !>(CCError) rtx_doc_open_as(RtxDoc *d, char[:0] src, char[:0] path) 
         }
     }
     rtx_doc_sort_runs(d);
+    rtx_doc_mdref_fix(d, 0, 0) !>(e) {
+        d->destroy();
+        return cc_err(e);
+    };
     return cc_ok();
 }
 
 void !>(CCError) RtxDoc_from_path(RtxDoc *d, char[:0] path) {
     rtx_doc_open_as(d, path, path) !>(e) { return cc_err(e); };
     rtx_doc_ident_stamp(d, path);
+    /* A `*.wb.md` path is a workbook (docs/workbook.md); no other file
+     * gets the derived-value hook. */
+    if (rtx_wb_path(path.ptr, path.len)) (void)rtx_wb_attach(d);
     return cc_ok();
 }
 
 void !>(CCError) RtxDoc_from_base(RtxDoc *d, char[:0] base, char[:0] path,
                                   int64_t mtime_ns, uint64_t sz, uint64_t ino) {
     rtx_doc_open_as(d, base, path) !>(e) { return cc_err(e); };
+    if (rtx_wb_path(path.ptr, path.len)) (void)rtx_wb_attach(d);
     d->disk_mtime = mtime_ns;
     d->disk_sz = sz;
     d->disk_ino = ino;
@@ -1883,6 +1999,7 @@ RtxStyle RtxDoc_style_at(const RtxDoc *d, size_t off) {
             if (d->runs.data[i].style.italic) z.italic = 1;
             if (d->runs.data[i].style.mono) z.mono = 1;
             if (d->runs.data[i].style.strike) z.strike = 1;
+            if (d->runs.data[i].style.hl) z.hl = 1;
             if (d->runs.data[i].style.scope != RTX_SCOPE_NONE) {
                 z.scope = d->runs.data[i].style.scope;
             }
@@ -2067,6 +2184,7 @@ static int rtx_style_cur_to(const RtxDoc *d, RtxStyleCur *c, size_t off) {
             if (x->style.italic) z.italic = 1;
             if (x->style.mono) z.mono = 1;
             if (x->style.strike) z.strike = 1;
+            if (x->style.hl) z.hl = 1;
             if (x->style.scope != RTX_SCOPE_NONE) z.scope = x->style.scope;
         }
         c->lim = lim;
@@ -2100,7 +2218,12 @@ size_t RtxDoc_style_cur_next(const RtxDoc *d, RtxStyleCur *c, size_t off, size_t
 size_t RtxDoc_mark_edges(const RtxDoc *d, size_t lo, size_t hi, size_t *out,
                          size_t cap) {
     size_t i, n, k = 0;
-    if (!d || !out || d->runs.len == 0 || hi <= lo) return 0;
+    if (!d || !out || hi <= lo) return 0;
+    if (d->derived) {
+        k = d->derived->edges(d->derived->ctx, d, lo, hi, out, cap);
+        if (k == (size_t)-1) return k;
+    }
+    if (d->runs.len == 0) return k;
     if (!rtx_doc_run_top_live(d)) return (size_t)-1; /* order not proven */
     n = d->runs.len;
     i = rtx_doc_run_first(d, lo ? lo - 1 : 0);
@@ -3524,6 +3647,139 @@ int RtxDoc_md_block_at(const RtxDoc *d, size_t off) {
     return role;
 }
 
+/* ---- Block context for editing (md_edit in workspace.ccs) ---- */
+
+static int rtx_mdb_role_code(int role) {
+    return role == RTX_MDB_ROLE_FENCE || role == RTX_MDB_ROLE_CODE ||
+           role == RTX_MDB_ROLE_HTML || role == RTX_MDB_ROLE_MATH ||
+           role == RTX_MDB_ROLE_FRONT;
+}
+
+/* The range around *klo whose runs are the block pass's current answer:
+ * the whole document lexed, the live window lex, or a section lexed
+ * whole. 0 when there is none (or the grammar has no block pass). */
+static int rtx_doc_md_known(const RtxDoc *d, size_t *klo, size_t *khi) {
+    const RtxTmRt *rt;
+    if (!d || !d->path.ptr) return 0;
+    rt = rtx_tm_for_path(d->path.ptr);
+    if (!rt || !rt->blocks) return 0;
+    if (d->hl_full) {
+        *klo = 0;
+        *khi = d->len();
+        return 1;
+    }
+    if (d->hl_cov.live && d->hl_cov.hi > d->hl_cov.lo && d->hl_cov.lo <= *klo &&
+        *klo <= d->hl_cov.hi) {
+        *klo = d->hl_cov.lo;
+        *khi = d->hl_cov.hi;
+        return 1;
+    }
+    {
+        /* A section lexed whole (the window's own sections of a large
+         * document are): its runs stand. */
+        size_t s, n = d->len(), at = *klo;
+        for (s = 0; s < d->secs.len; s++) {
+            size_t a = d->secs.data[s].start;
+            size_t b = s + 1 < d->secs.len ? d->secs.data[s + 1].start : n;
+            if (a > at || at > b) continue;
+            if (!d->secs.data[s].hl_done || !rtx_sec_lexed(d->secs.data[s].kind)) continue;
+            *klo = a;
+            *khi = b;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int RtxDoc_md_leaf_at(const RtxDoc *d, size_t off) {
+    size_t klo = off, khi = off, i, n;
+    int role = 0;
+    if (!rtx_doc_md_known(d, &klo, &khi) || off < klo || off > khi) return -1;
+    if (d->runs.len == 0) return 0;
+    n = d->len();
+    for (int pass = 0; pass < 2; pass++) {
+        /* At the end of the document, an unclosed leaf runs to it. */
+        size_t at = pass ? off - 1 : off;
+        if (pass && (off != n || off == 0)) break;
+        i = rtx_doc_run_first(d, at);
+        for (; i < d->runs.len && d->runs.data[i].start <= at;
+             i = rtx_doc_run_step(d, i, at)) {
+            const RtxRun *r = &d->runs.data[i];
+            const RtxTmRule *rule;
+            if (at >= r->start + r->len || r->planter != (unsigned char)RTX_RUN_TM) continue;
+            if (pass && r->hint_b) continue;
+            rule = rtx_doc_run_rule(d, r);
+            if (rule && rtx_mdb_role_code(rule->block)) role = rule->block;
+        }
+        if (role) break;
+    }
+    return role;
+}
+
+long RtxDoc_md_code_leaves(const RtxDoc *d, size_t lo, size_t hi, size_t *los,
+                           size_t *his, size_t cap, size_t *klo, size_t *khi) {
+    size_t i, k = 0;
+    if (!d || !los || !his || !klo || !khi) return -1;
+    *klo = *khi = lo;
+    if (!rtx_doc_md_known(d, klo, khi)) return -1;
+    if (lo < *klo) lo = *klo;
+    if (hi > *khi) hi = *khi;
+    if (hi <= lo || d->runs.len == 0) return 0;
+    for (i = rtx_doc_run_first(d, lo); i < d->runs.len && d->runs.data[i].start < hi; i++) {
+        const RtxRun *r = &d->runs.data[i];
+        const RtxTmRule *rule;
+        size_t a, b;
+        if (r->planter != (unsigned char)RTX_RUN_TM || r->start + r->len <= lo) continue;
+        rule = rtx_doc_run_rule(d, r);
+        if (!rule || !rtx_mdb_role_code(rule->block)) continue;
+        a = r->start > lo ? r->start : lo;
+        b = r->start + r->len < hi ? r->start + r->len : hi;
+        /* An unclosed leaf at the document's end holds its end too. */
+        if (!r->hint_b && r->start + r->len == d->len()) b = b + 1;
+        if (k && a <= his[k - 1]) {
+            if (b > his[k - 1]) his[k - 1] = b;
+            continue;
+        }
+        if (k == cap) break;
+        los[k] = a;
+        his[k] = b;
+        k++;
+    }
+    return (long)k;
+}
+
+int RtxDoc_md_role_covers(const RtxDoc *d, size_t off, int role) {
+    size_t i;
+    if (!d || d->runs.len == 0) return 0;
+    i = rtx_doc_run_first(d, off);
+    for (; i < d->runs.len && d->runs.data[i].start <= off;
+         i = rtx_doc_run_step(d, i, off)) {
+        const RtxRun *r = &d->runs.data[i];
+        const RtxTmRule *rule;
+        if (off >= r->start + r->len || r->planter != (unsigned char)RTX_RUN_TM) continue;
+        rule = rtx_doc_run_rule(d, r);
+        if (rule && rule->block == role) return 1;
+    }
+    return 0;
+}
+
+int RtxDoc_md_code_span_at(const RtxDoc *d, size_t off) {
+    size_t i;
+    if (!d || d->runs.len == 0 || off == 0) return 0;
+    i = rtx_doc_run_first(d, off - 1);
+    for (; i < d->runs.len && d->runs.data[i].start < off;
+         i = rtx_doc_run_step(d, i, off - 1)) {
+        const RtxRun *r = &d->runs.data[i];
+        const RtxTmRule *rule;
+        size_t end = r->start + r->len;
+        if (r->planter != (unsigned char)RTX_RUN_TM || !r->hint_a || !r->hint_b) continue;
+        if (off < r->start + r->hint_a || off > end - r->hint_b) continue;
+        rule = rtx_doc_run_rule(d, r);
+        if (rule && !rule->block && (rule->exact || rule->flank == RTX_FLANK_MATH)) return 1;
+    }
+    return 0;
+}
+
 size_t RtxDoc_outline(const RtxDoc *d, size_t lo, size_t hi, RtxOutlineEnt *out,
                       size_t cap) {
     size_t i, k = 0;
@@ -3563,6 +3819,30 @@ size_t RtxDoc_outline(const RtxDoc *d, size_t lo, size_t hi, RtxOutlineEnt *out,
     return k;
 }
 
+/* Label bytes [llo, lhi) → its definition's destination (doc offsets,
+ * `<>` stripped). 0 when the label has no definition in the map. */
+static int rtx_doc_ref_target(const RtxDoc *d, size_t llo, size_t lhi, size_t *lo,
+                              size_t *hi) {
+    char lab[1000];
+    char line[4096];
+    const RtxMdRef *r;
+    size_t n = lhi - llo, a, b, ln;
+    if (lhi <= llo || n >= sizeof lab) return 0;
+    if (rtx_tree_read((void *)&d->tree, llo, lab, n) != n) return 0;
+    r = rtx_mdref_get(&d->mdref, rtx_mdref_hash(lab, n));
+    if (!r) return 0;
+    ln = r->llen < sizeof line ? r->llen : sizeof line;
+    if (rtx_tree_read((void *)&d->tree, r->line, line, ln) != ln) return 0;
+    if (!rtx_mdref_dest(r, line, ln, &a, &b)) return 0;
+    if (lo) *lo = r->line + a;
+    if (hi) *hi = r->line + b;
+    return 1;
+}
+
+int RtxDoc_ref_target(const RtxDoc *d, size_t llo, size_t lhi, size_t *lo, size_t *hi) {
+    return d ? rtx_doc_ref_target(d, llo, lhi, lo, hi) : 0;
+}
+
 int RtxDoc_link_target(const RtxDoc *d, size_t off, size_t *lo, size_t *hi) {
     size_t plo, phi, klo, khi, dlo, dhi, ahi, blo, tlo, thi;
     if (!d) return 0;
@@ -3576,6 +3856,17 @@ int RtxDoc_link_target(const RtxDoc *d, size_t off, size_t *lo, size_t *hi) {
         }
         tlo = RtxDoc_hint_at(d, dlo, NULL, &ahi) ? ahi : dlo;
         thi = (dhi && RtxDoc_hint_at(d, dhi - 1, &blo, NULL)) ? blo : dhi;
+        {
+            /* A reference: `[x]` (dest is the lone `]`), `[x][]`, `[x][y]`
+             * — the target is its definition's destination. */
+            char h2[2] = {0, 0};
+            size_t got = dhi - dlo >= 2 ? 2 : dhi - dlo;
+            if (got && rtx_tree_read((void *)&d->tree, dlo, h2, got) == got &&
+                h2[0] == ']' && (got == 1 || h2[1] == '[')) {
+                if (got == 1 || thi <= tlo) return rtx_doc_ref_target(d, klo, khi, lo, hi);
+                return rtx_doc_ref_target(d, tlo, thi, lo, hi);
+            }
+        }
         if (thi <= tlo) return 0;
         if (lo) *lo = tlo;
         if (hi) *hi = thi;
@@ -3596,11 +3887,27 @@ int RtxDoc_link_target(const RtxDoc *d, size_t off, size_t *lo, size_t *hi) {
 int RtxDoc_has_marks(const RtxDoc *d) {
     size_t i;
     if (!d) return 0;
+    if (d->derived && d->derived->any(d->derived->ctx, d)) return 1;
     if (rtx_doc_run_top_live(d)) return d->runs_marks;
     for (i = 0; i < d->runs.len; i++) {
         if (d->runs.data[i].hint_a) return 1;
     }
     return 0;
+}
+
+/* Derived values (docs/workbook.md): forwarded to the owner; one compare
+ * on a document that is not a workbook. */
+int RtxDoc_derived_at(const RtxDoc *d, size_t off, int incl, size_t *lo,
+                      size_t *hi, char *g, size_t cap, size_t *gn) {
+    if (gn) *gn = 0;
+    if (!d || !d->derived) return 0;
+    return d->derived->at(d->derived->ctx, d, off, incl, lo, hi, g, cap, gn);
+}
+
+size_t RtxDoc_derived_changed(const RtxDoc *d, size_t *lo, size_t *hi,
+                              size_t cap) {
+    if (!d || !d->derived) return 0;
+    return d->derived->changed(d->derived->ctx, d, lo, hi, cap);
 }
 
 /* A section the markup lens may read: a MARKUP grammar, or grammarless
@@ -3918,6 +4225,7 @@ static unsigned char rtx_tm_rule_bits(const RtxTmRule *rule) {
     if (rule->sc_italic) bits |= (unsigned char)RTX_SBIT_ITALIC;
     if (rule->sc_mono) bits |= (unsigned char)RTX_SBIT_MONO;
     if (rule->sc_strike) bits |= (unsigned char)RTX_SBIT_STRIKE;
+    if (rule->sc_hl) bits |= (unsigned char)RTX_SBIT_HL;
     return bits;
 }
 
@@ -3958,6 +4266,7 @@ static int rtx_tm_add_span(RtxDoc *d, size_t start, size_t end, size_t emit_from
     r.style.italic = (bits & RTX_SBIT_ITALIC) != 0;
     r.style.mono = (bits & RTX_SBIT_MONO) != 0;
     r.style.strike = (bits & RTX_SBIT_STRIKE) != 0;
+    r.style.hl = (bits & RTX_SBIT_HL) != 0;
     r.planter = planter;
     r.hint_a = rtx_tm_hint(alen);
     r.hint_b = rtx_tm_hint(blen);
@@ -4557,6 +4866,7 @@ typedef struct {
     unsigned char sc_abort;
     unsigned char sc_block;
     unsigned char sc_strike;
+    unsigned char sc_hl;
     unsigned char sc_info;
     unsigned char sc_bold;
     unsigned char sc_italic;
@@ -4727,6 +5037,7 @@ static int rtx_tm_pat_from_raw(const RtxTmPatRaw *raw, RtxTmPat *out) {
     out->sc_abort = raw->sc_abort;
     out->sc_block = raw->sc_block;
     out->sc_strike = raw->sc_strike;
+    out->sc_hl = raw->sc_hl;
     out->sc_info = raw->sc_info;
     out->sc_bold = raw->sc_bold;
     out->sc_italic = raw->sc_italic;
@@ -4752,7 +5063,7 @@ static void rtx_tm_pat_clear(RtxTmPatRaw *p) {
     p->n_kids = 0;
     for (i = 0; i < (size_t)RTX_TM_CAPS; i++) p->capn[i][0] = 0;
     p->sc_has = p->sc_bol = p->sc_inl = p->sc_flank = p->sc_info = 0;
-    p->sc_exact = p->sc_abort = p->sc_block = p->sc_strike = 0;
+    p->sc_exact = p->sc_abort = p->sc_block = p->sc_strike = p->sc_hl = 0;
     p->sc_bold = p->sc_italic = p->sc_mono = 0;
     p->sc_apply[0] = 0;
     p->sc_insert[0] = 0;
@@ -4856,6 +5167,10 @@ static int rtx_jw_cctext_pat(RtxJw *j, RtxTmPatRaw *p) {
         } else if (rtx_cstr_eq_lit(key, "strike")) {
             if (!rtx_jw_bool(j, &b)) return 0;
             p->sc_strike = (unsigned char)b;
+            p->sc_has = 1;
+        } else if (rtx_cstr_eq_lit(key, "highlight")) {
+            if (!rtx_jw_bool(j, &b)) return 0;
+            p->sc_hl = (unsigned char)b;
             p->sc_has = 1;
         } else if (rtx_cstr_eq_lit(key, "block")) {
             char v[24];
@@ -5163,12 +5478,14 @@ static void rtx_tm_bind_bits(RtxTmRule *rule, const RtxTmPat *stable) {
         rule->sc_italic = stable->sc_italic;
         rule->sc_mono = stable->sc_mono;
         rule->sc_strike = stable->sc_strike;
+        rule->sc_hl = stable->sc_hl;
     } else {
         unsigned char bits = rtx_scope_default_bits(rule->scope);
         rule->sc_bold = (bits & RTX_SBIT_BOLD) != 0;
         rule->sc_italic = (bits & RTX_SBIT_ITALIC) != 0;
         rule->sc_mono = (bits & RTX_SBIT_MONO) != 0;
         rule->sc_strike = (bits & RTX_SBIT_STRIKE) != 0;
+        rule->sc_hl = (bits & RTX_SBIT_HL) != 0;
     }
 }
 
@@ -6833,6 +7150,9 @@ typedef struct {
     RtxTmConv *cv;
     int eof;              /* buffer end is the document end */
     int lend;             /* the current line's end is processed */
+    size_t hv_lo;         /* first line classified from a sure state: link
+                           * definitions from here on are staged */
+    int hv_set;
 } RtxMdCtx;
 
 static const RtxTmRule *rtx_md_role(const RtxTmRt *rt, int role) {
@@ -7043,6 +7363,57 @@ static int rtx_md_drop_inline(RtxMdCtx *X) {
     return rtx_md_drop(X, k);
 }
 
+/* The dest face a resolved shortcut reference plants on its `]`: the
+ * grammar's `][` reference dest (a path dest rule whose begin is `][`),
+ * so it hides, joins and unwraps as `[x][]` does. */
+static const RtxTmRule *rtx_md_ref_dest_rule(const RtxTmRt *rt) {
+    size_t k;
+    for (k = 0; k < rt->rules.len; k++) {
+        const RtxTmRule *r = &rt->rules.data[k];
+        if ((r->mark & RTX_MARK_DEST) && r->a && r->alen >= 2 && r->a[0] == ']' &&
+            r->a[1] == '[')
+            return r;
+    }
+    return NULL;
+}
+
+/* A path label (`[` / `![`) met its `]` with no `(` / `[` after it: a
+ * shortcut reference `[foo]` when a definition of `foo` is in the map —
+ * the label run plus a one-byte dest face on the `]`. 1 = planted and the
+ * frame popped, 0 = not a reference (the caller drops the frame), -1 =
+ * OOM. Every label asked is `seen`: a definition coming or going later
+ * relexes (md_refs.cch). */
+static int rtx_md_shortcut(RtxMdCtx *X, const RtxTmRule *fr) {
+    size_t k = X->sp - 1, open = X->stk_off[k], alen = X->stk_alen[k], lo, n;
+    const RtxTmRule *dr;
+    uint64_t h;
+    unsigned char pl = (unsigned char)RTX_RUN_TM;
+    if (fr->abort != ']' || (fr->mark & RTX_MARK_ARITY) != RTX_ARITY_PATH ||
+        (fr->mark & RTX_MARK_DEST))
+        return 0;
+    if (!X->snap[k].here || X->i < open + alen) return 0;
+    lo = open + alen;
+    n = X->i - lo;
+    if (n == 0 || n > 999) return 0;
+    h = rtx_mdref_hash(X->buf + lo, n);
+    if (!h) return 0;
+    rtx_mdref_see(&X->d->mdref, h);
+    if (!rtx_mdref_has(&X->d->mdref, h) && !rtx_mdref_staged(&X->d->mdref, h)) return 0;
+    dr = rtx_md_ref_dest_rule(X->rt);
+    if (!dr) return 0;
+    if (!rtx_tm_add_span(X->d, X->base + open, X->base + X->i, X->emit_from, fr->scope,
+                         rtx_tm_rule_bits(fr), rtx_tm_hints(X->rt, fr, pl) ? alen : 0, 0,
+                         pl, fr->mark, (unsigned short)rtx_tm_rule_tag(X->rt, fr)))
+        return -1;
+    if (!rtx_tm_add_span(X->d, X->base + X->i, X->base + X->i + 1, X->emit_from, dr->scope,
+                         rtx_tm_rule_bits(dr), rtx_tm_hints(X->rt, dr, pl) ? 1 : 0, 0, pl,
+                         dr->mark, (unsigned short)rtx_tm_rule_tag(X->rt, dr)))
+        return -1;
+    X->sp = k;
+    X->i++;
+    return 1;
+}
+
 /* One step of the inline / guest lex at X->i (< X->seg_hi). -1 = OOM. */
 static int rtx_md_step(RtxMdCtx *X) {
     RtxTmWalkSt *W = &X->W;
@@ -7106,7 +7477,9 @@ static int rtx_md_step(RtxMdCtx *X) {
             }
         }
         if (fr->abort && (unsigned char)buf[X->i] == fr->abort && frt == rt) {
-            rtx_md_drop(X, X->sp - 1);
+            int sc = rtx_md_shortcut(X, fr);
+            if (sc < 0) return -1;
+            if (!sc) rtx_md_drop(X, X->sp - 1);
             return 1;
         }
         if (fr->flank && frt == rt && X->sp > 1) {
@@ -7257,6 +7630,22 @@ static int rtx_md_line_spans(RtxMdCtx *X) {
             break;
         case RTX_MDB_S_REF_LABEL:
             ok = rtx_md_plant(X, RTX_MDB_ROLE_REF, lo, hi, 0, 0);
+            if (X->hv_set && !X->d->mdref.sweep_on && p->hi >= p->lo + 3) {
+                /* A link reference definition: the shortcut map's entry. */
+                RtxMdRef e = {0};
+                int t;
+                e.line = base + X->line;
+                e.llen = (uint32_t)(eol - X->line);
+                e.h = rtx_mdref_hash(X->buf + p->lo + 1, p->hi - p->lo - 3);
+                for (t = s + 1; t < L->nsp; t++) {
+                    if (L->sp[t].kind == RTX_MDB_S_REF_DEST) {
+                        e.dlo = (uint32_t)(L->sp[t].lo - X->line);
+                        e.dhi = (uint32_t)(L->sp[t].hi - X->line);
+                        break;
+                    }
+                }
+                rtx_mdref_stage_add(&X->d->mdref, &e);
+            }
             break;
         case RTX_MDB_S_REF_DEST:
         case RTX_MDB_S_REF_TITLE:
@@ -7426,6 +7815,7 @@ static void !>(CCError) rtx_md_lex_walk(RtxDoc *d, const RtxTmRt *rt, char[:] sr
         rtx_mdb_set_marp(&X->B, d->marp);
     }
     X->inl = ms && ms->inl > base ? ms->inl - base : 0;
+    rtx_mdref_stage_reset(&d->mdref);
     X->W.d = d;
     X->W.host = rt;
     X->W.buf = src.ptr;
@@ -7520,6 +7910,10 @@ static void !>(CCError) rtx_md_lex_walk(RtxDoc *d, const RtxTmRt *rt, char[:] sr
                 X->next_stride = ((base + i) / X->stride + 1) * X->stride;
             }
             X->bprev = X->B;
+            if (!X->hv_set && !(X->B.flags & (RTX_MDB_SOFT | RTX_MDB_UNSURE))) {
+                X->hv_set = 1;
+                X->hv_lo = i;
+            }
             nlp = (const char *)memchr(X->buf + i, '\n', X->n - i);
             X->eol = nlp ? (size_t)(nlp - X->buf) : X->n;
             X->nl = nlp ? X->eol + 1 : X->n;
@@ -7538,6 +7932,11 @@ static void !>(CCError) rtx_md_lex_walk(RtxDoc *d, const RtxTmRt *rt, char[:] sr
             return cc_err(CC_ERR_OUT_OF_MEMORY, "md run");
         }
     }
+    /* Link definitions: the lines this walk classified from a sure state
+     * replace what the map held there. */
+    if (X->hv_set && !d->mdref.sweep_on)
+        rtx_mdref_commit(&d->mdref, base + X->hv_lo, base + X->n);
+    rtx_mdref_stage_reset(&d->mdref);
     if (cv && cv->hit != (size_t)-1) {
         /* The old lex from here stands (its frames close there). */
         rtx_tm_ckpt_add(d, base + X->n, X->sp, stk_rule, stk_lang, stk_embed, X->pflag,
@@ -10099,6 +10498,7 @@ void !>(CCError) rtx_doc_highlight_span(RtxDoc *d, size_t lo, size_t hi) {
 static int rtx_run_same_rule(const RtxRun *a, const RtxRun *b) {
     return a->style.scope == b->style.scope && a->style.bold == b->style.bold &&
            a->style.italic == b->style.italic && a->style.mono == b->style.mono &&
+           a->style.strike == b->style.strike && a->style.hl == b->style.hl &&
            a->planter == b->planter && a->mark == b->mark && a->rule == b->rule;
 }
 
@@ -10335,7 +10735,18 @@ static int !>(CCError) rtx_doc_relex_edit(RtxDoc *d, size_t lo, size_t hi,
     return cc_ok(1);
 }
 
+static void !>(CCError) rtx_doc_reparse_edit_once(RtxDoc *d, size_t off,
+                                                  int full_markup);
+
 void !>(CCError) RtxDoc_reparse_edit(RtxDoc *d, size_t off, int full_markup) {
+    /* A re-sweep first: the relex then resolves with the map as it is. */
+    rtx_doc_mdref_update(d) !>(e) { return cc_err(e); };
+    rtx_doc_reparse_edit_once(d, off, full_markup) !>(e) { return cc_err(e); };
+    return rtx_doc_mdref_fix(d, off, 1);
+}
+
+static void !>(CCError) rtx_doc_reparse_edit_once(RtxDoc *d, size_t off,
+                                                  int full_markup) {
     size_t s, lo, hi, n, win_lo, win_hi, sec_n;
     RtxSectionKind kind, done = RTX_SEC_UNKNOWN;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
@@ -10544,6 +10955,24 @@ static int !>(CCError) rtx_doc_hl_extend(RtxDoc *d, size_t rlo, size_t rhi,
 }
 
 void !>(CCError) RtxDoc_ensure_hl(RtxDoc *d, RtxHlWin w) {
+    size_t n;
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
+    n = d->len();
+    rtx_doc_mdref_update(d) !>(e) { return cc_err(e); };
+    if (d->mdref.stale || d->mdref.npend || d->mdref.over || d->mdref.nlimbo) {
+        rtx_doc_mdref_fix(d, w.from, 0) !>(e) { return cc_err(e); };
+    }
+    rtx_doc_ensure_hl_once(d, w) !>(e) { return cc_err(e); };
+    if (d->mdref.npend || d->mdref.over || d->mdref.nlimbo) {
+        /* This lex met a definition a label it asked about names (a
+         * reference above its definition): once more, knowing it. */
+        rtx_doc_mdref_fix(d, w.from, 0) !>(e) { return cc_err(e); };
+        rtx_doc_ensure_hl_once(d, w) !>(e) { return cc_err(e); };
+    }
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_doc_ensure_hl_once(RtxDoc *d, RtxHlWin w) {
     size_t s, n, lo, hi, from, to, win_lo, win_hi, sec_n;
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     from = w.from;

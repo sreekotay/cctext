@@ -2827,9 +2827,13 @@ void !>(CCError) RtxBuf_move_edge(RtxBuf *b, int to_end, int shift,
  * list / quote containers going, Tab nests list items, typed pairs close
  * themselves, a URL pasted over a selection becomes a link, and table
  * rows / columns have explicit commands. Context comes from the line's
- * own bytes (rtx_md_line_parse) plus a window of lines around it — never
- * from the lexer — so none of this waits on a block pass. Every command
- * that writes several places is one edit group (one undo step).
+ * own bytes (rtx_md_line_parse) plus a window of lines around it, and
+ * from the block pass where it has lexed (RtxDoc_md_code_leaves): a line
+ * inside a fence, indented code, an HTML block, a math block or front
+ * matter is code — Enter keeps its indent and nothing else, Tab is a tab,
+ * pairs are the code table, a `- ` there is no list item. Where the block
+ * pass has not lexed, the lines' own fences decide (leftover). Every
+ * command that writes several places is one edit group (one undo step).
  * ------------------------------------------------------------------ */
 
 static int g_rtx_autopair = 1;
@@ -2854,6 +2858,7 @@ typedef struct {
     size_t len;  /* bytes, no newline */
     int nl;      /* a newline follows */
     int cr;      /* the line ends in `\r` (kept on every rewrite) */
+    int code;    /* block pass: 1 in a code leaf, 0 not, -1 not lexed */
     const char *s;
     RtxMdLine L;
 } RtxMeSrc;
@@ -2922,6 +2927,8 @@ static size_t rtx_me_bol(const RtxDoc *d, size_t off) {
     }
     return 0;
 }
+
+static void rtx_me_mark_code(RtxMeWin *W, const RtxDoc *d);
 
 /* Read the window and split it into lines. [lo_bol, hi) must be inside. */
 static int !>(CCError) rtx_me_load(RtxMeWin *W, const RtxDoc *d, size_t lo_bol,
@@ -2993,7 +3000,60 @@ static int !>(CCError) rtx_me_load(RtxMeWin *W, const RtxDoc *d, size_t lo_bol,
             break;
         }
     }
+    rtx_me_mark_code(W, d);
     return cc_ok(1);
+}
+
+/* Block context over the loaded lines: `code` from the block pass's code
+ * leaves; a line whose marker sits inside one is no list item / heading
+ * (its `- ` is code). */
+#define RTX_ME_LEAVES 256
+static void rtx_me_mark_code(RtxMeWin *W, const RtxDoc *d) {
+    size_t los[RTX_ME_LEAVES], his[RTX_ME_LEAVES], klo = 0, khi = 0, i, j = 0;
+    long nl;
+    for (i = 0; i < W->ns; i++) W->src[i].code = -1;
+    if (!W->ns) return;
+    nl = RtxDoc_md_code_leaves(d, W->src[0].off,
+                               W->src[W->ns - 1].off + W->src[W->ns - 1].len + 1, los, his,
+                               RTX_ME_LEAVES, &klo, &khi);
+    if (nl < 0) return;
+    for (i = 0; i < W->ns; i++) {
+        RtxMeSrc *S = &W->src[i];
+        RtxMdLine *L = &S->L;
+        size_t last = S->len ? S->off + S->len - 1 : S->off;
+        size_t mk = S->off + L->qhi + L->ind;
+        size_t k;
+        if (S->off < klo || last >= khi) continue;
+        while (j < (size_t)nl && his[j] <= S->off) j++;
+        S->code = 0;
+        if (L->qdepth > 0 && j < (size_t)nl && los[j] <= last) {
+            /* In a code leaf a `>` is a quote only where the block pass
+             * planted one (a fence inside a quote); else it is code. */
+            size_t q = 0;
+            while (q < L->n && (S->s[q] == ' ' || S->s[q] == '\t')) q++;
+            if (!RtxDoc_md_role_covers(d, S->off + q, RTX_MDB_ROLE_QUOTE)) {
+                L->qhi = 0;
+                L->qdepth = 0;
+                L->ind = q;
+                mk = S->off + q;
+            }
+        }
+        for (k = j; k < (size_t)nl && los[k] <= last; k++) {
+            if (last < his[k]) S->code = 1;
+            if (mk >= los[k] && mk < his[k] && mk <= last) {
+                size_t q;
+                int blank = 1;
+                L->kind = 0;
+                L->task = 0;
+                L->heading = 0;
+                L->mlo = L->mhi = L->chi = L->clo = L->qhi + L->ind;
+                for (q = L->qhi; q < L->n; q++) {
+                    if (S->s[q] != ' ' && S->s[q] != '\t') blank = 0;
+                }
+                L->blank = blank;
+            }
+        }
+    }
 }
 
 static long rtx_me_line_of(const RtxMeWin *W, size_t off) {
@@ -3296,6 +3356,9 @@ static int rtx_me_in_fence(const RtxMeWin *W, size_t line, int *open) {
     char fch = 0;
     size_t fn = 0;
     if (open) *open = 0;
+    /* The block pass knows (fence, indented code, HTML, math, front
+     * matter, opened anywhere it lexed); else the window's own fences. */
+    if (line < W->ns && W->src[line].code >= 0) return W->src[line].code;
     for (i = 0; i < line && i < W->ns; i++) {
         const RtxMdLine *L = &W->src[i].L;
         if (fch) {
@@ -3473,7 +3536,9 @@ static int !>(CCError) rtx_buf_md_enter(RtxBuf *b, int soft) {
     hcol = hi - W.src[line].off;
     if (pcol > L->n) pcol = L->n;
     if (hcol > L->n) hcol = L->n;
-    /* Fenced code: keep this line's indent (quote prefix included). */
+    /* Code (a fence, indented code, HTML, math, front matter): keep this
+     * line's indent (quote prefix included) — a list item that opens a
+     * fence indents to its content column. Nothing else. */
     if (rtx_me_in_fence(&W, line, &opens) || opens) {
         size_t k = 0;
         const char *s = W.src[line].s;
@@ -3481,6 +3546,9 @@ static int !>(CCError) rtx_buf_md_enter(RtxBuf *b, int soft) {
                (s[k] == ' ' || s[k] == '\t' || (k < L->qhi))) {
             pre[k] = s[k];
             k++;
+        }
+        if (L->kind && k <= L->mlo && L->chi <= pcol && L->chi < sizeof pre - 2) {
+            while (k < L->chi) pre[k++] = ' ';
         }
         rtx_me_drop(&W);
         {
@@ -3778,21 +3846,39 @@ static int !>(CCError) rtx_buf_autopair(RtxBuf *b, char ch) {
     if (!memchr(tab, ch, cc_slice_cstr(tab).len) && !memchr("()[]{}\"'`", ch, 9))
         return cc_ok(0);
     if (md) {
-        /* Inside a fence, code pairs. */
-        RtxMeWin W = {0};
-        size_t bol = rtx_me_bol(d, d->sel_lo());
-        int ok, in = 0;
-        if (bol != (size_t)-1) {
-            ok = rtx_me_load(&W, d, bol, bol) !>(e) { return cc_err(e); };
-            if (ok) {
-                long lt = rtx_me_line_of(&W, bol);
-                in = lt >= 0 && rtx_me_in_fence(&W, (size_t)lt, NULL);
-                rtx_me_drop(&W);
+        /* Inside a code leaf, code pairs: the block pass at the caret, or
+         * (not lexed there) the window's own fences. */
+        int in = RtxDoc_md_leaf_at(d, d->sel_lo());
+        if (in < 0) {
+            RtxMeWin W = {0};
+            size_t bol = rtx_me_bol(d, d->sel_lo());
+            int ok;
+            in = 0;
+            if (bol != (size_t)-1) {
+                ok = rtx_me_load(&W, d, bol, bol) !>(e) { return cc_err(e); };
+                if (ok) {
+                    long lt = rtx_me_line_of(&W, bol);
+                    in = lt >= 0 && rtx_me_in_fence(&W, (size_t)lt, NULL);
+                    rtx_me_drop(&W);
+                }
             }
         }
         if (in) {
             tab = "()[]{}\"\"''``";
             md = 0;
+        } else if (!d->has_sel() && RtxDoc_md_code_span_at(d, d->caret)) {
+            /* Inside `code` or $math$: no new pairs; stepping over the
+             * closer this pair typed still works. */
+            size_t c = d->caret;
+            if (rtx_ap_valid(b) && c < d->len() && rtx_me_byte(d, c) == ch &&
+                c < b->ap_hi) {
+                d->break_coalesce();
+                d->caret = c + 1;
+                d->sel_anchor = c + 1;
+                rtx_ap_note(b, c + 1, b->ap_hi);
+                return cc_ok(1);
+            }
+            return cc_ok(0);
         }
     }
     for (i = 0; tab[i] && tab[i + 1]; i += 2) {
@@ -3923,7 +4009,8 @@ void !>(CCError) RtxBuf_paste_text(RtxBuf *b, char[:] bytes) {
     e = bytes.len;
     while (s < e && rtx_ap_ws(bytes.ptr[s])) s++;
     while (e > s && rtx_ap_ws(bytes.ptr[e - 1])) e--;
-    if (rtx_buf_md_ok(b) && d->has_sel() &&
+    if (rtx_buf_md_ok(b) && d->has_sel() && RtxDoc_md_leaf_at(d, d->sel_lo()) <= 0 &&
+        !RtxDoc_md_code_span_at(d, d->sel_lo() + 1) &&
         rtx_paste_is_url(bytes.ptr + s, e - s)) {
         size_t lo = d->sel_lo(), hi = d->sel_hi(), k;
         int one = hi - lo <= RTX_ME_LINE_MAX;
@@ -4080,6 +4167,8 @@ static int !>(CCError) rtx_tbl_find(const RtxBuf *b, RtxMeTable *T) {
     int ok;
     *T = (RtxMeTable){0};
     if (bol == (size_t)-1) return cc_ok(0);
+    /* Pipe rows in a fence / code block are code, not a table. */
+    if (RtxDoc_md_leaf_at(d, d->caret) > 0) return cc_ok(0);
     ok = rtx_me_load(&T->W, d, bol, bol) !>(e) { return cc_err(e); };
     if (!ok) return cc_ok(0);
     if (!rtx_md_table_cover(T->W.buf, T->W.n, bol - T->W.lo, &T->t)) {
@@ -4630,7 +4719,11 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
         if (b->doc.index_covers(rec))
             cl = b->line_of(rec) !>(e) { return cc_err(e); };
     }
-    if (!rtx_layout_soft_wrap(&b->layout)) {
+    /* Unwrapped lines are one screen row each — except a Rich table's
+     * records, whose fitted cells wrap (taller rows): those go by the
+     * rows' heights below. */
+    if (!rtx_layout_soft_wrap(&b->layout) &&
+        !(b->layout.rich && b->layout.md_ntab > 0)) {
         b->top_wrap = 0;
         if (cl < b->top) b->top = cl;
         if (cl >= b->top + (size_t)vis) b->top = cl - (size_t)vis + 1;
@@ -4666,13 +4759,13 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
         size_t i;
         int rh;
         for (i = b->top_wrap; i < ri && i < b->layout.rows.len; i++) {
-            int h = (int)(b->layout.rows.data[i].height + 0.0001);
+            int h = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i]);
             if (h < 1) h = 1;
             screen += (size_t)h;
         }
         rh = 1;
         if (ri < b->layout.rows.len) {
-            rh = (int)(b->layout.rows.data[ri].height + 0.0001);
+            rh = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[ri]);
             if (rh < 1) rh = 1;
         }
         /* Row starts on-screen (may spill past the bottom). */
@@ -4683,13 +4776,13 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
         /* Scroll so `ri` sits near the bottom of the pane by screen height. */
         size_t screen = 0;
         size_t i = ri < b->layout.rows.len ? ri : b->layout.rows.len - 1;
-        int h = (int)(b->layout.rows.data[i].height + 0.0001);
+        int h = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i]);
         if (h < 1) h = 1;
         screen = (size_t)h;
         while (i > 0 && screen < (size_t)vis) {
             int nh;
             i--;
-            nh = (int)(b->layout.rows.data[i].height + 0.0001);
+            nh = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i]);
             if (nh < 1) nh = 1;
             if (screen + (size_t)nh > (size_t)vis && screen > 0) {
                 i++;
@@ -5227,8 +5320,9 @@ void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int 
     nlines = b->line_count();
     if (b->top >= nlines && nlines) b->top = nlines - 1;
     want = (size_t)vis + 8;
-    /* Tall MD wrap rows consume multiple screen slots; fill extra vis rows. */
-    if (rtx_layout_soft_wrap(&b->layout) && b->layout.rich)
+    /* Tall MD table rows (fitted cells wrap, soft wrap or not) consume
+     * several screen slots; fill extra vis rows. */
+    if (b->layout.rich)
         want = (size_t)vis * 3 + 8;
     avail = (b->top < nlines) ? (nlines - b->top) : 0;
     need = want < avail ? want : avail;
@@ -6536,7 +6630,7 @@ int rtx_buf_scroll_rel_row(const RtxBuf *b, int vis) {
     if (caret < b->layout.rows.data[i0].byte_start) return 0;
     for (i = i0; i < b->layout.rows.len && screen < (size_t)vis; i++) {
         const RtxVisRow *row = &b->layout.rows.data[i];
-        int h = (int)(row->height + 0.0001);
+        int h = rtx_layout_row_lines(&b->layout, row);
         if (h < 1) h = 1;
         if (caret >= row->byte_start && caret <= row->byte_start + row->byte_len) {
             int at = (int)screen;
@@ -6636,14 +6730,14 @@ RtxScrollRail !>(RtxIndexErr) RtxBuf_scroll_rail(const RtxBuf *b, int vis_rows) 
         size_t i0 = b->top_wrap < b->layout.rows.len ? b->top_wrap : 0;
         size_t i1 = i0;
         size_t shown = 0;
-        int h0 = (int)(b->layout.rows.data[i0].height + 0.0001);
+        int h0 = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i0]);
         if (h0 < 1) h0 = 1;
         shown = (size_t)h0;
         r.pos = b->layout.rows.data[i0].byte_start;
         while (i1 + 1 < b->layout.rows.len && shown < (size_t)vis_rows) {
             int h;
             i1++;
-            h = (int)(b->layout.rows.data[i1].height + 0.0001);
+            h = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i1]);
             if (h < 1) h = 1;
             shown += (size_t)h;
         }

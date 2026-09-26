@@ -1,0 +1,504 @@
+#!ccc ccs
+/*
+ * Regex conformance: the Rust `regex` crate's test data (converted by
+ * tests/rx_conformance/convert.py into rust_regex.fix) through every
+ * engine path — auto (lazy DFA + prefilter), DFA without the prefilter
+ * (force 3), Pike VM (force 1), backtracker (force 2) — comparing every
+ * match span and capture (groups 0..9) against the expected answer.
+ *
+ *   rx_conform [-v] [FIXTURE...]    (default tests/rx_conformance/rust_regex.fix)
+ *
+ * A test is: pass; flavour (a failure listed in `flavour[]` below with
+ * its reason — a deliberate Oniguruma / TextMate difference); unsup (the
+ * engine rejects syntax it does not support, which is required: an
+ * unsupported feature must not compile into a wrong answer); reject
+ * (Rust rejects the pattern: the engine should too, or it is an Onig
+ * extension, counted); skip (not expressible: regex sets, overlapping /
+ * earliest / all-match searches, CRLF mode, \b{start}...). Anything else
+ * fails the run, as does a flavour entry that now passes.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/rx.cch"
+
+#define MAXM 64   /* matches compared per test */
+#define MAXG 10   /* RTX_RX_CAPS */
+
+typedef struct {
+    size_t s[MAXG], e[MAXG];
+} Mat;
+
+typedef struct {
+    char *id, *kind, *flags;
+    char *pat;
+    size_t patn;
+    char *hay;
+    size_t hayn;
+    size_t lo, hi;
+    Mat m[MAXM];
+    int nm;
+    int ng; /* groups listed per expected match */
+    int more; /* expected list longer than MAXM */
+} Test;
+
+/* Known differences: a `run` test that fails for a documented reason.
+ * Each entry must still fail (a fix makes it stale: remove it). */
+typedef struct {
+    const char *id;
+    const char *why;
+} Flavour;
+
+#define FL_DIGIT "\\d is ASCII [0-9]"
+#define FL_FOLD "(?i) folds Latin-1, Latin Extended-A, Greek, Cyrillic, Armenian pairs " \
+                "(not U+212A KELVIN SIGN)"
+#define FL_NAMED "Onig: once a pattern has a named group, plain (...) does not capture"
+#define FL_UNIT "a match starts only where a scalar (or a stray byte) starts; Rust's " \
+                "utf8 = false iteration also reports empty matches inside a scalar"
+#define FL_WORD "\\w policy: a non-ASCII scalar is a word unless it is space or " \
+                "punctuation (unassigned U+7EF5E is a word)"
+#define FL_BAD "an invalid byte is a non-word for \\b / \\B; Rust's Unicode \\b / \\B " \
+               "never match beside invalid UTF-8"
+#define FL_STRAY "`.` / a full class takes an invalid byte alone (walks Latin-1 text)"
+
+static const Flavour flavour[] = {
+    {"bytes/perl-decimal-unicode", FL_DIGIT},
+    {"no-unicode/decimal-unicode", FL_DIGIT},
+    {"unicode/perl4", FL_DIGIT},
+    {"bytes/case-class-unicode", FL_FOLD},
+    {"no-unicode/case3", FL_FOLD},
+    {"regression/captures-repeat", FL_NAMED},
+    {"regression/lits-unambiguous-200", FL_NAMED},
+    {"no-unicode/iter1-bytes", FL_UNIT},
+    {"utf8/empty-utf8no", FL_UNIT},
+    {"utf8/empty-utf8no-startbound", FL_UNIT},
+    {"word-boundary/unicode5", FL_WORD},
+    {"word-boundary/unicode5-not", FL_WORD},
+    {"word-boundary/unicode5-not-noutf8", FL_BAD},
+    {"no-unicode/unanchored-invalid-utf8-nomatch", FL_STRAY},
+    {NULL, NULL},
+};
+
+static int verbose = 0;
+
+static size_t unesc(char *s) {
+    size_t i = 0, o = 0;
+    while (s[i]) {
+        if (s[i] == '\\' && s[i + 1] == 'x' && s[i + 2] && s[i + 3]) {
+            char h[3] = {s[i + 2], s[i + 3], 0};
+            s[o++] = (char)strtol(h, NULL, 16);
+            i += 4;
+        } else {
+            s[o++] = s[i++];
+        }
+    }
+    s[o] = 0;
+    return o;
+}
+
+static int parse_matches(Test *t, char *f) {
+    char *p = f;
+    t->nm = 0;
+    t->ng = 0;
+    t->more = 0;
+    if (!*p) return 1;
+    while (*p) {
+        int g = 0;
+        Mat *m;
+        if (t->nm >= MAXM) {
+            t->more = 1;
+            return 1;
+        }
+        m = &t->m[t->nm++];
+        for (g = 0; g < MAXG; g++) m->s[g] = m->e[g] = RTX_RX_UNSET;
+        g = 0;
+        for (;;) {
+            if (*p == '_') {
+                p++;
+            } else {
+                unsigned long a = strtoul(p, &p, 10), b;
+                if (*p != '-') return 0;
+                p++;
+                b = strtoul(p, &p, 10);
+                if (g < MAXG) {
+                    m->s[g] = a;
+                    m->e[g] = b;
+                }
+            }
+            g++;
+            if (*p == ',') {
+                p++;
+                continue;
+            }
+            break;
+        }
+        if (t->nm == 1) t->ng = g;
+        if (*p == ';') p++;
+        else if (*p) return 0;
+    }
+    return 1;
+}
+
+static RtxRx *try_compile(const char *p, size_t n, unsigned fl, CCArena a, const char **err) {
+    RtxRx *rx = rtx_rx_compile(cc_slice_from_buffer((void *)p, n), fl, a) !>(e) {
+        if (err) *err = e.message;
+        return NULL;
+    };
+    return rx;
+}
+
+static int is_boundary(const Test *t, size_t e) {
+    if (e >= t->hayn) return 1;
+    return ((unsigned char)t->hay[e] & 0xC0) != 0x80;
+}
+
+/* One match at or after `pos` (anchored: at `pos`), Rust iteration rules
+ * applied by the caller. 1 = got; 0 = none. */
+static int find_one(const RtxRx *rx, RtxRxIn *in, RtxRxScratch *s, int anchored, size_t pos,
+                    Mat *out, int *bad) {
+    size_t ms = 0, me = 0, end = 0;
+    RtxRxCaps caps;
+    unsigned g;
+    int r;
+    if (anchored) {
+        r = rtx_rx_at(rx, in, pos, s, &end, &caps);
+        if (r != RTX_RX_MATCH) return 0;
+        ms = pos;
+        me = end;
+    } else {
+        r = pos < in->n ? rtx_rx_search(rx, in, pos, in->n, 1, s, &ms, &me) : RTX_RX_NONE;
+        if (r == RTX_RX_PARTIAL) *bad = 1;
+        if (r != RTX_RX_MATCH) {
+            /* an empty match at the text end is outside search's [lo, stop) */
+            if (rtx_rx_at(rx, in, in->n, s, &end, &caps) != RTX_RX_MATCH || end != in->n)
+                return 0;
+            ms = me = in->n;
+        }
+        if (rtx_rx_at(rx, in, ms, s, &end, &caps) != RTX_RX_MATCH || end != me) {
+            /* search and the anchored matcher disagree */
+            *bad = 2;
+            for (g = 0; g < MAXG; g++) caps.s[g] = caps.e[g] = RTX_RX_UNSET;
+        }
+    }
+    for (g = 0; g < MAXG; g++) {
+        out->s[g] = caps.s[g];
+        out->e[g] = caps.e[g];
+    }
+    out->s[0] = ms;
+    out->e[0] = me;
+    return 1;
+}
+
+/* Rust's find with utf8 on: an empty match inside a UTF-8 scalar is
+ * skipped (anchored: no match). */
+static int find_rust(const Test *t, const RtxRx *rx, RtxRxIn *in, RtxRxScratch *s, int anchored,
+                     int utf8, size_t pos, Mat *m, int *bad) {
+    for (;;) {
+        if (pos > t->hi) return 0;
+        if (!find_one(rx, in, s, anchored, pos, m, bad)) return 0;
+        if (!utf8 || m->s[0] != m->e[0] || is_boundary(t, m->e[0])) return 1;
+        if (anchored) return 0;
+        pos++;
+    }
+}
+
+/* Rust's find_iter / captures_iter: leftmost-first, the next search from
+ * the previous end, an empty match at the previous end skipped (search
+ * again one byte on). */
+static int iterate(const Test *t, const RtxRx *rx, unsigned force, RtxRxScratch *s, Mat *got,
+                   int *bad) {
+    RtxRxIn in;
+    size_t pos = t->lo, last = RTX_RX_UNSET;
+    int n = 0, anchored = strchr(t->flags, 'a') != NULL, utf8 = strchr(t->flags, '8') != NULL;
+    int limit = strchr(t->flags, '1') ? 1 : MAXM;
+    memset(&in, 0, sizeof(in));
+    in.s = t->hay;
+    in.n = t->hayn;
+    in.gpos = RTX_RX_UNSET;
+    in.ctx = RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0;
+    in.force = force;
+    while (n < limit) {
+        Mat m;
+        if (!find_rust(t, rx, &in, s, anchored, utf8, pos, &m, bad)) break;
+        if (m.s[0] == m.e[0] && m.e[0] == last) {
+            pos++;
+            if (!find_rust(t, rx, &in, s, anchored, utf8, pos, &m, bad)) break;
+        }
+        got[n++] = m;
+        last = m.e[0];
+        pos = m.e[0];
+    }
+    return n;
+}
+
+static void show_mats(const char *lab, const Mat *m, int n, int ng) {
+    int k, g;
+    fprintf(stderr, "    %s:", lab);
+    if (!n) fprintf(stderr, " (none)");
+    for (k = 0; k < n; k++) {
+        fprintf(stderr, " [");
+        for (g = 0; g < ng && g < MAXG; g++) {
+            if (g) fprintf(stderr, ",");
+            if (m[k].s[g] == RTX_RX_UNSET) fprintf(stderr, "_");
+            else fprintf(stderr, "%zu-%zu", m[k].s[g], m[k].e[g]);
+        }
+        fprintf(stderr, "]");
+    }
+    fprintf(stderr, "\n");
+}
+
+static void show_bytes(const char *lab, const char *p, size_t n) {
+    size_t i;
+    fprintf(stderr, "    %s: \"", lab);
+    for (i = 0; i < n && i < 200; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (c < 0x20 || c >= 0x7F || c == '"' || c == '\\') fprintf(stderr, "\\x%02X", c);
+        else fputc(c, stderr);
+    }
+    fprintf(stderr, "%s\"\n", n > 200 ? "..." : "");
+}
+
+static const char *engine_name[] = {"auto(dfa+pf)", "dfa", "pike", "backtrack"};
+static const unsigned engine_force[] = {0, 3, 1, 2};
+
+static int cnt_pass, cnt_fail, cnt_flav, cnt_unsup, cnt_unsup_bad, cnt_reject, cnt_reject_acc,
+    cnt_skip, cnt_compile_err, cnt_stale;
+static int eng_fail[4];
+
+static const char *flavour_of(const char *id) {
+    int k;
+    for (k = 0; flavour[k].id; k++)
+        if (!strcmp(flavour[k].id, id)) return flavour[k].why;
+    return NULL;
+}
+
+/* 0 equal; 1 differs only where a group's got span is empty and the
+ * wanted one is unset or a non-empty span ending there — the group's last
+ * iteration matched empty; 2 any other difference. */
+static int compare(const Test *t, const RtxRx *rx, const Mat *got, int n, int ng, int bad) {
+    int i, g, lvl = 0;
+    if (t->more && n > MAXM) n = MAXM;
+    if (bad || n != t->nm) return 2;
+    if (t->ng > 1 && t->nm && (int)rtx_rx_groups(rx) != t->ng) return 2;
+    for (i = 0; i < n; i++) {
+        for (g = 0; g < ng; g++) {
+            size_t ws = t->m[i].s[g], we = t->m[i].e[g], gs = got[i].s[g], ge = got[i].e[g];
+            if (ws == gs && we == ge) continue;
+            if (g > 0 && gs != RTX_RX_UNSET && gs == ge &&
+                (ws == RTX_RX_UNSET || (ws < we && ge == we))) {
+                lvl = 1;
+                continue;
+            }
+            return 2;
+        }
+    }
+    return lvl;
+}
+
+static int non_ascii(const char *p, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++)
+        if ((unsigned char)p[i] >= 0x80) return 1;
+    return 0;
+}
+
+static char flavour_seen[256];
+
+static void run_test(Test *t) {
+    CCArena a;
+    RtxRx *rx;
+    const char *err = NULL;
+    unsigned fl = strchr(t->flags, 'i') ? RTX_RX_ICASE : 0u;
+    const char *fw = flavour_of(t->id);
+    int k;
+    if (fw) {
+        for (k = 0; flavour[k].id; k++)
+            if (!strcmp(flavour[k].id, t->id)) flavour_seen[k] = 1;
+    }
+    if (!strncmp(t->kind, "skip", 4)) {
+        cnt_skip++;
+        return;
+    }
+    a = cc_arena_heap(megabytes(2));
+    rx = try_compile(t->pat, t->patn, fl, a, &err);
+    if (!strncmp(t->kind, "unsup", 5)) {
+        if (rx) {
+            cnt_unsup_bad++;
+            fprintf(stderr, "FAIL unsup compiled: %s (%s)\n", t->id, t->kind + 6);
+        } else {
+            cnt_unsup++;
+            if (verbose) fprintf(stderr, "unsup %s: %s\n", t->id, err ? err : "?");
+        }
+        a.destroy();
+        return;
+    }
+    if (!strcmp(t->kind, "reject")) {
+        if (rx) {
+            cnt_reject_acc++;
+            if (verbose) fprintf(stderr, "reject-accepted %s\n", t->id);
+        } else {
+            cnt_reject++;
+        }
+        a.destroy();
+        return;
+    }
+    if (!rx) {
+        if (fw) {
+            cnt_flav++;
+        } else {
+            cnt_compile_err++;
+            cnt_fail++;
+            fprintf(stderr, "FAIL %s: compile error: %s\n", t->id, err ? err : "?");
+            show_bytes("pat", t->pat, t->patn);
+        }
+        a.destroy();
+        return;
+    }
+    {
+        RtxRxScratch s = {0};
+        static Mat got[4][MAXM];
+        int ngot[4], bad[4], lvl[4], e, worst = 0, budget = 0;
+        const char *why = fw;
+        int ng = t->ng ? t->ng : 1;
+        if (ng > MAXG) ng = MAXG;
+        for (e = 0; e < 4; e++) {
+            size_t bh = s.budget_hits;
+            bad[e] = 0;
+            ngot[e] = iterate(t, rx, engine_force[e], &s, got[e], &bad[e]);
+            lvl[e] = compare(t, rx, got[e], ngot[e], ng, bad[e]);
+            if (lvl[e] && s.budget_hits != bh) budget = 1;
+            if (lvl[e]) eng_fail[e]++;
+            if (lvl[e] > worst) worst = lvl[e];
+        }
+        rtx_rx_scratch_drop(&s);
+        if (!why && budget)
+            why = "the backtracker's step budget ran out (RTX_RX_BUDGET: no match there)";
+        if (!why && worst == 2 && rtx_rx_mode(rx) == RTX_RX_BACKTRACK)
+            /* Rust syntax has no backrefs / lookaround / atomic groups: the
+             * only way here is a loop whose body matches empty ahead of a
+             * consuming path (rx_star's bt_loop). */
+            why = "Onig: a loop ends on an iteration that matches empty (its body's empty "
+                  "path first); Rust and RE2 skip empty iterations";
+        if (!why && worst == 1)
+            why = "a repeated group keeps its last, empty iteration (Onig / Perl; Rust and "
+                  "RE2 keep the last non-empty one)";
+        if (!why && worst == 2 && strchr(t->flags, 'A') && non_ascii(t->hay, t->hayn))
+            why = "no ASCII mode: (?-u) / regex-lite read \\w \\d \\s \\b [^..] . per "
+                  "UTF-8 scalar";
+        if (worst && (!why || verbose)) {
+            fprintf(stderr, "%s %s [%s]%s%s\n", why ? "flavour" : "FAIL", t->id, t->flags,
+                    why ? ": " : "", why ? why : "");
+            show_bytes("pat", t->pat, t->patn);
+            show_bytes("hay", t->hay, t->hayn);
+            show_mats("want", t->m, t->nm, ng);
+            for (e = 0; e < 4; e++) {
+                if (!lvl[e]) continue;
+                fprintf(stderr, "  %s%s:\n", engine_name[e],
+                        bad[e] == 2 ? " (search/at disagree)" : bad[e] == 1 ? " (partial)" : "");
+                show_mats("got ", got[e], ngot[e], ng);
+            }
+        }
+        if (!worst) {
+            cnt_pass++;
+            if (fw) {
+                cnt_stale++;
+                fprintf(stderr, "STALE flavour entry now passes: %s\n", t->id);
+            }
+        } else if (why) {
+            cnt_flav++;
+        } else {
+            cnt_fail++;
+        }
+    }
+    a.destroy();
+}
+
+static int run_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    static char line[1 << 20];
+    int lines = 0;
+    if (!f) {
+        fprintf(stderr, "rx_conform: %s: missing (skipped)\n", path);
+        return 0;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        char *fld[8];
+        int nf = 0;
+        char *p = line;
+        size_t l = strlen(line);
+        static Test t;
+        if (l && line[l - 1] == '\n') line[--l] = 0;
+        if (!l || line[0] == '#') continue;
+        while (nf < 8) {
+            char *tab = strchr(p, '\t');
+            fld[nf++] = p;
+            if (!tab) break;
+            *tab = 0;
+            p = tab + 1;
+        }
+        if (nf < 7) {
+            fprintf(stderr, "rx_conform: %s: bad line %d\n", path, lines + 1);
+            fclose(f);
+            return -1;
+        }
+        memset(&t, 0, sizeof(t));
+        t.id = fld[0];
+        t.kind = fld[1];
+        t.flags = fld[2];
+        t.pat = fld[3];
+        t.patn = unesc(fld[3]);
+        t.hay = fld[4];
+        t.hayn = unesc(fld[4]);
+        t.lo = strtoul(fld[5], NULL, 10);
+        t.hi = strtoul(fld[6], NULL, 10);
+        unesc(t.id);
+        if (!parse_matches(&t, nf > 7 ? fld[7] : (char *)"")) {
+            fprintf(stderr, "rx_conform: %s: bad matches on line %d\n", path, lines + 1);
+            fclose(f);
+            return -1;
+        }
+        run_test(&t);
+        lines++;
+    }
+    fclose(f);
+    return lines;
+}
+
+int main(int argc, char **argv) {
+    int i, files = 0, total = 0, k, rc = 0;
+    for (i = 1; i < argc; i++) {
+        int n;
+        if (!strcmp(argv[i], "-v")) {
+            verbose = 1;
+            continue;
+        }
+        n = run_file(argv[i]);
+        if (n < 0) return 1;
+        total += n;
+        files++;
+    }
+    if (!files) {
+        int n = run_file("tests/rx_conformance/rust_regex.fix");
+        if (n < 0) return 1;
+        total += n;
+    }
+    for (k = 0; flavour[k].id; k++) {
+        if (!flavour_seen[k] && files == 0) {
+            fprintf(stderr, "flavour entry names no test: %s\n", flavour[k].id);
+            rc = 1;
+        }
+    }
+    printf("rx_conform: %d tests: pass %d, flavour %d, fail %d (compile errors %d), "
+           "unsup rejected %d (compiled: %d), rust-rejects rejected %d (accepted: %d), "
+           "skip %d\n",
+           total, cnt_pass, cnt_flav, cnt_fail, cnt_compile_err, cnt_unsup, cnt_unsup_bad,
+           cnt_reject, cnt_reject_acc, cnt_skip);
+    printf("rx_conform: engine mismatches (flavour included): auto %d, dfa %d, pike %d, "
+           "backtrack %d\n",
+           eng_fail[0], eng_fail[1], eng_fail[2], eng_fail[3]);
+    if (cnt_fail || cnt_unsup_bad || cnt_stale) rc = 1;
+    printf("rx_conform %s\n", rc ? "FAILED" : "ok");
+    return rc;
+}

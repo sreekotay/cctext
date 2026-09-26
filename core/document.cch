@@ -13,6 +13,7 @@
 #include "scope.cch"
 #include "rx.cch"
 #include "md_block.cch"
+#include "md_refs.cch"
 
 /* CODE and MARKUP are both lexed (TM / spike) and keep scope in style_at.
  * MARKUP is a grammar whose JSON declares `"cctext": { "kind": "markup" }`;
@@ -103,6 +104,7 @@ typedef struct {
     unsigned italic : 1;
     unsigned mono : 1;
     unsigned strike : 1;
+    unsigned hl : 1;     /* `==highlight==`: a highlight background */
     RtxScope scope;
 } RtxStyle;
 
@@ -330,6 +332,14 @@ typedef struct {
     int live;              /* 0: no edit since gen0 */
 } RtxEditSpan;
 
+/* Derived values (docs/workbook.md): an owner that paints computed text in
+ * place of byte spans (a workbook's formula cells and calc expressions).
+ * NULL on every other document, so each RtxDoc_derived_* query is one
+ * compare there. The owner (core/wb.ccs) installs it; the doc forwards
+ * every edit (`note`, the same (at, erased, inserted) the edit span gets)
+ * and destroys it with the document. */
+struct RtxDerived;
+
 typedef struct {
     RtxPieceTree tree;     /* document epoch: page store + nodes */
     CCArena session;       /* path + hist; lives until close */
@@ -372,7 +382,35 @@ typedef struct {
     int marp;               /* the last Markdown lex read `marp: true` front
                              * matter (RtxDoc_marp); an edit that flips it
                              * reparses */
+    /* Markdown link reference definitions (md_refs.cch): staged by the
+     * block pass, shifted by edits; outlives the analysis epoch. */
+    RtxMdRefs mdref;
+    struct RtxDerived *derived; /* workbook values; NULL = not a workbook */
 } RtxDoc;
+
+typedef struct RtxDerived {
+    void *ctx;
+    /* One replace: old [at, at + erased) is now [at, at + inserted). */
+    void (*note)(void *ctx, size_t at, size_t erased, size_t inserted);
+    /* Span [lo, hi) holding `off` (incl: `off == hi` counts too) and its
+     * value text in g (at most cap - 1 bytes; *gn). 0 = no span there. */
+    int (*at)(void *ctx, const RtxDoc *d, size_t off, int incl, size_t *lo,
+              size_t *hi, char *g, size_t cap, size_t *gn);
+    /* Span edges in (lo, hi), unsorted; (size_t)-1 past cap. */
+    size_t (*edges)(void *ctx, const RtxDoc *d, size_t lo, size_t hi,
+                    size_t *out, size_t cap);
+    /* Spans whose value changed at the last recalc; (size_t)-1 = more
+     * than cap (or a rebuild): relay everything. */
+    size_t (*changed)(void *ctx, const RtxDoc *d, size_t *lo, size_t *hi,
+                      size_t cap);
+    int (*any)(void *ctx, const RtxDoc *d);
+    void (*destroy)(void *ctx);
+} RtxDerived;
+
+int RtxDoc_derived_at(const RtxDoc *d, size_t off, int incl, size_t *lo,
+                      size_t *hi, char *g, size_t cap, size_t *gn);
+size_t RtxDoc_derived_changed(const RtxDoc *d, size_t *lo, size_t *hi,
+                              size_t cap);
 
 static inline size_t RtxDoc_len(const RtxDoc *d) {
     return d ? RtxPieceTree_len(&d->tree) : 0;
@@ -601,6 +639,22 @@ const char *RtxDoc_mark_apply(const RtxDoc *d, size_t off);
  * heading, quote, list …), 0 when none. Reads the runs the lex planted:
  * a table classify asks it so a `|` row inside a fence is no table. */
 int RtxDoc_md_block_at(const RtxDoc *d, size_t off);
+/* Editing context from the block pass (md_edit): the code leaf (fence,
+ * indented code, HTML block, math block, front matter: RTX_MDB_ROLE_*)
+ * holding `off`, 0 outside one, -1 when the block pass has not lexed
+ * there (the whole document, or the live window lex) — the caller falls
+ * back to its own line reading. A leaf left open at the document's end
+ * holds the end offset too. */
+int RtxDoc_md_leaf_at(const RtxDoc *d, size_t off);
+/* The code leaves over [lo, hi) as intervals (sorted, merged; at most
+ * `cap`), clipped to the known range [*klo, *khi). -1: none known. */
+long RtxDoc_md_code_leaves(const RtxDoc *d, size_t lo, size_t hi, size_t *los,
+                           size_t *his, size_t cap, size_t *klo, size_t *khi);
+/* A block-pass run of `role` (RTX_MDB_ROLE_*) covers `off`. */
+int RtxDoc_md_role_covers(const RtxDoc *d, size_t off, int role);
+/* A caret at `off` sits inside an inline code span or inline math (after
+ * its opener, at or before its closer). */
+int RtxDoc_md_code_span_at(const RtxDoc *d, size_t off);
 /* Outline: headings whose run starts in [lo, hi), in order — the level
  * (ATX `#` count, setext 1 / 2) and the title bytes. Reads the runs of
  * the lexed window only (no index, no lex). Returns the count written
@@ -616,6 +670,11 @@ size_t RtxDoc_outline(const RtxDoc *d, size_t lo, size_t hi, RtxOutlineEnt *out,
 /* Dest content (path) or pair interior (wrapped autolink). 1 if `off` is
  * on a followable mark. */
 int RtxDoc_link_target(const RtxDoc *d, size_t off, size_t *lo, size_t *hi);
+/* Link reference: label bytes [llo, lhi) → its definition's destination
+ * [lo, hi) (doc offsets, `<>` stripped) from the definition map
+ * (md_refs.cch). 0 when the map has no such label. A shortcut `[x]`,
+ * collapsed `[x][]` and full `[x][y]` reference follow through this. */
+int RtxDoc_ref_target(const RtxDoc *d, size_t llo, size_t lhi, size_t *lo, size_t *hi);
 /* Markup lens / pair arity (docs/mark_arity.md). Not a second write —
  * one `replace`, or one edit group (one undo step) when it pulls in
  * partner hints outside [lo, hi). Rich pane edit paths call this via
@@ -663,7 +722,7 @@ typedef @typeview Layout on RtxDoc {
        read_at, scratch_span, style_at, style_next, style_cur, style_cur_next,
        mark_edges, hint_at, mark_at,
        has_marks, markup_near, hint_next, dest_at, path_at, section_at, ensure_hl,
-       md_block_at, outline,
+       md_block_at, outline, derived_at,
        fold_covers, edit_stamp;
 } *RtxDocLayout;
 
