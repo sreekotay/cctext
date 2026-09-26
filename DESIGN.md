@@ -484,7 +484,9 @@ Literal hits overlap; regex hits are the
 leftmost-first chain. Each block searches its 2 MiB plus a
 `RTX_FIND_SPAN` (64 KiB) overlap; `@stage` re-chains across block edges
 so lanes equal a sequential scan. A match that would pass the span is
-not guessed: `long_n` / `long_off` show it in the header. A regex edit
+not guessed: `long_n` / `long_off` show it in the header. A start the
+backtracker cannot decide ends the list there, marked incomplete
+(Replace, Undecided regex starts). A regex edit
 re-scans a span-sized window and re-chains until it meets the shifted
 hits. `find_apply` plants via `find_set`.
 Newlines are counted in one place: `core/lf.ccs` (`rtx_count_lf`,
@@ -918,11 +920,67 @@ itself is not a position. The template is `$0`-`$9`, `${N}`, `${name}`
 and `\\`, parsed once per job. A group the pattern lacks, or one above 9,
 fails the kick. Without REGEX the replacement is verbatim.
 
+### Undecided regex starts
+
+A regex answer is MATCH, NONE, or undecided; a cap never turns "not
+decided" into "no match". The DFA and the Pike VM are linear and finish.
+The backtracker (backrefs, look-around, atomic groups, Onig's empty-loop
+rule) has a per-attempt step budget (`RTX_RX_BUDGET_DEFAULT`, 200 000;
+the budget is not raised for this), a stack cap and a look-around depth
+cap. Hitting any of them is `RTX_RX_INDET`, and so is a matcher that gets
+no scratch memory. `rtx_rx_search` stops at the first undecided start p
+and returns INDET at p: every start before p has no match, nothing is
+known from p on, and it never goes on to report a later start as the
+leftmost match. Every other cap was checked:
+
+| cap | what it does now |
+|---|---|
+| step budget / stack / look-around depth (backtracker) | INDET at that start; the search stops there |
+| scratch memory (any engine) | INDET at the call's start |
+| Pike VM step budget | only on `rtx_rx_at` (grammars, a re-match): INDET; search runs it unbudgeted |
+| lazy DFA cache thrash, reverse DFA give-up, reverse inner bail-outs | hand the call to the Pike VM or the plain DFA from `lo`: complete engines, not answers |
+| window edge (2 MiB block + 64 KiB span, replace slices, eof = 0) | a start whose decision reads past the window (a match that runs to the end, `$` `\b` `\B` `\z` at the end, a look-around or backref that read the end) is a leftover (PARTIAL) in every engine: the backtracker notes the read, the Pike VM keeps a thread an end assertion stopped as open, the DFA resolves its last state under each possible next byte, and a match that reaches the end is PARTIAL. The backtracker is conservative: an attempt that read the end is open even when its path then failed for another reason (an earlier leftover, never a wrong answer). |
+| lookbehind (255 bytes) | a compile-time limit; blocks keep `RTX_FIND_CTX` (259) bytes before them |
+
+Consumers:
+
+- **Find** (Ctrl-F list, next / prev, batch `find`): the block that meets
+  p publishes the hits before it and ends the scan there (`find.indet`,
+  `indet_off`, `indet_line`; done); later blocks publish nothing. The
+  header says `search incomplete: pattern too complex at line N`; next /
+  prev cycle the listed hits and never step past p. An edit rescans.
+- **Replace all** refuses the whole job at p, as it refuses a match over
+  64 KiB: `replace: pattern too complex to search exhaustively at line
+  N; nothing replaced` (the job's `err_off` is the offset), even when
+  valid sites were already staged or streamed into a bulk build. So does
+  the zero-width site at EOF and a capture re-match that is undecided.
+  Replace one refuses a hit it cannot re-match; batch `replace` (one)
+  needs a decided hit at or after the caret.
+- **Project search**: the file keeps its hits before p, is flagged
+  (`RtxPsGroup.indet_line` / `indet_off`, a group even with no hit) and
+  counted (`ps.n_indet`): the group header says `incomplete: pattern too
+  complex at line N`, the status `K files incomplete`, Enter on an empty
+  group opens the file at p. Batch prints `PATH:LINE: search incomplete:
+  ...` and counts them in the summary.
+- **Batch**: `replace --all` exits nonzero with the line; `find` and
+  `project-search` flag their output; `stats-json` find has state
+  `incomplete` and `incomplete: {off, line}`.
+- **Grammars (TextMate)**: best effort, on purpose. A rule whose regex is
+  undecided at a position does not match there (`rtx_rx_at` returns
+  INDET, which is not MATCH), and the lexer moves on as before. The
+  budget is part of grammar behaviour: highlighting output is
+  byte-identical across this change (`tm_dump` over the fixtures;
+  `tm_rx_diff` U=0), a wrong color never edits text, and
+  `stats-json` `rx_budget` counts the hits.
+- **Workbook**: no formula takes a regex today. One that does returns an
+  error value on INDET, never a result.
+
 `--batch` is a headless command host (no TTY): `-c` lines or a stdin script.
 Verbs are semantic (`goto @N` / `N%` / `LN`, `await index|island`, `print`,
-`read`, `insert`, `undo`, `redo`, `replace`, `save`, `stats-json`, `quit`) —
-not keystrokes. `replace [--all] [--regex] [--icase] [--word] [--] FIND
-REPL`. An argument is bare bytes up to white space, `'…'` (verbatim), or
+`read`, `insert`, `undo`, `redo`, `find`, `replace`, `save`, `stats-json`,
+`quit`) — not keystrokes. `replace [--all] [--regex] [--icase] [--word] [--]
+FIND REPL`; `find [--regex] [--icase] [--word] [--] QUERY` prints the find
+list (line, offset, length) and what it does not cover. An argument is bare bytes up to white space, `'…'` (verbatim), or
 `"…"` where only `\"` is an escape, so regex and template backslashes pass
 through; `""` is an empty replacement. Without `--all` it replaces the
 first match at or after the caret. Progressive
