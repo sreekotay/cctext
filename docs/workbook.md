@@ -906,7 +906,9 @@ the value paints in place again (Rich) or nothing shows (Source).
 - Cost: typing in a formula cell with the annotation showing is
   3.7 ms p50 against W0's 3.9 ms for the same keystrokes without it (the
   rebind + regraph of a formula edit dominates both); typing in a
-  literal cell is 2.1 ms (W0 2.8 ms).
+  literal cell is 2.1 ms (W0 2.8 ms). Since the scale work (a formula
+  edit placed locally in the order, no Tarjan) it is 2.0 ms, against
+  1.8 ms for the same keystrokes in a plain `.md`.
 
 ### Tests
 
@@ -942,20 +944,21 @@ the value paints in place again (Rich) or nothing shows (Source).
 `wb_perf`, release, same shared host, base (W0, `b8b7e3e`) and W2
 interleaved, best p50 of 4 runs: 3000 rows × 7 columns, 9 000 row
 formulas, 10 calc aggregates (the `aggs` workbook adds 1000 calc
-aggregates over one column).
+aggregates over one column). The "W2 at scale" column is one later run
+of the same tool (p50) after the scale work below.
 
-| Op | W0 | W2 | Notes |
-|---|---|---|---|
-| one cell edit, 1000 aggregates over its column | 101 ms | **0.70 ms** | each MA: one O(1) delta (2 row evaluations) |
-| one literal edit | 0.94 ms | 0.22 ms | the 10 aggregates take deltas, no rescan |
-| a new row / its delete | 14.8 ms | 1.95 ms | row path, no reparse (regraph for the row's formulas) |
-| a param a `where` reads (`k`) | 0.34 ms | 0.45 ms | that MA's one walk (W0 rescanned too; the MA also rebuilds its leaves) |
-| one formula edit (edges change) | 1.9 ms | 1.6 ms | |
-| one prose keystroke | 0.004 ms | 0.004 ms | |
-| open, 3000 rows | 66 ms | 68 ms | MAs built in the initial pass |
-| open, + 1000 aggregates | 154 ms | 180 ms | 1000 walks either way; MA bookkeeping |
-| keystroke in a table cell, type + Rich relayout | 2.79 ms | 2.06 ms | plain `.md`: 1.75 ms |
-| keystroke at a formula's end (annotation on in W2) | 3.92 ms | 3.72 ms | plain `.md`: 1.76 ms |
+| Op | W0 | W2 | W2 at scale | Notes |
+|---|---|---|---|---|
+| one cell edit, 1000 aggregates over its column | 101 ms | **0.70 ms** | 0.54 ms | each MA: one O(1) delta (2 row evaluations) |
+| one literal edit | 0.94 ms | 0.22 ms | 0.10 ms | the 10 aggregates take deltas, no rescan |
+| a new row / its delete | 14.8 ms | 1.95 ms | 0.12 ms | row path, no reparse; since W2 at scale no regraph for own-row formulas |
+| a param a `where` reads (`k`) | 0.34 ms | 0.45 ms | 0.19 ms | that MA's one walk (W0 rescanned too; the MA also rebuilds its leaves) |
+| one formula edit (edges change) | 1.9 ms | 1.6 ms | 0.11 ms | placed in the order locally, no Tarjan |
+| one prose keystroke | 0.004 ms | 0.004 ms | 0.004 ms | |
+| open, 3000 rows | 66 ms | 68 ms | 47 ms | MAs built in the initial pass |
+| open, + 1000 aggregates | 154 ms | 180 ms | 184 ms | 1000 walks either way; MA bookkeeping |
+| keystroke in a table cell, type + Rich relayout | 2.79 ms | 2.06 ms | 1.95 ms | plain `.md`: 1.75 ms |
+| keystroke at a formula's end (annotation on in W2) | 3.92 ms | 3.72 ms | 1.96 ms | plain `.md`: 1.76 ms |
 
 **Decisions.**
 
