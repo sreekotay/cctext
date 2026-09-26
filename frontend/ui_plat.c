@@ -802,6 +802,11 @@ static void script_arm_frame(void) {
         g_script_have = 0;
         return;
     }
+    if (strcmp(g_script_line, "down") == 0 || strcmp(g_script_line, "up") == 0) {
+        g_key_pressed[g_script_line[0] == 'd' ? KEY_DOWN : KEY_UP] = 1;
+        g_script_have = 0;
+        return;
+    }
     if (strncmp(g_script_line, "scmd ", 5) == 0 && g_script_line[5]) {
         /* Cmd-Shift-<key> (e.g. `scmd f`: project search). */
         int ch = g_script_line[5];
