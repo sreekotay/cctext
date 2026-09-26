@@ -3072,32 +3072,6 @@ static void ma_seg_set(RtxWb *wb, WMa *m, uint32_t j) {
     }
 }
 
-/* Recount leaf j: its stop rows and best row. */
-static void ma_leaf_scan(RtxWb *wb, WMa *m, uint32_t j) {
-    const WTab *t = &wb->tabs[m->tab];
-    ECtx c;
-    uint32_t r, lo = t->lvlo[j], hi = lo + t->lvn[j];
-    WBest b;
-    ma_ctx(wb, m, &c, 0);
-    m->lstop[j] = 0;
-    b.has = 0;
-    wb->st.ma_rescan++;
-    for (r = lo; r < hi; r++) {
-        WCon k;
-        wb_con(&c, &m->o, (int32_t)r, &k);
-        if (k.k == CN_STOP) m->lstop[j]++;
-        else if (m->lbest && k.k == CN_VAL && !wv_isnan(&k.v)) {
-            WBest x;
-            x.v = k.v;
-            x.rid = t->rowcell[r];
-            x.has = 1;
-            if (wb_better(wb, m->o.fn, &x, &b)) b = x;
-        }
-    }
-    if (m->lbest) m->lbest[j] = b;
-    m->lresc[j] = 0;
-}
-
 /* ---- group partials */
 
 static WGEnt *wg_find(WGMap *m, const WKey *k) {
@@ -3257,6 +3231,42 @@ static void wg_restale(RtxWb *wb, WMa *m) {
     m->gstale = 0;
 }
 
+/* Recount leaf j: its stop rows and best row. */
+static void ma_leaf_scan(RtxWb *wb, WMa *m, uint32_t j) {
+    const WTab *t = &wb->tabs[m->tab];
+    ECtx c;
+    uint32_t r, lo = t->lvlo[j], hi = lo + t->lvn[j];
+    WBest b;
+    ma_ctx(wb, m, &c, 0);
+    m->lstop[j] = 0;
+    b.has = 0;
+    wb->st.ma_rescan++;
+    if (m->grp) {
+        WGRow g;
+        if (wg_row_alloc(wb, m, &g))
+            for (r = lo; r < hi; r++) {
+                wg_con(&c, m, (int32_t)r, &g);
+                if (g.stop) m->lstop[j]++;
+            }
+        m->lresc[j] = 0;
+        return;
+    }
+    for (r = lo; r < hi; r++) {
+        WCon k;
+        wb_con(&c, &m->o, (int32_t)r, &k);
+        if (k.k == CN_STOP) m->lstop[j]++;
+        else if (m->lbest && k.k == CN_VAL && !wv_isnan(&k.v)) {
+            WBest x;
+            x.v = k.v;
+            x.rid = t->rowcell[r];
+            x.has = 1;
+            if (wb_better(wb, m->o.fn, &x, &b)) b = x;
+        }
+    }
+    if (m->lbest) m->lbest[j] = b;
+    m->lresc[j] = 0;
+}
+
 /* ---- build, deltas, value */
 
 static void ma_build(RtxWb *wb, WMa *m) {
@@ -3345,7 +3355,10 @@ static void ma_apply(RtxWb *wb, WMa *m) {
     WDirty *rows;
     WGRow go, gn;
     for (i = m->dhead; i != WN32; i = wb->dirty[i].next) n++;
-    if (!n && !m->anyresc && !m->gstale) return;
+    if (!n && !m->anyresc && !m->gstale) {
+        if (m->lbest && !m->segok) ma_seg_build(wb, m, t);
+        return;
+    }
     rows = (WDirty *)cc_arena_alloc(wb->sa, (size_t)(n ? n : 1) * sizeof(WDirty), 16);
     if (!rows) {
         m->dhead = WN32;
@@ -4426,19 +4439,66 @@ static void wb_push_dependents(RtxWb *wb, uint32_t id) {
 }
 
 /* A cycle through `s` inside its SCC (comp): `a → b → a`. */
+/* Canonical rank of every node: the document order a from-scratch build
+ * numbers nodes in (tables' cells row-major, then their columns; names by
+ * position; then MAs by owner). Cycle paths walk in this order, so they
+ * do not depend on which node ids edits happened to allocate. */
+static uint32_t *wb_ranks(RtxWb *wb) {
+    uint32_t *rank = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)(wb->nn + 1) * sizeof(uint32_t), 16);
+    uint32_t i, ti = 0, next = 0, j;
+    if (!rank) return NULL;
+    memset(rank, 0xff, (size_t)wb->nn * sizeof(uint32_t));
+    for (i = 0; i <= wb->nn; i++) {
+        const WNode *n = i < wb->nn ? &wb->nodes[i] : NULL;
+        if (n && n->kind != NK_NAME && n->kind != NK_LINE) continue;
+        while (ti < wb->ntab && (!n || wb->tabs[ti].lo < n->raw_lo)) {
+            const WTab *t = &wb->tabs[ti];
+            int32_t r, c;
+            for (r = 0; r < t->nrows; r++)
+                for (c = 0; c < t->ncols; c++) rank[wb_cell_id(t, r, c)] = next++;
+            for (c = 0; c < t->ncols; c++) rank[t->col0 + (uint32_t)c] = next++;
+            ti++;
+        }
+        if (n) rank[i] = next++;
+    }
+    /* MAs after every cell and name: by owner, in the owner's AST order */
+    for (i = 0; i < wb->nn; i++) {
+        const WNode *n = &wb->nodes[i];
+        if (!n->nmal || n->kind == NK_DEAD) continue;
+        for (j = 0; j < n->nmal; j++)
+            if (rank[n->mal[j]] == UINT32_MAX && wb->nodes[n->mal[j]].kind == NK_MA)
+                rank[n->mal[j]] = next++;
+    }
+    for (i = 0; i < wb->nn; i++)
+        if (rank[i] == UINT32_MAX) rank[i] = next++;
+    return rank;
+}
+
 static void wb_cycle_path(RtxWb *wb, uint32_t s, const uint32_t *comp, uint32_t *par,
-                          uint32_t *queue, char *out, size_t cap) {
+                          uint32_t *queue, const uint32_t *rank, char *out, size_t cap) {
     uint32_t qh = 0, qt = 0, v, k, last = UINT32_MAX;
-    uint32_t path[17];
+    uint32_t path[17], nb[64];
     int np = 0, i, first = -1;
     size_t at = 0;
     char lb[96];
     par[s] = s;
     queue[qt++] = s;
     while (qh < qt && last == UINT32_MAX) {
+        uint32_t nd, m = 0, a, b;
         v = queue[qh++];
-        for (k = 0; k < wb_ndeps(wb, v); k++) {
-            uint32_t w = wb_dep(wb, v, k);
+        nd = wb_ndeps(wb, v);
+        /* a formula's inputs in rank order (a column's cells already are) */
+        if (wb->nodes[v].kind != NK_COL && rank && nd <= 64) {
+            for (k = 0; k < nd; k++) nb[m++] = wb_dep(wb, v, k);
+            for (a = 1; a < m; a++)
+                for (b = a; b > 0 && rank[nb[b - 1]] > rank[nb[b]]; b--) {
+                    uint32_t x = nb[b];
+                    nb[b] = nb[b - 1];
+                    nb[b - 1] = x;
+                }
+        }
+        for (k = 0; k < nd; k++) {
+            uint32_t w = m ? nb[k] : wb_dep(wb, v, k);
             if (comp[w] != comp[s]) continue;
             if (w == s) {
                 last = v;
@@ -4518,7 +4578,7 @@ static int wb_ma_lists(RtxWb *wb) {
  * Seeds the heap with every node whose cycle state changed. */
 static int wb_regraph(RtxWb *wb, int seed) {
     uint32_t nn = wb->nn, v, k, idx = 0, topo = 0, sp = 0, fp = 0;
-    uint32_t *cnt, *index, *low, *stk, *fv, *fi, *comp, *par = NULL, *queue = NULL;
+    uint32_t *cnt, *index, *low, *stk, *fv, *fi, *comp, *par = NULL, *queue = NULL, *rank = NULL;
     uint8_t *on, *was;
     size_t total = 0;
     wb->st.regraphs++;
@@ -4610,13 +4670,21 @@ static int wb_regraph(RtxWb *wb, int seed) {
                     char path[400];
                     WVal cv;
                     if (!par) {
+                        rank = wb_ranks(wb);
                         par = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
                         queue = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)nn * sizeof(uint32_t), 16);
                         if (!par || !queue) return 0;
                         memset(par, 0xff, (size_t)nn * sizeof(uint32_t));
                     }
                     wb->st.cycles++;
-                    wb_cycle_path(wb, x, comp, par, queue, path, sizeof path);
+                    {
+                        /* start at the member first in document order */
+                        uint32_t s0 = x;
+                        if (rank)
+                            for (j = sp; j < sp + (topo - first); j++)
+                                if (rank[stk[j]] < rank[s0]) s0 = stk[j];
+                        wb_cycle_path(wb, s0, comp, par, queue, rank, path, sizeof path);
+                    }
                     cv = wv_err(wb, WE_CYCLE, "%s", path);
                     /* the SCC's members sit just above sp */
                     for (j = sp; j < sp + (topo - first); j++) {
@@ -5098,6 +5166,490 @@ static int wb_fast_prose(RtxWb *wb, const RtxDoc *d) {
     return 1;
 }
 
+/* ------------------------------------------------------ incremental rows
+ *
+ * Whole body rows of one table replaced by new pipe rows (an insert, a
+ * delete, a move, a row whose cell count changed): the old rows' MA
+ * contributions leave, their nodes die, the new rows get nodes, their
+ * contributions arrive at the next pop. Leaves split / merge like W1's;
+ * every MA over the table mirrors them. Header, separator, caption and
+ * table-end edits, and anything that would end or split the table, take
+ * the reparse.
+ */
+
+/* MA m mirrors the table's leaves (else it rebuilds at its next pop). */
+static int ma_mirrors(const RtxWb *wb, const WMa *m) {
+    (void)wb;
+    return m->live && m->lvok && !m->full && !m->stale;
+}
+
+static int lv_room(RtxWb *wb, WTab *t, uint32_t need) {
+    uint32_t i, nc;
+    if (need <= t->lvcap) return 1;
+    nc = t->lvcap * 2 + 16;
+    while (nc < need) nc *= 2;
+    {
+        uint32_t *n1 = (uint32_t *)wb_ma(wb, (size_t)nc * sizeof(uint32_t));
+        uint32_t *n2 = (uint32_t *)wb_ma(wb, (size_t)nc * sizeof(uint32_t));
+        if (!n1 || !n2) return 0;
+        memcpy(n1, t->lvn, t->nlv * sizeof(uint32_t));
+        memcpy(n2, t->lvlo, t->nlv * sizeof(uint32_t));
+        t->lvn = n1;
+        t->lvlo = n2;
+        t->lvcap = nc;
+    }
+    for (i = 0; i < t->ntma; i++) {
+        WMa *m = &wb->mas[t->tma[i]];
+        if (!ma_mirrors(wb, m)) continue;
+        if (!ma_lv_fit(wb, m, t)) m->lvok = 0;
+    }
+    return 1;
+}
+
+/* Insert an empty leaf of `cnt` rows at j (MAs: no stops, no best). */
+static int lv_ins(RtxWb *wb, WTab *t, uint32_t j, uint32_t cnt, int resc) {
+    uint32_t i;
+    if (!lv_room(wb, t, t->nlv + 1)) return 0;
+    memmove(t->lvn + j + 1, t->lvn + j, (t->nlv - j) * sizeof(uint32_t));
+    t->lvn[j] = cnt;
+    for (i = 0; i < t->ntma; i++) {
+        WMa *m = &wb->mas[t->tma[i]];
+        if (!ma_mirrors(wb, m)) continue;
+        memmove(m->lstop + j + 1, m->lstop + j, (t->nlv - j) * sizeof(uint32_t));
+        memmove(m->lresc + j + 1, m->lresc + j, t->nlv - j);
+        m->lstop[j] = 0;
+        m->lresc[j] = (uint8_t)resc;
+        if (resc) m->anyresc = 1;
+        if (m->lbest) {
+            memmove(m->lbest + j + 1, m->lbest + j, (t->nlv - j) * sizeof(WBest));
+            m->lbest[j].has = 0;
+        }
+        m->segok = 0;
+    }
+    t->nlv++;
+    return 1;
+}
+
+static void lv_del(RtxWb *wb, WTab *t, uint32_t j) {
+    uint32_t i, rest = t->nlv - j - 1;
+    memmove(t->lvn + j, t->lvn + j + 1, rest * sizeof(uint32_t));
+    for (i = 0; i < t->ntma; i++) {
+        WMa *m = &wb->mas[t->tma[i]];
+        if (!ma_mirrors(wb, m)) continue;
+        memmove(m->lstop + j, m->lstop + j + 1, rest * sizeof(uint32_t));
+        memmove(m->lresc + j, m->lresc + j + 1, rest);
+        if (m->lbest) memmove(m->lbest + j, m->lbest + j + 1, rest * sizeof(WBest));
+        m->segok = 0;
+    }
+    t->nlv--;
+}
+
+/* Leaf j+1 into leaf j: counts add, the best is the better (j first). */
+static void lv_merge(RtxWb *wb, WTab *t, uint32_t j) {
+    uint32_t i;
+    t->lvn[j] += t->lvn[j + 1];
+    for (i = 0; i < t->ntma; i++) {
+        WMa *m = &wb->mas[t->tma[i]];
+        if (!ma_mirrors(wb, m)) continue;
+        m->lstop[j] += m->lstop[j + 1];
+        m->lresc[j] |= m->lresc[j + 1];
+        if (m->lbest && wb_better(wb, m->o.fn, &m->lbest[j + 1], &m->lbest[j]))
+            m->lbest[j] = m->lbest[j + 1];
+    }
+    t->lvn[j + 1] = 0;
+    lv_del(wb, t, j + 1);
+}
+
+/* Leaf j over WB_LEAF_MAX rows: pieces of WB_LEAF. An MA whose leaf had a
+ * stop row, and every min / max, rescans the pieces at its pop. */
+static int lv_split(RtxWb *wb, WTab *t, uint32_t j) {
+    uint32_t c = t->lvn[j], i, pieces = (c + WB_LEAF - 1) / WB_LEAF, p;
+    if (c <= WB_LEAF_MAX) return 1;
+    for (i = 0; i < t->ntma; i++) {
+        WMa *m = &wb->mas[t->tma[i]];
+        if (!ma_mirrors(wb, m)) continue;
+        if (m->lstop[j] || m->lbest) {
+            m->lresc[j] = 1;
+            m->anyresc = 1;
+        }
+    }
+    t->lvn[j] = WB_LEAF;
+    for (p = 1; p < pieces; p++) {
+        uint32_t cnt = p + 1 < pieces ? WB_LEAF : c - p * WB_LEAF;
+        if (!lv_ins(wb, t, j + p, cnt, 0)) return 0;
+        for (i = 0; i < t->ntma; i++) {
+            WMa *m = &wb->mas[t->tma[i]];
+            if (!ma_mirrors(wb, m) || !m->lresc[j]) continue;
+            m->lresc[j + p] = 1;
+        }
+    }
+    for (i = 0; i < t->ntma; i++) {
+        WMa *m = &wb->mas[t->tma[i]];
+        if (!ma_mirrors(wb, m) || !m->lresc[j]) continue;
+        m->lstop[j] = 0; /* the rescan recounts every piece */
+        if (m->lbest) m->lbest[j].has = 0;
+    }
+    return 1;
+}
+
+/* The deleted rows' contributions leave every MA over t. */
+static void rows_retract(RtxWb *wb, WTab *t, int32_t a, int32_t b) {
+    uint32_t i;
+    int32_t r;
+    for (i = 0; i < t->ntma; i++) {
+        WMa *m = &wb->mas[t->tma[i]];
+        ECtx c;
+        WGRow g;
+        if (!m->live) continue;
+        if (!ma_mirrors(wb, m)) {
+            m->lvok = 0;
+            continue;
+        }
+        ma_ctx(wb, m, &c, 0);
+        if (m->grp && !wg_row_alloc(wb, m, &g)) {
+            m->full = 1;
+            continue;
+        }
+        for (r = a; r < b; r++) {
+            uint32_t rid = t->rowcell[r], lf = t->rleaf[r];
+            if (m->grp) {
+                wg_con(&c, m, r, &g);
+                wg_apply(wb, m, &g, rid, -1);
+                if (g.stop) m->lstop[lf]--;
+                m->gver++;
+                continue;
+            }
+            {
+                WCon k;
+                wb_con(&c, &m->o, r, &k);
+                acc_apply(&m->a, &m->o, &k, -1);
+                if (k.k == CN_STOP) m->lstop[lf]--;
+                if (m->lbest && k.k == CN_VAL && m->lbest[lf].has && m->lbest[lf].rid == rid) {
+                    m->lresc[lf] = 1;
+                    m->anyresc = 1;
+                }
+            }
+        }
+    }
+}
+
+/* Kill a node and the MAs of its formula. 1 if the graph must change. */
+static int rows_kill(RtxWb *wb, uint32_t id) {
+    WNode *n = &wb->nodes[id];
+    uint32_t k;
+    int g = n->form != 0;
+    for (k = 0; k < n->nmal; k++) {
+        uint32_t o = n->mal[k];
+        if (o >= wb->nn || wb->nodes[o].kind != NK_MA) continue;
+        wb->mas[wb->nodes[o].mai].live = 0;
+        wb->nodes[o].kind = NK_DEAD;
+        wb->nodes[o].ndeps = wb->nodes[o].nsd = 0;
+        g = 1;
+    }
+    n = &wb->nodes[id];
+    n->kind = NK_DEAD;
+    n->ndeps = n->nsd = 0;
+    n->nmal = 0;
+    n->raw_lo = n->raw_hi = n->f_lo = n->f_hi = WNONE;
+    return g;
+}
+
+/* Every offset at or after `at` moves by delta (a row window's end). */
+static void wb_shift_ge(RtxWb *wb, size_t at, ptrdiff_t delta, uint32_t from) {
+    uint32_t i, c;
+    int32_t r;
+#define WB_SGE(x)                                                                      \
+    do {                                                                               \
+        if ((x) != WNONE && (x) >= at) (x) = (size_t)((ptrdiff_t)(x) + delta);          \
+    } while (0)
+    if (!delta) return;
+    for (i = from; i < wb->nord; i++) {
+        WNode *n = &wb->nodes[wb->ord[i]];
+        WB_SGE(n->raw_lo);
+        WB_SGE(n->raw_hi);
+        WB_SGE(n->f_lo);
+        WB_SGE(n->f_hi);
+        WB_SGE(n->n_lo);
+        WB_SGE(n->n_hi);
+        WB_SGE(n->src_lo);
+    }
+    for (i = 0; i < wb->ntab; i++) {
+        WTab *t = &wb->tabs[i];
+        if (t->hi < at) continue;
+        WB_SGE(t->lo);
+        WB_SGE(t->hi);
+        WB_SGE(t->cap_lo);
+        WB_SGE(t->cap_hi);
+        for (c = 0; c < (uint32_t)t->ncols; c++) {
+            WB_SGE(t->hlo[c]);
+            WB_SGE(t->hhi[c]);
+        }
+        for (r = 0; r < t->nrows; r++) {
+            WB_SGE(t->row_lo[r]);
+            WB_SGE(t->row_hi[r]);
+        }
+    }
+    for (i = 0; i < wb->nblk; i++) {
+        WBlk *b = &wb->blks[i];
+        if (b->ext_hi < at) continue;
+        WB_SGE(b->lo);
+        WB_SGE(b->hi);
+        WB_SGE(b->ext_lo);
+        WB_SGE(b->ext_hi);
+    }
+#undef WB_SGE
+}
+
+static int wb_fast_rows(RtxWb *wb, const RtxDoc *d) {
+    size_t lo = wb->p_lo, old_n = wb->p_old, new_n = wb->p_new, end = lo + old_n;
+    ptrdiff_t delta = (ptrdiff_t)new_n - (ptrdiff_t)old_n;
+    uint32_t ti, i, k, nk = 0, kdead0, kdead1, cap2, base;
+    WTab *t = NULL;
+    int32_t a, b, n, n2, r, c;
+    size_t w0, w1, wn, pos;
+    char *buf;
+    int graph = 0;
+    uint32_t *nrowcell, *nrleaf;
+    size_t *nrlo, *nrhi;
+    uint32_t *newcells = NULL, nnew = 0;
+    uint8_t ot[RTX_WB_COLS_MAX], osc[RTX_WB_COLS_MAX];
+    for (ti = 0; ti < wb->ntab; ti++) {
+        WTab *x = &wb->tabs[ti];
+        if (x->big || x->nrows < 1) continue;
+        if (lo >= x->row_lo[0] && end <= x->hi) {
+            t = x;
+            break;
+        }
+    }
+    if (!t) return 0;
+    n = t->nrows;
+    if (t->hi != t->row_hi[n - 1] + 1) return 0; /* the last row ends the file without NL */
+    /* old window [w0, w1): whole rows a .. b-1 */
+    {
+        int32_t l = 0, h = n;
+        while (l + 1 < h) {
+            int32_t mid = (l + h) / 2;
+            if (t->row_lo[mid] <= lo) l = mid;
+            else h = mid;
+        }
+        a = l;
+    }
+    b = a;
+    while (b < n && t->row_lo[b] < end) b++;
+    w0 = t->row_lo[a];
+    for (;;) {
+        w1 = b < n ? t->row_lo[b] : t->hi;
+        if (w1 < end) return 0;
+        wn = (size_t)((ptrdiff_t)(w1 - w0) + delta);
+        buf = wb_read_tmp(wb, d, w0, wn);
+        if (!buf) return 0;
+        if (!wn || buf[wn - 1] == '\n') break;
+        if (b >= n) return 0;
+        b++;
+    }
+    /* the new lines: pipe rows, each ending in NL */
+    for (pos = 0; pos < wn;) {
+        size_t e = pos, ce;
+        while (e < wn && buf[e] != '\n') e++;
+        ce = e;
+        if (ce > pos && buf[ce - 1] == '\r') ce--;
+        if (wb_blank(buf + pos, ce - pos) || !rtx_md_line_pipe(buf + pos, ce - pos)) return 0;
+        nk++;
+        pos = e + 1;
+    }
+    if (!nk && a == b) return 0;
+    n2 = n - (b - a) + (int32_t)nk;
+    if (n2 < 1 || n2 > RTX_WB_ROWS_MAX) return 0;
+    /* --- committed: from here on the model changes */
+    wb->st.fast_rows++;
+    for (c = 0; c < t->ncols; c++) {
+        ot[c] = t->ct[c];
+        osc[c] = t->csc[c];
+    }
+    rows_retract(wb, t, a, b);
+    /* dead rows: ord range, column stats, nodes */
+    {
+        int64_t k0 = wb_ord_find(wb, w0 ? w0 - 1 : 0);
+        kdead0 = (uint32_t)(k0 + 1);
+        while (kdead0 < wb->nord && wb->nodes[wb->ord[kdead0]].raw_lo < w0) kdead0++;
+        kdead1 = kdead0;
+        while (kdead1 < wb->nord && wb->nodes[wb->ord[kdead1]].raw_lo < w1) kdead1++;
+    }
+    for (r = a; r < b; r++) {
+        for (c = 0; c < t->ncols; c++) {
+            uint32_t id = t->rowcell[r] + (uint32_t)c;
+            WNode *x = &wb->nodes[id];
+            wb_cs_add(&t->cs[c], x->lk, x->lsc, -1);
+            if (rows_kill(wb, id)) graph = 1;
+        }
+    }
+    /* row arrays: splice */
+    cap2 = (uint32_t)n2 > t->rowcap ? (uint32_t)n2 + 64 : t->rowcap;
+    nrlo = cap2 == t->rowcap ? t->row_lo : (size_t *)wb_ma(wb, cap2 * sizeof(size_t));
+    nrhi = cap2 == t->rowcap ? t->row_hi : (size_t *)wb_ma(wb, cap2 * sizeof(size_t));
+    nrowcell = cap2 == t->rowcap ? t->rowcell : (uint32_t *)wb_ma(wb, cap2 * sizeof(uint32_t));
+    nrleaf = cap2 == t->rowcap ? t->rleaf : (uint32_t *)wb_ma(wb, cap2 * sizeof(uint32_t));
+    if (!nrlo || !nrhi || !nrowcell || !nrleaf) return 0;
+    /* leaves: the deleted rows leave their leaves (old indexing) */
+    for (r = a; r < b; r++) t->lvn[t->rleaf[r]]--;
+    if (cap2 != t->rowcap) {
+        memcpy(nrlo, t->row_lo, (size_t)a * sizeof(size_t));
+        memcpy(nrhi, t->row_hi, (size_t)a * sizeof(size_t));
+        memcpy(nrowcell, t->rowcell, (size_t)a * sizeof(uint32_t));
+    }
+    memmove(nrlo + a + nk, t->row_lo + b, (size_t)(n - b) * sizeof(size_t));
+    memmove(nrhi + a + nk, t->row_hi + b, (size_t)(n - b) * sizeof(size_t));
+    memmove(nrowcell + a + nk, t->rowcell + b, (size_t)(n - b) * sizeof(uint32_t));
+    t->row_lo = nrlo;
+    t->row_hi = nrhi;
+    t->rowcell = nrowcell;
+    t->rleaf = nrleaf;
+    t->rowcap = cap2;
+    t->nrows = n2;
+    /* offsets after the window move (rows after it too: arrays spliced) */
+    for (r = a + (int32_t)nk; r < n2; r++) {
+        t->row_lo[r] = (size_t)((ptrdiff_t)t->row_lo[r] + delta);
+        t->row_hi[r] = (size_t)((ptrdiff_t)t->row_hi[r] + delta);
+    }
+    {
+        /* the table's own fields and every other offset past w1 */
+        int32_t save = t->nrows;
+        t->nrows = 0; /* its rows are done above */
+        memmove(wb->ord + kdead0, wb->ord + kdead1, (wb->nord - kdead1) * sizeof(uint32_t));
+        wb->nord -= kdead1 - kdead0;
+        wb_shift_ge(wb, w1, delta, kdead0);
+        t->nrows = save;
+    }
+    /* new rows: nodes, spans (new coordinates), literals */
+    newcells = (uint32_t *)cc_arena_alloc(wb->sa, (size_t)(nk * (uint32_t)t->ncols + 1) * sizeof(uint32_t), 16);
+    if (!newcells) return 0;
+    for (pos = 0, k = 0; k < nk; k++) {
+        size_t e = pos, ce, line = w0 + pos;
+        RtxMdCell cells[RTX_MD_TABLE_COLS];
+        size_t nc;
+        while (e < wn && buf[e] != '\n') e++;
+        ce = e;
+        if (ce > pos && buf[ce - 1] == '\r') ce--;
+        base = wb->nn;
+        for (c = 0; c < t->ncols; c++)
+            if (wb_node_new(wb, NK_CELL) == UINT32_MAX) return 0;
+        t = &wb->tabs[ti];
+        t->rowcell[a + (int32_t)k] = base;
+        t->row_lo[a + (int32_t)k] = line;
+        t->row_hi[a + (int32_t)k] = w0 + e;
+        nc = rtx_md_row_split(buf + pos, ce - pos, cells, RTX_MD_TABLE_COLS);
+        for (c = 0; c < t->ncols; c++) {
+            uint32_t id = base + (uint32_t)c;
+            WNode *x = &wb->nodes[id];
+            x->tab = (int32_t)ti;
+            x->row = a + (int32_t)k;
+            x->col = c;
+            if ((size_t)c >= nc) {
+                x->lk = LK_EMPTY;
+                x->src = "";
+                continue;
+            }
+            x->raw_lo = line + cells[c].lo;
+            x->raw_hi = line + cells[c].hi;
+            wb_cell_set(wb, id, buf + pos + cells[c].lo, cells[c].hi - cells[c].lo, x->raw_lo);
+            x = &wb->nodes[id];
+            wb_cs_add(&t->cs[c], x->lk, x->lsc, 1);
+            if (x->form) graph = 1;
+            newcells[nnew++] = id;
+        }
+        pos = e + 1;
+    }
+    /* ord: the new spanned cells where the dead ones were */
+    if (!wb_grow(wb, (void **)&wb->ord, &wb->ordcap, wb->nord + nnew, sizeof(uint32_t))) return 0;
+    memmove(wb->ord + kdead0 + nnew, wb->ord + kdead0, (wb->nord - kdead0) * sizeof(uint32_t));
+    memcpy(wb->ord + kdead0, newcells, nnew * sizeof(uint32_t));
+    wb->nord += nnew;
+    /* row positions after the window */
+    for (r = a + (int32_t)nk; r < n2; r++)
+        for (c = 0; c < t->ncols; c++) wb->nodes[t->rowcell[r] + (uint32_t)c].row = r;
+    /* leaves: drop empties, take the new rows, split / merge */
+    for (i = 0; i < t->nlv;) {
+        if (t->lvn[i] == 0) lv_del(wb, t, i);
+        else i++;
+    }
+    {
+        uint32_t j, at = 0;
+        if (!t->nlv) {
+            if (!lv_ins(wb, t, 0, 0, 0)) return 0;
+        }
+        /* the leaf holding row a (after the deletes), else the last */
+        for (j = 0; j < t->nlv; j++) {
+            if ((int32_t)(at + t->lvn[j]) > a) break;
+            at += t->lvn[j];
+        }
+        if (j >= t->nlv) j = t->nlv - 1;
+        t->lvn[j] += nk;
+        if (!lv_split(wb, t, j)) return 0;
+        /* merge small leaves near the edit */
+        for (j = 0; j + 1 < t->nlv;) {
+            if ((t->lvn[j] < WB_LEAF_MIN || t->lvn[j + 1] < WB_LEAF_MIN) &&
+                t->lvn[j] + t->lvn[j + 1] <= WB_LEAF_MAX)
+                lv_merge(wb, t, j);
+            else
+                j++;
+        }
+    }
+    wb_lv_index(t);
+    for (i = 0; i < t->ntma; i++) {
+        WMa *m = &wb->mas[t->tma[i]];
+        if (!m->live) continue;
+        if (!ma_mirrors(wb, m)) {
+            m->lvok = 0;
+            continue;
+        }
+        m->segok = 0;
+    }
+    /* column types */
+    for (c = 0; c < t->ncols; c++) wb_col_type(&t->cs[c], &t->ct[c], &t->csc[c]);
+    /* formulas of the new rows bind (own row known now) */
+    for (i = 0; i < nnew; i++)
+        if (wb->nodes[newcells[i]].form) (void)wb_bind_node(wb, newcells[i]);
+    t = &wb->tabs[ti];
+    /* a cycle's path names rows by position: recompute it too */
+    if ((graph || wb->st.cycles) && !wb_regraph(wb, 1)) return 0;
+    t = &wb->tabs[ti];
+    /* seeds: new cells (and their MAs), each MA over t (new rows queued),
+     * every column (lookups, scalar readers), error cells whose row moved,
+     * a retyped column's literals */
+    for (k = 0; k < nk; k++) {
+        uint32_t rid = t->rowcell[a + (int32_t)k];
+        for (c = 0; c < t->ncols; c++) {
+            wb_push_mas(wb, rid + (uint32_t)c);
+            wb_heap_push(wb, rid + (uint32_t)c);
+        }
+        for (i = 0; i < t->ntma; i++)
+            if (ma_mirrors(wb, &wb->mas[t->tma[i]])) ma_dirty(wb, t->tma[i], rid, 1);
+    }
+    for (i = 0; i < t->ntma; i++)
+        if (wb->mas[t->tma[i]].live) wb_heap_push(wb, wb->mas[t->tma[i]].node);
+    for (c = 0; c < t->ncols; c++) wb_heap_push(wb, t->col0 + (uint32_t)c);
+    for (r = a + (int32_t)nk; r < n2; r++)
+        for (c = 0; c < t->ncols; c++) {
+            uint32_t id = t->rowcell[r] + (uint32_t)c;
+            if (wb->nodes[id].form && wb->nodes[id].v.t == WV_ERR) wb_heap_push(wb, id);
+        }
+    for (c = 0; c < t->ncols; c++) {
+        if (t->ct[c] == ot[c] && t->csc[c] == osc[c]) continue;
+        for (r = 0; r < n2; r++) {
+            uint32_t id = t->rowcell[r] + (uint32_t)c;
+            if (!wb->nodes[id].form) wb_heap_push(wb, id);
+        }
+    }
+    /* a block right after the table: its line-before is the last row */
+    for (i = 0; i < wb->nblk; i++) {
+        WBlk *bk = &wb->blks[i];
+        if (bk->lo == t->hi && bk->ext_lo < t->hi) bk->ext_lo = t->row_lo[n2 - 1];
+    }
+    wb_recalc(wb);
+    wb_count(wb);
+    return 1;
+}
+
 static int wb_fast(RtxWb *wb, const RtxDoc *d) {
     size_t len = RtxDoc_len(d), lo = wb->p_lo, old_n = wb->p_old;
     int64_t k;
@@ -5109,10 +5661,18 @@ static int wb_fast(RtxWb *wb, const RtxDoc *d) {
         uint32_t id = wb->ord[k];
         const WNode *n = &wb->nodes[id];
         if (n->raw_hi != WNONE && lo + old_n <= n->raw_hi) {
-            int ok = n->kind == NK_CELL ? wb_fast_cell(wb, d, id) : wb_fast_line(wb, d, id);
-            if (ok) wb->doc_len = len;
-            return ok;
+            int cell = n->kind == NK_CELL;
+            int ok = cell ? wb_fast_cell(wb, d, id) : wb_fast_line(wb, d, id);
+            if (ok) {
+                wb->doc_len = len;
+                return 1;
+            }
+            if (!cell) return 0;
         }
+    }
+    if (wb_fast_rows(wb, d)) {
+        wb->doc_len = len;
+        return 1;
     }
     if (!wb_fast_prose(wb, d)) return 0;
     wb->doc_len = len;
@@ -5406,26 +5966,71 @@ static size_t wb_group_text(RtxWb *wb, const WVal *v, char *out, size_t cap) {
     return wb_puts(out, cap, at, "}");
 }
 
-size_t rtx_wb_dump(RtxWb *wb, const RtxDoc *d, char *out, size_t cap) {
+/* One dump line (and with RTX_WB_DUMP_MAS, the node's MA values). */
+static size_t wb_dump_node(RtxWb *wb, uint32_t id, int flags, char *out, size_t cap, size_t at) {
+    const WNode *n = &wb->nodes[id];
+    char lb[160], vb[4096];
+    uint32_t k;
+    wb_node_label(wb, id, lb, sizeof lb);
+    if (n->v.t == WV_GRP) wb_group_text(wb, &n->v, vb, sizeof vb);
+    else wb_fmt_dump(&n->v, vb, sizeof vb);
+    at = wb_puts(out, cap, at, lb);
+    at = wb_puts(out, cap, at, " = ");
+    at = wb_puts(out, cap, at, vb);
+    if ((flags & RTX_WB_DUMP_BITS) && n->v.t == WV_FLOAT) {
+        uint64_t b;
+        memcpy(&b, &n->v.u.f, sizeof b);
+        snprintf(vb, sizeof vb, " [%016llx]", (unsigned long long)b);
+        at = wb_puts(out, cap, at, vb);
+    }
+    at = wb_puts(out, cap, at, "\n");
+    if (!(flags & RTX_WB_DUMP_MAS)) return at;
+    for (k = 0; k < n->nmal; k++) {
+        const WNode *m = &wb->nodes[n->mal[k]];
+        if (m->kind != NK_MA) continue;
+        if (m->v.t == WV_GRP) wb_group_text(wb, &m->v, vb, sizeof vb);
+        else wb_fmt_dump(&m->v, vb, sizeof vb);
+        snprintf(lb, sizeof lb, "  ma%u = ", (unsigned)k);
+        at = wb_puts(out, cap, at, lb);
+        at = wb_puts(out, cap, at, vb);
+        if ((flags & RTX_WB_DUMP_BITS) && m->v.t == WV_FLOAT) {
+            uint64_t b;
+            memcpy(&b, &m->v.u.f, sizeof b);
+            snprintf(vb, sizeof vb, " [%016llx]", (unsigned long long)b);
+            at = wb_puts(out, cap, at, vb);
+        }
+        at = wb_puts(out, cap, at, "\n");
+    }
+    return at;
+}
+
+size_t rtx_wb_dump_ex(RtxWb *wb, const RtxDoc *d, int flags, char *out, size_t cap) {
     size_t at = 0;
-    uint32_t i;
-    char lb[160], vb[512];
+    uint32_t i, ti = 0;
     if (out && cap) out[0] = 0;
     if (!wb) return 0;
     rtx_wb_sync(wb, d);
     if (wb->off) return wb_puts(out, cap, 0, "(off)\n");
-    for (i = 0; i < wb->nn; i++) {
-        const WNode *n = &wb->nodes[i];
-        if (n->kind != NK_CELL && n->kind != NK_NAME) continue;
-        wb_node_label(wb, i, lb, sizeof lb);
-        if (n->v.t == WV_GRP) wb_group_text(wb, &n->v, vb, sizeof vb);
-        else wb_fmt_dump(&n->v, vb, sizeof vb);
-        at = wb_puts(out, cap, at, lb);
-        at = wb_puts(out, cap, at, " = ");
-        at = wb_puts(out, cap, at, vb);
-        at = wb_puts(out, cap, at, "\n");
+    /* document order: tables (rows, then columns) and names by position */
+    for (i = 0; i <= wb->nn; i++) {
+        const WNode *n = i < wb->nn ? &wb->nodes[i] : NULL;
+        if (n && n->kind != NK_NAME) continue;
+        while (ti < wb->ntab && (!n || wb->tabs[ti].lo < n->raw_lo)) {
+            const WTab *t = &wb->tabs[ti];
+            int32_t r, c;
+            for (r = 0; r < t->nrows; r++)
+                for (c = 0; c < t->ncols; c++)
+                    at = wb_dump_node(wb, wb_cell_id(t, r, c), flags, out, cap, at);
+            ti++;
+        }
+        if (n) at = wb_dump_node(wb, i, flags, out, cap, at);
     }
+    wb->sa.reset();
     return at;
+}
+
+size_t rtx_wb_dump(RtxWb *wb, const RtxDoc *d, char *out, size_t cap) {
+    return rtx_wb_dump_ex(wb, d, 0, out, cap);
 }
 
 size_t rtx_wb_reach(RtxWb *wb, const RtxDoc *d, size_t off) {
