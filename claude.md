@@ -130,3 +130,33 @@ core/md_table.ccs core/md_block.ccs`); that adds no `CC_TARGET` entry,
 so a new library TU can join an existing target instead of taking a
 slot (65 sources over 64 targets builds). `ccc build --build-file F a b`
 builds only `a` (2026-09-23): build targets one call each.
+
+## `memrchr` is not on macOS (2026-09-25)
+
+A bare `void *memrchr(...);` in `core/rx.ccs` links on glibc and fails
+everywhere else (`Undefined symbols: _memrchr`, first seen linking
+`utf8_cluster_smoke`). Provide a static fallback unless `__GLIBC__`.
+`memmem` is fine: macOS has it.
+
+## ccc 0.4.0-418 truncates long link lines (2026-09-25)
+
+Links of `cctext`, `cctext-ui`, `layout_measure_smoke` failed with
+`ld: file cannot be mmap()ed, errno=22 path=/Users` or `clang: error:
+no such file or directory: '/User'`: the host-cc command is cut at about
+4 KB. Fixed in concurrent-c `f24fff67` (growable `CCCmd`); the CI
+`CCC_PIN` (`0a633969`, 0.4.0-419) predates it. A side install of a
+newer commit works: `PREFIX=$HOME/.ccc-e59f ./cc-install.sh
+--no-add-to-path --no-editor-tools`, then build with that `bin/` first
+on PATH.
+
+The IDE's `cc-lsp` rewrites `out/.cc-build/clean/*.h` while a build
+reads them. A one-off `unknown type name` / `undeclared identifier` for
+a type the face plainly declares (`RtxMdbLine`, `RtxUtf8Cl`) is that
+race; rerun before debugging.
+
+## Smoke fixtures on macOS (2026-09-25)
+
+APFS rejects file names that are not valid UTF-8 (`EILSEQ`), so
+`term_safe_smoke` skips that fixture there. macOS `TMPDIR` is under
+`/var` → `/private/var`; compare against `realpath` output
+(`proj_smoke` canonicalizes its root).
