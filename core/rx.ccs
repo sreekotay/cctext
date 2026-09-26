@@ -3667,6 +3667,22 @@ static int rx_holds(int kind, const RtxRxIn *in, size_t pos) {
     return 0;
 }
 
+/* The assertion at `pos` reads past the text end (n): in a window that is
+ * not the end of the text, the bytes after n decide it. */
+static int rx_reads_end(int kind, size_t pos, size_t n) {
+    switch (kind) {
+    case RXA_EOL:
+    case RXA_EOT:
+    case RXA_WB:
+    case RXA_NWB:
+    case RXA_NCONT:
+        return pos >= n;
+    case RXA_EOTNL:
+        return pos + 1 >= n;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------- Pike VM */
 
 typedef struct {
@@ -3677,6 +3693,11 @@ typedef struct {
     uint32_t nslot;
     size_t steps;
     size_t budget; /* 0 = unlimited */
+    /* Search in a window that is not the text end: a thread an assertion
+     * stops at n is still open (the next bytes decide it). */
+    int endchk;
+    int end_live;
+    size_t end_min;
 } RxPike;
 
 static void rx_pike_add(RxPike *V, int li, uint32_t pc0, size_t pos) {
@@ -3726,6 +3747,10 @@ static void rx_pike_add(RxPike *V, int li, uint32_t pc0, size_t pos) {
                 pc = (uint32_t)I->x;
                 continue;
             case RXO_ASSERT:
+                if (V->endchk && rx_reads_end((int)I->aux, pos, V->in->n)) {
+                    V->end_live = 1;
+                    if (tc[0] < V->end_min) V->end_min = tc[0];
+                }
                 if (rx_holds(I->aux, V->in, pos)) {
                     pc = (uint32_t)I->x;
                     continue;
@@ -4064,7 +4089,11 @@ static int rx_pike(const RtxRx *rx, const RtxRxIn *in, RxWork *W, size_t lo,
         for (i = 0; i < 2; i++) {
             W->caps[i] = (size_t *)cc_arena_alloc(W->home, sizeof(size_t) * (size_t)W->cap_n *
                                                               W->cap_slot, 8);
-            if (!W->caps[i]) return RTX_RX_NONE;
+            if (!W->caps[i]) {
+                /* out of scratch memory: undecided from lo, not "none" */
+                *ms = *me = lo;
+                return RTX_RX_INDET;
+            }
         }
     }
     V.rx = rx;
@@ -4074,6 +4103,9 @@ static int rx_pike(const RtxRx *rx, const RtxRxIn *in, RxWork *W, size_t lo,
     V.nslot = nslot;
     V.steps = 0;
     V.budget = budget;
+    V.endchk = !anchored && !eof && nslot > 0;
+    V.end_live = 0;
+    V.end_min = RTX_RX_UNSET;
     rx_sp_clear(&W->sp[0]);
     rx_sp_clear(&W->sp[1]);
     for (;;) {
@@ -4127,6 +4159,10 @@ static int rx_pike(const RtxRx *rx, const RtxRxIn *in, RxWork *W, size_t lo,
         cur ^= 1;
         pos++;
     }
+    if (V.end_live) {
+        live = 1;
+        if (V.end_min < live_min) live_min = V.end_min;
+    }
     if (!anchored && !eof && live) {
         if (matched) return RTX_RX_PARTIAL;
         if (live_min < stop) {
@@ -4149,6 +4185,7 @@ typedef struct {
     size_t steps;
     size_t budget;
     uint32_t nslot;
+    int hitend; /* the attempt read (or asserted) past the text end */
 } RxBt;
 
 static int rx_bt_push(RxBt *B, int32_t pc, int32_t slot, size_t val) {
@@ -4214,7 +4251,10 @@ static int rx_bt_run(RxBt *B, uint32_t pc, size_t pos, size_t *caps, size_t targ
         case RXO_SET:
         case RXO_SWITCH: {
             uint32_t tgt;
-            if (pos >= n) goto fail;
+            if (pos >= n) {
+                B->hitend = 1;
+                goto fail;
+            }
             tgt = rx_step(pg, I, t[pos]);
             if (!tgt) goto fail;
             pos++;
@@ -4238,6 +4278,7 @@ static int rx_bt_run(RxBt *B, uint32_t pc, size_t pos, size_t *caps, size_t targ
             pc = caps[I->z] == pos ? (uint32_t)I->y : (uint32_t)I->x;
             continue;
         case RXO_ASSERT:
+            if (rx_reads_end((int)I->aux, pos, n)) B->hitend = 1;
             if (!rx_holds(I->aux, B->in, pos)) goto fail;
             pc = (uint32_t)I->x;
             continue;
@@ -4259,6 +4300,7 @@ static int rx_bt_run(RxBt *B, uint32_t pc, size_t pos, size_t *caps, size_t targ
                 if (s0 == RTX_RX_UNSET || e0 == RTX_RX_UNSET || e0 < s0) goto fail;
                 src = t + s0;
             }
+            if (e0 - s0 > n - pos) B->hitend = 1; /* the text may continue it */
             if (!rx_bref_eq(t, n, pos, src, e0 - s0, I->fl & 1, &adv)) goto fail;
             pos += adv;
             pc = (uint32_t)I->x;
@@ -4336,8 +4378,11 @@ over:
     return -1;
 }
 
+/* RTX_RX_MATCH (*end) / NONE, or RTX_RX_INDET: the step budget, the
+ * stack cap or the look-around depth ran out before the attempt was
+ * decided. *hitend (may be NULL): the attempt read past in->n. */
 static int rx_bt_at(const RtxRx *rx, const RtxRxIn *in, RtxRxScratch *S, RxWork *W,
-                    size_t at, size_t budget, size_t *caps, size_t *end) {
+                    size_t at, size_t budget, size_t *caps, size_t *end, int *hitend) {
     RxBt B;
     uint32_t i;
     int r;
@@ -4349,11 +4394,13 @@ static int rx_bt_at(const RtxRx *rx, const RtxRxIn *in, RtxRxScratch *S, RxWork 
     B.steps = 0;
     B.budget = budget;
     B.nslot = rx->nslot;
+    B.hitend = 0;
     for (i = 0; i < rx->nslot; i++) caps[i] = RTX_RX_UNSET;
     W->bt_top = 0;
     W->look_lv = 0;
     r = rx_bt_run(&B, rx->fwd.start, at, caps, RTX_RX_UNSET, end);
-    if (r < 0) return RTX_RX_BUDGET;
+    if (hitend) *hitend = B.hitend;
+    if (r < 0) return RTX_RX_INDET;
     return r ? RTX_RX_MATCH : RTX_RX_NONE;
 }
 
@@ -4841,6 +4888,25 @@ static int rx_dfa_final(RxDfa *D, RxWork *W, uint32_t si, unsigned B, unsigned A
     return 1;
 }
 
+/* Window end that is not the text end: would a candidate in state si be
+ * open or matched if some byte followed? The end context (1|2) can stop
+ * a thread at $ \b \B \z that the next byte lets through; then the plain
+ * path decides (a leftover, never a guess). */
+static int rx_dfa_open_past(RxDfa *D, RxWork *W, uint32_t si) {
+    static const unsigned after[4] = {0u, 1u, 4u, 32u}; /* other, '\n', word, continuation */
+    const uint32_t *pcs = D->pool + D->st[si].off;
+    uint32_t npc = D->st[si].npc, nl, i, k;
+    for (k = 0; k < 4; k++) {
+        int matched = 0, amb = 0, used = 0;
+        nl = rx_resolve(D->pg, W, pcs, npc, D->st[si].fl, after[k], 1, W->lbuf, &matched, &amb,
+                        &used);
+        if (amb || matched) return 1;
+        for (i = 0; i < nl; i++)
+            if (!D->pg->ustart || W->lbuf[i] < D->pg->ustart) return 1;
+    }
+    return 0;
+}
+
 #define RX_TRACK_TAIL 4096          /* bytes before the end where idle offsets are noted */
 #define RX_PF_RETRY ((size_t)1 << 20) /* a dense prefilter sleeps this long */
 #define RX_DFA_VIOL (-3)             /* the valid-UTF-8 assumption broke: rerun exact */
@@ -5026,6 +5092,7 @@ static int rx_dfa_fwd(RtxRxScratch *S, RxWork *W, const RtxRx *rx, const RtxRxIn
             return -1;
         if (matched) last = n;
         if (D->st[si].idle) *idle = n;
+        if (!eof && !live && rx->asserts && rx_dfa_open_past(D, W, si)) live = 1;
         if (!eof && live) {
             *end = last;
             return 2;
@@ -5398,20 +5465,20 @@ int rtx_rx_at(const RtxRx *rx, const RtxRxIn *in, size_t at, RtxRxScratch *s,
         return RTX_RX_MATCH;
     }
     W = rx_work(s, rx);
-    if (!W) return RTX_RX_NONE;
+    if (!W) return RTX_RX_INDET; /* no scratch memory: undecided */
     budget = in->budget ? in->budget : RTX_RX_BUDGET_DEFAULT;
     slots = W->bt_caps;
     if (rx->mode == RTX_RX_BACKTRACK || in->force == 2 ||
         (caps && rx->cap_loop && in->force != 1)) {
-        r = rx_bt_at(rx, in, s, W, at, budget, slots, &e);
+        r = rx_bt_at(rx, in, s, W, at, budget, slots, &e, NULL);
     } else {
         r = rx_pike(rx, in, W, at, at + 1, 1, 1, rx->nslot, budget, slots, &ms, &me);
         e = me;
     }
-    if (r == RTX_RX_BUDGET) {
+    if (r == RTX_RX_INDET) {
         s->budget_hits++;
         rtx_rx_note_budget(1);
-        return RTX_RX_BUDGET;
+        return RTX_RX_INDET;
     }
     if (r != RTX_RX_MATCH) return RTX_RX_NONE;
     *end = e;
@@ -5457,7 +5524,7 @@ static int rx_search_bt(const RtxRx *rx, const RtxRxIn *in, RtxRxScratch *s, RxW
     const unsigned char *t = (const unsigned char *)in->s;
     size_t p = lo, e = 0, budget = in->budget ? in->budget : RTX_RX_BUDGET_DEFAULT;
     while (p < stop) {
-        int r;
+        int r, hitend = 0;
         if (!rx->nullable) {
             p = rx_skip(rx, W, t, p, in->n);
             if (p >= stop || p >= in->n) break;
@@ -5466,24 +5533,46 @@ static int rx_search_bt(const RtxRx *rx, const RtxRxIn *in, RtxRxScratch *s, RxW
             p = rx_next_start(t, p, in->n);
             continue;
         }
-        r = rx_bt_at(rx, in, s, W, p, budget, W->bt_caps, &e);
+        r = rx_bt_at(rx, in, s, W, p, budget, W->bt_caps, &e, &hitend);
+        if (r == RTX_RX_INDET) {
+            /* Undecided at p: a later start is not the leftmost match,
+             * and "none" is not known either. Stop here. */
+            s->budget_hits++;
+            rtx_rx_note_budget(1);
+            *ms = *me = p;
+            return RTX_RX_INDET;
+        }
+        if (!eof && hitend) {
+            /* The attempt read the window end: the bytes after decide it. */
+            *ms = p;
+            *me = in->n;
+            return RTX_RX_PARTIAL;
+        }
         if (r == RTX_RX_MATCH) {
             *ms = p;
             *me = e;
             if (!eof && e >= in->n) return RTX_RX_PARTIAL;
             return RTX_RX_MATCH;
         }
-        if (r == RTX_RX_BUDGET) {
-            s->budget_hits++;
-            rtx_rx_note_budget(1);
-        }
         p++;
     }
     return RTX_RX_NONE;
 }
 
+static int rx_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t stop, int eof,
+                     RtxRxScratch *s, size_t *ms, size_t *me);
+
 int rtx_rx_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t stop, int eof,
                   RtxRxScratch *s, size_t *ms, size_t *me) {
+    int r = rx_search(rx, in, lo, stop, eof, s, ms, me);
+    /* A match that reaches the end of a window that is not the text end
+     * may be longer, or an assertion at the end may not hold: a leftover. */
+    if (r == RTX_RX_MATCH && !eof && *me >= in->n) r = RTX_RX_PARTIAL;
+    return r;
+}
+
+static int rx_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t stop, int eof,
+                     RtxRxScratch *s, size_t *ms, size_t *me) {
     const unsigned char *t;
     RxWork *W;
     size_t n;
@@ -5519,7 +5608,10 @@ int rtx_rx_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t stop, in
     lo = rx_next_start(t, lo, n);
     if (lo >= stop) return RTX_RX_NONE;
     W = rx_work(s, rx);
-    if (!W) return RTX_RX_NONE;
+    if (!W) {
+        *ms = *me = lo; /* no scratch memory: undecided from lo */
+        return RTX_RX_INDET;
+    }
     W->pf_t = NULL; /* the prefilter memo lives for one call: a buffer may be refilled */
     if (rx->rip.n && !force &&
         (in->force == 4 ||
