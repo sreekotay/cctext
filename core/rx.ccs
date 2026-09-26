@@ -3440,6 +3440,7 @@ typedef struct {
     RxDfa fwd;         /* malloc'ed tables: they move with the work block */
     RxDfa rev;
     RxDfa ri;          /* reverse inner: P reversed (its own cache and budget) */
+    RxDfa anc;         /* reverse inner: forward anchored at a start (own cache) */
     /* Prefilter memo: from pf_from, the first literal is at pf_hit and a
      * match starts at >= pf_bound (same text only). */
     const unsigned char *pf_t;
@@ -3449,11 +3450,15 @@ typedef struct {
     size_t pf_bound;
     size_t pf_finds;   /* vector scans run / bytes they passed (density) */
     size_t pf_bytes;
-    /* Reverse inner rests on this text (same pointer and length; a hint
-     * only) below ri_until after it gave up or found hits too dense. */
+    /* Reverse inner on this text (same pointer and length; a hint only):
+     * it rests below ri_until after it gave up or found hits too dense;
+     * ri_hits / ri_adv: literal hits and bytes they spanned over the
+     * calls so far (halved past RX_PF_RETRY), for that density. */
     const unsigned char *ri_t;
     size_t ri_n;
     size_t ri_until;
+    size_t ri_hits;
+    size_t ri_adv;
 } RxWork;
 
 static void rx_dfa_free(RxDfa *D);
@@ -3466,6 +3471,7 @@ void rtx_rx_scratch_drop(RtxRxScratch *s) {
         rx_dfa_free(&W->fwd);
         rx_dfa_free(&W->rev);
         rx_dfa_free(&W->ri);
+        rx_dfa_free(&W->anc);
     }
     if (s->a.base) s->a.destroy();
     s->w = NULL;
@@ -3475,7 +3481,7 @@ static RxWork *rx_work(RtxRxScratch *s, const RtxRx *rx) {
     RxWork *W = (RxWork *)s->w;
     uint32_t n = rx->fwd.n > rx->rev.n ? rx->fwd.n : rx->rev.n;
     uint32_t ns = rx->nslot < 2 ? 2 : rx->nslot;
-    RxDfa keep_f, keep_r, keep_i;
+    RxDfa keep_f, keep_r, keep_i, keep_a;
     int k;
     if (rx->rip.n > n) n = rx->rip.n;
     if (W && W->cap_n >= n && W->cap_slot >= ns) {
@@ -3490,10 +3496,12 @@ static RxWork *rx_work(RtxRxScratch *s, const RtxRx *rx) {
         memset(&keep_f, 0, sizeof(keep_f));
         memset(&keep_r, 0, sizeof(keep_r));
         memset(&keep_i, 0, sizeof(keep_i));
+        memset(&keep_a, 0, sizeof(keep_a));
         if (W) {
             keep_f = W->fwd;
             keep_r = W->rev;
             keep_i = W->ri;
+            keep_a = W->anc;
         }
         s->w = NULL;
         if (!s->a.base) {
@@ -3510,6 +3518,7 @@ static RxWork *rx_work(RtxRxScratch *s, const RtxRx *rx) {
         W->fwd = keep_f;
         W->rev = keep_r;
         W->ri = keep_i;
+        W->anc = keep_a;
         W->home = s->a;
         W->cap_n = n;
         W->cap_slot = ns;
@@ -3534,18 +3543,21 @@ static RxWork *rx_work(RtxRxScratch *s, const RtxRx *rx) {
         W->fwd.rx = NULL;
         W->rev.rx = NULL;
         W->ri.rx = NULL;
+        W->anc.rx = NULL;
     }
     return W;
 fail_w:
     rx_dfa_free(&W->fwd);
     rx_dfa_free(&W->rev);
     rx_dfa_free(&W->ri);
+    rx_dfa_free(&W->anc);
     s->w = NULL;
     return NULL;
 fail:
     rx_dfa_free(&keep_f);
     rx_dfa_free(&keep_r);
     rx_dfa_free(&keep_i);
+    rx_dfa_free(&keep_a);
     return NULL;
 }
 
@@ -5140,7 +5152,7 @@ static unsigned rx_rev_fl0(const RtxRx *rx, const unsigned char *t, size_t e, si
  * RX_DFA_VIOL rerun with assume = 0. *stopat: where it stopped reading. */
 static int rx_dfa_anch(RtxRxScratch *S, RxWork *W, const RtxRx *rx, const RtxRxIn *in,
                        size_t at, int eof, int assume, size_t *end, size_t *stopat) {
-    RxDfa *D = &W->fwd;
+    RxDfa *D = &W->anc;
     const unsigned char *t = (const unsigned char *)in->s;
     const uint8_t *cls = rx->cls;
     size_t n = in->n, p = at, last = RTX_RX_UNSET, reset_at = at;
@@ -5230,20 +5242,33 @@ static int rx_ri_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t st
                         size_t *from) {
     const unsigned char *t = (const unsigned char *)in->s;
     const RxPf *F = &rx->ripf;
-    size_t n = in->n, cur = lo, fwd_end = lo, far = lo, work = 0, hits = 0;
-    int reset = 0;
+    size_t n = in->n, cur = lo, fwd_end = lo, far = lo, work = 0, hits = 0, h = lo;
+    int reset = 0, ret;
     *from = lo;
-    if (!rx_dfa_bind(&W->ri, rx, 2) || !rx_dfa_bind(&W->fwd, rx, 0) || !rx_dfa_bind(&W->rev, rx, 1))
+    if (!rx_dfa_bind(&W->ri, rx, 2) || !rx_dfa_bind(&W->anc, rx, 0) || !rx_dfa_bind(&W->rev, rx, 1))
         return RX_RI_PLAIN;
+    if (W->ri_t != t || W->ri_n != n) {
+        W->ri_t = t;
+        W->ri_n = n;
+        W->ri_until = 0;
+        W->ri_hits = W->ri_adv = 0;
+    }
+    if (W->ri_adv > RX_PF_RETRY) {
+        W->ri_hits /= 2;
+        W->ri_adv /= 2;
+    }
     for (;;) {
-        size_t h = rx_pf_find(F, t, cur, n), st = 0, wk = 0, e = 0, stopat = 0;
+        size_t st = 0, wk = 0, e = 0, stopat = 0, th;
         uint32_t s0;
         int r;
+        h = rx_pf_find(F, t, cur, n);
         if (h >= n) break;
         hits++;
         if (h > far) far = h;
         if (h < fwd_end) goto rest; /* a forward scan already read past this hit */
-        if (!forced && hits >= 64 && h - lo < hits * 24) goto rest; /* hits every few bytes */
+        th = W->ri_hits + hits;
+        if (!forced && th >= 64 && W->ri_adv + (h - lo) < th * 24)
+            goto rest; /* hits every few bytes (over this call and the ones before) */
         s0 = rx_dfa_start(S, &W->ri, rx_rev_fl0(rx, t, h, n), &reset);
         if (s0 == RX_T_UNK) goto rest;
         r = rx_ri_back(S, W, &W->ri, s0, in, lo, h, fwd_end, &st, &wk);
@@ -5251,7 +5276,11 @@ static int rx_ri_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t st
         S->ri_work += wk;
         if (r < 0) goto rest;
         if (r > 0) {
-            if (st >= stop) return RTX_RX_NONE;
+            if (st >= stop) {
+                ret = RTX_RX_NONE;
+                h = n;
+                goto done;
+            }
             if (!rx_unit_start(t, st, n)) goto rest;
             r = rx_dfa_anch(S, W, rx, in, st, eof, 1, &e, &stopat);
             if (r == RX_DFA_VIOL) {
@@ -5263,12 +5292,15 @@ static int rx_ri_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t st
             if (r == RTX_RX_MATCH) {
                 *ms = st;
                 *me = e;
-                return RTX_RX_MATCH;
+                ret = RTX_RX_MATCH;
+                h = e;
+                goto done;
             }
             if (r == 2) {
                 /* undecided at the window end: s is the leftmost candidate */
                 *from = st;
-                return RX_RI_PLAIN;
+                ret = RX_RI_PLAIN;
+                goto done;
             }
             if (r != RTX_RX_NONE) goto rest;
             work += stopat - st;
@@ -5277,7 +5309,8 @@ static int rx_ri_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t st
         if (work > 3 * (h - lo) + RX_RI_SLACK) goto rest;
         cur = h + 1;
     }
-    if (eof) return RTX_RX_NONE;
+    ret = RTX_RX_NONE;
+    if (eof) goto done;
     {
         /* No whole literal is left: a candidate the window cuts is a
          * prefix of a match that runs to n. */
@@ -5293,17 +5326,19 @@ static int rx_ri_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t st
         r = rx_ri_back(S, W, &W->rev, s0, in, lo, n, lo, &y, &wk);
         S->ri_work += wk;
         if (r < 0) goto rest;
-        if (r == 0 || y >= stop) return RTX_RX_NONE;
-        *from = y;
-        return RX_RI_PLAIN;
+        if (r > 0 && y < stop) {
+            *from = y;
+            ret = RX_RI_PLAIN;
+        }
     }
+done:
+    W->ri_hits += hits;
+    W->ri_adv += (h > n ? n : h) - lo;
+    return ret;
 rest:
     S->ri_bails++;
-    if (!forced) {
-        W->ri_t = t;
-        W->ri_n = n;
-        W->ri_until = far > lo + RX_PF_RETRY ? far : lo + RX_PF_RETRY;
-    }
+    if (!forced) W->ri_until = far > lo + RX_PF_RETRY ? far : lo + RX_PF_RETRY;
+    W->ri_hits = W->ri_adv = 0;
     *from = lo;
     return RX_RI_PLAIN;
 }
