@@ -86,6 +86,8 @@ typedef struct {
 typedef struct {
     uint32_t id;
     uint32_t first, n;
+    uint32_t indet_line; /* RtxPsGroup.indet_line */
+    uint64_t indet_off;
 } RtxPsFileHits;
 
 /* Lane scratch for one chunk of files (the `cache` replica): the read
@@ -110,6 +112,8 @@ typedef struct {
     size_t skip;            /* files the search index ruled out, unread */
     size_t chunked;         /* files read only around passing chunks */
     uint64_t us_stat, us_read, us_scan;
+    uint32_t f_indet_line;  /* the file being scanned: undecided start (0 none) */
+    uint64_t f_indet_off;
 } RtxPsSlot;
 
 typedef struct RtxPsWalk {
@@ -1951,7 +1955,9 @@ static int rtx_ps_slot_file(RtxPsSlot *s, uint32_t id, size_t first) {
         s->fhcap = c;
     }
     s->fh[s->nfh++] = (RtxPsFileHits){ .id = id, .first = (uint32_t)first,
-                                       .n = (uint32_t)(s->nh - first) };
+                                       .n = (uint32_t)(s->nh - first),
+                                       .indet_line = s->f_indet_line,
+                                       .indet_off = s->f_indet_off };
     return 0;
 }
 
@@ -1977,7 +1983,8 @@ static int rtx_ps_buf(RtxPsSlot *s, size_t need) {
 
 /* Lane: matches starting in buf[lo, stop) of the text buf[0, n), which
  * sits at file offset `base`; lo is a line start of line `line`. ctx:
- * the regex context of buf[0]. -1 = out of lane scratch. */
+ * the regex context of buf[0]. -1 = out of lane scratch; 1 = the regex
+ * could not decide a start (s->f_indet_*): the file's hits stop there. */
 static int rtx_ps_match(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s, const char *buf,
                         size_t n, size_t lo, size_t stop, unsigned ctx, uint64_t base,
                         uint32_t line) {
@@ -1994,6 +2001,12 @@ static int rtx_ps_match(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s, const ch
         int r = rtx_rx_search(ps->rx, &in, p, stop, 1, &s->rxs, &ms, &me);
         size_t le, ws, we;
         RtxPsHit h;
+        if (r == RTX_RX_INDET) {
+            if (lpos < ms) line += (uint32_t)rtx_count_lf(buf + lpos, ms - lpos);
+            s->f_indet_line = line;
+            s->f_indet_off = base + ms;
+            return 1;
+        }
         if (r != RTX_RX_MATCH) break;
         if (me == ms || ((ps->opts & RTX_PS_WORD) && !rtx_ps_word_ok(buf, n, ms, me))) {
             p = rtx_ps_next_cp(buf, n, ms);
@@ -2139,9 +2152,10 @@ static int rtx_ps_scan_chunks(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s, in
             uint64_t t0o = st > 0 ? st - 1 : 0;
             uint64_t t1o = en < size ? en + 1 : size;
             unsigned ctx = st == 0 ? (RTX_RX_CTX_BOL0 | RTX_RX_CTX_BOT0) : 0;
-            if (rtx_ps_match(wk, id, s, s->buf + (t0o - a), (size_t)(t1o - t0o),
-                             (size_t)(st - t0o), (size_t)(en - t0o), ctx, t0o, line) < 0)
-                return -1;
+            int mr = rtx_ps_match(wk, id, s, s->buf + (t0o - a), (size_t)(t1o - t0o),
+                                  (size_t)(st - t0o), (size_t)(en - t0o), ctx, t0o, line);
+            if (mr < 0) return -1;
+            if (mr > 0) break; /* undecided: nothing past it in this file */
         }
         done_to = en;
         if (s->nh > RTX_PROJ_HITS_MAX) break;
@@ -2168,6 +2182,8 @@ static void rtx_ps_scan(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s) {
     long slow = atomic_load(&g_proj_slow_us);
     long ck = -1;          /* chunk reads: the index id */
     uint32_t cu0 = 0, cnu = 0;
+    s->f_indet_line = 0;
+    s->f_indet_off = 0;
     if (slow > 0) usleep((useconds_t)slow);
     /* The lane keeps its last directory open: a chunk's files mostly
      * share one, and openat(dir, name) skips resolving the root path
@@ -2255,13 +2271,14 @@ static void rtx_ps_scan(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s) {
                 return;
             }
             s->chunked++;
-            if (s->nh > first && rtx_ps_slot_file(s, id, first) < 0) {
+            if ((s->nh > first || s->f_indet_line) && rtx_ps_slot_file(s, id, first) < 0) {
                 s->nh = first;
                 s->err++;
             }
             return;
         }
         s->nh = first; /* a read failed: read it whole */
+        s->f_indet_line = 0;
     }
     if (!rtx_ps_buf(s, size + 1)) {
         close(fd);
@@ -2297,7 +2314,7 @@ static void rtx_ps_scan(const RtxPsWalk *wk, uint32_t id, RtxPsSlot *s) {
         s->err++;
         return;
     }
-    if (s->nh > first && rtx_ps_slot_file(s, id, first) < 0) {
+    if ((s->nh > first || s->f_indet_line) && rtx_ps_slot_file(s, id, first) < 0) {
         s->nh = first;
         s->err++;
     }
@@ -2334,8 +2351,9 @@ static int rtx_ps_stage_file(RtxProjSearch *ps, const RtxPsSlot *s, const RtxPsF
             ps->store, sizeof(RtxPsGroup) << RTX_PROJ_HCH_BITS, 8);
         if (!ps->gch[gk]) return -1;
     }
-    /* Hit chunks first: a failed chunk alloc leaves no partial group. */
-    for (i = ps->nh >> RTX_PROJ_HCH_BITS; i <= (ps->nh + f->n - 1) >> RTX_PROJ_HCH_BITS; i++) {
+    /* Hit chunks first: a failed chunk alloc leaves no partial group. (A
+     * group with no hits is an incomplete file: its header only.) */
+    for (i = ps->nh >> RTX_PROJ_HCH_BITS; f->n && i <= (ps->nh + f->n - 1) >> RTX_PROJ_HCH_BITS; i++) {
         if (ps->hch[i]) continue;
         ps->hch[i] = (RtxPsHit *)cc_arena_alloc(ps->store,
                                                 sizeof(RtxPsHit) << RTX_PROJ_HCH_BITS, 8);
@@ -2353,8 +2371,10 @@ static int rtx_ps_stage_file(RtxProjSearch *ps, const RtxPsSlot *s, const RtxPsF
         ps->nh++;
     }
     ps->gch[gk][ps->ng & ((1u << RTX_PROJ_HCH_BITS) - 1)] =
-        (RtxPsGroup){ .file = f->id, .first = first, .n = f->n };
+        (RtxPsGroup){ .file = f->id, .first = first, .n = f->n,
+                      .indet_line = f->indet_line, .indet_off = f->indet_off };
     ps->ng++;
+    if (f->indet_line) ps->n_indet++;
     return 0;
 }
 
