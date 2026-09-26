@@ -74,7 +74,7 @@ column, never a silent rebind.
 | State | Kind | Lives | Rebuilt from |
 |---|---|---|---|
 | Workbook text, external CSV bytes | truth | files, piece tree (`core/piece_tree.cch`) | — |
-| Parsed workbook: names, schemas, formulas, graph | derived | workbook epoch (arena on the workbook `RtxDoc`) | full parse of the workbook doc (small; capped `RTX_WB_MAX`, 8 MiB) |
+| Parsed workbook: names, schemas, formulas, graph | derived | workbook epoch (arena on the workbook `RtxDoc`) | full parse of the workbook doc (capped `RTX_WB_MAX`: 8 MiB in W0, 256 MiB since [W2 at scale](#w2-at-scale)) |
 | Table index: leaves, counts, zone maps, aggregate partials, key indexes | derived, persisted | index epoch on the *table's* `RtxDoc` + cache dir (`RTXI`) | one progressive build over the table bytes |
 | Formula values | derived, not persisted in the file | workbook epoch; cached in `RTXV` beside `RTXI` | graph eval over index roots |
 | Views (filter / sort) | derived | layout / view epoch | index + predicate |
@@ -566,8 +566,9 @@ under another name get no hook).
   keeps spaces; backticks are dropped). A caption name may be backticked
   too (`` Table: `Price List` ``). A GFM table with no caption is plain
   Markdown and not part of the workbook. Columns stop at the lens's 16;
-  a table over `RTX_WB_ROWS_MAX` (10 000) rows is refused: references to
-  it are `#ref(… W1 indexes it)`.
+  a table over `RTX_WB_ROWS_MAX` rows (10 000 in W0; 1 000 000 since
+  [W2 at scale](#w2-at-scale)) is refused: references to it are
+  `#ref(… W1 indexes it)`.
 - A body cell whose trimmed text starts with `=` is a formula; so is a
   code span `` `=…` `` (GitHub shows the formula as code). Anything else
   is a literal.
@@ -649,8 +650,10 @@ edit span). The next query syncs:
   dangling caption) nor the line before or after one, and the new lines
   start no fence, H1 or caption: offsets shift, nothing recalcs.
 - anything else — a new row, a header or separator edit, a new name, a
-  fence — reparses the workbook (capped at `RTX_WB_MAX`, 8 MiB; over it
-  values are off and the status says so). So does garbage from many
+  fence — reparses the workbook (capped at `RTX_WB_MAX`, 8 MiB in W0 and
+  256 MiB since W2 at scale; over it values are off and the status says
+  so; from 1 MiB the reparse waits for a pause in typing, see
+  [W2 at scale](#w2-at-scale)). So does garbage from many
   incremental edits (model / value arenas past 16 MiB or 2× the build).
 
 **Rich lens.** A formula span (a cell's trimmed `=…`, a calc
@@ -848,7 +851,7 @@ at its next pop. The leaves take the rows (split / merge; every MA's leaf
 arrays mirror them). Error cells below the edit re-evaluate (their
 messages name row numbers); so do cycle paths. The header, separator,
 caption, a fence, a row that would end or split the table, a table at EOF
-without a newline, and 0 or over 10 000 rows still reparse. Dumps and
+without a newline, and 0 or over `RTX_WB_ROWS_MAX` rows still reparse. Dumps and
 cycle paths follow document order, not node ids, so a workbook edited
 this way and one built from scratch print the same.
 
@@ -972,7 +975,7 @@ aggregates over one column).
 not built. Editing a group's definition reparses the workbook (its
 readers bind its outputs by name). Inserts into a table with no body
 rows reparse. A scalar input's change costs its MA one walk of the table
-(≤ 10 000 rows for an embedded table).
+(up to `RTX_WB_ROWS_MAX` rows for an embedded table: ~20 ms at 100k).
 
 ## Locks
 

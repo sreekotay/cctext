@@ -6,6 +6,15 @@
  *
  *   ./bin/wb_scale_perf [rows ...]          (default 10000 100000)
  *   ./bin/wb_scale_perf --pins [rows]        (one size; RESULT lines for pins)
+ *   ./bin/wb_scale_perf 1000000 5000000 10000000   (the big tiers)
+ *
+ * Each tier checks free disk first (the file is streamed to /tmp and
+ * deleted after), predicts the model's RSS (WB_SCALE_BPR bytes a row,
+ * default 3500) and runs the full model only under the guard
+ * (WB_SCALE_RSS_GB, default 8); over it, it reports what the parse costs
+ * with the table refused, and a watchdog stops the process cleanly if RSS
+ * passes the guard anyway. Tiers over the default caps (RTX_WB_ROWS_MAX /
+ * RTX_WB_MAX) lift them for the run (caps=lifted).
  *
  * RESULT op=... n= p50_ms= p95_ms= per size:
  *   open            attach (parse, bind, Tarjan, every MA's first walk); rss_mb
@@ -26,6 +35,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sys/statvfs.h>
 #include "../core/utf8.cch"
 #include "../core/document.cch"
 #include "../core/layout.cch"
@@ -84,6 +95,27 @@ static long proc_kb(const char *key) {
         }
     fclose(f);
     return v;
+}
+
+/* The RSS guard: a watchdog stops the run cleanly (the file removed). */
+static long g_guard_kb;
+static char g_file[512];
+static const char *volatile g_phase = "start";
+
+static void *watchdog(void *arg) {
+    (void)arg;
+    for (;;) {
+        long kb = proc_kb("VmRSS:");
+        if (g_guard_kb > 0 && kb > g_guard_kb) {
+            fprintf(stdout, "STOP phase=%s: RSS %.2f GB passed the %.1f GB guard; stopping cleanly\n",
+                    g_phase, kb / 1048576.0, g_guard_kb / 1048576.0);
+            fflush(stdout);
+            if (g_file[0]) unlink(g_file);
+            _exit(3);
+        }
+        usleep(20000);
+    }
+    return NULL;
 }
 
 static int dcmp(const void *a, const void *b) {
@@ -167,36 +199,19 @@ static void !>(CCError) toggle_cell(RtxDoc *d, RtxWb *wb, long rows, long id, in
     return cc_ok();
 }
 
-static void !>(CCError) engine(const char *dir, long rows, int pins) {
-    WbGen g = {0};
-    char path[512], extra[200], rowbuf[256];
-    size_t n = 0, off, rn;
-    char *src;
+static void !>(CCError) engine(const char *path, size_t n, long rows, int pins) {
+    char extra[300], rowbuf[256];
+    size_t off, rn;
     RtxDoc d = {0};
     RtxWb *wb;
     RtxWbStats st, s0, s1;
     double t0, v[64];
-    int i;
-    FILE *f;
+    int i, nre;
     long rss0 = proc_kb("VmRSS:");
     @errhandler(CCError e) {
         return cc_err(e);
     }
-    g.rows = (int)rows;
-    g.nagg_a = getenv("WB_SCALE_NAGG") ? atoi(getenv("WB_SCALE_NAGG")) : 1000;
-    g.nagg_b = g.nagg_a >= 100 ? 100 : g.nagg_a;
-    g.chain = 50;
-    src = wbgen(&g, &n);
-    if (!src) return cc_err(CC_ERR_OUT_OF_MEMORY, "gen");
-    snprintf(path, sizeof path, "%s/scale_%ld.wb.md", dir, rows);
-    f = fopen(path, "wb");
-    if (!f || fwrite(src, 1, n, f) != n) {
-        if (f) fclose(f);
-        free(src);
-        return cc_err(CC_ERR_IO, "write");
-    }
-    fclose(f);
-    free(src);
+    g_phase = "open";
     t0 = mono_ms();
     d.from_path(cc_slice_cstr(path)) !>;
     wb = rtx_wb_of(&d);
@@ -210,6 +225,7 @@ static void !>(CCError) engine(const char *dir, long rows, int pins) {
              proc_kb("VmHWM:") / 1024.0, st.mem_model / 1048576.0, st.mem_nodes / 1048576.0,
              st.mem_values / 1048576.0);
     report(rows, "open", v, 1, extra);
+    g_phase = "edits";
     if (st.off || getenv("WB_SCALE_OPENONLY")) {
         RtxDoc_destroy(&d);
         return cc_ok();
@@ -245,10 +261,13 @@ static void !>(CCError) engine(const char *dir, long rows, int pins) {
     rtx_wb_stats(wb, &d, &s1);
     snprintf(extra, sizeof extra, "ma_builds=%zu", (s1.ma_full - s0.ma_full) / 20);
     report(rows, "param", v, 20, extra);
-    if ((!pins || rows <= 100000) && !getenv("WB_SCALE_NOREPARSE")) {
-        /* the header: a whole-workbook parse */
+    nre = rows > 100000 || pins ? 2 : 4;
+    if (!getenv("WB_SCALE_NOREPARSE")) {
+        /* the header: a whole-workbook parse (rtx_wb_sync: synchronous; the
+         * editor's keystroke path defers it to the idle loop) */
+        g_phase = "reparse";
         off = find_off(&d, "| id | key |", 0);
-        for (i = 0; i < 4; i++) {
+        for (i = 0; i < nre; i++) {
             t0 = mono_ms();
             if (i % 2 == 0) d.replace(off + 1, 0, cc_slice_from_buffer((char *)" ", 1)) !>;
             else d.replace(off + 1, 1, cc_slice_empty()) !>;
@@ -257,18 +276,17 @@ static void !>(CCError) engine(const char *dir, long rows, int pins) {
         }
         rtx_wb_stats(wb, &d, &st);
         snprintf(extra, sizeof extra, "rebuilds=%zu", st.rebuilds);
-        report(rows, "reparse", v, 4, extra);
+        report(rows, "reparse", v, nre, extra);
     }
     RtxDoc_destroy(&d);
     return cc_ok();
 }
 
 /* Keystrokes in a cell, the formula-end annotation, and paging: Rich. */
-static void !>(CCError) lens(const char *dir, long rows, int px) {
+static void !>(CCError) lens(const char *path, long rows, int px) {
     RtxBuf b = {0} @destroy;
     RtxMeasure m = {0};
-    char path[512];
-    size_t off, line, lo, hi;
+    size_t off = 0, line, lo, hi;
     double v[120], t0, w = px ? 960.0 : PERF_W;
     int k;
     @errhandler(CCError e) {
@@ -279,7 +297,7 @@ static void !>(CCError) lens(const char *dir, long rows, int px) {
     }
     m.measure = px ? px_meas : cell_meas;
     m.line_height = px ? px_lh : cell_lh;
-    snprintf(path, sizeof path, "%s/scale_%ld.wb.md", dir, rows);
+    g_phase = px ? "lens_px" : "lens";
     b.doc.from_path(cc_slice_cstr(path)) !>;
     b.layout.rich = 1;
     b.layout.wrap = 1;
@@ -322,12 +340,59 @@ static void !>(CCError) lens(const char *dir, long rows, int px) {
     return cc_ok();
 }
 
+/* Free bytes where `dir` lives. */
+static unsigned long long disk_free(const char *dir) {
+    struct statvfs v;
+    if (statvfs(dir, &v) != 0) return 0;
+    return (unsigned long long)v.f_bavail * (unsigned long long)v.f_frsize;
+}
+
+/* A tier over the guard: what opening it costs without the model (the
+ * byte cap as shipped, then the byte cap lifted with the row cap kept:
+ * the table refused, everything else parsed). */
+static void !>(CCError) refused(const char *path, size_t n, long rows) {
+    size_t caps[3], w;
+    int pass;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    rtx_wb_limits_get(&caps[0], &caps[1], &caps[2]);
+    for (pass = 0; pass < 2; pass++) {
+        RtxDoc d = {0};
+        RtxWb *wb;
+        RtxWbStats st;
+        double t0, v[1];
+        char extra[300], msg[200];
+        long rss0 = proc_kb("VmRSS:");
+        if (pass == 1) rtx_wb_limits((size_t)UINT32_MAX - 16, RTX_WB_ROWS_MAX, 0);
+        g_phase = pass ? "open_refused" : "open_default";
+        t0 = mono_ms();
+        d.from_path(cc_slice_cstr(path)) !>;
+        wb = rtx_wb_of(&d);
+        rtx_wb_stats(wb, &d, &st);
+        v[0] = mono_ms() - t0;
+        msg[0] = 0;
+        w = rtx_wb_eval(wb, &d, "total", 5, msg, sizeof msg);
+        (void)w;
+        snprintf(extra, sizeof extra, "bytes=%zu off=%d nodes=%zu rss_mb=%.1f total=\"%s\"", n,
+                 st.off, st.nodes, (proc_kb("VmRSS:") - rss0) / 1024.0, msg);
+        report(rows, pass ? "open_refused" : "open_default", v, 1, extra);
+        RtxDoc_destroy(&d);
+    }
+    rtx_wb_limits(caps[0], caps[1], caps[2]);
+    return cc_ok();
+}
+
 int main(int argc, char **argv) {
     char dir[] = "/tmp/wb_scale_XXXXXX";
     long sizes[8];
     int ns = 0, i, pins = 0;
+    double bpr = getenv("WB_SCALE_BPR") ? atof(getenv("WB_SCALE_BPR")) : 3500.0;
+    double guard_gb = getenv("WB_SCALE_RSS_GB") ? atof(getenv("WB_SCALE_RSS_GB")) : 8.0;
+    pthread_t wd;
     @errhandler(CCError e) {
         fprintf(stderr, "wb_scale_perf: %s\n", e.message ? e.message : "error");
+        if (g_file[0]) unlink(g_file);
         return 1;
     }
     for (i = 1; i < argc && ns < 8; i++) {
@@ -339,15 +404,60 @@ int main(int argc, char **argv) {
         sizes[ns++] = 100000;
     }
     if (!mkdtemp(dir)) return 1;
+    g_guard_kb = (long)(guard_gb * 1048576.0);
+    pthread_create(&wd, NULL, watchdog, NULL);
+    pthread_detach(wd);
     for (i = 0; i < ns; i++) {
-        char p[512];
-        engine(dir, sizes[i], pins) !>;
-        if (!getenv("WB_SCALE_OPENONLY")) {
-            lens(dir, sizes[i], 0) !>;
-            lens(dir, sizes[i], 1) !>;
+        WbGen g = {0};
+        long rows = sizes[i];
+        double pred_gb, t0, gen_ms;
+        unsigned long long need = (unsigned long long)rows * 90ull + (64ull << 20), freeb = disk_free(dir);
+        size_t n, caps[3];
+        g.rows = (int)rows;
+        g.nagg_a = getenv("WB_SCALE_NAGG") ? atoi(getenv("WB_SCALE_NAGG")) : 1000;
+        g.nagg_b = g.nagg_a >= 100 ? 100 : g.nagg_a;
+        g.chain = 50;
+        if (freeb < need + (1ull << 30)) {
+            printf("SKIP rows=%ld: %.2f GB free in %s, the file needs %.2f GB (+1 GB kept free)\n", rows,
+                   freeb / 1073741824.0, dir, need / 1073741824.0);
+            continue;
         }
-        snprintf(p, sizeof p, "%s/scale_%ld.wb.md", dir, sizes[i]);
-        unlink(p);
+        snprintf(g_file, sizeof g_file, "%s/scale_%ld.wb.md", dir, rows);
+        g_phase = "generate";
+        t0 = mono_ms();
+        n = wbgen_file(&g, g_file);
+        gen_ms = mono_ms() - t0;
+        if (!n) {
+            unlink(g_file);
+            fprintf(stderr, "wb_scale_perf: could not write %s\n", g_file);
+            return 1;
+        }
+        pred_gb = ((double)rows * bpr + 2.0 * (double)n) / 1073741824.0 + 0.3;
+        printf("TIER rows=%ld bytes=%zu gen_ms=%.0f disk_free_gb=%.2f predicted_rss_gb=%.2f guard_gb=%.1f\n",
+               rows, n, gen_ms, freeb / 1073741824.0, pred_gb, guard_gb);
+        fflush(stdout);
+        rtx_wb_limits_get(&caps[0], &caps[1], &caps[2]);
+        if (pred_gb > guard_gb) {
+            refused(g_file, n, rows) !>;
+            printf("STOP rows=%ld: the model needs ~%.1f GB (%.0f B a row: a node per cell, row "
+                   "arrays, text) > the %.1f GB guard; embedded tables stop here (W1)\n",
+                   rows, pred_gb, bpr, guard_gb);
+        } else {
+            if ((size_t)rows + 16 > caps[1] || n + ((size_t)1 << 20) > caps[0]) {
+                rtx_wb_limits((size_t)UINT32_MAX - 16, (size_t)rows + 1000, 0);
+                printf("CAPS rows=%ld: at or over the default caps (%zu rows / %zu MiB): lifted for this run\n",
+                       rows, caps[1], caps[0] >> 20);
+            }
+            engine(g_file, n, rows, pins) !>;
+            if (!getenv("WB_SCALE_OPENONLY")) {
+                lens(g_file, rows, 0) !>;
+                lens(g_file, rows, 1) !>;
+            }
+            rtx_wb_limits(caps[0], caps[1], caps[2]);
+        }
+        fflush(stdout);
+        unlink(g_file);
+        g_file[0] = 0;
     }
     rmdir(dir);
     return 0;

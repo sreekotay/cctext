@@ -13,10 +13,14 @@
  * k / asof / lim that predicates read; calc aggregates: `nagg_a` over
  * column a (sum with a where on id, or avg / count / max), `nagg_b` over b,
  * one over e, a group by key, lookups into it, and a chain of `chain` names.
+ *
+ * wbgen: the text in memory. wbgen_file: streamed to a file (the 10M-row
+ * tier is ~0.8 GB; nothing that size is held).
  */
 #ifndef RTX_WB_GEN_H
 #define RTX_WB_GEN_H
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,49 +44,100 @@ static size_t wbgen_row(char *buf, size_t cap, long r) {
     return n > 0 ? (size_t)n : 0;
 }
 
-/* Malloc'd workbook text; *out_n its length. */
-static char *wbgen(const WbGen *g, size_t *out_n) {
-    size_t cap = (size_t)g->rows * 96 + (size_t)(g->nagg_a + g->nagg_b + g->chain) * 72 + 8192;
-    size_t n = 0;
-    char *p = (char *)malloc(cap);
+/* Where the text goes: a buffer (p, cap) or a file. */
+typedef struct {
+    char *p;
+    size_t n, cap;
+    FILE *f;
+    int bad;
+} WbSink;
+
+static void wbg_put(WbSink *s, const char *b, size_t n) {
+    if (s->bad) return;
+    if (s->f) {
+        if (fwrite(b, 1, n, s->f) != n) s->bad = 1;
+    } else if (s->n + n < s->cap) {
+        memcpy(s->p + s->n, b, n);
+    } else {
+        s->bad = 1;
+        return;
+    }
+    s->n += n;
+}
+
+static void wbg_printf(WbSink *s, const char *fmt, ...) {
+    char b[512];
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    if (n > 0) wbg_put(s, b, (size_t)n < sizeof b ? (size_t)n : sizeof b - 1);
+}
+
+static void wbgen_to(const WbGen *g, WbSink *s) {
+    char row[256];
     long r;
     int i;
-    if (!p) return NULL;
-#define WBG(...) n += (size_t)snprintf(p + n, cap - n, __VA_ARGS__)
-    WBG("# Scale\n\nA generated workbook: one big table, row formulas, aggregates, a group.\n\n"
-        "```params\nk = 500\nasof = 2026-06-01\nlim = 0.5\n```\n\nTable: Big\n\n"
-        "| id | key | a | b | c | d | e | f1 | f2 |\n"
-        "|----|-----|---|---|---|---|---|----|----|\n");
-    for (r = 1; r <= g->rows; r++) n += wbgen_row(p + n, cap - n, r);
-    WBG("\nProse between the table and the names.\n\n```calc\n");
-    WBG("total = sum(Big.f1)\n");
-    WBG("n_big = count(Big where a > k)\n");
-    WBG("avg_b = avg(Big.b where d >= asof)\n");
-    WBG("top_c = max(Big.c)\n");
-    WBG("low_b = min(Big.b where c > lim)\n");
-    WBG("sum_c = sum(Big.c)\n");
-    WBG("sum_f2 = sum?(Big.f2)\n");
-    WBG("keys = distinct(Big.key)\n");
-    WBG("by_key = group Big by key { n: count(), s: sum(b), hi: max(c), lo: min(a) }\n");
-    WBG("eu = by_key[key = \"EU\"].s\n");
-    WBG("us_hi = by_key[key = \"US\"].hi\n");
-    WBG("e_one = sum(Big.e)\n");
+    wbg_printf(s, "# Scale\n\nA generated workbook: one big table, row formulas, aggregates, a group.\n\n"
+                  "```params\nk = 500\nasof = 2026-06-01\nlim = 0.5\n```\n\nTable: Big\n\n"
+                  "| id | key | a | b | c | d | e | f1 | f2 |\n"
+                  "|----|-----|---|---|---|---|---|----|----|\n");
+    for (r = 1; r <= g->rows; r++) wbg_put(s, row, wbgen_row(row, sizeof row, r));
+    wbg_printf(s, "\nProse between the table and the names.\n\n```calc\n");
+    wbg_printf(s, "total = sum(Big.f1)\n");
+    wbg_printf(s, "n_big = count(Big where a > k)\n");
+    wbg_printf(s, "avg_b = avg(Big.b where d >= asof)\n");
+    wbg_printf(s, "top_c = max(Big.c)\n");
+    wbg_printf(s, "low_b = min(Big.b where c > lim)\n");
+    wbg_printf(s, "sum_c = sum(Big.c)\n");
+    wbg_printf(s, "sum_f2 = sum?(Big.f2)\n");
+    wbg_printf(s, "keys = distinct(Big.key)\n");
+    wbg_printf(s, "by_key = group Big by key { n: count(), s: sum(b), hi: max(c), lo: min(a) }\n");
+    wbg_printf(s, "eu = by_key[key = \"EU\"].s\n");
+    wbg_printf(s, "us_hi = by_key[key = \"US\"].hi\n");
+    wbg_printf(s, "e_one = sum(Big.e)\n");
     for (i = 0; i < g->nagg_a; i++) {
+        int rows = g->rows ? g->rows : 1;
         switch (i % 4) {
-        case 0: WBG("a%d = sum(Big.a where id > %d)\n", i, (i * 7919) % (g->rows ? g->rows : 1)); break;
-        case 1: WBG("a%d = avg(Big.a where key = \"%s\")\n", i, g_wbgen_keys[i % 5]); break;
-        case 2: WBG("a%d = count(Big where a > %d)\n", i, (i * 31) % 1000); break;
-        default: WBG("a%d = max(Big.a where id <= %d)\n", i, 1 + (i * 104729) % (g->rows ? g->rows : 1)); break;
+        case 0: wbg_printf(s, "a%d = sum(Big.a where id > %d)\n", i, (i * 7919) % rows); break;
+        case 1: wbg_printf(s, "a%d = avg(Big.a where key = \"%s\")\n", i, g_wbgen_keys[i % 5]); break;
+        case 2: wbg_printf(s, "a%d = count(Big where a > %d)\n", i, (i * 31) % 1000); break;
+        default:
+            wbg_printf(s, "a%d = max(Big.a where id <= %ld)\n", i, 1 + ((long)i * 104729) % rows);
+            break;
         }
     }
-    for (i = 0; i < g->nagg_b; i++)
-        WBG("b%d = sum(Big.b where a > %d)\n", i, (i * 17) % 1000);
-    WBG("chain0 = total + n_big\n");
-    for (i = 1; i < g->chain; i++) WBG("chain%d = chain%d + %d\n", i, i - 1, i);
-    WBG("```\n\nTail prose.\n");
-#undef WBG
-    *out_n = n;
-    return p;
+    for (i = 0; i < g->nagg_b; i++) wbg_printf(s, "b%d = sum(Big.b where a > %d)\n", i, (i * 17) % 1000);
+    wbg_printf(s, "chain0 = total + n_big\n");
+    for (i = 1; i < g->chain; i++) wbg_printf(s, "chain%d = chain%d + %d\n", i, i - 1, i);
+    wbg_printf(s, "```\n\nTail prose.\n");
+}
+
+/* Malloc'd workbook text; *out_n its length. */
+static char *wbgen(const WbGen *g, size_t *out_n) {
+    WbSink s = {0};
+    s.cap = (size_t)g->rows * 96 + (size_t)(g->nagg_a + g->nagg_b + g->chain) * 72 + 8192;
+    s.p = (char *)malloc(s.cap);
+    if (!s.p) return NULL;
+    wbgen_to(g, &s);
+    if (s.bad) {
+        free(s.p);
+        return NULL;
+    }
+    s.p[s.n] = 0;
+    *out_n = s.n;
+    return s.p;
+}
+
+/* Stream the workbook to `path`; its length, 0 on failure. */
+static size_t wbgen_file(const WbGen *g, const char *path) {
+    WbSink s = {0};
+    s.f = fopen(path, "wb");
+    if (!s.f) return 0;
+    wbgen_to(g, &s);
+    if (fclose(s.f) != 0) s.bad = 1;
+    return s.bad ? 0 : s.n;
 }
 
 #endif /* RTX_WB_GEN_H */
