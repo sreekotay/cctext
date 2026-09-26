@@ -1,0 +1,983 @@
+#!ccc ccs
+/*
+ * Save / history sequences at the commit boundaries.
+ *
+ * 1. A savepoint is a history state, not an undo-stack position: save,
+ *    undo, a divergent edit is dirty (and Save writes it); undo / redo
+ *    back onto the saved state is clean; the same through edit groups,
+ *    bulk groups, workspace transactions and a journal reload.
+ * 2. A --backup save writes through the opened inode. Every ORIGINAL
+ *    ref the tree and history hold keeps its bytes afterwards: uncached
+ *    reads, undo, redo and the next save agree with a model (small files,
+ *    past the old pin threshold, hard links, a second document on the
+ *    same inode).
+ * 3. Reference model: random edits / groups / undo / redo / save (plain
+ *    and --backup) / revert / journal reload, bytes (cached and
+ *    uncached), dirty and the file on disk compared at every step.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/safe.cch"
+
+static int fails = 0;
+static int quiet_fail = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        if (quiet_fail < 40) fprintf(stderr, "FAIL: %s\n", msg);
+        quiet_fail++;
+        fails++;
+    }
+}
+
+static uint64_t rng = 1;
+
+static uint64_t rnd(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+}
+
+static size_t rnd_n(size_t n) {
+    return n ? (size_t)(rnd() % n) : 0;
+}
+
+static void write_bytes(const char *path, const char *p, size_t n) {
+    FILE *f = fopen(path, "wb");
+    expect(f != NULL, "write file");
+    if (!f) return;
+    if (n) expect(fwrite(p, 1, n, f) == n, "write file bytes");
+    fclose(f);
+}
+
+/* Whole file, malloc'd (NUL past the end). NULL if missing. */
+static char *slurp(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    char *p;
+    long len;
+    *n = 0;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    p = (char *)malloc((size_t)len + 1);
+    if (!p) {
+        fclose(f);
+        return NULL;
+    }
+    if (len && fread(p, 1, (size_t)len, f) != (size_t)len) {
+        free(p);
+        fclose(f);
+        return NULL;
+    }
+    p[len] = 0;
+    *n = (size_t)len;
+    fclose(f);
+    return p;
+}
+
+static int file_is(const char *path, const char *want, size_t n) {
+    size_t got = 0;
+    char *p = slurp(path, &got);
+    int ok = p && got == n && (n == 0 || memcmp(p, want, n) == 0);
+    free(p);
+    return ok;
+}
+
+/* Doc bytes through the page cache (read_at) and past it (read_uncached:
+ * every ORIGINAL byte from the backing file). 0 on any read error. */
+static char *doc_bytes_mode(RtxDoc *d, size_t *out_n, int uncached) {
+    size_t n = d->len(), got;
+    char *p = (char *)malloc(n + 1);
+    *out_n = 0;
+    if (!p) return NULL;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        free(p);
+        return NULL;
+    }
+    if (n) {
+        if (uncached)
+            got = RtxPieceTree_read_uncached(&d->tree, 0, cc_slice_from_buffer(p, n)) !>;
+        else
+            got = d->read_at(0, cc_slice_from_buffer(p, n)) !>;
+        if (got != n) {
+            free(p);
+            return NULL;
+        }
+    }
+    p[n] = 0;
+    *out_n = n;
+    return p;
+}
+
+/* Cached and uncached reads both equal want. */
+static int doc_eq(RtxDoc *d, const char *want, size_t wn) {
+    size_t n1 = 0, n2 = 0;
+    char *a = doc_bytes_mode(d, &n1, 0);
+    char *b = doc_bytes_mode(d, &n2, 1);
+    int ok = a && b && n1 == wn && n2 == wn &&
+             (wn == 0 || (memcmp(a, want, wn) == 0 && memcmp(b, want, wn) == 0));
+    free(a);
+    free(b);
+    return ok;
+}
+
+static int doc_is(RtxDoc *d, const char *want) {
+    return doc_eq(d, want, strlen(want));
+}
+
+static int try_save(RtxDoc *d) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    d->save() !>;
+    return 1;
+}
+
+static int try_save_as(RtxDoc *d, const char *path) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    d->save_as(cc_slice_cstr(path)) !>;
+    return 1;
+}
+
+static int flush_reload(RtxDoc *d, const char *path, int *rc) {
+    RtxSafeCam cam;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    rtx_safe_cam_clear(&cam);
+    if (!rtx_safe_flush(d, NULL)) return 0;
+    d->destroy();
+    d->from_path(cc_slice_cstr(path)) !>;
+    *rc = rtx_safe_load(d, &cam);
+    return 1;
+}
+
+static void cleanup(const char *path) {
+    char bak[4096];
+    snprintf(bak, sizeof(bak), "%s~", path);
+    unlink(path);
+    unlink(bak);
+    rtx_safe_drop(path);
+}
+
+/* ------------------------------------------------------------------
+ * Bug 1: the savepoint.
+ */
+
+static void seq_savepoint(void) {
+    const char *path = "testdata/generated/seq_save_a.txt";
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        expect(0, "savepoint: unexpected error");
+        return;
+    }
+    {
+        /* Reviewer's sequence. */
+        RtxDoc d = {0} @destroy;
+        write_bytes(path, "abc", 3);
+        d.from_path(cc_slice_cstr(path)) !>;
+        d.replace(1, 0, "X") !>;
+        d.save() !>;
+        expect(!d.dirty() && file_is(path, "aXbc", 4), "savepoint: clean after save");
+        d.undo() !>;
+        expect(d.dirty() && doc_is(&d, "abc"), "savepoint: undo past save is dirty");
+        d.replace(1, 0, "Y") !>;
+        expect(doc_is(&d, "aYbc"), "savepoint: divergent edit bytes");
+        expect(d.dirty(), "savepoint: divergent edit after undo past save is dirty");
+        d.undo() !>;
+        expect(d.dirty() && doc_is(&d, "abc"), "savepoint: undo of divergent edit dirty");
+        d.redo() !>;
+        expect(d.dirty() && doc_is(&d, "aYbc"), "savepoint: redo of divergent edit dirty");
+        d.save() !>;
+        expect(!d.dirty() && file_is(path, "aYbc", 4), "savepoint: second save lands");
+        d.undo() !>;
+        expect(d.dirty(), "savepoint: undo after second save dirty");
+        d.redo() !>;
+        expect(!d.dirty(), "savepoint: redo back onto second save clean");
+    }
+    {
+        /* save → undo → redo onto the saved state: clean. */
+        RtxDoc d = {0} @destroy;
+        write_bytes(path, "abc", 3);
+        d.from_path(cc_slice_cstr(path)) !>;
+        d.replace(1, 0, "X") !>;
+        d.break_coalesce();
+        d.replace(3, 0, "Z") !>;
+        d.save() !>;
+        d.undo() !>;
+        d.undo() !>;
+        expect(d.dirty() && doc_is(&d, "abc"), "undo-redo: two undos dirty");
+        d.redo() !>;
+        expect(d.dirty() && doc_is(&d, "aXbc"), "undo-redo: one redo dirty");
+        d.redo() !>;
+        expect(!d.dirty() && doc_is(&d, "aXbZc"), "undo-redo: back onto save clean");
+        /* A later edit, then undo onto the save: clean. */
+        d.replace(0, 1, "Q") !>;
+        expect(d.dirty(), "undo-redo: edit past save dirty");
+        d.undo() !>;
+        expect(!d.dirty() && doc_is(&d, "aXbZc"), "undo-redo: undo onto save clean");
+    }
+    {
+        /* save → undo ×N → edit → undo → redo. */
+        RtxDoc d = {0} @destroy;
+        int i;
+        write_bytes(path, "0123456789", 10);
+        d.from_path(cc_slice_cstr(path)) !>;
+        for (i = 0; i < 4; i++) {
+            char c = (char)('a' + i);
+            d.break_coalesce();
+            d.replace((size_t)(2 * i), 1, cc_slice_from_buffer(&c, 1)) !>;
+        }
+        expect(doc_is(&d, "a1b3c5d789"), "undoN: four edits");
+        d.save() !>;
+        for (i = 0; i < 3; i++) d.undo() !>;
+        expect(d.dirty() && doc_is(&d, "a123456789"), "undoN: three undos");
+        d.replace(9, 1, "!") !>;
+        expect(d.dirty() && doc_is(&d, "a12345678!"), "undoN: divergent edit dirty");
+        d.undo() !>;
+        expect(d.dirty() && doc_is(&d, "a123456789"), "undoN: undo divergent dirty");
+        d.redo() !>;
+        expect(d.dirty(), "undoN: redo divergent dirty");
+        expect(!d.can_redo(), "undoN: old redo tail gone");
+        d.undo() !>;
+        d.undo() !>;
+        expect(d.dirty() && doc_is(&d, "0123456789"), "undoN: back at the open state dirty");
+        d.save() !>;
+        expect(!d.dirty() && file_is(path, "0123456789", 10), "undoN: save of the base");
+    }
+    {
+        /* Type, save, keep typing: the next keystroke does not fold into
+         * the saved record, so undo lands on the saved bytes, clean. */
+        RtxDoc d = {0} @destroy;
+        write_bytes(path, "abc", 3);
+        d.from_path(cc_slice_cstr(path)) !>;
+        d.caret = 1;
+        d.sel_anchor = 1;
+        d.type("X") !>;
+        d.save() !>;
+        d.type("Z") !>;
+        expect(d.dirty() && doc_is(&d, "aXZbc"), "coalesce: typing after save dirty");
+        d.undo() !>;
+        expect(!d.dirty() && doc_is(&d, "aXbc"), "coalesce: undo lands on the save");
+    }
+    {
+        /* Workspace Save skips a clean buffer: the divergent edit must be
+         * dirty there too, and Save must write it. */
+        RtxWs w = {0} @destroy;
+        RtxDoc *d;
+        write_bytes(path, "abc", 3);
+        w.add_path(cc_slice_cstr(path)) !>;
+        d = &w.bufs[0]->doc;
+        d->replace(1, 0, "X") !>;
+        w.save_buf(0) !>;
+        expect(file_is(path, "aXbc", 4), "ws: first save");
+        d->undo() !>;
+        d->replace(1, 0, "Y") !>;
+        expect(RtxWs_buf_dirty(&w, 0), "ws: divergent edit dirty (tab marker / quit prompt)");
+        w.save_buf(0) !>;
+        expect(file_is(path, "aYbc", 4), "ws: save writes the divergent edit");
+        expect(!RtxWs_buf_dirty(&w, 0), "ws: clean after save");
+    }
+    cleanup(path);
+}
+
+/* Edit groups (per site and bulk) and a workspace transaction. */
+static void seq_groups(int bulk) {
+    const char *path = "testdata/generated/seq_save_g.txt";
+    const char *pb = "testdata/generated/seq_save_gb.txt";
+    RtxEdit e[3];
+    @errhandler(CCError err) {
+        cc_error_log(err);
+        expect(0, "groups: unexpected error");
+        rtx_bulk_tune(0, 0);
+        return;
+    }
+    rtx_bulk_tune(bulk ? 1 : (size_t)-1, 0);
+    {
+        RtxDoc d = {0} @destroy;
+        write_bytes(path, "aaaa-bbbb-cccc", 14);
+        d.from_path(cc_slice_cstr(path)) !>;
+        e[0] = (RtxEdit){ .off = 0, .n = 4, .ins = cc_slice_cstr("A") };
+        e[1] = (RtxEdit){ .off = 5, .n = 4, .ins = cc_slice_cstr("B") };
+        e[2] = (RtxEdit){ .off = 10, .n = 4, .ins = cc_slice_cstr("C") };
+        d.replace_batch(e, 3) !>;
+        expect(doc_is(&d, "A-B-C"), bulk ? "bulk: group" : "group: group");
+        if (bulk)
+            expect(d.hist.head && d.hist.recs[d.hist.head - 1].bulk, "bulk: one bulk record");
+        d.save() !>;
+        d.undo() !>;
+        expect(d.dirty() && doc_is(&d, "aaaa-bbbb-cccc"), "group: undo past save dirty");
+        e[0] = (RtxEdit){ .off = 0, .n = 1, .ins = cc_slice_cstr("x") };
+        e[1] = (RtxEdit){ .off = 5, .n = 1, .ins = cc_slice_cstr("y") };
+        d.replace_batch(e, 2) !>;
+        expect(d.dirty() && doc_is(&d, "xaaa-ybbb-cccc"), "group: divergent group dirty");
+        d.undo() !>;
+        expect(d.dirty(), "group: undo divergent dirty");
+        d.redo() !>;
+        expect(d.dirty(), "group: redo divergent dirty");
+        d.save() !>;
+        expect(!d.dirty() && file_is(path, "xaaa-ybbb-cccc", 14), "group: save lands");
+        d.undo() !>;
+        d.redo() !>;
+        expect(!d.dirty(), "group: redo onto save clean");
+    }
+    {
+        /* Transaction: save both, undo all, one member diverges. */
+        RtxWs w = {0} @destroy;
+        RtxEdit ea[2], eb[1];
+        RtxWsEdits m[2];
+        uint64_t id;
+        write_bytes(path, "alpha beta alpha\n", 17);
+        write_bytes(pb, "name,alpha\n", 11);
+        w.add_path(cc_slice_cstr(path)) !>;
+        w.add_path(cc_slice_cstr(pb)) !>;
+        w.npanes = 1;
+        w.pane[0] = 0;
+        w.focus = 0;
+        ea[0] = (RtxEdit){ .off = 0, .n = 5, .ins = cc_slice_cstr("gamma") };
+        ea[1] = (RtxEdit){ .off = 11, .n = 5, .ins = cc_slice_cstr("gamma") };
+        eb[0] = (RtxEdit){ .off = 5, .n = 5, .ins = cc_slice_cstr("gamma") };
+        m[0] = (RtxWsEdits){ .bufi = 0, .edits = ea, .n = 2 };
+        m[1] = (RtxWsEdits){ .bufi = 1, .edits = eb, .n = 1 };
+        id = w.replace_xact(m, 2) !>;
+        expect(id != 0, "xact: id");
+        w.save_buf(0) !>;
+        w.save_buf(1) !>;
+        expect(!RtxWs_buf_dirty(&w, 0) && !RtxWs_buf_dirty(&w, 1), "xact: both saved");
+        w.undo(0, RTX_UNDO_ALL) !>;
+        expect(RtxWs_buf_dirty(&w, 0) && RtxWs_buf_dirty(&w, 1), "xact: undo all dirty");
+        w.bufs[1]->doc.replace(0, 4, "NAME") !>;
+        expect(RtxWs_buf_dirty(&w, 1) && doc_is(&w.bufs[1]->doc, "NAME,alpha\n"),
+               "xact: divergent member dirty");
+        w.save_buf(1) !>;
+        expect(file_is(pb, "NAME,alpha\n", 11), "xact: divergent member saved");
+        w.redo(0) !>;
+        expect(!RtxWs_buf_dirty(&w, 0), "xact: redo onto save clean");
+    }
+    rtx_bulk_tune(0, 0);
+    cleanup(path);
+    cleanup(pb);
+}
+
+/* Journal reload in the middle of a sequence. */
+static void seq_journal(void) {
+    const char *path = "testdata/generated/seq_save_j.txt";
+    int rc = -1;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        expect(0, "journal: unexpected error");
+        return;
+    }
+    {
+        /* Saved state dropped by a divergent edit: the reload must stay
+         * dirty and show the divergent bytes (the file is the save). */
+        RtxDoc d = {0} @destroy;
+        write_bytes(path, "abc", 3);
+        d.from_path(cc_slice_cstr(path)) !>;
+        d.replace(1, 0, "X") !>;
+        d.save() !>;
+        d.undo() !>;
+        d.replace(1, 0, "Y") !>;
+        expect(flush_reload(&d, path, &rc), "journal: flush + reload (branch)");
+        expect(rc == RTX_SAFE_LOAD_HIST, "journal: branch reload replays");
+        expect(doc_is(&d, "aYbc"), "journal: branch reload bytes");
+        expect(d.dirty(), "journal: branch reload dirty");
+        d.undo() !>;
+        expect(doc_is(&d, "abc") && d.dirty(), "journal: undo after branch reload");
+        d.redo() !>;
+        expect(doc_is(&d, "aYbc") && d.dirty(), "journal: redo after branch reload");
+        /* Twice: a reloaded branch flushes and loads again. */
+        expect(flush_reload(&d, path, &rc), "journal: second reload");
+        expect(doc_is(&d, "aYbc") && d.dirty(), "journal: second reload bytes");
+        d.save() !>;
+        expect(file_is(path, "aYbc", 4) && !d.dirty(), "journal: save after reload");
+        expect(flush_reload(&d, path, &rc), "journal: reload after save");
+        expect(doc_is(&d, "aYbc") && !d.dirty(), "journal: clean reload");
+        d.undo() !>;
+        expect(doc_is(&d, "abc") && d.dirty(), "journal: undo after clean reload");
+    }
+    {
+        /* Saved state in the redo tail: reload keeps it reachable. */
+        RtxDoc d = {0} @destroy;
+        write_bytes(path, "abc", 3);
+        d.from_path(cc_slice_cstr(path)) !>;
+        d.replace(1, 0, "X") !>;
+        d.break_coalesce();
+        d.replace(0, 1, "Q") !>;
+        d.save() !>;
+        d.undo() !>;
+        d.undo() !>;
+        expect(flush_reload(&d, path, &rc), "journal: flush + reload (tail)");
+        expect(doc_is(&d, "abc") && d.dirty(), "journal: tail reload bytes");
+        d.redo() !>;
+        expect(d.dirty(), "journal: one redo dirty");
+        d.redo() !>;
+        expect(doc_is(&d, "QXbc") && !d.dirty(), "journal: redo onto save clean");
+    }
+    {
+        /* Branch deeper than one record, then the fork moves down. */
+        RtxDoc d = {0} @destroy;
+        write_bytes(path, "0123456789", 10);
+        d.from_path(cc_slice_cstr(path)) !>;
+        d.replace(0, 1, "a") !>;
+        d.break_coalesce();
+        d.replace(2, 1, "b") !>;
+        d.break_coalesce();
+        d.replace(4, 1, "c") !>;
+        d.save() !>;
+        d.undo() !>;
+        d.undo() !>;
+        d.replace(9, 1, "Z") !>;        /* fork at 1: branch = b, c */
+        d.break_coalesce();
+        d.undo() !>;
+        d.undo() !>;
+        d.replace(8, 1, "Y") !>;        /* fork at 0: branch = a, b, c */
+        expect(doc_is(&d, "01234567Y9") && d.dirty(), "journal: deep branch bytes");
+        expect(flush_reload(&d, path, &rc), "journal: deep branch reload");
+        expect(rc == RTX_SAFE_LOAD_HIST && doc_is(&d, "01234567Y9") && d.dirty(),
+               "journal: deep branch reload bytes");
+        d.undo() !>;
+        expect(doc_is(&d, "0123456789") && d.dirty(), "journal: deep branch undo");
+        d.save() !>;
+        expect(file_is(path, "0123456789", 10) && !d.dirty(), "journal: deep branch save");
+    }
+    cleanup(path);
+}
+
+/* ------------------------------------------------------------------
+ * Bug 2: --backup save through the opened inode.
+ */
+
+static unsigned char pat_at(size_t i) {
+    return (unsigned char)('a' + (i * 7 + i / 61) % 26);
+}
+
+static void write_pattern(const char *path, size_t n) {
+    char *p = (char *)malloc(n ? n : 1);
+    size_t i;
+    for (i = 0; i < n; i++) p[i] = (char)pat_at(i);
+    write_bytes(path, p, n);
+    free(p);
+}
+
+typedef struct {
+    char *p;
+    size_t n;
+    size_t cap;
+} MBuf;
+
+static void mb_replace(MBuf *b, size_t off, size_t n, const char *ins, size_t k) {
+    if (b->n - n + k > b->cap) {
+        b->cap = (b->n - n + k) * 2 + 16;
+        b->p = (char *)realloc(b->p, b->cap);
+    }
+    memmove(b->p + off + k, b->p + off + n, b->n - off - n);
+    if (k) memcpy(b->p + off, ins, k);
+    b->n = b->n - n + k;
+}
+
+/* One sequence on a file of `n` bytes: backup saves around edits, undo,
+ * redo, uncached reads of the whole doc at every step. */
+static void seq_backup_one(size_t n, const char *tag) {
+    const char *path = "testdata/generated/seq_bak.txt";
+    char msg[160];
+    MBuf m = {0};
+    size_t i;
+    int prev = rtx_doc_save_backup();
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        snprintf(msg, sizeof(msg), "backup %s: unexpected error", tag);
+        expect(0, msg);
+        rtx_doc_set_save_backup(prev);
+        free(m.p);
+        return;
+    }
+    cleanup(path);
+    write_pattern(path, n);
+    m.cap = n + 64;
+    m.p = (char *)malloc(m.cap);
+    for (i = 0; i < n; i++) m.p[i] = (char)pat_at(i);
+    m.n = n;
+    rtx_doc_set_save_backup(1);
+    {
+        RtxDoc d = {0} @destroy;
+        MBuf s1 = {0}, s0 = {0};
+        size_t at = n > 4096 ? 1000 : 1;
+        d.from_path(cc_slice_cstr(path)) !>;
+        s0.p = (char *)malloc(m.n + 1);
+        memcpy(s0.p, m.p, m.n);
+        s0.n = m.n;
+        d.replace(at, 0, "X") !>;
+        mb_replace(&m, at, 0, "X", 1);
+        expect(try_save(&d), "backup: first save");
+        snprintf(msg, sizeof(msg), "backup %s: file after first save", tag);
+        expect(file_is(path, m.p, m.n), msg);
+        snprintf(msg, sizeof(msg), "backup %s: live doc after first save (uncached)", tag);
+        expect(doc_eq(&d, m.p, m.n), msg);
+        s1.p = (char *)malloc(m.n + 1);
+        memcpy(s1.p, m.p, m.n);
+        s1.n = m.n;
+        d.undo() !>;
+        snprintf(msg, sizeof(msg), "backup %s: undo after save", tag);
+        expect(doc_eq(&d, s0.p, s0.n) && d.dirty(), msg);
+        d.redo() !>;
+        snprintf(msg, sizeof(msg), "backup %s: redo after save", tag);
+        expect(doc_eq(&d, s1.p, s1.n) && !d.dirty(), msg);
+        d.undo() !>;
+        /* Save the open state back over the inode (same length as the
+         * original: the dirty-span path compares against the file). */
+        expect(try_save(&d), "backup: save of undone state");
+        snprintf(msg, sizeof(msg), "backup %s: file after save of undone state", tag);
+        expect(file_is(path, s0.p, s0.n), msg);
+        snprintf(msg, sizeof(msg), "backup %s: doc after save of undone state", tag);
+        expect(doc_eq(&d, s0.p, s0.n) && !d.dirty(), msg);
+        /* Delete across the old insert point, same-length replace, grow. */
+        d.replace(at > 1 ? at - 1 : 0, 3, cc_slice_empty()) !>;
+        d.break_coalesce();
+        d.replace(0, 2, "QQ") !>;
+        d.break_coalesce();
+        d.replace(d.len(), 0, "TAIL") !>;
+        {
+            MBuf e = {0};
+            e.p = (char *)malloc(s0.n + 8);
+            memcpy(e.p, s0.p, s0.n);
+            e.n = s0.n;
+            e.cap = s0.n + 8;
+            mb_replace(&e, at > 1 ? at - 1 : 0, 3, "", 0);
+            mb_replace(&e, 0, 2, "QQ", 2);
+            mb_replace(&e, e.n, 0, "TAIL", 4);
+            expect(try_save(&d), "backup: third save");
+            snprintf(msg, sizeof(msg), "backup %s: file after third save", tag);
+            expect(file_is(path, e.p, e.n), msg);
+            snprintf(msg, sizeof(msg), "backup %s: doc after third save", tag);
+            expect(doc_eq(&d, e.p, e.n), msg);
+            d.undo() !>;
+            d.undo() !>;
+            d.undo() !>;
+            snprintf(msg, sizeof(msg), "backup %s: undo x3 after third save", tag);
+            expect(doc_eq(&d, s0.p, s0.n), msg);
+            d.undo() !>;
+            snprintf(msg, sizeof(msg), "backup %s: undo to open state", tag);
+            expect(doc_eq(&d, s0.p, s0.n), msg);
+            d.redo() !>;
+            d.redo() !>;
+            d.redo() !>;
+            d.redo() !>;
+            snprintf(msg, sizeof(msg), "backup %s: redo x4", tag);
+            expect(doc_eq(&d, e.p, e.n) && !d.dirty(), msg);
+            free(e.p);
+        }
+        free(s0.p);
+        free(s1.p);
+    }
+    {
+        /* Reopen: the file is what the last save wrote. */
+        RtxDoc d = {0} @destroy;
+        size_t fn = 0;
+        char *fp = slurp(path, &fn);
+        d.from_path(cc_slice_cstr(path)) !>;
+        snprintf(msg, sizeof(msg), "backup %s: reopen", tag);
+        expect(fp && doc_eq(&d, fp, fn), msg);
+        free(fp);
+    }
+    rtx_doc_set_save_backup(prev);
+    free(m.p);
+    cleanup(path);
+}
+
+/* Another path to the same inode, and a second document on it. */
+static void seq_backup_alias(void) {
+    const char *path = "testdata/generated/seq_bak_a.txt";
+    const char *link2 = "testdata/generated/seq_bak_a_link.txt";
+    const char *other = "testdata/generated/seq_bak_b.txt";
+    int prev = rtx_doc_save_backup();
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        expect(0, "alias: unexpected error");
+        rtx_doc_set_save_backup(prev);
+        return;
+    }
+    cleanup(path);
+    cleanup(link2);
+    cleanup(other);
+    rtx_doc_set_save_backup(1);
+    {
+        /* Save-as onto a hard link of the doc's own backing file. */
+        RtxDoc d = {0} @destroy;
+        write_bytes(path, "hello world", 11);
+        expect(link(path, link2) == 0, "alias: hard link");
+        d.from_path(cc_slice_cstr(path)) !>;
+        d.replace(5, 0, ",") !>;
+        expect(try_save_as(&d, link2), "alias: save-as onto hard link");
+        expect(file_is(link2, "hello, world", 12), "alias: hard link bytes");
+        expect(doc_is(&d, "hello, world"), "alias: doc after save onto own inode");
+        d.undo() !>;
+        expect(doc_is(&d, "hello world"), "alias: undo after save onto own inode");
+        unlink(link2);
+    }
+    {
+        /* Two documents on one file; one saves --backup in place. */
+        RtxDoc a = {0} @destroy;
+        RtxDoc b = {0} @destroy;
+        size_t big = 3 * (size_t)RTX_PAGE_SIZE + 77;
+        char *want = (char *)malloc(big);
+        size_t i;
+        for (i = 0; i < big; i++) want[i] = (char)pat_at(i);
+        write_pattern(path, big);
+        a.from_path(cc_slice_cstr(path)) !>;
+        b.from_path(cc_slice_cstr(path)) !>;
+        b.replace(10, 0, "INSERTED") !>;
+        expect(try_save(&b), "alias: second doc saves");
+        expect(doc_eq(&a, want, big), "alias: first doc keeps its bytes");
+        a.replace(20, 5, cc_slice_empty()) !>;
+        a.undo() !>;
+        expect(doc_eq(&a, want, big), "alias: first doc undo");
+        free(want);
+    }
+    {
+        /* Save-as (backup) of doc B onto doc A's file. */
+        RtxDoc a = {0} @destroy;
+        RtxDoc b = {0} @destroy;
+        write_bytes(path, "first file bytes", 16);
+        write_bytes(other, "second", 6);
+        a.from_path(cc_slice_cstr(path)) !>;
+        b.from_path(cc_slice_cstr(other)) !>;
+        a.replace(0, 5, "FIRST") !>;
+        expect(try_save_as(&b, path), "alias: save-as onto another doc's file");
+        expect(file_is(path, "second", 6), "alias: save-as bytes");
+        expect(doc_is(&a, "FIRST file bytes"), "alias: other doc keeps its bytes");
+        a.undo() !>;
+        expect(doc_is(&a, "first file bytes"), "alias: other doc undo");
+    }
+    rtx_doc_set_save_backup(prev);
+    {
+        /* Plain (rename) saves never touch the old inode. */
+        RtxDoc a = {0} @destroy;
+        RtxDoc b = {0} @destroy;
+        write_bytes(path, "plain bytes", 11);
+        a.from_path(cc_slice_cstr(path)) !>;
+        b.from_path(cc_slice_cstr(path)) !>;
+        b.replace(0, 5, "PLAIN") !>;
+        expect(try_save(&b), "plain: save");
+        expect(doc_is(&a, "plain bytes") && doc_is(&b, "PLAIN bytes"), "plain: both docs");
+    }
+    cleanup(path);
+    cleanup(link2);
+    cleanup(other);
+}
+
+/* ------------------------------------------------------------------
+ * Reference model.
+ */
+
+#define MST_MAX 512
+
+typedef struct {
+    char *st[MST_MAX];
+    size_t stn[MST_MAX];
+    size_t nst;
+    size_t head;
+    long saved;       /* index into st, -1 = the saved state is gone */
+    char *disk;
+    size_t diskn;
+} Model;
+
+static void model_free(Model *m) {
+    size_t i;
+    for (i = 0; i < m->nst; i++) free(m->st[i]);
+    free(m->disk);
+    *m = (Model){0};
+}
+
+static void model_reset(Model *m, const char *p, size_t n) {
+    model_free(m);
+    m->st[0] = (char *)malloc(n + 1);
+    if (n) memcpy(m->st[0], p, n);
+    m->stn[0] = n;
+    m->nst = 1;
+    m->head = 0;
+    m->saved = 0;
+    m->disk = (char *)malloc(n + 1);
+    if (n) memcpy(m->disk, p, n);
+    m->diskn = n;
+}
+
+/* The doc took an edit: `coalesced` replaces the head state, else a new
+ * state is pushed. Either way the redo tail is gone. */
+static int model_edit(Model *m, char *bytes, size_t n, int coalesced) {
+    size_t i;
+    if (coalesced) {
+        if (m->saved >= (long)m->head) m->saved = -1;
+        for (i = m->head; i < m->nst; i++) free(m->st[i]);
+        m->nst = m->head;
+    } else {
+        if (m->head + 1 >= MST_MAX) return 0;
+        if (m->saved > (long)m->head) m->saved = -1;
+        for (i = m->head + 1; i < m->nst; i++) free(m->st[i]);
+        m->nst = m->head + 1;
+        m->head++;
+    }
+    m->st[m->head] = bytes;
+    m->stn[m->head] = n;
+    m->nst = m->head + 1;
+    return 1;
+}
+
+static int model_check(Model *m, RtxDoc *d, const char *path, const char *what,
+                       uint64_t seed, int step) {
+    char msg[200];
+    int ok = 1;
+    if (!doc_eq(d, m->st[m->head], m->stn[m->head])) {
+        snprintf(msg, sizeof(msg), "model seed %llu step %d (%s): bytes",
+                 (unsigned long long)seed, step, what);
+        expect(0, msg);
+        ok = 0;
+    }
+    if (d->dirty() != !(m->saved >= 0 && (size_t)m->saved == m->head)) {
+        snprintf(msg, sizeof(msg), "model seed %llu step %d (%s): dirty %d want %d",
+                 (unsigned long long)seed, step, what, d->dirty(),
+                 !(m->saved >= 0 && (size_t)m->saved == m->head));
+        expect(0, msg);
+        ok = 0;
+    }
+    if (!file_is(path, m->disk, m->diskn)) {
+        snprintf(msg, sizeof(msg), "model seed %llu step %d (%s): file",
+                 (unsigned long long)seed, step, what);
+        expect(0, msg);
+        ok = 0;
+    }
+    return ok;
+}
+
+static char *splice(const char *src, size_t n, size_t off, size_t del,
+                    const char *ins, size_t k, size_t *out_n) {
+    char *p = (char *)malloc(n - del + k + 1);
+    memcpy(p, src, off);
+    if (k) memcpy(p + off, ins, k);
+    memcpy(p + off + k, src + off + del, n - off - del);
+    *out_n = n - del + k;
+    return p;
+}
+
+static void model_run(uint64_t seed, size_t base_n, int steps) {
+    const char *path = "testdata/generated/seq_model.txt";
+    Model m = {0};
+    RtxDoc d = {0} @destroy;
+    int step;
+    int prev = rtx_doc_save_backup();
+    char *base = (char *)malloc(base_n + 1);
+    size_t i;
+    rng = seed * 2654435761u + 1;
+    for (i = 0; i < base_n; i++) {
+        base[i] = (char)('a' + rnd_n(26));
+        if (rnd_n(17) == 0) base[i] = '\n';
+    }
+    cleanup(path);
+    write_bytes(path, base, base_n);
+    model_reset(&m, base, base_n);
+    free(base);
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        {
+            char msg[120];
+            snprintf(msg, sizeof(msg), "model seed %llu: unexpected error",
+                     (unsigned long long)seed);
+            expect(0, msg);
+        }
+        rtx_doc_set_save_backup(prev);
+        rtx_bulk_tune(0, 0);
+        model_free(&m);
+        return;
+    }
+    rtx_bulk_tune(rnd_n(2) ? 1 : (size_t)-1, 0);
+    d.from_path(cc_slice_cstr(path)) !>;
+    for (step = 0; step < steps; step++) {
+        size_t r = rnd_n(100);
+        size_t len = d.len();
+        const char *what = "?";
+        if (r < 30) {
+            /* Type at a caret (coalesces with the previous keystroke when
+             * adjacent) or replace a range. */
+            char ins[16];
+            size_t k = 1 + rnd_n(6), off, del = 0, nn, h0 = d.hist.head;
+            char *next;
+            for (i = 0; i < k; i++) ins[i] = (char)('A' + rnd_n(26));
+            if (rnd_n(3) == 0 && d.caret <= len) off = d.caret;
+            else off = rnd_n(len + 1);
+            if (rnd_n(4) == 0 && off < len) del = 1 + rnd_n(len - off < 40 ? len - off : 40);
+            if (rnd_n(5) == 0) k = 0;
+            if (!k && !del) k = 1;
+            if (!del) {
+                d.caret = off;
+                d.sel_anchor = off;
+                d.type(cc_slice_from_buffer(ins, k)) !>;
+                what = "type";
+            } else {
+                d.replace(off, del, cc_slice_from_buffer(ins, k)) !>;
+                what = "replace";
+            }
+            next = splice(m.st[m.head], m.stn[m.head], off, del, ins, k, &nn);
+            if (!model_edit(&m, next, nn, d.hist.head == h0)) break;
+        } else if (r < 36) {
+            /* A big delete (piece refs in history), then maybe more. */
+            size_t off, del, nn;
+            char *next;
+            if (len < 8) continue;
+            off = rnd_n(len / 2);
+            del = len - off > 4 ? (len - off) / 2 : 1;
+            d.replace(off, del, cc_slice_empty()) !>;
+            next = splice(m.st[m.head], m.stn[m.head], off, del, "", 0, &nn);
+            if (!model_edit(&m, next, nn, 0)) break;
+            what = "bigdel";
+        } else if (r < 44) {
+            /* Group of 2..4 sites. */
+            RtxEdit e[4];
+            char txt[4][4];
+            size_t k = 2 + rnd_n(3), at = 0, s, nn, cn;
+            char *cur, *next;
+            if (len < 16) continue;
+            /* Strictly increasing offsets, non-overlapping. */
+            for (s = 0; s < k; s++) {
+                size_t lo = s ? at + 1 : 0;
+                size_t gap, del;
+                if (lo > len) {
+                    k = s;
+                    break;
+                }
+                gap = rnd_n((len - lo) / (k - s) + 1);
+                del = rnd_n(3);
+                if (lo + gap + del > len) del = 0;
+                txt[s][0] = (char)('0' + rnd_n(10));
+                txt[s][1] = (char)('0' + rnd_n(10));
+                e[s].off = lo + gap;
+                e[s].n = del;
+                e[s].ins = cc_slice_from_buffer(txt[s], 1 + rnd_n(2));
+                at = e[s].off + del;
+            }
+            if (k < 2) continue;
+            d.replace_batch(e, k) !>;
+            cn = m.stn[m.head];
+            cur = (char *)malloc(cn + 1);
+            memcpy(cur, m.st[m.head], cn);
+            for (s = k; s-- > 0;) {
+                next = splice(cur, cn, e[s].off, e[s].n, e[s].ins.ptr, e[s].ins.len, &nn);
+                free(cur);
+                cur = next;
+                cn = nn;
+            }
+            if (!model_edit(&m, cur, cn, 0)) break;
+            what = "group";
+        } else if (r < 58) {
+            size_t s = 1 + rnd_n(3);
+            while (s-- && m.head > 0) {
+                d.undo() !>;
+                m.head--;
+            }
+            what = "undo";
+        } else if (r < 68) {
+            size_t s = 1 + rnd_n(3);
+            while (s-- && m.head + 1 < m.nst) {
+                d.redo() !>;
+                m.head++;
+            }
+            what = "redo";
+        } else if (r < 82) {
+            int bk = (int)rnd_n(2);
+            rtx_doc_set_save_backup(bk);
+            d.save() !>;
+            rtx_doc_set_save_backup(prev);
+            free(m.disk);
+            m.diskn = m.stn[m.head];
+            m.disk = (char *)malloc(m.diskn + 1);
+            memcpy(m.disk, m.st[m.head], m.diskn);
+            m.saved = (long)m.head;
+            what = bk ? "save --backup" : "save";
+        } else if (r < 86) {
+            /* Revert: reopen the file, no journal. */
+            char *keep = (char *)malloc(m.diskn + 1);
+            size_t kn = m.diskn;
+            memcpy(keep, m.disk, kn);
+            d.destroy();
+            d.from_path(cc_slice_cstr(path)) !>;
+            model_reset(&m, keep, kn);
+            free(keep);
+            what = "revert";
+        } else if (r < 94) {
+            int rc = -1;
+            expect(flush_reload(&d, path, &rc), "model: flush + reload");
+            what = "journal reload";
+        } else {
+            /* Just read the whole doc past the cache. */
+            what = "uncached read";
+        }
+        if (!model_check(&m, &d, path, what, seed, step)) break;
+    }
+    rtx_doc_set_save_backup(prev);
+    rtx_bulk_tune(0, 0);
+    model_free(&m);
+    cleanup(path);
+}
+
+int main(int argc, char **argv) {
+    uint64_t seeds = 400, s;
+    const char *only = getenv("SEQ_ONLY");
+    const char *ns = getenv("SEQ_SEEDS");
+    (void)argc;
+    (void)argv;
+    rtx_safe_test_isol();
+    if (system("mkdir -p testdata/generated") != 0) expect(0, "mkdir");
+    if (ns && ns[0]) seeds = (uint64_t)strtoull(ns, NULL, 10);
+    if (!only || strstr(only, "save")) seq_savepoint();
+    if (!only || strstr(only, "group")) {
+        seq_groups(0);
+        seq_groups(1);
+    }
+    if (!only || strstr(only, "journal")) seq_journal();
+    if (!only || strstr(only, "backup")) {
+        seq_backup_one(3, "3 B");
+        seq_backup_one(5000, "5 KB");
+        seq_backup_one(3 * (size_t)RTX_PAGE_SIZE + 123, "3 pages");
+        seq_backup_one((size_t)RTX_SAVE_PIN_MAX + 3 * (size_t)RTX_PAGE_SIZE + 5,
+                       "past pin max");
+        seq_backup_alias();
+    }
+    if (!only || strstr(only, "model")) {
+        int before = fails;
+        for (s = 1; s <= seeds; s++) {
+            size_t n;
+            int steps = 60;
+            switch (s % 4) {
+                case 0: n = 3 + (size_t)(s % 50); break;
+                case 1: n = 200 + (size_t)(s % 300); break;
+                case 2: n = 70000 + (size_t)(s % 5000); steps = 40; break;
+                default: n = 600000 + (size_t)(s % 5000); steps = 20; break;
+            }
+            model_run(s, n, steps);
+            if (fails - before > 20) break;
+        }
+    }
+    if (fails) {
+        fprintf(stderr, "save_seq_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("save_seq_smoke ok\n");
+    return 0;
+}

@@ -146,3 +146,7 @@ CC_TARGET_DEPS rx_conform rtx_rx
 CC_TARGET sindex_smoke exe tests/sindex_smoke.ccs
 CC_TARGET_INCLUDE sindex_smoke .
 CC_TARGET_DEPS sindex_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
+
+CC_TARGET save_seq_smoke exe tests/save_seq_smoke.ccs
+CC_TARGET_INCLUDE save_seq_smoke .
+CC_TARGET_DEPS save_seq_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
