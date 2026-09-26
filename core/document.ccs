@@ -10314,6 +10314,7 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
     mode_t mode = 0666;
     int have_mode = 0;
     int have_st = 0;
+    int exists = 0;
     struct stat st;
     if (!d || !path.ptr || path.len == 0) return cc_err(CC_ERR_INVALID_ARG, "save path");
     if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
@@ -10327,6 +10328,7 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
         mode = st.st_mode & 0777;
         have_mode = 1;
         have_st = 1;
+        exists = 1;
     }
     {
         int force = d->save_overwrite;
@@ -10338,23 +10340,31 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
     }
     if (rtx_save_backup) {
         char bak[4096];
-        size_t lo = 0, hi = 0, oldn, newn, bak_to;
-        int same = 0;
+        size_t lo = 0, hi = 0, dlen, newn, bak_to;
+        int same = 0, alias;
         if (n + 2 >= sizeof(bak)) return cc_err(CC_ERR_INVALID_ARG, "path too long");
         snprintf(bak, sizeof(bak), "%s~", p);
         /* --backup writes through `p`, which may be the inode find /
          * island lanes pread. Join them first. */
         rtx_find_join(&d->find);
         rtx_isle_handle_stop(&d->tree);
-        oldn = d->tree.save_span(&lo, &hi);
+        /* `p` names this document's original (its path, a hard link, a
+         * symlink to it): the dirty span is against what that inode holds
+         * now (disk_len; spans a save already rewrote are not aligned),
+         * and nothing below writes it before the ORIGINAL bytes it changes
+         * are preserved (page_store.cch) — for this doc and every other
+         * doc open on that inode. */
+        alias = exists && RtxPageStore_orig_is(&d->tree.store, (uint64_t)st.st_dev,
+                                               (uint64_t)st.st_ino);
+        dlen = d->tree.save_span(&lo, &hi);
         newn = d->tree.len();
-        if (d->path.ptr && d->path.eq(path) && d->tree.store.orig_open &&
-            have_st && (size_t)st.st_size == oldn && lo <= oldn)
-            same = 1;
-        bak_to = (newn == oldn && hi <= oldn) ? hi : oldn;
-        if (access(p, F_OK) == 0) {
+        if (alias && have_st && (size_t)st.st_size == dlen && lo <= dlen) same = 1;
+        bak_to = (newn == dlen && hi <= dlen) ? hi : dlen;
+        if (exists) {
+            /* path~ is rewritten in place: it may be an open original. */
+            rtx_orig_preserve_path(bak, 0, (size_t)-1) !>(e) { return cc_err(e); };
             if (same)
-                rtx_save_copy_span(p, bak, lo, bak_to, oldn, mode, have_mode) !>(e) {
+                rtx_save_copy_span(p, bak, lo, bak_to, dlen, mode, have_mode) !>(e) {
                     return cc_err(e);
                 };
             else
@@ -10363,83 +10373,27 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
                 };
         }
         if (same) {
-            size_t flo = 0, fhi = 0, on;
-            CCArena pin_a = {0};
-            char *pin = NULL;
-            on = d->tree.save_orig_span(lo, hi, &flo, &fhi);
-            /* Streaming original pieces through the inode we are shifting
-             * aliases unread tail bytes. Pin a small tail first; a large
-             * one writes a full temp and copies onto the path. */
-            if (on > (size_t)RTX_SAVE_PIN_MAX) {
-                snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", p);
-                fd = mkstemp(tmp);
-                if (fd < 0) return cc_err(CC_ERR_IO, "save open");
-                if (have_mode && fchmod(fd, mode) != 0) {
-                    close(fd);
-                    unlink(tmp);
-                    return cc_err(CC_ERR_IO, "save fchmod");
-                }
-                d->tree.write_fd(fd) !>(e) {
-                    close(fd);
-                    unlink(tmp);
-                    return cc_err(e);
-                };
-                if (fsync(fd) != 0) {
-                    close(fd);
-                    unlink(tmp);
-                    return cc_err(CC_ERR_IO, "save fsync");
-                }
-                if (close(fd) != 0) {
-                    unlink(tmp);
-                    return cc_err(CC_ERR_IO, "save close");
-                }
-                rtx_save_copy_path(tmp, p, mode, have_mode) !>(e) {
-                    unlink(tmp);
-                    return cc_err(e);
-                };
-                unlink(tmp);
-                rtx_save_fsync_dir(p, n);
-                if (new_path.ptr) d->path = new_path;
-                d->mark_saved();
-                rtx_doc_ident_stamp(d, path);
-                return cc_ok();
-            }
-            if (on) {
-                pin_a = cc_arena_heap(on + 64);
-                if (!pin_a.base)
-                    return cc_err(CC_ERR_OUT_OF_MEMORY, "save pin");
-                pin = (char *)cc_arena_alloc(pin_a, on, 1);
-                if (!pin) {
-                    pin_a.destroy();
-                    return cc_err(CC_ERR_OUT_OF_MEMORY, "save pin");
-                }
-                RtxPageStore_pread(&d->tree.store, RTX_STORE_ORIG, flo, pin,
-                                   on) !>(e) {
-                    pin_a.destroy();
-                    return cc_err(e);
-                };
-            }
+            /* The dirty span [lo, hi) is written in place; a length change
+             * also rewrites and truncates everything after lo. */
+            size_t whi = (newn == dlen && hi <= dlen) ? hi : (size_t)-1;
+            rtx_orig_preserve_inode((uint64_t)st.st_dev, (uint64_t)st.st_ino, lo,
+                                    whi) !>(e) {
+                return cc_err(e);
+            };
             fd = open(p, O_WRONLY | O_CREAT, have_mode ? mode : 0666);
-            if (fd < 0) {
-                if (pin_a.base) pin_a.destroy();
-                return cc_err(CC_ERR_IO, "save open");
-            }
+            if (fd < 0) return cc_err(CC_ERR_IO, "save open");
             if (have_mode && fchmod(fd, mode) != 0) {
-                if (pin_a.base) pin_a.destroy();
                 close(fd);
                 return cc_err(CC_ERR_IO, "save fchmod");
             }
             if (lo && lseek(fd, (off_t)lo, SEEK_SET) < 0) {
-                if (pin_a.base) pin_a.destroy();
                 close(fd);
                 return cc_err(CC_ERR_IO, "save lseek");
             }
-            d->tree.write_fd_from_snap(fd, lo, hi, pin, flo, on) !>(e) {
-                if (pin_a.base) pin_a.destroy();
+            d->tree.write_fd_from(fd, lo, hi) !>(e) {
                 close(fd);
                 return cc_err(e);
             };
-            if (pin_a.base) pin_a.destroy();
             if (newn != (size_t)st.st_size) {
                 if (ftruncate(fd, (off_t)newn) != 0) {
                     close(fd);
@@ -10447,6 +10401,13 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
                 }
             }
         } else {
+            /* Truncate and rewrite. `p` may still be an open original: this
+             * doc's (a drifted size, an overwrite) or another doc's. */
+            if (exists)
+                rtx_orig_preserve_inode((uint64_t)st.st_dev, (uint64_t)st.st_ino, 0,
+                                        (size_t)-1) !>(e) {
+                    return cc_err(e);
+                };
             fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, have_mode ? mode : 0666);
             if (fd < 0) return cc_err(CC_ERR_IO, "save open");
             if (have_mode && fchmod(fd, mode) != 0) {
@@ -10464,6 +10425,7 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
         }
         if (close(fd) != 0) return cc_err(CC_ERR_IO, "save close");
         rtx_save_fsync_dir(p, n);
+        if (alias) RtxPageStore_set_disk_len(&d->tree.store, newn);
         if (new_path.ptr) d->path = new_path;
         d->mark_saved();
         rtx_doc_ident_stamp(d, path);

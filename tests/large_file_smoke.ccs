@@ -25,6 +25,116 @@ static void expect(int cond, const char *msg) {
     }
 }
 
+static char *slurp(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    char *p;
+    long len;
+    *n = 0;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    p = (char *)malloc((size_t)len + 1);
+    if (p && len && fread(p, 1, (size_t)len, f) != (size_t)len) {
+        free(p);
+        p = NULL;
+    }
+    fclose(f);
+    if (p) *n = (size_t)len;
+    return p;
+}
+
+/* Whole doc past the page cache (every ORIGINAL byte from the file). */
+static int doc_uncached_is(RtxDoc *d, const char *want, size_t n) {
+    char *p;
+    size_t got;
+    int ok;
+    if (d->len() != n) return 0;
+    p = (char *)malloc(n + 1);
+    if (!p) return 0;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        free(p);
+        return 0;
+    }
+    got = RtxPieceTree_read_uncached(&d->tree, 0, cc_slice_from_buffer(p, n)) !>;
+    ok = got == n && memcmp(p, want, n) == 0;
+    free(p);
+    return ok;
+}
+
+static int file_is(const char *path, const char *want, size_t n) {
+    size_t got = 0;
+    char *p = slurp(path, &got);
+    int ok = p && got == n && memcmp(p, want, n) == 0;
+    free(p);
+    return ok;
+}
+
+/* --backup saves through the opened inode of a multi-MiB file: the live
+ * tree and history keep their ORIGINAL bytes (uncached reads), undo /
+ * redo / the next save agree with a model at every step. */
+static void backup_seq(const char *src) {
+    const char *path = "testdata/generated/large_backup.txt";
+    char bak[256];
+    size_t n = 0, mid, i;
+    char *base = slurp(src, &n);
+    char *m1;
+    int prev = rtx_doc_save_backup();
+    RtxDoc d = {0} @destroy;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        expect(0, "backup seq: unexpected error");
+        rtx_doc_set_save_backup(prev);
+        free(base);
+        return;
+    }
+    snprintf(bak, sizeof(bak), "%s~", path);
+    expect(base != NULL && n > 1000000, "backup seq: read fixture");
+    if (!base) return;
+    {
+        FILE *f = fopen(path, "wb");
+        expect(f && fwrite(base, 1, n, f) == n, "backup seq: copy fixture");
+        if (f) fclose(f);
+    }
+    mid = n / 2;
+    /* m1: fixture with "BACKUP" inserted at mid and 100 bytes cut at n/4. */
+    m1 = (char *)malloc(n + 16);
+    memcpy(m1, base, n / 4);
+    memcpy(m1 + n / 4, base + n / 4 + 100, mid - n / 4 - 100);
+    memcpy(m1 + mid - 100, "BACKUP", 6);
+    memcpy(m1 + mid - 100 + 6, base + mid, n - mid);
+    rtx_doc_set_save_backup(1);
+    d.from_path(cc_slice_cstr(path)) !>;
+    d.replace(mid, 0, "BACKUP") !>;
+    d.break_coalesce();
+    d.replace(n / 4, 100, cc_slice_empty()) !>;
+    d.save() !>;
+    expect(file_is(path, m1, n - 94), "backup seq: file after save");
+    expect(doc_uncached_is(&d, m1, n - 94), "backup seq: live doc uncached after save");
+    d.undo() !>;
+    d.undo() !>;
+    expect(doc_uncached_is(&d, base, n) && d.dirty(), "backup seq: undo x2 uncached");
+    d.redo() !>;
+    d.redo() !>;
+    expect(doc_uncached_is(&d, m1, n - 94) && !d.dirty(), "backup seq: redo x2 uncached");
+    d.undo() !>;
+    d.undo() !>;
+    d.save() !>;
+    expect(file_is(path, base, n), "backup seq: save back to the original");
+    expect(doc_uncached_is(&d, base, n), "backup seq: doc after second save");
+    for (i = 0; i < 2; i++) d.redo() !>;
+    expect(doc_uncached_is(&d, m1, n - 94) && d.dirty(), "backup seq: redo after second save");
+    d.save() !>;
+    expect(file_is(path, m1, n - 94) && doc_uncached_is(&d, m1, n - 94),
+           "backup seq: third save");
+    rtx_doc_set_save_backup(prev);
+    free(m1);
+    free(base);
+    unlink(path);
+    unlink(bak);
+}
+
 static double meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
     (void)ctx;
     (void)style;
@@ -169,6 +279,8 @@ int main(void) {
         expect(L.rows.data[row_mid + 51].byte_start == tail_start + strlen(mark),
                "window rebuilt after mid insert");
     }
+
+    backup_seq(src);
 
     if (fails) {
         fprintf(stderr, "%d failure(s)\n", fails);

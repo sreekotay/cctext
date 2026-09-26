@@ -10,6 +10,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -22,6 +25,296 @@
 #define RTX_HAVE_MKOSTEMP 1
 int mkostemp(char *tmpl, int flags);
 #endif
+
+/* ------------------------------------------------------------------
+ * Original generation (header comment). The preserved set is an
+ * immutable snapshot of sorted, disjoint, merged [lo, hi) spans; a
+ * preserve publishes a new one (release) after its bytes are in the
+ * preserve file, and keeps the old ones until destroy (a concurrent
+ * reader may still hold one). */
+typedef struct RtxOrigKeep {
+    struct RtxOrigKeep *older;
+    size_t n;
+    size_t iv[]; /* lo0, hi0, lo1, hi1, ... */
+} RtxOrigKeep;
+
+typedef struct RtxOrigFile {
+    int fd;              /* the store's orig_fd (not owned here) */
+    size_t len;          /* orig_len */
+    uint64_t dev, ino;
+    size_t disk_len;     /* inode length as the owner last wrote it */
+    int pres_fd;         /* -1 until the first preserve */
+    _Atomic(RtxOrigKeep *) keep;
+    struct RtxOrigFile *next; /* registry */
+} RtxOrigFile;
+
+static pthread_mutex_t rtx_orig_mu = PTHREAD_MUTEX_INITIALIZER;
+static RtxOrigFile *rtx_orig_list;
+static _Atomic size_t rtx_orig_pres_bytes;
+
+size_t rtx_orig_preserved_bytes(void) {
+    return atomic_load_explicit(&rtx_orig_pres_bytes, memory_order_relaxed);
+}
+
+static RtxOrigKeep *rtx_orig_keep(const RtxOrigFile *of) {
+    return of ? atomic_load_explicit(&((RtxOrigFile *)of)->keep, memory_order_acquire)
+              : NULL;
+}
+
+/* First span in k that ends after `off` (k->n if none). */
+static size_t rtx_keep_find(const RtxOrigKeep *k, size_t off) {
+    size_t lo = 0, hi = k ? k->n : 0;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (k->iv[2 * mid + 1] <= off) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static int rtx_keep_overlaps(const RtxOrigKeep *k, size_t lo, size_t hi) {
+    size_t i;
+    if (!k || lo >= hi) return 0;
+    i = rtx_keep_find(k, lo);
+    return i < k->n && k->iv[2 * i] < hi;
+}
+
+int RtxPageStore_orig_is(const RtxPageStore *s, uint64_t dev, uint64_t ino) {
+    return s && s->orig_open && s->of && s->of->dev == dev && s->of->ino == ino;
+}
+
+int RtxPageStore_orig_on_disk(const RtxPageStore *s, size_t lo, size_t hi) {
+    if (!s || !s->of) return 1;
+    return !rtx_keep_overlaps(rtx_orig_keep(s->of), lo, hi);
+}
+
+size_t RtxPageStore_disk_len(const RtxPageStore *s) {
+    if (!s) return 0;
+    return s->of ? s->of->disk_len : s->orig_len;
+}
+
+void RtxPageStore_set_disk_len(RtxPageStore *s, size_t n) {
+    if (s && s->of) s->of->disk_len = n;
+}
+
+static void !>(CCError) rtx_pread_all(int fd, char *dest, size_t n, size_t off) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = pread(fd, dest + got, n - got, (off_t)(off + got));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return cc_err(CC_ERR_IO, "pread");
+        }
+        if (r == 0) return cc_err(CC_ERR_IO, "pread short");
+        got += (size_t)r;
+    }
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_pwrite_all(int fd, const char *src, size_t n, size_t off) {
+    size_t put = 0;
+    while (put < n) {
+        ssize_t w = pwrite(fd, src + put, n - put, (off_t)(off + put));
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return cc_err(CC_ERR_IO, "pwrite preserve");
+        }
+        if (w == 0) return cc_err(CC_ERR_IO, "pwrite preserve");
+        put += (size_t)w;
+    }
+    return cc_ok();
+}
+
+/* Original bytes [off, off + n): preserved spans from the preserve file,
+ * the rest from the inode. A span preserved while we read the inode (a
+ * save on another document) is read again from the preserve file: the
+ * preserve publishes only after its copy, and the write comes after. */
+static void !>(CCError) rtx_orig_read(const RtxOrigFile *of, int fd, size_t off,
+                                      char *dest, size_t n) {
+    size_t at = 0;
+    if (!of) return rtx_pread_all(fd, dest, n, off);
+    while (at < n) {
+        RtxOrigKeep *k = rtx_orig_keep(of);
+        size_t pos = off + at, i = rtx_keep_find(k, pos), take;
+        if (k && i < k->n && k->iv[2 * i] <= pos) {
+            size_t end = k->iv[2 * i + 1];
+            take = end - pos < n - at ? end - pos : n - at;
+            rtx_pread_all(of->pres_fd, dest + at, take, pos) !>(e) { return cc_err(e); };
+        } else {
+            size_t next = (k && i < k->n) ? k->iv[2 * i] : (size_t)-1;
+            take = next - pos < n - at ? next - pos : n - at;
+            rtx_pread_all(fd, dest + at, take, pos) !>(e) { return cc_err(e); };
+            if (rtx_orig_keep(of) != k) continue; /* re-route this span */
+        }
+        at += take;
+    }
+    return cc_ok();
+}
+
+static void rtx_orig_unregister(RtxOrigFile *of) {
+    RtxOrigFile **pp;
+    RtxOrigKeep *k;
+    if (!of) return;
+    pthread_mutex_lock(&rtx_orig_mu);
+    for (pp = &rtx_orig_list; *pp; pp = &(*pp)->next) {
+        if (*pp == of) {
+            *pp = of->next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&rtx_orig_mu);
+    k = rtx_orig_keep(of);
+    while (k) {
+        RtxOrigKeep *o = k->older;
+        free(k);
+        k = o;
+    }
+    if (of->pres_fd >= 0) close(of->pres_fd);
+    free(of);
+}
+
+static void !>(CCError) rtx_orig_register(RtxPageStore *s, const struct stat *st) {
+    RtxOrigFile *of = (RtxOrigFile *)calloc(1, sizeof(RtxOrigFile));
+    if (!of) return cc_err(CC_ERR_OUT_OF_MEMORY, "orig file");
+    of->fd = s->orig_fd;
+    of->len = s->orig_len;
+    of->dev = (uint64_t)st->st_dev;
+    of->ino = (uint64_t)st->st_ino;
+    of->disk_len = s->orig_len;
+    of->pres_fd = -1;
+    atomic_store_explicit(&of->keep, (RtxOrigKeep *)NULL, memory_order_relaxed);
+    pthread_mutex_lock(&rtx_orig_mu);
+    of->next = rtx_orig_list;
+    rtx_orig_list = of;
+    pthread_mutex_unlock(&rtx_orig_mu);
+    s->of = of;
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_orig_pres_open(RtxOrigFile *of) {
+    char path[PATH_MAX];
+    const char *dir;
+    int n, fd;
+    if (of->pres_fd >= 0) return cc_ok();
+    dir = getenv("TMPDIR");
+    if (!dir || !dir[0]) dir = "/tmp";
+    n = snprintf(path, sizeof(path), "%s/cctext-orig-XXXXXX", dir);
+    if (n < 0 || n >= (int)sizeof(path)) return cc_err(CC_ERR_IO, "mkstemp orig");
+#ifdef RTX_HAVE_MKOSTEMP
+    fd = mkostemp(path, O_CLOEXEC);
+#else
+    fd = mkstemp(path);
+    if (fd >= 0) (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
+    if (fd < 0) return cc_err(CC_ERR_IO, "mkstemp orig");
+    unlink(path);
+    of->pres_fd = fd;
+    return cc_ok();
+}
+
+/* Copy original [lo, hi) minus what is held into the preserve file, then
+ * publish the merged set. Caller holds rtx_orig_mu (one preserver). */
+static void !>(CCError) rtx_orig_preserve(RtxOrigFile *of, size_t lo, size_t hi) {
+    RtxOrigKeep *k, *nk;
+    size_t i, a, n_new, w;
+    char *buf = NULL;
+    const size_t bufn = (size_t)1 << 20;
+    if (hi > of->len) hi = of->len;
+    if (lo >= hi) return cc_ok();
+    k = rtx_orig_keep(of);
+    /* Gaps of [lo, hi) not in k: copy each from the inode. */
+    a = lo;
+    i = rtx_keep_find(k, lo);
+    while (a < hi) {
+        size_t gz;
+        if (k && i < k->n && k->iv[2 * i] <= a) {
+            a = k->iv[2 * i + 1];
+            i++;
+            continue;
+        }
+        gz = (k && i < k->n && k->iv[2 * i] < hi) ? k->iv[2 * i] : hi;
+        if (!buf) {
+            rtx_orig_pres_open(of) !>(e) { return cc_err(e); };
+            buf = (char *)malloc(bufn);
+            if (!buf) return cc_err(CC_ERR_OUT_OF_MEMORY, "preserve");
+        }
+        while (a < gz) {
+            size_t take = gz - a < bufn ? gz - a : bufn;
+            rtx_pread_all(of->fd, buf, take, a) !>(e) {
+                free(buf);
+                return cc_err(e);
+            };
+            rtx_pwrite_all(of->pres_fd, buf, take, a) !>(e) {
+                free(buf);
+                return cc_err(e);
+            };
+            atomic_fetch_add_explicit(&rtx_orig_pres_bytes, take, memory_order_relaxed);
+            a += take;
+        }
+    }
+    if (!buf) return cc_ok(); /* all held already */
+    free(buf);
+    /* Merge [lo, hi) into k. */
+    n_new = (k ? k->n : 0) + 1;
+    nk = (RtxOrigKeep *)malloc(sizeof(RtxOrigKeep) + 2 * n_new * sizeof(size_t));
+    if (!nk) return cc_err(CC_ERR_OUT_OF_MEMORY, "preserve");
+    w = 0;
+    {
+        size_t clo = lo, chi = hi;
+        int placed = 0;
+        for (i = 0; k && i < k->n; i++) {
+            size_t slo = k->iv[2 * i], shi = k->iv[2 * i + 1];
+            if (shi < clo) {
+                nk->iv[2 * w] = slo;
+                nk->iv[2 * w + 1] = shi;
+                w++;
+            } else if (slo > chi) {
+                if (!placed) {
+                    nk->iv[2 * w] = clo;
+                    nk->iv[2 * w + 1] = chi;
+                    w++;
+                    placed = 1;
+                }
+                nk->iv[2 * w] = slo;
+                nk->iv[2 * w + 1] = shi;
+                w++;
+            } else {
+                if (slo < clo) clo = slo;
+                if (shi > chi) chi = shi;
+            }
+        }
+        if (!placed) {
+            nk->iv[2 * w] = clo;
+            nk->iv[2 * w + 1] = chi;
+            w++;
+        }
+    }
+    nk->n = w;
+    nk->older = k;
+    atomic_store_explicit(&of->keep, nk, memory_order_release);
+    return cc_ok();
+}
+
+void !>(CCError) rtx_orig_preserve_inode(uint64_t dev, uint64_t ino, size_t lo,
+                                         size_t hi) {
+    RtxOrigFile *of;
+    pthread_mutex_lock(&rtx_orig_mu);
+    for (of = rtx_orig_list; of; of = of->next) {
+        if (of->dev != dev || of->ino != ino) continue;
+        rtx_orig_preserve(of, lo, hi) !>(e) {
+            pthread_mutex_unlock(&rtx_orig_mu);
+            return cc_err(e);
+        };
+    }
+    pthread_mutex_unlock(&rtx_orig_mu);
+    return cc_ok();
+}
+
+void !>(CCError) rtx_orig_preserve_path(const char *path, size_t lo, size_t hi) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0) return cc_ok();
+    return rtx_orig_preserve_inode((uint64_t)st.st_dev, (uint64_t)st.st_ino, lo, hi);
+}
 
 static void rtx_page_lru_unlink(RtxPageStore *s, size_t i) {
     RtxPageSlot *p = &s->slots[i];
@@ -171,11 +464,18 @@ void !>(CCError) RtxPageStore_open_original(RtxPageStore *s, char[:0] path) {
     s->orig_fd = fd;
     s->orig_open = 1;
     s->orig_len = (size_t)st.st_size;
+    rtx_orig_register(s, &st) !>(e) {
+        close(fd);
+        rtx_page_store_zero(s);
+        return cc_err(e);
+    };
     return cc_ok();
 }
 
 void RtxPageStore_destroy(RtxPageStore *s) {
     if (!s) return;
+    rtx_orig_unregister(s->of);
+    s->of = NULL;
     if (s->orig_open) close(s->orig_fd);
     if (s->add_open) close(s->add_fd);
     if (s->arena.base) s->arena.destroy();
@@ -204,6 +504,10 @@ static void !>(CCError) rtx_page_load(RtxPageStore *s, size_t i, RtxStoreFile f,
      * old page name over the new page's bytes. */
     slot->file_id = -1;
     slot->valid = 0;
+    if (f == RTX_STORE_ORIG && s->of) {
+        rtx_orig_read(s->of, fd, off, slot->bytes, want) !>(e) { return cc_err(e); };
+        got = want;
+    }
     while (got < want) {
         ssize_t r = pread(fd, slot->bytes + got, want - got, (off_t)(off + got));
         if (r < 0) {
@@ -296,6 +600,7 @@ void !>(CCError) RtxPageStore_pread(const RtxPageStore *s, RtxStoreFile f,
     }
     cc_external_wait_enter();
     @defer cc_external_wait_leave();
+    if (f == RTX_STORE_ORIG && s->of) return rtx_orig_read(s->of, fd, off, dest, n);
     while (got < n) {
         ssize_t r = pread(fd, dest + got, n - got, (off_t)(off + got));
         if (r < 0) {

@@ -855,16 +855,34 @@ fsync, `rename`, best-effort dir fsync). That replaces the inode: hard-link
 identity is lost, and a symlink at `path` is replaced rather than followed.
 Owner, ACL, and xattr are not copied. `--backup` is the other policy: write
 through `path` (follows the symlink / keeps the inode). When the dest is the
-opened original and its size still matches, only the dirty span is copied
-and overwritten — unchanged prefix (and a same-length original suffix) stay
-on disk. A length-changing write that still streams original pieces pins
-those file bytes before the first `pwrite` (the dest inode is the page
-store’s original). A tail above `RTX_SAVE_PIN_MAX` writes a full temp and
-copies onto the path. `path~` is then `RTXB` (magic / ver / old_len / lo)
-plus the old bytes that were about to be overwritten. A pure append writes
-no `path~`.
-If the dest is another path or the size drifted, fall back to a full copy
-then truncate+write. Crash mid-write can leave a mixed target; `path~` is
+opened original's inode (its path, a hard link, a symlink to it) and its
+size is what the last write left (`disk_len`), only the dirty span is
+copied and overwritten — unchanged prefix (and a same-length suffix) stay
+on disk. The span is against what the inode holds *now*: an ORIGINAL piece
+at its own offset counts as unchanged only while no save has rewritten
+those bytes. `path~` is then `RTXB` (magic / ver / old_len / lo) plus the
+old bytes that were about to be overwritten. A pure append writes no
+`path~`. If the dest is another inode or the size drifted, fall back to a
+full copy then truncate+write.
+
+The original is an immutable generation: every ORIGINAL ref the live tree
+and **any** history record (or journal branch) holds keeps its bytes while
+the document lives. A write through an inode that is an open original
+never happens before the page store *preserves* the original bytes it is
+about to change: it copies them from the inode into a private, unlinked,
+sparse temp file at the same offsets (disk-backed; a multi-GB original
+costs disk for the rewritten span, not RAM) and publishes the preserved
+span set; reads of those offsets (cached page loads and the uncached lane
+path) go there from then on. Every open original is in a process registry
+keyed by (dev, ino), so a save through any path — this document's
+`--backup` dirty span, a truncate+rewrite, a save-as onto a hard link,
+another document's save onto this file, `path~` when `path~` is itself
+open — preserves for every document on that inode. A lane that read the
+inode while a preserve landed re-reads that span from the preserve file.
+Rebasing only the live tree would leave undo refs wrong, and dropping the
+page cache only exposes the aliasing, so neither is the fix. The plain
+(rename) save never writes an open original: the old inode stays behind
+the page store's fd. Crash mid-write can leave a mixed target; `path~` is
 the recovery. Save stamps mtime + size + inode at open and after a
 successful write. A later save of that same path refuses if the identity
 drifted (`file changed on disk`) unless the user overwrites — then the
