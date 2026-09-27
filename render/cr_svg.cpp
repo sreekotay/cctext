@@ -7,11 +7,18 @@
 // below are what a family list can hit. Anything else falls back to "",
 // registered as Noto Sans.
 #include <lunasvg.h>
+#include <plutovg.h>
+
+// lunasvg's own face cache (an internal header): measuring through it picks
+// exactly the face the rasterizer will draw with.
+#include "graphics.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
+#include <string_view>
 
 #include "cr_svg.h"
 
@@ -90,6 +97,64 @@ void lower(char* s)
 
 } // namespace
 
+namespace {
+
+// lunasvg's SVGLayoutState::font(): the first family in the list the cache
+// knows (quotes and blanks stripped, lowercased), else the "" fallback.
+plutovg_font_face_t* pick_face(const char* families, bool bold, bool italic)
+{
+    std::string_view input(families ? families : "");
+    auto* cache = lunasvg::fontFaceCache();
+    while(!input.empty()) {
+        auto family = input.substr(0, input.find(','));
+        input.remove_prefix(family.length());
+        if(!input.empty() && input.front() == ',')
+            input.remove_prefix(1);
+        while(!family.empty() && (family.front() == ' ' || family.front() == '\t'))
+            family.remove_prefix(1);
+        while(!family.empty() && (family.back() == ' ' || family.back() == '\t'))
+            family.remove_suffix(1);
+        if(!family.empty() && (family.front() == '\'' || family.front() == '"')) {
+            auto quote = family.front();
+            family.remove_prefix(1);
+            if(!family.empty() && family.back() == quote)
+                family.remove_suffix(1);
+        }
+        std::string name(family);
+        for(auto& ch : name) {
+            if(ch >= 'A' && ch <= 'Z')
+                ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if(!name.empty()) {
+            auto face = cache->getFontFace(name, bold, italic);
+            if(!face.isNull())
+                return face.get();
+        }
+    }
+    return cache->getFontFace(std::string(), bold, italic).get();
+}
+
+} // namespace
+
+extern "C" double cr_svg_measure(const char* text, size_t n, double px, int weight, int italic, const char* families)
+{
+    auto* face = pick_face(families, weight >= 600, italic != 0);
+    if(!face || !text || !n || n > 0x7fffffff)
+        return 0;
+    return plutovg_font_face_text_extents(face, static_cast<float>(px), text, static_cast<int>(n),
+                                          PLUTOVG_TEXT_ENCODING_UTF8, nullptr);
+}
+
+extern "C" void cr_svg_font_metrics(double px, int weight, int italic, const char* families, double* ascent, double* descent)
+{
+    auto* face = pick_face(families, weight >= 600, italic != 0);
+    float a = 0, d = 0, lg = 0;
+    if(face)
+        plutovg_font_face_get_metrics(face, static_cast<float>(px), &a, &d, &lg, nullptr);
+    *ascent = a;
+    *descent = -d; // plutovg's descent is negative (below the baseline)
+}
+
 struct cr_svg {
     std::unique_ptr<lunasvg::Document> doc;
 };
@@ -160,6 +225,21 @@ extern "C" int cr_svg_png(const char* svg_path, const char* png_path, float scal
     auto pw = static_cast<int>(std::ceil(w)), ph = static_cast<int>(std::ceil(h));
     lunasvg::Bitmap bm(pw, ph);
     bm.clear(0);
+    doc->render(bm, lunasvg::Matrix(scale, 0, 0, scale, 0, 0));
+    return bm.writeToPng(png_path) ? 0 : -1;
+}
+
+extern "C" int cr_svg_png_data(const char* data, size_t n, const char* png_path, float scale, uint32_t bg)
+{
+    auto doc = lunasvg::Document::loadFromData(data, n);
+    if(!doc)
+        return -1;
+    float w = doc->width() * scale, h = doc->height() * scale;
+    if(!(w >= 1 && h >= 1 && w < 16384 && h < 16384))
+        return -1;
+    auto pw = static_cast<int>(std::ceil(w)), ph = static_cast<int>(std::ceil(h));
+    lunasvg::Bitmap bm(pw, ph);
+    bm.clear(bg);
     doc->render(bm, lunasvg::Matrix(scale, 0, 0, scale, 0, 0));
     return bm.writeToPng(png_path) ? 0 : -1;
 }

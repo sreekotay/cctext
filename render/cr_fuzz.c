@@ -5,6 +5,7 @@
  * "san" -> bin/cctext-render-fuzz). Any sanitizer report aborts the run.
  *
  *   cctext-render-fuzz PACK CORPUS_DIR [ITERS] [SEED]
+ *   cctext-render-fuzz --mermaid PACK CORPUS_DIR [ITERS] [SEED]
  *
  * Every *.svg under CORPUS_DIR (and one level of subdirectories) is a
  * seed; each seed renders once unmutated, then ITERS mutants follow
@@ -13,6 +14,17 @@
  * percentage <svg>). Fixed hostile cases run first. The sandbox is not
  * involved (the policy has its own tests); this is about memory safety
  * and undefined behaviour in the parser and rasterizer.
+ *
+ * --mermaid: every *.mmd is a seed for the whole Mermaid path the helper
+ * runs (QuickJS executing mermaid.min.js from the pack's bytecode, then
+ * lunasvg on its SVG), under the same sanitizers (QuickJS's C included):
+ * line deletions / duplications / swaps, token and arrow garbage, splices
+ * between diagram types, long labels and ids, deep subgraph nesting,
+ * directives (%%{init}%% with hostile config), click / href / callback
+ * lines, HTML and script in labels, classDef CSS garbage, control bytes
+ * and truncations. Each mutant has the editor's limits: 150 nodes and a
+ * time budget (an interrupted script is an outcome, not a finding). The
+ * engine restarts after every failure, as in the helper.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -23,6 +35,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include "cr_js.h"
 #include "cr_pack.h"
 #include "cr_svg.h"
 
@@ -73,6 +86,8 @@ typedef struct {
 static Seed g_seed[512];
 static int g_nseed;
 
+static const char *g_ext = ".svg";
+
 static void load_dir(const char *dir, int depth)
 {
     DIR *d = opendir(dir);
@@ -89,7 +104,7 @@ static void load_dir(const char *dir, int depth)
             if (depth < 1) load_dir(p, depth + 1);
             continue;
         }
-        if (l < 5 || strcmp(e->d_name + l - 4, ".svg") != 0 || st.st_size > (1 << 20)) continue;
+        if (l < 5 || strcmp(e->d_name + l - 4, g_ext) != 0 || st.st_size > (1 << 20)) continue;
         {
             FILE *f = fopen(p, "rb");
             Seed *s = &g_seed[g_nseed];
@@ -334,18 +349,281 @@ static int fonts_init(CrPack *p)
     return nf;
 }
 
+/* ---- Mermaid ------------------------------------------------------------ */
+
+static CrJs *g_mm;
+static long g_mm_ok, g_mm_err, g_mm_timeout, g_mm_large;
+
+static void mm_one(const char *what, const char *src, size_t n, uint32_t budget_ms, int dark)
+{
+    static const char opts_l[] = "{\"nodeMax\":150,\"theme\":\"default\"}";
+    static const char opts_d[] =
+        "{\"nodeMax\":150,\"theme\":\"dark\",\"themeVariables\":{\"primaryColor\":\"#223344\"}}";
+    char err[1024], *svg, *z;
+    const char *a[3];
+    int to = 0;
+    double t0 = now_ms(), dt;
+    z = malloc(n + 1);
+    if (!z) abort();
+    memcpy(z, src, n);
+    z[n] = 0; /* a NUL inside ends the source (as a JS string from the helper) */
+    a[0] = "cctext-mermaid";
+    a[1] = z;
+    a[2] = dark ? opts_d : opts_l;
+    svg = cr_js_call(g_mm, "mmRender", 3, a, budget_ms, err, sizeof err, &to);
+    if (svg && !strncmp(svg, "CCTEXT_TOO_LARGE", 16)) g_mm_large++;
+    else if (svg) {
+        g_mm_ok++;
+        render_one(what, svg, strlen(svg));
+    } else if (to) g_mm_timeout++;
+    else g_mm_err++;
+    free(svg);
+    free(z);
+    dt = now_ms() - t0;
+    if (dt > g_worst_ms) {
+        g_worst_ms = dt;
+        snprintf(g_worst, sizeof g_worst, "%s", what);
+    }
+}
+
+static const char *const MM_TOK[] = {
+    "-->", "---", "-.->", "==>", "--x", "--o", "<-->", "->>", "-->>", "-x", "-)", "||--o{", "}|..|{",
+    "<|--", "*--", "o--", "..>", "[*]", "((", "))", "{{", "}}", "[/", "/]", "[(", ")]", ">", "|",
+    ":", ";", "\"", "'", "`", "%%", "#", "&", "<br>", "<b>", "<script>alert(1)</script>",
+    "<img src=x onerror=alert(1)>", "javascript:alert(1)", "\\u0000", "\xef\xbf\xbf", "\xf0\x9f\x98\x80",
+    "\xe2\x80\xae", "subgraph", "end", "classDef", "class", "style", "linkStyle", "click", "call",
+    "href", "note", "loop", "alt", "else", "opt", "par", "and", "rect", "activate", "deactivate",
+    "section", "dateFormat", "axisFormat", "excludes", "after", "crit", "done", "active", "title",
+    "direction", "TB", "LR", "RL", "BT", "state", "fork", "join", "choice", "<<interface>>",
+    "1e308", "-1", "NaN", "9999999999", "0x7fffffff", "2020-13-45", "::", ":::", "~T~", "{", "}"};
+
+static const char *const MM_LINES[] = {
+    "%%{init: {\"securityLevel\": \"loose\", \"htmlLabels\": true, \"startOnLoad\": true}}%%",
+    "%%{init: {\"theme\": \"forest\", \"themeCSS\": \"* { font-size: 1e9px } svg { width: 1e9px }\"}}%%",
+    "%%{init: {\"flowchart\": {\"htmlLabels\": true, \"curve\": \"__proto__\"}, \"fontSize\": 1e9}}%%",
+    "%%{init: {\"maxTextSize\": 1e12, \"maxEdges\": 1e12, \"deterministicIDSeed\": \"<svg\"}}%%",
+    "%%{wrap}%%",
+    "---\nconfig:\n  theme: dark\n  look: handDrawn\n  layout: elk\n---",
+    "---\nconfig:\n  layout: elk\n---",
+    "  click A callback \"tip\"", "  click A href \"javascript:alert(1)\" _blank",
+    "  click A call alert(1)", "  A[\"<a href='javascript:alert(1)'>x</a>\"]",
+    "  classDef x fill:url(#a),stroke:expression(alert(1)),font-size:1e9px;",
+    "  style A fill:#f9f,stroke:#333,stroke-width:1e9px",
+    "  linkStyle 999999 stroke:red", "  A@{ shape: cyl, label: \"x\" }",
+    "  A@{ icon: \"fa:user\", img: \"https://example.com/x.png\", w: 1e9 }",
+    "  accTitle: <script>", "  accDescr: x", "  note right of A: <b>x</b>",
+    "  A -->|\"<img src=x>\"| B"};
+
+static void mm_mutate(const Seed *s, Buf *o)
+{
+    const char *b = s->d;
+    size_t n = s->n, i, k;
+    o->n = 0;
+    switch (rndn(12)) {
+    case 0: /* byte flips */
+        buf_add(o, b, n);
+        for (i = rndn(8) + 1; i-- && o->n;) o->b[rndn(o->n)] = (char)rnd();
+        break;
+    case 1: /* truncate */
+        buf_add(o, b, rndn(n + 1));
+        break;
+    case 2: { /* delete / duplicate / swap lines */
+        const char *ls[256];
+        size_t ll[256], nl = 0, p = 0;
+        while (p < n && nl < 256) {
+            size_t e = p;
+            while (e < n && b[e] != '\n') e++;
+            ls[nl] = b + p;
+            ll[nl++] = e - p;
+            p = e + 1;
+        }
+        for (i = 0; i < nl; i++) {
+            size_t r = rndn(10), j = i;
+            if (r == 0) continue;                /* delete */
+            if (r == 1) j = rndn(nl);             /* another line instead */
+            buf_add(o, ls[j], ll[j]);
+            buf_str(o, "\n");
+            if (r == 2)
+                for (k = rndn(20) + 1; k--;) { buf_add(o, ls[j], ll[j]); buf_str(o, "\n"); }
+        }
+        break;
+    }
+    case 3: /* token garbage at random places */
+        buf_add(o, b, n);
+        for (i = rndn(6) + 1; i--;) {
+            const char *t = MM_TOK[rndn(sizeof MM_TOK / sizeof MM_TOK[0])];
+            size_t at = rndn(o->n + 1), tl = strlen(t);
+            buf_add(o, t, tl);                    /* grow, then move the tail */
+            memmove(o->b + at + tl, o->b + at, o->n - tl - at);
+            memcpy(o->b + at, t, tl);
+        }
+        break;
+    case 4: { /* hostile lines after the header */
+        const char *nl = memchr(b, '\n', n);
+        size_t at = nl ? (size_t)(nl + 1 - b) : n;
+        if (rndn(3) == 0) {
+            buf_str(o, MM_LINES[rndn(4)]);
+            buf_str(o, "\n");
+            buf_add(o, b, n);
+            break;
+        }
+        buf_add(o, b, at);
+        for (i = rndn(3) + 1; i--;) {
+            buf_str(o, MM_LINES[rndn(sizeof MM_LINES / sizeof MM_LINES[0])]);
+            buf_str(o, "\n");
+        }
+        buf_add(o, b + at, n - at);
+        break;
+    }
+    case 5: { /* splice another type's lines in */
+        const Seed *t = &g_seed[rndn((size_t)g_nseed)];
+        size_t a = rndn(n + 1), f = rndn(t->n + 1), l = rndn(300) + 1;
+        if (f + l > t->n) l = t->n - f;
+        buf_add(o, b, a);
+        buf_add(o, t->d + f, l);
+        buf_add(o, b + a, n - a);
+        break;
+    }
+    case 6: { /* long labels / ids */
+        size_t at = rndn(n + 1), L = (size_t)1 << (8 + rndn(9));
+        buf_add(o, b, at);
+        for (k = 0; k < L; k++) buf_add(o, (rndn(20) ? "W" : " "), 1);
+        buf_add(o, b + at, n - at);
+        break;
+    }
+    case 7: { /* deep subgraph / state / namespace nesting */
+        static const size_t depths[] = {20, 100, 400};
+        size_t d = depths[rndn(3)];
+        int kind = (int)rndn(3);
+        buf_str(o, kind == 0 ? "flowchart TD\n" : kind == 1 ? "stateDiagram-v2\n" : "classDiagram\n");
+        for (k = 0; k < d; k++) {
+            char l[64];
+            if (kind == 0) snprintf(l, sizeof l, "subgraph s%zu\n", k);
+            else if (kind == 1) snprintf(l, sizeof l, "state S%zu {\n", k);
+            else snprintf(l, sizeof l, "namespace N%zu {\n", k);
+            buf_str(o, l);
+        }
+        buf_str(o, kind == 0 ? "a --> b\n" : kind == 1 ? "[*] --> x\n" : "class A\n");
+        for (k = 0; k < d; k++) buf_str(o, kind == 0 ? "end\n" : "}\n");
+        break;
+    }
+    case 8: { /* many nodes / edges around the cap */
+        size_t m = 100 + rndn(200);
+        buf_str(o, "flowchart LR\n");
+        for (k = 0; k < m; k++) {
+            char l[64];
+            snprintf(l, sizeof l, "n%zu --> n%zu\n", rndn(m / 2 + 1), rndn(m));
+            buf_str(o, l);
+        }
+        break;
+    }
+    case 9: /* control bytes and invalid UTF-8 */
+        for (i = 0; i < n; i++) {
+            buf_add(o, b + i, 1);
+            if (rndn(40) == 0) {
+                static const char junk[] = "\x01\x7f\xc0\xff\xed\xa0\x80\x00\r\t\x1b";
+                buf_add(o, junk + rndn(sizeof junk - 1), 1);
+            }
+        }
+        break;
+    case 10: /* extreme numbers (gantt dates, pie values, sizes) */
+        for (i = 0; i < n; i++) {
+            if (b[i] >= '0' && b[i] <= '9' && rndn(4) == 0) {
+                while (i + 1 < n && b[i + 1] >= '0' && b[i + 1] <= '9') i++;
+                buf_str(o, NUMS[rndn(sizeof NUMS / sizeof NUMS[0])]);
+            } else {
+                buf_add(o, b + i, 1);
+            }
+        }
+        break;
+    default: /* the seed unchanged, in the other theme */
+        buf_add(o, b, n);
+        break;
+    }
+}
+
+static int mm_main(int argc, char **argv, CrPack *pack)
+{
+    long iters = argc > 3 ? atol(argv[3]) : 200, i;
+    uint32_t budget = getenv("CR_FUZZ_MM_BUDGET_MS") ? (uint32_t)atol(getenv("CR_FUZZ_MM_BUDGET_MS"))
+                                                     : 20000u;
+    CrAsset *a = cr_pack_find(pack, "js:mermaid");
+    const uint8_t *bc = a ? cr_asset_data(a) : NULL;
+    CrJsPolicy pol = {(size_t)1 << 30, (size_t)256 << 20, 0, (size_t)16 << 20};
+    Buf o = {0};
+    double t0 = now_ms();
+    if (!bc) {
+        fprintf(stderr, "cctext-render-fuzz: no js:mermaid in the pack\n");
+        return 2;
+    }
+    g_mm = cr_js_new("mermaid", bc, a->raw_len, &pol);
+    g_ext = ".mmd";
+    load_dir(argv[2], 0);
+    if (!g_nseed) {
+        fprintf(stderr, "cctext-render-fuzz: no *.mmd under %s\n", argv[2]);
+        return 2;
+    }
+    for (i = 0; i < g_nseed && !getenv("CR_FUZZ_DUMP_ONLY"); i++)
+        mm_one(g_seed[i].name, g_seed[i].d, g_seed[i].n, budget > 60000 ? budget : 60000,
+               (int)(i & 1)); /* seeds must render: a generous budget under ASan */
+    if (g_mm_ok < g_nseed && !getenv("CR_FUZZ_DUMP_ONLY")) {
+        fprintf(stderr, "cctext-render-fuzz: only %ld of %d Mermaid seeds rendered\n", g_mm_ok,
+                g_nseed);
+        return 1;
+    }
+    for (i = 0; i < iters; i++) {
+        const Seed *s = &g_seed[rndn((size_t)g_nseed)];
+        char what[64];
+        int dark = (int)rndn(2);
+        mm_mutate(s, &o);
+        snprintf(what, sizeof what, "mermaid #%ld of %s", i, s->name);
+        if (getenv("CR_FUZZ_DUMP") && (atol(getenv("CR_FUZZ_DUMP")) == i ||
+                                       !strcmp(getenv("CR_FUZZ_DUMP"), "all"))) {
+            /* CR_FUZZ_DUMP=N (or all) writes the mutant to cr-fuzz-N.mmd */
+            char p[64];
+            FILE *df;
+            snprintf(p, sizeof p, "cr-fuzz-%ld.mmd", i);
+            df = fopen(p, "wb");
+            if (df) {
+                fwrite(o.b ? o.b : "", 1, o.n, df);
+                fclose(df);
+            }
+        }
+        /* CR_FUZZ_DUMP_ONLY: write the dumped mutant, render nothing */
+        if (!getenv("CR_FUZZ_DUMP_ONLY")) mm_one(what, o.b ? o.b : "", o.n, budget, dark);
+    }
+    {
+        CrJsStats st;
+        cr_js_stats(g_mm, &st);
+        printf("cctext-render-fuzz --mermaid: %d seeds, %ld mutants: %ld rendered, %ld errors, %ld "
+               "over the node cap, %ld timeouts, %u engine starts, %.1f s; slowest %.0f ms (%s)\n",
+               g_nseed, iters, g_mm_ok - g_nseed, g_mm_err, g_mm_large, g_mm_timeout, st.starts,
+               (now_ms() - t0) / 1000.0, g_worst_ms, g_worst);
+    }
+    cr_js_stop(g_mm);
+    free(g_mm);
+    free(o.b);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     static CrPack pack;
     FILE *f;
     long len;
     static uint8_t *pb;
-    long iters = argc > 3 ? atol(argv[3]) : 2000;
+    long iters;
     long i;
     Buf o = {0};
     double t0 = now_ms();
+    int mermaid = argc > 1 && !strcmp(argv[1], "--mermaid");
+    if (mermaid) {
+        argv++;
+        argc--;
+    }
+    iters = argc > 3 ? atol(argv[3]) : 2000;
     if (argc < 3) {
-        fprintf(stderr, "usage: cctext-render-fuzz PACK CORPUS_DIR [ITERS] [SEED]\n");
+        fprintf(stderr, "usage: cctext-render-fuzz [--mermaid] PACK CORPUS_DIR [ITERS] [SEED]\n");
         return 2;
     }
     if (argc > 4) g_rng ^= (uint64_t)strtoull(argv[4], NULL, 10) * 0x9E3779B97F4A7C15ull;
@@ -361,6 +639,7 @@ int main(int argc, char **argv)
     }
     fclose(f);
     if (fonts_init(&pack) < 1) return 2;
+    if (mermaid) return mm_main(argc, argv, &pack);
     load_dir(argv[2], 0);
     if (!g_nseed) {
         fprintf(stderr, "cctext-render-fuzz: no *.svg under %s\n", argv[2]);

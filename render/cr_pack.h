@@ -9,7 +9,13 @@
  * Entries are zlib streams (stb's deflate at build time; Wuffs inflates
  * them at run time, checking each stream's Adler-32). Names:
  *   font:<family>:<bold>:<italic>   a TrueType face (family lowercase)
- *   (later steps: js:<bundle> for QuickJS bytecode)
+ *   js:<bundle>                     QuickJS bytecode (render/js + third_party)
+ *
+ * The FNV trailer catches a damaged file. A js: entry is also checked
+ * against the SHA-256 of its stored bytes compiled into the helper
+ * (CR_PACK_JS_HASHES, a header the build step writes) before QuickJS
+ * reads it: bytecode is trusted input to QuickJS, never to be read from
+ * anything but the pack this build made.
  */
 #ifndef CR_PACK_H
 #define CR_PACK_H
@@ -39,7 +45,13 @@ const uint8_t *cr_asset_data(CrAsset *a);
 uint8_t *cr_zlib_compress(const uint8_t *in, size_t n, size_t *out_n);
 int cr_zlib_decompress(const uint8_t *in, size_t n, uint8_t *out, size_t raw_len);
 
-/* The build step: manifest -> pack. Returns 0 or prints why and 1. */
-int cr_pack_build(const char *manifest, const char *out_path);
+/* The build step: manifest -> pack (cr_pack.c documents the manifest).
+ * `compile` makes bytecode of a bundle (NULL: bundles are refused);
+ * `hash_hdr` (NULL: none) receives the CR_PACK_JS_HASHES header, rewritten
+ * only when it changes. Returns 0 or prints why and 1. */
+typedef int (*CrPackCompile)(const char *name, const char *src, size_t n, uint8_t **out,
+                             size_t *out_n, char *err, size_t errcap);
+int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile compile,
+                  const char *hash_hdr);
 
 #endif /* CR_PACK_H */

@@ -28,9 +28,20 @@ void cr_svg_render(cr_svg *s, float sx, float sy, uint32_t px_w, uint32_t px_h, 
 
 void cr_svg_free(cr_svg *s);
 
+/* Text metrics from the faces lunasvg draws with (the same family-list
+ * walk, case-insensitive names, bold at weight >= 600): the advance of
+ * UTF-8 text[0, n) at `px`, and the face's ascent / descent (both
+ * positive, px). The JavaScript host's getBBox asks these (cr_js.c). */
+double cr_svg_measure(const char *text, size_t n, double px, int weight, int italic,
+                      const char *families);
+void cr_svg_font_metrics(double px, int weight, int italic, const char *families, double *ascent,
+                         double *descent);
+
 /* Development: render a file to PNG at `scale` (not sandboxed; writes a
  * file). 0 = ok. */
 int cr_svg_png(const char *svg_path, const char *png_path, float scale);
+/* The same from SVG text in memory, over `bg` (0xRRGGBBAA). */
+int cr_svg_png_data(const char *data, size_t n, const char *png_path, float scale, uint32_t bg);
 
 #ifdef __cplusplus
 }
