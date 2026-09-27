@@ -5,7 +5,8 @@ Coarse properties of screenshots, as tests/ui_img_test.py:
 
 - a Markdown file with `![...](pipe.svg)`: the picture is on screen (the
   fixture's red / green / blue blocks, drawn by cctext-render), it stays
-  put while the window idles, and a transparent SVG gets its light
+  put while the window idles and when its pixels arrive late (the
+  self-test helper), and a transparent SVG gets its light
   backing plate on the dark pane;
 - an .svg opened directly is text; Ctrl-D swaps in its picture and back;
 - a Marp slide's `![bg left:40%](pipe.svg)` fills its side;
@@ -141,6 +142,47 @@ def case_markdown(exe, env, tmp):
     I.check(not alive, "svg markdown: the helper exits with the editor", "%s" % alive)
 
 
+PURPLE = (142, 36, 170)
+
+
+def case_stable(exe, env, tmp):
+    """The SVG's size first, its pixels 1.5 s later (the self-test helper's
+    `slowpx`): the picture below it does not move when they arrive."""
+    selftest = os.path.join(os.path.dirname(exe), "cctext-render-selftest")
+    if not os.path.exists(selftest):
+        print("skip: stable (no cctext-render-selftest)")
+        return
+    d = proj(tmp, "stable")
+    with open(os.path.join(d, "slow.svg"), "wb") as f:
+        f.write(b"<!--cr-selftest:slowpx-->" + PIPE.replace(b"#e61414", b"#8e24aa")
+                .replace(b"#14b428", b"#8e24aa").replace(b"#1e3cdc", b"#8e24aa"))
+    shutil.copy(os.path.join(I.IMG, "big.png"), d)
+    body = b"# Stable\n\n![slow](slow.svg)\n\n![big](big.png)\n\nend\n"
+    p, log = I.launch_in(exe, env, d, "doc.md", body, {"RTX_RENDER_BIN": selftest})
+    try:
+        win = I.window(env, p)
+        if not win:
+            print("skip: stable (no window)")
+            return
+        time.sleep(0.5)
+        a = P.Shot(env, tmp, win, "svg_stable_a")
+        time.sleep(2.5)
+        b = P.Shot(env, tmp, win, "svg_stable_b")
+        if not (a.ok and b.ok):
+            print("skip: stable (no screenshot)")
+            return
+        pa, pb = I.count(a, PURPLE, tol=10), I.count(b, PURPLE, tol=10)
+        if pa > 100:
+            print("skip: stable (the pixels beat the first screenshot: %d px)" % pa)
+            return
+        ta, tb = I.top_of(a, I.RED), I.top_of(b, I.RED)
+        I.check(pb > 2000, "svg stable: the SVG's pixels arrive late", "%d -> %d purple px" % (pa, pb))
+        I.check(ta is not None and ta == tb, "svg stable: the picture below does not move",
+                "big.png top %s -> %s" % (ta, tb))
+    finally:
+        U.stop(p)
+
+
 def case_viewer(exe, env, tmp):
     d = proj(tmp, "view")
     p, log = I.launch_in(exe, env, d, "pipe.svg", None)
@@ -232,7 +274,7 @@ def main(argv):
     env, xvfb = got
     try:
         with tempfile.TemporaryDirectory(prefix="cctext_svg_") as tmp:
-            for case in (case_markdown, case_viewer, case_slide, case_browse):
+            for case in (case_markdown, case_stable, case_viewer, case_slide, case_browse):
                 case(exe, env, tmp)
     finally:
         if xvfb:

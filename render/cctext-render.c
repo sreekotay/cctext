@@ -18,8 +18,9 @@
  * Built with -DCR_SELFTEST (bin/cctext-render-selftest, tests only), the
  * environment variable CR_SELFTEST names an escape to attempt right after
  * lockdown (socket, exec, fork, mmapx, readfd, thread, open), and a payload
- * that starts with "<!--cr-selftest:hang-->" / ":crash-->" / ":slow-->"
- * hangs, crashes or answers after 300 ms. The release build has none of it.
+ * that starts with "<!--cr-selftest:hang-->" / ":crash-->" / ":slow-->" /
+ * ":slowpx-->" hangs, crashes, answers after 300 ms, or sends pixels after
+ * 1.5 s. The release build has none of it.
  */
 #if !defined(_WIN32)
 #define _GNU_SOURCE
@@ -211,7 +212,17 @@ static void warm_up(void)
 /* ---- requests ----------------------------------------------------------- */
 
 #ifdef CR_SELFTEST
-static void selftest_payload(const char *src, size_t n)
+static void selftest_spin(long ms)
+{
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    do clock_gettime(CLOCK_MONOTONIC, &t1);
+    while ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < ms);
+}
+
+/* ":slowpx-->" delays only pixel requests (1.5 s): a size arrives, then
+ * the pixels much later (ui_svg_test: layout stable across the gap). */
+static void selftest_payload(const char *src, size_t n, int size_only)
 {
     static const char pre[] = "<!--cr-selftest:";
     if (n < sizeof pre - 1 || memcmp(src, pre, sizeof pre - 1) != 0) return;
@@ -220,12 +231,8 @@ static void selftest_payload(const char *src, size_t n)
         for (volatile unsigned long i = 0;; i++) {
         }
     if (strncmp(src, "crash-->", 8) == 0) abort();
-    if (strncmp(src, "slow-->", 7) == 0) {
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        do clock_gettime(CLOCK_MONOTONIC, &t1);
-        while ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 300);
-    }
+    if (strncmp(src, "slow-->", 7) == 0) selftest_spin(300);
+    if (strncmp(src, "slowpx-->", 9) == 0 && !size_only) selftest_spin(1500);
 }
 #endif
 
@@ -314,7 +321,7 @@ static void serve(int sandboxed)
         if (read_full(src, q.len) != 0) exit(0);
         src[q.len] = 0;
 #ifdef CR_SELFTEST
-        selftest_payload(src, q.len);
+        selftest_payload(src, q.len, (q.flags & CR_F_SIZE_ONLY) != 0);
 #endif
         if (g_disabled)
             send_error(q.id, CR_E_DISABLED, "renderer disabled on this platform (no sandbox)");

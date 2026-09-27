@@ -541,8 +541,11 @@ nested percentage `<svg>`. `@smoke` runs 400 mutants; `./make.shcc
 Findings, all fixed by the patches above: signed overflows in plutovg's
 CORDIC / MulDiv / rasterizer on huge coordinates, a `memcpy` from NULL,
 an int overflow from 1e-38 dashes, a NULL surface dereference after a
-failed 4 GiB group canvas, and a 16 s render from a curve at FLT_MAX.
-Three runs of 20000 are clean; the slowest mutant takes seconds under
+failed 4 GiB group canvas, undefined float -> int conversions in the
+texture blenders (`0 - INT_MIN`), and slow renders from flattening (a
+curve at FLT_MAX: 16 s; a dashed arc 1e8 units long: 3.3 s, now 60 ms).
+After the last fix, three runs of 20000 mutants (seeds 11-13) are clean
+(see the numbers below); a mutant can still take a second or more under
 ASan, which is what the editor's time budget is for.
 
 **Follow-ups** (not in this step):
