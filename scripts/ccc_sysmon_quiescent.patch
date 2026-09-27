@@ -1,0 +1,111 @@
+--- a/cc/runtime/sched_v2.c
++++ b/cc/runtime/sched_v2.c
+@@ -948,6 +948,21 @@
+  * recheck of idle is a park between long arms, not spare capacity. */
+ #define SCHED_V2_GROW_SLACK_NS 200000ull
+ static _Atomic int g_v2_grow_pending = 0;
++
++/* Quiescent sysmon (see sched_v2_sysmon_try_sleep). 1 while sysmon waits
++ * with no timeout: nothing queued, running, pending growth, deadlines or
++ * pool to settle. Whoever makes work (a ready push, a worklet, a park
++ * deadline) pokes it awake; a quiet process then wakes 0 times a second
++ * instead of 50. Store / fence / load on both sides (Dekker): either the
++ * producer sees the flag or sysmon's recheck sees the producer's work. */
++static _Atomic int g_v2_sysmon_asleep = 0;
++
++static inline void sched_v2_sysmon_poke(void) {
++    atomic_thread_fence(memory_order_seq_cst);
++    if (atomic_load_explicit(&g_v2_sysmon_asleep, memory_order_relaxed) &&
++        atomic_exchange_explicit(&g_v2_sysmon_asleep, 0, memory_order_acq_rel))
++        wake_primitive_wake_one(&g_v2.sysmon_wake);
++}
+ static _Atomic uint64_t g_v2_grow_requests = 0;   /* producer defers      */
+ static _Atomic uint64_t g_v2_grow_stall = 0;      /* recheck: pops slow   */
+ static _Atomic uint64_t g_v2_grow_backlog = 0;    /* recheck: deep queue  */
+@@ -1690,6 +1705,7 @@
+ 
+ static void sched_v2_enqueue_runnable_ex(fiber_v2* f, int prefer_local) {
+     int prev = v2_queue_push(&g_v2.ready_queue, f);
++    sched_v2_sysmon_poke();
+     /* If the queue was already deep, a drainer is on it (or a previous
+      * push just woke one) and will self-drain to our item. Skip the
+      * seq_cst fence + idle-worker scan on this push. Correctness is
+@@ -1982,6 +1998,7 @@
+     }
+     atomic_fetch_add_explicit(&g_v2_worklets_live, 1, memory_order_relaxed);
+     worklet_queue_push(&g_v2.worklets, w);
++    sched_v2_sysmon_poke();
+     atomic_fetch_add_explicit(&g_v2_worklet_spawn, 1, memory_order_relaxed);
+     sched_v2_wake(-1);
+     return w;
+@@ -2466,7 +2483,10 @@
+     atomic_store_explicit(&f->park_deadline_sec, (int64_t)d->tv_sec, memory_order_relaxed);
+     atomic_store_explicit(&f->park_deadline_nsec, (int64_t)d->tv_nsec, memory_order_relaxed);
+     int was = atomic_exchange_explicit(&f->has_park_deadline, 1, memory_order_release);
+-    if (!was) atomic_fetch_add_explicit(&g_v2_park_deadlines, 1, memory_order_relaxed);
++    if (!was) {
++        atomic_fetch_add_explicit(&g_v2_park_deadlines, 1, memory_order_relaxed);
++        sched_v2_sysmon_poke();
++    }
+ }
+ 
+ void sched_v2_fiber_clear_park_deadline(fiber_v2* f) {
+@@ -2992,6 +3012,49 @@
+     }
+ }
+ 
++/* Nothing for a tick to do: no ready or worklet backlog, no worker out
++ * of its park (running / spinning), no growth episode, no park deadline,
++ * and the pool already settled to the eager cap (or pinned). Parked
++ * fibers alone do not keep sysmon ticking (the stall / deadlock
++ * diagnostics then wait for the next work). */
++static int sched_v2_quiescent(void) {
++    int n, idle;
++    if (atomic_load_explicit(&g_v2_grow_pending, memory_order_relaxed)) return 0;
++    if (atomic_load_explicit(&g_v2.ready_queue.count, memory_order_relaxed)) return 0;
++    if (atomic_load_explicit(&g_v2.worklets.count, memory_order_relaxed)) return 0;
++    if (atomic_load_explicit(&g_v2_worklets_live, memory_order_relaxed)) return 0;
++    if (atomic_load_explicit(&g_v2_running_workers, memory_order_relaxed)) return 0;
++    if (atomic_load_explicit(&g_v2_park_deadlines, memory_order_relaxed)) return 0;
++    n = atomic_load_explicit(&g_v2.num_threads, memory_order_relaxed);
++    idle = atomic_load_explicit(&g_v2.idle_workers, memory_order_relaxed);
++    if (idle > 0 && n > g_v2_eager_threads &&
++        !atomic_load_explicit(&g_v2_noblock_pool_pinned, memory_order_relaxed))
++        return 0;
++    return 1;
++}
++
++/* Wait with no timeout while quiescent. `val` is the wake word sampled
++ * before the checks, so a poke or shutdown after it returns at once.
++ * Returns 0 (without waiting) when there is work to watch. */
++static int sched_v2_sysmon_try_sleep(uint32_t val) {
++    static int off = -1;
++    if (off < 0) {
++        const char* e = getenv("CC_V2_SYSMON_SLEEP");
++        off = (e && e[0] == '0') ? 1 : 0;
++    }
++    if (off) return 0;
++    atomic_store_explicit(&g_v2_sysmon_asleep, 1, memory_order_relaxed);
++    atomic_thread_fence(memory_order_seq_cst);
++    if (!sched_v2_quiescent() ||
++        !atomic_load_explicit(&g_v2.running, memory_order_acquire)) {
++        atomic_store_explicit(&g_v2_sysmon_asleep, 0, memory_order_relaxed);
++        return 0;
++    }
++    wake_primitive_wait(&g_v2.sysmon_wake, val);
++    atomic_store_explicit(&g_v2_sysmon_asleep, 0, memory_order_relaxed);
++    return 1;
++}
++
+ static void* sched_v2_sysmon_main(void* arg) {
+     (void)arg;
+     uint64_t last_run_count = 0;
+@@ -3014,7 +3077,7 @@
+         if (atomic_load_explicit(&g_v2_grow_pending, memory_order_acquire)) {
+             wake_primitive_wait_timeout_us(&g_v2.sysmon_wake, val,
+                                            (uint32_t)g_v2_grow_recheck_us);
+-        } else {
++        } else if (!sched_v2_sysmon_try_sleep(val)) {
+             wake_primitive_wait_timeout(&g_v2.sysmon_wake, val, V2_SYSMON_INTERVAL_MS);
+         }
+ 

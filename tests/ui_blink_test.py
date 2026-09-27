@@ -57,6 +57,85 @@ def wakeups(pid):
     return n
 
 
+def thread_wakeups(pid):
+    """{tid: context switches} for every thread of `pid`."""
+    out = {}
+    try:
+        tids = os.listdir("/proc/%d/task" % pid)
+    except OSError:
+        return out
+    for tid in tids:
+        n = 0
+        try:
+            with open("/proc/%d/task/%s/status" % (pid, tid)) as f:
+                for line in f:
+                    if line.startswith(("voluntary_ctxt_switches",
+                                        "nonvoluntary_ctxt_switches")):
+                        n += int(line.split()[1])
+        except OSError:
+            continue
+        out[tid] = n
+    return out
+
+
+def runtime_tick(pid, tid):
+    """The ccc runtime's sysmon between its 20 ms ticks: a raw
+    FUTEX_WAIT_PRIVATE (op 0x80) with a timeout (runtime/wake_primitive.h
+    wait_timeout). Nothing cctext or GTK runs waits so (condvars are
+    FUTEX_WAIT_BITSET, the runtime's workers park with no timeout); a
+    runtime whose sysmon sleeps while quiescent has no such thread."""
+    for _ in range(20):
+        try:
+            with open("/proc/%d/task/%s/syscall" % (pid, tid)) as f:
+                v = f.read().split()
+        except OSError:
+            return False
+        if v and v[0] == "running":
+            time.sleep(0.001)
+            continue
+        return (len(v) > 4 and v[0] == "202" and int(v[2], 16) == 0x80 and
+                int(v[4], 16) != 0)
+    return False
+
+
+IDLE_STRICT = os.environ.get("RTX_IDLE_STRICT", "") not in ("", "0")
+
+
+def idle_threads(pid, secs=3.0):
+    """Wakeups of every thread over `secs` once work has settled (a 0.5 s
+    window where nothing but the runtime's tick wakes; 8 s at most):
+    (own, tick, detail) — the host's threads (UI, GTK, cctext workers),
+    the ccc runtime's sysmon, and 'tid:comm:n' per thread that woke."""
+    def split(a, b):
+        own = tick = 0
+        detail = []
+        for tid, n in b.items():
+            d = n - a.get(tid, n)
+            if d <= 0:
+                continue
+            try:
+                with open("/proc/%d/task/%s/comm" % (pid, tid)) as f:
+                    comm = f.read().strip()
+            except OSError:
+                comm = "?"
+            if runtime_tick(pid, tid):
+                tick += d
+                detail.append("%s:ccc-sysmon:%d" % (tid, d))
+            else:
+                own += d
+                detail.append("%s:%s:%d" % (tid, comm, d))
+        return own, tick, " ".join(detail)
+    end = time.time() + 8.0
+    while time.time() < end:
+        a = thread_wakeups(pid)
+        time.sleep(0.5)
+        if split(a, thread_wakeups(pid))[0] == 0:
+            break
+    a = thread_wakeups(pid)
+    time.sleep(secs)
+    return split(a, thread_wakeups(pid))
+
+
 def strip_ms(line):
     """Host trace lines lead with a monotonic ms stamp; plat notes do not."""
     head, _, rest = line.partition(" ")

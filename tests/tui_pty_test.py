@@ -1191,6 +1191,105 @@ def proc_wakeups(pid):
     return n
 
 
+def thread_wakeups(pid):
+    """{tid: context switches} for every thread of `pid`."""
+    out = {}
+    try:
+        tids = os.listdir("/proc/%d/task" % pid)
+    except OSError:
+        return out
+    for tid in tids:
+        n = 0
+        try:
+            with open("/proc/%d/task/%s/status" % (pid, tid)) as f:
+                for line in f:
+                    if line.startswith(("voluntary_ctxt_switches",
+                                        "nonvoluntary_ctxt_switches")):
+                        n += int(line.split()[1])
+        except OSError:
+            continue
+        out[tid] = n
+    return out
+
+
+def runtime_tick(pid, tid):
+    """The ccc runtime's sysmon between its 20 ms ticks: a raw
+    FUTEX_WAIT_PRIVATE (op 0x80) with a timeout, runtime/wake_primitive.h
+    wait_timeout. Nothing cctext runs waits so (its condvars are
+    FUTEX_WAIT_BITSET; the runtime's workers park with no timeout). A
+    runtime whose sysmon sleeps while the scheduler is quiescent has no
+    such thread at idle."""
+    for _ in range(20):
+        try:
+            with open("/proc/%d/task/%s/syscall" % (pid, tid)) as f:
+                v = f.read().split()
+        except OSError:
+            return False
+        if v and v[0] == "running":
+            time.sleep(0.001)
+            continue
+        return (len(v) > 4 and v[0] == "202" and int(v[2], 16) == 0x80 and
+                int(v[4], 16) != 0)
+    return False
+
+
+IDLE_STRICT = os.environ.get("RTX_IDLE_STRICT", "") not in ("", "0")
+
+
+def idle_threads(pid, secs, pump):
+    """Wakeups of every thread over `secs` once work has settled (a 0.5 s
+    window where nothing but the runtime's tick wakes; 8 s at most):
+    (own, tick, detail) — cctext's threads, the ccc runtime's sysmon, and
+    'tid:comm:n' for each thread that woke."""
+    def split(a, b):
+        own = tick = 0
+        detail = []
+        for tid, n in b.items():
+            d = n - a.get(tid, n)
+            if d <= 0:
+                continue
+            try:
+                with open("/proc/%d/task/%s/comm" % (pid, tid)) as f:
+                    comm = f.read().strip()
+            except OSError:
+                comm = "?"
+            if runtime_tick(pid, tid):
+                tick += d
+                detail.append("%s:ccc-sysmon:%d" % (tid, d))
+            else:
+                own += d
+                detail.append("%s:%s:%d" % (tid, comm, d))
+        return own, tick, " ".join(detail)
+    end = time.time() + 8.0
+    while time.time() < end:
+        a = thread_wakeups(pid)
+        pump(0.5)
+        if split(a, thread_wakeups(pid))[0] == 0:
+            break
+    a = thread_wakeups(pid)
+    pump(secs)
+    return split(a, thread_wakeups(pid))
+
+
+def check_idle(tag, pid, pump, secs=3.0):
+    """Zero wakeups on every thread over `secs` of idle. The pinned ccc's
+    sysmon ticks 50 times a second once any `@parallel` ran (the image
+    lanes, browse, find); that is a note, and a failure with
+    RTX_IDLE_STRICT=1 or a runtime whose sysmon sleeps (then it has no
+    such tick to excuse)."""
+    own, tick, detail = idle_threads(pid, secs, pump)
+    check(own == 0, "%s: idle, no thread wakes" % tag,
+          "%d wakeups in %.1f s: %s" % (own, secs, detail))
+    if tick:
+        if IDLE_STRICT:
+            check(False, "%s: idle, the runtime's sysmon sleeps" % tag,
+                  "%d ticks in %.1f s: %s" % (tick, secs, detail))
+        else:
+            print("note: %s: ccc runtime sysmon ticked %d times in %.1f s "
+                  "(needs the quiescent-sysmon runtime)" % (tag, tick, secs))
+    return own, tick
+
+
 def quiet_window(t, secs):
     """Output bytes and wakeups while the editor is left alone."""
     mark = len(t.out)
@@ -3236,9 +3335,8 @@ def case_image_present(exe, tmp):
 
 
 def main_wakeups(pid):
-    """Context switches of the main (UI) thread: the editor's own loop.
-    (The runtime's worker threads, started by the image loader's lanes in
-    phase 1, keep their own clock and are not the editor waking.)"""
+    """Context switches of the main (UI) thread: the editor's own loop
+    (an animation's frame budget; idle counts every thread, check_idle)."""
     n = 0
     try:
         with open("/proc/%d/task/%d/status" % (pid, pid)) as f:
@@ -3248,6 +3346,47 @@ def main_wakeups(pid):
     except OSError:
         pass
     return n
+
+
+def case_idle_threads(exe, tmp):
+    """Every thread idle once work settles (check_idle): a Markdown file
+    with pictures (terminal pictures off too), a workbook, a Marp deck
+    presenting a picture slide, and browse with a Markdown preview open."""
+    if pyte is None or not os.path.exists("/proc/self/task"):
+        print("skip: idle threads (no pyte or /proc)")
+        return
+    import shutil
+    here = os.path.dirname(os.path.abspath(__file__))
+    proj, path, body = img_project(tmp, "idt", repo=False)
+    shutil.copy(os.path.join(here, "..", "testdata", "wb", "revenue.wb.md"), proj)
+    deck = os.path.join(proj, "deck.md")
+    with open(deck, "wb") as f:
+        f.write(b"---\nmarp: true\n---\n\n# One\n\n![pic w:400](big.png)\n\n---\n\n"
+                b"![bg left:40%](big.png)\n\n# Two\n\ntext\n")
+    big = os.path.join(proj, "big.wb.md")
+    with open(big, "w") as f:
+        f.write("# Big\n\nTable: T\n\n| id | amount | cost | margin |\n|----|----|----|----|\n")
+        for i in range(60000):
+            f.write("| %d | %d.50 | %d.25 | `=@amount - @cost` |\n" % (i, i % 997, i % 13))
+        f.write("\n```calc\ntotal = sum(T.margin)\n```\n")
+    runs = [("markdown with pictures", [path], {}, b""),
+            ("markdown, pictures off", [path], {"RTX_TUI_IMAGES": "off"}, b""),
+            ("workbook", [os.path.join(proj, "revenue.wb.md")], {}, b""),
+            ("big workbook (read job)", [big], {}, b""),
+            ("Marp deck presenting", [deck], {}, b"\x1b[15;2~"),
+            ("browse preview", [proj], {}, b"doc.md")]
+    for tag, args, extra, keys in runs:
+        t = Tui(exe, ["--no-blink"] + args, img_env(tmp, "idt", **extra),
+                fake=FakeTerm("silent"))
+        try:
+            t.pump(1.0)
+            if keys:
+                t.send(keys, 1.0)
+            check_idle("idle threads: " + tag, t.pid, t.pump)
+            t.send(b"\x1b", 0.2)
+            t.send(b"\x11", 0.3)
+        finally:
+            t.kill()
 
 
 def case_image_idle(exe, tmp):
@@ -3266,13 +3405,12 @@ def case_image_idle(exe, tmp):
             t.pump(1.5)
             c0 = proc_cpu(t.pid)
             mark = len(t.out)
-            w0 = main_wakeups(t.pid)
-            t.pump(1.5)
-            nbytes, wakes = len(t.out) - mark, main_wakeups(t.pid) - w0
+            check_idle("image idle: %s pictures on screen" % mode, t.pid, t.pump)
+            nbytes = len(t.out) - mark
             c1 = proc_cpu(t.pid)
-            check(nbytes == 0 and wakes <= 2 and c1 - c0 < 0.05,
+            check(nbytes == 0 and c1 - c0 < 0.05,
                   "image idle: %s pictures on screen, nothing to do" % mode,
-                  repr((nbytes, wakes, c1 - c0)))
+                  repr((nbytes, c1 - c0)))
             t.send(b"\x11", 0.3)
             t.wait_exit(5.0)
         finally:
@@ -3304,6 +3442,7 @@ def case_image_idle(exe, tmp):
 
 CASES = {
     "image_idle": case_image_idle,
+    "idle_threads": case_idle_threads,
     "image_viewer": case_image_viewer,
     "image_present": case_image_present,
     "image_blocks": case_image_blocks,
