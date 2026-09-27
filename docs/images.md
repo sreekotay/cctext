@@ -457,7 +457,10 @@ kept per decoded bitmap (per frame when animated) and freed with it.
   placement box. A sixel terminal that does not erase pixels when text
   overwrites their cells would keep stale pixels under rewritten text.
   Pictures in a transition, or under text on a whole-slide background,
-  are block art in sixel / iTerm2 terminals. OSC 11 (the background
+  are block art in sixel / iTerm2 terminals. A picture row is one layout
+  row N cells tall: like a tall table record it leaves the top of the
+  pane whole when the view scrolls past it (its bottom is clipped, never
+  its top). OSC 11 (the background
   colour) is not asked: a half-transparent pixel composites against the
   terminal's own background only at the 50 % alpha cut.
 - macOS drawing and the Win32 blit are untested / stubbed; NSURLSession
