@@ -544,9 +544,10 @@ an int overflow from 1e-38 dashes, a NULL surface dereference after a
 failed 4 GiB group canvas, undefined float -> int conversions in the
 texture blenders (`0 - INT_MIN`), and slow renders from flattening (a
 curve at FLT_MAX: 16 s; a dashed arc 1e8 units long: 3.3 s, now 60 ms).
-After the last fix, three runs of 20000 mutants (seeds 11-13) are clean
-(see the numbers below); a mutant can still take a second or more under
-ASan, which is what the editor's time budget is for.
+After the last fix, three runs of 20000 mutants (seeds 11-13) are clean,
+about 2 minutes each; the slowest mutants took 23 s, 1.5 s and 0.5 s
+under ASan (the first, a mutated Mermaid diagram, is the kind of input
+the editor's 5 s budget ends; not yet reduced).
 
 **Follow-ups** (not in this step):
 
