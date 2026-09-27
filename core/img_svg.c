@@ -18,43 +18,6 @@
 #include "img_svg.h"
 #include "../render/cr_proto.h"
 
-#if defined(_WIN32)
-
-/* No sandbox launcher on Windows yet (AppContainer): no helper, so every
- * SVG is a placeholder ("SVG renderer not available on this platform"). */
-int rtx_svg_size(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, const _Atomic int *cancel,
-                 float *w, float *h) {
-    (void)b; (void)n; (void)cfg; (void)cancel; (void)w; (void)h;
-    return RTX_SVG_ENONE;
-}
-int rtx_svg_render(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, uint32_t pw, uint32_t ph,
-                   const _Atomic int *cancel, uint8_t **out) {
-    (void)b; (void)n; (void)cfg; (void)pw; (void)ph; (void)cancel;
-    *out = NULL;
-    return RTX_SVG_ENONE;
-}
-void rtx_svg_shutdown(void) {}
-const char *rtx_svg_helper_path(void) { return ""; }
-void rtx_svg_stats(RtxSvgStats *o) { memset(o, 0, sizeof *o); }
-void rtx_svg_forget_memory(void) {}
-
-#else /* POSIX */
-
-#include <dirent.h>
-#include <poll.h>
-#include <pthread.h>
-#include <signal.h>
-#include <spawn.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#if defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
-
 /* ---- sniff ------------------------------------------------------------- */
 
 static int svg_ws(uint8_t c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
@@ -100,6 +63,43 @@ int rtx_svg_sniff(const uint8_t *b, size_t n) {
     }
     return 0;
 }
+
+#if defined(_WIN32)
+
+/* No sandbox launcher on Windows yet (AppContainer): no helper, so every
+ * SVG is a placeholder ("SVG renderer not available on this platform"). */
+int rtx_svg_size(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, const _Atomic int *cancel,
+                 float *w, float *h) {
+    (void)b; (void)n; (void)cfg; (void)cancel; (void)w; (void)h;
+    return RTX_SVG_ENONE;
+}
+int rtx_svg_render(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, uint32_t pw, uint32_t ph,
+                   const _Atomic int *cancel, uint8_t **out) {
+    (void)b; (void)n; (void)cfg; (void)pw; (void)ph; (void)cancel;
+    *out = NULL;
+    return RTX_SVG_ENONE;
+}
+void rtx_svg_shutdown(void) {}
+const char *rtx_svg_helper_path(void) { return ""; }
+void rtx_svg_stats(RtxSvgStats *o) { memset(o, 0, sizeof *o); }
+void rtx_svg_forget_memory(void) {}
+
+#else /* POSIX */
+
+#include <dirent.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 /* ---- state ------------------------------------------------------------- */
 
@@ -746,7 +746,7 @@ static int svg_disk_px_get(const RtxSvgCfg *cfg, uint64_t h, uint64_t n, uint32_
         return 0;
     }
     bn -= 8;
-    px = (uint8_t *)malloc(npx * 4 ? npx * 4 : 4);
+    px = (uint8_t *)malloc(npx ? npx * 4 : 4);
     if (!px) {
         free(b);
         return 0;
