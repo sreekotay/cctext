@@ -395,6 +395,17 @@ int main(int argc, char **argv)
         char what[64];
         mutate(s, &o);
         snprintf(what, sizeof what, "#%ld of %s", i, s->name);
+        if (getenv("CR_FUZZ_DUMP") && atol(getenv("CR_FUZZ_DUMP")) == i) {
+            /* reproduce one mutant: CR_FUZZ_DUMP=N writes it to cr-fuzz-N.svg */
+            char p[64];
+            FILE *df;
+            snprintf(p, sizeof p, "cr-fuzz-%ld.svg", i);
+            df = fopen(p, "wb");
+            if (df) {
+                fwrite(o.b ? o.b : "", 1, o.n, df);
+                fclose(df);
+            }
+        }
         render_one(what, o.b ? o.b : "", o.n);
     }
     printf("cctext-render-fuzz: %d seeds, %ld mutants: %ld parsed, %ld rejected, %.1f s; slowest "

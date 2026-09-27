@@ -511,7 +511,10 @@ void plutovg_path_traverse_flatten(const plutovg_path_t* path, plutovg_path_trav
                     l = 1.f;
                 }
 
-                if(d < threshold*l || b == beziers + 31) {
+                /* cctext patch: with coordinates near FLT_MAX, d and l
+                 * overflow to inf (or NaN) and the flatness test never
+                 * passes: 2^31 segments. Such a curve is drawn as its chord. */
+                if(d < threshold*l || b == beziers + 31 || !isfinite(d) || !isfinite(l)) {
                     plutovg_point_t p = { b->x4, b->y4 };
                     traverse_func(closure, PLUTOVG_PATH_COMMAND_LINE_TO, &p, 1);
                     --b;
