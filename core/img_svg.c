@@ -1,7 +1,8 @@
 /*
- * SVG through the sandboxed renderer helper (img_svg.h; docs/images.md,
- * "Renderer"): the helper process, its protocol (render/cr_proto.h), and
- * the content-hash size / pixel cache.
+ * The sandboxed renderer helper's client (img_svg.h; docs/images.md,
+ * "Renderer" and "Mermaid"): the helper processes (a slot for SVG, one for
+ * Mermaid), their protocol (render/cr_proto.h), and the content-hash size /
+ * pixel cache.
  */
 #if !defined(_WIN32)
 #define _GNU_SOURCE
@@ -79,9 +80,23 @@ int rtx_svg_render(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, uint32_t pw
     *out = NULL;
     return RTX_SVG_ENONE;
 }
+int rtx_mermaid_size(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, const _Atomic int *cancel,
+                     float *w, float *h, char *msg, size_t msgcap) {
+    (void)b; (void)n; (void)cfg; (void)cancel; (void)w; (void)h;
+    if (msg && msgcap) msg[0] = 0;
+    return RTX_SVG_ENONE;
+}
+int rtx_mermaid_render(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, uint32_t pw, uint32_t ph,
+                       const _Atomic int *cancel, uint8_t **out, char *msg, size_t msgcap) {
+    (void)b; (void)n; (void)cfg; (void)pw; (void)ph; (void)cancel;
+    *out = NULL;
+    if (msg && msgcap) msg[0] = 0;
+    return RTX_SVG_ENONE;
+}
 void rtx_svg_shutdown(void) {}
 const char *rtx_svg_helper_path(void) { return ""; }
 void rtx_svg_stats(RtxSvgStats *o) { memset(o, 0, sizeof *o); }
+void rtx_render_stats(int slot, RtxSvgStats *o) { (void)slot; memset(o, 0, sizeof *o); }
 void rtx_svg_forget_memory(void) {}
 
 #else /* POSIX */
@@ -103,9 +118,8 @@ void rtx_svg_forget_memory(void) {}
 
 /* ---- state ------------------------------------------------------------- */
 
-static uint64_t svg_fnv(const void *p, size_t n) {
+static uint64_t svg_fnv_from(uint64_t h, const void *p, size_t n) {
     const uint8_t *s = (const uint8_t *)p;
-    uint64_t h = 1469598103934665603ull;
     size_t i;
     for (i = 0; i < n; i++) {
         h ^= s[i];
@@ -114,22 +128,43 @@ static uint64_t svg_fnv(const void *p, size_t n) {
     return h;
 }
 
+static uint64_t svg_fnv(const void *p, size_t n) {
+    return svg_fnv_from(1469598103934665603ull, p, n);
+}
+
+/* A Mermaid key hashes the renderer version, then the payload. */
+static uint64_t mm_fnv(const void *p, size_t n) {
+    static const char v[] = RTX_MERMAID_VERSION;
+    return svg_fnv_from(svg_fnv(v, sizeof v), p, n);
+}
+
 static double svg_now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
 }
 
-static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-static pid_t g_pid;              /* live helper */
-static int g_fd = -1;            /* our end of the socketpair */
-static int g_disabled;           /* the helper said it refuses (platform stub) */
-static int g_missing;            /* no helper binary */
-static unsigned g_served;        /* requests the live helper answered */
-static uint32_t g_gen;           /* generation stamp of the last request */
-static double g_busy_until;      /* an abandoned request may run until then */
+/* One helper process. Its mutex serializes the requests (and the disk
+ * cache directory it writes). */
+typedef struct {
+    pthread_mutex_t mu;
+    int kind;               /* CR_KIND_SVG / CR_KIND_MERMAID */
+    pid_t pid;              /* live helper */
+    int fd;                 /* our end of the socketpair (-1: none) */
+    int disabled;           /* the helper said it refuses (platform stub / no kind) */
+    int missing;            /* no helper binary */
+    unsigned served;        /* requests the live helper answered */
+    uint32_t gen;           /* generation stamp of the last request */
+    double busy_until;      /* an abandoned request may run until then */
+    RtxSvgStats st;
+} SvgSlot;
+
+static SvgSlot g_slot[RTX_RENDER_SLOTS] = {
+    {PTHREAD_MUTEX_INITIALIZER, CR_KIND_SVG, 0, -1, 0, 0, 0, 0, 0, {0}},
+    {PTHREAD_MUTEX_INITIALIZER, CR_KIND_MERMAID, 0, -1, 0, 0, 0, 0, 0, {0}},
+};
+static pthread_mutex_t g_atexit_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_atexit;
-static RtxSvgStats g_st;
 static char g_bin[4096];
 static int g_bin_done;
 
@@ -142,19 +177,28 @@ typedef struct {
     int used;
 } SvgMem;
 static SvgMem g_mem[SVG_MEMN];
+static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
 
 void rtx_svg_forget_memory(void) {
-    pthread_mutex_lock(&g_mu);
+    pthread_mutex_lock(&g_mem_mu);
     memset(g_mem, 0, sizeof g_mem);
-    pthread_mutex_unlock(&g_mu);
+    pthread_mutex_unlock(&g_mem_mu);
 }
 
-void rtx_svg_stats(RtxSvgStats *out) {
-    pthread_mutex_lock(&g_mu);
-    *out = g_st;
-    out->pid = (int)g_pid;
-    pthread_mutex_unlock(&g_mu);
+void rtx_render_stats(int slot, RtxSvgStats *out) {
+    SvgSlot *S;
+    if (slot < 0 || slot >= RTX_RENDER_SLOTS) {
+        memset(out, 0, sizeof *out);
+        return;
+    }
+    S = &g_slot[slot];
+    pthread_mutex_lock(&S->mu);
+    *out = S->st;
+    out->pid = (int)S->pid;
+    pthread_mutex_unlock(&S->mu);
 }
+
+void rtx_svg_stats(RtxSvgStats *out) { rtx_render_stats(RTX_RENDER_SVG, out); }
 
 /* ---- the helper binary ---------------------------------------------------- */
 
@@ -206,29 +250,29 @@ const char *rtx_svg_helper_path(void) {
     return g_bin;
 }
 
-/* ---- the helper process (g_mu held) ----------------------------------- */
+/* ---- the helper process (S->mu held) ---------------------------------- */
 
-static void svg_reap(int kill_it) {
+static void svg_reap(SvgSlot *S, int kill_it) {
     int st;
-    if (g_fd >= 0) {
-        close(g_fd);
-        g_fd = -1;
+    if (S->fd >= 0) {
+        close(S->fd);
+        S->fd = -1;
     }
-    if (g_pid > 0) {
-        if (kill_it) kill(g_pid, SIGKILL);
-        while (waitpid(g_pid, &st, 0) < 0 && errno == EINTR) {
+    if (S->pid > 0) {
+        if (kill_it) kill(S->pid, SIGKILL);
+        while (waitpid(S->pid, &st, 0) < 0 && errno == EINTR) {
         }
     }
-    g_pid = 0;
-    g_served = 0;
-    g_busy_until = 0;
+    S->pid = 0;
+    S->served = 0;
+    S->busy_until = 0;
 }
 
 static void svg_atexit(void) { rtx_svg_shutdown(); }
 
 /* Read exactly n bytes by the deadline. 0 ok, -1 EOF / error, -2 timeout,
  * -3 cancelled. */
-static int svg_read(void *p, size_t n, double deadline, const _Atomic int *cancel) {
+static int svg_read(SvgSlot *S, void *p, size_t n, double deadline, const _Atomic int *cancel) {
     uint8_t *b = (uint8_t *)p;
     while (n) {
         struct pollfd pf;
@@ -238,14 +282,14 @@ static int svg_read(void *p, size_t n, double deadline, const _Atomic int *cance
         if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) return -3;
         if (left <= 0) return -2;
         to = left > 50 ? 50 : (int)left + 1;
-        pf.fd = g_fd;
+        pf.fd = S->fd;
         pf.events = POLLIN;
         pf.revents = 0;
         r = poll(&pf, 1, to);
         if (r < 0 && errno == EINTR) continue;
         if (r < 0) return -1;
         if (r == 0) continue;
-        k = read(g_fd, b, n);
+        k = read(S->fd, b, n);
         if (k < 0 && (errno == EINTR || errno == EAGAIN)) continue;
         if (k <= 0) return -1;
         b += k;
@@ -254,7 +298,7 @@ static int svg_read(void *p, size_t n, double deadline, const _Atomic int *cance
     return 0;
 }
 
-static int svg_write(const void *p, size_t n, double deadline) {
+static int svg_write(SvgSlot *S, const void *p, size_t n, double deadline) {
     const uint8_t *b = (const uint8_t *)p;
     while (n) {
         struct pollfd pf;
@@ -262,7 +306,7 @@ static int svg_write(const void *p, size_t n, double deadline) {
         ssize_t k;
         int r;
         if (left <= 0) return -2;
-        pf.fd = g_fd;
+        pf.fd = S->fd;
         pf.events = POLLOUT;
         pf.revents = 0;
         r = poll(&pf, 1, left > 50 ? 50 : (int)left + 1);
@@ -270,9 +314,9 @@ static int svg_write(const void *p, size_t n, double deadline) {
         if (r < 0) return -1;
         if (r == 0) continue;
 #if defined(MSG_NOSIGNAL)
-        k = send(g_fd, b, n, MSG_NOSIGNAL);
+        k = send(S->fd, b, n, MSG_NOSIGNAL);
 #else
-        k = send(g_fd, b, n, 0); /* SO_NOSIGPIPE is set on macOS */
+        k = send(S->fd, b, n, 0); /* SO_NOSIGPIPE is set on macOS */
 #endif
         if (k < 0 && (errno == EINTR || errno == EAGAIN)) continue;
         if (k <= 0) return -1;
@@ -284,23 +328,24 @@ static int svg_write(const void *p, size_t n, double deadline) {
 
 extern char **environ;
 
-static int svg_spawn(uint32_t timeout_ms) {
+static int svg_spawn(SvgSlot *S, const RtxSvgCfg *cfg) {
     int sv[2];
-    char pack[4200];
+    char pack[4200], rmb[24], rjobs[24];
     const char *bin;
-    char *argv[4];
+    char *argv[10];
     char *envp[4];
     char e1[256], e2[64];
-    int ne = 0, rc;
+    int ne = 0, na = 0, rc;
     posix_spawn_file_actions_t fa;
     posix_spawnattr_t at;
     sigset_t none, all;
     double t0 = svg_now_ms(), deadline;
+    uint32_t timeout_ms = cfg->timeout_ms;
     CrReply h;
     uint32_t hello[3];
     bin = rtx_svg_helper_path();
     if (!bin[0] || access(bin, X_OK) != 0) {
-        g_missing = 1;
+        S->missing = 1;
         return RTX_SVG_ENONE;
     }
     {
@@ -333,10 +378,23 @@ static int svg_spawn(uint32_t timeout_ms) {
     posix_spawnattr_setsigmask(&at, &none);
     posix_spawnattr_setsigdefault(&at, &all);
     posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
-    argv[0] = (char *)bin;
-    argv[1] = "--pack";
-    argv[2] = pack;
-    argv[3] = NULL;
+    argv[na++] = (char *)bin;
+    argv[na++] = "--pack";
+    argv[na++] = pack;
+    if (S->kind == CR_KIND_MERMAID) {
+        /* The engine's recycle policy (render/cctext-render.c). */
+        if (cfg->recycle_mb) {
+            snprintf(rmb, sizeof rmb, "%u", cfg->recycle_mb);
+            argv[na++] = "--recycle-mb";
+            argv[na++] = rmb;
+        }
+        if (cfg->recycle_jobs) {
+            snprintf(rjobs, sizeof rjobs, "%u", cfg->recycle_jobs);
+            argv[na++] = "--recycle-jobs";
+            argv[na++] = rjobs;
+        }
+    }
+    argv[na] = NULL;
     /* A minimal environment: nothing of the editor's leaks into the
      * process that parses untrusted input. */
     if (getenv("CR_SELFTEST")) {
@@ -348,47 +406,52 @@ static int svg_spawn(uint32_t timeout_ms) {
         envp[ne++] = e2;
     }
     envp[ne] = NULL;
-    rc = posix_spawn(&g_pid, bin, &fa, &at, argv, envp);
+    rc = posix_spawn(&S->pid, bin, &fa, &at, argv, envp);
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&at);
     close(sv[1]);
     if (rc != 0) {
         close(sv[0]);
-        g_pid = 0;
-        g_missing = 1;
+        S->pid = 0;
+        S->missing = 1;
         return RTX_SVG_ENONE;
     }
-    g_fd = sv[0];
-    g_st.spawns++;
-    g_served = 0;
-    g_busy_until = 0;
+    S->fd = sv[0];
+    S->st.spawns++;
+    S->served = 0;
+    S->busy_until = 0;
+    pthread_mutex_lock(&g_atexit_mu);
     if (!g_atexit) {
         g_atexit = 1;
         atexit(svg_atexit);
     }
+    pthread_mutex_unlock(&g_atexit_mu);
     deadline = t0 + (timeout_ms > 3000 ? timeout_ms : 3000);
-    if (svg_read(&h, sizeof h, deadline, NULL) != 0 || h.magic != CR_MAGIC_REP ||
+    if (svg_read(S, &h, sizeof h, deadline, NULL) != 0 || h.magic != CR_MAGIC_REP ||
         h.type != CR_R_HELLO || h.len != sizeof hello ||
-        svg_read(hello, sizeof hello, deadline, NULL) != 0) {
-        g_st.crashes++;
-        svg_reap(1);
+        svg_read(S, hello, sizeof hello, deadline, NULL) != 0) {
+        S->st.crashes++;
+        svg_reap(S, 1);
         return RTX_SVG_ECRASH;
     }
-    g_st.last_ready_ms = svg_now_ms() - t0;
-    if ((hello[2] & CR_H_DISABLED) || !(hello[1] & (1u << CR_KIND_SVG))) {
-        g_disabled = 1;
-        svg_reap(0);
+    S->st.last_ready_ms = svg_now_ms() - t0;
+    if (hello[0] != CR_PROTO_VERSION || (hello[2] & CR_H_DISABLED) ||
+        !(hello[1] & (1u << S->kind))) {
+        /* Another protocol, a platform stub, or a helper without this
+         * kind (a pack with no Mermaid): nothing to render with. */
+        S->disabled = 1;
+        svg_reap(S, 0);
         return RTX_SVG_ENONE;
     }
     return RTX_SVG_OK;
 }
 
 /* Skip n payload bytes of a frame we do not want. */
-static int svg_skip(size_t n, double deadline, const _Atomic int *cancel) {
+static int svg_skip(SvgSlot *S, size_t n, double deadline, const _Atomic int *cancel) {
     uint8_t buf[65536];
     while (n) {
         size_t k = n < sizeof buf ? n : sizeof buf;
-        int r = svg_read(buf, k, deadline, cancel);
+        int r = svg_read(S, buf, k, deadline, cancel);
         if (r) return r;
         n -= k;
     }
@@ -400,32 +463,43 @@ static int svg_err_of(uint32_t code) {
     case CR_E_PIXELS: return RTX_SVG_EPX;
     case CR_E_NOMEM: return RTX_SVG_ENOMEM;
     case CR_E_KIND:
-    case CR_E_DISABLED: return RTX_SVG_ENONE;
+    case CR_E_DISABLED:
+    case CR_E_ENGINE: return RTX_SVG_ENONE;
+    case CR_E_TOO_LARGE: return RTX_SVG_ELARGE;
+    case CR_E_TIMEOUT: return RTX_SVG_ETIMEOUT;
+    case CR_E_SCRIPT: return RTX_SVG_ESCRIPT;
     default: return RTX_SVG_ECORRUPT;
     }
 }
 
-/* One request (g_mu held). size_only: fill *w, *h. Else also *out. */
-static int svg_request_once(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, int size_only,
-                            uint32_t pw, uint32_t ph, const _Atomic int *cancel, float *w,
-                            float *h, uint8_t **out, int *retry) {
+/* Mermaid's engine budget is the setting; the editor's kill deadline sits
+ * this much later (the interrupt ends a script cleanly first). */
+#define MM_KILL_GRACE_MS 2000
+
+/* One request (S->mu held). size_only: fill *w, *h. Else also *out. */
+static int svg_request_once(SvgSlot *S, const uint8_t *b, size_t n, const RtxSvgCfg *cfg,
+                            int size_only, uint32_t pw, uint32_t ph, const _Atomic int *cancel,
+                            float *w, float *h, uint8_t **out, char *msg, size_t msgcap,
+                            int *retry) {
     CrReq q;
     double start, deadline;
+    uint32_t budget = cfg->timeout_ms ? cfg->timeout_ms : 5000;
     int rc, got_size = 0;
     *retry = 0;
-    if (g_disabled || g_missing) return RTX_SVG_ENONE;
-    if (!g_pid) {
-        rc = svg_spawn(cfg->timeout_ms);
+    if (S->disabled || S->missing) return RTX_SVG_ENONE;
+    if (!S->pid) {
+        rc = svg_spawn(S, cfg);
         if (rc) return rc;
     }
     start = svg_now_ms();
     /* An abandoned request may still be running ahead of ours. */
-    deadline = (g_busy_until > start ? g_busy_until : start) + (cfg->timeout_ms ? cfg->timeout_ms : 5000);
+    deadline = (S->busy_until > start ? S->busy_until : start) + budget +
+               (S->kind == CR_KIND_MERMAID ? MM_KILL_GRACE_MS : 0);
     memset(&q, 0, sizeof q);
     q.magic = CR_MAGIC_REQ;
-    q.id = ++g_gen;
-    if (!q.id) q.id = ++g_gen;
-    q.kind = CR_KIND_SVG;
+    q.id = ++S->gen;
+    if (!q.id) q.id = ++S->gen;
+    q.kind = (uint8_t)S->kind;
     q.flags = size_only ? CR_F_SIZE_ONLY : 0;
     q.scale = 1.0f;
     q.em_px = 16.0f;
@@ -433,40 +507,53 @@ static int svg_request_once(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, in
     q.box_h = size_only ? 0 : ph;
     q.max_px = cfg->px_max > 0xffffffffull ? 0xffffffffu : (uint32_t)cfg->px_max;
     q.len = (uint32_t)n;
-    g_st.requests++;
-    if (svg_write(&q, sizeof q, deadline) != 0 || svg_write(b, n, deadline) != 0) goto dead;
+    if (S->kind == CR_KIND_MERMAID) {
+        q.budget_ms = budget;
+        q.node_max = cfg->node_max;
+    }
+    S->st.requests++;
+    if (svg_write(S, &q, sizeof q, deadline) != 0 || svg_write(S, b, n, deadline) != 0) goto dead;
     for (;;) {
         CrReply r;
-        rc = svg_read(&r, sizeof r, deadline, cancel);
+        rc = svg_read(S, &r, sizeof r, deadline, cancel);
         if (rc) goto fail;
         if (r.magic != CR_MAGIC_REP || r.len > CR_PIXELS_HARD_MAX * 4u + 64u) goto dead;
         if (r.id != q.id) {
             /* A reply to a request we gave up on: drop it. */
-            g_st.stale++;
-            rc = svg_skip(r.len, deadline, cancel);
+            S->st.stale++;
+            rc = svg_skip(S, r.len, deadline, cancel);
             if (rc) goto fail;
             continue;
         }
         if (r.type == CR_R_ERROR) {
             uint32_t code = 0;
-            if (r.len < 4 || svg_read(&code, 4, deadline, cancel) != 0 ||
-                svg_skip(r.len - 4, deadline, cancel) != 0)
+            size_t ml = r.len >= 4 ? r.len - 4 : 0, keep = 0;
+            if (r.len < 4 || r.len > 4 + 65536 || svg_read(S, &code, 4, deadline, cancel) != 0)
                 goto dead;
-            g_served++;
-            g_busy_until = 0;
+            if (msg && msgcap) {
+                keep = ml < msgcap - 1 ? ml : msgcap - 1;
+                if (keep && svg_read(S, msg, keep, deadline, cancel) != 0) goto dead;
+                msg[keep] = 0;
+                /* Untrusted text: printable bytes only (it paints). */
+                for (size_t k = 0; k < keep; k++)
+                    if ((unsigned char)msg[k] < 0x20 || msg[k] == 0x7f) msg[k] = ' ';
+            }
+            if (svg_skip(S, ml - keep, deadline, cancel) != 0) goto dead;
+            S->served++;
+            S->busy_until = 0;
             return svg_err_of(code);
         }
         if (r.type == CR_R_SIZE) {
             CrSize sz;
-            if (r.len != sizeof sz || svg_read(&sz, sizeof sz, deadline, cancel) != 0) goto dead;
+            if (r.len != sizeof sz || svg_read(S, &sz, sizeof sz, deadline, cancel) != 0) goto dead;
             if (!(sz.w_css > 0) || !(sz.h_css > 0) || !isfinite(sz.w_css) || !isfinite(sz.h_css))
                 goto dead;
             *w = sz.w_css;
             *h = sz.h_css;
             got_size = 1;
             if (size_only) {
-                g_served++;
-                g_busy_until = 0;
+                S->served++;
+                S->busy_until = 0;
                 return RTX_SVG_OK;
             }
             continue;
@@ -475,23 +562,23 @@ static int svg_request_once(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, in
             uint32_t hdr[3];
             uint8_t *px;
             size_t nb = (size_t)pw * ph * 4;
-            if (r.len < 12 || svg_read(hdr, sizeof hdr, deadline, cancel) != 0) goto dead;
+            if (r.len < 12 || svg_read(S, hdr, sizeof hdr, deadline, cancel) != 0) goto dead;
             if (hdr[0] != pw || hdr[1] != ph || hdr[2] != pw * 4 || (size_t)r.len - 12 != nb)
                 goto dead;
             px = (uint8_t *)malloc(nb ? nb : 1);
             if (!px) {
-                rc = svg_skip(nb, deadline, cancel);
+                rc = svg_skip(S, nb, deadline, cancel);
                 if (rc) goto fail;
                 return RTX_SVG_ENOMEM;
             }
-            rc = svg_read(px, nb, deadline, cancel);
+            rc = svg_read(S, px, nb, deadline, cancel);
             if (rc) {
                 free(px);
                 goto fail;
             }
             *out = px;
-            g_served++;
-            g_busy_until = 0;
+            S->served++;
+            S->busy_until = 0;
             return RTX_SVG_OK;
         }
         goto dead;
@@ -499,51 +586,52 @@ static int svg_request_once(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, in
 fail:
     if (rc == -3) {
         /* Cancelled: leave the helper working; its reply will be stale. */
-        g_busy_until = deadline;
+        S->busy_until = deadline;
         return RTX_SVG_ECANCEL;
     }
     if (rc == -2) {
-        g_st.kills++;
-        svg_reap(1);
+        S->st.kills++;
+        svg_reap(S, 1);
         return RTX_SVG_ETIMEOUT;
     }
 dead:
     /* EOF or a broken frame: the helper crashed (or was killed by its
      * sandbox). An old helper may have died of old age (RLIMIT_CPU): one
      * retry on a fresh one. */
-    *retry = g_served > 0;
-    g_st.crashes++;
-    svg_reap(1);
+    *retry = S->served > 0;
+    S->st.crashes++;
+    svg_reap(S, 1);
     return RTX_SVG_ECRASH;
 }
 
-static int svg_request(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, int size_only,
-                       uint32_t pw, uint32_t ph, const _Atomic int *cancel, float *w, float *h,
-                       uint8_t **out) {
+static int svg_request(SvgSlot *S, const uint8_t *b, size_t n, const RtxSvgCfg *cfg,
+                       int size_only, uint32_t pw, uint32_t ph, const _Atomic int *cancel,
+                       float *w, float *h, uint8_t **out, char *msg, size_t msgcap) {
     int retry = 0, rc;
-    rc = svg_request_once(b, n, cfg, size_only, pw, ph, cancel, w, h, out, &retry);
+    rc = svg_request_once(S, b, n, cfg, size_only, pw, ph, cancel, w, h, out, msg, msgcap, &retry);
     if (rc == RTX_SVG_ECRASH && retry)
-        rc = svg_request_once(b, n, cfg, size_only, pw, ph, cancel, w, h, out, &retry);
+        rc = svg_request_once(S, b, n, cfg, size_only, pw, ph, cancel, w, h, out, msg, msgcap,
+                              &retry);
     return rc;
 }
 
-void rtx_svg_shutdown(void) {
-    pthread_mutex_lock(&g_mu);
-    if (g_pid > 0 && g_fd >= 0) {
+static void svg_slot_quit(SvgSlot *S) {
+    pthread_mutex_lock(&S->mu);
+    if (S->pid > 0 && S->fd >= 0) {
         CrReq q;
         double dl = svg_now_ms() + 200;
         memset(&q, 0, sizeof q);
         q.magic = CR_MAGIC_REQ;
         q.kind = CR_KIND_QUIT;
-        (void)svg_write(&q, sizeof q, dl);
-        close(g_fd);
-        g_fd = -1;
+        (void)svg_write(S, &q, sizeof q, dl);
+        close(S->fd);
+        S->fd = -1;
         /* Give it a moment to exit on its own, then make sure. */
         while (svg_now_ms() < dl) {
             int st;
-            pid_t w = waitpid(g_pid, &st, WNOHANG);
-            if (w == g_pid || (w < 0 && errno != EINTR)) {
-                g_pid = 0;
+            pid_t w = waitpid(S->pid, &st, WNOHANG);
+            if (w == S->pid || (w < 0 && errno != EINTR)) {
+                S->pid = 0;
                 break;
             }
             {
@@ -552,14 +640,19 @@ void rtx_svg_shutdown(void) {
             }
         }
     }
-    svg_reap(1);
+    svg_reap(S, 1);
     /* The next request resolves the helper again (tests switch binaries). */
-    g_missing = 0;
-    g_disabled = 0;
+    S->missing = 0;
+    S->disabled = 0;
+    pthread_mutex_unlock(&S->mu);
+}
+
+void rtx_svg_shutdown(void) {
+    int i;
+    for (i = 0; i < RTX_RENDER_SLOTS; i++) svg_slot_quit(&g_slot[i]);
     pthread_mutex_lock(&g_bin_mu);
     g_bin_done = 0;
     pthread_mutex_unlock(&g_bin_mu);
-    pthread_mutex_unlock(&g_mu);
 }
 
 /* ---- disk cache ----------------------------------------------------------- */
@@ -786,73 +879,108 @@ static SvgMem *svg_mem_slot(uint64_t h, uint64_t n) {
     return &g_mem[(h ^ n) % SVG_MEMN];
 }
 
-int rtx_svg_size(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, const _Atomic int *cancel,
-                 float *w, float *h) {
-    uint64_t hs;
+static int svg_mem_get(uint64_t h, uint64_t n, float *w, float *hh) {
     SvgMem *m;
+    int hit = 0;
+    pthread_mutex_lock(&g_mem_mu);
+    m = svg_mem_slot(h, n);
+    if (m->used && m->h == h && m->n == n) {
+        *w = m->w;
+        *hh = m->hh;
+        hit = 1;
+    }
+    pthread_mutex_unlock(&g_mem_mu);
+    return hit;
+}
+
+static void svg_mem_put(uint64_t h, uint64_t n, float w, float hh) {
+    SvgMem *m;
+    pthread_mutex_lock(&g_mem_mu);
+    m = svg_mem_slot(h, n);
+    m->used = 1;
+    m->h = h;
+    m->n = n;
+    m->w = w;
+    m->hh = hh;
+    pthread_mutex_unlock(&g_mem_mu);
+}
+
+static int render_size(SvgSlot *S, uint64_t hs, const uint8_t *b, size_t n, const RtxSvgCfg *cfg,
+                       const _Atomic int *cancel, float *w, float *h, char *msg, size_t msgcap) {
     int rc;
     float fw = 0, fh = 0;
+    if (msg && msgcap) msg[0] = 0;
     if (!b || !n || !cfg) return RTX_SVG_ECORRUPT;
     if ((uint64_t)n > cfg->input_max || n > CR_INPUT_HARD_MAX) return RTX_SVG_EBIG;
-    hs = svg_fnv(b, n);
-    pthread_mutex_lock(&g_mu);
-    m = svg_mem_slot(hs, n);
-    if (m->used && m->h == hs && m->n == n) {
-        *w = m->w;
-        *h = m->hh;
-        g_st.mem_hits++;
-        pthread_mutex_unlock(&g_mu);
+    if (svg_mem_get(hs, n, w, h)) {
+        pthread_mutex_lock(&S->mu);
+        S->st.mem_hits++;
+        pthread_mutex_unlock(&S->mu);
         return RTX_SVG_OK;
     }
+    pthread_mutex_lock(&S->mu);
     if (svg_disk_size_get(cfg, hs, n, &fw, &fh)) {
-        g_st.disk_size_hits++;
+        S->st.disk_size_hits++;
         rc = RTX_SVG_OK;
     } else {
-        rc = svg_request(b, n, cfg, 1, 0, 0, cancel, &fw, &fh, NULL);
+        rc = svg_request(S, b, n, cfg, 1, 0, 0, cancel, &fw, &fh, NULL, msg, msgcap);
         if (rc == RTX_SVG_OK) svg_disk_size_put(cfg, hs, n, fw, fh);
     }
+    pthread_mutex_unlock(&S->mu);
     if (rc == RTX_SVG_OK) {
-        m->used = 1;
-        m->h = hs;
-        m->n = n;
-        m->w = fw;
-        m->hh = fh;
+        svg_mem_put(hs, n, fw, fh);
         *w = fw;
         *h = fh;
     }
-    pthread_mutex_unlock(&g_mu);
     return rc;
 }
 
-int rtx_svg_render(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, uint32_t pw, uint32_t ph,
-                   const _Atomic int *cancel, uint8_t **out) {
-    uint64_t hs;
+static int render_px(SvgSlot *S, uint64_t hs, const uint8_t *b, size_t n, const RtxSvgCfg *cfg,
+                     uint32_t pw, uint32_t ph, const _Atomic int *cancel, uint8_t **out, char *msg,
+                     size_t msgcap) {
     int rc;
     float fw = 0, fh = 0;
     *out = NULL;
+    if (msg && msgcap) msg[0] = 0;
     if (!b || !n || !cfg || !pw || !ph) return RTX_SVG_ECORRUPT;
     if ((uint64_t)n > cfg->input_max || n > CR_INPUT_HARD_MAX) return RTX_SVG_EBIG;
     if ((uint64_t)pw * ph > cfg->px_max || pw > CR_SIDE_HARD_MAX || ph > CR_SIDE_HARD_MAX)
         return RTX_SVG_EPX;
-    hs = svg_fnv(b, n);
-    pthread_mutex_lock(&g_mu);
+    pthread_mutex_lock(&S->mu);
     if (svg_disk_px_get(cfg, hs, n, pw, ph, out)) {
-        g_st.disk_px_hits++;
-        pthread_mutex_unlock(&g_mu);
+        S->st.disk_px_hits++;
+        pthread_mutex_unlock(&S->mu);
         return RTX_SVG_OK;
     }
-    rc = svg_request(b, n, cfg, 0, pw, ph, cancel, &fw, &fh, out);
-    if (rc == RTX_SVG_OK) {
-        SvgMem *m = svg_mem_slot(hs, n);
-        m->used = 1;
-        m->h = hs;
-        m->n = n;
-        m->w = fw;
-        m->hh = fh;
-        svg_disk_px_put(cfg, hs, n, pw, ph, *out);
-    }
-    pthread_mutex_unlock(&g_mu);
+    rc = svg_request(S, b, n, cfg, 0, pw, ph, cancel, &fw, &fh, out, msg, msgcap);
+    if (rc == RTX_SVG_OK) svg_disk_px_put(cfg, hs, n, pw, ph, *out);
+    pthread_mutex_unlock(&S->mu);
+    if (rc == RTX_SVG_OK) svg_mem_put(hs, n, fw, fh);
     return rc;
+}
+
+int rtx_svg_size(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, const _Atomic int *cancel,
+                 float *w, float *h) {
+    return render_size(&g_slot[RTX_RENDER_SVG], b ? svg_fnv(b, n) : 0, b, n, cfg, cancel, w, h,
+                       NULL, 0);
+}
+
+int rtx_svg_render(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, uint32_t pw, uint32_t ph,
+                   const _Atomic int *cancel, uint8_t **out) {
+    return render_px(&g_slot[RTX_RENDER_SVG], b ? svg_fnv(b, n) : 0, b, n, cfg, pw, ph, cancel,
+                     out, NULL, 0);
+}
+
+int rtx_mermaid_size(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, const _Atomic int *cancel,
+                     float *w, float *h, char *msg, size_t msgcap) {
+    return render_size(&g_slot[RTX_RENDER_MERMAID], b ? mm_fnv(b, n) : 0, b, n, cfg, cancel, w,
+                       h, msg, msgcap);
+}
+
+int rtx_mermaid_render(const uint8_t *b, size_t n, const RtxSvgCfg *cfg, uint32_t pw, uint32_t ph,
+                       const _Atomic int *cancel, uint8_t **out, char *msg, size_t msgcap) {
+    return render_px(&g_slot[RTX_RENDER_MERMAID], b ? mm_fnv(b, n) : 0, b, n, cfg, pw, ph, cancel,
+                     out, msg, msgcap);
 }
 
 #endif /* POSIX */

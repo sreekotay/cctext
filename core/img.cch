@@ -39,6 +39,11 @@
 #define RTX_IMG_SVG_PX_MAX 16000000ull     /* rendered pixels (w * h) */
 #define RTX_IMG_SVG_TIMEOUT_MS 5000u       /* one render; past it the helper is killed */
 #define RTX_IMG_SVG_CACHE_MAX (64ull << 20) /* size + pixel cache on disk */
+/* Mermaid through cctext-render (docs/images.md "Mermaid"; settings mermaid_*) */
+#define RTX_IMG_MM_MAX (64ull << 10)       /* diagram source bytes */
+#define RTX_IMG_MM_NODES 150u              /* nodes a diagram may have */
+#define RTX_IMG_MM_TIMEOUT_MS 10000u       /* one diagram (engine budget) */
+#define RTX_IMG_MM_MAX_H 720u              /* Rich: display height cap, px */
 
 typedef struct {
     uint64_t file_max;
@@ -58,6 +63,13 @@ typedef struct {
     uint32_t svg_timeout_ms;
     uint64_t svg_cache_max;    /* 0: no disk cache */
     int svg_backing;           /* a light plate under SVGs in dark themes */
+    /* Mermaid (appended) */
+    int mermaid;               /* render ```mermaid fences (0: they stay code) */
+    uint64_t mm_max;           /* source bytes */
+    uint32_t mm_nodes;         /* node cap (0: none) */
+    uint32_t mm_timeout_ms;    /* one diagram */
+    uint32_t mm_recycle_jobs;  /* restart the helper's engine every N diagrams (0: never) */
+    uint32_t mm_max_h;         /* Rich display height cap, px */
 } RtxImgLimits;
 
 /* The process's limits (defaults above until settings change them). */
@@ -89,7 +101,9 @@ enum {
     RTX_IMG_ERENDER = -19,     /* SVG: the renderer crashed or broke protocol */
     RTX_IMG_ERTIME = -20,      /* SVG: over the render time budget (killed) */
     RTX_IMG_ENORENDER = -21,   /* SVG: no renderer (missing, or this platform) */
-    RTX_IMG_ESVGBIG = -22      /* SVG: over the SVG size limit */
+    RTX_IMG_ESVGBIG = -22,     /* SVG: over the SVG size limit */
+    RTX_IMG_ESCRIPT = -23,     /* Mermaid: does not parse (RtxImgView.msg says why) */
+    RTX_IMG_ELARGE = -24       /* Mermaid: over the node cap (msg: how many) */
 };
 /* Short text for a placeholder: "file over 64 MiB limit", "16384 px side
  * limit", ... (static or into buf). */
@@ -103,7 +117,8 @@ enum {
     RTX_IMG_FMT_BMP,
     RTX_IMG_FMT_WEBP,
     RTX_IMG_FMT_QOI,
-    RTX_IMG_FMT_SVG            /* vector: rendered by cctext-render (img_svg.c) */
+    RTX_IMG_FMT_SVG,           /* vector: rendered by cctext-render (img_svg.c) */
+    RTX_IMG_FMT_MERMAID        /* a ```mermaid fence: rendered by cctext-render */
 };
 const char *rtx_img_fmt_name(int fmt);
 
@@ -120,8 +135,12 @@ typedef struct {
  * draw directly; RGBA straight is for a terminal protocol (phase 2). */
 enum {
     RTX_IMG_PIX_BGRA_PREMUL = 0,
-    RTX_IMG_PIX_RGBA = 1
+    RTX_IMG_PIX_RGBA = 1,
+    /* OR'ed in: the same picture faded toward transparency (a stale
+     * diagram while its new render is on the way; a separate bitmap) */
+    RTX_IMG_PIX_DIM = 4
 };
+#define RTX_IMG_PIX_LAYOUT(p) ((p) & 3)
 
 typedef struct {
     uint32_t w, h, stride;
@@ -173,7 +192,8 @@ enum {
     RTX_IMG_SRC_NONE = 0,
     RTX_IMG_SRC_LOCAL,
     RTX_IMG_SRC_DATA,
-    RTX_IMG_SRC_REMOTE
+    RTX_IMG_SRC_REMOTE,
+    RTX_IMG_SRC_MERMAID        /* a diagram's source (the caller's bytes) */
 };
 
 #define RTX_IMG_PATH 4096
@@ -242,6 +262,8 @@ typedef struct {
     const RtxImgBmp *bmp;  /* S_OK */
     uint32_t frame;        /* animation frame to paint */
     RtxImgBmpEnt *be;      /* for the host's platform object (below) */
+    const char *msg;       /* Mermaid: the renderer's message for ERR (else NULL);
+                            * valid until the next rtx_img_pump */
     RtxImgSrc src;
 } RtxImgView;
 
@@ -307,6 +329,47 @@ void rtx_img_cells_px(uint32_t *cw, uint32_t *ch);
  * natural size; have 0 (header unknown): a placeholder box of 3 rows. */
 void rtx_img_cell_box(uint32_t iw, uint32_t ih, int have, uint32_t cols, uint32_t *bc,
                       uint32_t *br);
+/* The same with its own height cap in pixels (a Mermaid diagram's). */
+void rtx_img_cell_box_h(uint32_t iw, uint32_t ih, int have, uint32_t cols, uint32_t max_h,
+                        uint32_t *bc, uint32_t *br);
+
+/* ---- Mermaid (docs/images.md "Mermaid") -------------------------------- */
+
+/* The colours a diagram is drawn for: `dark` picks mermaid's dark theme,
+ * fg / bg / accent become its themeVariables (text and lines, the
+ * background, node borders and fills). */
+typedef struct {
+    int dark;
+    unsigned char fg[3], bg[3], accent[3];
+} RtxMmTheme;
+
+/* The Rich lens's theme (the host sets it from its palette; default: a
+ * dark pane). A change re-keys every diagram: visible ones re-render (the
+ * old picture stays, dimmed, until then). */
+void rtx_img_mm_theme_set(const RtxMmTheme *t);
+const RtxMmTheme *rtx_img_mm_theme(void);
+/* A 32-bit id of a theme (part of every diagram key). */
+uint32_t rtx_img_mm_theme_id(const RtxMmTheme *t);
+
+/* A theme from colours 0xRRGGBB (a slide's): dark when the background
+ * is. */
+void rtx_img_mm_theme_rgb(uint32_t bg, uint32_t fg, uint32_t accent, RtxMmTheme *out);
+
+/* A diagram from its source src[0, n) (the fence body; the caller's bytes
+ * need only live through the call that first sees it). Key: the source's
+ * hash, its length and the theme id. err: RTX_IMG_ESVGBIG past mm_max. */
+int rtx_img_src_mermaid(const char *src, size_t n, const RtxMmTheme *t, RtxImgSrc *out);
+/* The same diagram by key alone (a painter that has the layout's record):
+ * its entry must exist (the layout's rtx_img_info made it). */
+void rtx_img_src_mermaid_key(uint64_t h, uint64_t n, uint32_t theme, RtxImgSrc *out);
+/* The key parts of a Mermaid source (0 when src is not one). */
+int rtx_img_mermaid_key(const RtxImgSrc *src, uint64_t *h, uint64_t *n, uint32_t *theme);
+
+/* Stale display: the last diagram of a fence that had a size, by (owner,
+ * fence start). A fence whose source changed paints that one, dimmed,
+ * until the new render has a size (the workbook's stale convention). */
+void rtx_img_mm_note(const void *owner, size_t fence_lo, const RtxImgSrc *src);
+int rtx_img_mm_prev(const void *owner, size_t fence_lo, RtxImgSrc *out);
 
 /* Policy generation: bumps on every allow / revoke / reload (a host that
  * cached resolutions or a laid-out stand-in refreshes). */
