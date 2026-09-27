@@ -13,8 +13,10 @@
 //   table, keys.json / settings.json, the palette model, the fuzzy scorer),
 //   core/workspace.ccs, core/layout.ccs, core/document.ccs,
 //   core/img.ccs + core/img_wuffs.c (Wuffs, third_party/wuffs) + core/img_net.c (images)
+//   + core/img_term.c (terminal encoders: block art, sixel, PNG, zlib, kitty cells)
 //   frontend/gui_draw.ccs, frontend/gui_input.ccs, frontend/gui_chrome.ccs,
-//   frontend/cctext_draw.ccs, frontend/cctext_grid_draw.ccs,
+//   frontend/cctext_draw.ccs (+ cctext_present.ccs, cctext_img.ccs: terminal pictures),
+//   frontend/cctext_grid_draw.ccs,
 //   frontend/cctext_input.ccs, frontend/cctext_keys.ccs, frontend/cctext_osx.ccs
 //   cctext-ui platform (outside ccc, linked in by @cctext_ui): frontend/ui_plat.c
 //   (portable libui-ng) + frontend/ui_os_darwin.m (AppKit) or ui_os_gtk.c (GTK 3)
