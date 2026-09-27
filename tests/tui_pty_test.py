@@ -2669,14 +2669,15 @@ def case_wb_uses(exe, tmp):
           "wb uses: the edit reached the reader's pane; fresh again", repr(res["after"]))
 
 
-def img_project(tmp, name, extra=b""):
+def img_project(tmp, name, extra=b"", repo=True):
     """A project with quad.png (32x24, quadrants red / green / blue / white)
     and big.png (1200x900, the same quadrants) and a Markdown file that
-    shows both as picture rows, one inline, and 40 lines after."""
+    shows both as picture rows, one inline, and 40 lines after. repo=False:
+    no repository marker (the document's directory is the root)."""
     import shutil
     here = os.path.dirname(os.path.abspath(__file__))
     proj = os.path.join(tmp, name)
-    os.makedirs(os.path.join(proj, ".git"), exist_ok=True)
+    os.makedirs(os.path.join(proj, ".git") if repo else proj, exist_ok=True)
     for f in ("quad.png", "big.png", "anim.gif"):
         shutil.copy(os.path.join(here, "..", "testdata", "img", f), proj)
     body = (b"# Pics\n\n![a quad](quad.png)\n\nInline ![tiny](quad.png) here.\n\n"
@@ -3197,7 +3198,75 @@ def case_image_present(exe, tmp):
             t.kill()
 
 
+def main_wakeups(pid):
+    """Context switches of the main (UI) thread: the editor's own loop.
+    (The runtime's worker threads, started by the image loader's lanes in
+    phase 1, keep their own clock and are not the editor waking.)"""
+    n = 0
+    try:
+        with open("/proc/%d/task/%d/status" % (pid, pid)) as f:
+            for line in f:
+                if line.startswith(("voluntary_ctxt_switches", "nonvoluntary_ctxt_switches")):
+                    n += int(line.split()[1])
+    except OSError:
+        pass
+    return n
+
+
+def case_image_idle(exe, tmp):
+    """Pictures on screen and nothing to do: no output, no wakeups (block
+    art and kitty). With image_animate on, an animated GIF paints its
+    frames (at most ~12 a second) and a still file stays quiet again once
+    it scrolls away."""
+    if pyte is None or not os.path.exists("/proc/self/stat"):
+        print("skip: image idle (no pyte or /proc)")
+        return
+    proj, path, body = img_project(tmp, "idl", extra=b"![spin](anim.gif)\n\n", repo=False)
+    for mode in ("silent", "kitty"):
+        fake = FakeTerm(mode)
+        t = Tui(exe, ["--no-blink", path], img_env(tmp, "idl"), fake=fake)
+        try:
+            t.pump(1.5)
+            c0 = proc_cpu(t.pid)
+            mark = len(t.out)
+            w0 = main_wakeups(t.pid)
+            t.pump(1.5)
+            nbytes, wakes = len(t.out) - mark, main_wakeups(t.pid) - w0
+            c1 = proc_cpu(t.pid)
+            check(nbytes == 0 and wakes <= 2 and c1 - c0 < 0.05,
+                  "image idle: %s pictures on screen, nothing to do" % mode,
+                  repr((nbytes, wakes, c1 - c0)))
+            t.send(b"\x11", 0.3)
+            t.wait_exit(5.0)
+        finally:
+            t.kill()
+    home = config_home(tmp, "idl_cfg", settings='{ "image_animate": true }')
+    spin = os.path.join(proj, "spin.md")
+    with open(spin, "wb") as f:
+        f.write(b"# A\n\n![spin](anim.gif)\n\nend\n")
+    t = Tui(exe, ["--no-blink", spin], img_env(tmp, "idl2", XDG_CONFIG_HOME=home),
+            fake=FakeTerm("silent"))
+    try:
+        t.pump(1.5)
+        seen = set()
+        for _ in range(14):
+            t.pump(0.1)
+            sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+            seen.add(sc.buffer[2][2].bg)  # line 3 (a two-column gutter)
+        check(len(seen) >= 2, "image idle: image_animate paints the GIF's frames", repr(seen))
+        w0 = main_wakeups(t.pid)
+        t.pump(1.0)
+        wakes = main_wakeups(t.pid) - w0
+        check(0 < wakes <= 30, "image idle: animation wakes within the frame budget",
+              repr(wakes))
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
 CASES = {
+    "image_idle": case_image_idle,
     "image_viewer": case_image_viewer,
     "image_present": case_image_present,
     "image_blocks": case_image_blocks,
