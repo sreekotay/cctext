@@ -20,6 +20,9 @@ reapplies them onto a fresh upstream copy):
    viewport resolved once per level (was 2^depth).
 4. `0004-case-insensitive-font-family.patch`: font-family names match
    case-insensitively.
+5. `0005-bounded-offscreen-canvas.patch`: offscreen (group, mask,
+   pattern) canvases capped at 2^26 px; a failed allocation draws nothing
+   instead of dereferencing NULL.
 
 Build defines: `LUNASVG_BUILD_STATIC`, `LUNASVG_DISABLE_LOAD_SYSTEM_FONTS`,
 `LUNASVG_DISABLE_EXTERNAL_RESOURCES` (only `data:` images load; an

@@ -2,6 +2,10 @@
 #include "plutovg-utils.h"
 
 #include <assert.h>
+#include <math.h>
+
+/* cctext patch: most dash segments one stroke may produce (see plutovg_path_traverse_dashed). */
+#define PLUTOVG_MAX_DASHES 1000000.0
 
 void plutovg_path_iterator_init(plutovg_path_iterator_t* it, const plutovg_path_t* path)
 {
@@ -583,9 +587,21 @@ void plutovg_path_traverse_dashed(const plutovg_path_t* path, float offset, cons
         dash_sum += dashes[i];
     if(ndashes % 2 == 1)
         dash_sum *= 2.f;
-    if(dash_sum <= 0.f) {
+    if(!(dash_sum > 0.f) || !isfinite(dash_sum)) {
         plutovg_path_traverse(path, traverse_func, closure);
         return;
+    }
+
+    /* cctext patch: a dash pattern far finer than the path (1e-38 over a
+     * 100 px line) produced billions of segments: the element array's int
+     * capacity overflowed. Past PLUTOVG_MAX_DASHES segments the path is
+     * stroked solid, as Skia does for too-dense dashes. */
+    {
+        float length = plutovg_path_length(path);
+        if(!isfinite(length) || !isfinite(offset) || (double)length / dash_sum * ndashes > PLUTOVG_MAX_DASHES) {
+            plutovg_path_traverse(path, traverse_func, closure);
+            return;
+        }
     }
 
     dasher_t dasher;
