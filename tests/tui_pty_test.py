@@ -623,6 +623,43 @@ def case_page_keys(exe, tmp):
     check(got2.endswith(b"#"), "Ctrl-End goes to EOF", repr(got2[-12:]))
 
 
+def case_last_line(exe, tmp):
+    """The caret onto the empty line after a final newline (Down, Ctrl-End,
+    PageDown) and the wheel to EOF: the pane keeps the document's end on
+    screen instead of going blank ('~' rows only). Wrap on and off, Rich
+    and Source, with and without the final newline."""
+    if pyte is None:
+        print("skip: last line (no pyte)")
+        return
+    body = b"".join(b"line %d of some text here\n" % i for i in range(1, 60))
+    src = os.path.join(tmp, "source.json")
+    with open(src, "w") as f:
+        f.write('{"rich": false}')
+    moves = {"Down": b"\x1b[B" * 59, "Ctrl-End": b"\x1b[1;5F",
+             "PageDown": b"\x1b[6~" * 5, "wheel": b"\x1b[<65;10;5M" * 40}
+    for nl in (1, 0):
+        for mode in ("rich wrap", "rich nowrap", "source wrap"):
+            for how, seq in moves.items():
+                args = ["--settings", src] if "source" in mode else []
+                name = "last_%d_%s_%s.txt" % (nl, mode.replace(" ", "_"), how)
+                t, _ = open_tui(exe, tmp, name, body if nl else body[:-1], args=args)
+                try:
+                    if "nowrap" in mode:
+                        t.send(b"\x1bm", 0.2)
+                    t.send(seq, 0.6)
+                    rows = (screen_text(t) or "").split("\n")
+                    t.send(b"\x11", 0.2)
+                    t.wait_exit(5.0)
+                finally:
+                    t.kill()
+                text = [r for r in rows[:-1] if r.strip() and not r.strip().startswith("~")]
+                want = 1 if how == "wheel" else len(rows) // 2
+                check(len(text) >= want and any("line 59" in r for r in text),
+                      "last line: %s to EOF keeps text on screen (%s, %s)" %
+                      (how, mode, "final newline" if nl else "no final newline"),
+                      "%d text rows: %r" % (len(text), rows[:2]))
+
+
 def case_mouse_click(exe, tmp):
     body = b"".join(b"line %d\n" % i for i in range(40))
     # Click row 3 (line index 2), release, type.
@@ -3283,6 +3320,7 @@ CASES = {
     "unbracketed_typing": case_unbracketed_typing,
     "dangling_csi": case_dangling_csi,
     "page_keys": case_page_keys,
+    "last_line": case_last_line,
     "mouse_click": case_mouse_click,
     "find_run": case_find_run,
     "find_options": case_find_options,
