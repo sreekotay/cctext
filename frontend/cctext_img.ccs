@@ -155,6 +155,41 @@ static void ti_write(int fd, const char *b, size_t n) {
     }
 }
 
+/* A new private temp file at `path` (a name kitty deletes after reading
+ * it: in a temp directory, "tty-graphics-protocol" in it). Never follows
+ * or reuses what is there (O_EXCL | O_NOFOLLOW): on a clash a suffix is
+ * added to path. -1 on failure. Any thread. */
+static int ti_tmp_create(char *path, size_t cap) {
+    size_t base = strlen(path);
+    int k;
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+    for (k = 0; k < 8; k++) {
+        int fd;
+        if (k) snprintf(path + base, cap - base, "-%d", k);
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd >= 0) return fd;
+        if (errno != EEXIST) break;
+    }
+    path[base] = 0;
+    return -1;
+}
+
+/* An unpredictable tag for temp names (the clock's nanoseconds and pid). */
+static unsigned ti_rand(void) {
+    struct timespec ts;
+    unsigned v;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    v = (unsigned)ts.tv_nsec ^ ((unsigned)ts.tv_sec << 20) ^ ((unsigned)getpid() << 8);
+    v ^= v >> 13;
+    v *= 0x5bd1e995u;
+    return v ^ (v >> 15);
+}
+
 /* Wrap an escape sequence for tmux's DCS passthrough (every ESC doubled). */
 static size_t ti_tmux_wrap(const char *s, size_t n, char *out, size_t cap) {
     size_t o = 0, i;
@@ -313,9 +348,9 @@ void cctext_img_detect(unsigned char *left, size_t cap, size_t *leftn) {
             /* A file only this host can read: an OK means the terminal
              * reads our temp files (t=t, no base64 over the pty). */
             int fd;
-            snprintf(tfile, sizeof tfile, "%s/tty-graphics-protocol-cctext-%d-q", G.tmpdir,
-                     (int)getpid());
-            fd = open(tfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            snprintf(tfile, sizeof tfile, "%s/tty-graphics-protocol-cctext-%d-q%08x", G.tmpdir,
+                     (int)getpid(), ti_rand());
+            fd = ti_tmp_create(tfile, sizeof tfile);
             if (fd >= 0) {
                 static const char px[3] = {0, 0, 0};
                 if (write(fd, px, 3) == 3) got_file = 1;
@@ -608,7 +643,7 @@ static int ti_kitty_build(TiJob *j, const uint8_t *z, size_t zn, TiOut *o) {
     if (j->local && j->tfile[0]) {
         char b64[300];
         char seq[512];
-        int fd = open(j->tfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int fd = ti_tmp_create(j->tfile, sizeof j->tfile);
         size_t off = 0;
         if (fd < 0) return 0;
         while (off < zn) {
@@ -846,8 +881,8 @@ static void ti_schedule(void) {
     j->regs = G.sixel_regs;
     j->kid = pick->kid;
     if (j->local) {
-        snprintf(j->tfile, sizeof j->tfile, "%s/tty-graphics-protocol-cctext-%d-%d", G.tmpdir,
-                 (int)getpid(), ++g_kfile_seq);
+        snprintf(j->tfile, sizeof j->tfile, "%s/tty-graphics-protocol-cctext-%d-%d-%08x",
+                 G.tmpdir, (int)getpid(), ++g_kfile_seq, ti_rand());
     }
     pick->state = TE_RUN;
     ti_lane_kick(&g_lane) !>(err) {
@@ -1156,7 +1191,11 @@ int cctext_img_line(const CctiPic *p, int li, int c0, int n, int srow, int scol)
     int loading = 0, i;
     int32_t cf = -2, cb = -2;
     if (!p || n <= 0) return 0;
-    if (n > 512) n = 512;
+    if (n > 512) {
+        /* Wider than one batch: the rest after the first 512 cells. */
+        int done = cctext_img_line(p, li, c0, 512, srow, scol);
+        return done + cctext_img_line(p, li, c0 + 512, n - 512, srow, scol + 512);
+    }
     ti_fill(p, li, c0, n, srow, scol, cells, &loading);
     if (loading && li == 0) {
         char buf[256];
@@ -1270,8 +1309,8 @@ void cctext_img_pub_pre(void) {
             tj.rows = e->rows;
             tj.tmux = G.tmux;
             tj.local = 1;
-            snprintf(tj.tfile, sizeof tj.tfile, "%s/tty-graphics-protocol-cctext-%d-%d",
-                     G.tmpdir, (int)getpid(), ++g_kfile_seq);
+            snprintf(tj.tfile, sizeof tj.tfile, "%s/tty-graphics-protocol-cctext-%d-%d-%08x",
+                     G.tmpdir, (int)getpid(), ++g_kfile_seq, ti_rand());
             if (ti_kitty_build(&tj, e->z, e->zn, &o)) {
                 free(e->bytes);
                 e->bytes = o.p;

@@ -844,11 +844,29 @@ typedef struct {
 static void ti_bits(TiBits *w, uint32_t v, int n) {
     w->acc |= (uint64_t)v << w->nb;
     w->nb += n;
-    while (w->nb >= 8) {
+    if (w->nb >= 32) {
+        /* Four bytes at a time; room was reserved up front. */
+        if (ti_grow(w->b, 4)) {
+            uint8_t *o = w->b->p + w->b->n;
+            o[0] = (uint8_t)w->acc;
+            o[1] = (uint8_t)(w->acc >> 8);
+            o[2] = (uint8_t)(w->acc >> 16);
+            o[3] = (uint8_t)(w->acc >> 24);
+            w->b->n += 4;
+        }
+        w->acc >>= 32;
+        w->nb -= 32;
+    }
+}
+
+static void ti_bits_flush(TiBits *w) {
+    while (w->nb > 0) {
         ti_putc(w->b, (uint8_t)(w->acc & 255));
         w->acc >>= 8;
         w->nb -= 8;
     }
+    w->nb = 0;
+    w->acc = 0;
 }
 
 static uint32_t ti_rev(uint32_t v, int n) {
@@ -861,11 +879,36 @@ static uint32_t ti_rev(uint32_t v, int n) {
     return r;
 }
 
-static void ti_lit(TiBits *w, int v) {
-    if (v < 144) ti_bits(w, ti_rev((uint32_t)(0x30 + v), 8), 8);
-    else if (v < 256) ti_bits(w, ti_rev((uint32_t)(0x190 + v - 144), 9), 9);
-    else if (v < 280) ti_bits(w, ti_rev((uint32_t)(v - 256), 7), 7);
-    else ti_bits(w, ti_rev((uint32_t)(0xC0 + v - 280), 8), 8);
+/* The fixed Huffman codes, bit-reversed for the LSB-first writer. */
+static uint16_t g_lcode[288];
+static uint8_t g_llen[288];
+static uint8_t g_dcode[30];
+static volatile int g_codes_ok;
+
+static void ti_codes(void) {
+    int v;
+    if (g_codes_ok) return;
+    for (v = 0; v < 288; v++) {
+        if (v < 144) {
+            g_lcode[v] = (uint16_t)ti_rev((uint32_t)(0x30 + v), 8);
+            g_llen[v] = 8;
+        } else if (v < 256) {
+            g_lcode[v] = (uint16_t)ti_rev((uint32_t)(0x190 + v - 144), 9);
+            g_llen[v] = 9;
+        } else if (v < 280) {
+            g_lcode[v] = (uint16_t)ti_rev((uint32_t)(v - 256), 7);
+            g_llen[v] = 7;
+        } else {
+            g_lcode[v] = (uint16_t)ti_rev((uint32_t)(0xC0 + v - 280), 8);
+            g_llen[v] = 8;
+        }
+    }
+    for (v = 0; v < 30; v++) g_dcode[v] = (uint8_t)ti_rev((uint32_t)v, 5);
+    g_codes_ok = 1;
+}
+
+static inline void ti_lit(TiBits *w, int v) {
+    ti_bits(w, g_lcode[v], g_llen[v]);
 }
 
 static const uint16_t g_lbase[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
@@ -886,13 +929,15 @@ static void ti_match(TiBits *w, int len, int dist) {
     if (g_lext[i]) ti_bits(w, (uint32_t)(len - g_lbase[i]), g_lext[i]);
     for (i = 29; i > 0 && g_dbase[i] > dist; i--) {
     }
-    ti_bits(w, ti_rev((uint32_t)i, 5), 5);
+    ti_bits(w, g_dcode[i], 5);
     if (g_dext[i]) ti_bits(w, (uint32_t)(dist - g_dbase[i]), g_dext[i]);
 }
 
 #define TI_WIN 32768
 #define TI_HBITS 15
-#define TI_CHAIN 24
+#ifndef TI_CHAIN
+#define TI_CHAIN 8
+#endif
 
 int rtx_timg_zlib(const uint8_t *b, size_t n, uint8_t **out, size_t *on) {
     TiBuf B = {0};
@@ -911,6 +956,13 @@ int rtx_timg_zlib(const uint8_t *b, size_t n, uint8_t **out, size_t *on) {
         return 0;
     }
     memset(head, 0xff, sizeof(int32_t) << TI_HBITS);
+    ti_codes();
+    /* Fixed codes are at most 9 bits a byte (plus the headers). */
+    if (!ti_grow(&B, n + n / 7 + 64)) {
+        free(head);
+        free(prev);
+        return 0;
+    }
     W.b = &B;
     W.acc = 0;
     W.nb = 0;
@@ -960,7 +1012,7 @@ int rtx_timg_zlib(const uint8_t *b, size_t n, uint8_t **out, size_t *on) {
         }
     }
     ti_lit(&W, 256);
-    if (W.nb) ti_bits(&W, 0, 8 - W.nb);
+    ti_bits_flush(&W);
     for (i = 0; i < n; i++) {
         a1 = (a1 + b[i]) % 65521u;
         a2 = (a2 + a1) % 65521u;
