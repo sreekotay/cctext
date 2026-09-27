@@ -21,6 +21,10 @@ cctext-render fuzz run (ASan + UBSan):
    array; a curve with non-finite flatness measures is drawn as its chord,
    subdivision stops at depth 16 and one flattening emits at most 2^20
    segments (a hostile arc took 3.3 s, a curve at FLT_MAX 16 s).
+3. `0003-blend-conversions.patch`: texture offsets and fixed-point
+   texture / gradient coordinates clamped before float -> integer
+   conversion (a 1e38 translation computed `0 - INT_MIN`); the
+   transformed blenders step in 64-bit.
 
 Build defines: `PLUTOVG_BUILD_STATIC`, `PLUTOVG_DISABLE_FONT_FACE_CACHE_LOAD`
 (no system font scan), `STBI_MAX_DIMENSIONS=16384` (a `data:` image inside

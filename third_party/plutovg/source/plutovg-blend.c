@@ -182,6 +182,28 @@ static inline int gradient_clamp(const gradient_data_t* gradient, int ipos)
     return ipos;
 }
 
+/* cctext patch: float -> integer conversions of texture and gradient
+ * coordinates are clamped first. A 1e38 translation or a texture drawn
+ * 1000x smaller than its pixels made (int)(v * 65536) undefined (fuzz,
+ * UBSan); texture stepping now runs in 64-bit, from values clamped to
+ * +-2^46, and gradient positions clamp to +-2^30 (NaN -> 0). */
+static inline int64_t blend_fixed(float v)
+{
+    double d = (double)v * 65536.0;
+    if(!(d == d)) return 0;
+    if(d > 70368744177664.0) return INT64_C(70368744177664);
+    if(d < -70368744177664.0) return -INT64_C(70368744177664);
+    return (int64_t)d;
+}
+
+static inline int gradient_int(float v)
+{
+    if(!(v == v)) return 0;
+    if(v > 1073741824.f) return 1073741824;
+    if(v < -1073741824.f) return -1073741824;
+    return (int)v;
+}
+
 #define FIXPT_BITS 8
 #define FIXPT_SIZE (1 << FIXPT_BITS)
 static inline uint32_t gradient_pixel_fixed(const gradient_data_t* gradient, int fixed_pos)
@@ -192,7 +214,7 @@ static inline uint32_t gradient_pixel_fixed(const gradient_data_t* gradient, int
 
 static inline uint32_t gradient_pixel(const gradient_data_t* gradient, float pos)
 {
-    int ipos = (int)(pos * (COLOR_TABLE_SIZE - 1) + 0.5f);
+    int ipos = gradient_int(pos * (COLOR_TABLE_SIZE - 1) + 0.5f);
     return gradient->colortable[gradient_clamp(gradient, ipos)];
 }
 
@@ -214,7 +236,7 @@ static void fetch_linear_gradient(uint32_t* buffer, const linear_gradient_values
 
     const uint32_t* end = buffer + length;
     if(inc > -1e-5f && inc < 1e-5f) {
-        plutovg_memfill32(buffer, length, gradient_pixel_fixed(gradient, (int)(t * FIXPT_SIZE)));
+        plutovg_memfill32(buffer, length, gradient_pixel_fixed(gradient, gradient_int(t * FIXPT_SIZE)));
     } else {
         if(t + inc * length < (float)(INT_MAX >> (FIXPT_BITS + 1)) && t + inc * length > (float)(INT_MIN >> (FIXPT_BITS + 1))) {
             int t_fixed = (int)(t * FIXPT_SIZE);
@@ -727,6 +749,17 @@ static void blend_radial_gradient(plutovg_surface_t* surface, plutovg_operator_t
     }
 }
 
+/* cctext patch: a texture translation far off the surface ((int)1e38 is
+ * undefined; it came out INT_MIN and `0 - INT_MIN` overflowed). Offsets
+ * are clamped to +-2^30 (NaN -> 0) before the integer span arithmetic. */
+static inline int blend_offset(float v)
+{
+    if(!(v == v)) return 0;
+    if(v > 1073741824.f) return 1073741824;
+    if(v < -1073741824.f) return -1073741824;
+    return (int)v;
+}
+
 static void blend_untransformed_argb(plutovg_surface_t* surface, plutovg_operator_t op, const texture_data_t* texture, const plutovg_span_buffer_t* span_buffer)
 {
     composition_function_t func = composition_table[op];
@@ -734,8 +767,8 @@ static void blend_untransformed_argb(plutovg_surface_t* surface, plutovg_operato
     const int image_width = texture->width;
     const int image_height = texture->height;
 
-    int xoff = (int)(texture->matrix.e);
-    int yoff = (int)(texture->matrix.f);
+    int xoff = blend_offset(texture->matrix.e);
+    int yoff = blend_offset(texture->matrix.f);
 
     int count = span_buffer->spans.size;
     const plutovg_span_t* spans = span_buffer->spans.data;
@@ -774,8 +807,8 @@ static void blend_transformed_argb(plutovg_surface_t* surface, plutovg_operator_
     int image_width = texture->width;
     int image_height = texture->height;
 
-    int fdx = (int)(texture->matrix.a * FIXED_SCALE);
-    int fdy = (int)(texture->matrix.b * FIXED_SCALE);
+    int64_t fdx = blend_fixed(texture->matrix.a);
+    int64_t fdy = blend_fixed(texture->matrix.b);
 
     int count = span_buffer->spans.size;
     const plutovg_span_t* spans = span_buffer->spans.data;
@@ -785,8 +818,8 @@ static void blend_transformed_argb(plutovg_surface_t* surface, plutovg_operator_
         const float cx = spans->x + 0.5f;
         const float cy = spans->y + 0.5f;
 
-        int x = (int)((texture->matrix.c * cy + texture->matrix.a * cx + texture->matrix.e) * FIXED_SCALE);
-        int y = (int)((texture->matrix.d * cy + texture->matrix.b * cx + texture->matrix.f) * FIXED_SCALE);
+        int64_t x = blend_fixed(texture->matrix.c * cy + texture->matrix.a * cx + texture->matrix.e);
+        int64_t y = blend_fixed(texture->matrix.d * cy + texture->matrix.b * cx + texture->matrix.f);
 
         int length = spans->len;
         const int coverage = (spans->coverage * texture->const_alpha) >> 8;
@@ -795,8 +828,8 @@ static void blend_transformed_argb(plutovg_surface_t* surface, plutovg_operator_
             const uint32_t* end = buffer + l;
             uint32_t* b = buffer;
             while(b < end) {
-                int px = x >> 16;
-                int py = y >> 16;
+                int64_t px = x >> 16;
+                int64_t py = y >> 16;
                 if((px < 0) || (px >= image_width) || (py < 0) || (py >= image_height)) {
                     *b = 0x00000000;
                 } else {
@@ -824,8 +857,8 @@ static void blend_untransformed_tiled_argb(plutovg_surface_t* surface, plutovg_o
     int image_width = texture->width;
     int image_height = texture->height;
 
-    int xoff = (int)(texture->matrix.e) % image_width;
-    int yoff = (int)(texture->matrix.f) % image_height;
+    int xoff = blend_offset(texture->matrix.e) % image_width;
+    int yoff = blend_offset(texture->matrix.f) % image_height;
 
     if(xoff < 0)
         xoff += image_width;
@@ -875,8 +908,8 @@ static void blend_transformed_tiled_argb(plutovg_surface_t* surface, plutovg_ope
     int image_height = texture->height;
     const int scanline_offset = texture->stride / 4;
 
-    int fdx = (int)(texture->matrix.a * FIXED_SCALE);
-    int fdy = (int)(texture->matrix.b * FIXED_SCALE);
+    int64_t fdx = blend_fixed(texture->matrix.a);
+    int64_t fdy = blend_fixed(texture->matrix.b);
 
     int count = span_buffer->spans.size;
     const plutovg_span_t* spans = span_buffer->spans.data;
@@ -887,8 +920,8 @@ static void blend_transformed_tiled_argb(plutovg_surface_t* surface, plutovg_ope
         const float cx = spans->x + 0.5f;
         const float cy = spans->y + 0.5f;
 
-        int x = (int)((texture->matrix.c * cy + texture->matrix.a * cx + texture->matrix.e) * FIXED_SCALE);
-        int y = (int)((texture->matrix.d * cy + texture->matrix.b * cx + texture->matrix.f) * FIXED_SCALE);
+        int64_t x = blend_fixed(texture->matrix.c * cy + texture->matrix.a * cx + texture->matrix.e);
+        int64_t y = blend_fixed(texture->matrix.d * cy + texture->matrix.b * cx + texture->matrix.f);
 
         const int coverage = (spans->coverage * texture->const_alpha) >> 8;
         int length = spans->len;
@@ -897,13 +930,13 @@ static void blend_transformed_tiled_argb(plutovg_surface_t* surface, plutovg_ope
             const uint32_t* end = buffer + l;
             uint32_t* b = buffer;
             while(b < end) {
-                int px = x >> 16;
-                int py = y >> 16;
+                int64_t px = x >> 16;
+                int64_t py = y >> 16;
                 px %= image_width;
                 py %= image_height;
                 if(px < 0) px += image_width;
                 if(py < 0) py += image_height;
-                int y_offset = py * scanline_offset;
+                int y_offset = (int)py * scanline_offset;
 
                 assert(px >= 0 && px < image_width);
                 assert(py >= 0 && py < image_height);
@@ -941,8 +974,8 @@ static void blend_transformed_bilinear_tiled_argb(plutovg_surface_t* surface, pl
     int image_width = texture->width;
     int image_height = texture->height;
 
-    int fdx = (int)(texture->matrix.a * FIXED_SCALE);
-    int fdy = (int)(texture->matrix.b * FIXED_SCALE);
+    int64_t fdx = blend_fixed(texture->matrix.a);
+    int64_t fdy = blend_fixed(texture->matrix.b);
 
     int count = span_buffer->spans.size;
     const plutovg_span_t* spans = span_buffer->spans.data;
@@ -952,8 +985,8 @@ static void blend_transformed_bilinear_tiled_argb(plutovg_surface_t* surface, pl
         const float cx = spans->x + 0.5f;
         const float cy = spans->y + 0.5f;
 
-        int fx = (int)((texture->matrix.c * cy + texture->matrix.a * cx + texture->matrix.e) * FIXED_SCALE);
-        int fy = (int)((texture->matrix.d * cy + texture->matrix.b * cx + texture->matrix.f) * FIXED_SCALE);
+        int64_t fx = blend_fixed(texture->matrix.c * cy + texture->matrix.a * cx + texture->matrix.e);
+        int64_t fy = blend_fixed(texture->matrix.d * cy + texture->matrix.b * cx + texture->matrix.f);
 
         fx -= HALF_POINT;
         fy -= HALF_POINT;
@@ -965,8 +998,8 @@ static void blend_transformed_bilinear_tiled_argb(plutovg_surface_t* surface, pl
             const uint32_t* end = buffer + l;
             uint32_t* b = buffer;
             while (b < end) {
-                int x1 = (fx >> 16) % image_width;
-                int y1 = (fy >> 16) % image_height;
+                int x1 = (int)((fx >> 16) % image_width);
+                int y1 = (int)((fy >> 16) % image_height);
 
                 if(x1 < 0) x1 += image_width;
                 if(y1 < 0) y1 += image_height;
