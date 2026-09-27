@@ -1,0 +1,371 @@
+#!ccc ccs
+/*
+ * Terminal image encoders (core/img_term.h, docs/images.md "Terminal"):
+ * golden block art for a few small images (half blocks / quadrants /
+ * sextants, 24-bit and 256 colours, dithered), the resampler works in
+ * linear light, the xterm-256 quantiser, a sixel round trip through a
+ * small decoder here (pixels and transparency), PNG + zlib round trips
+ * through the Wuffs loader, and kitty placeholder cells.
+ * RTX_GOLDEN_PRINT=1 prints the block art strings instead of checking.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/img.cch"
+#include "../core/img_term.h"
+
+static int fails = 0;
+static int g_print;
+
+/* Golden block art (RTX_GOLDEN_PRINT=1 prints what the encoder makes). */
+#define GOLD_QUAD_HALF_TRUE \
+    "20:-/#dc1e1e 20:-/#dc1e1e 20:-/#1ec828 20:-/#1ec828|"\
+    "2580:#dc1e1e/#283cdc 2580:#dc1e1e/#283cdc 2580:#1ec828/#fafafa 2580:#1ec828/#fafafa|"\
+    "20:-/#283cdc 20:-/#283cdc 20:-/#fafafa 20:-/#fafafa"
+#define GOLD_QUAD_HALF_256 \
+    "20:-/160 20:-/160 20:-/40 20:-/40|"\
+    "2580:160/26 2580:160/26 2580:40/231 2580:40/231|"\
+    "20:-/26 20:-/26 20:-/231 20:-/231"
+#define GOLD_QUAD_QUAD \
+    "2580:#dc1e1e/#a330a3 2580:#1ec828/#b9e3ba|"\
+    "2580:#283cdc/- 2580:#fafafa/-"
+#define GOLD_QUAD_SEXT \
+    "1FB0E:#dc1e1e/#a330a3 1FB0E:#1ec828/#b9e3ba|"\
+    "1FB0E:#283cdc/- 1FB0E:#fafafa/-"
+#define GOLD_QUAD_QUAD1 \
+    "259B:#897f89/#fafafa"
+#define GOLD_QUAD_SEXT1 \
+    "1FB15:#907190/#ddefdd"
+#define GOLD_QUAD_DITHER \
+    "20:-/160 2580:160/167 2580:41/70 2580:40/41|"\
+    "2580:160/27 2580:160/62 2580:41/255 2580:76/255|"\
+    "2580:62/26 2580:20/62 2580:231/255 20:-/231"
+#define GOLD_ANIM \
+    "20:-/#dc1e1e 20:-/#dc1e1e"
+#define GOLD_EXIF6 \
+    "20:-/160 20:-/160 20:-/40 20:-/40|"\
+    "20:-/26 20:-/26 20:-/231 20:-/231"
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static uint8_t *slurp(const char *path, size_t *n) {
+    FILE *fp = fopen(path, "rb");
+    long sz;
+    uint8_t *b;
+    *n = 0;
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    b = (uint8_t *)malloc((size_t)sz + 1);
+    if (b && fread(b, 1, (size_t)sz, fp) != (size_t)sz) {
+        free(b);
+        b = NULL;
+    }
+    fclose(fp);
+    if (b) *n = (size_t)sz;
+    return b;
+}
+
+static int decode_file(const char *path, RtxImgBmp *bmp) {
+    size_t n = 0;
+    uint8_t *b = slurp(path, &n);
+    int rc;
+    if (!b) return 0;
+    rc = rtx_img_decode(b, n, rtx_img_limits(), 0, 0, RTX_IMG_PIX_RGBA, 1, NULL, bmp, NULL);
+    free(b);
+    return rc == RTX_IMG_OK;
+}
+
+/* "cp:fg/bg" per cell, rows joined by '|'; colours as palette numbers or
+ * #rrggbb, '-' for the default. */
+static void cells_str(const RtxTimgCell *c, int cols, int rows, char *out, size_t cap) {
+    size_t o = 0;
+    int i, n = cols * rows;
+    out[0] = 0;
+    for (i = 0; i < n && o + 40 < cap; i++) {
+        char f[16], b[16];
+        if (c[i].fg < 0) snprintf(f, sizeof f, "-");
+        else if (RTX_TIMG_IS_RGB(c[i].fg)) snprintf(f, sizeof f, "#%06x", (unsigned)(c[i].fg & 0xffffff));
+        else snprintf(f, sizeof f, "%d", (int)c[i].fg);
+        if (c[i].bg < 0) snprintf(b, sizeof b, "-");
+        else if (RTX_TIMG_IS_RGB(c[i].bg)) snprintf(b, sizeof b, "#%06x", (unsigned)(c[i].bg & 0xffffff));
+        else snprintf(b, sizeof b, "%d", (int)c[i].bg);
+        o += (size_t)snprintf(out + o, cap - o, "%s%X:%s/%s", i % cols ? " " : (i ? "|" : ""),
+                              (unsigned)c[i].cp, f, b);
+    }
+}
+
+static void golden(const char *name, const RtxImgBmp *bmp, uint32_t cw, uint32_t ch, int cols,
+                   int rows, int glyphs, int colors, int dither, const char *want) {
+    RtxTimgCell cells[64];
+    char got[4096], msg[4400];
+    int ok = rtx_timg_blocks(bmp->px, bmp->w, bmp->h, bmp->stride, 0, 0, cw, ch, (uint32_t)cols,
+                             (uint32_t)rows, glyphs, colors, dither, cells);
+    cells_str(cells, cols, rows, got, sizeof got);
+    if (g_print) {
+        printf("%s: \"%s\"\n", name, got);
+        return;
+    }
+    snprintf(msg, sizeof msg, "golden %s:\n  got  %s\n  want %s", name, got, want);
+    expect(ok && strcmp(got, want) == 0, msg);
+}
+
+static void test_golden(void) {
+    RtxImgBmp q, a, e;
+    memset(&q, 0, sizeof q);
+    memset(&a, 0, sizeof a);
+    memset(&e, 0, sizeof e);
+    expect(decode_file("testdata/img/quad.png", &q), "decode quad.png");
+    expect(decode_file("testdata/img/anim.gif", &a), "decode anim.gif");
+    expect(decode_file("testdata/img/exif6.png", &e), "decode exif6.png (EXIF 6 upright)");
+    if (!q.px || !a.px || !e.px) goto out;
+    /* quad.png: 32x24, red / green / blue / white quadrants. */
+    golden("quad half 24-bit 8x8", &q, 8, 8, 4, 3, RTX_TIMG_HALF, RTX_TIMG_TRUE, 0,
+           GOLD_QUAD_HALF_TRUE);
+    golden("quad half 256 8x8", &q, 8, 8, 4, 3, RTX_TIMG_HALF, RTX_TIMG_256, 0,
+           GOLD_QUAD_HALF_256);
+    golden("quad quadrant 24-bit 16x16", &q, 16, 16, 2, 2, RTX_TIMG_QUAD, RTX_TIMG_TRUE, 0,
+           GOLD_QUAD_QUAD);
+    golden("quad sextant 24-bit 16x16", &q, 16, 16, 2, 2, RTX_TIMG_SEXT, RTX_TIMG_TRUE, 0,
+           GOLD_QUAD_SEXT);
+    /* The whole picture in one cell: the best two-colour split. */
+    golden("quad quadrant one cell", &q, 32, 24, 1, 1, RTX_TIMG_QUAD, RTX_TIMG_TRUE, 0,
+           GOLD_QUAD_QUAD1);
+    golden("quad sextant one cell", &q, 32, 24, 1, 1, RTX_TIMG_SEXT, RTX_TIMG_TRUE, 0,
+           GOLD_QUAD_SEXT1);
+    golden("quad half 256 dithered 8x8", &q, 8, 8, 4, 3, RTX_TIMG_HALF, RTX_TIMG_256, 1,
+           GOLD_QUAD_DITHER);
+    /* anim.gif frame 0: 16x16 solid red: spaces on a red background. */
+    golden("anim half 24-bit 8x16", &a, 8, 16, 2, 1, RTX_TIMG_HALF, RTX_TIMG_TRUE, 0,
+           GOLD_ANIM);
+    /* exif6.png: 40x20 displayed after EXIF 6. */
+    golden("exif6 quadrant 256 10x10", &e, 10, 10, 4, 2, RTX_TIMG_QUAD, RTX_TIMG_256, 0,
+           GOLD_EXIF6);
+out:
+    rtx_img_bmp_free(&q);
+    rtx_img_bmp_free(&a);
+    rtx_img_bmp_free(&e);
+}
+
+static void test_scale(void) {
+    /* Black and white averaged in linear light: sRGB 188, not 128. */
+    uint8_t src[8] = {0, 0, 0, 255, 255, 255, 255, 255}, dst[4];
+    uint8_t half[8] = {255, 0, 0, 255, 0, 0, 0, 0}; /* red, transparent */
+    expect(rtx_timg_scale(src, 2, 1, 8, 1, 1, 0, 0, 1, 1, dst) && dst[0] >= 186 &&
+               dst[0] <= 189 && dst[3] == 255,
+           "scale: linear-light average of black and white");
+    expect(rtx_timg_scale(half, 2, 1, 8, 1, 1, 0, 0, 1, 1, dst) && dst[0] == 255 && dst[1] == 0 &&
+               dst[3] >= 127 && dst[3] <= 128,
+           "scale: premultiplied (a transparent neighbour does not darken)");
+    expect(rtx_timg_scale(src, 2, 1, 8, 4, 1, 2, 0, 2, 1, dst) == 1, "scale: up, crop");
+    expect(!rtx_timg_scale(src, 2, 1, 8, 4, 1, 3, 0, 2, 1, dst), "scale: crop out of range");
+}
+
+static void test_256(void) {
+    uint8_t r, g, b;
+    expect(rtx_timg_256(255, 0, 0) == 196, "256: red is 196");
+    expect(rtx_timg_256(0, 0, 0) == 16, "256: black is 16");
+    expect(rtx_timg_256(128, 128, 128) == 244, "256: mid grey on the ramp");
+    rtx_timg_256_rgb(231, &r, &g, &b);
+    expect(r == 255 && g == 255 && b == 255, "256: 231 is white");
+}
+
+/* A sixel decoder (the subset rtx_timg_sixel writes). */
+static int sixel_dec(const char *s, size_t n, uint8_t *px, uint32_t w, uint32_t h, int *pw,
+                     int *ph) {
+    size_t i = 0;
+    int pal[256][3], cur = 0, x = 0, y = 0;
+    memset(pal, 0, sizeof pal);
+    if (n < 4 || s[0] != 0x1b || s[1] != 'P') return 0;
+    while (i < n && s[i] != 'q') i++;
+    i++;
+    if (i < n && s[i] == '"') {
+        int a, b2;
+        if (sscanf(s + i, "\"%d;%d;%d;%d", &a, &b2, pw, ph) != 4) return 0;
+        while (i < n && s[i] != '#') i++;
+    }
+    while (i < n) {
+        char c = s[i];
+        if (c == 0x1b) break;
+        if (c == '#') {
+            int k = 0, m, rr, gg, bb, used = 0;
+            if (sscanf(s + i, "#%d;%d;%d;%d;%d%n", &k, &m, &rr, &gg, &bb, &used) == 5 && used) {
+                pal[k & 255][0] = rr * 255 / 100;
+                pal[k & 255][1] = gg * 255 / 100;
+                pal[k & 255][2] = bb * 255 / 100;
+                i += (size_t)used;
+            } else {
+                sscanf(s + i, "#%d%n", &k, &used);
+                i += (size_t)(used ? used : 1);
+            }
+            cur = k & 255;
+            continue;
+        }
+        if (c == '$') {
+            x = 0;
+            i++;
+            continue;
+        }
+        if (c == '-') {
+            x = 0;
+            y += 6;
+            i++;
+            continue;
+        }
+        {
+            int rep = 1, bits, k2, used = 0;
+            if (c == '!') {
+                sscanf(s + i, "!%d%n", &rep, &used);
+                i += (size_t)used;
+                c = s[i];
+            }
+            if (c < 63 || c > 126) {
+                i++;
+                continue;
+            }
+            bits = c - 63;
+            while (rep-- > 0) {
+                for (k2 = 0; k2 < 6; k2++)
+                    if ((bits & (1 << k2)) && (uint32_t)x < w && (uint32_t)(y + k2) < h) {
+                        uint8_t *p = px + ((size_t)(y + k2) * w + (size_t)x) * 4;
+                        p[0] = (uint8_t)pal[cur][0];
+                        p[1] = (uint8_t)pal[cur][1];
+                        p[2] = (uint8_t)pal[cur][2];
+                        p[3] = 255;
+                    }
+                x++;
+            }
+            i++;
+        }
+    }
+    return 1;
+}
+
+static void test_sixel(void) {
+    RtxImgBmp q;
+    char *six = NULL;
+    size_t sn = 0;
+    uint8_t *px;
+    int pw = 0, ph = 0, bad = 0;
+    uint32_t x, y;
+    memset(&q, 0, sizeof q);
+    if (!decode_file("testdata/img/quad.png", &q)) {
+        expect(0, "sixel: decode quad.png");
+        return;
+    }
+    expect(rtx_timg_sixel(q.px, q.w, q.h, q.stride, 256, NULL, &six, &sn) && sn > 20,
+           "sixel: encode");
+    px = (uint8_t *)calloc((size_t)q.w * q.h, 4);
+    expect(px && sixel_dec(six, sn, px, q.w, q.h, &pw, &ph), "sixel: decode");
+    expect(pw == 32 && ph == 24, "sixel: raster attributes carry the size");
+    expect(sn > 2 && six[sn - 2] == 0x1b && six[sn - 1] == '\\', "sixel: ends with ST");
+    for (y = 0; px && y < q.h; y++)
+        for (x = 0; x < q.w; x++) {
+            const uint8_t *a = q.px + (size_t)y * q.stride + (size_t)x * 4;
+            const uint8_t *b = px + ((size_t)y * q.w + x) * 4;
+            if (a[3] < 128) {
+                if (b[3]) bad++; /* transparent stays untouched */
+            } else if (abs(a[0] - b[0]) > 3 || abs(a[1] - b[1]) > 3 || abs(a[2] - b[2]) > 3 ||
+                       !b[3]) {
+                bad++;
+            }
+        }
+    expect(bad == 0, "sixel: round trip pixels (<= 3 off), transparency kept");
+    {
+        /* Cancel: a set flag stops the encoder between bands. */
+        volatile int cancel = 1;
+        char *o = NULL;
+        size_t on = 0;
+        expect(!rtx_timg_sixel(q.px, q.w, q.h, q.stride, 16, &cancel, &o, &on) && !o,
+               "sixel: cancel");
+    }
+    free(px);
+    free(six);
+    rtx_img_bmp_free(&q);
+}
+
+static void test_png(void) {
+    uint32_t w = 97, h = 61, x, y;
+    uint8_t *src = (uint8_t *)malloc((size_t)w * h * 4), *png = NULL;
+    size_t pn = 0;
+    RtxImgBmp out;
+    int rc, same = 1;
+    memset(&out, 0, sizeof out);
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            uint8_t *p = src + ((size_t)y * w + x) * 4;
+            p[0] = (uint8_t)(x * 255 / w);
+            p[1] = (uint8_t)(y * 255 / h);
+            p[2] = ((x / 8 + y / 8) & 1) ? 200 : 30;
+            p[3] = (x < 5 && y < 5) ? 0 : 255;
+        }
+    expect(rtx_timg_png(src, w, h, w * 4, &png, &pn) && pn > 60, "png: encode");
+    rc = rtx_img_decode(png, pn, rtx_img_limits(), 0, 0, RTX_IMG_PIX_RGBA, 1, NULL, &out, NULL);
+    expect(rc == RTX_IMG_OK && out.w == w && out.h == h, "png: Wuffs reads it back");
+    for (y = 0; rc == RTX_IMG_OK && y < h; y++)
+        for (x = 0; x < w; x++) {
+            const uint8_t *a = src + ((size_t)y * w + x) * 4;
+            const uint8_t *b = out.px + (size_t)y * out.stride + (size_t)x * 4;
+            if (a[3] != b[3] || (a[3] && memcmp(a, b, 3) != 0)) same = 0;
+        }
+    expect(same, "png + zlib: pixels identical");
+    {
+        /* A long run compresses (LZ77 matches), and zero bytes are a valid
+         * stream. */
+        uint8_t *z = NULL, zeros[65536];
+        size_t zn = 0;
+        memset(zeros, 7, sizeof zeros);
+        expect(rtx_timg_zlib(zeros, sizeof zeros, &z, &zn) && zn < 2000, "zlib: runs compress");
+        free(z);
+        z = NULL;
+        expect(rtx_timg_zlib(zeros, 0, &z, &zn) && zn >= 8, "zlib: empty input");
+        free(z);
+    }
+    free(src);
+    free(png);
+    rtx_img_bmp_free(&out);
+}
+
+static void test_kitty(void) {
+    char ph[32];
+    int n = rtx_timg_kitty_ph(0, 0, 0, ph);
+    /* U+10EEEE U+0305 U+0305 */
+    expect(n == 8 && memcmp(ph, "\xf4\x8e\xbb\xae\xcc\x85\xcc\x85", 8) == 0,
+           "kitty: placeholder (0, 0)");
+    n = rtx_timg_kitty_ph(2, 5, 7, ph);
+    expect(n == 10 && memcmp(ph + 4, "\xcc\x8e\xcc\xbd\xcc\xbf", 6) == 0,
+           "kitty: row 2, column 5, id byte 7");
+    expect(rtx_timg_kitty_diac(0x0305) == 0 && rtx_timg_kitty_diac(0x1D244) == 296 &&
+               rtx_timg_kitty_diac(0x0300) == -1,
+           "kitty: the diacritics table");
+    {
+        char b[32];
+        expect(rtx_timg_b64((const uint8_t *)"any carnal pleas", 16, b) == 24 &&
+                   strcmp(b, "YW55IGNhcm5hbCBwbGVhcw==") == 0,
+               "base64");
+    }
+}
+
+int main(void) {
+    g_print = getenv("RTX_GOLDEN_PRINT") != NULL;
+    test_golden();
+    if (g_print) return 0;
+    test_scale();
+    test_256();
+    test_sixel();
+    test_png();
+    test_kitty();
+    if (fails) {
+        fprintf(stderr, "img_term_smoke: %d failed\n", fails);
+        return 1;
+    }
+    printf("img_term_smoke ok\n");
+    return 0;
+}

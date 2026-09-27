@@ -430,27 +430,33 @@ static void ti_cell(int glyphs, int colors, int n, const int *pr, const int *pg,
             }
         }
     }
-    s1[0] = s1[1] = s1[2] = s0[0] = s0[1] = s0[2] = 0;
-    n1 = n0 = 0;
-    for (k = 0; k < n; k++) {
-        if (best & (1u << k)) {
-            s1[0] += pr[k];
-            s1[1] += pg[k];
-            s1[2] += pb[k];
-            n1++;
-        } else if (!clear[k]) {
-            s0[0] += pr[k];
-            s0[1] += pg[k];
-            s0[2] += pb[k];
-            n0++;
+    {
+        /* Each side's colour: the mean in linear light. */
+        float f1[3] = {0, 0, 0}, f0[3] = {0, 0, 0};
+        n1 = n0 = 0;
+        for (k = 0; k < n; k++) {
+            float *f;
+            if (best & (1u << k)) {
+                f = f1;
+                n1++;
+            } else if (!clear[k]) {
+                f = f0;
+                n0++;
+            } else {
+                continue;
+            }
+            f[0] += g_lin[pr[k]];
+            f[1] += g_lin[pg[k]];
+            f[2] += g_lin[pb[k]];
         }
+        ti_lut();
+        c->cp = ti_glyph(glyphs, best);
+        c->fg = ti_color(colors, ti_to_srgb(f1[0] / (float)n1), ti_to_srgb(f1[1] / (float)n1),
+                         ti_to_srgb(f1[2] / (float)n1));
+        if (n0)
+            c->bg = ti_color(colors, ti_to_srgb(f0[0] / (float)n0),
+                             ti_to_srgb(f0[1] / (float)n0), ti_to_srgb(f0[2] / (float)n0));
     }
-    c->cp = ti_glyph(glyphs, best);
-    c->fg = ti_color(colors, (int)((s1[0] + n1 / 2) / n1), (int)((s1[1] + n1 / 2) / n1),
-                     (int)((s1[2] + n1 / 2) / n1));
-    if (n0)
-        c->bg = ti_color(colors, (int)((s0[0] + n0 / 2) / n0), (int)((s0[1] + n0 / 2) / n0),
-                         (int)((s0[2] + n0 / 2) / n0));
     if (n0 && c->fg == c->bg) {
         c->cp = 0x20;
         c->fg = -1;

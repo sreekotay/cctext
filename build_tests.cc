@@ -179,6 +179,10 @@ CC_TARGET img_fuzz exe tests/img_fuzz.ccs
 CC_TARGET_INCLUDE img_fuzz .
 CC_TARGET_DEPS img_fuzz rtx_img rtx_safe rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_rx rtx_page_store
 
+CC_TARGET img_term_smoke exe tests/img_term_smoke.ccs
+CC_TARGET_INCLUDE img_term_smoke .
+CC_TARGET_DEPS img_term_smoke rtx_img rtx_safe rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_rx rtx_page_store
+
 CC_TARGET img_layout_smoke exe tests/img_layout_smoke.ccs
 CC_TARGET_INCLUDE img_layout_smoke .
 CC_TARGET_DEPS img_layout_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout rtx_img rtx_safe rtx_rx rtx_page_store
