@@ -3440,12 +3440,108 @@ def case_image_idle(exe, tmp):
         t.kill()
 
 
+def case_mermaid_blocks(exe, tmp):
+    """A ```mermaid fence in the terminal (docs/images.md "Mermaid"):
+    RTX_TUI_IMAGES=blocks, so the diagram cctext-render draws is Unicode
+    block art in ordinary cells; the fence's lines are hidden (the picture
+    row is its opening line); the caret into the fence shows the source
+    with the diagram under it; typing keeps the old diagram up (darkened)
+    until the new one lands; nothing to do once it settles."""
+    if pyte is None:
+        print("skip: mermaid blocks (no pyte)")
+        return
+    if not os.path.exists(os.path.join(os.path.dirname(exe), "cctext-render")):
+        print("skip: mermaid blocks (no cctext-render)")
+        return
+    proj = os.path.join(tmp, "mmb")
+    os.makedirs(os.path.join(proj, ".git"), exist_ok=True)
+    body = (b"# Diagram\n\nBefore.\n\n```mermaid\nflowchart LR\n  A[Start] --> B{Ok?}\n"
+            b"  B --> C[Done]\n```\n\nAfter the fence.\n" +
+            b"".join(b"line %d\n" % i for i in range(30)))
+    path = os.path.join(proj, "doc.md")
+    with open(path, "wb") as f:
+        f.write(body)
+    env = img_env(tmp, "mmb")
+    env["RTX_TUI_IMAGES"] = "blocks"
+    t = Tui(exe, ["--no-blink", path], env, fake=FakeTerm("silent"))
+
+    def art_rows(sc, y0, y1):
+        """Rows in [y0, y1) holding block glyphs."""
+        n = 0
+        for y in range(max(0, y0), min(sc.lines, y1)):
+            row = "".join(sc.buffer[y][x].data for x in range(sc.columns))
+            if any(ch in row for ch in "▀▄█"):
+                n += 1
+        return n
+    try:
+        t0 = time.time()
+        while time.time() - t0 < 2.0 and b"\x1b[?2026h" not in t.out:
+            t.pump(0.02)
+        t.pump(0.05)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        txt = "\n".join(sc.display)
+        check("[diagram: rendering...]" in txt or art_rows(sc, 4, 20) > 0,
+              "mermaid blocks: a one-line box while it renders", txt[:400])
+        t.pump(3.0)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        txt = "\n".join(sc.display)
+        top = find_row(sc, " 5 ")
+        after = find_row(sc, "After the fence.")
+        check(top >= 0 and after > top + 4 and art_rows(sc, top, after) >= 4,
+              "mermaid blocks: the diagram is block art under line 5",
+              repr((top, after, art_rows(sc, top, after))))
+        check("flowchart LR" not in txt and "```mermaid" not in txt,
+              "mermaid blocks: the fence's lines are hidden")
+        frames = t.out[t.out.find(b"\x1b[?2026h"):]
+        check(b"\x1b_G" not in frames and b"\x1bPq" not in frames,
+              "mermaid blocks: no graphics escapes (cells only)")
+        # Settled: nothing to do.
+        mark = len(t.out)
+        c0 = proc_cpu(t.pid) if os.path.exists("/proc/self/stat") else 0
+        check_idle("mermaid blocks: settled", t.pid, t.pump)
+        c1 = proc_cpu(t.pid) if os.path.exists("/proc/self/stat") else 0
+        check(len(t.out) == mark and c1 - c0 < 0.05, "mermaid blocks: idle, no output",
+              repr((len(t.out) - mark, c1 - c0)))
+        # The caret into the fence: the source, the diagram under it.
+        t.send(b"\x1b[B" * 4, 0.8)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        close = find_row(sc, " 9 ```")
+        after = find_row(sc, "After the fence.")
+        check(find_row(sc, "flowchart LR") >= 0 and close >= 0 and after > close + 3 and
+              art_rows(sc, close + 1, after) >= 4,
+              "mermaid blocks: the caret shows the source, the diagram under it",
+              repr((close, after)))
+        # Type into the fence: the old diagram stays (darkened), then the new.
+        # Looked at well inside the new render (a flowchart takes ~200 ms
+        # warm): its size lands a moment before its pixels, and the box
+        # re-fits in that gap.
+        t.send(b"\x1b[B\x1b[B\x1b[B\x1b[F", 0.3)
+        t.send(b"\r  C --> D[More]", 0.12)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        close = find_row(sc, "10 ```")
+        check(close > 0 and art_rows(sc, close + 1, close + 14) >= 4,
+              "mermaid blocks: the old diagram stays up while the source changes",
+              "\n".join(sc.display))
+        t.pump(3.0)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        close = find_row(sc, "10 ```")
+        check(close > 0 and art_rows(sc, close + 1, close + 14) >= 4 and
+              "[diagram" not in "\n".join(sc.display),
+              "mermaid blocks: the new diagram lands", "\n".join(sc.display))
+        t.send(b"\x11", 0.3)
+        t.send(b"n", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
 CASES = {
     "image_idle": case_image_idle,
     "idle_threads": case_idle_threads,
     "image_viewer": case_image_viewer,
     "image_present": case_image_present,
     "image_blocks": case_image_blocks,
+    "mermaid_blocks": case_mermaid_blocks,
     "image_kitty": case_image_kitty,
     "image_sixel": case_image_sixel,
     "image_iterm": case_image_iterm,
