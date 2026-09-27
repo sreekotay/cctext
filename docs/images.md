@@ -1,10 +1,10 @@
 # Images
 
-Phase 1: cctext-ui paints pictures in the Markdown Rich lens, in slides,
-in the browse preview and in an image viewer; cctext (the terminal) shows
-the text stand-in `[image: alt WxH]`. Terminal graphics (kitty, iTerm2,
-sixel) are phase 2; the loader already decodes to straight RGBA at a
-requested size for them.
+cctext-ui paints pictures in the Markdown Rich lens, in slides, in the
+browse preview and in an image viewer (phase 1); cctext paints them in
+the same places with the kitty graphics protocol, sixel, iTerm2 inline
+images or Unicode block art, whichever the terminal answers for, else
+the text stand-in `[image: alt WxH]` (phase 2, [Terminal](#terminal-cctext)).
 
 Bytes stay the truth. `![alt](path)` stays in the file exactly as typed;
 the picture is a painted stand-in over those bytes (the Rich lens, the
@@ -18,7 +18,9 @@ shim), `core/layout.ccs` (stand-ins and picture rows),
 `frontend/gui_img.ccs` (pictures, placeholders, dialog, viewer, preview),
 `frontend/gui_present.ccs` (slides), `frontend/ui_os_*` (the blit),
 `frontend/cctext_input.ccs` / `cctext_draw.ccs` / `cctext_present.ccs`
-(terminal stand-ins and prompt).
+(terminal stand-ins, prompt, picture rows, viewer, slides),
+`frontend/cctext_img.ccs` (terminal detection, encode cache and jobs,
+overlays, kitty ids), `core/img_term.c` / `.h` (terminal encoders).
 
 ## Decoder
 
@@ -194,10 +196,16 @@ is, the image's bytes show like any revealed mark (`rtx_layout_reveal`
 unions the images on the caret's and anchor's lines), and they edit as
 text.
 
-- **Terminal** (and an image inside a line of text in cctext-ui): the
-  stand-in is text, `[image: alt WxH]` — `[image: alt]` while the header
-  is on its way, `[image: alt - host]` for a remote image not yet
-  allowed, `[image: alt - outside project]`, `[image: alt - reason]`.
+- **An image inside a line of text** (both hosts), and every image in a
+  terminal that cannot draw pictures: the stand-in is text,
+  `[image: alt WxH]` — `[image: alt]` while the header is on its way,
+  `[image: alt - host]` for a remote image not yet allowed,
+  `[image: alt - outside project]`, `[image: alt - reason]` (a terminal
+  keeps this one-line stand-in for an image that failed or waits for a
+  decision, even when it draws pictures).
+- **cctext, a line that is one image**: a picture row of cell rows
+  ([Terminal](#terminal-cctext)), no padding; revealed, the picture sits
+  under the source line.
 - **cctext-ui, a line that is one image** (blanks around it allowed) is
   a **picture row**: its height is the picture's box (the pane's width
   and `image_max_height`, never upscaled) plus 3 px above and below. The
@@ -224,17 +232,131 @@ image lays out at its header size, or Marp's `w:` / `h:` (`width:` /
 the slide. Transitions animate images with everything else (fade, move,
 wipe clips, zoom and morph scale them); the bitmap is decoded once at the
 slide's own scale, so a zoom scales one bitmap instead of decoding per
-frame. The terminal slide shows the stand-in text.
+frame. The terminal slide paints them as pictures too
+([Terminal](#terminal-cctext)); a terminal without pictures shows the
+stand-in text.
 
 ## Browse preview and the viewer
 
 An image file in the browse preview is its picture scaled to the pane,
-with its format, size and byte count under it (cctext: the stand-in
-line). Opened directly, an image file is the **viewer** in cctext-ui:
-fitted (never above 100 %), `+` / `-` zoom, `0` fit, `1` actual size,
-arrows pan; typing never edits the bytes there. `Ctrl-D` switches the
+with its format, size and byte count under it (cctext:
+`[image: PNG 1200x900, 4.4 KiB]` under the picture). Opened directly, an
+image file is the **viewer** in both hosts: fitted (never above 100 %),
+`+` / `-` zoom, `0` fit, `1` actual size, arrows pan; typing never edits
+the bytes there. `Ctrl-D` switches the
 pane to hex and back (the view is the journal's, so it sticks). These are
 files the user picked, so no document policy applies.
+
+## Terminal (cctext)
+
+Phase 2: cctext paints pictures too — in the Rich lens, in slides, in the
+browse preview and in the image viewer — with whatever the terminal can
+draw, found by asking it, never by guessing from `TERM`.
+
+| Protocol | When (`tui_images: auto`) | How it paints |
+|---|---|---|
+| **kitty** graphics, Unicode placeholders | the terminal answers a kitty query (`a=q`) OK (not WezTerm / Konsole by XTVERSION: no placeholders there) | the image is sent once per (bitmap, box) with a virtual placement (`a=T,U=1,c=…,r=…,f=32,o=z,q=2`); then it is ordinary cells: `U+10EEEE` plus the row and column diacritics, the id's low byte in the fg colour (256-colour), its top byte in a third diacritic |
+| **iTerm2** inline images | XTVERSION says iTerm2 or WezTerm | `OSC 1337 ; File=inline=1;width=N;height=M` (cells) with a PNG we encode, over blank cells |
+| **sixel** | DA1 lists attribute 4 | a median-cut palette (up to 256, or what `XTSMGRAPHICS` reports) and sixel bands, over blank cells |
+| **block art** | none of those, and the terminal has colours | Unicode `▀` half blocks with 24-bit fg / bg (1 × 2 pixels a cell); quadrants (2 × 2) or sextants (`U+1FB00` block, 2 × 3) by setting; xterm-256 colours when there is no truecolor |
+| text | no colours at all (`TERM=xterm`, a console), or `off` | the stand-in `[image: alt WxH]` as before |
+
+Block art and kitty cells are text: they go through the row diff, the
+region scrolls, split panes and clipping unchanged (and through tmux,
+which only sees cells). Sixel and iTerm2 draw outside the text grid, so
+the frame writer treats them as overlays: the rows under one are blank
+cells; an overlay is drawn after the rows whenever it is new, moved, or
+any row it covers was just written; rows whose overlay went away are
+rewritten (which erases its pixels); a region scroll never moves rows
+that an overlay covers (they take the plain row diff); a picture in a
+side-by-side pane, or partly scrolled out, is cropped and encoded for
+that crop.
+
+**Pixels** come only from the loader: `rtx_img_want_pix(…, RTX_IMG_PIX_RGBA)`
+asks for straight RGBA at the display size (never above natural size),
+kept apart from cctext-ui's premultiplied bitmaps; never the file's
+bytes. The encoders (`core/img_term.c`, pure C, no libm) resample in
+linear light (an area average of premultiplied samples; nearest when
+zooming in), pick each cell's two colours as the best split of its
+sub-pixels (least squared error, means in linear light), quantize to the
+xterm cube / grey ramp (Floyd–Steinberg with `tui_dither`), build sixel
+bands with run-length repeats, and write PNG and zlib (a fixed-Huffman
+deflate with LZ77) for kitty's `o=z` and iTerm2 — no zlib dependency.
+
+**Detection** runs once the TTY is raw, before the first frame: a kitty
+query (and, when not over SSH, a second one naming a temp file, `t=t`:
+an OK means the terminal reads our files), XTVERSION, `CSI 16 t` when
+`TIOCGWINSZ` has no pixel size, `XTSMGRAPHICS`, a truecolor `DECRQSS`
+probe (unless `COLORTERM` says so), then DA1. Every terminal answers DA1,
+so its reply ends the wait; with no reply at all the wait is at most
+150 ms (`RTX_TUI_DETECT_MS`), then block art (or the text stand-in).
+Keys typed meanwhile stay input; a reply that comes later is swallowed
+by the key decoder (an `APC G`, a DCS or an OSC string), never typed.
+The cell size is `ws_xpixel / ws_col` × `ws_ypixel / ws_row`, else the
+`CSI 16 t` reply, else 8 × 16 (1:2).
+
+**tmux**: the kitty query and XTVERSION go through DCS passthrough; only
+if the outer terminal's echo comes back (`allow-passthrough` on) are
+kitty transmits wrapped for passthrough — the placeholders are plain
+cells tmux keeps. Otherwise block art (tmux's own DA1 decides sixel).
+Nothing is spawned (`tmux show` is never run).
+
+**SSH** (`SSH_TTY` / `SSH_CONNECTION`): kitty sends chunked base64 (4096
+a chunk, `m=1`), never a temp file; a picture over `tui_ssh_kpx`
+thousand display pixels (64) is block art unless `tui_images` names a
+protocol. Locally kitty gets a temp file per image
+(`$TMPDIR/tty-graphics-protocol-cctext-<pid>-<n>`, `t=t`: the terminal
+reads and deletes it).
+
+**Kitty images are ours to delete**: ids are `(top byte << 24) | low
+byte`, the top byte from the pid (below 2³¹), 255 live ids recycled
+least recently painted first (a `d=I` delete for the old one). Exit, ^Z
+and the fatal-signal handler write a delete for every image sent
+(`a=d,d=I,i=…`, one async-signal-safe `write` of a prebuilt string, next
+to the scroll-region reset); resume sends them again.
+
+**Where pictures show**:
+
+- **Rich Markdown**: a line that is one image is a picture row of N
+  terminal rows — `rtx_img_cells_set` switches the layout's picture rows
+  on for cells, the box from the header and the cell pixel size (the
+  pane's width by `image_max_height` or the screen's rows minus 4,
+  never above natural size). The rows are reserved from the header
+  before a pixel is decoded; an image that failed or waits for a
+  decision keeps its one-line stand-in. The caret on the line shows the
+  source with the picture under it, as in cctext-ui; an inline image
+  stays `[image: alt WxH]`. While pixels are on the way the first row
+  shows the stand-in text dimmed.
+- **Slides** (`Shift-F5`): a content image at its natural size at the
+  slide's scale (Marp `w:` / `h:`), fitted to what is left of the slide;
+  `![bg]` cover (cropped to the middle), contain / fit or auto, the whole
+  slide or its `left:` / `right:` side. A transition moves cells, so
+  pictures are cells then (sixel / iTerm2 fall back to block art for
+  those frames), as is a whole-slide background with text over it.
+- **Browse preview**: an image file's picture fitted to the preview,
+  its `[image: PNG 1200x900, 4.4 KiB]` line under it.
+- **The viewer**: an image file opened in cctext shows the picture,
+  fitted (never above 100 %); `+` / `=` zoom in, `-` out, `1` actual size,
+  `0` fit, arrows / wheel / PgUp / PgDn pan, Home back to the corner;
+  typing never edits the bytes; `Ctrl-D` shows the hex and back. A
+  picture's box is capped at 296 cells a side (what a kitty placement
+  can address).
+
+**Never block**: scaling and encoding run on one background lane (the
+loader's lane shape: a job record owning a copy of its pixels, a done
+flag, adopt on the UI thread), most recently painted first, cached per
+(bitmap, frame, protocol, box, crop) under 96 MiB; a paint pass that no
+longer asks for a queued or running encode drops or cancels it (sixel
+polls the flag between bands); one not painted for 600 whole paints
+goes. The UI thread only copies pixels and writes what is ready. An
+idle editor with pictures on screen writes nothing and does not wake;
+with `image_animate` an animated GIF repaints at most every 80 ms (the
+terminal frame budget), each frame one cached encode.
+
+**Settings** (`settings.json`): `tui_images` (`auto` | `kitty` | `sixel`
+| `iterm` | `blocks` | `off`; `RTX_TUI_IMAGES` overrides), `tui_blocks`
+(`half` | `quadrant` | `sextant`; `RTX_TUI_BLOCKS`), `tui_dither`
+(Floyd–Steinberg in 256 colours), `tui_ssh_kpx`.
 
 ## Drawing (cctext-ui)
 
@@ -277,8 +399,39 @@ kept per decoded bitmap (per frame when animated) and freed with it.
   under it, inline images and fenced ones, the terminal's stand-in text,
   bytes unchanged.
 - `tests/tui_pty_test.py image_placeholder`: the stand-ins in a real
-  terminal (header size, inline, remote host), the caret shows the
-  source, **Load Image** prompts, Esc cancels, the file is unchanged.
+  terminal (`tui_images` off: header size, inline, remote host), the
+  caret shows the source, **Load Image** prompts, Esc cancels, the file
+  is unchanged.
+- `img_term_smoke` (`@smoke`): golden block art for `quad.png` (half
+  blocks 24-bit / 256 / dithered, quadrants, sextants, one-cell splits),
+  `anim.gif` and `exif6.png`; the resampler averages in linear light and
+  premultiplied (black + white is sRGB 188); the xterm-256 quantiser; a
+  sixel round trip through a decoder in the test (pixels within 3,
+  transparency untouched, cancel); PNG + zlib read back by Wuffs,
+  identical; kitty placeholder bytes, the diacritics table, base64.
+- `tests/tui_pty_test.py image_*`: a fake terminal on the pty
+  (`FakeTerm`) answers the startup queries as kitty, sixel, iTerm2 or a
+  silent terminal (in tmux, passthrough on or off), reads kitty temp
+  files as kitty does and records every command; `fake_screen` feeds
+  the output to pyte with a pixel layer (sixel decoded at the cursor;
+  text, EL, ED and line moves erase or move it). `image_blocks`: half
+  blocks and colours, the first frame within the detection timeout with
+  no replies, inline stays text, the caret reveal, scrolled frames equal
+  a full repaint with and without scroll regions, 24-bit, quadrants,
+  sextants, no colours → the stand-in. `image_kitty`: two transmits with
+  a virtual placement, temp files locally and chunked base64 over SSH,
+  the data inflates to s × v × 4, placeholder ids / rows / columns match
+  the cells, scrolling and splits leave no stale cells, ^Z deletes every
+  image and resume sends them again, exit deletes them.
+  `image_sixel` / `image_iterm`: pictures drawn in their cells, and after
+  every scroll, split and close the text and pixels equal a full repaint
+  (nothing torn or stale). `image_tmux`: passthrough on → wrapped kitty
+  transmits, off → block art. `image_viewer`: fit, actual size, pan,
+  typing eaten, `Ctrl-D` hex and back, bytes unchanged, the browse
+  preview's picture. `image_present`: a content image and a split
+  `![bg left]` (block art and kitty). `image_idle`: pictures on screen,
+  no output and no main-thread wakeups; `image_animate` frames within
+  the frame budget. `key_decode_smoke`: late replies are swallowed.
 - `tests/ui_img_test.py` (Xvfb): a Markdown picture on screen and still,
   the caret reveal, idle with a picture (no paints, no CPU), an animated
   GIF painting its frames with `image_animate`, a slide's
@@ -298,6 +451,15 @@ kept per decoded bitmap (per frame when animated) and freed with it.
   prose line is taller; with tall picture rows the caret can sit a few
   lines below the visible bottom before the pane scrolls (the same
   pre-existing approximation prose rows have).
+- Terminal: the protocols are checked against a fake terminal on a pty
+  here, not against real kitty / foot / iTerm2 / WezTerm / tmux builds
+  (none in this environment). Kitty picks its own scale inside the
+  placement box. A sixel terminal that does not erase pixels when text
+  overwrites their cells would keep stale pixels under rewritten text.
+  Pictures in a transition, or under text on a whole-slide background,
+  are block art in sixel / iTerm2 terminals. OSC 11 (the background
+  colour) is not asked: a half-transparent pixel composites against the
+  terminal's own background only at the 50 % alpha cut.
 - macOS drawing and the Win32 blit are untested / stubbed; NSURLSession
   and libcurl backends are not wired (curl is spawned).
 - Decisions are per project root; a document outside any project (no
