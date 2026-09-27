@@ -372,6 +372,7 @@ static void mm_one(const char *what, const char *src, size_t n, uint32_t budget_
     a[2] = dark ? opts_d : opts_l;
     svg = cr_js_call(g_mm, "mmRender", 3, a, budget_ms, err, sizeof err, &to);
     if (svg && !strncmp(svg, "CCTEXT_TOO_LARGE", 16)) g_mm_large++;
+    else if (svg && !strncmp(svg, "CCTEXT_PARSE ", 13)) g_mm_err++; /* engine kept */
     else if (svg) {
         g_mm_ok++;
         render_one(what, svg, strlen(svg));

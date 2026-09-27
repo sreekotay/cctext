@@ -6,10 +6,11 @@
 //
 // opts: { theme: 'default' | 'dark', themeVariables: {...}, fontFamily,
 //         nodeMax, maxTextSize }
-// Errors reject with mermaid's Error. A diagram over opts.nodeMax
-// resolves to "CCTEXT_TOO_LARGE <count> <limit>" instead (the host answers
-// "diagram too large to render (N nodes, limit M)" and keeps the engine:
-// nothing ran).
+// A source that does not parse resolves to "CCTEXT_PARSE <message>"; a
+// diagram over opts.nodeMax to "CCTEXT_TOO_LARGE <count> <limit>" (the
+// host answers "diagram too large to render (N nodes, limit M)"). Both keep
+// the engine: no layout ran. Errors past the parse reject with mermaid's
+// Error (the host then starts a fresh engine for the next diagram).
 {
   // Configuration no diagram may change: `secure` keys are dropped from
   // %%{init}%% directives and frontmatter config (mermaid's own rule).
@@ -83,8 +84,17 @@
       lastKey = key;
     }
     try {
+      // Parse first. A source that does not parse (every other keystroke
+      // while one is typed) is an answer, not a failure: resolve with the
+      // message (the host keeps the engine; parsing ran only the diagram's
+      // own grammar over a fresh db).
+      let d;
+      try {
+        d = await mermaid.mermaidAPI.getDiagramFromText(src);
+      } catch (e) {
+        return 'CCTEXT_PARSE ' + String(e && e.message ? e.message : e);
+      }
       if (o.nodeMax > 0) {
-        const d = await mermaid.mermaidAPI.getDiagramFromText(src);
         const n = countNodes(d);
         // A refusal, not a failure: resolve (the host keeps the engine).
         if (n > o.nodeMax) return 'CCTEXT_TOO_LARGE ' + n + ' ' + o.nodeMax;

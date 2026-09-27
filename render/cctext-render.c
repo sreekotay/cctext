@@ -538,6 +538,13 @@ static void handle_mermaid(const CrReq *q, char *payload)
         send_error(q->id, CR_E_TOO_LARGE, m);
         return;
     }
+    if (svg && strncmp(svg, "CCTEXT_PARSE ", 13) == 0) {
+        char m[400];
+        one_line_error(svg + 13, m, sizeof m);
+        free(svg);
+        send_error(q->id, CR_E_SCRIPT, m);
+        return;
+    }
     if (!svg) {
         if (timed_out) {
             send_error(q->id, CR_E_TIMEOUT, "diagram took too long to render");
