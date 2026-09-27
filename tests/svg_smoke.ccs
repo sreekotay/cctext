@@ -1,0 +1,875 @@
+#!ccc ccs
+/*
+ * SVG through cctext-render (docs/images.md, "Renderer"): the helper's
+ * sandbox (seccomp self-tests), its protocol (hello, malformed frames,
+ * the input and pixel caps, unknown kinds), the editor side (lazy spawn,
+ * the time budget -> kill and respawn, crash -> respawn, stale replies
+ * dropped by generation, cancel), the content-hash cache in memory and on
+ * disk (a later run lays out and paints with no helper), external
+ * references never fetched, the exponential nested-<svg> case, rendering
+ * against committed reference PNGs, and SVG in the image cache: sniff,
+ * policy, data: URIs, a Rich picture row whose height is stable before
+ * and after the pixels.
+ *
+ * Needs bin/cctext-render, its pack and bin/cctext-render-selftest
+ * (./make.shcc @cctext_render; @smoke builds them first).
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/img.cch"
+#include "../core/img_svg.h"
+#include "../render/cr_proto.h"
+
+void rtx_safe_test_isol(void);
+extern char **environ;
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static uint8_t *slurp(const char *path, size_t *n) {
+    FILE *fp = fopen(path, "rb");
+    long sz;
+    uint8_t *b;
+    *n = 0;
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    b = (uint8_t *)malloc((size_t)sz + 1);
+    if (b && fread(b, 1, (size_t)sz, fp) != (size_t)sz) {
+        free(b);
+        b = NULL;
+    }
+    fclose(fp);
+    if (b) {
+        b[sz] = 0;
+        *n = (size_t)sz;
+    }
+    return b;
+}
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static char g_bin[1024], g_selftest[1024];
+
+static void cfg_default(RtxSvgCfg *c) {
+    memset(c, 0, sizeof *c);
+    c->input_max = 16u << 20;
+    c->px_max = 16000000u;
+    c->timeout_ms = 5000;
+}
+
+/* ---- raw protocol: a helper on a socketpair ------------------------------ */
+
+typedef struct {
+    pid_t pid;
+    int fd;
+} Raw;
+
+static int raw_spawn(Raw *r, const char *bin, const char *selftest) {
+    int sv[2];
+    posix_spawn_file_actions_t fa;
+    char *argv[2];
+    char env0[128];
+    char *envp[2];
+    memset(r, 0, sizeof *r);
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) return -1;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, sv[1], 0);
+    posix_spawn_file_actions_adddup2(&fa, sv[1], 1);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    argv[0] = (char *)bin;
+    argv[1] = NULL;
+    envp[0] = NULL;
+    if (selftest) {
+        snprintf(env0, sizeof env0, "CR_SELFTEST=%s", selftest);
+        envp[0] = env0;
+        envp[1] = NULL;
+    }
+    if (posix_spawn(&r->pid, bin, &fa, NULL, argv, envp) != 0) {
+        posix_spawn_file_actions_destroy(&fa);
+        close(sv[0]);
+        close(sv[1]);
+        return -1;
+    }
+    posix_spawn_file_actions_destroy(&fa);
+    close(sv[1]);
+    r->fd = sv[0];
+    return 0;
+}
+
+static int raw_read(Raw *r, void *p, size_t n, int ms) {
+    uint8_t *b = (uint8_t *)p;
+    double dl = now_ms() + ms;
+    while (n) {
+        struct pollfd pf = {r->fd, POLLIN, 0};
+        ssize_t k;
+        int left = (int)(dl - now_ms());
+        if (left <= 0) return -2;
+        if (poll(&pf, 1, left) <= 0) continue;
+        k = read(r->fd, b, n);
+        if (k <= 0) return -1;
+        b += k;
+        n -= (size_t)k;
+    }
+    return 0;
+}
+
+static void raw_send(Raw *r, const void *p, size_t n) {
+    if (send(r->fd, p, n, MSG_NOSIGNAL) < 0) {
+        /* the helper may already be gone: the test checks how */
+    }
+}
+
+/* Wait for exit: returns the wait status, or -1 on timeout (then kills). */
+static int raw_wait(Raw *r, int ms) {
+    double dl = now_ms() + ms;
+    int st = 0;
+    for (;;) {
+        pid_t w = waitpid(r->pid, &st, WNOHANG);
+        if (w == r->pid) break;
+        if (now_ms() > dl) {
+            kill(r->pid, SIGKILL);
+            waitpid(r->pid, &st, 0);
+            close(r->fd);
+            return -1;
+        }
+        {
+            struct timespec ts = {0, 2000000};
+            nanosleep(&ts, NULL);
+        }
+    }
+    close(r->fd);
+    return st;
+}
+
+static int raw_hello(Raw *r, uint32_t hello[3]) {
+    CrReply h;
+    if (raw_read(r, &h, sizeof h, 5000) != 0) return -1;
+    if (h.magic != CR_MAGIC_REP || h.type != CR_R_HELLO || h.len != 12) return -1;
+    return raw_read(r, hello, 12, 5000);
+}
+
+static void raw_req(Raw *r, uint32_t id, uint8_t kind, uint8_t flags, uint32_t bw, uint32_t bh,
+                    uint32_t max_px, const char *src) {
+    CrReq q;
+    memset(&q, 0, sizeof q);
+    q.magic = CR_MAGIC_REQ;
+    q.id = id;
+    q.kind = kind;
+    q.flags = flags;
+    q.scale = 1.0f;
+    q.box_w = bw;
+    q.box_h = bh;
+    q.max_px = max_px;
+    q.len = src ? (uint32_t)strlen(src) : 0;
+    raw_send(r, &q, sizeof q);
+    if (q.len) raw_send(r, src, q.len);
+}
+
+/* Next frame: type, id and payload (malloc'd). */
+static int raw_frame(Raw *r, CrReply *h, uint8_t **payload) {
+    *payload = NULL;
+    if (raw_read(r, h, sizeof *h, 5000) != 0) return -1;
+    if (h->magic != CR_MAGIC_REP) return -1;
+    *payload = (uint8_t *)malloc(h->len + 1);
+    if (!*payload) return -1;
+    if (raw_read(r, *payload, h->len, 5000) != 0) return -1;
+    return 0;
+}
+
+static const char k_small[] =
+    "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='20'>"
+    "<rect width='40' height='20' fill='#ff0000'/></svg>";
+
+static void test_selftests(void) {
+    static const char *kill_names[] = {"socket", "exec", "fork", "mmapx", "readfd", "thread", NULL};
+    int i;
+    for (i = 0; kill_names[i]; i++) {
+        Raw r;
+        int st;
+        char msg[128];
+        if (raw_spawn(&r, g_selftest, kill_names[i]) != 0) {
+            expect(0, "selftest: spawn");
+            continue;
+        }
+        st = raw_wait(&r, 10000);
+        snprintf(msg, sizeof msg, "seccomp: %s is killed by SIGSYS (status 0x%x)", kill_names[i],
+                 (unsigned)st);
+        expect(st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS, msg);
+    }
+    {
+        Raw r;
+        int st;
+        if (raw_spawn(&r, g_selftest, "open") == 0) {
+            st = raw_wait(&r, 10000);
+            expect(st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+                   "seccomp: open fails soft with EACCES");
+        } else {
+            expect(0, "selftest open: spawn");
+        }
+    }
+}
+
+static void test_protocol(void) {
+    Raw r;
+    uint32_t hello[3];
+    CrReply h;
+    uint8_t *p;
+    int st;
+    /* hello, a size-only request, a pixel request */
+    expect(raw_spawn(&r, g_bin, NULL) == 0, "proto: spawn");
+    expect(raw_hello(&r, hello) == 0, "proto: hello");
+    expect(hello[0] == CR_PROTO_VERSION && (hello[1] & (1u << CR_KIND_SVG)) &&
+               (hello[2] & CR_H_SANDBOXED),
+           "proto: hello says version 1, SVG, sandboxed");
+    raw_req(&r, 7, CR_KIND_SVG, CR_F_SIZE_ONLY, 0, 0, 0, k_small);
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_SIZE && h.id == 7 && h.len == 20,
+           "proto: SIZE for a size-only request");
+    if (p && h.len == 20) {
+        CrSize sz;
+        memcpy(&sz, p, sizeof sz);
+        expect(sz.w_css == 40.0f && sz.h_css == 20.0f && sz.px_w == 40 && sz.px_h == 20,
+               "proto: SIZE values");
+    }
+    free(p);
+    raw_req(&r, 8, CR_KIND_SVG, 0, 80, 40, 0, k_small);
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_SIZE && h.id == 8, "proto: SIZE first");
+    free(p);
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_PIXELS && h.id == 8 &&
+               h.len == 12 + 80 * 40 * 4,
+           "proto: then PIXELS at the box");
+    if (p && h.len == 12 + 80 * 40 * 4)
+        expect(p[12] == 255 && p[13] == 0 && p[14] == 0 && p[15] == 255,
+               "proto: premultiplied RGBA, red");
+    free(p);
+    /* pixel cap: SIZE then ERROR, and the helper lives on */
+    raw_req(&r, 9, CR_KIND_SVG, 0, 4000, 2000, 1000000, k_small);
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_SIZE, "proto cap: SIZE");
+    free(p);
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_ERROR && p &&
+               *(uint32_t *)p == CR_E_PIXELS,
+           "proto cap: ERROR pixels over the request's cap");
+    free(p);
+    raw_req(&r, 10, CR_KIND_SVG, 0, 4000000, 4000000, 0, k_small);
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_SIZE, "proto hard cap: SIZE");
+    free(p);
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_ERROR && p &&
+               *(uint32_t *)p == CR_E_PIXELS,
+           "proto hard cap: ERROR past the helper's own ceiling");
+    free(p);
+    /* not an SVG; an unknown kind; the reserved kinds */
+    raw_req(&r, 11, CR_KIND_SVG, 0, 0, 0, 0, "<html>no</html>");
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_ERROR && p && *(uint32_t *)p == CR_E_PARSE,
+           "proto: parse error");
+    free(p);
+    raw_req(&r, 12, 77, 0, 0, 0, 0, "x");
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_ERROR && p && *(uint32_t *)p == CR_E_KIND,
+           "proto: unknown kind");
+    free(p);
+    raw_req(&r, 13, CR_KIND_TEX, 0, 0, 0, 0, "x^2");
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_ERROR && p && *(uint32_t *)p == CR_E_KIND,
+           "proto: math is not in this step");
+    free(p);
+    raw_req(&r, 14, CR_KIND_SVG, 0, 0, 0, 0, "<svg xmlns='http://www.w3.org/2000/svg'/>");
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_ERROR && p && *(uint32_t *)p == CR_E_EMPTY,
+           "proto: no size");
+    free(p);
+    /* still alive after all that */
+    raw_req(&r, 15, CR_KIND_SVG, CR_F_SIZE_ONLY, 0, 0, 0, k_small);
+    expect(raw_frame(&r, &h, &p) == 0 && h.type == CR_R_SIZE && h.id == 15, "proto: still serving");
+    free(p);
+    /* quit */
+    raw_req(&r, 0, CR_KIND_QUIT, 0, 0, 0, 0, NULL);
+    st = raw_wait(&r, 3000);
+    expect(st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "proto: quit exits 0");
+
+    /* Malformed frames end the process cleanly (exit 3), never a crash. */
+    {
+        static const char junk[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        expect(raw_spawn(&r, g_bin, NULL) == 0 && raw_hello(&r, hello) == 0, "bad magic: spawn");
+        raw_send(&r, junk, sizeof junk - 1);
+        st = raw_wait(&r, 3000);
+        expect(st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 3, "bad magic: exit 3");
+    }
+    {
+        CrReq q;
+        expect(raw_spawn(&r, g_bin, NULL) == 0 && raw_hello(&r, hello) == 0, "huge len: spawn");
+        memset(&q, 0, sizeof q);
+        q.magic = CR_MAGIC_REQ;
+        q.id = 1;
+        q.kind = CR_KIND_SVG;
+        q.len = 0xFFFFFFF0u;
+        raw_send(&r, &q, sizeof q);
+        st = raw_wait(&r, 3000);
+        expect(st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 3,
+               "oversized frame: exit 3 before reading it");
+    }
+    {
+        CrReq q;
+        expect(raw_spawn(&r, g_bin, NULL) == 0 && raw_hello(&r, hello) == 0, "truncated: spawn");
+        memset(&q, 0, sizeof q);
+        q.magic = CR_MAGIC_REQ;
+        q.id = 1;
+        q.kind = CR_KIND_SVG;
+        q.len = 1000;
+        raw_send(&r, &q, sizeof q);
+        raw_send(&r, "<svg", 4);
+        shutdown(r.fd, SHUT_WR);
+        st = raw_wait(&r, 3000);
+        expect(st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+               "truncated frame: EOF ends it cleanly");
+    }
+    {
+        expect(raw_spawn(&r, g_bin, NULL) == 0 && raw_hello(&r, hello) == 0, "half header: spawn");
+        raw_send(&r, "CRQ1\x01\x00", 6);
+        shutdown(r.fd, SHUT_WR);
+        st = raw_wait(&r, 3000);
+        expect(st >= 0 && WIFEXITED(st), "half a header: exits");
+    }
+}
+
+/* ---- the editor side ----------------------------------------------------- */
+
+static int size_of(const char *svg, const RtxSvgCfg *c, float *w, float *h) {
+    return rtx_svg_size((const uint8_t *)svg, strlen(svg), c, NULL, w, h);
+}
+
+typedef struct {
+    _Atomic int *flag;
+    int ms;
+} Canceller;
+
+static void *cancel_after(void *arg) {
+    Canceller *c = (Canceller *)arg;
+    struct timespec ts = {0, (long)c->ms * 1000000L};
+    nanosleep(&ts, NULL);
+    atomic_store(c->flag, 1);
+    return NULL;
+}
+
+static void test_client(void) {
+    RtxSvgCfg c;
+    RtxSvgStats s0, s1;
+    float w = 0, h = 0;
+    uint8_t *px = NULL;
+    size_t n;
+    uint8_t *drawio = slurp("testdata/svg/samples/drawio-pipeline.svg", &n);
+    int rc;
+    double t0;
+    cfg_default(&c);
+    setenv("RTX_RENDER_BIN", g_bin, 1);
+    rtx_svg_shutdown();
+    rtx_svg_stats(&s0);
+    expect(s0.pid == 0, "client: no helper before the first SVG");
+    /* the input cap is checked before any helper exists */
+    {
+        RtxSvgCfg small = c;
+        small.input_max = 16;
+        expect(rtx_svg_size((const uint8_t *)k_small, strlen(k_small), &small, NULL, &w, &h) ==
+                   RTX_SVG_EBIG,
+               "client: input over the SVG limit refused");
+        rtx_svg_stats(&s1);
+        expect(s1.spawns == s0.spawns && s1.pid == 0, "client: ... without spawning");
+    }
+    t0 = now_ms();
+    rc = rtx_svg_size(drawio, n, &c, NULL, &w, &h);
+    expect(rc == RTX_SVG_OK && w == 402.0f && h == 232.0f, "client: drawio size 402x232");
+    rtx_svg_stats(&s1);
+    expect(s1.spawns == s0.spawns + 1 && s1.pid > 0, "client: spawned lazily, once");
+    printf("svg_smoke: spawn-to-ready %.1f ms, first size %.1f ms\n", s1.last_ready_ms,
+           now_ms() - t0);
+    rc = rtx_svg_size(drawio, n, &c, NULL, &w, &h);
+    rtx_svg_stats(&s0);
+    expect(rc == RTX_SVG_OK && s0.requests == s1.requests && s0.mem_hits == s1.mem_hits + 1,
+           "client: second size from memory, no request");
+    rc = rtx_svg_render(drawio, n, &c, 201, 116, NULL, &px);
+    expect(rc == RTX_SVG_OK && px != NULL, "client: pixels");
+    free(px);
+    px = NULL;
+    /* the pixel cap is the editor's too */
+    {
+        RtxSvgCfg cap = c;
+        cap.px_max = 1000;
+        expect(rtx_svg_render(drawio, n, &cap, 400, 300, NULL, &px) == RTX_SVG_EPX,
+               "client: over the pixel cap refused");
+    }
+    /* Time budget: a hanging render is killed, the next one respawns. */
+    setenv("RTX_RENDER_BIN", g_selftest, 1);
+    rtx_svg_shutdown();
+    {
+        static const char hang[] =
+            "<!--cr-selftest:hang--><svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>";
+        RtxSvgCfg quick = c;
+        quick.timeout_ms = 300;
+        rtx_svg_stats(&s0);
+        t0 = now_ms();
+        rc = rtx_svg_size((const uint8_t *)hang, sizeof hang - 1, &quick, NULL, &w, &h);
+        rtx_svg_stats(&s1);
+        expect(rc == RTX_SVG_ETIMEOUT, "timeout: over budget");
+        expect(now_ms() - t0 < 2500, "timeout: returned near the budget");
+        expect(s1.kills == s0.kills + 1 && s1.pid == 0, "timeout: helper killed");
+        rc = rtx_svg_size((const uint8_t *)k_small, strlen(k_small), &c, NULL, &w, &h);
+        rtx_svg_stats(&s0);
+        expect(rc == RTX_SVG_OK && s0.spawns == s1.spawns + 1, "timeout: next request respawns");
+    }
+    {
+        static const char crash[] =
+            "<!--cr-selftest:crash--><svg xmlns='http://www.w3.org/2000/svg' width='5' height='5'/>";
+        rtx_svg_shutdown();
+        rtx_svg_stats(&s0);
+        rc = rtx_svg_size((const uint8_t *)crash, sizeof crash - 1, &c, NULL, &w, &h);
+        rtx_svg_stats(&s1);
+        expect(rc == RTX_SVG_ECRASH && s1.crashes == s0.crashes + 1, "crash: reported");
+        rtx_svg_forget_memory();
+        rc = size_of("<svg xmlns='http://www.w3.org/2000/svg' width='6' height='3'/>", &c, &w, &h);
+        expect(rc == RTX_SVG_OK && w == 6.0f && h == 3.0f, "crash: next request on a new helper");
+    }
+    {
+        /* Stale generation: cancel a slow request, the next one drops its reply. */
+        static const char slow[] =
+            "<!--cr-selftest:slow--><svg xmlns='http://www.w3.org/2000/svg' width='7' height='7'/>";
+        _Atomic int flag = 0;
+        pthread_t th;
+        Canceller cc = {&flag, 60};
+        rtx_svg_forget_memory();
+        rtx_svg_stats(&s0);
+        pthread_create(&th, NULL, cancel_after, &cc);
+        rc = rtx_svg_size((const uint8_t *)slow, sizeof slow - 1, &c, &flag, &w, &h);
+        pthread_join(th, NULL);
+        expect(rc == RTX_SVG_ECANCEL, "cancel: returns at once");
+        rc = size_of("<svg xmlns='http://www.w3.org/2000/svg' width='9' height='2'/>", &c, &w, &h);
+        rtx_svg_stats(&s1);
+        expect(rc == RTX_SVG_OK && w == 9.0f && h == 2.0f, "stale: the next answer is its own");
+        expect(s1.stale >= s0.stale + 1 && s1.pid == s0.pid && s1.kills == s0.kills,
+               "stale: the cancelled reply dropped, same helper");
+    }
+    setenv("RTX_RENDER_BIN", g_bin, 1);
+    rtx_svg_shutdown();
+    /* Missing helper: a clear error, no crash. */
+    setenv("RTX_RENDER_BIN", "/nonexistent/cctext-render", 1);
+    rtx_svg_forget_memory();
+    rc = rtx_svg_size((const uint8_t *)k_small, strlen(k_small), &c, NULL, &w, &h);
+    expect(rc == RTX_SVG_ENONE, "missing helper: ENONE");
+    setenv("RTX_RENDER_BIN", g_bin, 1);
+    rtx_svg_shutdown();
+    free(drawio);
+}
+
+static void test_disk_cache(void) {
+    RtxSvgCfg c;
+    RtxSvgStats s0, s1;
+    float w = 0, h = 0;
+    uint8_t *a = NULL, *b = NULL;
+    size_t n;
+    uint8_t *svg = slurp("testdata/svg/samples/features.svg", &n);
+    if (system("rm -rf testdata/generated/svgcache && mkdir -p testdata/generated/svgcache") != 0)
+        return;
+    cfg_default(&c);
+    c.cache_dir = "testdata/generated/svgcache";
+    c.cache_max = 8u << 20;
+    rtx_svg_forget_memory();
+    expect(rtx_svg_size(svg, n, &c, NULL, &w, &h) == RTX_SVG_OK && w == 320 && h == 200,
+           "disk: size");
+    expect(rtx_svg_render(svg, n, &c, 320, 200, NULL, &a) == RTX_SVG_OK, "disk: render");
+    /* A later session: no memory, and no helper at all. */
+    rtx_svg_shutdown();
+    rtx_svg_forget_memory();
+    setenv("RTX_RENDER_BIN", "/nonexistent/cctext-render", 1);
+    rtx_svg_stats(&s0);
+    expect(rtx_svg_size(svg, n, &c, NULL, &w, &h) == RTX_SVG_OK && w == 320 && h == 200,
+           "disk: size from the cache without a helper");
+    expect(rtx_svg_render(svg, n, &c, 320, 200, NULL, &b) == RTX_SVG_OK && b &&
+               memcmp(a, b, 320 * 200 * 4) == 0,
+           "disk: identical pixels from the cache");
+    rtx_svg_stats(&s1);
+    expect(s1.disk_size_hits == s0.disk_size_hits + 1 && s1.disk_px_hits == s0.disk_px_hits + 1 &&
+               s1.spawns == s0.spawns,
+           "disk: hits counted, nothing spawned");
+    free(b);
+    b = NULL;
+    expect(rtx_svg_render(svg, n, &c, 160, 100, NULL, &b) == RTX_SVG_ENONE,
+           "disk: another size needs the helper");
+    /* A corrupted pixel file is ignored, never trusted. */
+    {
+        char cmd[256];
+        snprintf(cmd, sizeof cmd,
+                 "for f in testdata/generated/svgcache/*.px; do printf 'XXXX' | dd of=$f bs=1 "
+                 "seek=40 conv=notrunc 2>/dev/null; done");
+        if (system(cmd) != 0) fprintf(stderr, "corrupt: cmd failed\n");
+        free(b);
+        b = NULL;
+        expect(rtx_svg_render(svg, n, &c, 320, 200, NULL, &b) == RTX_SVG_ENONE,
+               "disk: a corrupt pixel file is not used");
+    }
+    setenv("RTX_RENDER_BIN", g_bin, 1);
+    rtx_svg_shutdown();
+    free(a);
+    free(b);
+    free(svg);
+}
+
+static void test_hostile(void) {
+    RtxSvgCfg c;
+    float w = 0, h = 0;
+    uint8_t *px = NULL;
+    char *doc;
+    size_t cap = 1 << 22, k = 0;
+    int i, rc;
+    double t0;
+    cfg_default(&c);
+    rtx_svg_forget_memory();
+    doc = (char *)malloc(cap);
+    /* 40 nested percentage <svg>: 2^40 before lunasvg patch 0003. */
+    k = (size_t)snprintf(doc, cap, "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'>");
+    for (i = 0; i < 40; i++) k += (size_t)snprintf(doc + k, cap - k, "<svg width='99%%' height='99%%'>");
+    k += (size_t)snprintf(doc + k, cap - k, "<rect width='50%%' height='50%%' fill='blue'/>");
+    for (i = 0; i < 41; i++) k += (size_t)snprintf(doc + k, cap - k, "</svg>");
+    t0 = now_ms();
+    rc = rtx_svg_render((const uint8_t *)doc, k, &c, 100, 100, NULL, &px);
+    expect(rc == RTX_SVG_OK, "hostile: 40 nested svg renders");
+    expect(now_ms() - t0 < 1500, "hostile: ... fast (O(depth))");
+    free(px);
+    px = NULL;
+    /* 100k nested groups: capped at 256 levels, no stack overflow. */
+    k = (size_t)snprintf(doc, cap, "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'>");
+    for (i = 0; i < 100000; i++) k += (size_t)snprintf(doc + k, cap - k, "<g>");
+    k += (size_t)snprintf(doc + k, cap - k, "<rect width='5' height='5'/>");
+    for (i = 0; i < 100000; i++) k += (size_t)snprintf(doc + k, cap - k, "</g>");
+    k += (size_t)snprintf(doc + k, cap - k, "</svg>");
+    rc = rtx_svg_render((const uint8_t *)doc, k, &c, 10, 10, NULL, &px);
+    expect(rc == RTX_SVG_OK, "hostile: 100k nesting renders");
+    free(px);
+    px = NULL;
+    /* External references: not fetched (a listener sees no connection),
+     * rendered as missing (the rect under the images shows). */
+    {
+        int ls = socket(AF_INET, SOCK_STREAM, 0), port = 0;
+        struct sockaddr_in a;
+        socklen_t al = sizeof a;
+        size_t n;
+        char *ext = (char *)slurp("testdata/svg/fuzz/external.svg", &n), *q;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (ls >= 0 && bind(ls, (struct sockaddr *)&a, sizeof a) == 0 && listen(ls, 4) == 0 &&
+            getsockname(ls, (struct sockaddr *)&a, &al) == 0)
+            port = ntohs(a.sin_port);
+        expect(port > 0 && ext, "external: listener");
+        if (port > 0 && ext) {
+            char buf[8192];
+            size_t o = 0;
+            /* point the http: references at our listener */
+            for (q = ext; *q && o + 16 < sizeof buf;) {
+                if (strncmp(q, "127.0.0.1:9/", 12) == 0) {
+                    o += (size_t)snprintf(buf + o, sizeof buf - o, "127.0.0.1:%d/", port);
+                    q += 12;
+                } else {
+                    buf[o++] = *q++;
+                }
+            }
+            buf[o] = 0;
+            rc = rtx_svg_render((const uint8_t *)buf, o, &c, 120, 40, NULL, &px);
+            expect(rc == RTX_SVG_OK && px, "external: renders");
+            if (px) {
+                const uint8_t *p = px + (20 * 120 + 20) * 4;
+                expect(p[0] == 0x15 && p[1] == 0x65 && p[2] == 0xc0 && p[3] == 255,
+                       "external: file: image missing, the rect shows");
+            }
+            {
+                struct pollfd pf = {ls, POLLIN, 0};
+                expect(poll(&pf, 1, 300) == 0, "external: nothing connected to the http: host");
+            }
+        }
+        if (ls >= 0) close(ls);
+        free(ext);
+        free(px);
+        px = NULL;
+    }
+    free(doc);
+}
+
+/* ---- rendering against the reference PNGs -------------------------------- */
+
+static void test_refs(void) {
+    static const char *names[] = {"drawio-pipeline", "features",   "matplotlib-lines",
+                                  "matplotlib-scatter", "mermaid-flow", "mermaid-pie",
+                                  "mermaid-seq", NULL};
+    int i;
+    RtxImgLimits lim;
+    rtx_img_limits_default(&lim);
+    lim.svg_cache_max = 0;
+    rtx_svg_forget_memory();
+    for (i = 0; names[i]; i++) {
+        char p[256], msg[256];
+        size_t n, rn;
+        uint8_t *svg, *ref;
+        RtxImgBmp got, want;
+        RtxImgInfo gi, wi;
+        int rc1, rc2;
+        double t0;
+        snprintf(p, sizeof p, "testdata/svg/samples/%s.svg", names[i]);
+        svg = slurp(p, &n);
+        snprintf(p, sizeof p, "testdata/svg/ref/%s.png", names[i]);
+        ref = slurp(p, &rn);
+        if (!svg || !ref) {
+            snprintf(msg, sizeof msg, "ref %s: fixture missing", names[i]);
+            expect(0, msg);
+            free(svg);
+            free(ref);
+            continue;
+        }
+        expect(rtx_img_sniff(svg, n) == RTX_IMG_FMT_SVG, "ref: sniffed as SVG");
+        rc2 = rtx_img_decode(ref, rn, &lim, 0, 0, RTX_IMG_PIX_BGRA_PREMUL, 1, NULL, &want, &wi);
+        t0 = now_ms();
+        /* natural size = the reference's size (ceil of the CSS size) */
+        rc1 = rtx_img_decode(svg, n, &lim, wi.w, wi.h, RTX_IMG_PIX_BGRA_PREMUL, 1, NULL, &got, &gi);
+        snprintf(msg, sizeof msg, "ref %s: decodes (%d, %d)", names[i], rc1, rc2);
+        expect(rc1 == RTX_IMG_OK && rc2 == RTX_IMG_OK, msg);
+        if (rc1 == RTX_IMG_OK && rc2 == RTX_IMG_OK) {
+            size_t k, bad = 0, npx = (size_t)got.w * got.h;
+            snprintf(msg, sizeof msg, "ref %s: size %ux%u vs %ux%u", names[i], got.w, got.h,
+                     want.w, want.h);
+            expect(got.w == want.w && got.h == want.h && gi.fmt == RTX_IMG_FMT_SVG &&
+                       gi.w == wi.w && gi.h == wi.h,
+                   msg);
+            if (got.w == want.w && got.h == want.h) {
+                for (k = 0; k < npx; k++) {
+                    int c, d = 0;
+                    for (c = 0; c < 4; c++) {
+                        int e = abs((int)got.px[k * 4 + c] - (int)want.px[k * 4 + c]);
+                        if (e > d) d = e;
+                    }
+                    if (d > 24) bad++;
+                }
+                snprintf(msg, sizeof msg, "ref %s: %zu of %zu pixels off (> 0.5%%)", names[i], bad,
+                         npx);
+                expect(bad * 200 <= npx, msg);
+                printf("svg_smoke: %-20s %4ux%-4u %6.1f ms  %zu px differ\n", names[i], got.w,
+                       got.h, now_ms() - t0, bad);
+            }
+        }
+        if (rc1 == RTX_IMG_OK) rtx_img_bmp_free(&got);
+        if (rc2 == RTX_IMG_OK) rtx_img_bmp_free(&want);
+        free(svg);
+        free(ref);
+    }
+    /* Straight RGBA (a terminal protocol's layout) from the same render. */
+    {
+        size_t n;
+        uint8_t *svg = slurp("testdata/svg/samples/features.svg", &n);
+        RtxImgBmp a, b;
+        RtxImgInfo ia;
+        if (svg && rtx_img_decode(svg, n, &lim, 320, 200, RTX_IMG_PIX_RGBA, 1, NULL, &a, &ia) ==
+                       RTX_IMG_OK &&
+            rtx_img_decode(svg, n, &lim, 320, 200, RTX_IMG_PIX_BGRA_PREMUL, 1, NULL, &b, &ia) ==
+                RTX_IMG_OK) {
+            /* the opaque red quadrant of the data: image (272, 162) */
+            const uint8_t *pa = a.px + (162 * 320 + 272) * 4, *pb = b.px + (162 * 320 + 272) * 4;
+            expect(a.pix == RTX_IMG_PIX_RGBA && pa[0] > 200 && pa[2] < 40 && pb[2] > 200 &&
+                       pb[0] < 40,
+                   "pix: RGBA straight and BGRA premultiplied layouts");
+            rtx_img_bmp_free(&a);
+            rtx_img_bmp_free(&b);
+        } else {
+            expect(0, "pix: decode");
+        }
+        free(svg);
+    }
+    /* A vector scales up: twice the natural size is rendered, not blown up. */
+    {
+        size_t n;
+        uint8_t *svg = slurp("testdata/svg/samples/drawio-pipeline.svg", &n);
+        RtxImgBmp a;
+        RtxImgInfo ia;
+        expect(svg && rtx_img_decode(svg, n, &lim, 804, 464, RTX_IMG_PIX_BGRA_PREMUL, 1, NULL, &a,
+                                     &ia) == RTX_IMG_OK &&
+                   a.w == 804 && a.h == 464,
+               "vector: rendered at twice its natural size");
+        if (a.px) rtx_img_bmp_free(&a);
+        free(svg);
+    }
+}
+
+/* ---- in the image cache: sniff, policy, data:, layout ------------------- */
+
+static double px_meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 8.0 * (double)bytes.len;
+}
+
+static double px_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 18.0;
+}
+
+#define SDIR "testdata/generated/svgdoc"
+
+static void test_cache_and_layout(void) {
+    char cwd[512], path[700];
+    FILE *fp;
+    RtxImgSrc s;
+    RtxImgView v;
+    static const char doc[] =
+        "# SVG\n"
+        "\n"
+        "![pipeline](pipe.svg)\n"
+        "\n"
+        "Text after.\n";
+    rtx_img_reset();
+    expect(rtx_img_sniff((const uint8_t *)"\xEF\xBB\xBF<?xml version='1.0'?>\n<!-- c -->\n"
+                                          "<!DOCTYPE svg [ <!ENTITY a 'b'> ]>\n<svg>",
+                         77) == RTX_IMG_FMT_SVG,
+           "sniff: BOM, prolog, comment, DOCTYPE subset");
+    expect(rtx_img_sniff((const uint8_t *)"<?xml version='1.0'?><html/>", 28) == RTX_IMG_FMT_NONE,
+           "sniff: other XML is not SVG");
+    expect(rtx_img_sniff((const uint8_t *)"<svgx/>", 7) == RTX_IMG_FMT_NONE, "sniff: <svgx");
+    if (system("rm -rf " SDIR " testdata/generated/svgout && mkdir -p " SDIR "/.git "
+               "testdata/generated/svgout && cp testdata/svg/samples/drawio-pipeline.svg " SDIR
+               "/pipe.svg && cp testdata/svg/samples/features.svg testdata/generated/svgout/f.svg") != 0)
+        return;
+    if (!getcwd(cwd, sizeof cwd)) return;
+    snprintf(path, sizeof path, "%s/" SDIR "/doc.md", cwd);
+    fp = fopen(path, "wb");
+    if (!fp) return;
+    fwrite(doc, 1, sizeof doc - 1, fp);
+    fclose(fp);
+    /* The same permission rules as raster images. */
+    expect(rtx_img_resolve(path, "pipe.svg", 8, &s) == RTX_IMG_OK, "policy: svg in the project");
+    expect(rtx_img_resolve(path, "../svgout/f.svg", 15, &s) == RTX_IMG_EDENIED,
+           "policy: svg outside the project asks");
+    expect(rtx_img_allow(path, &s, RTX_IMG_ALLOW_FILE), "policy: allow this svg");
+    expect(rtx_img_resolve(path, "../svgout/f.svg", 15, &s) == RTX_IMG_OK, "policy: allowed");
+    rtx_img_revoke(path);
+    {
+        /* data: URIs, base64 and percent-encoded */
+        static const char d1[] =
+            "data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHdpZHRo"
+            "PSczMCcgaGVpZ2h0PScxMCc+PHJlY3Qgd2lkdGg9JzMwJyBoZWlnaHQ9JzEwJyBmaWxsPSdsaW1lJy8+PC9zdmc+";
+        static const char d2[] =
+            "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='12'%20height="
+            "'8'%3E%3C/svg%3E";
+        expect(rtx_img_resolve(path, d1, strlen(d1), &s) == RTX_IMG_OK, "data: svg base64 resolves");
+        rtx_img_info(&s, &v);
+        rtx_img_finish();
+        rtx_img_info(&s, &v);
+        expect(v.state == RTX_IMG_S_INFO && v.info.fmt == RTX_IMG_FMT_SVG && v.info.w == 30 &&
+                   v.info.h == 10,
+               "data: svg base64 size");
+        rtx_img_frame();
+        rtx_img_want(&s, 30, 10, &v);
+        rtx_img_finish();
+        rtx_img_want(&s, 30, 10, &v);
+        expect(v.state == RTX_IMG_S_OK && v.bmp && v.bmp->w == 30 && v.bmp->px[1] == 255,
+               "data: svg base64 pixels (lime)");
+        expect(rtx_img_resolve(path, d2, strlen(d2), &s) == RTX_IMG_OK, "data: svg percent resolves");
+        rtx_img_info(&s, &v);
+        rtx_img_finish();
+        rtx_img_info(&s, &v);
+        expect(v.state == RTX_IMG_S_INFO && v.info.w == 12 && v.info.h == 8, "data: svg percent size");
+    }
+    {
+        @errhandler(CCError e) {
+            fprintf(stderr, "error: %s\n", e.message ? e.message : "?");
+            fails++;
+            return;
+        }
+        RtxDoc d = {0} @destroy;
+        RtxLayout R = {0} @destroy;
+        RtxMeasure pm = {0};
+        size_t at = (size_t)(strstr(doc, "![pipeline]") - doc);
+        const RtxImgRec *rec;
+        double h0, h1;
+        char st[128];
+        pm.measure = px_meas;
+        pm.line_height = px_lh;
+        d.from_path(cc_slice_cstr(path)) !>;
+        R.rich = 1;
+        R.wrap = 1;
+        R.doc(&d, &pm, 300.0) !>;
+        rec = rtx_layout_img_rec(&R, at);
+        expect(rec && rec->h == 54.0, "layout: placeholder box while the size is on its way");
+        rtx_img_finish();
+        expect(rtx_img_layout_changed(), "layout: size arrival reported");
+        R.doc(&d, &pm, 300.0) !>;
+        rec = rtx_layout_img_rec(&R, at);
+        /* 402 x 232 fitted into 296 (the pane minus padding) */
+        expect(rec && rec->w == 296 && rec->h == 171, "layout: svg box from its size, fitted");
+        h0 = R.rows.data[R.row_of(at)].height;
+        rtx_img_resolve(path, "pipe.svg", 8, &s);
+        rtx_img_frame();
+        rtx_img_want(&s, 296, 171, &v);
+        rtx_img_finish();
+        rtx_img_want(&s, 296, 171, &v);
+        expect(v.state == RTX_IMG_S_OK && v.bmp && v.bmp->w == 296 && v.bmp->h == 171 &&
+                   v.bmp->pix == RTX_IMG_PIX_BGRA_PREMUL,
+               "layout: pixels at the box, in the GUI's layout");
+        R.doc(&d, &pm, 300.0) !>;
+        h1 = R.rows.data[R.row_of(at)].height;
+        expect(h0 == h1 && h0 == 171.0 + 6.0, "layout: row height stable after the pixels");
+        rtx_img_standin(&v, "pipeline", 8, st, sizeof st);
+        expect(strcmp(st, "[image: pipeline 402x232]") == 0, "layout: terminal stand-in");
+    }
+    rtx_img_reset();
+}
+
+int main(void) {
+    char cwd[512];
+    rtx_safe_test_isol();
+    if (!getcwd(cwd, sizeof cwd)) return 1;
+    snprintf(g_bin, sizeof g_bin, "%s/bin/cctext-render", cwd);
+    snprintf(g_selftest, sizeof g_selftest, "%s/bin/cctext-render-selftest", cwd);
+    if (access(g_bin, X_OK) != 0 || access(g_selftest, X_OK) != 0) {
+        fprintf(stderr, "svg_smoke: build bin/cctext-render first (./make.shcc @cctext_render)\n");
+        return 1;
+    }
+    setenv("RTX_RENDER_BIN", g_bin, 1);
+    test_selftests();
+    test_protocol();
+    test_client();
+    test_disk_cache();
+    test_hostile();
+    test_refs();
+    test_cache_and_layout();
+    rtx_svg_shutdown();
+    if (fails) {
+        fprintf(stderr, "svg_smoke: %d failures\n", fails);
+        return 1;
+    }
+    printf("svg_smoke: ok\n");
+    return 0;
+}

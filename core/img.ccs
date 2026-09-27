@@ -23,6 +23,7 @@
 #include "img.cch"
 #include "img_wuffs.h"
 #include "img_net.h"
+#include "img_svg.h"
 #include "rtx_par.cch"
 /* From safe.ccs (safe.cch pulls the document face in; two decls do). */
 int rtx_safe_dir(char *dst, size_t n);
@@ -43,6 +44,11 @@ void rtx_img_limits_default(RtxImgLimits *l) {
     l->remote_max = RTX_IMG_REMOTE_MAX;
     l->timeout_s = RTX_IMG_TIMEOUT_S;
     l->cache_max = RTX_IMG_CACHE_MAX;
+    l->svg_max = RTX_IMG_SVG_MAX;
+    l->svg_px_max = RTX_IMG_SVG_PX_MAX;
+    l->svg_timeout_ms = RTX_IMG_SVG_TIMEOUT_MS;
+    l->svg_cache_max = RTX_IMG_SVG_CACHE_MAX;
+    l->svg_backing = 1;
 }
 
 static RtxImgLimits g_img_lim;
@@ -106,6 +112,21 @@ const char *rtx_img_err_text(int err, char *buf, size_t n) {
         break;
     case RTX_IMG_EHTTP: snprintf(buf, n, "plain http not allowed for this host"); break;
     case RTX_IMG_ESRC: snprintf(buf, n, "no image source"); break;
+    case RTX_IMG_ERENDER: snprintf(buf, n, "SVG renderer failed on this file"); break;
+    case RTX_IMG_ERTIME:
+        snprintf(buf, n, "SVG took over %u ms to render", (unsigned)l->svg_timeout_ms);
+        break;
+    case RTX_IMG_ENORENDER:
+#if defined(_WIN32)
+        snprintf(buf, n, "SVG renderer not available on this platform yet");
+#else
+        snprintf(buf, n, "SVG renderer (cctext-render) not found");
+#endif
+        break;
+    case RTX_IMG_ESVGBIG:
+        img_mib(m, sizeof m, l->svg_max);
+        snprintf(buf, n, "SVG over the %s limit", m);
+        break;
     default: snprintf(buf, n, "image error %d", err); break;
     }
     return buf;
@@ -119,6 +140,7 @@ const char *rtx_img_fmt_name(int fmt) {
     case RTX_IMG_FMT_BMP: return "BMP";
     case RTX_IMG_FMT_WEBP: return "WebP";
     case RTX_IMG_FMT_QOI: return "QOI";
+    case RTX_IMG_FMT_SVG: return "SVG";
     default: return "?";
     }
 }
@@ -302,12 +324,164 @@ static int img_head(RtxWuffsDec *d, const uint8_t *b, size_t n, int closed, int 
     return img_check(out, lim);
 }
 
-int rtx_img_sniff(const uint8_t *b, size_t n) {
-    return img_fmt_of_wuffs(rtx_wuffs_sniff(b, n, 1));
+/* ---- SVG: the sandboxed renderer (core/img_svg.c) ----------------------- */
+
+typedef char img_svg_codes_match[(RTX_SVG_ECORRUPT == RTX_IMG_ECORRUPT &&
+                                  RTX_SVG_ENOMEM == RTX_IMG_ENOMEM &&
+                                  RTX_SVG_ECANCEL == RTX_IMG_ECANCEL &&
+                                  RTX_SVG_EPX == RTX_IMG_EPX &&
+                                  RTX_SVG_ECRASH == RTX_IMG_ERENDER &&
+                                  RTX_SVG_ETIMEOUT == RTX_IMG_ERTIME &&
+                                  RTX_SVG_ENONE == RTX_IMG_ENORENDER &&
+                                  RTX_SVG_EBIG == RTX_IMG_ESVGBIG)
+                                     ? 1
+                                     : -1];
+
+static void img_svg_cfg(const RtxImgLimits *lim, const char *dir, RtxSvgCfg *c) {
+    c->input_max = lim->svg_max < lim->file_max ? lim->svg_max : lim->file_max;
+    c->px_max = lim->svg_px_max;
+    c->timeout_ms = lim->svg_timeout_ms ? lim->svg_timeout_ms : RTX_IMG_SVG_TIMEOUT_MS;
+    c->cache_max = dir && dir[0] ? lim->svg_cache_max : 0;
+    c->cache_dir = dir && dir[0] ? dir : NULL;
 }
+
+/* libm is not linked: the two helpers the SVG box needs. */
+static uint32_t img_ceil_u32(float v) {
+    uint32_t u;
+    if (!(v > 1.0f)) return 1;
+    u = (uint32_t)v;
+    return (float)u < v ? u + 1 : u;
+}
+
+static double img_sqrt(double v) {
+    double x = v > 1 ? v : 1;
+    int i;
+    if (!(v > 0)) return 0;
+    for (i = 0; i < 64; i++) x = 0.5 * (x + v / x);
+    return x;
+}
+
+/* Size of an SVG: its CSS size rounded up (the displayed size at 1x). */
+static int img_svg_info(const uint8_t *b, size_t n, const RtxImgLimits *lim, const char *dir,
+                        const _Atomic int *cancel, RtxImgInfo *out) {
+    RtxSvgCfg c;
+    float w = 0, h = 0;
+    int rc;
+    memset(out, 0, sizeof *out);
+    out->fmt = RTX_IMG_FMT_SVG;
+    img_svg_cfg(lim, dir, &c);
+    rc = rtx_svg_size(b, n, &c, cancel, &w, &h);
+    if (rc != RTX_SVG_OK) return rc;
+    out->cw = out->w = w >= 1e6f ? 1000000u : img_ceil_u32(w);
+    out->ch = out->h = h >= 1e6f ? 1000000u : img_ceil_u32(h);
+    out->orient = 1;
+    return RTX_IMG_OK;
+}
+
+/* Fit for a vector image: aspect kept, scaled up or down to the box
+ * (0 = no cap on that side; both 0 = natural size). */
+static void img_svg_fit(uint32_t w, uint32_t h, uint32_t max_w, uint32_t max_h, uint32_t *ow,
+                        uint32_t *oh) {
+    double s = 1.0, rw, rh;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    if (max_w || max_h) {
+        s = 1e30;
+        if (max_w) s = (double)max_w / (double)w;
+        if (max_h && (double)max_h / (double)h < s) s = (double)max_h / (double)h;
+    }
+    rw = (double)w * s + 0.5;
+    rh = (double)h * s + 0.5;
+    *ow = rw < 1 ? 1 : rw > 1e9 ? 1000000000u : (uint32_t)rw;
+    *oh = rh < 1 ? 1 : rh > 1e9 ? 1000000000u : (uint32_t)rh;
+}
+
+/* The pixel box an SVG renders at for a (max_w, max_h) ask: fitted (up or
+ * down), then within the render caps (svg_px_max, the side limit): past
+ * them it renders smaller and the blit scales. */
+static void img_svg_box(const RtxImgLimits *lim, uint32_t w, uint32_t h, uint32_t max_w,
+                        uint32_t max_h, uint32_t *ow, uint32_t *oh) {
+    uint32_t tw, th;
+    img_svg_fit(w, h, max_w, max_h, &tw, &th);
+    if ((uint64_t)tw * th > lim->svg_px_max || tw > lim->dim_max || th > lim->dim_max) {
+        double s = img_sqrt((double)lim->svg_px_max / ((double)tw * (double)th));
+        double sd = (double)lim->dim_max / (double)(tw > th ? tw : th);
+        if (sd < s) s = sd;
+        if (s > 1) s = 1;
+        tw = (uint32_t)((double)tw * s);
+        th = (uint32_t)((double)th * s);
+        if (tw < 1) tw = 1;
+        if (th < 1) th = 1;
+    }
+    *ow = tw;
+    *oh = th;
+}
+
+/* RGBA8 premultiplied (the helper's wire format) -> the layout `pix`. */
+static void img_from_rgba_premul(uint8_t *px, size_t npx, int pix) {
+    size_t i;
+    for (i = 0; i < npx; i++) {
+        uint8_t *p = px + i * 4;
+        uint8_t r = p[0], g = p[1], b = p[2], a = p[3];
+        if (pix == RTX_IMG_PIX_RGBA) {
+            if (a && a != 255) {
+                r = (uint8_t)((r * 255u + a / 2) / a);
+                g = (uint8_t)((g * 255u + a / 2) / a);
+                b = (uint8_t)((b * 255u + a / 2) / a);
+            }
+            p[0] = r;
+            p[1] = g;
+            p[2] = b;
+        } else {
+            p[0] = b;
+            p[2] = r;
+        }
+    }
+}
+
+static int img_svg_decode(const uint8_t *b, size_t n, const RtxImgLimits *lim, const char *dir,
+                          uint32_t max_w, uint32_t max_h, int pix, const _Atomic int *cancel,
+                          RtxImgBmp *out, RtxImgInfo *info) {
+    RtxImgInfo in;
+    RtxSvgCfg c;
+    uint32_t tw, th;
+    uint8_t *px = NULL;
+    int rc = img_svg_info(b, n, lim, dir, cancel, &in);
+    if (info) *info = in;
+    if (rc != RTX_IMG_OK) return rc;
+    img_svg_box(lim, in.w, in.h, max_w, max_h, &tw, &th);
+    if ((uint64_t)tw * th * 4 > lim->budget) return RTX_IMG_EBUDGET;
+    img_svg_cfg(lim, dir, &c);
+    rc = rtx_svg_render(b, n, &c, tw, th, cancel, &px);
+    if (rc != RTX_SVG_OK) return rc;
+    img_from_rgba_premul(px, (size_t)tw * th, pix);
+    out->px = px;
+    out->w = tw;
+    out->h = th;
+    out->stride = tw * 4;
+    out->pix = pix;
+    out->nframe = 1;
+    out->delay = NULL;
+    out->bytes = (uint64_t)tw * th * 4;
+    return RTX_IMG_OK;
+}
+
+int rtx_img_sniff(const uint8_t *b, size_t n) {
+    int f = img_fmt_of_wuffs(rtx_wuffs_sniff(b, n, 1));
+    if (f == RTX_IMG_FMT_NONE && rtx_svg_sniff(b, n)) f = RTX_IMG_FMT_SVG;
+    return f;
+}
+
+static int img_probe_ex(const uint8_t *b, size_t n, int closed, const RtxImgLimits *lim,
+                        const char *svg_dir, const _Atomic int *cancel, RtxImgInfo *out);
 
 int rtx_img_probe(const uint8_t *b, size_t n, int closed, const RtxImgLimits *lim,
                   RtxImgInfo *out) {
+    return img_probe_ex(b, n, closed, lim, NULL, NULL, out);
+}
+
+static int img_probe_ex(const uint8_t *b, size_t n, int closed, const RtxImgLimits *lim,
+                        const char *svg_dir, const _Atomic int *cancel, RtxImgInfo *out) {
     int fmt;
     RtxWuffsDec *d;
     int rc;
@@ -317,6 +491,12 @@ int rtx_img_probe(const uint8_t *b, size_t n, int closed, const RtxImgLimits *li
     if (!lim) lim = rtx_img_limits();
     if (!b || !n) return closed ? RTX_IMG_EFORMAT : RTX_IMG_MORE;
     fmt = rtx_wuffs_sniff(b, n, closed);
+    if (fmt == RTX_WUFFS_FMT_NONE && rtx_svg_sniff(b, n)) {
+        /* SVG: the whole document goes to the renderer for its size. */
+        out->fmt = RTX_IMG_FMT_SVG;
+        if (!closed) return RTX_IMG_MORE;
+        return img_svg_info(b, n, lim, svg_dir, cancel, out);
+    }
     if (fmt == RTX_WUFFS_FMT_NONE) return (!closed && n < 64) ? RTX_IMG_MORE : RTX_IMG_EFORMAT;
     d = rtx_wuffs_open(fmt);
     if (!d) return RTX_IMG_ENOMEM;
@@ -429,9 +609,21 @@ void rtx_img_bmp_free(RtxImgBmp *bmp) {
     memset(bmp, 0, sizeof *bmp);
 }
 
+static int img_decode_ex(const uint8_t *b, size_t n, const RtxImgLimits *lim,
+                         uint32_t max_w, uint32_t max_h, int pix, uint32_t max_frames,
+                         const _Atomic int *cancel, RtxImgBmp *out, RtxImgInfo *info,
+                         const char *svg_dir);
+
 int rtx_img_decode(const uint8_t *b, size_t n, const RtxImgLimits *lim,
                    uint32_t max_w, uint32_t max_h, int pix, uint32_t max_frames,
                    const _Atomic int *cancel, RtxImgBmp *out, RtxImgInfo *info) {
+    return img_decode_ex(b, n, lim, max_w, max_h, pix, max_frames, cancel, out, info, NULL);
+}
+
+static int img_decode_ex(const uint8_t *b, size_t n, const RtxImgLimits *lim,
+                         uint32_t max_w, uint32_t max_h, int pix, uint32_t max_frames,
+                         const _Atomic int *cancel, RtxImgBmp *out, RtxImgInfo *info,
+                         const char *svg_dir) {
     RtxImgInfo in;
     RtxWuffsDec *d;
     int fmt, rc;
@@ -445,6 +637,8 @@ int rtx_img_decode(const uint8_t *b, size_t n, const RtxImgLimits *lim,
     if ((uint64_t)n > lim->file_max) return RTX_IMG_EFILE;
     if (max_frames < 1) max_frames = 1;
     fmt = rtx_wuffs_sniff(b, n, 1);
+    if (fmt == RTX_WUFFS_FMT_NONE && rtx_svg_sniff(b, n))
+        return img_svg_decode(b, n, lim, svg_dir, max_w, max_h, pix, cancel, out, info);
     if (fmt == RTX_WUFFS_FMT_NONE) return RTX_IMG_EFORMAT;
     d = rtx_wuffs_open(fmt);
     if (!d) return RTX_IMG_ENOMEM;
@@ -1381,6 +1575,7 @@ typedef struct {
     RtxImgBmp out;
     int64_t mtime;
     uint64_t size;
+    char svg_dir[RTX_IMG_PATH]; /* SVG size + pixel cache (safe home), or "" */
     _Atomic int done;
 } ImgJob;
 
@@ -1484,6 +1679,18 @@ static int img_cache_dir(char *out, size_t n) {
     snprintf(out, n, "%s/img/cache", dir);
     (void)mkdir(out, 0700);
     return 1;
+}
+
+/* The SVG size + pixel cache (<safe>/img/svg; img_svg.c), or "" (no safe
+ * home, or svg_cache_mb 0). UI thread: jobs get a copy. */
+static void img_svg_dir(char *out, size_t n) {
+    char dir[RTX_IMG_PATH];
+    out[0] = 0;
+    if (!rtx_img_limits()->svg_cache_max || !rtx_safe_dir(dir, sizeof dir)) return;
+    snprintf(out, n, "%s/img", dir);
+    (void)mkdir(out, 0700);
+    snprintf(out, n, "%s/img/svg", dir);
+    if (mkdir(out, 0700) != 0 && errno != EEXIST) out[0] = 0;
 }
 
 static void img_cache_file(const char *url, const char *ext, char *out, size_t n) {
@@ -1608,7 +1815,7 @@ static void img_job_run(ImgJob *j) {
                 if (j->rc != RTX_IMG_OK) break;
                 b = buf;
             }
-            j->rc = rtx_img_probe(b, n, closed, &j->lim, &j->info);
+            j->rc = img_probe_ex(b, n, closed, &j->lim, j->svg_dir, &j->cancel, &j->info);
             if (j->rc != RTX_IMG_MORE || closed) break;
         }
         if (j->rc == RTX_IMG_MORE) j->rc = RTX_IMG_ETRUNC;
@@ -1624,8 +1831,8 @@ static void img_job_run(ImgJob *j) {
             b = buf;
         }
         if (j->rc == RTX_IMG_OK)
-            j->rc = rtx_img_decode(b, n, &j->lim, j->w, j->h, j->pix, j->frames, &j->cancel,
-                                   &j->out, &j->info);
+            j->rc = img_decode_ex(b, n, &j->lim, j->w, j->h, j->pix,
+                                   j->frames, &j->cancel, &j->out, &j->info, j->svg_dir);
         free(buf);
     }
     atomic_store_explicit(&j->done, 1, memory_order_release);
@@ -1769,6 +1976,7 @@ static void img_schedule(void) {
             L->job.be = NULL;
             L->job.lim = *rtx_img_limits();
             L->job.cancel = 0;
+            img_svg_dir(L->job.svg_dir, sizeof L->job.svg_dir);
             pick->hstate = IMG_H_RUN;
             pick->jobs++;
             img_lane_kick(L) !>(err) {
@@ -1804,6 +2012,7 @@ static void img_schedule(void) {
             L->job.pix = pick->pix;
             L->job.frames = lim->anim ? lim->anim_frames : 1;
             L->job.cancel = 0;
+            img_svg_dir(L->job.svg_dir, sizeof L->job.svg_dir);
             memset(&L->job.out, 0, sizeof L->job.out);
             pick->state = IMG_B_RUN;
             pick->cancel = 0;
@@ -1933,6 +2142,7 @@ int rtx_img_file(const RtxImgSrc *s, char *out, size_t n) {
         case RTX_IMG_FMT_BMP: ext = "bmp"; break;
         case RTX_IMG_FMT_WEBP: ext = "webp"; break;
         case RTX_IMG_FMT_QOI: ext = "qoi"; break;
+        case RTX_IMG_FMT_SVG: ext = "svg"; break;
         default: ext = "bin"; break;
         }
         snprintf(out, n, "%s/data-%016llx.%s", dir,
@@ -2049,7 +2259,10 @@ static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, int pix,
                                  RtxImgBmpEnt **anyp) {
     RtxImgBmpEnt *be, *best = NULL, *any = NULL;
     uint32_t fw, fh;
-    rtx_img_fit(e->info.w, e->info.h, w, h, &fw, &fh);
+    if (e->info.fmt == RTX_IMG_FMT_SVG)
+        img_svg_box(rtx_img_limits(), e->info.w, e->info.h, w, h, &fw, &fh);
+    else
+        rtx_img_fit(e->info.w, e->info.h, w, h, &fw, &fh);
     for (be = e->bmps; be; be = be->next) {
         uint32_t dw;
         uint32_t dh;

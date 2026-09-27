@@ -67,12 +67,23 @@ def mermaid_samples():
 
 
 def refs():
+    """Through the protocol, exactly as the editor asks: size, then pixels at
+    the natural box (ceil of the CSS size)."""
+    import math
+    sys.path.insert(0, os.path.join(ROOT, 'bench'))
+    from render_client import Helper, save_png
     os.makedirs(os.path.join(HERE, 'ref'), exist_ok=True)
-    helper = os.path.join(ROOT, 'bin', 'cctext-render')
+    h = Helper()
     for f in sorted(glob.glob(os.path.join(S, '*.svg'))):
         name = os.path.basename(f)[:-4]
-        subprocess.run([helper, '--png', f, os.path.join(HERE, 'ref', name + '.png'), '1'], check=True)
-        print('ref', name)
+        src = open(f, 'rb').read()
+        sz = h.render(src, size_only=True)
+        r = h.render(src, box=(math.ceil(sz['w']), math.ceil(sz['h'])))
+        if 'error' in r:
+            sys.exit('%s: %r' % (name, r['error']))
+        save_png(r, os.path.join(HERE, 'ref', name + '.png'))
+        print('ref', name, r['pw'], r['ph'])
+    h.close()
 
 
 if __name__ == '__main__':

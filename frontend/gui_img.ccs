@@ -66,9 +66,16 @@ void gui_img_placeholder(GuiFonts *fonts, const RtxImgView *v, double x, double 
     EndScissorMode();
 }
 
+static int gui_img_draw_impl(GuiFonts *fonts, const RtxImgSrc *src, double x, double y,
+                             double w, double h, double want_w, double want_h, float alpha,
+                             const char *alt, size_t altn, int plate);
+
+/* Panes are dark: an SVG drawn as-is (docs/images.md "Renderer") may be
+ * dark lines on transparency, so it gets a light backing plate there
+ * (settings svg_backing; slides paint their own background and skip it). */
 int gui_img_draw_src(GuiFonts *fonts, const RtxImgSrc *src, double x, double y, double w,
                      double h, float alpha, const char *alt, size_t altn) {
-    return gui_img_draw_at(fonts, src, x, y, w, h, w, h, alpha, alt, altn);
+    return gui_img_draw_impl(fonts, src, x, y, w, h, w, h, alpha, alt, altn, 1);
 }
 
 /* As gui_img_draw_src, decoding at (want_w, want_h) whatever the drawn
@@ -76,6 +83,12 @@ int gui_img_draw_src(GuiFonts *fonts, const RtxImgSrc *src, double x, double y, 
 int gui_img_draw_at(GuiFonts *fonts, const RtxImgSrc *src, double x, double y, double w,
                     double h, double want_w, double want_h, float alpha, const char *alt,
                     size_t altn) {
+    return gui_img_draw_impl(fonts, src, x, y, w, h, want_w, want_h, alpha, alt, altn, 0);
+}
+
+static int gui_img_draw_impl(GuiFonts *fonts, const RtxImgSrc *src, double x, double y,
+                             double w, double h, double want_w, double want_h, float alpha,
+                             const char *alt, size_t altn, int plate) {
     RtxImgView v;
     uint32_t bw, bh;
     if (w < 1 || h < 1) return RTX_IMG_S_ERR;
@@ -85,6 +98,9 @@ int gui_img_draw_at(GuiFonts *fonts, const RtxImgSrc *src, double x, double y, d
     if (bh < 1) bh = 1;
     rtx_img_want(src, bw, bh, &v);
     if (v.state == RTX_IMG_S_OK && v.bmp && v.be) {
+        if (plate && v.have_info && v.info.fmt == RTX_IMG_FMT_SVG && rtx_img_limits()->svg_backing)
+            DrawRectangle((int)x, (int)y, (int)(w + 0.5), (int)(h + 0.5),
+                          gui_img_col(244, 244, 240, alpha));
         void *pi = rtx_img_plat(v.be, v.frame);
         if (!pi) {
             const RtxImgBmp *bm = v.bmp;
@@ -294,7 +310,9 @@ void gui_img_cmd_revoke(RtxWs *w, RtxBuf *b, char *status, size_t sn) {
 
 /* Format of the document's bytes (RTX_IMG_FMT_NONE: not an image). */
 int gui_img_doc_fmt(RtxDoc *d) {
-    char head[32];
+    /* An SVG's root element can follow a prolog (XML declaration,
+     * comments, a DOCTYPE): look a little further than magic bytes. */
+    char head[2048];
     size_t got;
     @errhandler(CCError e) {
         (void)e;
@@ -357,9 +375,17 @@ typedef struct {
     const RtxBuf *b;
     double zoom;           /* 0 = fit */
     double px, py;         /* pan, window px */
+    int svg_preview;       /* an SVG shows its picture (Ctrl-D); else its text */
 } GuiImgZoom;
 
 static GuiImgZoom g_zoom[16];
+
+static GuiImgZoom *gui_img_zoom_find(const RtxBuf *b) {
+    int i;
+    for (i = 0; i < 16; i++)
+        if (g_zoom[i].b == b) return &g_zoom[i];
+    return NULL;
+}
 
 static GuiImgZoom *gui_img_zoom(const RtxBuf *b) {
     int i, free_i = -1;
@@ -373,10 +399,18 @@ static GuiImgZoom *gui_img_zoom(const RtxBuf *b) {
     return &g_zoom[free_i];
 }
 
+/* An SVG is text: it opens in the editor, and Ctrl-D (view.rich) swaps
+ * the pane to its picture and back (docs/images.md "Renderer"). */
 int gui_img_viewer_on(RtxBuf *b) {
+    int fmt;
     if (!b || rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout)) return 0;
     if (!RtxDoc_file_path(&b->doc)) return 0;
-    return gui_img_doc_fmt(&b->doc) != RTX_IMG_FMT_NONE;
+    fmt = gui_img_doc_fmt(&b->doc);
+    if (fmt == RTX_IMG_FMT_SVG) {
+        GuiImgZoom *z = gui_img_zoom_find(b);
+        return z && z->svg_preview;
+    }
+    return fmt != RTX_IMG_FMT_NONE;
 }
 
 void gui_img_viewer_draw(GuiFonts *fonts, RtxBuf *b, int x0, int y0, int pw, int ph) {
@@ -398,19 +432,26 @@ void gui_img_viewer_draw(GuiFonts *fonts, RtxBuf *b, int x0, int y0, int pw, int
     } else {
         double sx = bw / (double)v.info.w, sy = bh / (double)v.info.h;
         s = sx < sy ? sx : sy;
-        if (s > 1) s = 1;
+        if (s > 1 && v.info.fmt != RTX_IMG_FMT_SVG) s = 1; /* vectors fit up too */
     }
     dw = (double)v.info.w * s;
     dh = (double)v.info.h * s;
     dx = x0 + 12 + (bw - dw) / 2 + z->px;
     dy = y0 + 12 + (bh - dh) / 2 + z->py;
     BeginScissorMode(x0 + 4, y0 + 4, pw - 8, ph - 30);
-    /* Decode at most at the natural size; the blit scales beyond. */
-    gui_img_draw_at(fonts, &src, dx, dy, dw, dh, dw < v.info.w ? dw : v.info.w,
-                    dh < v.info.h ? dh : v.info.h, 1.0f, NULL, 0);
+    if (v.info.fmt == RTX_IMG_FMT_SVG) {
+        /* Vector: rendered at the drawn size (within the SVG pixel cap),
+         * so a zoom stays sharp. */
+        gui_img_draw_impl(fonts, &src, dx, dy, dw, dh, dw, dh, 1.0f, NULL, 0, 1);
+    } else {
+        /* Decode at most at the natural size; the blit scales beyond. */
+        gui_img_draw_at(fonts, &src, dx, dy, dw, dh, dw < v.info.w ? dw : v.info.w,
+                        dh < v.info.h ? dh : v.info.h, 1.0f, NULL, 0);
+    }
     EndScissorMode();
-    snprintf(extra, sizeof extra, "  %d%%%s  + - zoom  0 fit  1 actual  Ctrl-D hex",
-             (int)(s * 100 + 0.5), z->zoom > 0 ? "" : " (fit)");
+    snprintf(extra, sizeof extra, "  %d%%%s  + - zoom  0 fit  1 actual  Ctrl-D %s",
+             (int)(s * 100 + 0.5), z->zoom > 0 ? "" : " (fit)",
+             v.info.fmt == RTX_IMG_FMT_SVG ? "text" : "hex");
     gui_img_caption(fonts, &v, b->doc.len(), x0 + 12, y0 + ph - 24,
                     RtxDoc_dirty(&b->doc) ? "  (edited: showing the file on disk)" : extra);
 }
@@ -432,7 +473,7 @@ void gui_img_viewer_keys(RtxBuf *b) {
         double bw = g_gg[p].w - 24, bh = g_gg[p].h - 36;
         double sx = bw / (double)v.info.w, sy = bh / (double)v.info.h;
         cur = sx < sy ? sx : sy;
-        if (cur > 1) cur = 1;
+        if (cur > 1 && v.info.fmt != RTX_IMG_FMT_SVG) cur = 1;
         if (cur <= 0) cur = 1;
     }
     if (IsKeyPressed(KEY_LEFT)) z->px += 48;
@@ -455,8 +496,19 @@ void gui_img_viewer_keys(RtxBuf *b) {
 
 /* Ctrl-D on an image file: the picture <-> its hex. 1 when it applied. */
 int gui_img_viewer_toggle(RtxBuf *b) {
-    if (!b || !RtxDoc_file_path(&b->doc) || gui_img_doc_fmt(&b->doc) == RTX_IMG_FMT_NONE)
-        return 0;
+    int fmt;
+    if (!b || !RtxDoc_file_path(&b->doc)) return 0;
+    fmt = gui_img_doc_fmt(&b->doc);
+    if (fmt == RTX_IMG_FMT_NONE) return 0;
+    if (fmt == RTX_IMG_FMT_SVG) {
+        /* An SVG: its text <-> its picture (hex stays on Ctrl-L). */
+        GuiImgZoom *z;
+        if (rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout)) return 0;
+        z = gui_img_zoom(b);
+        z->svg_preview = !z->svg_preview;
+        b->layout.clear_rows();
+        return 1;
+    }
     if (rtx_layout_is_hex(&b->layout)) rtx_layout_set_view(&b->layout, RTX_VIEW_DEFAULT);
     else rtx_layout_set_view(&b->layout, RTX_VIEW_HEX);
     b->layout.clear_rows();

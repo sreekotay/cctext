@@ -137,7 +137,7 @@ CC_TARGET perf_matrix_smoke exe tests/perf_matrix_smoke.ccs
 CC_TARGET_INCLUDE perf_matrix_smoke .
 CC_TARGET_DEPS perf_matrix_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout
 
-CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c core/img_term.c
+CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c core/img_term.c core/img_svg.c
 CC_TARGET_INCLUDE rtx_img .
 CC_TARGET_DEPS rtx_img rtx_safe
 
