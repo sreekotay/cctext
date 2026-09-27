@@ -1070,6 +1070,224 @@ static void cctext_hw_md_rest(RtxBuf *b, const RtxUi *ui, int focused,
     cctext_hw_put(scr_row, base + (int)(cx + 0.5), 0);
 }
 
+/* ---- the image viewer (an image file opened directly) ----------------- */
+
+/* Zoom and pan per buffer, this session (docs/images.md "Terminal"). */
+typedef struct {
+    const RtxBuf *b;
+    double zoom;           /* 0 = fit */
+    int px, py;            /* pan, cells from the picture's top-left */
+    int vw, vh;            /* the last paint's area, cells */
+    double fit;            /* the last fit scale */
+} CctextZoom;
+
+static CctextZoom g_zoom[16];
+
+static CctextZoom *cctext_zoom(const RtxBuf *b) {
+    int i, free_i = -1;
+    for (i = 0; i < 16; i++) {
+        if (g_zoom[i].b == b) return &g_zoom[i];
+        if (!g_zoom[i].b && free_i < 0) free_i = i;
+    }
+    if (free_i < 0) free_i = 0;
+    memset(&g_zoom[free_i], 0, sizeof g_zoom[free_i]);
+    g_zoom[free_i].b = b;
+    return &g_zoom[free_i];
+}
+
+static int cctext_doc_img_fmt(RtxDoc *d) {
+    char head[32];
+    size_t got;
+    @errhandler(CCError e) {
+        (void)e;
+        return RTX_IMG_FMT_NONE;
+    }
+    if (!d || d->len() < 8) return RTX_IMG_FMT_NONE;
+    got = d->read_at(0, cc_slice_from_buffer(head, sizeof head)) !>;
+    return rtx_img_sniff((const uint8_t *)head, got);
+}
+
+int cctext_viewer_on(RtxBuf *b) {
+    if (!b || rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout)) return 0;
+    if (!RtxDoc_file_path(&b->doc)) return 0;
+    return cctext_doc_img_fmt(&b->doc) != RTX_IMG_FMT_NONE;
+}
+
+/* Ctrl-D on an image file: the picture <-> its hex. 1 when it applied. */
+int cctext_viewer_toggle(RtxBuf *b) {
+    if (!b || !RtxDoc_file_path(&b->doc) || cctext_doc_img_fmt(&b->doc) == RTX_IMG_FMT_NONE)
+        return 0;
+    if (rtx_layout_is_hex(&b->layout)) rtx_layout_set_view(&b->layout, RTX_VIEW_DEFAULT);
+    else rtx_layout_set_view(&b->layout, RTX_VIEW_HEX);
+    b->layout.clear_rows();
+    return 1;
+}
+
+/* The picture's cell box at a scale (cells capped at the placeholder
+ * range kitty can address). */
+static void cctext_viewer_box(const RtxImgInfo *in, double s, int *bc, int *br, uint32_t *dw,
+                              uint32_t *dh) {
+    uint32_t cw = 8, ch = 16;
+    double w, h;
+    rtx_img_cells_px(&cw, &ch);
+    w = (double)in->w * s;
+    h = (double)in->h * s;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    *dw = (uint32_t)(w + 0.5);
+    *dh = (uint32_t)(h + 0.5);
+    *bc = (int)((*dw + cw - 1) / cw);
+    *br = (int)((*dh + ch - 1) / ch);
+}
+
+/* + / = zoom in, - out, 0 fit, 1 actual size, arrows / wheel / PgUp PgDn
+ * pan. Keys that would edit are eaten: the viewer never changes the
+ * bytes. 1 = consumed. */
+int cctext_viewer_key(RtxBuf *b, int kind, int ch) {
+    CctextZoom *z = cctext_zoom(b);
+    double cur = z->zoom > 0 ? z->zoom : (z->fit > 0 ? z->fit : 1.0);
+    int page = z->vh > 2 ? z->vh - 1 : 1;
+    if (kind == KEY_TEXT && g_text) {
+        /* A typed run: each character in turn. */
+        size_t i;
+        for (i = 0; i < g_text_n; i++) cctext_viewer_key(b, KEY_CHAR, (unsigned char)g_text[i]);
+        return 1;
+    }
+    switch (kind) {
+    case KEY_CHAR:
+        if (ch == '+' || ch == '=') z->zoom = cur * 1.25 > 32 ? 32 : cur * 1.25;
+        else if (ch == '-') z->zoom = cur / 1.25 < 0.02 ? 0.02 : cur / 1.25;
+        else if (ch == '0') {
+            z->zoom = 0;
+            z->px = z->py = 0;
+        } else if (ch == '1') z->zoom = 1;
+        return 1;
+    case KEY_LEFT: z->px -= 4; return 1;
+    case KEY_RIGHT: z->px += 4; return 1;
+    case KEY_UP: case KEY_WHEEL_UP: z->py -= 2; return 1;
+    case KEY_DOWN: case KEY_WHEEL_DOWN: z->py += 2; return 1;
+    case KEY_PAGE_UP: z->py -= page; return 1;
+    case KEY_PAGE_DOWN: z->py += page; return 1;
+    case KEY_HOME: z->px = z->py = 0; return 1;
+    case KEY_PASTE_TEXT: case KEY_BACKSPACE: case KEY_DELETE: case KEY_ENTER:
+    case KEY_TAB: case KEY_CUT: case KEY_PASTE: case KEY_UNDO: case KEY_REDO:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void cctext_viewer_row_blank(int r, int col0, int pcols, int pad_rest) {
+    int k;
+    fprintf(stdout, "\x1b[%d;%dH\x1b[0m", r + 1 + g_cctext_row0, col0);
+    if (pad_rest)
+        for (k = 0; k < pcols; k++) fputc(' ', stdout);
+    else
+        fputs("\x1b[K", stdout);
+}
+
+static void cctext_draw_viewer(RtxBuf *b, int vis, int pcols, int col0, int pad_rest) {
+    RtxImgSrc src;
+    RtxImgView v;
+    CctextZoom *z = cctext_zoom(b);
+    CctiPic P;
+    char cap[256], why[120], sz[32];
+    int area = vis - 1, r, bc = 0, br = 0, x_off = 0, y_off = 0;
+    uint32_t dw = 0, dh = 0, cw = 8, ch = 16;
+    double s = 1;
+    uint64_t bytes = b->doc.len();
+    rtx_img_src_file(RtxDoc_file_path(&b->doc), &src);
+    rtx_img_info(&src, &v);
+    rtx_img_cells_px(&cw, &ch);
+    if (area < 1) area = 1;
+    z->vw = pcols;
+    z->vh = area;
+    if (bytes >= (1u << 20))
+        snprintf(sz, sizeof sz, "%.1f MiB", (double)bytes / (double)(1u << 20));
+    else
+        snprintf(sz, sizeof sz, "%.1f KiB", (double)bytes / 1024.0);
+    if (v.have_info && v.state != RTX_IMG_S_ERR) {
+        double sx = (double)pcols * cw / (double)v.info.w;
+        double sy = (double)area * ch / (double)v.info.h;
+        z->fit = sx < sy ? sx : sy;
+        if (z->fit > 1) z->fit = 1;
+        s = z->zoom > 0 ? z->zoom : z->fit;
+        cctext_viewer_box(&v.info, s, &bc, &br, &dw, &dh);
+        if (bc > RTX_IMG_VIEW_CELLS || br > RTX_IMG_VIEW_CELLS) {
+            /* Past what a kitty placement can address: cap the zoom. */
+            double k = (double)RTX_IMG_VIEW_CELLS / (double)(bc > br ? bc : br);
+            s *= k;
+            if (z->zoom > 0) z->zoom = s;
+            cctext_viewer_box(&v.info, s, &bc, &br, &dw, &dh);
+        }
+        if (bc <= pcols) {
+            x_off = (pcols - bc) / 2;
+            z->px = 0;
+        } else {
+            if (z->px > bc - pcols) z->px = bc - pcols;
+            if (z->px < 0) z->px = 0;
+        }
+        if (br <= area) {
+            y_off = (area - br) / 2;
+            z->py = 0;
+        } else {
+            if (z->py > br - area) z->py = br - area;
+            if (z->py < 0) z->py = 0;
+        }
+        snprintf(cap, sizeof cap, " %s %ux%u  %s  %d%%%s  + - zoom  0 fit  1 actual  arrows pan"
+                 "  Ctrl-D hex%s",
+                 rtx_img_fmt_name(v.info.fmt), (unsigned)v.info.w, (unsigned)v.info.h, sz,
+                 (int)(s * 100 + 0.5), z->zoom > 0 ? "" : " (fit)",
+                 RtxDoc_dirty(&b->doc) ? "  (edited: showing the file on disk)" : "");
+    } else if (v.state == RTX_IMG_S_ERR) {
+        snprintf(cap, sizeof cap, " [image: %s]  %s", rtx_img_err_text(v.err, why, sizeof why), sz);
+    } else {
+        snprintf(cap, sizeof cap, " [image: reading header]  %s", sz);
+    }
+    memset(&P, 0, sizeof P);
+    P.src = &src;
+    P.cols = bc;
+    P.rows = br;
+    P.dw = dw;
+    P.dh = dh;
+    for (r = 0; r < area; r++) {
+        int li = r - y_off + z->py;
+        if (!bc || cctext_img_proto() == CCTI_OFF || li < 0 || li >= br) {
+            cctext_viewer_row_blank(r, col0, pcols, pad_rest);
+            continue;
+        }
+        {
+            int c0 = z->px, n = bc - c0, k;
+            if (n > pcols - x_off) n = pcols - x_off;
+            fprintf(stdout, "\x1b[%d;%dH\x1b[0m", r + 1 + g_cctext_row0, col0);
+            for (k = 0; k < x_off; k++) fputc(' ', stdout);
+            if (n > 0) cctext_img_line(&P, li, c0, n, r + 1 + g_cctext_row0, col0 + x_off);
+            else n = 0;
+            if (pad_rest)
+                for (k = x_off + n; k < pcols; k++) fputc(' ', stdout);
+            else
+                fputs("\x1b[K", stdout);
+        }
+    }
+    if (cctext_img_proto() == CCTI_OFF && v.have_info && v.state != RTX_IMG_S_ERR) {
+        /* No pictures in this terminal: the stand-in. */
+        char line[200];
+        snprintf(line, sizeof line, " [image: %s %ux%u]", rtx_img_fmt_name(v.info.fmt),
+                 (unsigned)v.info.w, (unsigned)v.info.h);
+        fprintf(stdout, "\x1b[%d;%dH\x1b[0m", 1 + g_cctext_row0, col0);
+        cctext_put_text(line, strlen(line), pcols, NULL);
+    }
+    fprintf(stdout, "\x1b[%d;%dH\x1b[0;90m", area + 1 + g_cctext_row0, col0);
+    {
+        int used = cctext_put_text(cap, strlen(cap), pcols, NULL), k;
+        fputs("\x1b[0m", stdout);
+        if (pad_rest)
+            for (k = used; k < pcols; k++) fputc(' ', stdout);
+        else
+            fputs("\x1b[K", stdout);
+    }
+}
+
 /* A Rich picture row in cells (docs/images.md "Terminal"): lines
  * [li0, box rows) of the record's box at pane rows r.. (clipped to
  * body), the gutter's line number on the first when `label`. Returns the
@@ -1172,7 +1390,9 @@ void cctext_draw_pane(RtxBuf *b, const RtxUi *ui, int focused, int vis,
         sel_lo = b->doc.sel_lo();
         sel_hi = b->doc.sel_hi();
     }
-    if (rtx_layout_is_hex(&b->layout)) {
+    if (cctext_viewer_on(b)) {
+        cctext_draw_viewer(b, vis, pcols, col0, pad_rest);
+    } else if (rtx_layout_is_hex(&b->layout)) {
         cctext_draw_hex_pane(b, ui, focused, vis, pcols, col0, pad_rest);
     } else if (rtx_layout_is_grid(&b->layout)) {
         cctext_draw_grid_pane(b, ui, focused, vis, pcols, col0, pad_rest);
@@ -2600,6 +2820,34 @@ static int cctext_img_prev(RtxBrowsePrev *pv, int row0, int col0, int cols, int 
                  n >= (1u << 20) ? "MiB" : "KiB");
     else
         snprintf(line, sizeof line, " [image: reading header]");
+    if (cctext_img_proto() != CCTI_OFF && v.have_info && v.state != RTX_IMG_S_ERR &&
+        cols > 3 && vis > 2) {
+        /* The picture, fitted to the pane (never above natural size),
+         * its caption under it (docs/images.md "Terminal"). */
+        CctiPic P;
+        int bc, br;
+        uint32_t dw, dh;
+        cctext_img_fit(v.info.w, v.info.h, cols - 2, vis - 1, &bc, &br, &dw, &dh);
+        memset(&P, 0, sizeof P);
+        P.src = &src;
+        P.cols = bc;
+        P.rows = br;
+        P.dw = dw;
+        P.dh = dh;
+        for (r = 0; r < vis; r++) {
+            int k;
+            if (r >= br) {
+                cctext_browse_row(row0 + r, col0, cols, pad_rest, 0, r == br ? line : "",
+                                  RTX_BROWSE_FACE_FILE);
+                continue;
+            }
+            fprintf(stdout, "\x1b[%d;%dH\x1b[0m ", row0 + r + g_cctext_row0, col0);
+            cctext_img_line(&P, r, 0, bc, row0 + r + g_cctext_row0, col0 + 1);
+            for (k = 1 + bc; k < cols; k++) fputc(' ', stdout);
+            if (!pad_rest) fputs("\x1b[K", stdout);
+        }
+        return 1;
+    }
     for (r = 0; r < vis; r++)
         cctext_browse_row(row0 + r, col0, cols, pad_rest, 0, r == 0 ? line : "",
                           RTX_BROWSE_FACE_FILE);

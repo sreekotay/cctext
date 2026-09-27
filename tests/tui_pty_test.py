@@ -3064,7 +3064,142 @@ def case_image_tmux(exe, tmp):
             t.kill()
 
 
+def case_image_viewer(exe, tmp):
+    """An image file opened directly is the viewer: the picture fitted to
+    the pane (block art here) with its caption; + zooms, 1 is actual
+    size, arrows pan, 0 fits again; typing never edits; Ctrl-D is its hex
+    and back. The browse preview of an image file shows its picture over
+    the size line."""
+    if pyte is None:
+        print("skip: image viewer (no pyte)")
+        return
+    proj, path, body = img_project(tmp, "vw")
+    big = os.path.join(proj, "big.png")
+    with open(big, "rb") as f:
+        disk = f.read()
+    fake = FakeTerm("silent")
+    t = Tui(exe, ["--no-blink", big], img_env(tmp, "vw"), fake=fake)
+    try:
+        t.pump(1.5)
+        sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+        txt = "\n".join(sc.display)
+        # 1200x900 into 80 x 22 cells of 8x16: 10 rows of 16 = 352 px tall.
+        mid = sc.buffer[5]
+        check("PNG 1200x900" in txt and "(fit)" in txt, "image viewer: caption", repr(txt[-300:]))
+        check(near(fg_rgb(mid[20].bg), (220, 30, 30)) and near(fg_rgb(mid[60].bg), (30, 200, 40)),
+              "image viewer: the picture, fitted", repr((mid[20].bg, mid[60].bg)))
+        t.send(b"1", 0.8)
+        sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+        txt = "\n".join(sc.display)
+        check("100%" in txt and near(fg_rgb(sc.buffer[5][40].bg), (220, 30, 30)),
+              "image viewer: 1 = actual size (red corner fills the pane)")
+        t.send(b"\x1b[C" * 30 + b"\x1b[B" * 20, 0.8)
+        sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+        check(near(fg_rgb(sc.buffer[10][40].bg), (250, 250, 250)),
+              "image viewer: arrows pan to the white corner",
+              repr(sc.buffer[10][40].bg))
+        t.send(b"abc\x7f\r", 0.4)
+        t.send(b"0", 0.6)
+        txt = "\n".join(fake_screen(t.out, t.cols, t.rows, (8, 16)).display)
+        check("(fit)" in txt, "image viewer: 0 fits again")
+        t.send(b"\x04", 0.6)
+        txt = "\n".join(fake_screen(t.out, t.cols, t.rows, (8, 16)).display)
+        check("89 50 4e 47" in txt.lower(), "image viewer: Ctrl-D shows the hex",
+              repr(txt[:200]))
+        t.send(b"\x04", 0.6)
+        txt = "\n".join(fake_screen(t.out, t.cols, t.rows, (8, 16)).display)
+        check("PNG 1200x900" in txt, "image viewer: Ctrl-D back to the picture")
+        t.send(b"\x13", 0.3)
+        t.send(b"\x11", 0.3)
+        t.send(b"q", 0.2)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    with open(big, "rb") as f:
+        check(f.read() == disk, "image viewer: bytes unchanged")
+    # Browse preview: the picture, then the size line.
+    t = Tui(exe, ["--no-blink", proj], img_env(tmp, "vw2"), fake=FakeTerm("silent"), cols=120)
+    try:
+        t.pump(1.0)
+        for _ in range(8):
+            sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+            if "big.png" in "\n".join(sc.display):
+                break
+            t.pump(0.3)
+        # ../, anim.gif, big.png: two steps down.
+        t.send(b"\x1b[B", 0.5)
+        t.send(b"\x1b[B", 0.5)
+        y = -1
+        for _ in range(10):
+            sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+            y = find_row(sc, "[image: PNG 1200x900")
+            if y > 3:
+                break
+            t.pump(0.3)
+        txt = "\n".join(sc.display)
+        colored = [x for x in range(t.cols) if y > 3 and near(fg_rgb(sc.buffer[y - 3][x].bg),
+                                                                  (250, 250, 250))]
+        check(y > 3 and colored and min(colored) > t.cols // 2,
+              "image preview: the picture above the size line", repr((y, txt[-600:])))
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
+def case_image_present(exe, tmp):
+    """Terminal presentation: a slide's content image and a split
+    `![bg left]` are pictures in the slide box (block art); a kitty
+    terminal gets placeholder cells for them."""
+    if pyte is None:
+        print("skip: image present (no pyte)")
+        return
+    import shutil
+    here = os.path.dirname(os.path.abspath(__file__))
+    proj = os.path.join(tmp, "prs")
+    os.makedirs(os.path.join(proj, ".git"), exist_ok=True)
+    shutil.copy(os.path.join(here, "..", "testdata", "img", "big.png"), proj)
+    deck = (b"---\nmarp: true\n---\n\n# One\n\n![pic w:400](big.png)\n\n---\n\n"
+            b"![bg left:40%](big.png)\n\n# Two\n\ntext\n")
+    path = os.path.join(proj, "deck.md")
+    with open(path, "wb") as f:
+        f.write(deck)
+    for mode in ("silent", "kitty"):
+        fake = FakeTerm(mode)
+        t = Tui(exe, ["--no-blink", path], img_env(tmp, "prs"), fake=fake)
+        cell = (10, 20) if mode == "kitty" else (8, 16)
+        try:
+            t.pump(1.0)
+            t.send(b"\x1b[15;2~", 1.2)            # Shift-F5 on slide 1
+            sc = fake_screen(t.out, t.cols, t.rows, cell)
+            if mode == "silent":
+                red = [(x, y) for y in range(t.rows) for x in range(t.cols)
+                       if near(fg_rgb(sc.buffer[y][x].bg), (220, 30, 30))]
+                check(red and "One" in "\n".join(sc.display),
+                      "image present: a content picture (blocks)")
+            else:
+                load_diac()
+                check(kitty_cells(sc) and fake.images(), "image present: kitty cells")
+            t.send(b" ", 1.2)                      # slide 2: bg left
+            sc = fake_screen(t.out, t.cols, t.rows, cell)
+            if mode == "silent":
+                left = [x for x in range(t.cols // 2)
+                        if near(fg_rgb(sc.buffer[t.rows // 3][x].bg), (220, 30, 30)) or
+                        near(fg_rgb(sc.buffer[t.rows // 3][x].bg), (30, 200, 40))]
+                check(left and "Two" in "\n".join(sc.display),
+                      "image present: ![bg left] is a picture on its side")
+            t.send(b"\x1b", 0.5)
+            t.send(b"\x11", 0.3)
+            t.wait_exit(5.0)
+            if mode == "kitty":
+                check(fake.images() == {}, "image present: kitty images deleted on exit")
+        finally:
+            t.kill()
+
+
 CASES = {
+    "image_viewer": case_image_viewer,
+    "image_present": case_image_present,
     "image_blocks": case_image_blocks,
     "image_kitty": case_image_kitty,
     "image_sixel": case_image_sixel,
