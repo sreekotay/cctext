@@ -18,11 +18,14 @@
 #include "find.cch"
 #include "rtx_par.cch"
 #include "workspace.cch"
+#include "wb.cch"
 #include <stdatomic.h>
 
 int RtxWs_ensure(RtxWs *w) {
     if (!w) return 0;
     if (w->session.base) return 1;
+    /* workbook indexes (docs/workbook.md) live beside the Safe journals */
+    rtx_wb_set_cache_fn(rtx_safe_dir);
     w->session = cc_arena_heap(kilobytes(8));
     return w->session.base != NULL;
 }
@@ -33,7 +36,7 @@ void RtxBuf_destroy(RtxBuf *b) {
         b->layout.destroy();
         b->doc.destroy();
     }
-    *b = (RtxBuf){0};
+    memset(b, 0, sizeof(*b));
 }
 
 static int rtx_buf_rich(const RtxBuf *b);
@@ -137,7 +140,7 @@ static uint64_t rtx_ws_safe_sig(const RtxBuf *b) {
     uint64_t h = 1469598103934665603ull;
     if (!b) return 0;
     h ^= (uint64_t)b->doc.edit_gen; h *= 1099511628211ull;
-    h ^= (uint64_t)b->doc.saved_head; h *= 1099511628211ull;
+    h ^= (uint64_t)b->doc.saved_sid; h *= 1099511628211ull;
     h ^= (uint64_t)b->doc.caret; h *= 1099511628211ull;
     h ^= (uint64_t)b->doc.sel_anchor; h *= 1099511628211ull;
     h ^= (uint64_t)b->seek_off; h *= 1099511628211ull;
@@ -162,7 +165,7 @@ static uint64_t rtx_ws_safe_sig(const RtxBuf *b) {
 static void rtx_ws_safe_note(RtxBuf *b) {
     if (!b) return;
     b->safe_gen = b->doc.edit_gen;
-    b->safe_saved = b->doc.saved_head;
+    b->safe_saved = b->doc.saved_sid;
     b->safe_caret = b->doc.caret;
     b->safe_sel = b->doc.sel_anchor;
     b->safe_seek = b->seek_off;
@@ -189,7 +192,7 @@ static void rtx_ws_safe_note(RtxBuf *b) {
 
 static int rtx_ws_safe_hist_stale(const RtxBuf *b) {
     if (!b || b->parked) return 0;
-    return b->safe_gen != b->doc.edit_gen || b->safe_saved != b->doc.saved_head;
+    return b->safe_gen != b->doc.edit_gen || b->safe_saved != b->doc.saved_sid;
 }
 
 static int rtx_ws_safe_stale(const RtxBuf *b) {
@@ -381,9 +384,10 @@ static int rtx_ws_snap_tree(const RtxWs *w, int n, const int *ent_of_buf,
 
 static void rtx_ws_write_ws(RtxWs *w) {
     RtxSafeWs ws;
-    RtxSafeWsEnt ents[64];
+    RtxSafeWsEnt *ents;
     int ent_of_buf[64];
-    size_t i, n = 0;
+    size_t i, n = 0, cap;
+    CCArena frame = {0};
     if (!w) return;
     if (!rtx_safe_enabled()) {
         /* --batch without --safe: nothing would land; skip the snapshot. */
@@ -391,7 +395,19 @@ static void rtx_ws_write_ws(RtxWs *w) {
         w->ws_pending = 0;
         return;
     }
-    ws = (RtxSafeWs){0};
+    /* Entries carry a 4 KiB path each: 64 of them on the stack made this a
+     * 260 KiB frame. Heap scratch sized to the live buffer count. */
+    cap = w->len < 64 ? w->len : 64;
+    frame = cc_arena_heap((cap ? cap : 1) * sizeof(RtxSafeWsEnt) + 64);
+    ents = frame.base ? (RtxSafeWsEnt *)cc_arena_alloc(frame, (cap ? cap : 1) * sizeof(RtxSafeWsEnt),
+                                                       _Alignof(RtxSafeWsEnt))
+                      : NULL;
+    if (!ents) {
+        /* No snapshot this time; ws_pending stays set and the next pump retries. */
+        if (frame.base) frame.destroy();
+        return;
+    }
+    memset(&ws, 0, sizeof(ws));
     for (i = 0; i < w->len; i++) {
         const char *path = rtx_ws_buf_path(w->bufs[i]);
         if (i < 64) ent_of_buf[i] = -1;
@@ -424,6 +440,7 @@ static void rtx_ws_write_ws(RtxWs *w) {
         ws.nnode = 0;
     }
     rtx_safe_ws_write(&ws);
+    frame.destroy();
     w->browse_split_dirty = 0;
     w->ws_pending = 0;
 }
@@ -1362,7 +1379,9 @@ void RtxWs_destroy(RtxWs *w) {
     w->cap = 0;
     if (w->clip_a.base) w->clip_a.destroy();
     if (w->session.base) w->session.destroy();
-    *w = (RtxWs){0};
+    /* memset, not a compound literal: RtxWs is ~400 KiB and an unoptimized
+     * `(RtxWs){0}` copies it through a stack temporary. */
+    memset(w, 0, sizeof(*w));
 }
 
 RtxBuf *RtxWs_active(RtxWs *w) {
@@ -1418,7 +1437,7 @@ static RtxBuf *!>(CCError) rtx_ws_new_buf(RtxWs *w) {
         if (!b) return cc_err(CC_ERR_OUT_OF_MEMORY, "ws buf");
         w->bufs[w->len] = b;
     }
-    *b = (RtxBuf){0};
+    memset(b, 0, sizeof(*b));
     return cc_ok(b);
 }
 
@@ -1648,7 +1667,9 @@ void !>(CCError) RtxWs_open_files(RtxWs *w, int npaths, char **paths) {
     int i;
     if (!w) return cc_err(CC_ERR_INVALID_ARG, "null ws");
     if (w->session.base || w->len) return cc_err(CC_ERR_INVALID_ARG, "ws already live");
-    *w = (RtxWs){0};
+    /* memset, not a compound literal: RtxWs is ~400 KiB and an unoptimized
+     * `(RtxWs){0}` copies it through a stack temporary. */
+    memset(w, 0, sizeof(*w));
     w->npanes = 1;
     w->focus = 0;
     w->pane[0] = 0;
@@ -5820,7 +5841,7 @@ void !>(CCError) RtxWs_open_in_pane(RtxWs *w, char[:0] path) {
         for (p = 0; p < RTX_PANES_MAX; p++)
             if (w->cam[p].of == w->bufs[0]) rtx_ws_cam_drop(&w->cam[p]);
         w->bufs[0]->destroy();
-        *w->bufs[0] = (RtxBuf){0};
+        memset(w->bufs[0], 0, sizeof(*w->bufs[0]));
         w->len = 0;
         w->add_path(path) !>(e) { return cc_err(e); };
         bufi = 0;
@@ -6036,7 +6057,7 @@ void RtxWs_browse_prev_drop(RtxWs *w, int pane) {
     } else if (p->layout.store.base) {
         p->layout.destroy();
     }
-    *p = (RtxBrowsePrev){0};
+    memset(p, 0, sizeof(*p)); /* ~42 KiB: no stack temporary */
     /* Hosts compare against the last value seen: a reset would repeat it. */
     p->ready_seq = seq + 1;
     rtx_layout_set_view(&p->layout, view);
@@ -6372,6 +6393,9 @@ void !>(CCError) RtxWs_browse_prev_sync(RtxWs *w, int pane, RtxMeasure *m,
         rtx_browse_prev_adopt(p);
     if (p->live && p->kind == RTX_BROWSE_PREV_FILE &&
         strcmp(p->path, path) == 0) {
+        /* Back on the painted file (A -> B -> A): an open for B may still
+         * be reading want[]. Cancel it (join + drop staging) first. */
+        if (p->h.live() || p->want[0]) rtx_browse_prev_cancel(p);
         p->want[0] = 0;
         p->layout.wrap_char = 1;
         return rtx_ws_prev_fill(p, m, width, vis);

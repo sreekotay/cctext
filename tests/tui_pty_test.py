@@ -1897,8 +1897,404 @@ def case_present(exe, tmp):
           repr(out.stdout[:200] + out.stderr[:200]))
 
 
+def case_wb_annotation(exe, tmp):
+    """Workbook (docs/workbook.md "Live value"): the caret in a formula
+    shows ` → value` after it, dimmed, changing with every keystroke (an
+    error while half-typed), in Rich and Source; the cursor stays at the
+    formula's end, before the annotation; the file never holds it."""
+    if pyte is None:
+        print("skip: wb annotation (no pyte)")
+        return
+    body = (b"# S\n\nTable: T\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | =@a * 2 |\n\n"
+            b"```calc\ns = sum(T.a)\n```\n")
+    t, path = open_tui(exe, tmp, "w.wb.md", body)
+    res = {}
+
+    def calc_line():
+        for ln in (screen_text(t) or "").split("\n"):
+            if "s = " in ln:
+                return ln
+        return ""
+
+    try:
+        txt = screen_text(t) or ""
+        if "rich" not in txt.split("\n")[-1]:
+            t.send(b"\x04", 0.4)  # Ctrl-D: Rich on
+        res["before"] = calc_line()
+        t.send(b"\x1b[1;5F", 0.3)  # Ctrl-End
+        t.send(b"\x1b[A\x1b[A\x1b[F", 0.4)  # Up, Up, End: after `)`
+        res["on"] = calc_line()
+        res["dim"] = None
+        sc = t.screen()
+        for y in range(t.rows):
+            row = "".join(sc.buffer[y][x].data for x in range(t.cols))
+            if "s = sum" in row and "\u2192" in row:
+                x = row.index("\u2192")
+                res["dim"] = (sc.buffer[y][x].fg, sc.buffer[y][row.index("s = ")].fg)
+        c = cursor_at(t)
+        res["cur"] = (c, cell_char(t, c[0] - 1, c[1]) if c else None)
+        steps = []
+        for key, want in ((b"+", "#parse"), (b"1", "5"), (b"0", "14")):
+            t.send(key, 0.35)
+            steps.append((key, want, calc_line()))
+        res["steps"] = steps
+        t.send(b"\x7f" * 4, 0.5)  # back to `s = sum(T.a`: half-typed
+        res["half"] = calc_line()
+        t.send(b"\x04", 0.4)  # Ctrl-D: Source
+        res["source"] = calc_line()
+        t.send(b")", 0.3)
+        t.send(b"\x1b[A", 0.4)  # the caret leaves the formula
+        res["off"] = calc_line()
+        t.send(b"\x04", 0.4)  # Ctrl-D: Rich again
+        # the table cell `=@a * 2`: from the end, up to its row; End, Left
+        # past `|` and ` `
+        t.send(b"\x1b[1;5F", 0.3)
+        t.send(b"\x1b[A\x1b[A\x1b[A\x1b[A\x1b[F\x1b[D\x1b[D", 0.5)
+        res["cell"] = [ln for ln in (screen_text(t) or "").split("\n") if "=@a" in ln]
+        c = cursor_at(t)
+        res["cellcur"] = (c, cell_char(t, c[0] - 1, c[1]) if c else None)
+        t.send(b"\x13", 0.4)  # Ctrl-S
+        t.send(b"\x11", 0.2)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    with open(path, "rb") as f:
+        disk = f.read()
+    arrow = "→"
+    check(arrow not in res["before"] and "s = 4" in res["before"],
+          "wb: a calc line paints its value", repr(res["before"]))
+    check(("s = sum(T.a) " + arrow + " 4 ") in res["on"],
+          "wb: caret in the formula: the formula, then its value", repr(res["on"]))
+    check(bool(res["dim"]) and res["dim"][0] != res["dim"][1],
+          "wb: the annotation paints in its own (dim) colour", repr(res["dim"]))
+    check(bool(res["cur"][0]) and res["cur"][1] == ")",
+          "wb: the cursor sits at the formula's end, before the annotation",
+          repr(res["cur"]))
+    for key, want, line in res["steps"]:
+        check((arrow + " " + want) in line,
+              "wb: keystroke %r: annotation %s" % (key, want), repr(line))
+    check((arrow + " #parse(") in res["half"],
+          "wb: a half-typed formula shows its error", repr(res["half"]))
+    check(("s = sum(T.a " + arrow + " #parse(") in res["source"],
+          "wb: Source view shows the annotation too", repr(res["source"]))
+    check(arrow not in res["off"], "wb: the caret leaves: no annotation", repr(res["off"]))
+    check(bool(res["cell"]) and ("=@a * 2 " + arrow + " 6") in res["cell"][0],
+          "wb: a table cell formula shows its value after it", repr(res["cell"]))
+    check(bool(res["cellcur"][0]) and res["cellcur"][1] == "2",
+          "wb: in the cell, the cursor sits before the annotation", repr(res["cellcur"]))
+    check(arrow.encode() not in disk and b"s = sum(T.a)\n" in disk,
+          "wb: the file never holds the annotation", repr(disk[-40:]))
+
+
+def case_wb_deferred(exe, tmp):
+    """Workbook at scale (docs/workbook.md "W1: the lazy engine"): in a
+    workbook over RTX_WB_DEFER_BYTES (1 MiB) a structural edit does not
+    reparse on the keystroke; the read is a job the idle loop steps in
+    slices, values hide while it reads, the status says recalculating,
+    and the values paint again when it ends."""
+    if pyte is None:
+        print("skip: wb deferred (no pyte)")
+        return
+    rows = b"".join(b"| %d | =@a * 2 |\n" % i for i in range(1, 400001))
+    body = (b"# D\n\n```calc\ns = sum(T.a)\n```\n\nTable: T\n\n| a | b |\n|---|---|\n" +
+            rows)
+    t, path = open_tui(exe, tmp, "big.wb.md", body, settle=4.0)
+    res = {}
+
+    def calc_line():
+        for ln in (screen_text(t) or "").split("\n"):
+            if "s = " in ln:
+                return ln
+        return ""
+
+    try:
+        txt = screen_text(t) or ""
+        if "rich" not in txt.split("\n")[-1]:
+            t.send(b"\x04", 0.6)  # Ctrl-D: Rich on
+        res["before"] = calc_line()
+        t.send(b"\x1b[1;5H", 0.3)  # Ctrl-Home
+        t.send(b"\x1b[B\x1b[B\x1b[F", 0.3)  # the ```calc line, its end
+        # break the fence and mend it in one burst: a structural edit
+        t.send(b"x\x7f", 0.05)
+        txt = screen_text(t) or ""
+        res["mid"] = calc_line()
+        res["mid_status"] = txt.split("\n")[-1]
+        t.pump(4.0)
+        res["after"] = calc_line()
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    check("s = " in res["before"] and "sum(" not in res["before"],
+          "wb big: a calc line paints its value", repr(res["before"]))
+    check("sum(" in res["mid"],
+          "wb big: a structural edit hides the values (no reparse on the keystroke)",
+          repr(res["mid"]))
+    check("recalculating" in res["mid_status"],
+          "wb big: the status says the reparse waits", repr(res["mid_status"]))
+    check("s = " in res["after"] and "sum(" not in res["after"],
+          "wb big: the idle loop reparses and repaints", repr(res["after"]))
+
+
+def _line_with(t, needle):
+    for ln in (screen_text(t) or "").split("\n"):
+        if needle in ln:
+            return ln
+    return ""
+
+
+def _fg_of(t, needle, sub):
+    """(fg of `sub`'s first char, fg of `needle`'s first char) on the row
+    holding `needle`, else None."""
+    sc = t.screen()
+    for y in range(t.rows):
+        row = "".join(sc.buffer[y][x].data for x in range(t.cols))
+        if needle in row and sub in row[row.index(needle):]:
+            x0 = row.index(needle)
+            x1 = row.index(sub, x0)
+            return (sc.buffer[y][x1].fg, sc.buffer[y][x0].fg)
+    return None
+
+
+def case_wb_stale(exe, tmp):
+    """Workbook W1 stale display (docs/workbook.md "W1: the lazy engine"):
+    a param flip over a big table is a job; until it ends the value paints
+    its last value after `≈`, dimmed (its own theme colour), and the status
+    says recalculating; Esc cancels (the stale mark stays, the status says
+    so); the next edit plans the job again and the value paints fresh."""
+    if pyte is None:
+        print("skip: wb stale (no pyte)")
+        return
+    rows = b"".join(b"| %d |\n" % (i % 10) for i in range(300000))
+    body = (b"# S\n\n```params\nlim = 5\n```\n\n```calc\nbig = sum(T.x where x > lim)\n```\n\n"
+            b"Table: T\n\n| x |\n|---|\n" + rows)
+    env = {"RTX_WB_INLINE_WORK": "512", "RTX_WB_SLICE_MS": "1", "RTX_WB_SLICE_ROWS": "64",
+           "RTX_WB_SLICE_PAUSE_MS": "2"}  # the job outlasts the keys below
+    path = scratch_file(tmp, "stale.wb.md", body)
+    env["RTX_SAFE_HOME"] = os.path.join(tmp, "safe")
+    t = Tui(exe, [path], env, cols=200)  # wide: the status after the key hints
+    t.pump(6.0)
+    res = {}
+    try:
+        txt = screen_text(t) or ""
+        if "rich" not in txt.split("\n")[-1]:
+            t.send(b"\x04", 0.5)  # Ctrl-D: Rich on
+        t.pump(1.5)
+        res["before"] = _line_with(t, "big = ")
+        t.send(b"\x1b[1;5H", 0.3)  # Ctrl-Home
+        t.send(b"\x1b[B\x1b[B\x1b[B\x1b[F", 0.3)  # `lim = 5`, its end
+        t.send(b"\x1b[1;2D", 0.2)  # Shift-Left: select the 5
+        t.send(b"7", 0.08)  # one edit: lim = 7
+        txt = screen_text(t) or ""
+        res["mid"] = _line_with(t, "big = ")
+        res["mid_status"] = txt.split("\n")[-1]
+        res["mid_fg"] = _fg_of(t, "big = ", "\u2248")
+        t.send(b"\x1b", 0.8)  # Esc: cancel
+        txt = screen_text(t) or ""
+        res["cancel"] = _line_with(t, "big = ")
+        res["cancel_status"] = txt.split("\n")[-1]
+        t.pump(1.0)
+        res["cancel_later"] = _line_with(t, "big = ")
+        t.send(b"\x1b[1;2D", 0.2)
+        t.send(b"8", 0.2)  # the next edit plans the job again (x > 8)
+        t.pump(6.0)
+        res["after"] = _line_with(t, "big = ")
+        t.send(b"\x11", 0.3)
+        t.send(b"d", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    check("big = 900000" in res["before"], "wb stale: the value before", repr(res["before"]))
+    check("big = \u2248900000" in res["mid"],
+          "wb stale: while the job runs, the last value after the stale mark", repr(res["mid"]))
+    check("recalculating" in res["mid_status"], "wb stale: the status says recalculating",
+          repr(res["mid_status"]))
+    check(bool(res["mid_fg"]) and res["mid_fg"][0] != res["mid_fg"][1],
+          "wb stale: the stale value paints in its own (dim) colour", repr(res["mid_fg"]))
+    check("big = \u2248900000" in res["cancel"] and "big = \u2248900000" in res["cancel_later"],
+          "wb stale: Esc cancels, the stale mark stays", repr((res["cancel"], res["cancel_later"])))
+    check("cancel" in res["cancel_status"], "wb stale: the status says cancelled",
+          repr(res["cancel_status"]))
+    check("big = 270000" in res["after"] and "\u2248" not in res["after"],
+          "wb stale: the next edit recomputes; fresh again", repr(res["after"]))
+
+
+def case_wb_anchor(exe, tmp):
+    """Workbook anchors (docs/workbook.md "Fixed rows: anchors"): `{#name}`
+    at a row's first cell stays visible in Rich and in Source, painted in
+    its own accent colour; `T#name.col` reads the row; Copy Reference to
+    Row on an anchored row says what it copied; Anchor Row on a row without
+    one inserts `{#name}` (one undo step)."""
+    if pyte is None:
+        print("skip: wb anchor (no pyte)")
+        return
+    body = (b"# A\n\n```calc\nx = T#top.v * 10\n```\n\nTable: T\n\n| k | v |\n|---|---|\n"
+            b"| {#top} alpha | 4 |\n| beta | 5 |\n")
+    home = config_home(tmp, "cfg_anc")
+    path = scratch_file(tmp, "anc.wb.md", body)
+    # wide: the status line's message follows the key hints
+    t = Tui(exe, [path], {"RTX_SAFE_HOME": os.path.join(tmp, "safe"), "XDG_CONFIG_HOME": home},
+            cols=200)
+    t.pump(0.8)
+    res = {}
+    try:
+        txt = screen_text(t) or ""
+        if "rich" not in txt.split("\n")[-1]:
+            t.send(b"\x04", 0.5)  # Ctrl-D: Rich on
+        res["rich"] = _line_with(t, "alpha")
+        res["rich_fg"] = _fg_of(t, "{#top}", "alpha")
+        res["calc"] = _line_with(t, "x = ")
+        t.send(b"\x04", 0.5)  # Source
+        res["source"] = _line_with(t, "alpha")
+        res["source_fg"] = _fg_of(t, "{#top}", "alpha")
+        t.send(b"\x04", 0.5)  # Rich again
+        # the caret on `beta`: Ctrl-End, Up, Home
+        t.send(b"\x1b[1;5F", 0.3)
+        t.send(b"\x1b[A\x1b[H\x1b[C\x1b[C\x1b[C", 0.3)
+        t.send(F1, 0.4)
+        t.send(b"copy reference to row", 0.4)
+        t.send(b"\r", 0.5)
+        res["noanchor_status"] = (screen_text(t) or "").split("\n")[-1]
+        t.send(F1, 0.4)
+        t.send(b"anchor row", 0.4)
+        t.send(b"\r", 0.5)
+        res["anchored"] = _line_with(t, "beta")
+        t.send(F1, 0.4)
+        t.send(b"copy reference to row", 0.4)
+        t.send(b"\r", 0.5)
+        res["copied_status"] = (screen_text(t) or "").split("\n")[-1]
+        t.send(b"\x1a", 0.5)  # Ctrl-Z: one undo removes the anchor
+        res["undone"] = _line_with(t, "beta")
+        t.send(b"\x11", 0.3)
+        t.send(b"d", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    check("{#top} alpha" in res["rich"], "wb anchor: the tag stays visible in Rich", repr(res["rich"]))
+    check(bool(res["rich_fg"]) and res["rich_fg"][0] != res["rich_fg"][1],
+          "wb anchor: the tag paints in its own colour (Rich)", repr(res["rich_fg"]))
+    check("{#top} alpha" in res["source"], "wb anchor: the tag is in Source", repr(res["source"]))
+    check(bool(res["source_fg"]) and res["source_fg"][0] != res["source_fg"][1],
+          "wb anchor: the tag paints in its own colour (Source)", repr(res["source_fg"]))
+    check("x = 40" in res["calc"], "wb anchor: T#top.v reads the anchored row", repr(res["calc"]))
+    check("no anchor" in res["noanchor_status"],
+          "wb anchor: Copy Reference on a row without an anchor says so",
+          repr(res["noanchor_status"]))
+    check("{#beta}" in res["anchored"], "wb anchor: Anchor Row inserts {#name}", repr(res["anchored"]))
+    check("T#beta." in res["copied_status"], "wb anchor: Copy Reference copies T#name.col",
+          repr(res["copied_status"]))
+    check("{#" not in res["undone"], "wb anchor: one undo removes it", repr(res["undone"]))
+
+
+def case_image_placeholder(exe, tmp):
+    """Images in a Rich Markdown pane (docs/images.md): the terminal paints
+    the text stand-in `[image: alt WxH]` (the size read from the header in
+    the background), inline too; the caret on the line shows the source;
+    a remote image names its host and is not fetched; "Load Image" on it
+    prompts, Esc cancels; the bytes on disk never change."""
+    if pyte is None:
+        print("skip: image placeholder (no pyte)")
+        return
+    import shutil
+    here = os.path.dirname(os.path.abspath(__file__))
+    proj = os.path.join(tmp, "imgproj")
+    os.makedirs(os.path.join(proj, ".git"), exist_ok=True)
+    shutil.copy(os.path.join(here, "..", "testdata", "img", "quad.png"), proj)
+    body = (b"# Pics\n\n![a quad](quad.png)\n\nInline ![tiny](quad.png) here.\n\n"
+            b"![far](http://127.0.0.1:9/x.png)\n\nend\n")
+    path = os.path.join(proj, "doc.md")
+    with open(path, "wb") as f:
+        f.write(body)
+    t = Tui(exe, [path], {"RTX_SAFE_HOME": os.path.join(tmp, "safe_img")})
+    shots = {}
+    try:
+        t.pump(1.0)
+        txt = screen_text(t) or ""
+        if "rich" not in txt.split("\n")[-1]:
+            t.send(b"\x04", 0.5)  # Ctrl-D: Rich on
+        t.pump(0.5)
+        shots["rich"] = screen_text(t)
+        t.send(b"\x1b[B\x1b[B", 0.5)  # caret onto the image line
+        shots["caret"] = screen_text(t)
+        t.send(b"\x1b[B\x1b[B\x1b[B\x1b[B", 0.5)  # the remote image's line
+        t.send(F1, 0.4)
+        t.send(b"load image", 0.4)
+        t.send(b"\r", 0.5)
+        shots["ask"] = screen_text(t)
+        t.send(b"\x1b", 0.5)
+        shots["cancel"] = screen_text(t)
+        t.send(b"\x11", 0.2)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    with open(path, "rb") as f:
+        disk = f.read()
+    rich = shots["rich"] or ""
+    check("[image: a quad 32x24]" in rich, "image: stand-in with the header size", repr(rich[:300]))
+    check("Inline [image: tiny 32x24] here." in rich, "image: inline stand-in")
+    check("[image: far - 127.0.0.1]" in rich, "image: remote names its host, not fetched")
+    check("![a quad](quad.png)" in (shots["caret"] or ""), "image: caret on the line shows the source")
+    check("remote image (127.0.0.1, http): 1 load" in (shots["ask"] or ""),
+          "image: Load Image prompts for a remote image", repr((shots["ask"] or "")[-160:]))
+    check("remote image (" not in (shots["cancel"] or "") and "Load Image" not in (shots["cancel"] or ""),
+          "image: Esc cancels the prompt")
+    check(disk == body, "image: bytes on disk unchanged")
+
+def case_wb_uses(exe, tmp):
+    """Workbook imports (docs/workbook.md "W1 phase 2 as built"): two panes,
+    a.wb.md `uses q = "q.wb.md"` and reads q's names; q is open in the other
+    pane. An edit in q's pane plans a job there; a's pane paints the
+    imported value stale (`≈` and its last value) while q works, then the
+    new value, fresh."""
+    if pyte is None:
+        print("skip: wb uses (no pyte)")
+        return
+    rows = b"".join(b"| %d |\n" % (i % 10) for i in range(300000))
+    q = (b"# Q\n\n```params\nlim = 5\n```\n\n```calc\nbig = sum(T.x where x > lim)\n```\n\n"
+         b"Table: T\n\n| x |\n|---|\n" + rows)
+    a = (b"# A\n\n```uses\nq = \"q.wb.md\"\n```\n\n```calc\nimp = q.big\ntwice = imp * 2\n```\n")
+    env = {"RTX_WB_INLINE_WORK": "512", "RTX_WB_SLICE_MS": "1", "RTX_WB_SLICE_ROWS": "64",
+           "RTX_WB_SLICE_PAUSE_MS": "2"}  # q's job outlasts the keys below
+    qp = scratch_file(tmp, "q.wb.md", q)
+    ap = scratch_file(tmp, "a.wb.md", a)
+    env["RTX_SAFE_HOME"] = os.path.join(tmp, "safe_uses")
+    t = Tui(exe, [ap, qp], env, cols=200)
+    t.pump(6.0)
+    res = {}
+    try:
+        txt = screen_text(t) or ""
+        if "rich" not in txt.split("\n")[-1]:
+            t.send(b"\x04", 0.5)  # Ctrl-D: Rich on (a's pane)
+        t.pump(1.5)
+        res["before"] = _line_with(t, "twice = ")
+        t.send(b"\x1b[17~", 0.3)  # F6: q's pane
+        t.send(b"\x1b[1;5H", 0.3)  # Ctrl-Home
+        t.send(b"\x1b[B\x1b[B\x1b[B\x1b[F", 0.3)  # `lim = 5`, its end
+        t.send(b"\x1b[1;2D", 0.2)  # Shift-Left: select the 5
+        t.send(b"7", 0.2)  # lim = 7: q's big rebuilds as a job
+        res["mid"] = _line_with(t, "twice = ")
+        res["mid_fg"] = _fg_of(t, "twice = ", "≈")
+        t.pump(8.0)
+        res["after"] = _line_with(t, "twice = ")
+        t.send(b"\x11", 0.3)
+        t.send(b"d", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    check("twice = 1800000" in res["before"], "wb uses: the imported value in the other pane",
+          repr(res["before"]))
+    check("twice = ≈1800000" in res["mid"],
+          "wb uses: stale (the last value after the mark) while the used workbook works",
+          repr(res["mid"]))
+    check(bool(res["mid_fg"]) and res["mid_fg"][0] != res["mid_fg"][1],
+          "wb uses: the stale import paints dimmed", repr(res["mid_fg"]))
+    check("twice = 1020000" in res["after"] and "≈" not in res["after"],
+          "wb uses: the edit reached the reader's pane; fresh again", repr(res["after"]))
+
+
 CASES = {
     "present": case_present,
+    "image_placeholder": case_image_placeholder,
     "tabs_and_panes": case_tabs_and_panes,
     "bracketed_paste": case_bracketed_paste,
     "paste_split_reads": case_paste_split_reads,
@@ -1950,6 +2346,11 @@ CASES = {
     "settings_file": case_settings_file,
     "quick_open": case_quick_open,
     "project_search": case_project_search,
+    "wb_annotation": case_wb_annotation,
+    "wb_deferred": case_wb_deferred,
+    "wb_stale": case_wb_stale,
+    "wb_anchor": case_wb_anchor,
+    "wb_uses": case_wb_uses,
 }
 
 

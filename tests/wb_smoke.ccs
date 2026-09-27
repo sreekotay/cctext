@@ -19,9 +19,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "../core/document.cch"
 #include "../core/layout.cch"
 #include "../core/wb.cch"
+#include "../core/wb_num.cch"
 
 static int fails = 0;
 
@@ -98,8 +100,12 @@ static size_t find_off(RtxDoc *d, const char *needle, int nth) {
     return off;
 }
 
+/* The last step's edit, for a failure report. */
+static char g_last_edit[256];
+
 static int rep(RtxDoc *d, size_t off, size_t n, const char *s) {
     size_t sn = strlen(s);
+    snprintf(g_last_edit, sizeof g_last_edit, "replace %zu %zu \"%s\"", off, n, s);
     @errhandler(CCError e) {
         cc_error_log(e);
         return 0;
@@ -114,6 +120,7 @@ static int undo(RtxDoc *d) {
         return 0;
     }
     if (!d->can_undo()) return 0;
+    snprintf(g_last_edit, sizeof g_last_edit, "undo");
     d->undo() !>;
     return 1;
 }
@@ -124,6 +131,7 @@ static int redo(RtxDoc *d) {
         return 0;
     }
     if (!d->can_redo()) return 0;
+    snprintf(g_last_edit, sizeof g_last_edit, "redo");
     d->redo() !>;
     return 1;
 }
@@ -232,23 +240,48 @@ static void counter(void) {
     /* Sales.amount[2]: 300.50 → 310.50 */
     off = find_off(&d, "300.50", 0);
     reach = rtx_wb_reach(wb, &d, off);
-    expect(reach == 19, "amount[2] reaches 19 nodes");
+    /* W1: the rule graph (a column's formula is one rule, whatever its
+     * rows): the amount column, margin's rule and column, the actual
+     * rule and column, gap's, and the names and aggregates over them */
+    expect(reach == 19, "amount[2] reaches 19 rule-graph nodes");
+    /* paint margin[2], actual[2] (US) and gap[2]: the view caches them */
+    {
+        size_t a0 = find_off(&d, "`=@amount - @cost`", 1);
+        size_t a1 = find_off(&d, "`=sum(Sales.amount where region = @region)`", 1);
+        size_t a2 = find_off(&d, "`=@actual - @target`", 1);
+        expect(RtxDoc_derived_at(&d, a0 + 2, 0, &flo, &fhi, g, sizeof g, &gn) &&
+                   RtxDoc_derived_at(&d, a1 + 2, 0, &flo, &fhi, g, sizeof g, &gn) &&
+                   RtxDoc_derived_at(&d, a2 + 2, 0, &flo, &fhi, g, sizeof g, &gn),
+               "row 2's formulas paint");
+    }
+    rtx_wb_stats(wb, &d, &s0);
     expect(rep(&d, off, 6, "310.50"), "edit a cell");
     rtx_wb_stats(wb, &d, &s1);
     expect(s1.rebuilds == 1, "a cell edit does not reparse the workbook");
     expect(s1.fast_cell == s0.fast_cell + 1, "cell fast path");
     expect(s1.regraphs == s0.regraphs, "a literal edit keeps the graph");
-    if (s1.visited != 15)
-        fprintf(stderr, "FAIL: visited %zu (want 15 of reach %zu, %zu nodes)\n", s1.visited,
+    /* W1 visits the aggregates whose partials moved (US actual,
+     * recent_mgn, avg_amt, max_amt), the names whose value moved
+     * (recent_mgn, avg_amt; max_amt kept 1000: cutoff), and the rules /
+     * columns downstream (margin, actual, gap); cells are not nodes —
+     * the view re-reads the cells it shows */
+    if (s1.visited != 11)
+        fprintf(stderr, "FAIL: visited %zu (want 11 of reach %zu, %zu nodes)\n", s1.visited,
                 reach, s1.nodes);
-    expect(s1.visited == 15, "recalc visits exactly the changed path (cutoff at unchanged)");
-    expect(s1.visited <= reach && s1.visited * 4 < s1.nodes, "visits only dependents");
+    expect(s1.visited == 11, "recalc visits exactly the changed path (cutoff at unchanged)");
+    expect(s1.ma_full == s0.ma_full, "a cell edit walks no table");
+    /* one out and one in per instance: US actual, recent_mgn, avg_amt, max_amt */
+    if (s1.ma_delta - s0.ma_delta != 8)
+        fprintf(stderr, "FAIL: ma_delta %zu (want 8)\n", s1.ma_delta - s0.ma_delta);
+    expect(s1.ma_delta - s0.ma_delta == 8, "row deltas: US actual, avg_amt, max_amt, recent_mgn");
+    expect(s1.visited <= reach, "visits only dependents");
     check_eval(wb, &d, "Targets[region = \"US\"].actual", "355.60");
     check_eval(wb, &d, "Targets[region = \"US\"].gap", "-44.40");
     check_eval(wb, &d, "eu_total", "219.99");
     check_eval(wb, &d, "recent_mgn", "215.24");
     /* changed spans: margin[2], actual[2], gap[2], avg_amt, recent_mgn */
     nch = RtxDoc_derived_changed(&d, lo, hi, 16);
+    if (nch != 5) fprintf(stderr, "FAIL: changed %zu (want 5)\n", nch);
     expect(nch == 5, "five painted values changed");
     /* painted value of Targets.gap[2] */
     off = find_off(&d, "`=@actual - @target`", 1);
@@ -294,7 +327,9 @@ static void counter(void) {
     expect(rep(&d, off + 10, 9, "* 2"), "formula edit");
     rtx_wb_stats(wb, &d, &s1);
     expect(s1.fast_cell == s0.fast_cell + 1 && s1.rebuilds == s0.rebuilds, "formula edit: cell path");
-    expect(s1.regraphs == s0.regraphs + 1, "deps changed: one regraph");
+    /* a formula text no row had: a new rule, one rule-graph pass (rules,
+     * not cells) */
+    expect(s1.regraphs <= s0.regraphs + 1, "a new rule: at most one rule-graph pass");
     check_eval(wb, &d, "Targets[region = \"EU\"].gap", "439.98");
     expect(undo(&d), "undo formula");
     check_eval(wb, &d, "Targets[region = \"EU\"].gap", "19.99");
@@ -328,13 +363,13 @@ static void counter(void) {
     expect(s1.cycles == 0, "cycle gone");
     check_eval(wb, &d, "eu_eur", "219.990000");
 
-    /* Structure: a new row reparses. */
+    /* Structure: a new row is a row delta (W2), not a reparse. */
     rtx_wb_stats(wb, &d, &s0);
     off = find_off(&d, "| APAC   | 900", 0);
     expect(rep(&d, off, 0, "| LATAM  | 50     | =sum(Sales.amount where region = @region) | =@actual - @target |\n"),
            "insert a row");
     rtx_wb_stats(wb, &d, &s1);
-    expect(s1.rebuilds == s0.rebuilds + 1, "a new row reparses");
+    expect(s1.rebuilds == s0.rebuilds && s1.fast_rows == s0.fast_rows + 1, "a new row: row path");
     check_eval(wb, &d, "Targets[region = \"LATAM\"].gap", "-50");
     check_eval(wb, &d, "count(Targets)", "4");
     RtxDoc_destroy(&d);
@@ -424,6 +459,110 @@ static void rich_lens(void) {
                    !memcmp(hv.g, "98945.60", 8),
                "stand-in is the value");
     }
+    RtxLayout_destroy(&L);
+    RtxDoc_destroy(&d);
+}
+
+/* ------------------------------------------------ live value annotation */
+
+/* The stand-in at the annotated formula's last cluster (row bytes read). */
+static int annot_at(RtxLayout *L, RtxDoc *d, size_t lo, char *out, size_t cap) {
+    char row[256];
+    RtxHintVis hv;
+    size_t n = 0;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    n = d->read_at(lo, cc_slice_from_buffer(row, sizeof row)) !>;
+    if (!rtx_layout_hint_vis(L, d, lo, row, 0, n, &hv) || !hv.ann) return 0;
+    snprintf(out, cap, "%.*s|%.*s", (int)hv.ann, hv.g, (int)(hv.gn - hv.ann), hv.g + hv.ann);
+    return 1;
+}
+
+/* While the caret is in a formula, ` → value` paints after it (Rich and
+ * Source), updates as the formula is typed, shows a half-typed formula's
+ * error, stays out of the bytes, x_of and hits stop before it. */
+static void annotation(void) {
+    RtxDoc d = {0};
+    RtxLayout L = {0};
+    RtxMeasure m = {0};
+    size_t off, end, n0 = 0, n1 = 0, row, h;
+    char g[160];
+    char *bytes;
+    double xe, xl;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    m.measure = m_bytes;
+    m.line_height = m_lh;
+    d.from_path(cc_slice_cstr("testdata/wb/revenue.wb.md")) !>;
+    L.rich = 1;
+    L.wrap = 0;
+    off = find_off(&d, "count(Sales)", 0);
+    end = off + strlen("count(Sales)");
+    d.caret = d.sel_anchor = end;
+    expect(rtx_layout_reveal(&L, &d, end, end) && L.inl_on && L.inl_off == end &&
+               L.inl_lo == end - 1,
+           "caret at a formula's end: annotation on");
+    RtxLayout_lines(&L, &d, &m, 400.0, 0, 200) !>;
+    expect(annot_at(&L, &d, end - 1, g, sizeof g) && !strcmp(g, ")| \xe2\x86\x92 5"),
+           "annotation: the last cluster, then ` → 5`");
+    xe = RtxLayout_x_of(&L, &d, &m, end) !>;
+    xl = RtxLayout_x_of(&L, &d, &m, end - 1) !>;
+    expect(xe == xl + 1.0, "the caret at the formula's end sits before the annotation");
+    row = RtxLayout_row_of(&L, end);
+    {
+        double y = 0;
+        size_t i;
+        for (i = 0; i < row && i < L.rows.len; i++) y += L.rows.data[i].height;
+        h = RtxLayout_hit(&L, &d, &m, xe + 3.0, y + 0.5) !>;
+    }
+    expect(h == end, "a click on the annotation: the formula's end");
+    /* typing: each keystroke's value */
+    expect(rep(&d, end, 0, " + 1"), "type into the formula");
+    end += 4;
+    rtx_layout_reveal(&L, &d, end, end);
+    RtxLayout_after_edit(&L, &d, &m, 400.0) !>;
+    expect(annot_at(&L, &d, end - 1, g, sizeof g) && !strcmp(g, "1| \xe2\x86\x92 6"),
+           "annotation follows the keystroke: 6");
+    /* half-typed: the error, with its message */
+    expect(rep(&d, off, end - off, "count(Sal"), "half-typed");
+    end = off + strlen("count(Sal");
+    rtx_layout_reveal(&L, &d, end, end);
+    RtxLayout_after_edit(&L, &d, &m, 400.0) !>;
+    expect(annot_at(&L, &d, end - 1, g, sizeof g) &&
+               !strncmp(g, "l| \xe2\x86\x92 #parse(", strlen("l| \xe2\x86\x92 #parse(")),
+           "a half-typed formula shows its error");
+    /* Source view: the same annotation */
+    L.rich = 0;
+    L.inl_on = 0;
+    expect(rtx_layout_reveal(&L, &d, end, end) && L.inl_on, "Source: annotation on");
+    RtxLayout_lines(&L, &d, &m, 400.0, 0, 200) !>;
+    expect(annot_at(&L, &d, end - 1, g, sizeof g), "Source: annotation paints");
+    /* a table cell formula */
+    L.rich = 1;
+    off = find_off(&d, "`=@actual - @target`", 1);
+    end = off + strlen("`=@actual - @target`");
+    rtx_layout_reveal(&L, &d, end - 3, end - 3);
+    RtxLayout_lines(&L, &d, &m, 400.0, 0, 200) !>;
+    expect(annot_at(&L, &d, end - 1, g, sizeof g) && !strcmp(g, "`| \xe2\x86\x92 -54.40"),
+           "a cell formula's annotation");
+    {
+        int ti = rtx_layout_md_index(&L, off);
+        /* 20 formula bytes + ` → -54.40` (9 cells) */
+        if (ti >= 0 && L.md_colw[ti][3] != 29)
+            fprintf(stderr, "FAIL: gap column %d cells (want 29)\n", L.md_colw[ti][3]);
+        expect(ti >= 0 && L.md_colw[ti][3] == 29, "the column widens while the annotation shows");
+    }
+    /* the caret leaves: gone; the bytes never held it */
+    expect(rtx_layout_reveal(&L, &d, 0, 0) && !L.inl_on, "caret out: annotation off");
+    bytes = doc_bytes(&d, &n0);
+    expect(bytes && !strstr(bytes, "\xe2\x86\x92"), "the annotation is never in the bytes");
+    free(bytes);
+    (void)n1;
     RtxLayout_destroy(&L);
     RtxDoc_destroy(&d);
 }
@@ -724,34 +863,45 @@ static void property(void) {
     expect(wb != NULL, "attach to a buffer");
     if (!wb) return;
     for (step = 0; step < steps && bad < 3; step++) {
-        size_t n = 0, a, b;
-        char *p;
+        size_t n = 0, a, b, n0 = 0;
+        char *p, *p0 = doc_bytes(&d, &n0);
         RtxDoc s = {0};
         RtxWb *sw;
+        g_last_edit[0] = 0;
         if (!prop_step(&d, step)) {
             expect(0, "property edit");
             bad++;
+            free(p0);
             continue;
         }
+        if (getenv("WB_STEP_TRACE")) {
+            /* a hang's last step: the doc before and the edit */
+            FILE *tf = fopen("wb_step_trace.txt", "w");
+            if (tf) {
+                fprintf(tf, "step %d\n--- before (%s)\n%s\n--- end\n", step, g_last_edit, p0 ? p0 : "");
+                fclose(tf);
+            }
+        }
         p = doc_bytes(&d, &n);
-        a = rtx_wb_dump(wb, &d, g_dump, sizeof g_dump);
+        a = rtx_wb_dump_ex(wb, &d, RTX_WB_DUMP_SPANS | RTX_WB_DUMP_MAS, g_dump, sizeof g_dump);
         {
             CCArena sa = cc_arena_heap(n + 64);
             char[:] src = cc_slice_from_buffer(p, n);
             char[:] keep = src.clone_into(sa) !>;
             s.from_buffer(keep) !>;
             sw = rtx_wb_attach(&s);
-            b = rtx_wb_dump(sw, &s, g_dump2, sizeof g_dump2);
+            b = rtx_wb_dump_ex(sw, &s, RTX_WB_DUMP_SPANS | RTX_WB_DUMP_MAS, g_dump2, sizeof g_dump2);
             RtxDoc_destroy(&s);
             sa.destroy();
         }
         if (a != b || memcmp(g_dump, g_dump2, a) != 0) {
-            fprintf(stderr, "FAIL: step %d incremental != scratch\n--- doc\n%s\n--- inc\n%s\n--- scratch\n%s\n",
-                    step, p, g_dump, g_dump2);
+            fprintf(stderr, "FAIL: step %d incremental != scratch\n--- doc\n%s\n--- inc\n%s\n--- scratch\n%s\n--- before (%s)\n%s\n--- end\n",
+                    step, p, g_dump, g_dump2, g_last_edit, p0 ? p0 : "");
             fails++;
             bad++;
         }
         free(p);
+        free(p0);
     }
     rtx_wb_stats(wb, &d, &st);
     printf("wb_smoke property: %d steps, rebuilds %zu, cell %zu, line %zu, prose %zu, regraphs %zu\n",
@@ -761,12 +911,13 @@ static void property(void) {
     RtxDoc_destroy(&d);
 }
 
-/* Over RTX_WB_MAX: values off, said so, nothing painted or relaid. */
+/* Over the byte cap (lowered to 8 MiB here; RTX_WB_MAX is 256 MiB):
+ * values off, said so, nothing painted or relaid. */
 static void too_big(void) {
     RtxDoc d = {0};
     RtxWb *wb;
     RtxWbStats st;
-    size_t n = RTX_WB_MAX + 4096, i, lo[4], hi[4];
+    size_t n = ((size_t)8 << 20) + 4096, i, lo[4], hi[4];
     char *p = (char *)malloc(n), msg[128];
     CCArena a = cc_arena_heap(n + 64);
     static const char head[] = "Table: T\n\n| a | b |\n|---|---|\n| 1 | =@a |\n\n";
@@ -778,6 +929,7 @@ static void too_big(void) {
         return;
     }
     if (!p) return;
+    rtx_wb_limits((size_t)8 << 20, 0, 0);
     for (i = 0; i < n; i++) p[i] = (i % 64 == 63) ? '\n' : 'x';
     memcpy(p, head, sizeof head - 1);
     {
@@ -794,6 +946,458 @@ static void too_big(void) {
     RtxDoc_destroy(&d);
     a.destroy();
     free(p);
+    rtx_wb_limits(RTX_WB_MAX, 0, 0);
+}
+
+/* The row cap (lowered here): a table over it is refused with a message
+ * naming the cap; a row insert that would cross it reparses and refuses. */
+static void rows_cap(void) {
+    RtxDoc d = {0};
+    CCArena keep_a = cc_arena_heap(8192) @destroy;
+    RtxWb *wb;
+    char buf[4096];
+    size_t n = 0, off;
+    int r;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    rtx_wb_limits(0, 40, 0);
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "Table: T\n\n| a | b |\n|---|---|\n");
+    for (r = 1; r <= 40; r++) n += (size_t)snprintf(buf + n, sizeof buf - n, "| %d | =@a * 2 |\n", r);
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "\n```calc\ns = sum(T.b)\n```\n");
+    {
+        char[:] src = cc_slice_from_buffer(buf, n);
+        char[:] keep = src.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    wb = rtx_wb_attach(&d);
+    check_eval(wb, &d, "s", "1640");
+    off = find_off(&d, "| 7 |", 0);
+    expect(rep(&d, off, 0, "| 41 | =@a * 2 |\n"), "row over the cap");
+    check_eval(wb, &d, "s", "#ref(T has more than 40 rows (W1 phase 2 indexes it))");
+    expect(undo(&d), "undo the row");
+    check_eval(wb, &d, "s", "1640");
+    RtxDoc_destroy(&d);
+    rtx_wb_limits(0, RTX_WB_ROWS_MAX, 0);
+}
+
+/* A big workbook's reparse (lowered to 1 KiB here) waits for a pause:
+ * the keystroke path (hooks, status) hides the values, rtx_wb_idle
+ * reparses once due; an explicit query reparses at once. */
+static void deferred(void) {
+    RtxDoc d = {0};
+    CCArena keep_a = cc_arena_heap(8192) @destroy;
+    RtxWb *wb;
+    char buf[4096], msg[160];
+    size_t n = 0, off, lo = 0, hi = 0;
+    int r, k;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    /* W1: a workbook of the deferred size or more reads as a job (the
+     * host's idle loop steps it); the keystroke never waits for it */
+    rtx_wb_limits(0, 0, 1024);
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "Table: T\n\n| a | b |\n|---|---|\n");
+    for (r = 1; r <= 80; r++) n += (size_t)snprintf(buf + n, sizeof buf - n, "| %d | =@a * 2 |\n", r);
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "\n```calc\ns = sum(T.b)\n```\n");
+    {
+        char[:] src = cc_slice_from_buffer(buf, n);
+        char[:] keep = src.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    wb = rtx_wb_attach(&d);
+    off = find_off(&d, "=@a * 2", 0);
+    expect(rtx_wb_deferred(&d) && rtx_wb_due_ms(&d) == 0, "defer: the open reads as a job, due now");
+    expect(!RtxDoc_has_marks(&d), "defer: no values while it reads");
+    expect(rtx_wb_describe(wb, &d, off, msg, sizeof msg) && strstr(msg, "recalculating"),
+           "defer: the status says recalculating");
+    for (k = 0; k < 1000 && rtx_wb_deferred(&d); k++) (void)rtx_wb_idle(&d);
+    expect(!rtx_wb_deferred(&d) && RtxDoc_has_marks(&d), "defer: idle slices finish the read");
+    expect(RtxDoc_derived_at(&d, off, 1, &lo, &hi, msg, sizeof msg, NULL) == 1, "defer: painted");
+    expect(rtx_wb_due_ms(&d) == -1 && rtx_wb_idle(&d) == 0, "defer: nothing owed");
+    /* a cell edit: the fast path, never deferred */
+    expect(rep(&d, off + 6, 1, "3"), "defer: cell edit");
+    expect(RtxDoc_derived_at(&d, off, 1, &lo, &hi, msg, sizeof msg, NULL) == 1 &&
+               !strcmp(msg, "3"), "defer: cell edit painted at once");
+    /* the header: a reparse, a job again */
+    off = find_off(&d, "| a | b |", 0);
+    expect(rep(&d, off + 1, 0, " "), "defer: header edit");
+    expect(!RtxDoc_has_marks(&d), "defer: values hidden");
+    expect(rtx_wb_deferred(&d) && rtx_wb_due_ms(&d) == 0, "defer: owed");
+    expect(rtx_wb_describe(wb, &d, off, msg, sizeof msg) && strstr(msg, "recalculating"),
+           "defer: said so");
+    for (k = 0, r = 0; k < 1000 && rtx_wb_deferred(&d); k++) r = rtx_wb_idle(&d);
+    expect(r == 2, "defer: the last slice moved values (relayout)");
+    expect(!rtx_wb_deferred(&d) && RtxDoc_has_marks(&d), "defer: values back");
+    check_eval(wb, &d, "s", "6481");
+    /* an explicit query reads at once */
+    expect(rep(&d, off + 1, 1, ""), "defer: header back");
+    expect(!RtxDoc_has_marks(&d) && rtx_wb_deferred(&d), "defer: hidden again");
+    check_eval(wb, &d, "s", "6481");
+    expect(!rtx_wb_deferred(&d), "defer: a query reparsed");
+    RtxDoc_destroy(&d);
+    rtx_wb_limits(0, 0, RTX_WB_DEFER_BYTES);
+}
+
+/* ------------------------------------------------ W2: exact arithmetic */
+
+static double bits_d(uint64_t b) {
+    double f;
+    memcpy(&f, &b, sizeof f);
+    return f;
+}
+
+static uint64_t d_bits(double f) {
+    uint64_t b;
+    memcpy(&b, &f, sizeof b);
+    return b;
+}
+
+/* testdata/wb/xsum.txt (tests/wb_xsum_gen.py: Python's exact Fraction sums,
+ * rounded once): each float set summed forward, backward, shuffled, with
+ * junk added then subtracted, and as two merged halves — all must round to
+ * the same bits. */
+/* ------------------------------------------------------------ numbers */
+
+/* The numeric contract against an independent reference: every case of
+ * testdata/wb/numops.wb.md (generated by tests/wb_num_gen.py from Python
+ * ints / Fractions / doubles) must dump as numops.expect says — floats bit
+ * for bit, errors by their tag (the message is the engine's). */
+static void numops(void) {
+    RtxDoc d = {0};
+    RtxWb *wb;
+    size_t en = 0, gn, n = 0, bad = 0;
+    char *want, *gp, *wp;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    d.from_path(cc_slice_cstr("testdata/wb/numops.wb.md")) !>;
+    wb = rtx_wb_of(&d);
+    want = read_file("testdata/wb/numops.expect", &en);
+    expect(wb != NULL && want != NULL, "numops fixture");
+    if (!wb || !want) {
+        free(want);
+        RtxDoc_destroy(&d);
+        return;
+    }
+    gn = rtx_wb_dump_ex(wb, &d, RTX_WB_DUMP_BITS, g_dump, sizeof g_dump);
+    (void)gn;
+    gp = g_dump;
+    wp = want;
+    while (*wp) {
+        char *we = strchr(wp, '\n'), *ge;
+        size_t wl = we ? (size_t)(we - wp) : strlen(wp), gl;
+        int ok;
+        /* the next name line of the dump */
+        while (*gp && strncmp(gp, "Numbers.", 8)) {
+            ge = strchr(gp, '\n');
+            gp = ge ? ge + 1 : gp + strlen(gp);
+        }
+        if (!*gp) {
+            fprintf(stderr, "FAIL: numops: dump ends before %.*s\n", (int)wl, wp);
+            fails++;
+            break;
+        }
+        ge = strchr(gp, '\n');
+        gl = ge ? (size_t)(ge - gp) : strlen(gp);
+        ok = gl == wl && !memcmp(gp, wp, wl);
+        if (!ok) {
+            /* an error: its tag; a NaN: any NaN bits */
+            const char *weq = memchr(wp, '=', wl), *geq = memchr(gp, '=', gl);
+            if (weq && geq && weq - wp == geq - gp && !memcmp(wp, gp, (size_t)(weq - wp))) {
+                size_t wv = wl - (size_t)(weq - wp), gv = gl - (size_t)(geq - gp);
+                if (weq[2] == '#' && gv > wv && !memcmp(weq, geq, wv) && geq[wv] == '(') ok = 1;
+                if (wv >= 5 && !memcmp(weq, "= nan", 5) && gv >= 5 && !memcmp(geq, "= nan", 5)) ok = 1;
+            }
+        }
+        if (!ok && bad++ < 12)
+            fprintf(stderr, "FAIL: numops: got  %.*s\n                want %.*s\n", (int)gl, gp, (int)wl, wp);
+        if (!ok) fails++;
+        n++;
+        gp = ge ? ge + 1 : gp + gl;
+        wp = we ? we + 1 : wp + wl;
+    }
+    printf("wb_smoke numops: %zu cases, %zu differ\n", n, bad);
+    free(want);
+    RtxDoc_destroy(&d);
+}
+
+static void xsum(void) {
+    size_t n = 0, lines = 0;
+    char *txt = read_file("testdata/wb/xsum.txt", &n), *line, *save = NULL;
+    static double fs[10000];
+    static int64_t dv[64];
+    static int dsc[64];
+    if (!txt) {
+        expect(0, "xsum fixture");
+        return;
+    }
+    for (line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char kind = line[0];
+        char *p = line + 2, *e;
+        lines++;
+        if (kind == 'F' || kind == 'M') {
+            uint64_t want = strtoull(p, &e, 16);
+            size_t nf = strtoul(e, &e, 10), nd = 0, i, pass;
+            for (i = 0; i < nf && i < 10000; i++) fs[i] = bits_d(strtoull(e, &e, 16));
+            if (kind == 'M') {
+                nd = strtoul(e, &e, 10);
+                for (i = 0; i < nd && i < 64; i++) {
+                    dv[i] = strtoll(e, &e, 10);
+                    dsc[i] = (int)strtol(e + 1, &e, 10);
+                }
+            }
+            for (pass = 0; pass < 5; pass++) {
+                RtxXs x, y;
+                RtxXd dd;
+                double got;
+                rtx_xs_zero(&x);
+                rtx_xs_zero(&y);
+                rtx_xd_zero(&dd);
+                if (pass == 2)
+                    for (i = nf; i > 1; i--) {
+                        size_t j = rnd_n(i);
+                        double t = fs[i - 1];
+                        fs[i - 1] = fs[j];
+                        fs[j] = t;
+                    }
+                for (i = 0; i < nf; i++) {
+                    size_t k = pass == 1 ? nf - 1 - i : i;
+                    if (pass == 3) {
+                        /* junk in, then out: subtraction is exact */
+                        double junk = bits_d(rnd() & 0x7fefffffffffffffull);
+                        rtx_xs_add(&x, junk, 1);
+                        rtx_xs_add(&x, fs[k], 1);
+                        rtx_xs_add(&x, junk, -1);
+                    } else if (pass == 4) {
+                        rtx_xs_add(i % 2 ? &y : &x, fs[k], 1);
+                    } else {
+                        rtx_xs_add(&x, fs[k], 1);
+                    }
+                }
+                if (pass == 4) rtx_xs_merge(&x, &y, 1);
+                for (i = 0; i < nd; i++) rtx_xd_add(&dd, dv[i], dsc[i], 1);
+                got = kind == 'M' ? rtx_xs_round_mixed(&x, &dd) : rtx_xs_round(&x);
+                if (d_bits(got) != want) {
+                    fprintf(stderr, "FAIL: xsum line %zu pass %zu: got %016llx want %016llx\n", lines,
+                            pass, (unsigned long long)d_bits(got), (unsigned long long)want);
+                    fails++;
+                    break;
+                }
+            }
+        } else if (kind == 'D') {
+            int sc = (int)strtol(p, &e, 10), ok;
+            char want[32];
+            size_t nd, i;
+            RtxXd dd;
+            int64_t got = 0;
+            while (*e == ' ') e++;
+            for (i = 0; *e && *e != ' ' && i < sizeof want - 1; i++) want[i] = *e++;
+            want[i] = 0;
+            nd = strtoul(e, &e, 10);
+            rtx_xd_zero(&dd);
+            for (i = 0; i < nd; i++) {
+                int64_t v = strtoll(e, &e, 10);
+                int s = (int)strtol(e + 1, &e, 10);
+                rtx_xd_add(&dd, v, s, 1);
+                rtx_xd_add(&dd, 777, 5, 1); /* junk in and out */
+                rtx_xd_add(&dd, 777, 5, -1);
+            }
+            ok = rtx_xd_get(&dd, sc, &got);
+            {
+                /* the per-scale 128-bit route (what an MA keeps) agrees */
+                char *q = strchr(p, ' ');
+                __int128 ps[19];
+                RtxXd d2;
+                int64_t got2 = 0;
+                size_t m;
+                memset(ps, 0, sizeof ps);
+                q = q ? strchr(q + 1, ' ') : NULL;
+                if (q) (void)strtoul(q, &q, 10); /* nd */
+                for (m = 0; q && m < nd; m++) {
+                    int64_t v = strtoll(q, &q, 10);
+                    int s = (int)strtol(q + 1, &q, 10);
+                    if (s >= 0 && s < 19) ps[s] += v;
+                }
+                rtx_xd_zero(&d2);
+                for (m = 0; m < 19; m++)
+                    if (ps[m]) rtx_xd_add128(&d2, ps[m], (int)m);
+                if (rtx_xd_get(&d2, sc, &got2) != ok || (ok && got2 != got)) {
+                    fprintf(stderr, "FAIL: xsum line %zu: 128-bit route differs\n", lines);
+                    fails++;
+                }
+            }
+            if (!strcmp(want, "X") ? ok : (!ok || got != strtoll(want, NULL, 10))) {
+                fprintf(stderr, "FAIL: xsum line %zu: dec sum %lld (ok %d) want %s\n", lines,
+                        (long long)got, ok, want);
+                fails++;
+            }
+        } else if (kind == 'C') {
+            int want = (int)strtol(p, &e, 10);
+            int64_t v = strtoll(e, &e, 10);
+            int sc = (int)strtol(e, &e, 10);
+            double f = bits_d(strtoull(e, &e, 16));
+            int got = rtx_num_cmp_dec_f(v, sc, f);
+            if (got != want) {
+                fprintf(stderr, "FAIL: xsum line %zu: cmp %d want %d\n", lines, got, want);
+                fails++;
+            }
+        }
+    }
+    expect(lines > 200, "xsum fixture lines");
+    free(txt);
+}
+
+/* One cell edit under 1000 aggregates of its column: every MA takes an
+ * O(1) delta (two contribution evaluations: the row's old and new), none
+ * walks the table; then lowering that row (the max's best) rescans only
+ * its leaf. */
+static void counter_1000(void) {
+    size_t cap = 256u << 10, at = 0, off, i;
+    char *src = (char *)malloc(cap);
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats s0, s1;
+    CCArena keep_a;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        free(src);
+        return;
+    }
+    if (!src) return;
+    at += (size_t)snprintf(src + at, cap - at, "# C\n\nTable: T\n\n| id | v |\n|----|---|\n");
+    for (i = 0; i < 500; i++) at += (size_t)snprintf(src + at, cap - at, "| %zu | %zu |\n", i, i % 7);
+    at += (size_t)snprintf(src + at, cap - at, "\n```calc\n");
+    for (i = 0; i < 1000; i++) {
+        if (i < 700) at += (size_t)snprintf(src + at, cap - at, "s%zu = sum(T.v where id > %zu)\n", i, i % 500);
+        else if (i < 800) at += (size_t)snprintf(src + at, cap - at, "s%zu = avg(T.v where id < %zu)\n", i, i % 500);
+        else if (i < 900) at += (size_t)snprintf(src + at, cap - at, "s%zu = count(T where v > %zu)\n", i, i % 7);
+        else at += (size_t)snprintf(src + at, cap - at, "s%zu = max(T.v where id >= %zu)\n", i, i % 300);
+    }
+    at += (size_t)snprintf(src + at, cap - at, "```\n");
+    keep_a = cc_arena_heap(at + 64);
+    {
+        char[:] sl = cc_slice_from_buffer(src, at);
+        char[:] keep = sl.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    wb = rtx_wb_attach(&d);
+    if (!wb) {
+        expect(0, "counter_1000 attach");
+        free(src);
+        return;
+    }
+    rtx_wb_settle(wb, &d); /* the open's builds (a job past the inline box) */
+    rtx_wb_stats(wb, &d, &s0);
+    expect(s0.mas == 1000 && s0.ma_full == 1000, "1000 MAs, each built by one walk at open");
+    /* row 350: v = 0 (350 % 7) -> 100, a new maximum: no leaf loses its best */
+    off = find_off(&d, "| 350 | 0 |", 0);
+    expect(off != (size_t)-1 && rep(&d, off + 8, 1, "100"), "edit v[351]");
+    rtx_wb_stats(wb, &d, &s1);
+    if (s1.ma_rows - s0.ma_rows != 2000 || s1.ma_full != s0.ma_full || s1.ma_rescan != s0.ma_rescan)
+        fprintf(stderr, "FAIL: 1000 MAs: rows %zu full %zu rescans %zu\n", s1.ma_rows - s0.ma_rows,
+                s1.ma_full - s0.ma_full, s1.ma_rescan - s0.ma_rescan);
+    expect(s1.ma_rows - s0.ma_rows == 2000, "each MA evaluates the row twice (old, new): O(1)");
+    expect(s1.ma_full == s0.ma_full, "no MA walks its table");
+    expect(s1.ma_rescan == s0.ma_rescan, "no leaf rescan");
+    expect(s1.fast_cell == s0.fast_cell + 1 && s1.rebuilds == s0.rebuilds, "one cell fast path");
+    check_eval(wb, &d, "s950", "100");
+    /* back to 0: the max MAs covering row 350 lost their best: one leaf each */
+    rtx_wb_stats(wb, &d, &s0);
+    expect(rep(&d, off + 8, 3, "0"), "edit v[351] back");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.ma_full == s0.ma_full, "removing the extreme walks no table");
+    /* W1: a block of the position index is the leaf (256 rows, 512 at
+     * most before it splits) */
+    if (s1.ma_rescan - s0.ma_rescan != 100 || s1.ma_rows - s0.ma_rows > 2000 + 100 * 512)
+        fprintf(stderr, "FAIL: max rescans %zu rows %zu\n", s1.ma_rescan - s0.ma_rescan,
+                s1.ma_rows - s0.ma_rows);
+    expect(s1.ma_rescan - s0.ma_rescan == 100 && s1.ma_rows - s0.ma_rows <= 2000 + 100 * 512,
+           "each max MA rescans one block");
+    check_eval(wb, &d, "s950", "6");
+    RtxDoc_destroy(&d);
+    keep_a.destroy();
+    free(src);
+}
+
+/* group, distinct, and a row insert / delete as deltas (no reparse). */
+static void groups_rows(void) {
+    static const char src[] =
+        "# G\n\n"
+        "Table: S\n\n"
+        "| region | amount | n |\n"
+        "|--------|--------|---|\n"
+        "| EU     | 10.50  | 1 |\n"
+        "| US     | 20.25  | 2 |\n"
+        "| EU     | 1.25   | 3 |\n"
+        "| APAC   | 7.00   | 4 |\n"
+        "\n"
+        "```calc\n"
+        "by = group S by region { n: count(), total: sum(amount), top: max(amount) }\n"
+        "eu = by[region = \"EU\"].total\n"
+        "eu_n = by[region = \"EU\"].n\n"
+        "top_us = by[region = \"US\"].top\n"
+        "none = by[region = \"LATAM\"].total\n"
+        "k = distinct(S.region)\n"
+        "tot = sum(S.amount)\n"
+        "```\n";
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats s0, s1;
+    size_t off;
+    CCArena keep_a = cc_arena_heap(sizeof src + 64) @destroy;
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    {
+        char[:] sl = cc_slice_from_buffer((char *)src, sizeof src - 1);
+        char[:] keep = sl.clone_into(keep_a) !>;
+        d.from_buffer(keep) !>;
+    }
+    wb = rtx_wb_attach(&d);
+    if (!wb) {
+        expect(0, "groups attach");
+        return;
+    }
+    check_eval(wb, &d, "eu", "11.75");
+    check_eval(wb, &d, "eu_n", "2");
+    check_eval(wb, &d, "top_us", "20.25");
+    check_eval(wb, &d, "none", "null");
+    check_eval(wb, &d, "k", "3");
+    rtx_wb_dump(wb, &d, g_dump, sizeof g_dump);
+    expect(strstr(g_dump, "G.by = {\"APAC\": n=1, total=7.00, top=7.00; \"EU\": n=2, total=11.75, "
+                          "top=10.50; \"US\": n=1, total=20.25, top=20.25}") != NULL,
+           "group listing in key order");
+    rtx_wb_stats(wb, &d, &s0);
+    off = find_off(&d, "| US ", 0);
+    expect(rep(&d, off, 0, "| EU     | 100.00 | 5 |\n| LATAM  | 3.00   | 6 |\n"), "insert two rows");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.rebuilds == s0.rebuilds && s1.fast_rows == s0.fast_rows + 1, "rows: no reparse");
+    expect(s1.ma_full == s0.ma_full, "rows: no MA walk");
+    check_eval(wb, &d, "eu", "111.75");
+    check_eval(wb, &d, "none", "3.00");
+    check_eval(wb, &d, "k", "4");
+    check_eval(wb, &d, "tot", "142.00");
+    /* delete the EU 100.00 row */
+    off = find_off(&d, "| EU     | 100.00", 0);
+    rtx_wb_stats(wb, &d, &s0);
+    expect(rep(&d, off, strlen("| EU     | 100.00 | 5 |\n"), ""), "delete a row");
+    rtx_wb_stats(wb, &d, &s1);
+    expect(s1.rebuilds == s0.rebuilds && s1.ma_full == s0.ma_full, "delete: a delta");
+    check_eval(wb, &d, "eu", "11.75");
+    check_eval(wb, &d, "tot", "42.00");
+    expect(undo(&d), "undo the delete");
+    check_eval(wb, &d, "eu", "111.75");
+    RtxDoc_destroy(&d);
 }
 
 int main(void) {
@@ -801,12 +1405,20 @@ int main(void) {
     fixture("checks");
     fixture("cycles");
     fixture("scopes");
+    fixture("anchors");
     not_a_workbook();
     counter();
     rich_lens();
+    annotation();
     rename_rt();
     property();
     too_big();
+    rows_cap();
+    deferred();
+    xsum();
+    numops();
+    counter_1000();
+    groups_rows();
     if (fails) {
         fprintf(stderr, "wb_smoke: %d failure(s)\n", fails);
         return 1;

@@ -11,7 +11,8 @@
 //   core/nav.ccs, core/scope.ccs, core/find.ccs, core/safe.ccs, core/ui.ccs,
 //   core/ui_help.ccs (+ cmd.ccs, keymap.ccs, palette.ccs, fuzzy.ccs: the command
 //   table, keys.json / settings.json, the palette model, the fuzzy scorer),
-//   core/workspace.ccs, core/layout.ccs, core/document.ccs
+//   core/workspace.ccs, core/layout.ccs, core/document.ccs,
+//   core/img.ccs + core/img_wuffs.c (Wuffs, third_party/wuffs) + core/img_net.c (images)
 //   frontend/gui_draw.ccs, frontend/gui_input.ccs, frontend/gui_chrome.ccs,
 //   frontend/cctext_draw.ccs, frontend/cctext_grid_draw.ccs,
 //   frontend/cctext_input.ccs, frontend/cctext_keys.ccs, frontend/cctext_osx.ccs
@@ -45,13 +46,13 @@ CC_TARGET rtx_batch obj core/batch.ccs
 CC_TARGET_INCLUDE rtx_batch .
 CC_TARGET_DEPS rtx_batch rtx_document rtx_workspace rtx_piece_tree rtx_nav rtx_find
 
-CC_TARGET rtx_document obj core/document.ccs core/slides.ccs core/wb.ccs
+CC_TARGET rtx_document obj core/document.ccs core/slides.ccs core/wb.ccs core/wb_num.ccs
 CC_TARGET_INCLUDE rtx_document .
 CC_TARGET_DEPS rtx_document rtx_piece_tree rtx_nav rtx_scope rtx_rx rtx_md_table
 
 CC_TARGET rtx_layout obj core/layout.ccs
 CC_TARGET_INCLUDE rtx_layout .
-CC_TARGET_DEPS rtx_layout rtx_document rtx_hex rtx_grid rtx_md_table
+CC_TARGET_DEPS rtx_layout rtx_document rtx_hex rtx_grid rtx_md_table rtx_img
 
 CC_TARGET rtx_workspace obj core/workspace.ccs
 CC_TARGET_INCLUDE rtx_workspace .
@@ -61,7 +62,7 @@ CC_TARGET rtx_nav obj core/nav.ccs
 CC_TARGET_INCLUDE rtx_nav .
 CC_TARGET_DEPS rtx_nav rtx_scope rtx_piece_tree
 
-CC_TARGET rtx_find obj core/find.ccs core/proj.ccs
+CC_TARGET rtx_find obj core/find.ccs core/proj.ccs core/sindex.ccs
 CC_TARGET_INCLUDE rtx_find .
 CC_TARGET_DEPS rtx_find rtx_piece_tree rtx_scope rtx_document rtx_rx
 
@@ -134,9 +135,9 @@ CC_TARGET perf_matrix_smoke exe tests/perf_matrix_smoke.ccs
 CC_TARGET_INCLUDE perf_matrix_smoke .
 CC_TARGET_DEPS perf_matrix_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout
 
-CC_TARGET insert_profile exe tests/insert_profile.ccs
-CC_TARGET_INCLUDE insert_profile .
-CC_TARGET_DEPS insert_profile rtx_piece_tree rtx_nav rtx_scope rtx_find rtx_document
+CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c
+CC_TARGET_INCLUDE rtx_img .
+CC_TARGET_DEPS rtx_img rtx_safe
 
 CC_TARGET hex_view_smoke exe tests/hex_view_smoke.ccs
 CC_TARGET_INCLUDE hex_view_smoke .
@@ -236,7 +237,7 @@ CC_TARGET_DEPS cctext rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rt
 CC_TARGET rtx_gui_chrome obj frontend/gui_chrome.ccs
 CC_TARGET_INCLUDE rtx_gui_chrome .
 
-CC_TARGET rtx_gui_draw obj frontend/gui_draw.ccs frontend/gui_present.ccs
+CC_TARGET rtx_gui_draw obj frontend/gui_draw.ccs frontend/gui_present.ccs frontend/gui_img.ccs
 CC_TARGET_INCLUDE rtx_gui_draw .
 CC_TARGET_DEPS rtx_gui_draw rtx_ui
 

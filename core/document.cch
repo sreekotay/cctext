@@ -219,6 +219,11 @@ typedef struct {
     uint64_t xact;
     /* Bulk group (its own group id, one record): NULL otherwise. */
     RtxHistBulk *bulk;
+    /* Identity of the history state this record leads to (DESIGN Edits,
+     * savepoint). Handed out once per doc, never reused: a coalesce that
+     * extends the record takes a new one. A group's state is its last
+     * member's. */
+    uint64_t sid;
 } RtxHistRec;
 
 RtxHistRec rtx_hist_rec_empty(void);
@@ -235,6 +240,17 @@ typedef struct {
     int applying;
     int coalesce;
     size_t group_next;     /* last group id handed out */
+    uint64_t base_sid;     /* state id at head 0 */
+    uint64_t sid_next;     /* last state id handed out */
+    /* The saved state left the stack (a new edit dropped the redo tail it
+     * sat in): it is the state `fork_sid` (on the stack) plus the records
+     * `sb[0, sb_len)` applied forward. Kept so a journal can still replay
+     * against the file; the doc stays dirty until the next save. Session
+     * arena. sb_len 0 = the saved state is on the stack (or lost). */
+    RtxHistRec *sb;
+    size_t sb_len;
+    uint64_t fork_sid;
+    int sb_lost;           /* saved state gone with no branch kept */
 } RtxHistory;
 
 #ifndef RTX_FIND_BUDGET
@@ -289,6 +305,13 @@ typedef struct {
      * block edge. Count and the first offset; written in the stage. */
     _Atomic size_t long_n;
     _Atomic size_t long_off;
+    /* Incomplete: the regex could not decide the start at indet_off
+     * (RTX_RX_INDET: its step budget ran out). The list holds the hits
+     * before it and ends there (done); nothing past it is shown as a
+     * hit. indet_line is 0-based. Written in the stage. */
+    _Atomic unsigned char indet;
+    size_t indet_off;
+    size_t indet_line;
     Vec::[RtxFindHit] hits; /* on store; append only in @stage */
     size_t scan_off;
     size_t scan_line;      /* newlines before scan_off; a resume continues */
@@ -364,7 +387,7 @@ typedef struct {
     uint64_t disk_sz;
     uint64_t disk_ino;
     int save_overwrite;    /* one-shot: next save ignores disk_changed */
-    size_t saved_head;
+    uint64_t saved_sid;    /* history state the file holds (RtxDoc_dirty) */
     size_t edit_gen;       /* bumps on every successful content change (incl. coalesce) */
     size_t last_off;
     int last_markup;       /* `=` / large delete — sections may have moved */
@@ -392,6 +415,10 @@ typedef struct RtxDerived {
     void *ctx;
     /* One replace: old [at, at + erased) is now [at, at + inserted). */
     void (*note)(void *ctx, size_t at, size_t erased, size_t inserted);
+    /* Before a tree write of old [at, at + erased) (NULL: none). The
+     * bytes are still the old ones: a hook may read what goes away. A
+     * group lands several writes before its notes. */
+    void (*pre)(void *ctx, const RtxDoc *d, size_t at, size_t erased);
     /* Span [lo, hi) holding `off` (incl: `off == hi` counts too) and its
      * value text in g (at most cap - 1 bytes; *gn). 0 = no span there. */
     int (*at)(void *ctx, const RtxDoc *d, size_t off, int incl, size_t *lo,
@@ -404,6 +431,10 @@ typedef struct RtxDerived {
     size_t (*changed)(void *ctx, const RtxDoc *d, size_t *lo, size_t *hi,
                       size_t cap);
     int (*any)(void *ctx, const RtxDoc *d);
+    /* A derived style run (the workbook's anchor tags) holding `off`: 1
+     * and [lo, hi); 0 and *hi the next offset one may start at
+     * ((size_t)-1: none). NULL: no runs. */
+    int (*style)(void *ctx, const RtxDoc *d, size_t off, size_t *lo, size_t *hi);
     void (*destroy)(void *ctx);
 } RtxDerived;
 
@@ -414,6 +445,12 @@ size_t RtxDoc_derived_changed(const RtxDoc *d, size_t *lo, size_t *hi,
 
 static inline size_t RtxDoc_len(const RtxDoc *d) {
     return d ? RtxPieceTree_len(&d->tree) : 0;
+}
+
+/* The document's file path (NUL-terminated), NULL when untitled: what a
+ * relative image source resolves against (docs/images.md). */
+static inline const char *RtxDoc_file_path(const RtxDoc *d) {
+    return d && d->path.ptr && d->path.len ? d->path.ptr : NULL;
 }
 
 /* Content stamp: edit_gen. A layout records it per fill so a patch knows
@@ -700,6 +737,16 @@ char[:] !>(CCError) rtx_session_bytes(RtxDoc *d, char[:] src);
 Vec::[char] !>(CCError) rtx_hist_own(RtxDoc *d, char[:] src);
 Vec::[char] !>(CCError) rtx_hist_buf(RtxDoc *d, size_t n);
 void rtx_hist_clear(RtxHistory *h);
+/* State id at head (DESIGN Edits, savepoint). */
+uint64_t rtx_hist_cur_sid(const RtxHistory *h);
+/* Position (0..len) whose state is `sid`, (size_t)-1 if none. */
+size_t rtx_hist_pos_of(const RtxHistory *h, uint64_t sid);
+/* The file now holds the current state (after a save / a clean open). */
+void RtxDoc_mark_saved(RtxDoc *d);
+/* Where the saved state is, for a journal: 1 = on the stack at *pos;
+ * 2 = a branch: the stack state *pos plus hist.sb[0, sb_len); 0 = not
+ * representable (sb_lost). */
+int RtxDoc_saved_where(const RtxDoc *d, size_t *pos);
 int rtx_doc_add_run(RtxDoc *d, size_t start, size_t len, RtxStyle style,
                     RtxRunPlanter planter);
 
@@ -723,7 +770,7 @@ typedef @typeview Layout on RtxDoc {
        mark_edges, hint_at, mark_at,
        has_marks, markup_near, hint_next, dest_at, path_at, section_at, ensure_hl,
        md_block_at, outline, derived_at,
-       fold_covers, edit_stamp;
+       fold_covers, edit_stamp, file_path;
 } *RtxDocLayout;
 
 #endif /* RTX_DOCUMENT_H */

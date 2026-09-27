@@ -1,0 +1,464 @@
+#!ccc ccs
+/*
+ * cctext-ui images (docs/images.md): pictures and placeholders, the
+ * permission dialog, click-to-open. Pixels come from core/img.ccs; one
+ * platform image per decoded bitmap is kept on the bitmap itself
+ * (rtx_img_plat), made the first time it paints.
+ */
+#include <ccc/std/prelude.cch>
+#include <stdio.h>
+#include <string.h>
+#include "gui_plat.h"
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/find.cch"
+#include "../core/ui.cch"
+#include "../core/img.cch"
+#include "gui.cch"
+
+static Color gui_img_col(int r, int g, int b, float alpha) {
+    int a = (int)(255.0f * alpha + 0.5f);
+    return (Color){(unsigned char)r, (unsigned char)g, (unsigned char)b,
+                   (unsigned char)(a < 0 ? 0 : a > 255 ? 255 : a)};
+}
+
+static void gui_img_text(GuiFonts *fonts, const char *s, size_t n, double x, double y,
+                         float sz, Color c) {
+    char buf[256];
+    if (n >= sizeof buf) n = sizeof buf - 1;
+    memcpy(buf, s, n);
+    buf[n] = 0;
+    DrawTextEx(fonts->prose, buf, (Vector2){(float)x, (float)y}, sz, 0, c);
+}
+
+void gui_img_placeholder(GuiFonts *fonts, const RtxImgView *v, double x, double y, double w,
+                         double h, const char *alt, size_t altn, float alpha) {
+    char line2[200], why[120];
+    float sz = 13.0f;
+    DrawRectangle((int)x, (int)y, (int)w, (int)h, gui_img_col(34, 36, 44, alpha));
+    DrawRectangleLines((int)x, (int)y, (int)w, (int)h, gui_img_col(78, 82, 98, alpha));
+    line2[0] = 0;
+    if (v->state == RTX_IMG_S_ASK && v->src.kind == RTX_IMG_SRC_REMOTE)
+        snprintf(line2, sizeof line2, "remote image from %s%s: click to load", v->src.host,
+                 v->src.http ? " (http)" : "");
+    else if (v->state == RTX_IMG_S_ASK)
+        snprintf(line2, sizeof line2, "outside the project: click to allow");
+    else if (v->state == RTX_IMG_S_ERR)
+        snprintf(line2, sizeof line2, "%s", rtx_img_err_text(v->err, why, sizeof why));
+    else if (v->have_info)
+        snprintf(line2, sizeof line2, "%s %ux%u", rtx_img_fmt_name(v->info.fmt),
+                 (unsigned)v->info.w, (unsigned)v->info.h);
+    else
+        snprintf(line2, sizeof line2, "loading");
+    if (w < 24 || h < 12) return;
+    BeginScissorMode((int)x + 1, (int)y + 1, (int)w - 2, (int)h - 2);
+    if (alt && altn)
+        gui_img_text(fonts, alt, altn, x + 8, y + 6, sz, gui_img_col(200, 204, 214, alpha));
+    else
+        gui_img_text(fonts, "image", 5, x + 8, y + 6, sz, gui_img_col(150, 154, 166, alpha));
+    if (h >= 38)
+        gui_img_text(fonts, line2, strlen(line2), x + 8, y + 24, sz - 1,
+                     gui_img_col(v->state == RTX_IMG_S_ERR ? 220 : 140,
+                                 v->state == RTX_IMG_S_ERR ? 140 : 146,
+                                 v->state == RTX_IMG_S_ERR ? 120 : 160, alpha));
+    EndScissorMode();
+}
+
+int gui_img_draw_src(GuiFonts *fonts, const RtxImgSrc *src, double x, double y, double w,
+                     double h, float alpha, const char *alt, size_t altn) {
+    return gui_img_draw_at(fonts, src, x, y, w, h, w, h, alpha, alt, altn);
+}
+
+/* As gui_img_draw_src, decoding at (want_w, want_h) whatever the drawn
+ * size: a transition that scales every frame reuses one bitmap. */
+int gui_img_draw_at(GuiFonts *fonts, const RtxImgSrc *src, double x, double y, double w,
+                    double h, double want_w, double want_h, float alpha, const char *alt,
+                    size_t altn) {
+    RtxImgView v;
+    uint32_t bw, bh;
+    if (w < 1 || h < 1) return RTX_IMG_S_ERR;
+    bw = (uint32_t)(want_w + 0.5);
+    bh = (uint32_t)(want_h + 0.5);
+    if (bw < 1) bw = 1;
+    if (bh < 1) bh = 1;
+    rtx_img_want(src, bw, bh, &v);
+    if (v.state == RTX_IMG_S_OK && v.bmp && v.be) {
+        void *pi = rtx_img_plat(v.be, v.frame);
+        if (!pi) {
+            const RtxImgBmp *bm = v.bmp;
+            pi = gui_image_new(bm->px + (size_t)v.frame * bm->h * bm->stride, (int)bm->w,
+                               (int)bm->h, (int)bm->stride);
+            if (pi) rtx_img_plat_set(v.be, v.frame, pi, gui_image_free);
+        }
+        if (pi) {
+            gui_image_draw(pi, x, y, w, h, alpha);
+            return v.state;
+        }
+    }
+    gui_img_placeholder(fonts, &v, x, y, w, h, alt, altn, alpha);
+    return v.state;
+}
+
+/* A picture row's image (bytes: the row's). */
+void gui_img_row(GuiFonts *fonts, RtxBuf *b, const RtxImgRec *rec, char[:] bytes,
+                 size_t row_start, double x, double y) {
+    RtxImgSrc src;
+    size_t so, an;
+    if (!rec || rec->slo < row_start || rec->shi > row_start + bytes.len) return;
+    so = rec->slo - row_start;
+    an = rec->ahi > rec->alo ? rec->ahi - rec->alo : 0;
+    rtx_img_resolve(RtxDoc_file_path(&b->doc), bytes.ptr + so, rec->shi - rec->slo, &src);
+    gui_img_draw_src(fonts, &src, x, y, rec->w, rec->h, 1.0f,
+                     an && rec->alo >= row_start ? bytes.ptr + (rec->alo - row_start) : NULL,
+                     an);
+}
+
+/* A picture box under pane text coordinates (x after the gutter, y from
+ * the pane top); its record, or NULL. */
+const RtxImgRec *gui_img_at(RtxBuf *b, double x, double y) {
+    size_t i;
+    double acc = 0;
+    if (!b || !b->layout.img_recs.len) return NULL;
+    for (i = b->top_wrap; i < b->layout.rows.len; i++) {
+        const RtxVisRow *r = &b->layout.rows.data[i];
+        if (y >= acc && y < acc + r->height) {
+            const RtxImgRec *rec = rtx_layout_img_rec(&b->layout, r->byte_start);
+            double ry = y - acc;
+            if (!rec) return NULL;
+            if (x >= rec->x && x < rec->x + rec->w && ry >= rec->top && ry < rec->top + rec->h)
+                return rec;
+            return NULL;
+        }
+        acc += r->height;
+    }
+    return NULL;
+}
+
+/* The picture records' layouts saw a stale size / policy: refill panes
+ * that hold images. */
+void gui_img_relayout(RtxWs *w) {
+    size_t i;
+    if (!w) return;
+    for (i = 0; i < w->len; i++) {
+        RtxBuf *b = w->bufs[i];
+        if (b && b->layout.img_on && b->layout.rows.len) b->layout.clear_rows();
+    }
+}
+
+/* Ask about `src` (resolved from doc_path) and store the answer. 1 when
+ * something was allowed. */
+int gui_img_ask(const char *doc_path, const RtxImgSrc *src, char *status, size_t sn) {
+    char msg[600];
+    int remote = src->kind == RTX_IMG_SRC_REMOTE, c, what = 0;
+    if (remote)
+        snprintf(msg, sizeof msg,
+                 "This document shows an image from %s%s:\n%.300s\n\nRemote images are "
+                 "never fetched without your say-so.",
+                 src->host, src->http ? " over plain http (not encrypted)" : "", src->key);
+    else
+        snprintf(msg, sizeof msg,
+                 "This document shows an image outside its project:\n%.300s", src->key);
+    c = gui_alert_image(remote, msg);
+    if (c == 1) what = remote ? RTX_IMG_ALLOW_ONCE : RTX_IMG_ALLOW_FILE;
+    else if (c == 2) what = remote ? RTX_IMG_ALLOW_HOST : RTX_IMG_ALLOW_DIR;
+    else if (c == 3) what = remote ? RTX_IMG_ALLOW_ALL_REMOTE : RTX_IMG_ALLOW_ALL_LOCAL;
+    if (!what) return 0;
+    if (!rtx_img_allow(doc_path, src, what)) {
+        if (status && sn) snprintf(status, sn, "image: could not store the permission");
+        return 0;
+    }
+    if (status && sn)
+        snprintf(status, sn, "image: %s", c == 1 ? (remote ? "loading" : "file allowed")
+                                           : c == 2 ? (remote ? "host allowed" : "directory allowed")
+                                                    : (remote ? "remote images allowed in this project"
+                                                              : "all local images allowed"));
+    if (remote) {
+        RtxImgSrc again;
+        rtx_img_resolve(doc_path, src->key, strlen(src->key), &again);
+        rtx_img_fetch(&again);
+    }
+    return 1;
+}
+
+/* The image the caret's line shows (the first one), resolved. */
+static int gui_img_on_line(RtxBuf *b, RtxImgSrc *src, size_t *slo, size_t *shi) {
+    char buf[4096];
+    size_t len, a, got, ls, le, i;
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    len = b->doc.len();
+    a = b->doc.caret > 2048 ? b->doc.caret - 2048 : 0;
+    got = b->doc.read_at(a, cc_slice_from_buffer(buf, sizeof buf < len - a ? sizeof buf : len - a)) !>;
+    ls = b->doc.caret - a;
+    if (ls > got) ls = got;
+    while (ls > 0 && buf[ls - 1] != '\n') ls--;
+    le = b->doc.caret - a;
+    if (le > got) le = got;
+    while (le < got && buf[le] != '\n') le++;
+    for (i = ls; i + 1 < le; i++) {
+        size_t alo, ahi, s0, s1;
+        if (buf[i] != '!' || buf[i + 1] != '[') continue;
+        if (!rtx_img_md_parse(buf, i, le, &alo, &ahi, &s0, &s1)) continue;
+        rtx_img_resolve(RtxDoc_file_path(&b->doc), buf + s0, s1 - s0, src);
+        if (slo) *slo = a + s0;
+        if (shi) *shi = a + s1;
+        return 1;
+    }
+    return 0;
+}
+
+/* Open the image full size (the image viewer, docs/images.md). */
+static int gui_img_open(RtxWs *w, const RtxImgSrc *src, char *status, size_t sn) {
+    char path[RTX_IMG_PATH];
+    int ok = 1;
+    if (!rtx_img_file(src, path, sizeof path)) {
+        if (status && sn) snprintf(status, sn, "image: no local copy to open");
+        return 0;
+    }
+    {
+        @errhandler(CCError e) {
+            if (status && sn) snprintf(status, sn, "%s", e.message ? e.message : "open failed");
+            ok = 0;
+        }
+        w->open_in_pane(cc_slice_cstr(path)) !>;
+    }
+    return ok;
+}
+
+/* A picture row clicked: ask, open full size, or 0 (a caret click). */
+int gui_img_click(RtxWs *w, RtxBuf *b, const RtxImgRec *rec, char *status, size_t sn) {
+    char sb[RTX_IMG_PATH];
+    CCArena fr;
+    RtxImgSrc src;
+    RtxImgView v;
+    size_t n;
+    if (!w || !b || !rec || rec->shi <= rec->slo) return 0;
+    n = rec->shi - rec->slo;
+    if (n >= sizeof sb) return 0;
+    fr = cc_arena_heap(n + 64);
+    if (!fr.base) return 0;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            fr.destroy();
+            return 0;
+        }
+        char[:] s = b->doc.scratch_span(rec->slo, n, fr) !>;
+        memcpy(sb, s.ptr, n);
+    }
+    fr.destroy();
+    rtx_img_resolve(RtxDoc_file_path(&b->doc), sb, n, &src);
+    rtx_img_info(&src, &v);
+    if (v.state == RTX_IMG_S_ASK) {
+        if (gui_img_ask(RtxDoc_file_path(&b->doc), &src, status, sn)) gui_img_relayout(w);
+        return 1;
+    }
+    if (v.state == RTX_IMG_S_ERR) return 0;
+    return gui_img_open(w, &src, status, sn);
+}
+
+/* "image.load": the image on the caret's line. */
+void gui_img_cmd_load(RtxWs *w, RtxBuf *b, char *status, size_t sn) {
+    RtxImgSrc src;
+    RtxImgView v;
+    if (!b || !gui_img_on_line(b, &src, NULL, NULL)) {
+        if (status && sn) snprintf(status, sn, "image: no image on this line");
+        return;
+    }
+    rtx_img_info(&src, &v);
+    if (v.state == RTX_IMG_S_ASK) {
+        if (gui_img_ask(RtxDoc_file_path(&b->doc), &src, status, sn)) gui_img_relayout(w);
+        return;
+    }
+    if (v.state == RTX_IMG_S_ERR) {
+        char why[120];
+        if (status && sn)
+            snprintf(status, sn, "image: %s", rtx_img_err_text(v.err, why, sizeof why));
+        return;
+    }
+    gui_img_open(w, &src, status, sn);
+}
+
+void gui_img_cmd_revoke(RtxWs *w, RtxBuf *b, char *status, size_t sn) {
+    int n = rtx_img_revoke(b ? RtxDoc_file_path(&b->doc) : NULL);
+    if (status && sn)
+        snprintf(status, sn, "image: %d permission%s revoked", n, n == 1 ? "" : "s");
+    gui_img_relayout(w);
+}
+
+/* ---- a file that is an image: the browse preview and the viewer ---- */
+
+/* Format of the document's bytes (RTX_IMG_FMT_NONE: not an image). */
+int gui_img_doc_fmt(RtxDoc *d) {
+    char head[32];
+    size_t got;
+    @errhandler(CCError e) {
+        (void)e;
+        return RTX_IMG_FMT_NONE;
+    }
+    if (!d || d->len() < 8) return RTX_IMG_FMT_NONE;
+    got = d->read_at(0, cc_slice_from_buffer(head, sizeof head)) !>;
+    return rtx_img_sniff((const uint8_t *)head, got);
+}
+
+static void gui_img_caption(GuiFonts *fonts, const RtxImgView *v, uint64_t bytes, double x,
+                            double y, const char *extra) {
+    char cap[256], why[120], sz[32];
+    if (bytes >= (1u << 20))
+        snprintf(sz, sizeof sz, "%.1f MiB", (double)bytes / (double)(1u << 20));
+    else
+        snprintf(sz, sizeof sz, "%.1f KiB", (double)bytes / 1024.0);
+    if (v->state == RTX_IMG_S_ERR)
+        snprintf(cap, sizeof cap, "%s  %s", rtx_img_err_text(v->err, why, sizeof why), sz);
+    else if (v->have_info)
+        snprintf(cap, sizeof cap, "%s  %u x %u  %s%s", rtx_img_fmt_name(v->info.fmt),
+                 (unsigned)v->info.w, (unsigned)v->info.h, sz, extra ? extra : "");
+    else
+        snprintf(cap, sizeof cap, "reading header  %s", sz);
+    DrawTextEx(fonts->mono, cap, (Vector2){(float)x, (float)y}, 13, 0,
+               (Color){170, 176, 190, 255});
+}
+
+/* Browse preview of an image file: scaled to the pane, its size and
+ * format under it. 0 when the file is not an image. */
+int gui_img_prev(RtxBrowsePrev *pv, GuiFonts *fonts, int x0, int y0, int tw, int ph) {
+    RtxImgSrc src;
+    RtxImgView v;
+    double bw, bh, bx, by;
+    uint32_t fw, fh;
+    if (!pv || !pv->live || !pv->path[0] || gui_img_doc_fmt(&pv->doc) == RTX_IMG_FMT_NONE)
+        return 0;
+    rtx_img_src_file(pv->path, &src);
+    rtx_img_info(&src, &v);
+    bw = tw - 16;
+    bh = ph - 34;
+    if (bw < 8 || bh < 8) return 1;
+    if (v.have_info && v.state != RTX_IMG_S_ERR) {
+        rtx_img_fit(v.info.w, v.info.h, (uint32_t)bw, (uint32_t)bh, &fw, &fh);
+        bx = x0 + 8 + (bw - fw) / 2;
+        by = y0 + 8;
+        gui_img_draw_src(fonts, &src, bx, by, fw, fh, 1.0f, NULL, 0);
+        gui_img_caption(fonts, &v, pv->doc.len(), x0 + 8, by + fh + 8, NULL);
+    } else {
+        gui_img_placeholder(fonts, &v, x0 + 8, y0 + 8, bw < 360 ? bw : 360, 60, NULL, 0, 1.0f);
+        gui_img_caption(fonts, &v, pv->doc.len(), x0 + 8, y0 + 76, NULL);
+    }
+    return 1;
+}
+
+/* The viewer: an image file opened directly shows the picture (fit, or a
+ * zoom), not its bytes, until Ctrl-D switches the pane to hex. Zoom is
+ * per buffer, this session. */
+typedef struct {
+    const RtxBuf *b;
+    double zoom;           /* 0 = fit */
+    double px, py;         /* pan, window px */
+} GuiImgZoom;
+
+static GuiImgZoom g_zoom[16];
+
+static GuiImgZoom *gui_img_zoom(const RtxBuf *b) {
+    int i, free_i = -1;
+    for (i = 0; i < 16; i++) {
+        if (g_zoom[i].b == b) return &g_zoom[i];
+        if (!g_zoom[i].b && free_i < 0) free_i = i;
+    }
+    if (free_i < 0) free_i = 0;
+    memset(&g_zoom[free_i], 0, sizeof g_zoom[free_i]);
+    g_zoom[free_i].b = b;
+    return &g_zoom[free_i];
+}
+
+int gui_img_viewer_on(RtxBuf *b) {
+    if (!b || rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout)) return 0;
+    if (!RtxDoc_file_path(&b->doc)) return 0;
+    return gui_img_doc_fmt(&b->doc) != RTX_IMG_FMT_NONE;
+}
+
+void gui_img_viewer_draw(GuiFonts *fonts, RtxBuf *b, int x0, int y0, int pw, int ph) {
+    RtxImgSrc src;
+    RtxImgView v;
+    GuiImgZoom *z = gui_img_zoom(b);
+    double bw = pw - 24, bh = ph - 36, s, dw, dh, dx, dy;
+    char extra[96];
+    if (bw < 8 || bh < 8) return;
+    rtx_img_src_file(RtxDoc_file_path(&b->doc), &src);
+    rtx_img_info(&src, &v);
+    if (!v.have_info || v.state == RTX_IMG_S_ERR) {
+        gui_img_placeholder(fonts, &v, x0 + 12, y0 + 12, bw < 360 ? bw : 360, 60, NULL, 0, 1.0f);
+        gui_img_caption(fonts, &v, b->doc.len(), x0 + 12, y0 + ph - 24, NULL);
+        return;
+    }
+    if (z->zoom > 0) {
+        s = z->zoom;
+    } else {
+        double sx = bw / (double)v.info.w, sy = bh / (double)v.info.h;
+        s = sx < sy ? sx : sy;
+        if (s > 1) s = 1;
+    }
+    dw = (double)v.info.w * s;
+    dh = (double)v.info.h * s;
+    dx = x0 + 12 + (bw - dw) / 2 + z->px;
+    dy = y0 + 12 + (bh - dh) / 2 + z->py;
+    BeginScissorMode(x0 + 4, y0 + 4, pw - 8, ph - 30);
+    /* Decode at most at the natural size; the blit scales beyond. */
+    gui_img_draw_at(fonts, &src, dx, dy, dw, dh, dw < v.info.w ? dw : v.info.w,
+                    dh < v.info.h ? dh : v.info.h, 1.0f, NULL, 0);
+    EndScissorMode();
+    snprintf(extra, sizeof extra, "  %d%%%s  + - zoom  0 fit  1 actual  Ctrl-D hex",
+             (int)(s * 100 + 0.5), z->zoom > 0 ? "" : " (fit)");
+    gui_img_caption(fonts, &v, b->doc.len(), x0 + 12, y0 + ph - 24,
+                    RtxDoc_dirty(&b->doc) ? "  (edited: showing the file on disk)" : extra);
+}
+
+/* Viewer keys: + / = zoom in, - out, 0 fit, 1 actual size, arrows pan.
+ * Nothing edits the bytes from the viewer. */
+void gui_img_viewer_keys(RtxBuf *b) {
+    GuiImgZoom *z = gui_img_zoom(b);
+    int ch;
+    RtxImgSrc src;
+    RtxImgView v;
+    double cur;
+    rtx_img_src_file(RtxDoc_file_path(&b->doc), &src);
+    rtx_img_info(&src, &v);
+    cur = z->zoom > 0 ? z->zoom : 1.0;
+    if (z->zoom <= 0 && v.have_info && g_live.w) {
+        /* The fit scale, as the last paint used (approximate: pane geometry). */
+        int p = g_live.w->focus;
+        double bw = g_gg[p].w - 24, bh = g_gg[p].h - 36;
+        double sx = bw / (double)v.info.w, sy = bh / (double)v.info.h;
+        cur = sx < sy ? sx : sy;
+        if (cur > 1) cur = 1;
+        if (cur <= 0) cur = 1;
+    }
+    if (IsKeyPressed(KEY_LEFT)) z->px += 48;
+    if (IsKeyPressed(KEY_RIGHT)) z->px -= 48;
+    if (IsKeyPressed(KEY_UP)) z->py += 48;
+    if (IsKeyPressed(KEY_DOWN)) z->py -= 48;
+    ch = GetCharPressed();
+    while (ch > 0) {
+        if (ch == '+' || ch == '=') z->zoom = cur * 1.25 > 32 ? 32 : cur * 1.25;
+        else if (ch == '-') z->zoom = cur / 1.25 < 0.02 ? 0.02 : cur / 1.25;
+        else if (ch == '0') {
+            z->zoom = 0;
+            z->px = z->py = 0;
+        } else if (ch == '1') z->zoom = 1;
+        if (z->zoom > 0) cur = z->zoom;
+        ch = GetCharPressed();
+    }
+    g_dirty = 1;
+}
+
+/* Ctrl-D on an image file: the picture <-> its hex. 1 when it applied. */
+int gui_img_viewer_toggle(RtxBuf *b) {
+    if (!b || !RtxDoc_file_path(&b->doc) || gui_img_doc_fmt(&b->doc) == RTX_IMG_FMT_NONE)
+        return 0;
+    if (rtx_layout_is_hex(&b->layout)) rtx_layout_set_view(&b->layout, RTX_VIEW_DEFAULT);
+    else rtx_layout_set_view(&b->layout, RTX_VIEW_HEX);
+    b->layout.clear_rows();
+    return 1;
+}

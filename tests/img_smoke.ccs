@@ -1,0 +1,729 @@
+#!ccc ccs
+/*
+ * Images (docs/images.md): the loader on every format, broken and hostile
+ * inputs, limits before allocation, EXIF orientation, the cache budget,
+ * the path policy and its persisted allowances, and the remote flow
+ * against a local HTTP server (never fetched without consent; caching,
+ * the byte cap, the timeout). Fixtures: testdata/img (tests/img_gen.py).
+ */
+#include <ccc/std/prelude.cch>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include "../core/img.cch"
+void rtx_safe_test_isol(void);
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static uint8_t *slurp(const char *path, size_t *n) {
+    FILE *fp = fopen(path, "rb");
+    long sz;
+    uint8_t *b;
+    *n = 0;
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    b = (uint8_t *)malloc((size_t)sz + 1);
+    if (b && fread(b, 1, (size_t)sz, fp) != (size_t)sz) {
+        free(b);
+        b = NULL;
+    }
+    fclose(fp);
+    if (b) *n = (size_t)sz;
+    return b;
+}
+
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Pixel (x, y) of an RGBA bitmap near an RGB colour (JPEG slack). */
+static int near_rgb(const RtxImgBmp *b, uint32_t x, uint32_t y, int r, int g, int bl, int tol) {
+    const uint8_t *p = b->px + (size_t)y * b->stride + (size_t)x * 4;
+    return abs(p[0] - r) <= tol && abs(p[1] - g) <= tol && abs(p[2] - bl) <= tol;
+}
+
+static void test_formats(void) {
+    static const char *names[] = {"quad.png", "quad.jpg", "quad.gif", "quad.bmp",
+                                  "quad.webp", "quad.qoi", NULL};
+    static const int fmts[] = {RTX_IMG_FMT_PNG, RTX_IMG_FMT_JPEG, RTX_IMG_FMT_GIF,
+                               RTX_IMG_FMT_BMP, RTX_IMG_FMT_WEBP, RTX_IMG_FMT_QOI};
+    int i;
+    for (i = 0; names[i]; i++) {
+        char path[256], msg[256];
+        size_t n;
+        uint8_t *b;
+        RtxImgInfo info;
+        RtxImgBmp bmp;
+        int rc;
+        snprintf(path, sizeof path, "testdata/img/%s", names[i]);
+        b = slurp(path, &n);
+        snprintf(msg, sizeof msg, "%s: read", names[i]);
+        expect(b != NULL, msg);
+        if (!b) continue;
+        rc = rtx_img_probe(b, n, 1, rtx_img_limits(), &info);
+        snprintf(msg, sizeof msg, "%s: probe ok (%d)", names[i], rc);
+        expect(rc == RTX_IMG_OK, msg);
+        snprintf(msg, sizeof msg, "%s: format + 32x24", names[i]);
+        expect(info.fmt == fmts[i] && info.w == 32 && info.h == 24, msg);
+        /* A prefix too short for the header asks for more. */
+        rc = rtx_img_probe(b, 12, 0, rtx_img_limits(), &info);
+        snprintf(msg, sizeof msg, "%s: short prefix -> MORE (%d)", names[i], rc);
+        expect(rc == RTX_IMG_MORE || (rc == RTX_IMG_OK && info.w == 32), msg);
+        rc = rtx_img_decode(b, n, rtx_img_limits(), 0, 0, RTX_IMG_PIX_RGBA, 1, NULL, &bmp,
+                            &info);
+        snprintf(msg, sizeof msg, "%s: decode ok (%d)", names[i], rc);
+        expect(rc == RTX_IMG_OK && bmp.w == 32 && bmp.h == 24 && bmp.nframe == 1, msg);
+        if (rc == RTX_IMG_OK) {
+            int tol = fmts[i] == RTX_IMG_FMT_JPEG ? 24 : (fmts[i] == RTX_IMG_FMT_GIF ? 12 : 1);
+            snprintf(msg, sizeof msg, "%s: quadrant colours", names[i]);
+            expect(near_rgb(&bmp, 4, 4, 220, 30, 30, tol) &&
+                       near_rgb(&bmp, 28, 4, 30, 200, 40, tol) &&
+                       near_rgb(&bmp, 4, 20, 40, 60, 220, tol) &&
+                       near_rgb(&bmp, 28, 20, 250, 250, 250, tol),
+                   msg);
+            if (fmts[i] == RTX_IMG_FMT_PNG || fmts[i] == RTX_IMG_FMT_WEBP ||
+                fmts[i] == RTX_IMG_FMT_QOI) {
+                snprintf(msg, sizeof msg, "%s: transparent pixel kept", names[i]);
+                expect(bmp.px[3] == 0, msg);
+            }
+        }
+        rtx_img_bmp_free(&bmp);
+        /* Scaled decode keeps only the small result. */
+        rc = rtx_img_decode(b, n, rtx_img_limits(), 16, 0, RTX_IMG_PIX_BGRA_PREMUL, 1, NULL,
+                            &bmp, &info);
+        snprintf(msg, sizeof msg, "%s: scaled to 16x12", names[i]);
+        expect(rc == RTX_IMG_OK && bmp.w == 16 && bmp.h == 12 && bmp.bytes == 16 * 12 * 4, msg);
+        rtx_img_bmp_free(&bmp);
+        free(b);
+    }
+}
+
+static void test_broken(void) {
+    static const struct {
+        const char *name;
+        int want;
+    } cases[] = {
+        {"trunc.png", RTX_IMG_ETRUNC},   {"trunc.jpg", RTX_IMG_ETRUNC},
+        {"corrupt.png", RTX_IMG_ECORRUPT}, {"garbage.png", RTX_IMG_EFORMAT},
+        {"bomb_dim.png", RTX_IMG_EDIM},  {"bomb_px.png", RTX_IMG_EPX},
+        {NULL, 0},
+    };
+    int i;
+    for (i = 0; cases[i].name; i++) {
+        char path[256], msg[256];
+        size_t n;
+        uint8_t *b;
+        RtxImgInfo info;
+        RtxImgBmp bmp;
+        int rc;
+        long t0;
+        snprintf(path, sizeof path, "testdata/img/%s", cases[i].name);
+        b = slurp(path, &n);
+        if (!b) {
+            expect(0, cases[i].name);
+            continue;
+        }
+        t0 = now_ms();
+        rc = rtx_img_decode(b, n, rtx_img_limits(), 0, 0, RTX_IMG_PIX_RGBA, 1, NULL, &bmp,
+                            &info);
+        snprintf(msg, sizeof msg, "%s: decode -> %d (got %d)", cases[i].name, cases[i].want, rc);
+        /* A corrupt stream may also read as truncated; both are refusals. */
+        expect(rc == cases[i].want ||
+                   (cases[i].want == RTX_IMG_ECORRUPT && rc == RTX_IMG_ETRUNC) ||
+                   (cases[i].want == RTX_IMG_ETRUNC && rc == RTX_IMG_ECORRUPT),
+               msg);
+        expect(bmp.px == NULL && bmp.bytes == 0, "failed decode holds nothing");
+        if (cases[i].want == RTX_IMG_EDIM || cases[i].want == RTX_IMG_EPX) {
+            /* Refused from the 33-byte header: the claimed canvas (up to
+             * 40 GB) was never allocated, and it took no time. */
+            snprintf(msg, sizeof msg, "%s: header names the size", cases[i].name);
+            expect(info.cw >= 12000 && info.ch >= 12000, msg);
+            expect(now_ms() - t0 < 50, "bomb refused at once");
+            rc = rtx_img_probe(b, n, 1, rtx_img_limits(), &info);
+            expect(rc == cases[i].want, "probe applies the same limit");
+        }
+        free(b);
+    }
+    {
+        /* The file limit is checked before reading pixels, too. */
+        RtxImgLimits l = *rtx_img_limits();
+        size_t n;
+        uint8_t *b = slurp("testdata/img/big.png", &n);
+        RtxImgBmp bmp;
+        l.file_max = 100;
+        expect(rtx_img_decode(b, n, &l, 0, 0, 0, 1, NULL, &bmp, NULL) == RTX_IMG_EFILE,
+               "file limit");
+        l = *rtx_img_limits();
+        l.dim_max = 1000;
+        expect(rtx_img_decode(b, n, &l, 0, 0, 0, 1, NULL, &bmp, NULL) == RTX_IMG_EDIM,
+               "dimension limit setting");
+        l = *rtx_img_limits();
+        l.px_max = 1000000;
+        expect(rtx_img_decode(b, n, &l, 0, 0, 0, 1, NULL, &bmp, NULL) == RTX_IMG_EPX,
+               "megapixel limit setting");
+        l = *rtx_img_limits();
+        l.budget = 1000;
+        expect(rtx_img_decode(b, n, &l, 100, 0, 0, 1, NULL, &bmp, NULL) == RTX_IMG_EBUDGET,
+               "budget limit on the scaled result");
+        {
+            _Atomic int stop = 1;
+            expect(rtx_img_decode(b, n, rtx_img_limits(), 64, 0, 0, 1, &stop, &bmp, NULL) ==
+                       RTX_IMG_ECANCEL,
+                   "cancel flag stops a decode");
+        }
+        {
+            RtxImgInfo info;
+            long t0 = now_ms();
+            int rc = rtx_img_decode(b, n, rtx_img_limits(), 300, 200, RTX_IMG_PIX_RGBA, 1, NULL,
+                                    &bmp, &info);
+            expect(rc == RTX_IMG_OK && bmp.w == 267 && bmp.h == 200, "fit 1200x900 into 300x200");
+            expect(info.w == 1200 && info.h == 900, "natural size reported");
+            if (rc == RTX_IMG_OK)
+                expect(near_rgb(&bmp, 10, 10, 220, 30, 30, 2) &&
+                           near_rgb(&bmp, 250, 190, 250, 250, 250, 2),
+                       "scaled colours");
+            printf("img: 1200x900 png -> 267x200 in %ld ms\n", now_ms() - t0);
+            rtx_img_bmp_free(&bmp);
+        }
+        free(b);
+    }
+}
+
+static void test_exif(void) {
+    int o;
+    for (o = 1; o <= 9; o++) {
+        char path[256], msg[256];
+        size_t n;
+        uint8_t *b;
+        RtxImgInfo info;
+        RtxImgBmp bmp;
+        int rc;
+        if (o == 9) snprintf(path, sizeof path, "testdata/img/exif6.png");
+        else snprintf(path, sizeof path, "testdata/img/exif%d.jpg", o);
+        b = slurp(path, &n);
+        if (!b) {
+            expect(0, path);
+            continue;
+        }
+        expect(rtx_img_exif_orient(b, n) == (o == 9 ? 6 : o), "exif tag read");
+        rc = rtx_img_decode(b, n, rtx_img_limits(), 0, 0, RTX_IMG_PIX_RGBA, 1, NULL, &bmp,
+                            &info);
+        snprintf(msg, sizeof msg, "%s: displayed 40x20 (rc %d, %ux%u)", path, rc, bmp.w, bmp.h);
+        expect(rc == RTX_IMG_OK && bmp.w == 40 && bmp.h == 20 && info.w == 40 && info.h == 20,
+               msg);
+        if (rc == RTX_IMG_OK) {
+            snprintf(msg, sizeof msg, "%s: quadrants upright", path);
+            expect(near_rgb(&bmp, 4, 4, 220, 30, 30, 30) &&
+                       near_rgb(&bmp, 35, 4, 30, 200, 40, 30) &&
+                       near_rgb(&bmp, 4, 15, 40, 60, 220, 30) &&
+                       near_rgb(&bmp, 35, 15, 250, 250, 250, 30),
+                   msg);
+        }
+        rtx_img_bmp_free(&bmp);
+        free(b);
+    }
+}
+
+static void test_anim(void) {
+    size_t n;
+    uint8_t *b = slurp("testdata/img/anim.gif", &n);
+    RtxImgBmp bmp;
+    int rc;
+    if (!b) {
+        expect(0, "anim.gif");
+        return;
+    }
+    rc = rtx_img_decode(b, n, rtx_img_limits(), 0, 0, RTX_IMG_PIX_RGBA, 1, NULL, &bmp, NULL);
+    expect(rc == RTX_IMG_OK && bmp.nframe == 1 && !bmp.delay, "animation off: first frame only");
+    if (rc == RTX_IMG_OK) expect(near_rgb(&bmp, 8, 8, 220, 30, 30, 8), "first frame colour");
+    rtx_img_bmp_free(&bmp);
+    rc = rtx_img_decode(b, n, rtx_img_limits(), 0, 0, RTX_IMG_PIX_RGBA, 64, NULL, &bmp, NULL);
+    expect(rc == RTX_IMG_OK && bmp.nframe == 3 && bmp.delay, "animation on: 3 frames");
+    if (rc == RTX_IMG_OK && bmp.delay) {
+        RtxImgBmp f2 = bmp;
+        f2.px = bmp.px + 2 * (size_t)bmp.h * bmp.stride;
+        expect(bmp.delay[0] == 100 && bmp.delay[1] == 200 && bmp.delay[2] == 300, "delays");
+        expect(near_rgb(&f2, 8, 8, 40, 60, 220, 8), "third frame colour");
+    }
+    rtx_img_bmp_free(&bmp);
+    rc = rtx_img_decode(b, n, rtx_img_limits(), 0, 0, RTX_IMG_PIX_RGBA, 2, NULL, &bmp, NULL);
+    expect(rc == RTX_IMG_OK && bmp.nframe == 2, "frame cap");
+    rtx_img_bmp_free(&bmp);
+    free(b);
+}
+
+static void test_md(void) {
+    size_t lo, hi, alo, ahi, slo, shi;
+    const char *s1 = "![a cat](img/cat.png \"Title\")";
+    const char *s2 = "  ![x](<a b.png>)  ";
+    const char *s3 = "text ![x](a.png)";
+    const char *s4 = "![x](a.png) and more";
+    const char *s5 = "![nested [br]](p(1).png)";
+    expect(rtx_img_md_line(s1, strlen(s1), &lo, &hi, &alo, &ahi, &slo, &shi) && lo == 0 &&
+               hi == strlen(s1) && ahi - alo == 5 && shi - slo == 11 &&
+               memcmp(s1 + slo, "img/cat.png", 11) == 0,
+           "md: title stripped");
+    expect(rtx_img_md_line(s2, strlen(s2), &lo, &hi, &alo, &ahi, &slo, &shi) &&
+               memcmp(s2 + slo, "a b.png", 7) == 0 && shi - slo == 7,
+           "md: angle brackets");
+    expect(!rtx_img_md_line(s3, strlen(s3), &lo, &hi, &alo, &ahi, &slo, &shi),
+           "md: text before is no image line");
+    expect(!rtx_img_md_line(s4, strlen(s4), &lo, &hi, &alo, &ahi, &slo, &shi),
+           "md: text after is no image line");
+    expect(rtx_img_md_line(s5, strlen(s5), &lo, &hi, &alo, &ahi, &slo, &shi) &&
+               memcmp(s5 + slo, "p(1).png", 8) == 0,
+           "md: nested brackets / parens");
+    {
+        /* The stand-in fits its buffer whatever the alt and the host. */
+        RtxImgView v;
+        char out[96], alt[300];
+        size_t n;
+        memset(&v, 0, sizeof v);
+        memset(alt, 'a', sizeof alt);
+        v.state = RTX_IMG_S_ASK;
+        v.src.kind = RTX_IMG_SRC_REMOTE;
+        memset(v.src.host, 'h', 250);
+        v.src.host[250] = 0;
+        n = rtx_img_standin(&v, alt, sizeof alt, out, sizeof out);
+        expect(n < sizeof out && out[n] == 0 && out[n - 1] == ']' &&
+                   strncmp(out, "[image:", 7) == 0,
+               "standin: long host and alt fit");
+        v.state = RTX_IMG_S_INFO;
+        v.have_info = 1;
+        v.info.w = 640;
+        v.info.h = 480;
+        n = rtx_img_standin(&v, "cat", 3, out, sizeof out);
+        expect(n == strlen("[image: cat 640x480]") && strcmp(out, "[image: cat 640x480]") == 0,
+               "standin: alt and size");
+        n = rtx_img_standin(&v, alt, sizeof alt, out, sizeof out);
+        expect(n < sizeof out && strstr(out, "..") && strstr(out, " 640x480]"),
+               "standin: a long alt is cut, the size kept");
+    }
+}
+
+/* ---- policy ------------------------------------------------------------ */
+
+static void sh(const char *cmd) {
+    if (system(cmd) != 0) fprintf(stderr, "cmd failed: %s\n", cmd);
+}
+
+#define PROJ "testdata/generated/imgproj"
+#define OUTD "testdata/generated/imgout"
+
+static void test_policy(void) {
+    RtxImgSrc s;
+    char doc[512], cwd[400];
+    if (!getcwd(cwd, sizeof cwd)) return;
+    sh("rm -rf " PROJ " " OUTD " && mkdir -p " PROJ "/.git " PROJ "/sub " OUTD);
+    sh("cp testdata/img/quad.png " PROJ "/pic.png && cp testdata/img/quad.png " PROJ
+       "/sub/a%20b.png && cp testdata/img/quad.jpg " OUTD "/x.jpg && cp testdata/img/quad.gif " OUTD
+       "/y.gif");
+    sh("ln -s ../imgout/x.jpg " PROJ "/link.jpg");
+    snprintf(doc, sizeof doc, "%s/" PROJ "/doc.md", cwd);
+    expect(rtx_img_resolve(doc, "pic.png", 7, &s) == RTX_IMG_OK && s.kind == RTX_IMG_SRC_LOCAL,
+           "policy: inside the project");
+    expect(rtx_img_resolve(doc, "sub/a%2520b.png", 15, &s) == RTX_IMG_OK,
+           "policy: percent-decoded");
+    expect(rtx_img_resolve(doc, "missing.png", 11, &s) == RTX_IMG_EIO, "policy: missing file");
+    expect(rtx_img_resolve(doc, "../imgout/x.jpg", 15, &s) == RTX_IMG_EDENIED,
+           "policy: .. escape denied");
+    expect(rtx_img_resolve(doc, "sub/../../imgout/x.jpg", 22, &s) == RTX_IMG_EDENIED,
+           "policy: nested .. escape denied");
+    expect(rtx_img_resolve(doc, "link.jpg", 8, &s) == RTX_IMG_EDENIED,
+           "policy: symlink escape denied");
+    expect(strstr(s.key, "imgout/x.jpg") != NULL, "policy: key is the real path");
+    /* Allow this file: persisted, survives a reload, revoked by the command. */
+    expect(rtx_img_allow(doc, &s, RTX_IMG_ALLOW_FILE), "policy: allow file stored");
+    rtx_img_policy_reload();
+    expect(rtx_img_resolve(doc, "link.jpg", 8, &s) == RTX_IMG_OK, "policy: allowed file (link)");
+    expect(rtx_img_resolve(doc, "../imgout/x.jpg", 15, &s) == RTX_IMG_OK,
+           "policy: allowed file (direct)");
+    expect(rtx_img_resolve(doc, "../imgout/y.gif", 15, &s) == RTX_IMG_EDENIED,
+           "policy: file allowance is one file");
+    expect(rtx_img_revoke(doc) >= 1, "policy: revoke counts");
+    rtx_img_policy_reload();
+    expect(rtx_img_resolve(doc, "../imgout/x.jpg", 15, &s) == RTX_IMG_EDENIED,
+           "policy: revoked");
+    /* Allow this directory. */
+    rtx_img_resolve(doc, "../imgout/x.jpg", 15, &s);
+    expect(rtx_img_allow(doc, &s, RTX_IMG_ALLOW_DIR), "policy: allow dir stored");
+    rtx_img_policy_reload();
+    expect(rtx_img_resolve(doc, "../imgout/y.gif", 15, &s) == RTX_IMG_OK,
+           "policy: dir allowance covers siblings");
+    rtx_img_revoke(doc);
+    /* Allow ALL local images. */
+    rtx_img_resolve(doc, "../imgout/y.gif", 15, &s);
+    expect(rtx_img_allow(doc, &s, RTX_IMG_ALLOW_ALL_LOCAL), "policy: allow all stored");
+    rtx_img_policy_reload();
+    {
+        char abs[600];
+        snprintf(abs, sizeof abs, "%s/" OUTD "/x.jpg", cwd);
+        expect(rtx_img_resolve(doc, abs, strlen(abs), &s) == RTX_IMG_OK,
+               "policy: all local covers absolute paths");
+    }
+    {
+        /* Another project keeps its own allowances. */
+        char other[600];
+        sh("mkdir -p testdata/generated/imgproj2/.git");
+        snprintf(other, sizeof other, "%s/testdata/generated/imgproj2/doc.md", cwd);
+        expect(rtx_img_resolve(other, "../imgout/x.jpg", 15, &s) == RTX_IMG_EDENIED,
+               "policy: allowances are per project");
+    }
+    rtx_img_revoke(doc);
+    rtx_img_policy_reload();
+    expect(rtx_img_resolve(doc, "../imgout/y.gif", 15, &s) == RTX_IMG_EDENIED,
+           "policy: all revoked");
+    expect(rtx_img_resolve(NULL, "pic.png", 7, &s) == RTX_IMG_ESRC,
+           "policy: untitled has no relative base");
+    {
+        /* data: URIs up to the limit. */
+        static const char png1[] =
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+            "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        RtxImgView v;
+        expect(rtx_img_resolve(doc, png1, strlen(png1), &s) == RTX_IMG_OK &&
+                   s.kind == RTX_IMG_SRC_DATA,
+               "data: resolves");
+        rtx_img_want(&s, 10, 10, &v);
+        rtx_img_finish();
+        rtx_img_want(&s, 10, 10, &v);
+        expect(v.state == RTX_IMG_S_OK && v.bmp && v.bmp->w == 1 && v.bmp->h == 1,
+               "data: 1x1 png decodes");
+        {
+            size_t big = (1u << 20) * 2;
+            char *d = (char *)malloc(big + 32);
+            memcpy(d, "data:image/png;base64,", 22);
+            memset(d + 22, 'A', big);
+            expect(rtx_img_resolve(doc, d, big + 22, &s) == RTX_IMG_EDATA,
+                   "data: over 1 MiB refused");
+            free(d);
+        }
+    }
+}
+
+static void test_cache(void) {
+    char cwd[400], doc[512];
+    RtxImgLimits *l = rtx_img_limits();
+    RtxImgLimits save = *l;
+    static const char *srcs[] = {"a.png", "b.png", "c.png", "d.png"};
+    RtxImgSrc s[4];
+    RtxImgView v;
+    int i, round;
+    if (!getcwd(cwd, sizeof cwd)) return;
+    snprintf(doc, sizeof doc, "%s/" PROJ "/doc.md", cwd);
+    for (i = 0; i < 4; i++) {
+        char cmd[256];
+        snprintf(cmd, sizeof cmd, "cp testdata/img/quad.png " PROJ "/%s", srcs[i]);
+        sh(cmd);
+    }
+    rtx_img_reset();
+    /* Room for two 32x24 bitmaps. */
+    l->budget = 32 * 24 * 4 * 2 + 100;
+    for (i = 0; i < 4; i++) rtx_img_resolve(doc, srcs[i], 5, &s[i]);
+    /* Header first (size for layout), then pixels. */
+    expect(rtx_img_info(&s[0], &v) == RTX_IMG_S_WAIT || v.state == RTX_IMG_S_INFO,
+           "cache: header queued");
+    rtx_img_finish();
+    expect(rtx_img_info(&s[0], &v) == RTX_IMG_S_INFO && v.have_info && v.info.w == 32,
+           "cache: header known");
+    for (round = 0; round < 4; round++) {
+        rtx_img_frame();
+        rtx_img_want(&s[round], 32, 24, &v);
+        rtx_img_finish();
+        rtx_img_want(&s[round], 32, 24, &v);
+        expect(v.state == RTX_IMG_S_OK, "cache: wanted bitmap decoded");
+        expect(rtx_img_held() <= l->budget, "cache: under budget");
+        expect(rtx_img_nbmp() <= 2, "cache: LRU keeps two");
+    }
+    /* The oldest (a) was evicted; wanting it again decodes it anew. */
+    rtx_img_frame();
+    rtx_img_want(&s[0], 32, 24, &v);
+    expect(v.state != RTX_IMG_S_OK, "cache: evicted bitmap re-decodes");
+    rtx_img_finish();
+    rtx_img_want(&s[0], 32, 24, &v);
+    expect(v.state == RTX_IMG_S_OK && rtx_img_nbmp() <= 2, "cache: re-decoded under budget");
+    /* A size within 10 % reuses the bitmap. */
+    rtx_img_want(&s[0], 30, 23, &v);
+    expect(v.state == RTX_IMG_S_OK && v.bmp && v.bmp->w == 32, "cache: near size reused");
+    /* Its pixels alone over the budget: named, not decoded. */
+    l->budget = 100;
+    rtx_img_want(&s[1], 32, 24, &v);
+    rtx_img_finish();
+    rtx_img_want(&s[1], 32, 24, &v);
+    expect(v.state == RTX_IMG_S_ERR && v.err == RTX_IMG_EBUDGET, "cache: over budget named");
+    *l = save;
+    {
+        /* Far off screen: unpainted for 600 whole paints, dropped even
+         * under the budget. */
+        size_t n0;
+        int k;
+        rtx_img_frame();
+        rtx_img_want(&s[2], 32, 24, &v);
+        rtx_img_finish();
+        rtx_img_want(&s[2], 32, 24, &v);
+        n0 = rtx_img_nbmp();
+        expect(v.state == RTX_IMG_S_OK && n0 >= 1, "cache: bitmap held");
+        for (k = 0; k < 601; k++) rtx_img_frame();
+        rtx_img_pump();
+        expect(rtx_img_nbmp() < n0, "cache: a far bitmap is dropped");
+    }
+    rtx_img_reset();
+    expect(rtx_img_held() == 0 && rtx_img_nbmp() == 0, "cache: reset frees");
+}
+
+/* ---- remote: a local HTTP server ------------------------------------- */
+
+static int g_srv_fd = -1;
+static int g_port;
+static _Atomic int g_hits;
+static uint8_t *g_png;
+static size_t g_png_n;
+
+static void *srv_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        char req[2048], hdr[256];
+        int c = accept(g_srv_fd, NULL, NULL);
+        ssize_t r;
+        if (c < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        r = recv(c, req, sizeof req - 1, 0);
+        if (r <= 0) {
+            close(c);
+            continue;
+        }
+        req[r] = 0;
+        atomic_fetch_add(&g_hits, 1);
+        if (strncmp(req, "GET /ok.png", 11) == 0) {
+            int hn = snprintf(hdr, sizeof hdr,
+                              "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %zu\r\n"
+                              "ETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                              g_png_n);
+            send(c, hdr, (size_t)hn, 0);
+            send(c, g_png, g_png_n, 0);
+        } else if (strncmp(req, "GET /big.png", 12) == 0) {
+            /* No length: the cap is enforced while the body arrives. */
+            static char junk[65536];
+            int k;
+            const char *h = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nConnection: close\r\n\r\n";
+            send(c, h, strlen(h), 0);
+            for (k = 0; k < 64; k++)
+                if (send(c, junk, sizeof junk, MSG_NOSIGNAL) < 0) break;
+        } else if (strncmp(req, "GET /slow.png", 13) == 0) {
+            struct timespec ts = {4, 0};
+            nanosleep(&ts, NULL);
+            {
+                const char *h = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                send(c, h, strlen(h), MSG_NOSIGNAL);
+            }
+        } else {
+            const char *h = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send(c, h, strlen(h), 0);
+        }
+        close(c);
+    }
+    return NULL;
+}
+
+static int srv_start(void) {
+    struct sockaddr_in a;
+    socklen_t al = sizeof a;
+    pthread_t t;
+    g_png = slurp("testdata/img/quad.png", &g_png_n);
+    g_srv_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_srv_fd < 0) return 0;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    if (bind(g_srv_fd, (struct sockaddr *)&a, sizeof a) != 0) return 0;
+    if (listen(g_srv_fd, 8) != 0) return 0;
+    if (getsockname(g_srv_fd, (struct sockaddr *)&a, &al) != 0) return 0;
+    g_port = ntohs(a.sin_port);
+    if (pthread_create(&t, NULL, srv_main, NULL) != 0) return 0;
+    pthread_detach(t);
+    return 1;
+}
+
+static int wait_state(const RtxImgSrc *s, int want_state, long max_ms, RtxImgView *v) {
+    long t0 = now_ms();
+    for (;;) {
+        rtx_img_frame();
+        rtx_img_pump();
+        rtx_img_want(s, 64, 64, v);
+        if (v->state == want_state || v->state == RTX_IMG_S_ERR) return v->state == want_state;
+        if (now_ms() - t0 > max_ms) return 0;
+        {
+            struct timespec ts = {0, 10 * 1000000};
+            nanosleep(&ts, NULL);
+        }
+    }
+}
+
+static void test_remote(void) {
+    char cwd[400], doc[512], url[256];
+    RtxImgSrc s;
+    RtxImgView v;
+    RtxImgLimits *l = rtx_img_limits();
+    RtxImgLimits save = *l;
+    int k;
+    if (!getcwd(cwd, sizeof cwd)) return;
+    if (system("curl --version >/dev/null 2>&1") != 0) {
+        printf("img: curl missing: remote tests skipped\n");
+        return;
+    }
+    if (!srv_start()) {
+        expect(0, "remote: server");
+        return;
+    }
+    snprintf(doc, sizeof doc, "%s/" PROJ "/doc.md", cwd);
+    rtx_img_reset();
+    rtx_img_revoke(doc);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/ok.png", g_port);
+    /* No decision: a placeholder, and nothing is fetched. */
+    expect(rtx_img_resolve(doc, url, strlen(url), &s) == RTX_IMG_EREMOTE, "remote: needs consent");
+    expect(strcmp(s.host, "127.0.0.1") == 0 && s.http, "remote: host named");
+    for (k = 0; k < 5; k++) {
+        rtx_img_want(&s, 64, 64, &v);
+        rtx_img_info(&s, &v);
+        rtx_img_pump();
+    }
+    expect(v.state == RTX_IMG_S_ASK, "remote: asks");
+    rtx_img_finish();
+    expect(atomic_load(&g_hits) == 0 && rtx_img_fetches() == 0, "remote: never fetched without consent");
+    /* "Load this image": this session only. */
+    expect(rtx_img_allow(doc, &s, RTX_IMG_ALLOW_ONCE), "remote: once");
+    expect(rtx_img_resolve(doc, url, strlen(url), &s) == RTX_IMG_OK && s.once, "remote: once allows");
+    expect(wait_state(&s, RTX_IMG_S_OK, 5000, &v), "remote: fetched and decoded");
+    expect(v.bmp && v.bmp->w == 32, "remote: pixels");
+    expect(atomic_load(&g_hits) == 1, "remote: one request");
+    /* Next open (policy reloaded): a once-decision is gone, and the cached
+     * file is not used without asking. */
+    rtx_img_policy_reload();
+    rtx_img_reset();
+    expect(rtx_img_resolve(doc, url, strlen(url), &s) == RTX_IMG_EREMOTE,
+           "remote: once is not remembered");
+    rtx_img_want(&s, 64, 64, &v);
+    expect(v.state == RTX_IMG_S_ASK, "remote: cache not used after once");
+    /* "Always load from this host": persisted; next open reuses the cache
+     * without a request. */
+    expect(rtx_img_allow(doc, &s, RTX_IMG_ALLOW_HOST), "remote: always host stored");
+    rtx_img_policy_reload();
+    rtx_img_reset();
+    expect(rtx_img_resolve(doc, url, strlen(url), &s) == RTX_IMG_OK, "remote: host allowed");
+    expect(wait_state(&s, RTX_IMG_S_OK, 5000, &v), "remote: from the cache");
+    expect(atomic_load(&g_hits) == 1, "remote: cache reused, no request");
+    /* https only unless http was allowed for that host. */
+    {
+        char u2[256];
+        RtxImgSrc s2;
+        snprintf(u2, sizeof u2, "http://localhost:%d/ok.png", g_port);
+        rtx_img_allow(doc, &s, RTX_IMG_ALLOW_ALL_REMOTE);
+        expect(rtx_img_resolve(doc, u2, strlen(u2), &s2) == RTX_IMG_EREMOTE,
+               "remote: all-remote does not cover plain http of another host");
+        snprintf(u2, sizeof u2, "https://example.invalid/a.png");
+        expect(rtx_img_resolve(doc, u2, strlen(u2), &s2) == RTX_IMG_OK,
+               "remote: all-remote covers https");
+    }
+    /* Byte cap. */
+    l->remote_max = 64 << 10;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/big.png", g_port);
+    rtx_img_resolve(doc, url, strlen(url), &s);
+    expect(s.err == RTX_IMG_OK, "remote: big allowed by host");
+    wait_state(&s, RTX_IMG_S_OK, 8000, &v);
+    expect(v.state == RTX_IMG_S_ERR && v.err == RTX_IMG_ESIZE, "remote: byte cap");
+    /* Timeout. */
+    {
+        long t0 = now_ms();
+        l->timeout_s = 1;
+        snprintf(url, sizeof url, "http://127.0.0.1:%d/slow.png", g_port);
+        rtx_img_resolve(doc, url, strlen(url), &s);
+        wait_state(&s, RTX_IMG_S_OK, 8000, &v);
+        expect(v.state == RTX_IMG_S_ERR && v.err == RTX_IMG_ETIMEOUT, "remote: timeout");
+        expect(now_ms() - t0 < 4500, "remote: timeout is prompt");
+    }
+    *l = save;
+    rtx_img_revoke(doc);
+    rtx_img_reset();
+}
+
+/* RTX_IMG_BENCH=file: best of 5 header probes and decodes to fit
+ * 800x600 (a Rich pane), printed; not a check. */
+static void bench(const char *path) {
+    size_t n;
+    uint8_t *b = slurp(path, &n);
+    int k;
+    long best_p = -1, best_d = -1;
+    RtxImgLimits lim = *rtx_img_limits();
+    struct timespec t0, t1;
+    RtxImgInfo info;
+    RtxImgBmp bmp;
+    if (!b) return;
+    lim.file_max = (uint64_t)n + 1;
+    for (k = 0; k < 5; k++) {
+        long us;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        rtx_img_probe(b, n < (64u << 10) ? n : (64u << 10), n < (64u << 10), &lim, &info);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        us = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
+        if (best_p < 0 || us < best_p) best_p = us;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (rtx_img_decode(b, n, &lim, 800, 600, RTX_IMG_PIX_BGRA_PREMUL, 1, NULL, &bmp,
+                           &info) != RTX_IMG_OK) {
+            printf("bench: %s does not decode\n", path);
+            free(b);
+            return;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        us = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
+        if (best_d < 0 || us < best_d) best_d = us;
+        rtx_img_bmp_free(&bmp);
+    }
+    printf("bench: %s %s %ux%u (%zu bytes): header %ld us, decode to 800x600 %ld ms\n", path,
+           rtx_img_fmt_name(info.fmt), info.w, info.h, n, best_p, best_d / 1000);
+    free(b);
+}
+
+int main(void) {
+    rtx_safe_test_isol();
+    if (getenv("RTX_IMG_BENCH")) {
+        bench(getenv("RTX_IMG_BENCH"));
+        return 0;
+    }
+    test_formats();
+    test_broken();
+    test_exif();
+    test_anim();
+    test_md();
+    test_policy();
+    test_cache();
+    test_remote();
+    if (fails) {
+        fprintf(stderr, "img_smoke: %d failures\n", fails);
+        return 1;
+    }
+    printf("img_smoke: ok\n");
+    return 0;
+}

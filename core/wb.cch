@@ -24,11 +24,31 @@
 #include <stdint.h>
 #include "document.cch"
 
-#define RTX_WB_MAX (8u << 20)        /* whole-workbook parse cap (bytes) */
-#define RTX_WB_ROWS_MAX 10000        /* embedded table rows (W1 indexes more) */
+/* Caps (docs/workbook.md "W1 as built"): a 10M-row table is ~0.8 GiB of
+ * bytes and ~210 MB of index (~21 B a row); past them external tables
+ * (W1 phase 2) take over. */
+#define RTX_WB_MAX ((size_t)1 << 30)   /* whole-workbook parse cap (bytes; < 4 GiB) */
+#define RTX_WB_ROWS_MAX 10000000       /* embedded table rows (W1 phase 2 indexes more) */
+/* A workbook this big reads as a job (the idle loop's slices): a
+ * structural edit never reparses on the keystroke. */
+#define RTX_WB_DEFER_BYTES ((size_t)1 << 20)
+#define RTX_WB_DEFER_MS 300
 #define RTX_WB_COLS_MAX 16            /* = RTX_MD_TABLE_COLS: the lens caps a GFM table */
 #define RTX_WB_CHANGED_MAX 256       /* value spans one recalc reports */
 #define RTX_WB_VAL_MAX 48            /* painted value text (bytes, NUL incl) */
+/* W1 lazy engine (docs/workbook.md "W1: the lazy engine"). Work past
+ * RTX_WB_INLINE_WORK units (rows evaluated / scanned) in one edit is left
+ * to background jobs that run in RTX_WB_SLICE_MS slices from the host's
+ * idle loop; until they finish the affected values paint stale. */
+#define RTX_WB_INLINE_WORK ((size_t)256 << 10)
+#define RTX_WB_SLICE_MS 8
+/* Relative rows: `@col[-k]`, `T#a[+k].col` — |k| at most this. */
+#define RTX_WB_REL_MAX 64
+#define RTX_WB_REL_MAX_S "64"
+#define RTX_WB_RING 64               /* row value cache entries */
+/* A visible cell of a running chain is computed inline when its
+ * checkpoint is at most this many rows back; else it paints stale. */
+#define RTX_WB_VIEW_CHAIN 32768
 
 typedef struct RtxWb RtxWb;
 
@@ -37,12 +57,68 @@ int rtx_wb_path(const char *path, size_t n);
 /* Parse, bind and calc `d`; install the derived hook. NULL when `d` is
  * NULL, already a workbook, or out of memory. */
 RtxWb *rtx_wb_attach(RtxDoc *d);
+/* The same for the bytes of the file at `path`, just read: the file's
+ * identity is taken now and its persisted index (docs/workbook.md "W1
+ * phase 2 as built") is used when it matches — a reopen reads no table
+ * body. RtxDoc_from_path attaches this way. */
+RtxWb *rtx_wb_attach_path(RtxDoc *d, const char *path);
+/* The same without the index (bytes that are not the file's: a journal's
+ * recovered base): other workbooks still find it by path for `uses`. */
+RtxWb *rtx_wb_attach_named(RtxDoc *d, const char *path);
+/* The persisted index lives under a cache dir: `dir` (NULL / "": none),
+ * or `fn` (the host passes rtx_safe_dir) when no dir was set. Off by
+ * default (tests and hosts opt in); RTX_WB_INDEX=0 turns it off. */
+void rtx_wb_set_cache_dir(const char *dir);
+void rtx_wb_set_cache_fn(int (*fn)(char *, size_t));
+/* The index file of doc_path (1), or 0 when there is none to have. */
+int rtx_wb_index_path(const char *doc_path, char *out, size_t cap);
+/* Write the index now if the model may (clean, trusted, settled or not):
+ * 1 when handed to the writer. The writer is a thread; flush waits. */
+int rtx_wb_index_write(RtxWb *wb, const RtxDoc *d);
+void rtx_wb_index_flush(void);
+unsigned rtx_wb_index_writes(void);
+const char *rtx_wb_index_why(int state);
+/* The parallel structural read: lanes (0 auto, 1 serial) and bytes per
+ * lane per window (0 auto). Tests move them. */
+void rtx_wb_read_lanes(int lanes, size_t chunk);
+/* `uses` imports: how often a privately opened workbook's file is checked
+ * for a change (ms; default 1000). Tests move it. */
+void rtx_wb_uses_poll_ms(long ms);
+/* A hash of the structural model (tables, blocks, rows, counts, rules,
+ * anchors, names, blocks of structure): equal for equal models. */
+uint64_t rtx_wb_model_hash(RtxWb *wb, const RtxDoc *d);
 /* The document's workbook, or NULL. */
 RtxWb *rtx_wb_of(const RtxDoc *d);
 /* Apply edits noted since the last sync (lazy: every query syncs). */
 void rtx_wb_sync(RtxWb *wb, const RtxDoc *d);
 /* Reparse, rebind and recalc everything now (palette: Recalculate). */
 void rtx_wb_recalc_all(RtxWb *wb, const RtxDoc *d);
+/* The keystroke path (the derived hooks, the status line) never reparses
+ * a workbook of RTX_WB_DEFER_BYTES or more: a structural edit there hides
+ * the values until rtx_wb_idle, which the host calls from its idle loop.
+ * rtx_wb_due_ms: -1 nothing owed, else ms until it is due (0: now).
+ * rtx_wb_idle: 1 when it reparsed (relayout the views). */
+long rtx_wb_due_ms(const RtxDoc *d);
+int rtx_wb_idle(const RtxDoc *d);
+int rtx_wb_deferred(const RtxDoc *d);
+/* Process-wide caps (0 keeps one): the whole-workbook bytes, rows per
+ * embedded table, and the deferred-reparse size. Tests and the scale
+ * perf tool move them; the defaults are the RTX_WB_* above. */
+void rtx_wb_limits(size_t max_bytes, size_t max_rows, size_t defer_bytes);
+void rtx_wb_limits_get(size_t *max_bytes, size_t *max_rows, size_t *defer_bytes);
+/* Job tuning (0 / <= 0 keeps one): the work done inline per edit and the
+ * idle slice. Tests move them to force jobs. */
+void rtx_wb_job_limits(size_t inline_work, long slice_ms);
+/* Run every pending job to completion (tests, save, dump). */
+void rtx_wb_settle(RtxWb *wb, const RtxDoc *d);
+/* 1 while jobs are pending (values may paint stale). */
+int rtx_wb_busy(const RtxDoc *d);
+/* Drop the pending jobs (Esc / Workbook: Cancel Recalculation): stale
+ * values stay stale-marked until the next edit or Recalculate. 1 if any
+ * job was cancelled. */
+int rtx_wb_cancel(RtxDoc *d);
+/* Pending work done, percent (100 when idle). */
+int rtx_wb_progress(const RtxDoc *d);
 
 typedef struct {
     size_t tables, names, cells, formulas, nodes, edges, cycles, errors;
@@ -54,9 +130,70 @@ typedef struct {
     size_t visited;      /* nodes the last recalc evaluated */
     size_t visited_total;
     size_t last_us;      /* last sync, microseconds */
-    int off;             /* 1: over RTX_WB_MAX, values off */
+    /* W2 maintained aggregates (MAs) */
+    size_t mas;          /* live MAs (one per aggregate / group in a formula) */
+    size_t ma_full;      /* MA builds by one walk of their table (open, a
+                          * new formula, a changed scalar input) */
+    size_t ma_delta;     /* row deltas applied to MAs */
+    size_t ma_rows;      /* rows MAs evaluated (walks, deltas, leaf rescans) */
+    size_t ma_rescan;    /* leaf rescans (min / max lost its extreme; split) */
+    size_t fast_rows;    /* syncs served by the incremental row path */
+    size_t mem_model;    /* model bytes: the node array plus the model arena since
+                          * the last rebuild (ASTs, cell text, row arrays, garbage) */
+    size_t mem_values;   /* value arena bytes (text values, error messages) */
+    size_t mem_nodes;    /* of mem_model: the node array (live capacity) */
+    /* W1 */
+    size_t rules;        /* live bound rules (a column formula is one rule) */
+    size_t insts;        /* live aggregate instances (one per parameter tuple) */
+    size_t jobs;         /* 1 while jobs are pending */
+    size_t kx_probe;     /* key-index probes (lookups) */
+    size_t kx_builds;    /* key indexes built */
+    size_t range_q;      /* anchor-range queries served from block partials */
+    size_t chain_dirty;  /* running-chain dirty marks */
+    size_t chain_rows;   /* chain rows evaluated */
+    size_t chain_view;   /* chain rows evaluated for the view (inline) */
+    size_t chain_conv;   /* chain walks that converged early (checkpoint equal) */
+    size_t chain_skip;   /* chain blocks skipped by convergence */
+    size_t job_rows;     /* rows done by background jobs */
+    size_t cancels;      /* jobs cancelled */
+    size_t slices;       /* idle slices run */
+    size_t scan_rows;    /* rows scanned by the incremental parse */
+    size_t vc_hit;       /* view cache hits */
+    size_t cells_eval;   /* formula cells evaluated */
+    size_t mem_index;    /* position / block / key / anchor indexes (bytes) */
+    size_t mem_partials; /* block partials and chain checkpoints (bytes) */
+    /* phase 2: the persisted index and the parallel read */
+    int idx_state;       /* 0 none tried, 1 loaded, else why not (rtx_wb_index_why) */
+    size_t idx_writes;   /* index files handed to the writer */
+    size_t idx_bytes;    /* the last one's size */
+    size_t idx_load_us;  /* reading + checking the file */
+    size_t idx_rows;     /* rows installed from it (not read) */
+    size_t idx_insts;    /* aggregate instances restored from it */
+    size_t idx_chains;   /* chains restored */
+    size_t idx_kx;       /* key indexes restored */
+    size_t par_windows;  /* parallel pre-read windows */
+    size_t par_rows;     /* rows taken from them */
+    size_t imp_evals;    /* imports read from another workbook's engine */
+    size_t uses_private; /* workbooks opened privately for `uses` */
+    size_t uses_reread;  /* ... read again (their file changed) */
+    size_t grp_blocks;   /* group min / max: blocks rescanned for a lost extreme */
+    size_t grp_resolves; /* ... resolves (each: the marked blocks, then the keys) */
+    size_t rkx_builds;   /* reader-side key indexes built (a walk of the reader table) */
+    size_t rkx_rows;     /* reader rows an edit of a looked-up row took as deltas */
+    size_t par_us;       /* wall time the lanes took (all windows) */
+    size_t par_bytes;    /* bytes the windows pre-read */
+    int off;             /* 1: over the byte cap (RTX_WB_MAX), values off */
 } RtxWbStats;
 void rtx_wb_stats(RtxWb *wb, const RtxDoc *d, RtxWbStats *out);
+/* rtx_wb_stats without the census (tables .. errors keep the last
+ * rtx_wb_stats values): O(1), for per-step counter checks at scale. */
+void rtx_wb_counters(RtxWb *wb, const RtxDoc *d, RtxWbStats *out);
+/* Row `row` (0-based position), column `col` of table `table`: the bytes
+ * between its pipes [lo, hi). 0 if there is no such cell. */
+int rtx_wb_cell_at(RtxWb *wb, const RtxDoc *d, const char *table, size_t row, int col,
+                   size_t *lo, size_t *hi);
+/* Rows of table `table` (0: none). */
+size_t rtx_wb_rows(RtxWb *wb, const RtxDoc *d, const char *table);
 
 /* Evaluate `expr` in the workbook (calc scope of the first sheet, no row)
  * and format it (errors as `#code(message)`). Returns 1 unless the
@@ -67,6 +204,13 @@ int rtx_wb_eval(RtxWb *wb, const RtxDoc *d, const char *expr, size_t n,
  * `Table.col[row] = value` / `name = value` (`Sheet.name` off the first
  * sheet). Returns bytes written (NUL kept; output is clipped at cap). */
 size_t rtx_wb_dump(RtxWb *wb, const RtxDoc *d, char *out, size_t cap);
+/* rtx_wb_dump with RTX_WB_DUMP_BITS (a float also as its bits, `[hex]`)
+ * and RTX_WB_DUMP_MAS (under each formula, its maintained aggregates'
+ * values: `  ma0 = value`). The property smokes compare these. */
+#define RTX_WB_DUMP_BITS 1
+#define RTX_WB_DUMP_MAS 2
+#define RTX_WB_DUMP_SPANS 4 /* each cell's / name's bytes and painted span */
+size_t rtx_wb_dump_ex(RtxWb *wb, const RtxDoc *d, int flags, char *out, size_t cap);
 /* The node at `off` (a cell or a name line) plus everything that reads
  * it, transitively: the most a recalc after an edit there may visit.
  * 0 when `off` is on no node. */
@@ -75,6 +219,17 @@ size_t rtx_wb_reach(RtxWb *wb, const RtxDoc *d, size_t off);
  * message. 0 when `off` is on no workbook element. */
 int rtx_wb_describe(RtxWb *wb, const RtxDoc *d, size_t off, char *out,
                     size_t cap);
+/* Workbook: Anchor Row — insert `{#name}` at the start of the caret row's
+ * first cell (name from the row's key / first cell, made unique), one
+ * edit group; *caret gets the name's offset. 0 with `msg` on refusal
+ * (not in a table body, row already anchored). */
+size_t !>(CCError) rtx_wb_anchor_row(RtxDoc *d, size_t off, char *msg, size_t msgn,
+                                     size_t *caret);
+/* Workbook: Copy Reference to Row — `T#name.col` for the cell at `off`
+ * when its row has an anchor; 0 with `msg` ("row has no anchor — use
+ * Anchor Row") otherwise. */
+int rtx_wb_row_ref(RtxWb *wb, const RtxDoc *d, size_t off, char *out, size_t cap, char *msg,
+                   size_t msgn);
 /* The table / column / name at `off` (a definition or a reference inside
  * a formula) — the rename target — as its current name. 0 if none. */
 int rtx_wb_rename_target(RtxWb *wb, const RtxDoc *d, size_t off, char *out,

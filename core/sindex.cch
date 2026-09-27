@@ -1,0 +1,252 @@
+#!ccc cch
+/*
+ * Project search index (bodies in sindex.ccs, a third source of the
+ * rtx_find target — no new target): one Bloom filter per 64 KiB block of
+ * the project, built only on demand ("Build Search Index" / "Update
+ * Search Index" in the palette, batch `project-index [--update]`), about
+ * 2 % of the indexed bytes. A search uses whatever index exists; with
+ * none, project search is exactly the plain scan (nothing is hashed or
+ * stat'ed for it: rtx_si_work counts every trigram the index code
+ * touches).
+ *
+ * Units. The indexed files (regular, not empty, <= RTX_SI_FILE_MAX or
+ * the search's size cap when bigger, no NUL in the first 8 KiB) in
+ * directory-walk order (paths compared with '/' lowest: a directory's
+ * files stay together, like a sorted recursive walk) are packed into
+ * blocks of consecutive files up to RTX_SI_BLK (64 KiB). A bigger file
+ * is its own run of chunks: chunk j covers [j * BLK, (j + 1) * BLK +
+ * RTX_SI_OVL) (63 bytes of overlap: the longest literal the planner uses
+ * is 64 bytes, so every literal lies whole in a chunk). A block or a
+ * chunk is a unit; each unit has one Bloom filter over its case-folded
+ * (ASCII) trigrams, one hash (k = 1), sized to the unit's distinct-
+ * trigram count so the filters together fill the budget.
+ *
+ * Build (rtx_si_build). Two reads of every indexed file, in parallel
+ * segments of the walk order (at most 256, whatever the lane count: one
+ * lane writes the same file; a segment packs its own blocks): pass 1
+ * reads each file (its identity from the fd), counts each unit's
+ * distinct trigrams and each chunk's newlines; the budget
+ * (`search_index_pct` of the indexed bytes, default 2 %, capped at
+ * RTX_SI_CAP_MB) pays for the header, file table and unit directory, and
+ * the rest is split over the units by distinct count (64-bit words, at
+ * least one); pass 2 reads again, checks the identity, and sets one bit
+ * per trigram straight into the file image. A file that changed between
+ * the passes is marked dead (always read).
+ *
+ * Update (rtx_si_update). Loads the index, stats the walk: a file whose
+ * identity is unchanged (and was trusted) keeps its unit; a unit holding
+ * a changed file is re-read whole (<= 64 KiB, or the one big file) and
+ * its filter rewritten at its fixed size; a deleted file leaves the table
+ * (its bits stay); new files and files whose shape changed (small <-> big,
+ * or another chunk count) go to new tail units sized at the build's bits
+ * per trigram. More than RTX_SI_UPD_PCT % of the units (dirty + new), no
+ * index, or another root: a full build instead. The report says which,
+ * and the full build's time from the header for comparison.
+ *
+ * Identity. Each file is keyed by (dev, ino, size, mtime ns, ctime ns)
+ * from the fd read in pass 1 and checked again in pass 2. ctime catches
+ * `touch -m` restoring the mtime. Racy stamps (git's "racily clean"): a
+ * file is trusted only when max(mtime, ctime) < build start -
+ * granularity (2 s when a stamp has no sub-second part, else
+ * RTX_SI_GRAN_MS). An untrusted, new, changed, dead, hard-linked (two
+ * paths, one inode) or dirty-buffer file is searched normally.
+ *
+ * Query (rtx_si_plan, rtx_si_cands). The regex engine's required
+ * literals (rtx_rx_req_n / rtx_rx_req_lit: every match holds one) become
+ * trigram windows (each up to 27 folded alternatives). A unit passes
+ * when, for some literal, every window has an alternative whose bit is
+ * set. A literal under 3 bytes, or no required literal: no pruning — the
+ * search is the plain scan. With pruning, a lane stats each file: an
+ * indexed, unchanged, trusted file none of whose units pass is skipped
+ * unread; a big one only some of whose chunks pass is read only there
+ * when the pattern cannot match across a newline (rtx_rx_one_line); any
+ * other file is read whole.
+ *
+ * Chunk reads (core/proj.ccs). Passing chunks merge into runs; a run is
+ * widened to whole lines, plus the '\n' before and the byte after as
+ * context, so ^ $ \b \A \z \Z and look-around see what they see in the
+ * whole file (no match of a one-line pattern crosses a '\n'). The line
+ * number at a chunk start is the newline count stored per chunk (a
+ * varint in the unit directory) — counting forward would need the bytes
+ * the read skips.
+ *
+ * File: `<safe dir>/w/<FNV-1a 64 of the root realpath>.si`, the sidecar
+ * of the project's RTXW leaf. Built in memory, written to `.tmp`,
+ * fsync'ed, renamed. 16 header words ("RTXI" + version, build time,
+ * granularity, counts, block size, bits per trigram), the root path
+ * (checked on load), the device table, the file table, the unit
+ * directory, the filters (64-bit words), a 64-bit checksum. File table,
+ * per file in unit order (the id is the order; no paths — lookups go by
+ * (dev, ino)): [dev index if more than one device], zigzag ino delta,
+ * size, zigzag ctime-seconds delta, a u32 of ctime ns | mtime==ctime
+ * << 30 | dead << 31, [zigzag mtime - ctime ns]. Unit directory: per run,
+ * nfiles << 1 (a block) then its filter words; or nchunks << 1 | 1 (the
+ * next file's chunks) then per chunk filter words and newlines. Unknown
+ * version, wrong root, bad sizes or sum: no index.
+ */
+#ifndef RTX_SINDEX_H
+#define RTX_SINDEX_H
+
+#include <ccc/std/prelude.cch>
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/stat.h>
+#include "rx.cch"
+
+#define RTX_SI_VER 2u
+#ifndef RTX_SI_PCT
+#define RTX_SI_PCT 2             /* budget: % of the indexed bytes */
+#endif
+#ifndef RTX_SI_CAP_MB
+#define RTX_SI_CAP_MB 256        /* absolute cap */
+#endif
+#ifndef RTX_SI_GRAN_MS
+#define RTX_SI_GRAN_MS 100L      /* ns-precise stamps: >= any kernel tick */
+#endif
+#ifndef RTX_SI_BLK
+#define RTX_SI_BLK 65536u        /* block / chunk bytes */
+#endif
+#ifndef RTX_SI_UPD_PCT
+#define RTX_SI_UPD_PCT 20        /* update: more units than this % -> rebuild */
+#endif
+#ifndef RTX_SI_FILE_MAX
+#define RTX_SI_FILE_MAX (64u << 20) /* index text files up to this (read whole) */
+#endif
+#define RTX_SI_OVL 63u           /* chunk overlap: RTX_SI_WINS + 1 */
+#define RTX_SI_GRAN_COARSE_MS 2000L
+#define RTX_SI_LITS 8            /* = the rx prefilter's literal cap */
+#define RTX_SI_WINS 62           /* windows per literal (64-byte literals) */
+#define RTX_SI_KEEP_MAX 64       /* files never skipped (dirty buffers) */
+
+typedef struct {
+    uint64_t dev, ino, size;
+    int64_t mtime_ns, ctime_ns;
+} RtxSiId;
+
+/* One literal: windows of up to 27 folded trigram alternatives. */
+typedef struct {
+    uint8_t nw;
+    uint8_t wn[RTX_SI_WINS];
+    uint32_t t[RTX_SI_WINS][27];
+} RtxSiLit;
+
+/* Any-of literals; n == 0: nothing to prune with. */
+typedef struct {
+    unsigned n;
+    RtxSiLit lit[RTX_SI_LITS];
+} RtxSiQ;
+
+/* A loaded index (read-only once loaded). */
+typedef struct RtxSi {
+    char root[4096];
+    size_t root_n;
+    char path[4096];        /* the .si file ("" = none) */
+    CCArena a;              /* file bytes + tables */
+    int load_rc;            /* 1 loaded, 0 no file, -1 rejected */
+    int64_t built_ns;
+    long gran_ms;
+    uint32_t nfiles;
+    RtxSiId *id;            /* per file id */
+    uint8_t *trust;         /* per file id: trusted at the build (not dead) */
+    uint8_t *dead;          /* per file id: changed during the build */
+    uint32_t *f2u;          /* per file id: its first unit */
+    uint32_t *tab;          /* (dev, ino) -> id + 1 (trusted files) */
+    size_t tcap;
+    uint32_t nunits;
+    uint64_t *uoff;         /* nunits + 1 filter word offsets */
+    uint32_t *uf;           /* per unit: first file id (a chunk: its file) */
+    uint32_t *ux;           /* per unit: files (a block), or RTX_SI_CHUNK | j */
+    uint64_t *unl;          /* per unit: newlines before the chunk start */
+    uint32_t *ucnt;         /* per unit: newlines in [j * BLK, (j + 1) * BLK) */
+    const uint64_t *filt;
+    uint64_t filt_words;
+    uint64_t bpt16;         /* filter bits per distinct trigram << 16 */
+    uint64_t budget;
+    long full_ms;           /* the last full build's time */
+    uint64_t corpus;        /* indexed bytes */
+    uint64_t file_bytes;
+    uint64_t ftab_bytes, udir_bytes;
+    long load_ms;
+} RtxSi;
+
+#define RTX_SI_CHUNK 0x80000000u
+
+/* Build input / report. */
+typedef struct {
+    const char *root;       /* absolute, no trailing '/' */
+    size_t root_n;
+    const char *const *rel; /* n relative paths (NUL-terminated) */
+    uint32_t n;
+    size_t max_bytes;       /* bigger files are not indexed */
+    unsigned pct;           /* 0 = rtx_si_pct() */
+    int lanes;              /* 0 = one per core (<= 8); 1 = single-threaded */
+    const char *out;        /* the .si path */
+    _Atomic unsigned char *cancel; /* may be NULL */
+    _Atomic size_t *done;   /* files through pass 1 + pass 2; may be NULL */
+} RtxSiBuildIn;
+
+typedef struct {
+    int ok;
+    const char *err;
+    int update;             /* 1 = an incremental update was written */
+    const char *why_full;   /* update asked, full build done: why */
+    uint32_t files;         /* indexed */
+    uint64_t corpus;        /* indexed bytes */
+    uint64_t budget, bytes; /* file size */
+    uint64_t ftab_bytes, udir_bytes, filt_bytes;
+    uint32_t units, blocks, chunks;
+    uint64_t distinct;      /* sum over units of distinct trigrams */
+    double fill;            /* set bits / filter bits */
+    uint64_t peak;          /* bytes of heap the build held at most */
+    long ms_pass1, ms_pass2, ms_write, ms;
+    /* update */
+    uint32_t upd_same, upd_changed, upd_new, upd_gone; /* files */
+    uint32_t upd_dirty, upd_tail;  /* units re-read / appended */
+    uint64_t upd_bytes;     /* bytes re-read */
+    long ms_stat, full_ms;  /* the walk's stats; the last full build */
+} RtxSiBuildOut;
+
+/* Global switch (`search_index` in settings.json; RTX_SEARCH_INDEX=0). */
+void rtx_si_set_enabled(int on);
+int rtx_si_enabled(void);
+/* Budget percent (`search_index_pct`, RTX_SEARCH_INDEX_PCT). */
+void rtx_si_set_pct(long pct);
+long rtx_si_pct(void);
+/* Test hook: the granularity of ns-precise stamps in ms (< 0: default). */
+void rtx_si_test_gran_ms(long ms);
+/* Test hook: the update's rebuild threshold in % of units (< 0: default). */
+void rtx_si_test_upd_pct(long pct);
+/* Trigrams the index code has touched (build, plan, candidates) — the
+ * no-index path must leave it unchanged. */
+uint64_t rtx_si_work(void);
+
+/* The index file of `root` under the Safe dir: dir/w/<hash>.si. */
+int rtx_si_path(char *dst, size_t n, const char *safe_dir, const char *root, size_t rn);
+
+/* Build and write (rel paths in any order). 1 = written. */
+int rtx_si_build(const RtxSiBuildIn *in, RtxSiBuildOut *out);
+/* Update the index at in->out in place of a rebuild where it can (see
+ * above); a full build otherwise. 1 = written. */
+int rtx_si_update(const RtxSiBuildIn *in, RtxSiBuildOut *out);
+
+/* Load `path` for `root` (calloc'd; load_rc says what happened). */
+RtxSi *rtx_si_load(const char *path, const char *root, size_t rn);
+void rtx_si_free(RtxSi *si);
+
+void rtx_si_id_of(const struct stat *st, RtxSiId *id);
+int rtx_si_trusted(const RtxSiId *id, int64_t built_ns);
+/* Indexed, unchanged and trusted file id of st, or -1. */
+long rtx_si_find(const RtxSi *si, const struct stat *st);
+/* Units of file id k: [*u0, *u0 + return). */
+uint32_t rtx_si_units(const RtxSi *si, long k, uint32_t *u0);
+/* Chunk geometry: chunks of a file of `size` bytes (1 when it is not
+ * bigger than a block: it sits in a block). */
+uint32_t rtx_si_nchunks(uint64_t size);
+
+unsigned rtx_si_plan(const RtxRx *rx, RtxSiQ *q);
+/* Passing units into `ucand` (nunits bits, zeroed here). 1 = prune with
+ * it, 0 = no pruning (plain scan). *ncand = files with a passing unit. */
+int rtx_si_cands(const RtxSi *si, const RtxSiQ *q, uint64_t *ucand, size_t *ncand);
+
+#endif /* RTX_SINDEX_H */

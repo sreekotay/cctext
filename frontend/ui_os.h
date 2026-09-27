@@ -105,6 +105,22 @@ const char *ui_os_font_family(const char *path);
  * screen resolution (96 by default), so 16 px is 12 pt there. */
 double ui_os_pt_per_px(void);
 
+/*
+ * Images (docs/images.md). libui's draw context has no image call; these
+ * add the one blit cctext needs. A platform image wraps a decoded bitmap
+ * (BGRA premultiplied, 4 bytes a pixel, `stride` bytes a row) without
+ * copying it: the bitmap must outlive the image (the cache frees the
+ * image first). GTK: a cairo image surface (ARGB32 is BGRA premultiplied
+ * on little-endian hosts); AppKit: a CGImage (32Little |
+ * PremultipliedFirst); Win32: stub (NULL, draws nothing).
+ * draw scales the whole image into (x, y, w, h), area coordinates y
+ * down, with `alpha` (0-1), smooth filtering, clipped to the scissor.
+ */
+void *ui_os_image_new(const unsigned char *bgra, int w, int h, int stride);
+void ui_os_image_free(void *img);
+void ui_os_image_draw(uiDrawContext *ctx, void *img, double x, double y, double w,
+                      double h, double alpha);
+
 /* Toolkit → portable: wheel notches this event. +y = up (away from the
  * user); +x = scroll_x(+1), the view moves right. Fractions accumulate. */
 void ui_plat_wheel(float dx, float dy);

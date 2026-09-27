@@ -33,16 +33,17 @@ There is no inflight counter and no drain-to-zero. A path that gives up says so 
 | Document | piece-tree arena + page-store arena (fds + LRU page pool) | `RtxDoc.destroy()` |
 | Session | `d.session` | close (path, undo) |
 | Analysis | `d.analysis` | `analysis.reset()` on reparse |
-| Workbook | `d.derived` → `RtxWb` (`core/wb.ccs`, `*.wb.md` only): own heap arenas for the model (names, cells, ASTs, graph), values, and per-operation scratch | a structural edit (or garbage past its bound) rebuilds the model; cell / calc-line / prose edits patch it; `RtxDoc.destroy()` |
+| Workbook | `d.derived` → `RtxWb` (`core/wb.ccs`, `*.wb.md` only; W1, docs/workbook.md "W1 as built"): own heap arenas for the model — names, one rule per distinct column formula (`=@a * @b` over a million rows is one bound AST), the rule graph, aggregate instances with per-block partials, per table a position index of ~256-row blocks with stable row ids (~20 B a row), chain checkpoints per block, key and anchor indexes — and values only for names, instances and a bounded view cache: no node or value per cell; the old bytes of an edited row (captured by the `pre` hook before the tree write) and per-operation scratch | a structural edit (header, fence, caption, a table's end) or garbage past its bound rebuilds the model as a read job; cell / calc-line / prose edits and whole-row inserts / deletes patch it (row deltas; docs/workbook.md "W1 as built"); work past `RTX_WB_INLINE_WORK` (an aggregate's build, a chain recompute, the read of a big workbook) is a job the host steps from its idle loop (`rtx_wb_idle`, 8 ms slices), cancellable (`rtx_wb_cancel`); names keep their last values across a rebuild; phase 2 (docs/workbook.md "W1 phase 2 as built"): a persisted index `<safe>/w/<hash>.wbi` (written by a writer thread: temp, fsync, rename) installs table positions and partials on a reopen when the file's identity matches, the structural read's pre-read runs in `@parallel` lanes from a dest-live arm the `pre` hook cancels, `uses` imports hold private read-only documents or find open ones in a registry, and CSV / TSV tables are read-only documents of their own; `RtxDoc.destroy()` |
 | Find | `d.find.store` (query + hits) | new query resets; `RtxDoc.destroy()`; edit invalidates offsets |
 | Layout | `L.store` | width/edit reset (vis rows) |
 | Workspace | `w.session` | close (bufs) |
 | Clip | `w.clip_a` (own heap arena) | next clip value (built on a fresh arena, then adopted); unchanged bytes skip the copy; close |
 | Browse | `br.store` ents + `br.walk` jobs | kick resets; drop destroys |
 | Project index | `RtxProjIdx.store` (fixed-size file / dir / name chunks that never move) + the walk's arena (jobs, kept ignore levels, visited set) | open / close; a re-walk builds a second index and swaps it in (search joined first); the walk arena dies at the join |
-| Project search | `RtxProj.ps.store` (query copy, program, hit / group / preview chunks) | a new query or option resets; the index swap re-runs it; close |
+| Project search | `RtxProj.ps.store` (query copy, program, hit / group / preview chunks, the index candidates) | a new query or option resets; the index swap re-runs it; close |
+| Search index | `RtxProj.si` (`RtxSi.a`: the file's bytes — filters included —, per-file identity + trust + first unit, the (dev, ino) table, per-unit word offsets and newline counts); the build's heap (per-file identities, per-segment unit lists, per-shard 2 MiB dedupe sets and read buffers, the file image) | loaded by the first search arm, kept for the session; a finished build frees it (the next search loads the new file); close |
 | Quick-open | `RtxProj.pick` a / b (ping-pong: this query's top list and candidates / the last query's) | each non-extending query resets one side |
-| Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | `RTXS` hist + `RTXC` state sidecar + `.b` base pin while dirty; `RTXW` workspace per project (`w/<hash of the git root, else cwd>`; the pre-v4 global leaf migrates once; the one open_files owes lands on the first safe_pump, after the first frame); each leaf is built in memory and written once before its fsync + rename; unknown ver / bad sum ignored; identity mismatch tosses clean hist, replays dirty hist onto its pin, else holds it; quit-`q` drops dirty journals |
+| Safe | on-disk journals (`~/Library/Caches/cctext/safe` or `$XDG_CACHE_HOME/cctext/safe`; `RTX_SAFE_HOME` overrides) | `RTXS` hist + `RTXC` state sidecar + `.b` base pin while dirty; `RTXW` workspace per project (`w/<hash of the git root, else cwd>`, and its `.si` sidecar: the search index, see Search index; the pre-v4 global leaf migrates once; the one open_files owes lands on the first safe_pump, after the first frame); each leaf is built in memory and written once before its fsync + rename; unknown ver / bad sum ignored; identity mismatch tosses clean hist, replays dirty hist onto its pin, else holds it; quit-`q` drops dirty journals |
 | TM | process `rtx_tm_store` (langs + rules + interned pattern strings + compiled regex programs) | first lookup scans the grammar dir for metadata (name / scopeName / fileTypes); a grammar's rules load + compile the first time a lookup hands it out (under a lock: browse previews open on a worker); process |
 | Frame | `cc_arena_stack` | end of the call (row / replace / copy) |
 
@@ -375,7 +376,8 @@ field the worker is still storing into.
 | island | `isle_kick` (land / gap view) | dest-live wrapper; wait-for 2 MiB blocks | `isle_h.live()` | `isle_from` | — |
 | browse | `rtx_browse_kick` | dest-live wrapper; one `RTX_BROWSE_WAVE` of dir jobs; pump joins a finished arm then starts the next | `h.live()` | `jhead` | — |
 | proj walk | `rtx_proj_open` / `rtx_proj_rewalk` | one dest-live arm for the whole walk: waves of `RTX_PROJ_WAVE` dir jobs under `@parallel wait`; the stage appends dirs / files / child jobs and publishes `pub_nf` / `pub_nd` | `!pub_done` | — (a re-walk starts over) | — |
-| psearch | `rtx_proj_search_set` | dest-live arm over index ids `[next, pub_nf)` at kick, one `@parallel wait` with a ticket per `RTX_PS_CHUNK` files (the lane reads each file whole into its reused buffer and keeps the chunk's hits on its cache replica); the stage appends one group per file, in id order, and publishes once per chunk; the pump kicks the next arm while the walk grows | `ps.wk` / `!complete` | `next` | binary / over size: counted, skipped |
+| psearch | `rtx_proj_search_set` | dest-live arm over index ids `[next, pub_nf)` at kick, one `@parallel wait` with a ticket per `RTX_PS_CHUNK` files (the lane reads each file whole into its reused buffer and keeps the chunk's hits on its cache replica; with the search index it stats first, skips an indexed, unchanged, trusted file none of whose units pass, and reads a big one only around its passing chunks for a one-line pattern); the stage appends one group per file, in id order, and publishes once per chunk; the pump kicks the next arm while the walk grows; the query's first arm loads the index and computes the passing units | `ps.wk` / `!complete` | `next` | binary / over size: counted, skipped; index-ruled-out: counted (`n_idx_skip`, chunk reads `n_idx_chunk`) |
+| index build | "Build Search Index" / "Update Search Index" (`rtx_proj_index_kick_mode`; deferred while the walk runs) | one dest-live arm: two passes over the index files, each a `@parallel wait` over `lanes` shards taking walk-order segments from a counter, bits set straight into the file image, then write; an update stats the walk, re-reads dirty units as jobs and packs new files as a two-pass tail | `rtx_proj_index_building` | — (a rebuild / an update) | close and a re-walk swap cancel it (nothing written; a swap re-asks); the pump joins it while no search arm is live |
 | replace | `rtx_replace_kick` | `rtx_replace_step`: 1 MiB windows of starts on the UI thread, up to `RTX_LINE_ISLE_WORK_MS` or input; past the bulk threshold each site also feeds the bulk build (tree reads, staged add bytes) | `rtx_ui_repl_busy` | `pos` | long match / cap / an edit since kick → `RTX_REPL_FAIL`, nothing edited |
 
 The project walk and search copy the find / browse shape. A walk lane
@@ -442,6 +444,30 @@ regex, Alt-C / Alt-W / Alt-R). A search is the lazy DFA (a dense
 state × byte-class table per lane scratch) behind the rarest required
 literal (prefix, inner literal on its line, or an alternation's set;
 ignore case too); a literal query is that filter alone (core/rx.cch).
+A pattern with none of those (its literal sits after an unbounded part
+that may take a newline: `\w+\s+Holmes`) may split at the top level as
+P L S (reverse inner; reverse suffix when S is empty): the filter finds
+L, P reversed gives the leftmost start of a P that ends at the hit, and
+the forward DFA anchored there confirms it with the usual leftmost-first
+end (both lazy DFAs have their own cache and budget, and give up to the
+plain path when it thrashes). Compile builds it only
+with a proof that no earlier match can use a later hit (`rx_ri_safe`: P
+of one length; P never takes L's first byte; a required class run ends
+P that no other part of P and no first scalar of L shares, `\s+` in
+`\w+\s+`; P a chain of class runs, `.*` or `\w+\s*`), so the first
+confirmed hit is the plain engine's match. Linear time: a hit inside the
+last failed forward scan, a reverse scan still alive below where that
+scan stopped, reverse + failed forward bytes over 3x what the hits
+advanced, or hits every few bytes (counted over the calls on one text)
+give the call to the plain DFA from
+`lo` and rest the strategy on that text for 1 MiB. Reverse scans never
+read below `lo`. A window that is not the text end never guesses: past
+the last whole hit, a reverse scan from the window end for a prefix of
+a match (every consuming pc of the reversed pattern) names the leftmost
+candidate the edge cuts, and the plain DFA answers from there (a
+leftover, as before). Texts under 256 bytes (grammar lines) stay on the
+plain DFA; `force` 4 runs it on any text (`rx_conform`'s fifth engine,
+`rx_smoke`'s differential and linear-time checks).
 Text is walked in units: a scalar, or a stray byte (a lead with fewer
 continuation bytes than it needs is one unit, cut where they stop). `.` and
 negated classes take one unit, never a scalar's bytes one by one
@@ -452,13 +478,22 @@ defers to the Pike VM). `rx_conform` runs the Rust regex crate's test data
 (tests/rx_conformance, translated to the Onig flavour) through every path
 and lists the deliberate differences: Onig empty-iteration and named-group
 captures, ASCII \d, the \w policy, no ASCII / byte mode, the fold
-table. The prefilter's byte table rates non-ASCII for text in the query's
+table. The \w policy (and so \b) is Oniguruma's, as vscode-textmate
+runs it: Alphabetic | Mark | Nd | Pc, plus Latin-1's ² ³ ¹ ¼ ½ ¾; U+207F
+ⁿ is a word, U+00B7 · U+2070 ⁰ U+2082 ₂ ZWJ are not. `rx_nonword_hi` is
+Onig-exact in Latin-1, U+2000-20CF, 2460-24FF and 2E00-2E7F and by block
+elsewhere (a symbol or No inside a letter block is a word): the exact
+~800-range set compiles a `\w` ~10x slower. `rx_smoke` sweeps \b / \B
+over sampled scalars on every path against the table, and
+`rx_conformance/wordb.fix` checks non-ASCII boundaries against Rust. The prefilter's byte table rates non-ASCII for text in the query's
 own script (leads common, continuation bytes from ru / zh text).
 Literal hits overlap; regex hits are the
 leftmost-first chain. Each block searches its 2 MiB plus a
 `RTX_FIND_SPAN` (64 KiB) overlap; `@stage` re-chains across block edges
 so lanes equal a sequential scan. A match that would pass the span is
-not guessed: `long_n` / `long_off` show it in the header. A regex edit
+not guessed: `long_n` / `long_off` show it in the header. A start the
+backtracker cannot decide ends the list there, marked incomplete
+(Replace, Undecided regex starts). A regex edit
 re-scans a span-sized window and re-chains until it meets the shifted
 hits. `find_apply` plants via `find_set`.
 Newlines are counted in one place: `core/lf.ccs` (`rtx_count_lf`,
@@ -479,6 +514,203 @@ the camera moved; help / find / jump paint as chrome on the last
 window. Tests call `finish` (wait). Do not drain the first screen
 before first paint. Tests that need a covered `line_of` call
 `rtx_line_scan_to` (or a pump) first.
+
+### Search index
+
+Project search reads every file, so a repeat search over a big tree costs
+what reading it costs. The search index (`core/sindex.ccs`) is one Bloom
+filter per 64 KiB of the project — a block of consecutive files, or a
+chunk of a big file — about 2 % of the indexed bytes, built only when
+asked ("Build Search Index" / "Update Search Index" in the palette; batch
+`project-index [--update]`). With no index file the search is exactly
+the plain scan: the plan, the loader and the lanes' stat never run
+(`rtx_si_work()` stays put; `sindex_smoke` asserts it). The model was
+picked by a simulation on the Linux tree (ripgrep's benchsuite queries
+plus a dozen identifiers): a truncated rare-trigram posting index (the
+previous design) read 100 % of the bytes at the median query at 1 %,
+because every trigram of a common identifier is in hundreds of files;
+per-block Bloom filters read 37 % (128 KiB blocks), 24.5 % at 64 KiB
+when a big file is read only where its chunks pass, 12.8 % at 2 %.
+Walk-order locality is what makes blocks work (shuffled: 63 %); k = 2,
+a per-file second-level filter, dropping common trigrams and 4-grams
+were all worse at the same size.
+
+Units. The indexed files — regular, not empty, up to 64 MiB
+(`RTX_SI_FILE_MAX`, or the search's size cap when bigger), no NUL in the
+first 8 KiB — in walk order (paths compared with `/` lowest, so a
+directory's files stay together) are packed greedily into blocks of up
+to 64 KiB. A file over 64 KiB is its own run of chunks: chunk j is
+`[j·64 KiB, (j+1)·64 KiB + 63)`. The 63-byte overlap is the longest
+literal the planner uses (64 bytes, `RTX_SI_WINS` + 2) less one, so any
+literal lies whole in some chunk. Each unit's filter holds its
+ASCII-folded trigrams with one hash (k = 1: `bit = h32 · bits >> 32`),
+sized in 64-bit words to the unit's distinct-trigram count so the
+filters together fill what the budget leaves after the fixed parts.
+
+Build: two reads of every indexed file. The walk order is cut into at
+most 256 segments (independent of the lane count: one lane and eight
+write the same file but for its build time); `lanes` shards in a
+`@parallel wait` take segments from an atomic counter. Pass 1 reads each
+file (identity from its fd), packs the segment's blocks, counts each
+unit's distinct trigrams (a 2^24-bit set per shard, cleared through its
+touched list) and each chunk's newlines. Then the budget
+(`search_index_pct`, default 2 % of the indexed bytes, capped at 256
+MiB) pays for header, root, device table, file table and unit directory;
+the rest is split over the units by distinct count (the directory's size
+depends on the word counts: sized twice). The file image is allocated
+once; pass 2 re-reads each file, checks its identity against pass 1 and
+sets the bits straight into the image (units own whole words: no
+atomics). A file that changed between the passes gets the dead bit in
+place (its stamp word keeps its size) and is always read.
+
+Identity and trust: (dev, ino, size, mtime ns, ctime ns) of the fd read
+in pass 1 — ctime because `touch -m` restores the mtime but not ctime.
+A file is trusted only if max(mtime, ctime) < build start − granularity
+(2 s when a stamp has no sub-second part, else 100 ms; git's
+racily-clean rule). Two paths on one inode (hard or symbolic links):
+neither is trusted by a search.
+
+Query: the regex engine's required literals (`rtx_rx_req_n` /
+`rtx_rx_req_lit`, the prefilter's set — every match holds one of them;
+ignore-case pairs and tiny classes as byte sets) become trigram windows
+of up to 27 folded alternatives. A unit passes when, for some literal,
+every window has an alternative whose bit is set (a literal under 3
+bytes, or no required literal: no pruning, the plain scan). The first
+arm computes the passing units once (a bit per unit; ~30k units on
+Linux, well under a millisecond per window). A lane then stats each file
+(`fstatat`) and, when its (dev, ino) maps to an indexed id whose
+identity is unchanged and trusted and it is not a dirty buffer's file
+(`rtx_proj_keep_add`):
+
+- no unit passes: skipped unread (`n_idx_skip`);
+- a big file with some but not all chunks passing, and a pattern no
+  match of which crosses a newline (`rtx_rx_one_line`: no consuming
+  instruction, look-around included, takes `\n`): read only there
+  (`n_idx_chunk`), after re-checking the identity on the opened fd;
+- otherwise read whole.
+
+Chunk reads. Runs of passing chunks merge (and runs whose padded ranges
+meet); each run `[cs, ce)` is read with 256 bytes of padding and widened
+until it holds the `\n` before `cs` and the `\n` at or after `ce − 1`,
+plus the byte after it — whole lines with one byte of real context on
+each side, so `^ $ \b \A \z \Z` and look-around (which cannot cross a
+`\n`) decide exactly as in the whole file; `\A` holds only at offset 0.
+Matches may start only inside the run's lines, and a later run never
+rescans what an earlier one did, so there are no duplicates. The line
+number at the run's start is the chunk's newline count from the index
+(`unl`, a varint per chunk in the unit directory) less the newlines
+between the line start and `cs`. Counting forward instead would read the
+bytes the chunk read skips; the stored counts cost 2 bytes a chunk.
+
+Update ("Update Search Index", `project-index --update`): load the index,
+`fstatat` every walked file and look its (dev, ino) up (one walk path
+per old entry; a shared inode's entries are matched one each). Unchanged
+and trusted by its stamps: kept, unread. Changed with the same shape
+(small, or the same chunk count): its unit is dirty — the whole block
+(≤ 64 KiB) or the whole chunk run is re-read and its filter rewritten at
+its fixed size (fresh newline counts too). Deleted: leaves the table
+(its bits stay; false positives only). New, or reshaped (small ↔ big,
+another chunk count): packed into new tail units, sized at the build's
+bits per trigram (in the header). More than 20 % of the units dirty or
+new (`RTX_SI_UPD_PCT`), no index, or an unreadable one: a full build,
+and the report says why. The new file's build time is the update's
+start: a kept file was trusted before, so it is still trusted. A budget
+change (`--pct`) needs a Build.
+
+File: `<safe>/w/<FNV-1a 64 of the root realpath>.si`, the RTXW leaf's
+sidecar, built in memory, written to `.tmp`, fsync'ed, renamed. 16
+header words ("RTXI" + version 2, build ns, granularity, file / device /
+unit counts, section sizes, block size and overlap, indexed bytes,
+budget, bits per trigram, the last full build's ms); the root path
+(checked on load); the device table; the file table; the unit
+directory; the filters; a 64-bit four-lane word checksum. File table,
+per file in unit order, no paths (lookups go by (dev, ino); the walk
+supplies paths): the device index only when there are several, the
+zigzag delta of the inode from the previous file's, the size, the
+zigzag delta of the ctime seconds from the previous file's, a u32 of
+ctime nanoseconds with `mtime == ctime` and dead flags in its top bits,
+and the zigzag mtime − ctime only when they differ. Unit directory: per
+run, `nfiles << 1` (a block) and its filter words; or
+`nchunks << 1 | 1` (the next file's chunks) and, per chunk, its words
+and its newlines. The loader checks every count against the bytes left,
+chunk counts against sizes, block members ≤ 64 KiB and the word total. A
+bad magic / version / root / size / sum: no index.
+
+Measured on Linux (torvalds/linux, depth 1: 95,986 files, 1.64 GB
+indexed; 4-core VM shared with other agents' builds, so times are
+noisy — best of 3, interleaved; page cache warm; whole `cctext --batch`
+processes, walk included; rg 14.1 `--hidden`; `bench/rg_suite.py`):
+
+| | |
+|---|---|
+| index | 32.7 MB = 1.99 % (budget 2 %): file table 0.785 MB, unit directory 0.095 MB, filters 31.8 MB |
+| units | 30,525 (15,313 blocks, 15,212 chunks), fill 0.32 |
+| file table | 0.048 % of the corpus = 2.4 % of the budget (8.2 B a file); the previous table (paths front-coded, full varint stamps) was 3.45 MB = 0.23 %, 23 % of a 1 % budget |
+| build, all lanes | 5.2 s (pass 1 2.2, pass 2 2.7, write 0.26), peak RSS 93 MiB |
+| build, one lane | 13.3 s (5.9 / 7.1 / 0.27), peak RSS 78 MiB |
+| update, 1 changed file | 0.51 s (stat 0.31, read 0.03, write 0.18): 1 unit re-read, 60 KB |
+| update, 100 changed files | 0.46–0.65 s: 84 units re-read, 4.3–6.4 MB |
+
+Bytes read per query, as a % of what the plain scan reads, against the
+simulation at 2 % (its chunk-read column; its tree excluded the eleven
+files over 8 MiB, which the bench also runs with `--max-size 8388608`
+to compare; with them read — they are indexed and chunk-read too — the
+bench's default run reads `PM_RESUME` at 24.4 %):
+
+| query | cctext | simulation |
+|---|---|---|
+| `PM_RESUME` (literal, `-i`, `-w`) | 27.0 % | 24.0 % |
+| `[A-Z]+_RESUME` | 47.7 % | 44.1 % |
+| `ERR_SYS\|PME_TURN_OFF\|LINK_REQ_RST\|CFG_BME_EVT` (and `-i`) | 36.9 % | 47.5 % |
+| `pthread_mutex_timedlock` | 0.7 % | 0.8 % |
+| `crc32c_le` / `regmap_update_bits_base` / `iommu_map_sg` | 2.3 / 2.3 / 2.3 % | 1.2 / 3.8 / 3.2 % |
+| `kfree_skb_list` / `hrtimer_forward_now` / `SLAB_HWCACHE_ALIGN` | 3.1 / 0.8 / 0.6 % | 4.5 / 1.9 / 0.9 % |
+| `kmalloc_array` / `copy_from_user` / `spin_lock_irqsave` | 12.3 / 14.1 / 13.7 % | 12.8 / 10.8 / 14.4 % |
+| "should never happen" / "for the time being" | 12.4 / 38.6 % | 16.6 / 33.3 % |
+| absent `flibbertigibbet` | 0.4 % | 0.3 % |
+| median of the 19 | 12.4 % | 12.8 % |
+
+(The "about 16 %" at 2 % is the simulation's whole-file median; its
+chunk-read median is 12.8 %. The alternation reads 10 points less than
+modelled; the rest are within 4 points.) Queries with no usable literal
+(`\p{Greek}` blocks, `\wAh`, `\w{5}\s+…`) are plain scans: 100 %.
+
+Warm wall time (whole processes; walk = the project walk, which a batch
+process pays each time and the editor once per session; lanes = time
+summed over 4 lanes):
+
+| query | rg | no index | index | walk / search ms | lanes stat / read+scan, index | lanes stat / read+scan, no index |
+|---|---|---|---|---|---|---|
+| linux_literal | 576 | 723 | 548 | 539 / 539 | 311 / 351 | 45 / 1364 |
+| linux_literal_casei | 644 | 858 | 739 | 731 / 729 | 359 / 447 | 53 / 1446 |
+| linux_re_literal_suffix | 744 | 1157 | 831 | 817 / 814 | 463 / 954 | 66 / 2034 |
+| linux_word | 841 | 1084 | 796 | 779 / 779 | 487 / 505 | 97 / 1875 |
+| linux_alternates | 958 | 1331 | 908 | 812 / 896 | 506 / 850 | 79 / 2679 |
+| linux_unicode_word (plain) | 542 | 719 | 719 | 628 / 709 | 46 / 1256 | 45 / 1302 |
+| linux_no_literal (plain) | 1669 | 3904 | 4288 | 2006 / 4254 | 120 / 13062 | 108 / 11930 |
+| pthread_mutex_timedlock | 547 | 712 | 443 | 434 / 435 | 256 / 11 | 42 / 1296 |
+| kmalloc_array | 583 | 738 | 483 | 471 / 472 | 286 / 157 | 50 / 1300 |
+| spin_lock_irqsave | 660 | 726 | 497 | 481 / 482 | 260 / 162 | 70 / 1326 |
+| flibbertigibbet | 924 | 1066 | 639 | 628 / 629 | 278 / 13 | 67 / 1697 |
+| all 24 queries | 19.7 s | 25.9 s | 20.7 s | | | |
+
+Reading: with the index, read + scan falls from ~1.3 s (summed) to
+10–500 ms, and the search finishes as soon as the walk does — the walk
+(0.4–0.8 s here, one `getdents` + `fstatat` pass) and one `fstatat` per
+file in the lanes are the floor. In the editor the walk is paid once, so
+the gain there is the read+scan column. Counts equal rg's except where
+the semantics differ (a symlinked file rg does not follow, `\p{Greek}`
+run as block classes, `\w` / `\s` past ASCII); with and without the
+index cctext's rows are identical for every query (the bench compares
+them).
+
+Limits: a changed file costs one re-read of its block (≤ 64 KiB) or of
+its whole run of chunks; updates never compact (deleted files' bits and
+tail units stay until a Build); shapes are fixed, so a file growing
+past 64 KiB moves to the tail. The residual risk of trusting stamps is
+a change that keeps size, mtime and ctime (a clock set back, a file
+system that does not move ctime, mmap stores never msync'ed), the same
+as git's.
 
 ## Surfaces
 
@@ -509,7 +741,7 @@ Constructors assume dead. Reopen is `d.destroy(); d.from_path(...)`.
 
 A path that gives up is not success: a non-empty original must produce a root; scan / highlight / reparse do not plant markup or set `hl_done` after a missing span. Lex a window, not the body — do not pass `len` as a highlight bound. The **root section is the path kind** (`CODE` if a grammar matches, else `PROSE`). `===` headers still split. Mixed markup stays `UNKNOWN` until a header or BOF — do not invent a path-default for a file with no grammar. `*` / `` ` `` refresh style runs; `=` or a large delete rescans sections. An edit in a grammar section relexes from a checkpoint (every 4 KiB) at least 2 KiB before it and stops at the first checkpoint past it where the lex state matches the old one — checkpoints past an edit are shifted and stale until that proves them; the old runs from there on stand (`incr_smoke` checks this against a full lex). A section over `RTX_HL_FULL_MAX` does the same inside its window: the window lex (lookback lead-in included) plants **window** checkpoints (every 1 KiB) from its anchor and is recorded as `hl_cov`; an edit inside `[lo, hi]` relexes from the last of them 2 KiB before it (emitting from `lo`, as the window lex did) to where it converges, and a fill inside `hl_cov` lexes nothing. A window checkpoint is that lookback's state, never a catch-up seed; the same lex may resume from it when its window moves on (Interactive, Run working set). No seed, an edit outside, a group edit, or any other lex over it drops `hl_cov`: the fill relexes the window as before — never more than the window plus its lookback. A Markdown fill lexes window + `RTX_MARKUP_LOOKBACK` in one pass. A grammar with `"blocks": "commonmark"` is lexed by the Markdown block pass (docs/md_view.md): its block state rides in the checkpoint (planted at line starts only), a relex converges only outside a paragraph, and a bare window lex starts at an anchor ≤ 256 KiB behind the lookback (an info-string fence or the section floor), classifying blocks only up to the lookback — or, with none, starts unsure and paints fence bodies as text (leftover, never a wrong nest; never a walk to BOF). Link reference definitions (`core/md_refs.ccs`) come from that block pass too — the walk stages the definitions it classified over the range it lexed, a file up to 4 MiB is swept once (classify only, checkpointed every 4 KiB; an edit re-sweeps only to where the state converges) — and edits shift them; a definition that comes or goes relexes only when a label the lex asked about changed (a `seen` filter), never a file scan per frame. A frame whose end reads its begin (backrefs, `\G`) or a `cctext.bol` prefix frame is never a seed or a match. A `===` header starts a fresh lex; a window's first section need not start at one. A window's section scan (file over `RTX_MARKUP_SCAN_MAX`) records every header in it — no per-window cap — and reads a header that `to` cuts whole (the merge replaces the sections starting in `[anchor, to]`); its prose rescan covers the lines its edges cut, up to 4 KiB past them (`scroll-dense` / `scroll-txt` in `incr_smoke` check each window against its sections lexed whole). Lex copies die with the frame, not an `analysis` bump. A lex call owns its regex scratch (`RtxRxScratch`, freed at return); a grammar regex sees one line with its newline, as TextMate hands Oniguruma a line. A short `read_at` mid-document is a fault, not EOF.
 
-Commit only after the new value exists: hist after `tree.replace` (reserve coalesced bytes before, commit after); clip after a successful cut; path + `saved_head` after a prepared rename. After a successful mutate, commit or rollback failure is `RTX_ERR_UNRESTORABLE` and sets `d.broken` — further edits refuse (do not return a retryable kind with tree advanced and hist still reserved). Clipboard allocs into a local, then assigns. Empty source is a real clear. A path that gives up is unchanged or `broken` — never a hole that looks retryable.
+Commit only after the new value exists: hist after `tree.replace` (reserve coalesced bytes before, commit after); clip after a successful cut; path + `saved_sid` after a prepared rename. After a successful mutate, commit or rollback failure is `RTX_ERR_UNRESTORABLE` and sets `d.broken` — further edits refuse (do not return a retryable kind with tree advanced and hist still reserved). Clipboard allocs into a local, then assigns. Empty source is a real clear. A path that gives up is unchanged or `broken` — never a hole that looks retryable.
 
 ## Faces
 
@@ -517,13 +749,19 @@ Commit only after the new value exists: hist after `tree.replace` (reserve coale
 
 - `as: tree` on `RtxDoc`, `as: doc` on `RtxBuf` — miss on the outer retries on the embed.
 - `RtxDocHighlight` — `read_at`, `scratch_span`, `style_at`, `section_at`, `ensure_hl(RtxHlWin)`. It cannot `len` / `line_*` / `insert` / `type` / `save`.
-- `RtxDocLayout` — measure may `len`, `line_count`, `line_start`, `line_guess`, `index_covers`, `read_at`, `scratch_span`, `style_at`, `style_next`, `style_cur` / `style_cur_next` (a forward cursor per walk), `mark_edges`, `section_at`, `ensure_hl(RtxHlWin)`, `fold_covers`, `md_block_at` / `outline` (runs the lex planted). It cannot `line_of` / `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
+- `RtxDocLayout` — measure may `len`, `line_count`, `line_start`, `line_guess`, `index_covers`, `read_at`, `scratch_span`, `style_at`, `style_next`, `style_cur` / `style_cur_next` (a forward cursor per walk), `mark_edges`, `section_at`, `ensure_hl(RtxHlWin)`, `fold_covers`, `md_block_at` / `outline` (runs the lex planted), `file_path` (image sources). It cannot `line_of` / `insert` / `type` / `save`. `view_after_edit` takes a full `RtxDoc*` because it reparses.
 
 Mark motion and fold walk the runs `ensure_hl` already produced. They do not lex ahead, pump, or keep a file-shaped table. Heading pairs use those runs; brace pairs (`{}` `[]` `()`) match on the caret’s 256KiB analysis page plus at most one neighbor page each side (same grain as `RTX_HL_WIN_MAX`, not the 64KiB store). Paint does not `ensure_hl` that span — skip uses whatever runs the layout window already has. A fold is stored only when both ends are in that window. Layout skips interiors; caret and scroll jump to the fold edge; hex ignores folds. Folds are document state (`RtxDoc.folds`, cap `RTX_FOLD_MAX`), shared by every pane on the doc — per-pane folds are a known non-feature.
 
 Grid, hex, and the markup lens (Rich hints, nested children, injected lex) are paint policies over the same bytes and the same runs — see [docs/md_view.md](docs/md_view.md). Pair / prefix / path mark shapes: [docs/mark_arity.md](docs/mark_arity.md).
 
+A workbook formula's live value while the caret is in it (`` → value``, dimmed: `rtx_theme_annot`) is paint too, in Rich and Source: the stand-in of the formula's last cluster carries the cluster's glyphs and then the annotation (`RtxHintVis.ann`), so every width, wrap, table fit and hit that already walks stand-ins counts it with no new walk; `x_of` and hits stop before it, so the caret at the formula's end sits before it and a click on it lands there. It holds no bytes: copy, search and save never see it ([docs/workbook.md](docs/workbook.md#live-value-annotation)).
+
+A workbook value still being recomputed (a job has not reached it) paints its last value after `≈`, in `rtx_theme_stale` (scope `comment.stale.workbook`): the derived hook's `at` returns 2 and `hint_vis` sets `RtxHintVis.stale`, which both frontends' stand-in painters turn into the stale style — no new walk, the width is the text's. A row anchor tag `{#name}` stays in the text (Rich and Source) and paints in `rtx_theme_anchor` (`entity.name.anchor.workbook`) through the derived hook's `style` runs, which `RtxDoc_style_at` / `style_next` consult before the lexer's runs; a workbook document then answers style queries without the style cursor (a binary search a run, the same as `style_at`).
+
 A Marp deck is one more view of the same bytes ([docs/slides.md](docs/slides.md)): `marp: true` in the first 4 KiB sets a block-pass flag that rides in the checkpoints (a top-level thematic break is a slide separator), the deck index is that block pass over a bounded prefix keyed by the edit stamp (slide numbers need every separator before the caret, as line numbers need the line index), and presenting a slide lexes only that slide. The presenter is host-neutral state; a transition asks the host loop for frames only while it plays (`rtx_present_wait_ms`), so a still slide wakes nothing.
+
+An image (`![alt](src)`, [docs/images.md](docs/images.md)) is a stand-in over its own bytes in the Rich lens: hidden source while the caret is off its line, `[image: alt WxH]` as the stand-in text, and in a pixel layout a line that is one image becomes a picture row whose box comes from the image header, so pixels never move a row. The layout asks a process-wide cache (`core/img.ccs`) for sizes and the paint asks it for pixels; both only ask — a header probe and a decode are jobs on their own dest-live arms (the browse-preview shape), adopted by the host's pump, cancelled when a paint pass no longer wants them, evicted least-recently-painted under a pixel budget. The decoder is Wuffs in one static translation unit; every limit is checked from the header before an allocation. Where a picture may come from is policy, not paint: a local file inside the document's project root, a `data:` URI, or what the user allowed (per project, in the Safe home); a remote image is fetched only after a decision, by a child process polled from the pump. `RtxDocLayout` gains `file_path` (a relative source resolves against the document).
 
 Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for `write_fd` / page-store internals.
 
@@ -531,7 +769,7 @@ Call sites use the doc face (`d.len()`, `b->line_count()`). Peel `.tree` for `wr
 
 The same file in several panes is several cameras on one document. After a mutation, reparse once (the first camera's turn, after every camera planned its patch) and make every matching camera’s vis rows current — each at its own pane's width and rows (`RtxWs_pane_geom`) — a width/top cache is not an edit stamp. Current is either a refill or an exact patch (`RtxLayoutPatch`): the doc keeps one edit span since the last refresh (`RtxDoc.span`, based at `gen0`); rows laid out by `lines()` — or by a seeking camera's `fill_off` over whole lines — at `gen0` relay only the edited lines plus lines whose runs, reveal, section or MD table widths moved (runs diffed over the window, planned before the reparse), and shift the rest by bytes and lines. A patched seeking camera labels its rows as its refill would (`line_guess(seek_off)`, then the keyed origin). Anything the patch cannot prove — a byte-capped seek window, grid / hex, folds, `=` / large-delete rescans, an edit above the camera or eating its last newline, a table set / column change, a width change — refills.
 
-The document write is `replace` (byte range in `[0, len]`). `insert` / `erase` on the doc call it. User changes are `replace` on the history stack. Dirty is `hist.head != saved_head`. Offsets, caret, and selection are bytes. Save streams pieces (`write_fd`). Deleted bytes stay in the original/add buffers; hist stores them inline only while they still coalesce (typing/backspace), and otherwise keeps piece descriptors so undo splices the range back. A record coalesces only a pure insert onto a pure insert or a pure erase onto a pure erase; a replace that does both, and every mark / table policy write (join, apply, unwrap, toggle, row / column), is its own record.
+The document write is `replace` (byte range in `[0, len]`). `insert` / `erase` on the doc call it. User changes are `replace` on the history stack. A savepoint is a history *state*, not a stack position: every record carries the id of the state it leads to (`sid`, handed out once per document, never reused — a coalesce that extends a record takes a new one), head's state is `rtx_hist_cur_sid`, and a save records it in `saved_sid`. Dirty is `cur_sid != saved_sid`, so undo / redo back onto the saved state is clean and a divergent edit after undoing past a save is dirty (Save writes it). A record whose state is the saved one (or a branch's fork) takes no more coalescing, and a save breaks coalescing, so undo lands on the saved bytes. When a new edit drops a redo tail that holds the saved state, the records from head to it move to `hist.sb` (the branch; `fork_sid` is the state it hangs off, and a later drop below the fork prepends to it) — the doc stays dirty, and the Safe journal writes that branch (`RTXS` v9) so a reload walks it back from the file and replays from the fork. The branch is allocated before the tree moves, like every other hist need. Offsets, caret, and selection are bytes. Save streams pieces (`write_fd`). Deleted bytes stay in the original/add buffers; hist stores them inline only while they still coalesce (typing/backspace), and otherwise keeps piece descriptors so undo splices the range back. A record coalesces only a pure insert onto a pure insert or a pure erase onto a pure erase; a replace that does both, and every mark / table policy write (join, apply, unwrap, toggle, row / column), is its own record.
 
 ### Edit groups
 
@@ -549,7 +787,7 @@ never a silent partial edit. One effective site is a plain policy
 Members sit contiguous on `hist.recs` (still raw + `cc_arena_realloc`)
 with one group id, in apply order — descending offset, so each record's
 `off` is exact when it lands. Undo / redo move over the whole run; head
-never rests inside a group, so dirty (`head != saved_head`) is at group
+never rests inside a group, so dirty (`cur_sid != saved_sid`) is at group
 granularity. Undo restores the caret from the first member, redo from
 the last (a policy path that places the caret patches the last member,
 as single records do). Typing never coalesces into a group, and the
@@ -628,16 +866,34 @@ fsync, `rename`, best-effort dir fsync). That replaces the inode: hard-link
 identity is lost, and a symlink at `path` is replaced rather than followed.
 Owner, ACL, and xattr are not copied. `--backup` is the other policy: write
 through `path` (follows the symlink / keeps the inode). When the dest is the
-opened original and its size still matches, only the dirty span is copied
-and overwritten — unchanged prefix (and a same-length original suffix) stay
-on disk. A length-changing write that still streams original pieces pins
-those file bytes before the first `pwrite` (the dest inode is the page
-store’s original). A tail above `RTX_SAVE_PIN_MAX` writes a full temp and
-copies onto the path. `path~` is then `RTXB` (magic / ver / old_len / lo)
-plus the old bytes that were about to be overwritten. A pure append writes
-no `path~`.
-If the dest is another path or the size drifted, fall back to a full copy
-then truncate+write. Crash mid-write can leave a mixed target; `path~` is
+opened original's inode (its path, a hard link, a symlink to it) and its
+size is what the last write left (`disk_len`), only the dirty span is
+copied and overwritten — unchanged prefix (and a same-length suffix) stay
+on disk. The span is against what the inode holds *now*: an ORIGINAL piece
+at its own offset counts as unchanged only while no save has rewritten
+those bytes. `path~` is then `RTXB` (magic / ver / old_len / lo) plus the
+old bytes that were about to be overwritten. A pure append writes no
+`path~`. If the dest is another inode or the size drifted, fall back to a
+full copy then truncate+write.
+
+The original is an immutable generation: every ORIGINAL ref the live tree
+and **any** history record (or journal branch) holds keeps its bytes while
+the document lives. A write through an inode that is an open original
+never happens before the page store *preserves* the original bytes it is
+about to change: it copies them from the inode into a private, unlinked,
+sparse temp file at the same offsets (disk-backed; a multi-GB original
+costs disk for the rewritten span, not RAM) and publishes the preserved
+span set; reads of those offsets (cached page loads and the uncached lane
+path) go there from then on. Every open original is in a process registry
+keyed by (dev, ino), so a save through any path — this document's
+`--backup` dirty span, a truncate+rewrite, a save-as onto a hard link,
+another document's save onto this file, `path~` when `path~` is itself
+open — preserves for every document on that inode. A lane that read the
+inode while a preserve landed re-reads that span from the preserve file.
+Rebasing only the live tree would leave undo refs wrong, and dropping the
+page cache only exposes the aliasing, so neither is the fix. The plain
+(rename) save never writes an open original: the old inode stays behind
+the page store's fd. Crash mid-write can leave a mixed target; `path~` is
 the recovery. Save stamps mtime + size + inode at open and after a
 successful write. A later save of that same path refuses if the identity
 drifted (`file changed on disk`) unless the user overwrites — then the
@@ -693,11 +949,67 @@ itself is not a position. The template is `$0`-`$9`, `${N}`, `${name}`
 and `\\`, parsed once per job. A group the pattern lacks, or one above 9,
 fails the kick. Without REGEX the replacement is verbatim.
 
+### Undecided regex starts
+
+A regex answer is MATCH, NONE, or undecided; a cap never turns "not
+decided" into "no match". The DFA and the Pike VM are linear and finish.
+The backtracker (backrefs, look-around, atomic groups, Onig's empty-loop
+rule) has a per-attempt step budget (`RTX_RX_BUDGET_DEFAULT`, 200 000;
+the budget is not raised for this), a stack cap and a look-around depth
+cap. Hitting any of them is `RTX_RX_INDET`, and so is a matcher that gets
+no scratch memory. `rtx_rx_search` stops at the first undecided start p
+and returns INDET at p: every start before p has no match, nothing is
+known from p on, and it never goes on to report a later start as the
+leftmost match. Every other cap was checked:
+
+| cap | what it does now |
+|---|---|
+| step budget / stack / look-around depth (backtracker) | INDET at that start; the search stops there |
+| scratch memory (any engine) | INDET at the call's start |
+| Pike VM step budget | only on `rtx_rx_at` (grammars, a re-match): INDET; search runs it unbudgeted |
+| lazy DFA cache thrash, reverse DFA give-up, reverse inner bail-outs | hand the call to the Pike VM or the plain DFA from `lo`: complete engines, not answers |
+| window edge (2 MiB block + 64 KiB span, replace slices, eof = 0) | a start whose decision reads past the window (a match that runs to the end, `$` `\b` `\B` `\z` at the end, a look-around or backref that read the end) is a leftover (PARTIAL) in every engine: the backtracker notes the read, the Pike VM keeps a thread an end assertion stopped as open, the DFA resolves its last state under each possible next byte, and a match that reaches the end is PARTIAL. The backtracker is conservative: an attempt that read the end is open even when its path then failed for another reason (an earlier leftover, never a wrong answer). |
+| lookbehind (255 bytes) | a compile-time limit; blocks keep `RTX_FIND_CTX` (259) bytes before them |
+
+Consumers:
+
+- **Find** (Ctrl-F list, next / prev, batch `find`): the block that meets
+  p publishes the hits before it and ends the scan there (`find.indet`,
+  `indet_off`, `indet_line`; done); later blocks publish nothing. The
+  header says `search incomplete: pattern too complex at line N`; next /
+  prev cycle the listed hits and never step past p. An edit rescans.
+- **Replace all** refuses the whole job at p, as it refuses a match over
+  64 KiB: `replace: pattern too complex to search exhaustively at line
+  N; nothing replaced` (the job's `err_off` is the offset), even when
+  valid sites were already staged or streamed into a bulk build. So does
+  the zero-width site at EOF and a capture re-match that is undecided.
+  Replace one refuses a hit it cannot re-match; batch `replace` (one)
+  needs a decided hit at or after the caret.
+- **Project search**: the file keeps its hits before p, is flagged
+  (`RtxPsGroup.indet_line` / `indet_off`, a group even with no hit) and
+  counted (`ps.n_indet`): the group header says `incomplete: pattern too
+  complex at line N`, the status `K files incomplete`, Enter on an empty
+  group opens the file at p. Batch prints `PATH:LINE: search incomplete:
+  ...` and counts them in the summary.
+- **Batch**: `replace --all` exits nonzero with the line; `find` and
+  `project-search` flag their output; `stats-json` find has state
+  `incomplete` and `incomplete: {off, line}`.
+- **Grammars (TextMate)**: best effort, on purpose. A rule whose regex is
+  undecided at a position does not match there (`rtx_rx_at` returns
+  INDET, which is not MATCH), and the lexer moves on as before. The
+  budget is part of grammar behaviour: highlighting output is
+  byte-identical across this change (`tm_dump` over the fixtures;
+  `tm_rx_diff` U=0), a wrong color never edits text, and
+  `stats-json` `rx_budget` counts the hits.
+- **Workbook**: no formula takes a regex today. One that does returns an
+  error value on INDET, never a result.
+
 `--batch` is a headless command host (no TTY): `-c` lines or a stdin script.
 Verbs are semantic (`goto @N` / `N%` / `LN`, `await index|island`, `print`,
-`read`, `insert`, `undo`, `redo`, `replace`, `save`, `stats-json`, `quit`) —
-not keystrokes. `replace [--all] [--regex] [--icase] [--word] [--] FIND
-REPL`. An argument is bare bytes up to white space, `'…'` (verbatim), or
+`read`, `insert`, `undo`, `redo`, `find`, `replace`, `save`, `stats-json`,
+`quit`) — not keystrokes. `replace [--all] [--regex] [--icase] [--word] [--]
+FIND REPL`; `find [--regex] [--icase] [--word] [--] QUERY` prints the find
+list (line, offset, length) and what it does not cover. An argument is bare bytes up to white space, `'…'` (verbatim), or
 `"…"` where only `\"` is an escape, so regex and template backslashes pass
 through; `""` is an empty replacement. Without `--all` it replaces the
 first match at or after the caret. Progressive

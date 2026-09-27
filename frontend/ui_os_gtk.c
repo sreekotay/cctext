@@ -649,3 +649,58 @@ const char *ui_os_font_family(const char *path) {
     if (strstr(path, "DejaVuSans")) return "DejaVu Sans";
     return "Monospace";
 }
+
+/* ---- images (ui_os.h) ---------------------------------------------------- */
+
+typedef struct {
+    cairo_surface_t *s;
+    int w, h;
+} UiImg;
+
+void *ui_os_image_new(const unsigned char *bgra, int w, int h, int stride) {
+    UiImg *im;
+    if (!bgra || w <= 0 || h <= 0 || stride < w * 4) return NULL;
+    if (cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, w) != stride) return NULL;
+    im = (UiImg *)calloc(1, sizeof *im);
+    if (!im) return NULL;
+    /* No copy: the cache frees this before the pixels. */
+    im->s = cairo_image_surface_create_for_data((unsigned char *)bgra, CAIRO_FORMAT_ARGB32,
+                                                w, h, stride);
+    if (cairo_surface_status(im->s) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(im->s);
+        free(im);
+        return NULL;
+    }
+    im->w = w;
+    im->h = h;
+    return im;
+}
+
+void ui_os_image_free(void *img) {
+    UiImg *im = (UiImg *)img;
+    if (!im) return;
+    cairo_surface_destroy(im->s);
+    free(im);
+}
+
+void ui_os_image_draw(uiDrawContext *ctx, void *img, double x, double y, double w,
+                      double h, double alpha) {
+    UiImg *im = (UiImg *)img;
+    cairo_t *cr;
+    cairo_pattern_t *pat;
+    if (!ctx || !im || w <= 0 || h <= 0 || alpha <= 0) return;
+    cr = ctx->cr;
+    cairo_save(cr);
+    cairo_rectangle(cr, x, y, w, h);
+    cairo_clip(cr);
+    cairo_translate(cr, x, y);
+    cairo_scale(cr, w / (double)im->w, h / (double)im->h);
+    cairo_set_source_surface(cr, im->s, 0, 0);
+    pat = cairo_get_source(cr);
+    cairo_pattern_set_filter(pat, (w < im->w * 0.75 || w > im->w * 1.5) ? CAIRO_FILTER_GOOD
+                                                                       : CAIRO_FILTER_BILINEAR);
+    cairo_pattern_set_extend(pat, CAIRO_EXTEND_PAD);
+    if (alpha >= 1.0) cairo_paint(cr);
+    else cairo_paint_with_alpha(cr, alpha);
+    cairo_restore(cr);
+}

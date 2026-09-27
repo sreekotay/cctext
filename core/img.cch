@@ -1,0 +1,305 @@
+#!ccc cch
+/*
+ * Images (docs/images.md). Owner: img.ccs (+ img_wuffs.c, the decoder;
+ * img_net.c, the fetch shim). Host-neutral: a loader (probe / decode /
+ * scale / EXIF), the source policy (local paths, data: URIs, remote
+ * URLs, the per-project allowances), a process-wide cache of decoded
+ * bitmaps under a pixel budget, and the background jobs that fill it.
+ *
+ * Bytes stay the truth: nothing here edits a document. A Markdown
+ * `![alt](src)` is a painted stand-in over its own bytes (layout.ccs);
+ * slides, the browse preview and the image viewer ask the same cache.
+ *
+ * Threads: the cache, the policy and every RtxImgView are UI-thread
+ * state. Jobs (header probe, decode, fetch) run on their own arms and
+ * touch only their job record; rtx_img_pump adopts finished jobs on the
+ * UI thread. Nothing blocks the frame: a query that needs work queues it
+ * and answers "wait" (the host paints a placeholder).
+ */
+#ifndef RTX_IMG_H
+#define RTX_IMG_H
+
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/* ---- limits (settings.json image_*; rtx_img_limits) ------------------- */
+#define RTX_IMG_FILE_MAX (64ull << 20)     /* bytes read from a file */
+#define RTX_IMG_DIM_MAX 16384u             /* either side, pixels */
+#define RTX_IMG_PX_MAX 100000000ull        /* width * height */
+#define RTX_IMG_BUDGET (256ull << 20)      /* decoded bytes held, LRU */
+#define RTX_IMG_MAX_H 480u                 /* Rich: display height cap, px */
+#define RTX_IMG_ANIM_FRAMES 64u            /* frame cap when animation is on */
+#define RTX_IMG_DATA_MAX (1ull << 20)      /* data: URI payload */
+#define RTX_IMG_REMOTE_MAX (16ull << 20)   /* bytes one fetch may bring */
+#define RTX_IMG_TIMEOUT_S 20u              /* one fetch, seconds */
+#define RTX_IMG_CACHE_MAX (256ull << 20)   /* fetch cache on disk */
+
+typedef struct {
+    uint64_t file_max;
+    uint32_t dim_max;
+    uint64_t px_max;
+    uint64_t budget;
+    uint32_t max_h;
+    int anim;              /* animated GIF / WebP: 0 = first frame only */
+    uint32_t anim_frames;
+    uint64_t data_max;
+    uint64_t remote_max;
+    uint32_t timeout_s;
+    uint64_t cache_max;
+} RtxImgLimits;
+
+/* The process's limits (defaults above until settings change them). */
+RtxImgLimits *rtx_img_limits(void);
+void rtx_img_limits_default(RtxImgLimits *l);
+
+/* ---- results ---------------------------------------------------------- */
+enum {
+    RTX_IMG_OK = 0,
+    RTX_IMG_MORE = 1,          /* probe: the header runs past the bytes given */
+    RTX_IMG_EFORMAT = -1,      /* not an image format we read */
+    RTX_IMG_ECORRUPT = -2,
+    RTX_IMG_ETRUNC = -3,
+    RTX_IMG_ENOMEM = -4,
+    RTX_IMG_ECANCEL = -5,
+    RTX_IMG_EFILE = -6,        /* over the file size limit */
+    RTX_IMG_EDIM = -7,         /* a side over the dimension limit */
+    RTX_IMG_EPX = -8,          /* over the megapixel limit */
+    RTX_IMG_EBUDGET = -9,      /* its pixels alone pass the cache budget */
+    RTX_IMG_EIO = -10,         /* missing / unreadable */
+    RTX_IMG_EDENIED = -11,     /* local file outside the project, not allowed */
+    RTX_IMG_EREMOTE = -12,     /* remote, not consented */
+    RTX_IMG_EFETCH = -13,      /* fetch failed (status, network) */
+    RTX_IMG_EDATA = -14,       /* data: URI malformed or over its limit */
+    RTX_IMG_ETIMEOUT = -15,    /* fetch timed out */
+    RTX_IMG_ESIZE = -16,       /* fetch passed its byte cap */
+    RTX_IMG_EHTTP = -17,       /* plain http, not allowed for this host */
+    RTX_IMG_ESRC = -18         /* no source (untitled document, empty src) */
+};
+/* Short text for a placeholder: "file over 64 MiB limit", "16384 px side
+ * limit", ... (static or into buf). */
+const char *rtx_img_err_text(int err, char *buf, size_t n);
+
+enum {
+    RTX_IMG_FMT_NONE = 0,
+    RTX_IMG_FMT_PNG,
+    RTX_IMG_FMT_JPEG,
+    RTX_IMG_FMT_GIF,
+    RTX_IMG_FMT_BMP,
+    RTX_IMG_FMT_WEBP,
+    RTX_IMG_FMT_QOI
+};
+const char *rtx_img_fmt_name(int fmt);
+
+typedef struct {
+    int fmt;
+    uint32_t w, h;         /* as displayed (EXIF orientation applied) */
+    uint32_t cw, ch;       /* coded canvas */
+    int orient;            /* EXIF 1-8; 1 = as coded */
+    uint64_t workbuf;      /* decoder scratch the image needs */
+} RtxImgInfo;
+
+/* Pixel layouts a caller can ask for. BGRA premultiplied is what cairo
+ * (ARGB32, little-endian) and Core Graphics (32Little | PremultipliedFirst)
+ * draw directly; RGBA straight is for a terminal protocol (phase 2). */
+enum {
+    RTX_IMG_PIX_BGRA_PREMUL = 0,
+    RTX_IMG_PIX_RGBA = 1
+};
+
+typedef struct {
+    uint32_t w, h, stride;
+    int pix;
+    uint32_t nframe;       /* >= 1 */
+    uint32_t *delay;       /* per frame, ms (NULL when nframe == 1) */
+    uint8_t *px;           /* nframe * h * stride */
+    uint64_t bytes;
+} RtxImgBmp;
+
+/* ---- the loader (pure; any thread) ------------------------------------ */
+
+/* Format of b[0, n) from its magic bytes (RTX_IMG_FMT_NONE: not ours). */
+int rtx_img_sniff(const uint8_t *b, size_t n);
+
+/* Header only: format, size, EXIF orientation. `closed`: b[0, n) is the
+ * whole input. Limits are checked here, before anything is allocated:
+ * RTX_IMG_EDIM / EPX / EBUDGET with *out filled. RTX_IMG_MORE: read more. */
+int rtx_img_probe(const uint8_t *b, size_t n, int closed, const RtxImgLimits *lim,
+                  RtxImgInfo *out);
+
+/* EXIF orientation (1-8) from a JPEG APP1, PNG eXIf or WebP EXIF chunk in
+ * b[0, n); 1 when absent or unreadable. Other metadata is ignored. */
+int rtx_img_exif_orient(const uint8_t *b, size_t n);
+
+/* Decode to at most max_w x max_h (0 = natural), aspect kept, never
+ * upscaled, orientation applied, in layout `pix`. Only the scaled result
+ * is kept: the full-size canvas is freed before return. max_frames > 1
+ * decodes that many frames of an animation (each scaled). Polls *cancel.
+ * Limits are checked from the header before any pixel allocation. */
+int rtx_img_decode(const uint8_t *b, size_t n, const RtxImgLimits *lim,
+                   uint32_t max_w, uint32_t max_h, int pix, uint32_t max_frames,
+                   const _Atomic int *cancel, RtxImgBmp *out, RtxImgInfo *info);
+void rtx_img_bmp_free(RtxImgBmp *bmp);
+
+/* Fit (w, h) into (max_w, max_h) (0 = no cap), aspect kept, never above
+ * natural; at least 1 x 1. */
+void rtx_img_fit(uint32_t w, uint32_t h, uint32_t max_w, uint32_t max_h,
+                 uint32_t *ow, uint32_t *oh);
+
+/* Box-filter scale with an EXIF orientation: src (cw x ch BGRA premul,
+ * stride cw*4) → dst (w x h, stride w*4), `orient` 1-8. */
+void rtx_img_scale(const uint8_t *src, uint32_t cw, uint32_t ch, int orient,
+                   uint8_t *dst, uint32_t w, uint32_t h);
+
+/* ---- sources and policy ----------------------------------------------- */
+enum {
+    RTX_IMG_SRC_NONE = 0,
+    RTX_IMG_SRC_LOCAL,
+    RTX_IMG_SRC_DATA,
+    RTX_IMG_SRC_REMOTE
+};
+
+#define RTX_IMG_PATH 4096
+
+typedef struct {
+    int kind;
+    int err;               /* RTX_IMG_OK, EDENIED (ask), EREMOTE (ask), EIO... */
+    char key[RTX_IMG_PATH];    /* cache key: realpath / url / data:<hash> */
+    char host[256];        /* remote host */
+    int http;              /* remote over plain http */
+    int once;              /* remote allowed for this session only */
+    const char *data;      /* data: the URI bytes (caller's) */
+    size_t data_n;
+} RtxImgSrc;
+
+/* Resolve a Markdown image destination `src[0, n)` of the document at
+ * `doc_path` (NULL: untitled). Local: percent-decoded, relative to the
+ * document's directory, then realpath (symlinks followed); allowed inside
+ * the document's project root (nearest `.git` above it, else its
+ * directory) or by an allowance. Remote: allowed only by a decision. */
+int rtx_img_resolve(const char *doc_path, const char *src, size_t n, RtxImgSrc *out);
+
+/* A file the user opened or selected (the image viewer, the browse
+ * preview): no document, so no project policy; realpath only. */
+int rtx_img_src_file(const char *path, RtxImgSrc *out);
+
+/* Allowances (per project, a sidecar in the safe home, `img/<hash>`):
+ * persisted with the project's root. */
+enum {
+    RTX_IMG_ALLOW_FILE = 1,
+    RTX_IMG_ALLOW_DIR,
+    RTX_IMG_ALLOW_ALL_LOCAL,
+    RTX_IMG_ALLOW_ONCE,        /* remote: this URL, this session */
+    RTX_IMG_ALLOW_HOST,        /* remote: always from this host */
+    RTX_IMG_ALLOW_ALL_REMOTE   /* remote: always, this project */
+};
+/* Record a decision for `s` (as resolved from doc_path). 1 = stored. A
+ * remote http URL's decision also allows http for its host. */
+int rtx_img_allow(const char *doc_path, const RtxImgSrc *s, int what);
+/* Forget every allowance of the project holding doc_path (NULL: all
+ * projects this process loaded); also forgets session decisions and
+ * drops cached entries that depended on them. Returns how many went. */
+int rtx_img_revoke(const char *doc_path);
+/* Project root rtx_img_resolve uses for doc_path (tests, status). */
+int rtx_img_project_of(const char *doc_path, char *out, size_t n);
+/* Drop the in-memory copy of every allowance file (tests: reload). */
+void rtx_img_policy_reload(void);
+
+/* ---- cache + jobs (UI thread) ----------------------------------------- */
+
+enum {
+    RTX_IMG_S_WAIT = 0,        /* header or pixels on the way: placeholder */
+    RTX_IMG_S_INFO,            /* size known, pixels on the way */
+    RTX_IMG_S_OK,              /* bitmap ready */
+    RTX_IMG_S_ERR,             /* err says why: placeholder naming it */
+    RTX_IMG_S_ASK              /* needs a decision (EDENIED / EREMOTE) */
+};
+
+typedef struct RtxImgBmpEnt RtxImgBmpEnt;
+
+typedef struct {
+    int state;
+    int err;
+    int have_info;
+    RtxImgInfo info;
+    const RtxImgBmp *bmp;  /* S_OK */
+    uint32_t frame;        /* animation frame to paint */
+    RtxImgBmpEnt *be;      /* for the host's platform object (below) */
+    RtxImgSrc src;
+} RtxImgView;
+
+/* Size only (layout): header state for `src`; queues a header probe when
+ * unknown. Never decodes pixels. */
+int rtx_img_info(const RtxImgSrc *src, RtxImgView *v);
+
+/* Pixels at about (w, h) for painting this frame: marks the bitmap wanted
+ * (visible first; one not asked for since the last rtx_img_frame is
+ * cancelled when pending, and evictable), queues a decode when missing.
+ * A cached bitmap within 10 % of (w, h) is reused. */
+int rtx_img_want(const RtxImgSrc *src, uint32_t w, uint32_t h, RtxImgView *v);
+
+/* A paint pass begins: bitmaps not wanted in the last pass may be
+ * cancelled / evicted. Partial paints (a caret blink) do not call it. */
+void rtx_img_frame(void);
+
+/* Adopt finished jobs, start queued ones, cancel ones nobody wants,
+ * advance fetches. Returns 1 when something a host shows changed (sizes:
+ * relayout; pixels: repaint). */
+int rtx_img_pump(void);
+/* A header size arrived since the last call (layout must refill). */
+int rtx_img_layout_changed(void);
+/* Bumps whenever a header size or a policy decision changes what a
+ * layout would reserve (a cache of laid-out slides compares it). */
+unsigned rtx_img_gen(void);
+/* Work in flight (the host polls at its frame tick while 1). */
+int rtx_img_busy(void);
+/* ms until an animation frame is due (-1: none; the host sleeps). */
+long rtx_img_next_ms(long now_ms);
+/* Wait for every queued job (tests, batch). */
+void rtx_img_finish(void);
+
+/* Host platform object per bitmap (cairo surface, CGImage): the GUI
+ * keeps one per decoded bitmap here; it is freed with the bitmap. */
+void *rtx_img_plat(const RtxImgBmpEnt *be, uint32_t frame);
+void rtx_img_plat_set(RtxImgBmpEnt *be, uint32_t frame, void *obj,
+                      void (*free_fn)(void *obj));
+
+/* The text stand-in of an image: "[image: alt WxH]" (the terminal's
+ * whole picture in this phase, and cctext-ui's for an image inside a
+ * line of text); "[image: alt]" while the header is on its way;
+ * "[image: alt - host]" / "[image: alt - reason]" when it needs a
+ * decision or failed. The alt is cut to fit. Returns bytes (< cap). */
+size_t rtx_img_standin(const RtxImgView *v, const char *alt, size_t altn, char *out,
+                       size_t cap);
+
+/* Policy generation: bumps on every allow / revoke / reload (a host that
+ * cached resolutions or a laid-out stand-in refreshes). */
+unsigned rtx_img_policy_gen(void);
+
+/* A file holding the image's bytes, to open full size: the local path,
+ * the fetch cache file (remote, once fetched), or a data: payload written
+ * beside the cache. 0 when there is none yet. */
+int rtx_img_file(const RtxImgSrc *src, char *out, size_t n);
+
+/* Remote: start the fetch the user just allowed for `src` (a no-op when
+ * cached / in flight). */
+void rtx_img_fetch(const RtxImgSrc *src);
+
+/* Statistics (tests, status): decoded bytes held, bitmaps, entries. */
+uint64_t rtx_img_held(void);
+size_t rtx_img_nbmp(void);
+size_t rtx_img_fetches(void);      /* fetch processes started */
+/* Drop every cached bitmap and header (tests). */
+void rtx_img_reset(void);
+
+/* Parse a Markdown image at s[i, e): `![alt](src "title")`. Returns the
+ * byte after it or 0; alt [*alo, *ahi), src [*slo, *shi) (angle brackets
+ * and title stripped). */
+size_t rtx_img_md_parse(const char *s, size_t i, size_t e, size_t *alo,
+                        size_t *ahi, size_t *slo, size_t *shi);
+/* A line that is one image and blanks (the Rich stand-in's line). The
+ * image's span is [*lo, *hi). */
+int rtx_img_md_line(const char *s, size_t n, size_t *lo, size_t *hi,
+                    size_t *alo, size_t *ahi, size_t *slo, size_t *shi);
+
+#endif /* RTX_IMG_H */

@@ -408,8 +408,52 @@ static void !>(CCError) rtx_doc_policy_replace(RtxDoc *d, size_t off, size_t n,
     return cc_ok();
 }
 
+uint64_t rtx_hist_cur_sid(const RtxHistory *h) {
+    if (!h) return 0;
+    return h->head ? h->recs[h->head - 1].sid : h->base_sid;
+}
+
+size_t rtx_hist_pos_of(const RtxHistory *h, uint64_t sid) {
+    size_t i;
+    if (!h) return (size_t)-1;
+    if (sid == h->base_sid) return 0;
+    for (i = h->len; i-- > 0;) {
+        if (h->recs[i].sid == sid) return i + 1;
+    }
+    return (size_t)-1;
+}
+
+/* A savepoint is a history state, not a stack position (DESIGN Edits):
+ * dirty unless the state at head IS the state the file holds. */
 int RtxDoc_dirty(const RtxDoc *d) {
-    return d && d->hist.head != d->saved_head;
+    return d && rtx_hist_cur_sid(&d->hist) != d->saved_sid;
+}
+
+void RtxDoc_mark_saved(RtxDoc *d) {
+    if (!d) return;
+    d->saved_sid = rtx_hist_cur_sid(&d->hist);
+    d->hist.sb = NULL;
+    d->hist.sb_len = 0;
+    d->hist.fork_sid = 0;
+    d->hist.sb_lost = 0;
+    /* The next keystroke is its own record: undo lands on the save. */
+    d->hist.coalesce = 0;
+}
+
+int RtxDoc_saved_where(const RtxDoc *d, size_t *pos) {
+    size_t p;
+    if (!d) return 0;
+    if (d->hist.sb_lost) return 0;
+    if (d->hist.sb_len) {
+        p = rtx_hist_pos_of(&d->hist, d->hist.fork_sid);
+        if (p == (size_t)-1) return 0;
+        if (pos) *pos = p;
+        return 2;
+    }
+    p = rtx_hist_pos_of(&d->hist, d->saved_sid);
+    if (p == (size_t)-1) return 0;
+    if (pos) *pos = p;
+    return 1;
 }
 
 int RtxDoc_has_sel(const RtxDoc *d) {
@@ -1016,6 +1060,11 @@ static void rtx_doc_fold_shift(RtxDoc *d, size_t at, size_t erased, size_t inser
         }
     }
     d->fold_n = o;
+}
+
+/* Tell the derived hook a tree write of old [at, at + erased) is next. */
+static void rtx_doc_pre(RtxDoc *d, size_t at, size_t erased) {
+    if (d && d->derived && d->derived->pre) d->derived->pre(d->derived->ctx, d, at, erased);
 }
 
 /* Grow the edit span by one replace (old [at, at+erased) -> [at, at+inserted)).
@@ -1871,14 +1920,14 @@ void !>(CCError) RtxDoc_from_path(RtxDoc *d, char[:0] path) {
     rtx_doc_ident_stamp(d, path);
     /* A `*.wb.md` path is a workbook (docs/workbook.md); no other file
      * gets the derived-value hook. */
-    if (rtx_wb_path(path.ptr, path.len)) (void)rtx_wb_attach(d);
+    if (rtx_wb_path(path.ptr, path.len)) (void)rtx_wb_attach_path(d, path.ptr);
     return cc_ok();
 }
 
 void !>(CCError) RtxDoc_from_base(RtxDoc *d, char[:0] base, char[:0] path,
                                   int64_t mtime_ns, uint64_t sz, uint64_t ino) {
     rtx_doc_open_as(d, base, path) !>(e) { return cc_err(e); };
-    if (rtx_wb_path(path.ptr, path.len)) (void)rtx_wb_attach(d);
+    if (rtx_wb_path(path.ptr, path.len)) (void)rtx_wb_attach_named(d, path.ptr);
     d->disk_mtime = mtime_ns;
     d->disk_sz = sz;
     d->disk_ino = ino;
@@ -1930,6 +1979,9 @@ void rtx_find_scan_wipe(RtxDoc *d) {
     d->find.chain_end = 0;
     d->find.long_n = 0;
     d->find.long_off = 0;
+    d->find.indet = 0;
+    d->find.indet_off = 0;
+    d->find.indet_line = 0;
 }
 
 void RtxDoc_find_invalidate(RtxDoc *d) {
@@ -1987,9 +2039,33 @@ static size_t rtx_doc_run_step(const RtxDoc *d, size_t i, size_t off) {
     return rtx_doc_run_top_find(d, i + 1, off);
 }
 
+/* The derived hook's style runs (workbook anchor tags): 1 and the tag's
+ * scope when `off` is in one; *next the next edge after `off` either way
+ * ((size_t)-1: none). */
+static int rtx_doc_dstyle(const RtxDoc *d, size_t off, RtxScope *scope, size_t *next) {
+    static RtxScope anchor;
+    size_t lo = 0, hi = (size_t)-1;
+    *next = (size_t)-1;
+    if (!d || !d->derived || !d->derived->style) return 0;
+    if (!d->derived->style(d->derived->ctx, d, off, &lo, &hi)) {
+        *next = hi;
+        return 0;
+    }
+    *next = hi;
+    if (anchor == RTX_SCOPE_NONE && !rtx_scope_put(&anchor, "entity.name.anchor.workbook"))
+        return 0;
+    *scope = anchor;
+    return 1;
+}
+
 RtxStyle RtxDoc_style_at(const RtxDoc *d, size_t off) {
     RtxStyle z = {0};
-    size_t i;
+    size_t i, dn;
+    RtxScope ds;
+    if (d && d->derived && d->derived->style && rtx_doc_dstyle(d, off, &ds, &dn)) {
+        z.scope = ds;
+        return z;
+    }
     if (!d || d->runs.len == 0) return z;
     i = rtx_doc_run_first(d, off);
     for (; i < d->runs.len && d->runs.data[i].start <= off;
@@ -2017,7 +2093,19 @@ RtxStyle RtxDoc_style_at(const RtxDoc *d, size_t off) {
  * style_at is constant on [off, style_next(off)). Same binary search and
  * outer-cover back-walk as style_at, so nested runs (CSV string with
  * inner runs) report the inner edge, not just the cover's. */
+static size_t rtx_doc_style_next_runs(const RtxDoc *d, size_t off, size_t hi);
+
 size_t RtxDoc_style_next(const RtxDoc *d, size_t off, size_t hi) {
+    size_t next = rtx_doc_style_next_runs(d, off, hi), dn;
+    RtxScope ds;
+    if (d && d->derived && d->derived->style && off < hi) {
+        rtx_doc_dstyle(d, off, &ds, &dn);
+        if (dn > off && dn < next) next = dn;
+    }
+    return next;
+}
+
+static size_t rtx_doc_style_next_runs(const RtxDoc *d, size_t off, size_t hi) {
     size_t lo, j, next = hi;
     if (!d || d->runs.len == 0 || off >= hi) return hi;
     lo = rtx_doc_run_last_le(d, off);
@@ -2195,7 +2283,7 @@ static int rtx_style_cur_to(const RtxDoc *d, RtxStyleCur *c, size_t off) {
 
 RtxStyle RtxDoc_style_cur(const RtxDoc *d, RtxStyleCur *c, size_t off) {
     RtxStyle z = {0};
-    if (!d || !c) return RtxDoc_style_at(d, off);
+    if (!d || !c || (d->derived && d->derived->style)) return RtxDoc_style_at(d, off);
     if (d->runs.len == 0) return z;
     if (!rtx_style_cur_to(d, c, off)) return RtxDoc_style_at(d, off);
     z = c->raw;
@@ -2210,7 +2298,8 @@ RtxStyle RtxDoc_style_cur(const RtxDoc *d, RtxStyleCur *c, size_t off) {
 }
 
 size_t RtxDoc_style_cur_next(const RtxDoc *d, RtxStyleCur *c, size_t off, size_t hi) {
-    if (!d || !c || d->runs.len == 0 || off >= hi) return RtxDoc_style_next(d, off, hi);
+    if (!d || !c || d->runs.len == 0 || off >= hi || (d->derived && d->derived->style))
+        return RtxDoc_style_next(d, off, hi);
     if (!rtx_style_cur_to(d, c, off)) return RtxDoc_style_next(d, off, hi);
     return c->lim < hi ? c->lim : hi;
 }
@@ -6569,9 +6658,81 @@ static int rtx_bytes_touch_section(char[:] p) {
     return 0;
 }
 
-static void rtx_hist_drop_tail(RtxHistory *h) {
-    if (!h || h->head >= h->len) return;
+/* Dropping the redo tail (a new edit after undo). The saved state may sit
+ * in that tail, or be a branch hanging off a state in it: keep what
+ * reaches it as the branch (hist.sb) so a journal still replays against
+ * the file. Prep allocates before the tree moves; commit only assigns. */
+typedef struct {
+    RtxHistRec *sb;
+    size_t n;
+    uint64_t fork;
+    int live;
+} RtxHistCut;
+
+static void !>(CCError) rtx_hist_cut_prep(RtxDoc *d, RtxHistCut *c) {
+    RtxHistory *h;
+    size_t sp, fp, head, n, i;
+    RtxHistRec *sb;
+    *c = (RtxHistCut){0};
+    if (!d) return cc_err(CC_ERR_INVALID_ARG, "hist cut");
+    h = &d->hist;
+    head = h->head;
+    if (head >= h->len || h->sb_lost) return cc_ok();
+    sp = rtx_hist_pos_of(h, d->saved_sid);
+    if (sp != (size_t)-1 && sp > head) {
+        n = sp - head;
+        fp = sp;
+    } else if (sp == (size_t)-1 && h->sb_len) {
+        fp = rtx_hist_pos_of(h, h->fork_sid);
+        if (fp == (size_t)-1 || fp <= head) return cc_ok();
+        n = fp - head + h->sb_len;
+    } else {
+        return cc_ok();
+    }
+    if (n > SIZE_MAX / sizeof(RtxHistRec)) return cc_err(CC_ERR_OUT_OF_MEMORY, "hist cut");
+    sb = (RtxHistRec *)cc_arena_alloc(d->session, n * sizeof(RtxHistRec), 8);
+    if (!sb) return cc_err(CC_ERR_OUT_OF_MEMORY, "hist cut");
+    for (i = head; i < fp; i++) sb[i - head] = h->recs[i];
+    if (fp - head < n) {
+        for (i = 0; i < h->sb_len; i++) sb[fp - head + i] = h->sb[i];
+    }
+    c->sb = sb;
+    c->n = n;
+    c->fork = rtx_hist_cur_sid(h);
+    c->live = 1;
+    return cc_ok();
+}
+
+static void rtx_hist_cut_commit(RtxDoc *d, const RtxHistCut *c) {
+    RtxHistory *h = &d->hist;
+    if (h->head >= h->len) return;
+    if (c && c->live) {
+        h->sb = c->sb;
+        h->sb_len = c->n;
+        h->fork_sid = c->fork;
+    } else if (!h->sb_lost) {
+        /* No prep (or it could not allocate): a saved state that was in
+         * the tail is gone for good. Dirty stays right (its id is never
+         * handed out again); only a journal can no longer name it. */
+        size_t sp = rtx_hist_pos_of(h, d->saved_sid);
+        size_t fp = h->sb_len ? rtx_hist_pos_of(h, h->fork_sid) : (size_t)-1;
+        if ((sp != (size_t)-1 && sp > h->head) ||
+            (sp == (size_t)-1 && fp != (size_t)-1 && fp > h->head)) {
+            h->sb = NULL;
+            h->sb_len = 0;
+            h->fork_sid = 0;
+            h->sb_lost = 1;
+        }
+    }
     h->len = h->head;
+}
+
+/* The record at head - 1 leads to the saved state or the branch's fork:
+ * extending it in place would change that state, so it takes no more. */
+static int rtx_hist_anchored(const RtxDoc *d, const RtxHistRec *r) {
+    if (!d || !r) return 0;
+    if (r->sid == d->saved_sid) return 1;
+    return d->hist.sb_len && r->sid == d->hist.fork_sid;
 }
 
 /* Coalesce only a pure insert onto a pure insert, or a pure erase onto a
@@ -8193,6 +8354,7 @@ void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
     size_t sel0;
     int markup;
     int coalesced = 0;
+    RtxHistCut cut = {0};
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
     len = d->len();
@@ -8230,7 +8392,8 @@ void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
                  rtx_bytes_touch_section(del) ||
                  rtx_bytes_touch_section(ins);
         if (!d->hist.applying) {
-            if (d->hist.coalesce && d->hist.head > 0) {
+            if (d->hist.coalesce && d->hist.head > 0 &&
+                !rtx_hist_anchored(d, &d->hist.recs[d->hist.head - 1])) {
                 last = &d->hist.recs[d->hist.head - 1];
                 if (rtx_hist_can_coalesce_insert(last, off, n, ins)) {
                     rtx_hist_coalesce_ins_reserve(d, last, ins.len) !>(e) {
@@ -8273,9 +8436,11 @@ void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
                     rec.ins = keep;
                 }
                 rtx_hist_grow(d) !>(e) { return cc_err(e); };
+                rtx_hist_cut_prep(d, &cut) !>(e) { return cc_err(e); };
             }
         }
         rtx_find_join(&d->find);
+        rtx_doc_pre(d, off, n);
         d->tree.replace(off, n, ins) !>(e) {
             if (rtx_err_is_unrestorable(e)) d->broken = 1;
             return cc_err(e);
@@ -8305,6 +8470,7 @@ void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
                 last->sel_box_after = d->sel_box;
                 last->box_acol_after = d->box_acol;
                 last->box_ccol_after = d->box_ccol;
+                last->sid = ++d->hist.sid_next; /* a different state now */
             } else if (coalesced == 2 && last) {
                 rtx_hist_coalesce_del_commit(last, del) !>(e) {
                     d->broken = 1;
@@ -8316,8 +8482,10 @@ void !>(CCError) RtxDoc_replace(RtxDoc *d, size_t off, size_t n, char[:] ins) {
                 last->sel_box_after = d->sel_box;
                 last->box_acol_after = d->box_acol;
                 last->box_ccol_after = d->box_ccol;
+                last->sid = ++d->hist.sid_next;
             } else {
-                rtx_hist_drop_tail(&d->hist);
+                rtx_hist_cut_commit(d, &cut);
+                rec.sid = ++d->hist.sid_next;
                 rec.off = off;
                 rec.caret_before = caret0;
                 rec.sel_before = sel0;
@@ -8648,6 +8816,7 @@ static RtxGroupSide rtx_group_rec_ins(const RtxHistRec *r) {
  * rule single undo keeps). */
 static void !>(CCError) rtx_group_put(RtxDoc *d, size_t at, size_t old_n,
                                      const RtxGroupSide *put) {
+    rtx_doc_pre(d, at, old_n);
     if (!put->nrefs) return d->tree.replace(at, old_n, put->text);
     if (old_n) {
         d->tree.replace(at, old_n, cc_slice_empty()) !>(e) { return cc_err(e); };
@@ -8839,6 +9008,7 @@ void !>(CCError) rtx_doc_replace_group(RtxDoc *d, const RtxEdit *edits, size_t n
     CCArena a = {0} @destroy;
     RtxGroupOp *ops;
     RtxHistRec *prep;
+    RtxHistCut cut = {0};
     size_t i, k, t, len, caret0, sel0, bac0, bcc0, caret1;
     int box0;
     ptrdiff_t acc;
@@ -8888,6 +9058,7 @@ void !>(CCError) rtx_doc_replace_group(RtxDoc *d, const RtxEdit *edits, size_t n
         size_t need = d->hist.head + k;
         if (need < d->hist.head) return cc_err(CC_ERR_OUT_OF_MEMORY, "group hist");
         rtx_hist_reserve(d, need) !>;
+        rtx_hist_cut_prep(d, &cut) !>;
     }
     caret0 = d->caret;
     sel0 = d->sel_anchor;
@@ -8944,7 +9115,7 @@ void !>(CCError) rtx_doc_replace_group(RtxDoc *d, const RtxEdit *edits, size_t n
     d->box_ccol = 0;
     if (!d->hist.applying) {
         size_t gid;
-        rtx_hist_drop_tail(&d->hist);
+        rtx_hist_cut_commit(d, &cut);
         gid = ++d->hist.group_next;
         /* Apply order: the highest site first. */
         for (t = k; t-- > 0;) {
@@ -8962,6 +9133,7 @@ void !>(CCError) rtx_doc_replace_group(RtxDoc *d, const RtxEdit *edits, size_t n
             rec.box_ccol_after = 0;
             rec.group = gid;
             rec.xact = xact;
+            rec.sid = ++d->hist.sid_next;
             d->hist.recs[d->hist.len++] = rec;
         }
         d->hist.head = d->hist.len;
@@ -9539,6 +9711,7 @@ static void !>(CCError) rtx_bulk_land(RtxBulk *b, RtxPieceRef **olds, RtxPieceRe
     if ((b->nold && !*olds) || (b->nnew && !*news))
         return cc_err(CC_ERR_OUT_OF_MEMORY, "bulk hist");
     rtx_find_join(&d->find);
+    rtx_doc_pre(d, b->lo, b->old_n);
     RtxPieceTree_bulk_swap(&d->tree, b->lo, b->old_n, b->news, b->nnew, b->staged) !>(e) {
         if (rtx_err_is_unrestorable(e)) d->broken = 1;
         return cc_err(e);
@@ -9550,6 +9723,7 @@ static void !>(CCError) rtx_bulk_land(RtxBulk *b, RtxPieceRef **olds, RtxPieceRe
 void !>(CCError) rtx_bulk_commit(RtxBulk *b, uint64_t xact) {
     RtxDoc *d;
     RtxHistBulk *hb = NULL;
+    RtxHistCut cut = {0};
     RtxPieceRef *olds = NULL, *news = NULL;
     size_t caret0, sel0, bac0, bcc0;
     int box0, rec;
@@ -9573,6 +9747,10 @@ void !>(CCError) rtx_bulk_commit(RtxBulk *b, uint64_t xact) {
         *hb = (RtxHistBulk){0};
         hb->enc = enc;
         hb->enc_n = b->enc_n;
+        rtx_hist_cut_prep(d, &cut) !>(e) {
+            rtx_bulk_drop(b);
+            return cc_err(e);
+        };
     }
     caret0 = d->caret;
     sel0 = d->sel_anchor;
@@ -9600,7 +9778,8 @@ void !>(CCError) rtx_bulk_commit(RtxBulk *b, uint64_t xact) {
         hb->news = news;
         hb->nnew = b->nnew;
         hb->ready = 1;
-        rtx_hist_drop_tail(&d->hist);
+        rtx_hist_cut_commit(d, &cut);
+        r.sid = ++d->hist.sid_next;
         r.off = b->lo;
         r.caret_before = caret0;
         r.sel_before = sel0;
@@ -9652,6 +9831,7 @@ static void !>(CCError) rtx_hist_bulk_move(RtxDoc *d, RtxHistRec *r, int redo) {
         hb->ready = 1;
     } else {
         rtx_find_join(&d->find);
+        rtx_doc_pre(d, hb->lo, cur_n);
         RtxPieceTree_bulk_swap(&d->tree, hb->lo, cur_n, redo ? hb->news : hb->olds,
                                redo ? hb->nnew : hb->nold, 0) !>(e) {
             if (rtx_err_is_unrestorable(e)) d->broken = 1;
@@ -9796,7 +9976,16 @@ int RtxDoc_hist_has_xact(const RtxDoc *d, uint64_t xact) {
 }
 
 void rtx_hist_cut_tail(RtxDoc *d) {
-    if (d) rtx_hist_drop_tail(&d->hist);
+    RtxHistCut cut = {0};
+    if (!d) return;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            cut.live = 0;
+        }
+        rtx_hist_cut_prep(d, &cut) !>;
+    }
+    rtx_hist_cut_commit(d, &cut);
 }
 
 void !>(CCError) RtxDoc_undo(RtxDoc *d) {
@@ -9828,6 +10017,7 @@ void !>(CCError) RtxDoc_undo(RtxDoc *d) {
             restore_n = refs.nbytes;
             markup = 1;
             pieces = 1;
+            rtx_doc_pre(d, r->off, ins.len);
             d->tree.replace(r->off, ins.len, cc_slice_empty()) !>(e) {
                 d->hist.applying = 0;
                 if (rtx_err_is_unrestorable(e)) d->broken = 1;
@@ -9845,6 +10035,7 @@ void !>(CCError) RtxDoc_undo(RtxDoc *d) {
             restore_n = del.len;
             markup = rtx_bytes_touch_section(del) ||
                      rtx_bytes_touch_section(ins);
+            rtx_doc_pre(d, r->off, ins.len);
             d->tree.replace(r->off, ins.len, del) !>(e) {
                 d->hist.applying = 0;
                 if (rtx_err_is_unrestorable(e)) d->broken = 1;
@@ -9890,6 +10081,7 @@ void !>(CCError) RtxDoc_redo(RtxDoc *d) {
     d->hist.applying = 1;
     d->hist.coalesce = 0;
     rtx_find_join(&d->find);
+    rtx_doc_pre(d, r->off, erase_n);
     d->tree.replace(r->off, erase_n, ins) !>(e) {
         d->hist.applying = 0;
         if (rtx_err_is_unrestorable(e)) d->broken = 1;
@@ -10171,6 +10363,7 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
     mode_t mode = 0666;
     int have_mode = 0;
     int have_st = 0;
+    int exists = 0;
     struct stat st;
     if (!d || !path.ptr || path.len == 0) return cc_err(CC_ERR_INVALID_ARG, "save path");
     if (d->broken) return cc_err(CC_ERR_INTERNAL, "doc broken");
@@ -10184,6 +10377,7 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
         mode = st.st_mode & 0777;
         have_mode = 1;
         have_st = 1;
+        exists = 1;
     }
     {
         int force = d->save_overwrite;
@@ -10195,23 +10389,31 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
     }
     if (rtx_save_backup) {
         char bak[4096];
-        size_t lo = 0, hi = 0, oldn, newn, bak_to;
-        int same = 0;
+        size_t lo = 0, hi = 0, dlen, newn, bak_to;
+        int same = 0, alias;
         if (n + 2 >= sizeof(bak)) return cc_err(CC_ERR_INVALID_ARG, "path too long");
         snprintf(bak, sizeof(bak), "%s~", p);
         /* --backup writes through `p`, which may be the inode find /
          * island lanes pread. Join them first. */
         rtx_find_join(&d->find);
         rtx_isle_handle_stop(&d->tree);
-        oldn = d->tree.save_span(&lo, &hi);
+        /* `p` names this document's original (its path, a hard link, a
+         * symlink to it): the dirty span is against what that inode holds
+         * now (disk_len; spans a save already rewrote are not aligned),
+         * and nothing below writes it before the ORIGINAL bytes it changes
+         * are preserved (page_store.cch) — for this doc and every other
+         * doc open on that inode. */
+        alias = exists && RtxPageStore_orig_is(&d->tree.store, (uint64_t)st.st_dev,
+                                               (uint64_t)st.st_ino);
+        dlen = d->tree.save_span(&lo, &hi);
         newn = d->tree.len();
-        if (d->path.ptr && d->path.eq(path) && d->tree.store.orig_open &&
-            have_st && (size_t)st.st_size == oldn && lo <= oldn)
-            same = 1;
-        bak_to = (newn == oldn && hi <= oldn) ? hi : oldn;
-        if (access(p, F_OK) == 0) {
+        if (alias && have_st && (size_t)st.st_size == dlen && lo <= dlen) same = 1;
+        bak_to = (newn == dlen && hi <= dlen) ? hi : dlen;
+        if (exists) {
+            /* path~ is rewritten in place: it may be an open original. */
+            rtx_orig_preserve_path(bak, 0, (size_t)-1) !>(e) { return cc_err(e); };
             if (same)
-                rtx_save_copy_span(p, bak, lo, bak_to, oldn, mode, have_mode) !>(e) {
+                rtx_save_copy_span(p, bak, lo, bak_to, dlen, mode, have_mode) !>(e) {
                     return cc_err(e);
                 };
             else
@@ -10220,83 +10422,27 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
                 };
         }
         if (same) {
-            size_t flo = 0, fhi = 0, on;
-            CCArena pin_a = {0};
-            char *pin = NULL;
-            on = d->tree.save_orig_span(lo, hi, &flo, &fhi);
-            /* Streaming original pieces through the inode we are shifting
-             * aliases unread tail bytes. Pin a small tail first; a large
-             * one writes a full temp and copies onto the path. */
-            if (on > (size_t)RTX_SAVE_PIN_MAX) {
-                snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", p);
-                fd = mkstemp(tmp);
-                if (fd < 0) return cc_err(CC_ERR_IO, "save open");
-                if (have_mode && fchmod(fd, mode) != 0) {
-                    close(fd);
-                    unlink(tmp);
-                    return cc_err(CC_ERR_IO, "save fchmod");
-                }
-                d->tree.write_fd(fd) !>(e) {
-                    close(fd);
-                    unlink(tmp);
-                    return cc_err(e);
-                };
-                if (fsync(fd) != 0) {
-                    close(fd);
-                    unlink(tmp);
-                    return cc_err(CC_ERR_IO, "save fsync");
-                }
-                if (close(fd) != 0) {
-                    unlink(tmp);
-                    return cc_err(CC_ERR_IO, "save close");
-                }
-                rtx_save_copy_path(tmp, p, mode, have_mode) !>(e) {
-                    unlink(tmp);
-                    return cc_err(e);
-                };
-                unlink(tmp);
-                rtx_save_fsync_dir(p, n);
-                if (new_path.ptr) d->path = new_path;
-                d->saved_head = d->hist.head;
-                rtx_doc_ident_stamp(d, path);
-                return cc_ok();
-            }
-            if (on) {
-                pin_a = cc_arena_heap(on + 64);
-                if (!pin_a.base)
-                    return cc_err(CC_ERR_OUT_OF_MEMORY, "save pin");
-                pin = (char *)cc_arena_alloc(pin_a, on, 1);
-                if (!pin) {
-                    pin_a.destroy();
-                    return cc_err(CC_ERR_OUT_OF_MEMORY, "save pin");
-                }
-                RtxPageStore_pread(&d->tree.store, RTX_STORE_ORIG, flo, pin,
-                                   on) !>(e) {
-                    pin_a.destroy();
-                    return cc_err(e);
-                };
-            }
+            /* The dirty span [lo, hi) is written in place; a length change
+             * also rewrites and truncates everything after lo. */
+            size_t whi = (newn == dlen && hi <= dlen) ? hi : (size_t)-1;
+            rtx_orig_preserve_inode((uint64_t)st.st_dev, (uint64_t)st.st_ino, lo,
+                                    whi) !>(e) {
+                return cc_err(e);
+            };
             fd = open(p, O_WRONLY | O_CREAT, have_mode ? mode : 0666);
-            if (fd < 0) {
-                if (pin_a.base) pin_a.destroy();
-                return cc_err(CC_ERR_IO, "save open");
-            }
+            if (fd < 0) return cc_err(CC_ERR_IO, "save open");
             if (have_mode && fchmod(fd, mode) != 0) {
-                if (pin_a.base) pin_a.destroy();
                 close(fd);
                 return cc_err(CC_ERR_IO, "save fchmod");
             }
             if (lo && lseek(fd, (off_t)lo, SEEK_SET) < 0) {
-                if (pin_a.base) pin_a.destroy();
                 close(fd);
                 return cc_err(CC_ERR_IO, "save lseek");
             }
-            d->tree.write_fd_from_snap(fd, lo, hi, pin, flo, on) !>(e) {
-                if (pin_a.base) pin_a.destroy();
+            d->tree.write_fd_from(fd, lo, hi) !>(e) {
                 close(fd);
                 return cc_err(e);
             };
-            if (pin_a.base) pin_a.destroy();
             if (newn != (size_t)st.st_size) {
                 if (ftruncate(fd, (off_t)newn) != 0) {
                     close(fd);
@@ -10304,6 +10450,13 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
                 }
             }
         } else {
+            /* Truncate and rewrite. `p` may still be an open original: this
+             * doc's (a drifted size, an overwrite) or another doc's. */
+            if (exists)
+                rtx_orig_preserve_inode((uint64_t)st.st_dev, (uint64_t)st.st_ino, 0,
+                                        (size_t)-1) !>(e) {
+                    return cc_err(e);
+                };
             fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, have_mode ? mode : 0666);
             if (fd < 0) return cc_err(CC_ERR_IO, "save open");
             if (have_mode && fchmod(fd, mode) != 0) {
@@ -10321,8 +10474,9 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
         }
         if (close(fd) != 0) return cc_err(CC_ERR_IO, "save close");
         rtx_save_fsync_dir(p, n);
+        if (alias) RtxPageStore_set_disk_len(&d->tree.store, newn);
         if (new_path.ptr) d->path = new_path;
-        d->saved_head = d->hist.head;
+        d->mark_saved();
         rtx_doc_ident_stamp(d, path);
         return cc_ok();
     }
@@ -10347,7 +10501,7 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
     /* Best-effort directory fsync so the rename itself is durable. */
     rtx_save_fsync_dir(p, n);
     if (new_path.ptr) d->path = new_path;
-    d->saved_head = d->hist.head;
+    d->mark_saved();
     rtx_doc_ident_stamp(d, path);
     return cc_ok();
 }

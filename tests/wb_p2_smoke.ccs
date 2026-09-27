@@ -1,0 +1,1212 @@
+#!ccc ccs
+/*
+ * Workbook phase 2 smoke (docs/workbook.md "W1 phase 2 as built"):
+ *
+ *   par      — the parallel structural read builds the serial read's
+ *              model: random workbooks (tables of formula / literal /
+ *              anchored rows, CRLF, tables inside fences, unnamed tables,
+ *              separator-shaped and header-shaped rows inside a body,
+ *              a table at EOF without a NL) read with 1 lane and with 2,
+ *              3, 4 and 7 lanes over tiny and default chunks, synchronous
+ *              and as an idle job: equal model hashes and settled dumps.
+ *   persist  — the persisted index: written after a settle, a reopen
+ *              installs every table body and every aggregate's partials
+ *              (no row read, no aggregate built) and its values are the
+ *              scratch build's; edits after the load stay bit-identical
+ *              to scratch; a changed file (size, same size with a new
+ *              mtime, `touch -m` back to the old mtime: ctime), a
+ *              corrupt, truncated or other-version file and a racily
+ *              clean stamp are refused and the values are still right.
+ *
+ *   ./bin/wb_p2_smoke [steps]     (default 300)
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <errno.h>
+#include <stdarg.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include "../core/document.cch"
+#include "../core/wb.cch"
+#include "../core/sindex.cch"
+
+static int fails = 0;
+static uint64_t rng;
+static char g_last[256];
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static uint64_t rnd(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+}
+
+static size_t rnd_n(size_t n) {
+    return n ? (size_t)(rnd() % n) : 0;
+}
+
+/* ------------------------------------------------------------ text */
+
+typedef struct {
+    char *p;
+    size_t n, cap;
+} Buf;
+
+static void bput(Buf *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 4096;
+        while (nc < b->n + n + 1) nc *= 2;
+        b->p = (char *)realloc(b->p, nc);
+        b->cap = nc;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+}
+
+static void bf(Buf *b, const char *fmt, ...) {
+    char tmp[1024];
+    va_list ap;
+    int k;
+    va_start(ap, fmt);
+    k = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (k > 0) bput(b, tmp, (size_t)k < sizeof tmp ? (size_t)k : sizeof tmp - 1);
+}
+
+static const char *const g_keys[] = {"EU", "US", "APAC", "LATAM"};
+static const char *const g_fl[] = {"0.1", "1e-300", "-2.5e10", "3.5", "-0.5", "7e-5"};
+
+/* A random workbook: two named tables (T with anchors, a running total
+ * and row formulas; K a keyed table), calc names over both, and noise the
+ * read must not take for rows. rows: T's rows. */
+static char *gen_wb(uint64_t seed, int rows, size_t *out_n) {
+    Buf b = {0};
+    int i, crlf = (int)(seed % 3 == 0);
+    const char *nl = crlf ? "\r\n" : "\n";
+    rng = seed * 2654435761u + 7;
+    bf(&b, "# Main%s%s", nl, nl);
+    bf(&b, "```params%sk = %d%slim = 500%s```%s%s", nl, (int)rnd_n(50), nl, nl, nl, nl);
+    bf(&b, "Some prose | with a pipe | that is not a table%s%s", nl, nl);
+    bf(&b, "```text%s| a | b |%s|---|---|%s| 1 | 2 |%s```%s%s", nl, nl, nl, nl, nl, nl);
+    bf(&b, "| unnamed | table |%s|---|---|%s| 1 | 2 |%s| 3 | 4 |%s%s", nl, nl, nl, nl, nl);
+    bf(&b, "Table: K%s%s| id | tier | w |%s|----|------|---|%s", nl, nl, nl, nl);
+    for (i = 1; i <= 40; i++) bf(&b, "| %d | %s | %d |%s", i, g_keys[i % 4], (i * 7) % 13, nl);
+    bf(&b, "%sTable: T%s%s| id | key | x | f | run | c |%s|---|---|---|---|---|---|%s", nl, nl, nl, nl, nl);
+    for (i = 1; i <= rows; i++) {
+        int kind = (int)rnd_n(100);
+        const char *anc = "";
+        char ab[32];
+        if (kind < 2) {
+            snprintf(ab, sizeof ab, "{#a%d} ", i);
+            anc = ab;
+        }
+        if (kind == 50 && i > 3) {
+            /* a separator-shaped row inside the body: still a row */
+            bf(&b, "|---|---|---|---|---|---|%s", nl);
+            continue;
+        }
+        if (kind == 51 && i > 3 && i + 1 < rows) {
+            /* a header-shaped row (followed by a separator-shaped one) */
+            bf(&b, "| %d | EU | 1 | x | 0 | 1 |%s|---|---|---|---|---|---|%s", i, nl, nl);
+            continue;
+        }
+        bf(&b, "| %s%d | %s | %d | %s | =coalesce(@run[-1], 0) + @x | %s |%s", anc, i, g_keys[rnd_n(4)],
+           (int)rnd_n(1000) - 100,
+           kind < 40   ? "=@x * 2"
+           : kind < 60 ? "=K[id = @id % 40 + 1].w + @x"
+           : kind < 70 ? "`=@x - 1`"
+           : kind < 75 ? "text"
+                       : "",
+           g_fl[rnd_n(6)], nl);
+    }
+    bf(&b, "%s```calc%s", nl, nl);
+    bf(&b, "s = sum(T.x)%sm = max(T.x)%smi = min(T.c)%sn = count(T where x > k)%s", nl, nl, nl, nl);
+    bf(&b, "d = distinct(T.key)%sa = avg(T.c)%sf = sum(T.f)%slast = T#last.run%s", nl, nl, nl, nl);
+    bf(&b, "g = group T by key { n: count(), hi: max(x), lo: min(c), t: sum(x) }%s", nl);
+    bf(&b, "eu = g[key = \"EU\"].hi%slk = K[id = 3].tier%s", nl, nl);
+    bf(&b, "rg = sum(T[#first .. #last].x)%s", nl);
+    bf(&b, "```%s", nl);
+    if (seed % 2) {
+        /* a table at the end without a NL */
+        bf(&b, "%sTable: Z%s%s| p | q |%s|---|---|%s| 1 | =@p * 3 |%s| 2 | 5 |", nl, nl, nl, nl, nl, nl);
+    }
+    *out_n = b.n;
+    return b.p;
+}
+
+/* ------------------------------------------------------------ docs */
+
+static char *doc_bytes(RtxDoc *d, size_t *out_n) {
+    size_t n = d->len();
+    char *p = (char *)malloc(n + 1);
+    *out_n = 0;
+    if (!p) return NULL;
+    if (n) {
+        size_t got = d->read_at(0, cc_slice_from_buffer(p, n)) ?> 0;
+        if (got != n) {
+            free(p);
+            return NULL;
+        }
+    }
+    p[n] = 0;
+    *out_n = n;
+    return p;
+}
+
+static size_t find_off_s(RtxDoc *d, const char *needle) {
+    size_t n = 0, off = (size_t)-1;
+    char *p = doc_bytes(d, &n), *q;
+    if (!p) return off;
+    q = strstr(p, needle);
+    if (q) off = (size_t)(q - p);
+    free(p);
+    return off;
+}
+
+static int open_buf(RtxDoc *d, CCArena *keep_a, const char *src, size_t n) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    *keep_a = cc_arena_heap(n + 64);
+    {
+        char[:] sl = cc_slice_from_buffer((char *)src, n);
+        char[:] keep = sl.clone_into(*keep_a) !>;
+        d->from_buffer(keep) !>;
+    }
+    return rtx_wb_attach(d) != NULL;
+}
+
+static int open_path(RtxDoc *d, const char *path) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    d->from_path(cc_slice_cstr(path)) !>;
+    return rtx_wb_of(d) != NULL;
+}
+
+static int rep(RtxDoc *d, size_t off, size_t n, const char *s) {
+    size_t sn = strlen(s);
+    snprintf(g_last, sizeof g_last, "replace %zu %zu \"%s\"", off, n, s);
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    d->replace(off, n, sn ? cc_slice_from_buffer((char *)s, sn) : cc_slice_empty()) !>;
+    return 1;
+}
+
+static int undo(RtxDoc *d) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    if (!d->can_undo()) return 0;
+    snprintf(g_last, sizeof g_last, "undo");
+    d->undo() !>;
+    return 1;
+}
+
+#define DUMP_CAP (8u << 20)
+static char g_a[DUMP_CAP];
+static char g_b[DUMP_CAP];
+
+static size_t dump_of(RtxDoc *d, char *out) {
+    RtxWb *wb = rtx_wb_of(d);
+    rtx_wb_settle(wb, d);
+    return rtx_wb_dump_ex(wb, d, RTX_WB_DUMP_BITS | RTX_WB_DUMP_MAS, out, DUMP_CAP);
+}
+
+static void diff_report(const char *what, size_t la, size_t lb) {
+    size_t i = 0, ls = 0, line = 1;
+    const char *ea, *eb;
+    while (i < la && i < lb && g_a[i] == g_b[i]) {
+        if (g_a[i] == '\n') {
+            line++;
+            ls = i + 1;
+        }
+        i++;
+    }
+    ea = strchr(g_a + ls, '\n');
+    eb = strchr(g_b + ls, '\n');
+    fprintf(stderr, "FAIL: %s (%s): differs at dump line %zu\n  a: %.*s\n  b: %.*s\n", what, g_last, line,
+            (int)(ea ? ea - (g_a + ls) : 0), g_a + ls, (int)(eb ? eb - (g_b + ls) : 0), g_b + ls);
+    fails++;
+}
+
+/* Settled dump of d against a scratch build of its bytes. */
+static int same_as_scratch(RtxDoc *d, const char *what) {
+    size_t n = 0, la, lb;
+    char *p = doc_bytes(d, &n);
+    RtxDoc x = {0};
+    CCArena sa;
+    int ok;
+    if (!p) return 0;
+    la = dump_of(d, g_a);
+    rtx_wb_read_lanes(1, 0);
+    if (!open_buf(&x, &sa, p, n)) {
+        free(p);
+        return 0;
+    }
+    lb = dump_of(&x, g_b);
+    RtxDoc_destroy(&x);
+    sa.destroy();
+    ok = la == lb && !memcmp(g_a, g_b, la);
+    if (!ok) diff_report(what, la, lb);
+    free(p);
+    return ok;
+}
+
+/* ------------------------------------------------------------ par */
+
+static void par_one(uint64_t seed, int rows) {
+    size_t n = 0, la, lb;
+    char *src = gen_wb(seed, rows, &n);
+    RtxDoc a = {0};
+    CCArena aa;
+    uint64_t h1;
+    static const int lanes[] = {2, 3, 4, 7};
+    /* on the caller (RTX_PARALLEL_INLINE) windows of a byte or seven are
+     * cheap; the background arm's ring hands each over: bigger ones */
+    static const size_t chunks_inline[] = {1, 7, 97, 4096, 65536};
+    static const size_t chunks_arm[] = {61, 97, 1024, 4096, 65536};
+    const char *pi = getenv("RTX_PARALLEL_INLINE");
+    const size_t *chunks = pi && pi[0] == '1' ? chunks_inline : chunks_arm;
+    int li, ci;
+    RtxWbStats st;
+    rtx_wb_read_lanes(1, 0);
+    if (!open_buf(&a, &aa, src, n)) {
+        expect(0, "par: open serial");
+        free(src);
+        return;
+    }
+    h1 = rtx_wb_model_hash(rtx_wb_of(&a), &a);
+    la = dump_of(&a, g_a);
+    for (li = 0; li < 4; li++) {
+        for (ci = 0; ci < 5; ci++) {
+            RtxDoc b = {0};
+            CCArena ba;
+            uint64_t h2;
+            snprintf(g_last, sizeof g_last, "seed %llu lanes %d chunk %zu", (unsigned long long)seed,
+                     lanes[li], chunks[ci]);
+            rtx_wb_read_lanes(lanes[li], chunks[ci]);
+            if (!open_buf(&b, &ba, src, n)) {
+                expect(0, "par: open parallel");
+                continue;
+            }
+            h2 = rtx_wb_model_hash(rtx_wb_of(&b), &b);
+            rtx_wb_stats(rtx_wb_of(&b), &b, &st);
+            if (h1 != h2) {
+                fprintf(stderr, "FAIL: par model hash (%s)\n", g_last);
+                fails++;
+            }
+            expect(st.par_rows > 0, "par: rows came from the lanes");
+            lb = dump_of(&b, g_b);
+            if (la != lb || memcmp(g_a, g_b, la)) diff_report("par dump", la, lb);
+            RtxDoc_destroy(&b);
+            ba.destroy();
+        }
+    }
+    /* as an idle job over a deferred read: slices of windows */
+    {
+        RtxDoc b = {0};
+        CCArena ba;
+        size_t mb, mr, md;
+        int k;
+        rtx_wb_limits_get(&mb, &mr, &md);
+        rtx_wb_limits(0, 0, 1024);
+        rtx_wb_read_lanes(3, 61);
+        snprintf(g_last, sizeof g_last, "seed %llu job", (unsigned long long)seed);
+        if (open_buf(&b, &ba, src, n)) {
+            for (k = 0; k < 1000000 && rtx_wb_deferred(&b); k++) (void)rtx_wb_idle(&b);
+            if (rtx_wb_model_hash(rtx_wb_of(&b), &b) != h1) {
+                fprintf(stderr, "FAIL: par job model hash (%s)\n", g_last);
+                fails++;
+            }
+            lb = dump_of(&b, g_b);
+            if (la != lb || memcmp(g_a, g_b, la)) diff_report("par job dump", la, lb);
+            RtxDoc_destroy(&b);
+            ba.destroy();
+        }
+        rtx_wb_limits(mb, mr, md);
+    }
+    rtx_wb_read_lanes(1, 0);
+    RtxDoc_destroy(&a);
+    aa.destroy();
+    free(src);
+}
+
+static void par(void) {
+    uint64_t s;
+    for (s = 1; s <= 6; s++) par_one(s, 300 + (int)(s * 97) % 700);
+    printf("wb_p2_smoke par: 6 seeds x 4 lane counts x 5 chunks + jobs\n");
+}
+
+/* ------------------------------------------------------------ persist */
+
+static char g_dir[512], g_cache[600], g_file[700], g_idx[5000];
+
+static int write_file(const char *path, const char *p, size_t n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    if (fwrite(p, 1, n, f) != n) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
+static int stat_of(RtxDoc *d) {
+    RtxWbStats st;
+    rtx_wb_counters(rtx_wb_of(d), d, &st);
+    return st.idx_state;
+}
+
+static void sleep_ms(long ms) {
+    struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+/* Open g_file, check the index state, settle, compare with scratch. */
+static int reopen(RtxDoc *d, int want_state, const char *what) {
+    char msg[200];
+    if (!open_path(d, g_file)) {
+        expect(0, what);
+        return 0;
+    }
+    snprintf(msg, sizeof msg, "%s: index state %d (%s), want %d", what, stat_of(d),
+             rtx_wb_index_why(stat_of(d)), want_state);
+    expect(stat_of(d) == want_state, msg);
+    return 1;
+}
+
+static void persist(int steps) {
+    size_t n = 0;
+    char *src;
+    RtxDoc a = {0}, b = {0};
+    RtxWbStats st;
+    unsigned w0;
+    int i;
+    snprintf(g_dir, sizeof g_dir, "testdata/generated/wb_p2");
+    mkdir("testdata", 0755);
+    mkdir("testdata/generated", 0755);
+    mkdir(g_dir, 0755);
+    snprintf(g_cache, sizeof g_cache, "%s/cache", g_dir);
+    mkdir(g_cache, 0755);
+    snprintf(g_file, sizeof g_file, "%s/p.wb.md", g_dir);
+    rtx_wb_set_cache_dir(g_cache);
+    rtx_si_test_gran_ms(0);
+    rtx_wb_read_lanes(0, 0);
+    src = gen_wb(11, 3000, &n);
+    expect(write_file(g_file, src, n), "persist: write the workbook");
+    expect(rtx_wb_index_path(g_file, g_idx, sizeof g_idx), "persist: index path");
+    unlink(g_idx);
+    sleep_ms(5);
+    /* first open: no index; the settle writes one */
+    w0 = rtx_wb_index_writes();
+    reopen(&a, 2, "persist: first open (no file)");
+    (void)dump_of(&a, g_a);
+    rtx_wb_settle(rtx_wb_of(&a), &a);
+    rtx_wb_index_flush();
+    expect(rtx_wb_index_writes() > w0, "persist: settle wrote the index");
+    {
+        struct stat sb;
+        expect(stat(g_idx, &sb) == 0 && sb.st_size > 0, "persist: the index file exists");
+    }
+    /* reopen: every body and aggregate from the index */
+    if (getenv("RTX_WB_INDEX_DEBUG")) fprintf(stderr, "--- reopen\n");
+    reopen(&b, 1, "persist: reopen");
+    rtx_wb_counters(rtx_wb_of(&b), &b, &st);
+    expect(!rtx_wb_busy(&b), "persist: no job after a reopen");
+    expect(st.idx_rows >= 3000, "persist: rows installed, not read");
+    expect(st.idx_insts > 0, "persist: instances restored");
+    expect(st.idx_chains > 0, "persist: the chain restored");
+    expect(st.ma_full == 0, "persist: no aggregate built on reopen");
+    expect(rtx_wb_model_hash(rtx_wb_of(&a), &a) == rtx_wb_model_hash(rtx_wb_of(&b), &b),
+           "persist: model equal to the read's");
+    {
+        size_t la = dump_of(&a, g_a), lb = dump_of(&b, g_b);
+        if (la != lb || memcmp(g_a, g_b, la)) diff_report("persist: reopen dump", la, lb);
+    }
+    rtx_wb_counters(rtx_wb_of(&b), &b, &st);
+    expect(st.ma_full == 0 && st.job_rows == 0, "persist: settling built nothing");
+    /* edits after the load: bit-identical to scratch */
+    rng = 99;
+    for (i = 0; i < steps; i++) {
+        size_t len = b.len(), off;
+        char *p = doc_bytes(&b, &len), *q;
+        int k = (int)rnd_n(10);
+        char v[32];
+        if (!p) break;
+        if (getenv("WB_P2_SAVE") && atoi(getenv("WB_P2_SAVE")) == i) {
+            char sp[800];
+            snprintf(sp, sizeof sp, "%s/before.wb.md", g_dir);
+            write_file(sp, p, len);
+        }
+        q = strstr(p + len / 3 + rnd_n(len / 3), "\n| ");
+        if (!q) q = strstr(p, "\n| ");
+        off = (size_t)(q - p) + 1;
+        if (k < 5) {
+            /* a cell: the x column (third pipe) */
+            char *c = strchr(p + off + 1, '|');
+            c = c ? strchr(c + 1, '|') : NULL;
+            if (c) {
+                char *e = strchr(c + 1, '|');
+                snprintf(v, sizeof v, " %d ", (int)rnd_n(2000) - 1000);
+                rep(&b, (size_t)(c + 1 - p), (size_t)(e - c - 1), v);
+            }
+        } else if (k < 7) {
+            /* a new row */
+            rep(&b, off, 0, "| 9999 | EU | 5 | =@x * 2 | =coalesce(@run[-1], 0) + @x | 0.5 |\n");
+        } else if (k < 8) {
+            /* a row out */
+            char *e = strchr(p + off, '\n');
+            if (e) rep(&b, off, (size_t)(e - (p + off)) + 1, "");
+        } else {
+            undo(&b);
+        }
+        free(p);
+        if (i % 25 == 24 || i + 1 == steps) {
+            char w[64];
+            snprintf(w, sizeof w, "persist: edit %d after the load", i);
+            same_as_scratch(&b, w);
+        }
+    }
+    RtxDoc_destroy(&b);
+    /* stale: the file changed (another size) */
+    {
+        Buf x = {0};
+        bput(&x, src, n);
+        bput(&x, "\nmore prose\n", 12);
+        sleep_ms(3);
+        write_file(g_file, x.p, x.n);
+        sleep_ms(3);
+        reopen(&b, 7, "persist: grown file");
+        same_as_scratch(&b, "persist: grown file values");
+        RtxDoc_destroy(&b);
+        free(x.p);
+    }
+    /* the settle of that open wrote a new index: the same bytes reopen */
+    rtx_wb_index_flush();
+    reopen(&b, 1, "persist: rewritten index");
+    RtxDoc_destroy(&b);
+    /* same size, new mtime */
+    {
+        char *c = strdup(src);
+        char *q = strstr(c, "| 1 | EU");
+        struct stat s0;
+        size_t la, lb;
+        if (q) q[2] = '7';
+        write_file(g_file, src, n);
+        sleep_ms(3);
+        /* index for these bytes */
+        reopen(&b, 7, "persist: back to the first bytes");
+        rtx_wb_settle(rtx_wb_of(&b), &b);
+        rtx_wb_index_flush();
+        RtxDoc_destroy(&b);
+        stat(g_file, &s0);
+        sleep_ms(3);
+        write_file(g_file, c, n);
+        reopen(&b, 7, "persist: same size, new mtime");
+        la = dump_of(&b, g_a);
+        RtxDoc_destroy(&b);
+        /* touch -m back to the old mtime: ctime still moved */
+        {
+            struct timespec ts[2];
+#ifdef __APPLE__
+            ts[0] = s0.st_atimespec;
+            ts[1] = s0.st_mtimespec;
+#else
+            ts[0] = s0.st_atim;
+            ts[1] = s0.st_mtim;
+#endif
+            utimensat(AT_FDCWD, g_file, ts, 0);
+        }
+        reopen(&b, 7, "persist: mtime restored (ctime)");
+        lb = dump_of(&b, g_b);
+        expect(la == lb && !memcmp(g_a, g_b, la), "persist: values after touch -m");
+        same_as_scratch(&b, "persist: touch -m values");
+        rtx_wb_settle(rtx_wb_of(&b), &b);
+        rtx_wb_index_flush();
+        RtxDoc_destroy(&b);
+        free(c);
+    }
+    /* corrupt, truncated, other version */
+    {
+        int fd;
+        struct stat sb;
+        char byte;
+        reopen(&b, 1, "persist: before corrupting");
+        RtxDoc_destroy(&b);
+        stat(g_idx, &sb);
+        fd = open(g_idx, O_RDWR);
+        pread(fd, &byte, 1, sb.st_size / 2);
+        byte ^= 0x40;
+        pwrite(fd, &byte, 1, sb.st_size / 2);
+        close(fd);
+        reopen(&b, 5, "persist: corrupt (checksum)");
+        same_as_scratch(&b, "persist: corrupt values");
+        rtx_wb_settle(rtx_wb_of(&b), &b);
+        rtx_wb_index_flush();
+        RtxDoc_destroy(&b);
+        reopen(&b, 1, "persist: rewritten after corrupt");
+        RtxDoc_destroy(&b);
+        stat(g_idx, &sb);
+        truncate(g_idx, sb.st_size - 16);
+        reopen(&b, 5, "persist: truncated");
+        RtxDoc_destroy(&b);
+        /* version: the word after the magic */
+        reopen(&b, 1, "persist: truncated, rewritten at open");
+        rtx_wb_settle(rtx_wb_of(&b), &b);
+        rtx_wb_index_flush();
+        RtxDoc_destroy(&b);
+        fd = open(g_idx, O_RDWR);
+        {
+            uint32_t v = 999;
+            pwrite(fd, &v, 4, 8);
+        }
+        close(fd);
+        reopen(&b, 4, "persist: other version");
+        same_as_scratch(&b, "persist: other version values");
+        rtx_wb_settle(rtx_wb_of(&b), &b);
+        rtx_wb_index_flush();
+        RtxDoc_destroy(&b);
+    }
+    /* racily clean: stamps within the granularity of the bytes' read */
+    {
+        rtx_si_test_gran_ms(3600L * 1000);
+        reopen(&b, 8, "persist: racy stamps refused");
+        w0 = rtx_wb_index_writes();
+        rtx_wb_settle(rtx_wb_of(&b), &b);
+        rtx_wb_index_flush();
+        expect(rtx_wb_index_writes() == w0, "persist: no write for racy stamps");
+        same_as_scratch(&b, "persist: racy values");
+        RtxDoc_destroy(&b);
+        rtx_si_test_gran_ms(0);
+    }
+    /* an index for a doc edited and saved is not used for other bytes */
+    RtxDoc_destroy(&a);
+    rtx_wb_set_cache_dir(NULL);
+    free(src);
+    printf("wb_p2_smoke persist: %d edits after a load, stale / corrupt / version / racy refused\n", steps);
+}
+
+/* ------------------------------------------------------------ lookups */
+
+static char *lookups_src(int rows, size_t *out_n) {
+    Buf b = {0};
+    int i;
+    static const char *const tiers[] = {"gold", "silver", "bronze"};
+    bf(&b, "# L\n\nTable: K\n\n| id | w | tier |\n|----|---|------|\n");
+    for (i = 1; i <= 200; i++) bf(&b, "| %d | %d | %s |\n", i, (i * 7) % 50, tiers[i % 3]);
+    bf(&b, "\nTable: T\n\n| n | cust | x | f | g |\n|---|------|---|---|---|\n");
+    for (i = 1; i <= rows; i++)
+        bf(&b, "| %d | %d | %d | =K[id = @cust].w + @x | =K[id = @cust].tier |\n", i, 1 + (i * 13) % 200,
+           i % 17);
+    bf(&b, "\n```calc\ns = sum(T.f)\nmx = max(T.f)\nmn = min(T.f)\ngold = count(T where g = \"gold\")\n"
+           "grp = group T by g { n: count(), t: sum(f), hi: max(f) }\ngs = grp[g = \"silver\"].t\n"
+           "d = distinct(T.f)\n```\n");
+    *out_n = b.n;
+    return b.p;
+}
+
+/* The byte range of cell `col` of the row starting at `row_off`. */
+static int cell_of(const char *p, size_t row_off, int col, size_t *lo, size_t *hi) {
+    const char *q = p + row_off, *e;
+    int k;
+    q = strchr(q, '|');
+    for (k = 0; q && k < col; k++) q = strchr(q + 1, '|');
+    if (!q) return 0;
+    e = strchr(q + 1, '|');
+    if (!e) return 0;
+    *lo = (size_t)(q + 1 - p);
+    *hi = (size_t)(e - p);
+    return 1;
+}
+
+/* The start of the i-th body row of table `name` (0-based), or -1. */
+static long row_off(const char *p, const char *name, int i) {
+    char cap[64];
+    const char *q;
+    snprintf(cap, sizeof cap, "Table: %s\n", name);
+    q = strstr(p, cap);
+    if (!q) return -1;
+    q = strstr(q, "|---");
+    if (!q) return -1;
+    q = strchr(q, '\n');
+    while (q && i-- > 0) q = strchr(q + 1, '\n');
+    return q ? (long)(q + 1 - p) : -1;
+}
+
+static void lookups(int steps) {
+    size_t n = 0;
+    char *src = lookups_src(3000, &n);
+    RtxDoc d = {0};
+    CCArena da;
+    RtxWbStats s0, s1;
+    int i, delta_steps = 0, checked = 0;
+    rng = 4242;
+    rtx_wb_read_lanes(1, 0);
+    if (!open_buf(&d, &da, src, n)) {
+        expect(0, "lookups: open");
+        free(src);
+        return;
+    }
+    rtx_wb_settle(rtx_wb_of(&d), &d);
+    for (i = 0; i < steps; i++) {
+        size_t len = 0, lo, hi;
+        char *p = doc_bytes(&d, &len);
+        int k = (int)rnd_n(20);
+        char v[48];
+        long ro;
+        if (!p) break;
+        rtx_wb_counters(rtx_wb_of(&d), &d, &s0);
+        if (k < 8) {
+            /* a looked-up value (K.w): the readers take row deltas */
+            ro = row_off(p, "K", (int)rnd_n(200));
+            if (ro >= 0 && cell_of(p, (size_t)ro, 1, &lo, &hi)) {
+                snprintf(v, sizeof v, " %d ", (int)rnd_n(100) - 20);
+                rep(&d, lo, hi - lo, v);
+                rtx_wb_sync(rtx_wb_of(&d), &d);
+                rtx_wb_counters(rtx_wb_of(&d), &d, &s1);
+                if (s1.fast_cell > s0.fast_cell) {
+                    delta_steps++;
+                    if (s1.ma_full != s0.ma_full) {
+                        fprintf(stderr, "FAIL: lookups: a K.w edit rebuilt %zu aggregates (step %d)\n",
+                                s1.ma_full - s0.ma_full, i);
+                        fails++;
+                    }
+                }
+            }
+        } else if (k < 10) {
+            /* a looked-up text (K.tier): group keys move by delta */
+            static const char *const tt[] = {" gold ", " silver ", " bronze ", " tin "};
+            ro = row_off(p, "K", (int)rnd_n(200));
+            if (ro >= 0 && cell_of(p, (size_t)ro, 2, &lo, &hi)) rep(&d, lo, hi - lo, tt[rnd_n(4)]);
+        } else if (k < 12) {
+            /* a key (the wholesale path) */
+            ro = row_off(p, "K", (int)rnd_n(200));
+            snprintf(v, sizeof v, " %d ", 1 + (int)rnd_n(230));
+            if (ro >= 0 && cell_of(p, (size_t)ro, 0, &lo, &hi)) rep(&d, lo, hi - lo, v);
+        } else if (k < 14) {
+            /* a reader's probe (T.cust) or value (T.x) */
+            ro = row_off(p, "T", (int)rnd_n(3000));
+            snprintf(v, sizeof v, " %d ", 1 + (int)rnd_n(210));
+            if (ro >= 0 && cell_of(p, (size_t)ro, 1 + (int)rnd_n(2), &lo, &hi)) rep(&d, lo, hi - lo, v);
+        } else if (k < 16) {
+            /* rows in and out of either table */
+            const char *tn = rnd_n(2) ? "T" : "K";
+            ro = row_off(p, tn, (int)rnd_n(100));
+            if (ro >= 0) {
+                if (rnd_n(2)) {
+                    const char *e = strchr(p + ro, '\n');
+                    if (e) rep(&d, (size_t)ro, (size_t)(e - (p + ro)) + 1, "");
+                } else if (tn[0] == 'T') {
+                    rep(&d, (size_t)ro, 0, "| 0 | 7 | 3 | =K[id = @cust].w + @x | =K[id = @cust].tier |\n");
+                } else {
+                    rep(&d, (size_t)ro, 0, "| 7 | 99 | gold |\n");
+                }
+            }
+        } else {
+            undo(&d);
+        }
+        free(p);
+        if (i % 10 == 9 || i + 1 == steps) {
+            char w[64];
+            snprintf(w, sizeof w, "lookups: step %d", i);
+            same_as_scratch(&d, w);
+            checked++;
+        }
+    }
+    rtx_wb_counters(rtx_wb_of(&d), &d, &s1);
+    expect(delta_steps > 0 && s1.rkx_rows > 0, "lookups: reader rows took deltas");
+    printf("wb_p2_smoke lookups: %d steps, %d K.w edits by delta, %zu reader rows, %zu reader index builds, %d scratch compares\n",
+           steps, delta_steps, s1.rkx_rows, s1.rkx_builds, checked);
+    RtxDoc_destroy(&d);
+    da.destroy();
+    free(src);
+}
+
+/* ------------------------------------------------------------ group min / max */
+
+static const char *const g_gk[] = {"a", "b", "c", "d", "e"};
+
+static void gminmax(int steps) {
+    Buf b = {0};
+    RtxDoc d = {0};
+    CCArena da;
+    RtxWbStats s0, s1;
+    int i, vsteps = 0, checked = 0;
+    rng = 777;
+    bf(&b, "# G\n\nTable: G\n\n| k | v | w |\n|---|---|---|\n");
+    for (i = 0; i < 3000; i++)
+        bf(&b, "| %s | %d | %s |\n", g_gk[rnd_n(5)], (int)rnd_n(1000) - 300, rnd_n(9) ? "1.5" : "2");
+    bf(&b, "\n```calc\ng = group G by k { hi: max(v), lo: min(v), n: count(), wx: max(w), s: sum(v) }\n"
+           "ah = g[k = \"a\"].hi\nal = g[k = \"a\"].lo\nbh = g[k = \"b\"].hi\nel = g[k = \"e\"].lo\n```\n");
+    rtx_wb_read_lanes(1, 0);
+    if (!open_buf(&d, &da, b.p, b.n)) {
+        expect(0, "gminmax: open");
+        free(b.p);
+        return;
+    }
+    rtx_wb_settle(rtx_wb_of(&d), &d);
+    for (i = 0; i < steps; i++) {
+        size_t len = 0, lo, hi;
+        char *p = doc_bytes(&d, &len);
+        int k = (int)rnd_n(20);
+        char v[48];
+        long ro;
+        if (!p) break;
+        rtx_wb_counters(rtx_wb_of(&d), &d, &s0);
+        ro = row_off(p, "G", (int)rnd_n(2900));
+        if (ro < 0) {
+            free(p);
+            continue;
+        }
+        if (k < 9) {
+            /* a value: often the group's extreme (max 999 / min -300 region) */
+            snprintf(v, sizeof v, " %d ", (int)rnd_n(1400) - 400);
+            if (cell_of(p, (size_t)ro, 1, &lo, &hi)) {
+                rep(&d, lo, hi - lo, v);
+                rtx_wb_sync(rtx_wb_of(&d), &d);
+                rtx_wb_counters(rtx_wb_of(&d), &d, &s1);
+                if (s1.fast_cell > s0.fast_cell) {
+                    vsteps++;
+                    if (s1.ma_full != s0.ma_full) {
+                        fprintf(stderr, "FAIL: gminmax: a value edit rebuilt the group (step %d)\n", i);
+                        fails++;
+                    }
+                }
+            }
+        } else if (k < 12) {
+            /* a key: the row moves between groups */
+            snprintf(v, sizeof v, " %s ", g_gk[rnd_n(5)]);
+            if (cell_of(p, (size_t)ro, 0, &lo, &hi)) rep(&d, lo, hi - lo, v);
+        } else if (k < 14) {
+            /* a mixed-kind extreme: w's max between 1.5 and 2 (ties: the earlier row) */
+            if (cell_of(p, (size_t)ro, 2, &lo, &hi)) rep(&d, lo, hi - lo, rnd_n(2) ? " 2.0 " : " 2 ");
+        } else if (k < 16) {
+            /* a run of new rows in one place (a block splits) */
+            Buf r = {0};
+            int j, m = 1 + (int)rnd_n(300);
+            for (j = 0; j < m; j++) bf(&r, "| %s | %d | 1.5 |\n", g_gk[rnd_n(5)], (int)rnd_n(1000));
+            rep(&d, (size_t)ro, 0, r.p);
+            free(r.p);
+        } else if (k < 18) {
+            /* a run of rows out (blocks merge) */
+            const char *e = p + ro;
+            int j, m = 1 + (int)rnd_n(250);
+            for (j = 0; j < m && e; j++) {
+                const char *nx = strchr(e, '\n');
+                if (!nx || nx[1] != '|') break;
+                e = nx + 1;
+            }
+            if (e && e > p + ro) rep(&d, (size_t)ro, (size_t)(e - (p + ro)), "");
+        } else {
+            undo(&d);
+        }
+        free(p);
+        if (i % 10 == 9 || i + 1 == steps) {
+            char w[64];
+            snprintf(w, sizeof w, "gminmax: step %d", i);
+            same_as_scratch(&d, w);
+            checked++;
+        }
+    }
+    rtx_wb_counters(rtx_wb_of(&d), &d, &s1);
+    expect(s1.grp_blocks > 0, "gminmax: lost extremes rescanned blocks");
+    printf("wb_p2_smoke gminmax: %d steps, %d value edits without a rebuild, %zu block rescans in %zu resolves, %d scratch compares\n",
+           steps, vsteps, s1.grp_blocks, s1.grp_resolves, checked);
+    RtxDoc_destroy(&d);
+    da.destroy();
+    free(b.p);
+}
+
+/* ------------------------------------------------------------ uses */
+
+static char g_ud[512];
+
+static void upath(char *out, size_t cap, const char *name) {
+    snprintf(out, cap, "%s/%s", g_ud, name);
+}
+
+static void uwrite(const char *name, const char *text) {
+    char p[700];
+    upath(p, sizeof p, name);
+    write_file(p, text, strlen(text));
+}
+
+/* rtx_wb_eval of `expr` in d, into out. */
+static const char *ueval(RtxDoc *d, const char *expr, char *out, size_t cap) {
+    out[0] = 0;
+    rtx_wb_eval(rtx_wb_of(d), d, expr, strlen(expr), out, cap);
+    return out;
+}
+
+static void expect_eval(RtxDoc *d, const char *expr, const char *want, const char *what) {
+    char got[512];
+    ueval(d, expr, got, sizeof got);
+    if (strcmp(got, want) && !(want[0] == '~' && strstr(got, want + 1))) {
+        fprintf(stderr, "FAIL: %s: %s = %s, want %s\n", what, expr, got, want);
+        fails++;
+    }
+}
+
+/* The painted value of the name defined as `name = ...` in d: 1 fresh, 2 stale, 0 none. */
+static int paint_of(RtxDoc *d, const char *name, char *g, size_t cap) {
+    char needle[64];
+    size_t off, lo, hi, gn = 0;
+    int k;
+    snprintf(needle, sizeof needle, "\n%s = ", name);
+    off = find_off_s(d, needle);
+    if (off == (size_t)-1) return 0;
+    off += strlen(needle);
+    k = RtxDoc_derived_at(d, off, 0, &lo, &hi, g, cap - 1, &gn);
+    g[k ? gn : 0] = 0;
+    return k;
+}
+
+static const char g_q2[] =
+    "# Q2\n\n```params\nrate = 2\n```\n\n```calc\ntotal = sum(T.v)\nhalf = total / 2\n```\n\n"
+    "# Other\n\n```calc\nlabel = \"q2\"\n```\n\n"
+    "Table: T\n\n| k | v |\n|---|---|\n| {#q1} a | 1 |\n| b | 2 |\n| {#q3} c | 3 |\n| d | 4 |\n";
+
+static const char g_ua[] =
+    "# A\n\n```uses\nprior = \"q2.wb.md\"\nnope = \"missing.wb.md\"\n```\n\n```calc\n"
+    "t = prior.total\nh = prior.half * 10\nlab = prior.Other.label\ncell = prior.T#q3.v\n"
+    "nxt = prior.T#q3[+1].v\nrng = sum(prior.T[#q1 .. #q3].v)\ncnt = count(prior.T where v > prior.rate)\n"
+    "bad = prior.nothing\nmiss = nope.x\nboth = t + cell\n```\n\n"
+    "Table: R\n\n| x | y |\n|---|---|\n| 1 | =prior.total * @x |\n| 2 | =prior.T#q1.v + @x |\n";
+
+static void uses(void) {
+    char pa[700], pq[700], pc1[700], pc2[700], g[128];
+    RtxDoc a = {0}, q = {0}, a2 = {0}, c1 = {0}, c2 = {0};
+    RtxWbStats st;
+    int k;
+    snprintf(g_ud, sizeof g_ud, "testdata/generated/wb_p2/uses");
+    mkdir("testdata", 0755);
+    mkdir("testdata/generated", 0755);
+    mkdir("testdata/generated/wb_p2", 0755);
+    mkdir(g_ud, 0755);
+    rtx_wb_set_cache_dir(NULL);
+    rtx_wb_uses_poll_ms(1);
+    uwrite("q2.wb.md", g_q2);
+    uwrite("a.wb.md", g_ua);
+    upath(pa, sizeof pa, "a.wb.md");
+    upath(pq, sizeof pq, "q2.wb.md");
+    /* 1: q2 not open anywhere: a opens it privately */
+    if (!open_path(&a, pa)) {
+        expect(0, "uses: open a");
+        return;
+    }
+    expect_eval(&a, "t", "10", "uses private");
+    expect_eval(&a, "h", "50", "uses private");
+    expect_eval(&a, "lab", "\"q2\"", "uses sheet name");
+    expect_eval(&a, "cell", "3", "uses anchored cell");
+    expect_eval(&a, "nxt", "4", "uses anchored offset");
+    expect_eval(&a, "rng", "6", "uses anchor range");
+    expect_eval(&a, "cnt", "2", "uses where with an import");
+    expect_eval(&a, "bad", "~#ref(prior has no name nothing", "uses unknown name");
+    expect_eval(&a, "miss", "~#ref(nope: missing.wb.md not found", "uses missing file");
+    expect_eval(&a, "both", "13", "uses sum");
+    expect_eval(&a, "sum(R.y)", "13", "uses: row formulas reading imports");
+    rtx_wb_counters(rtx_wb_of(&a), &a, &st);
+    expect(st.uses_private == 1, "uses: q2 opened privately once");
+    /* 2: q2 changes on disk: the private copy is read again */
+    {
+        char *t = strdup(g_q2);
+        char *v = strstr(t, "| d | 4 |");
+        v[6] = '9';
+        sleep_ms(5);
+        uwrite("q2.wb.md", t);
+        free(t);
+        for (k = 0; k < 50; k++) {
+            sleep_ms(2);
+            (void)rtx_wb_idle(&a);
+        }
+        expect_eval(&a, "t", "15", "uses: file changed on disk");
+        rtx_wb_counters(rtx_wb_of(&a), &a, &st);
+        expect(st.uses_reread >= 1, "uses: the private copy was read again");
+    }
+    /* 3: q2 open (a pane): the live document, its edits */
+    if (!open_path(&q, pq)) {
+        expect(0, "uses: open q2");
+        return;
+    }
+    {
+        size_t off = find_off_s(&q, "| d | 9 |");
+        rep(&q, off + 6, 1, "20");
+        expect_eval(&a, "t", "26", "uses: an edit in the live q2");
+        expect_eval(&a, "h", "130", "uses: an edit in the live q2 (half)");
+        /* stale: q2 busy (a structural edit read as a job): a's import
+         * paints its last value stale, then settles */
+        {
+            size_t mb, mr, md;
+            rtx_wb_limits_get(&mb, &mr, &md);
+            rtx_wb_limits(0, 0, 16);
+            off = find_off_s(&q, "| k | v |");
+            rep(&q, off + 1, 0, " ");
+            (void)rtx_wb_busy(&q);
+            k = paint_of(&a, "t", g, sizeof g);
+            expect(rtx_wb_deferred(&q), "uses: the used workbook reads as a job");
+            if (k != 2 || strcmp(g, "\xe2\x89\x88" "26")) {
+                fprintf(stderr, "FAIL: uses: stale while the used workbook works: paint %d \"%s\"\n", k, g);
+                fails++;
+            }
+            for (k = 0; k < 10000 && (rtx_wb_busy(&q) || rtx_wb_busy(&a) || rtx_wb_due_ms(&a) == 0); k++) {
+                (void)rtx_wb_idle(&q);
+                (void)rtx_wb_idle(&a);
+            }
+            rtx_wb_limits(mb, mr, md);
+            k = paint_of(&a, "t", g, sizeof g);
+            expect(k == 1 && !strcmp(g, "26"), "uses: fresh after the used workbook's job");
+        }
+        off = find_off_s(&q, "} a | 1 |");
+        rep(&q, off + 6, 1, "5");
+        rtx_wb_sync(rtx_wb_of(&q), &q);
+        k = paint_of(&a, "t", g, sizeof g);
+        if (!(k == 1 && !strcmp(g, "30"))) {
+            char tv[256];
+            fprintf(stderr, "FAIL: uses: fresh again after the jobs: paint %d \"%s\" (t = %s)\n", k, g,
+                    ueval(&a, "t", tv, sizeof tv));
+            fails++;
+        }
+        /* the reader's own edits keep reading the import */
+        off = find_off_s(&a, "| 2 | =prior.T#q1.v");
+        rep(&a, off + 2, 1, "7");
+        expect_eval(&a, "sum(R.y)", "42", "uses: an edit in the reader");
+        undo(&q);
+        expect_eval(&a, "t", "26", "uses: undo in the live q2");
+    }
+    /* a scratch build of a's bytes reads the same */
+    {
+        size_t n = 0, la, lb;
+        char *p = doc_bytes(&a, &n);
+        CCArena sa;
+        la = dump_of(&a, g_a);
+        {
+            @errhandler(CCError e) {
+                cc_error_log(e);
+                return;
+            }
+            sa = cc_arena_heap(n + 64);
+            {
+                char[:] sl = cc_slice_from_buffer(p, n);
+                char[:] keep = sl.clone_into(sa) !>;
+                a2.from_buffer(keep) !>;
+            }
+        }
+        rtx_wb_attach_named(&a2, pa);
+        lb = dump_of(&a2, g_b);
+        if (la != lb || memcmp(g_a, g_b, la)) diff_report("uses: incremental vs scratch", la, lb);
+        RtxDoc_destroy(&a2);
+        sa.destroy();
+        free(p);
+    }
+    RtxDoc_destroy(&q);
+    /* q2 closed: back to a private copy, the file's bytes */
+    expect_eval(&a, "t", "15", "uses: q2 closed (the file again)");
+    RtxDoc_destroy(&a);
+    /* 4: cycles across files, with the full path */
+    uwrite("c1.wb.md", "# C1\n\n```uses\nother = \"c2.wb.md\"\n```\n\n```calc\nx = other.y + 1\nz = 5\n```\n");
+    uwrite("c2.wb.md", "# C2\n\n```uses\nback = \"c1.wb.md\"\n```\n\n```calc\ny = back.z * 2\n```\n");
+    upath(pc1, sizeof pc1, "c1.wb.md");
+    upath(pc2, sizeof pc2, "c2.wb.md");
+    if (open_path(&c1, pc1)) {
+        char got[512], r1[4096], r2[4096];
+        ueval(&c1, "x", got, sizeof got);
+        expect(strstr(got, "#cycle(") != NULL, "uses: a cycle across files");
+        if (realpath(pc1, r1) && realpath(pc2, r2))
+            expect(strstr(got, r1) && strstr(got, r2), "uses: the cycle names both files (full paths)");
+        if (getenv("WB_P2_VERBOSE")) fprintf(stderr, "cycle: %s\n", got);
+        /* both open (panes): the live cycle is found too */
+        if (open_path(&c2, pc2)) {
+            ueval(&c2, "y", got, sizeof got);
+            expect(strstr(got, "#cycle(") != NULL, "uses: a live cycle");
+            RtxDoc_destroy(&c2);
+        }
+        RtxDoc_destroy(&c1);
+    }
+    rtx_wb_uses_poll_ms(1000);
+    printf("wb_p2_smoke uses: private / live / changed on disk / stale / missing / cycles\n");
+}
+
+/* ------------------------------------------------------------ csv */
+
+static const char g_csv1[] =
+    "Order ID,Region,Amount,Note\r\n"
+    "1,EU,10.50,plain\r\n"
+    "2,US,\"1000.25\",\"a, comma\"\r\n"
+    "3,EU,3,\"said \"\"hi\"\"\"\r\n"
+    "4,\"EU\",4.25,\"two\nlines\"\r\n"
+    "\r\n"
+    "5,APAC,,=SUM(A1:A3)\r\n"
+    "6,US,7.75,last";
+
+static const char g_csvwb[] =
+    "# S\n\n```table Sales\nsource: data/sales.csv   # a comment\nformat: csv; header: 1\ncolumns:\n"
+    "  id: int <- \"Order ID\"\n  region: text <- \"Region\"\n  amount: float <- \"Amount\"\n"
+    "  note: text <- @4\n  missing: int <- \"Nope\"\n```\n\n"
+    "```table T2\nsource: data/t.tsv\nformat: tsv\n```\n\n"
+    "```table Bad\nsource: data/none.csv\n```\n\n"
+    "```calc\ntotal = sum(Sales.amount)\neu = sum(Sales.amount where region = \"EU\")\n"
+    "n = count(Sales)\nnote2 = Sales[id = 2].note\nnote3 = Sales[id = 3].note\nnote4 = Sales[id = 4].note\n"
+    "note5 = Sales[id = 5].note\nmiss = Sales[id = 1].missing\nt2 = sum(T2.qty)\nt2n = count(T2)\n"
+    "bad = count(Bad)\n```\n";
+
+static void csv(void) {
+    char dir[600], dd[700], pw[800], pcsv[800], g[256];
+    RtxDoc w = {0}, w2 = {0};
+    RtxWbStats st;
+    int k;
+    snprintf(dir, sizeof dir, "testdata/generated/wb_p2/csv");
+    mkdir("testdata", 0755);
+    mkdir("testdata/generated", 0755);
+    mkdir("testdata/generated/wb_p2", 0755);
+    mkdir(dir, 0755);
+    snprintf(dd, sizeof dd, "%s/data", dir);
+    mkdir(dd, 0755);
+    snprintf(pcsv, sizeof pcsv, "%s/sales.csv", dd);
+    write_file(pcsv, g_csv1, strlen(g_csv1));
+    snprintf(pw, sizeof pw, "%s/t.tsv", dd);
+    write_file(pw, "name\tqty\nx\t2\ny\t40\n", 18);
+    snprintf(pw, sizeof pw, "%s/w.wb.md", dir);
+    write_file(pw, g_csvwb, strlen(g_csvwb));
+    rtx_wb_set_cache_dir(NULL);
+    rtx_wb_uses_poll_ms(1);
+    if (!open_path(&w, pw)) {
+        expect(0, "csv: open");
+        return;
+    }
+    /* RFC 4180: quoted delimiters, doubled quotes, a record over two lines,
+     * CRLF, a blank line, an empty field, a formula-looking text, no final NL */
+    expect_eval(&w, "n", "6", "csv: records");
+    expect_eval(&w, "total", "1025.75", "csv: sum over quoted numbers");
+    expect_eval(&w, "eu", "17.75", "csv: where over a quoted text");
+    expect_eval(&w, "note2", "\"a, comma\"", "csv: a quoted delimiter");
+    expect_eval(&w, "note3", "\"said \"hi\"\"", "csv: doubled quotes");
+    expect_eval(&w, "note4", "\"two\nlines\"", "csv: a newline in quotes");
+    expect_eval(&w, "note5", "\"=SUM(A1:A3)\"", "csv: a leading = is text");
+    expect_eval(&w, "miss", "~#schema(Nope", "csv: a header the file lacks");
+    expect_eval(&w, "t2", "42", "tsv: header names, tab fields");
+    expect_eval(&w, "t2n", "2", "tsv: rows");
+    expect_eval(&w, "bad", "~#ref(Bad: cannot read data/none.csv", "csv: a missing file");
+    /* the file changes on disk: the table is read again */
+    {
+        const char more[] = "\r\n7,EU,100,new";
+        FILE *f = fopen(pcsv, "ab");
+        if (f) {
+            fwrite(more, 1, strlen(more), f);
+            fclose(f);
+        }
+        for (k = 0; k < 40; k++) {
+            sleep_ms(2);
+            (void)rtx_wb_idle(&w);
+        }
+        expect_eval(&w, "n", "7", "csv: the file grew (read again)");
+        expect_eval(&w, "eu", "117.75", "csv: the new row's value");
+        rtx_wb_counters(rtx_wb_of(&w), &w, &st);
+        expect(st.uses_reread >= 1, "csv: the change was seen");
+    }
+    /* painted: the calc line's value */
+    k = paint_of(&w, "total", g, sizeof g);
+    expect(k == 1 && !strcmp(g, "1125.75"), "csv: the value paints");
+    /* the index keeps the file's rows (and its identity) */
+    {
+        char cache[800];
+        snprintf(cache, sizeof cache, "%s/cache", dir);
+        mkdir(cache, 0755);
+        rtx_wb_set_cache_dir(cache);
+        rtx_si_test_gran_ms(0);
+        RtxDoc_destroy(&w);
+        sleep_ms(5);
+        if (open_path(&w, pw)) {
+            rtx_wb_settle(rtx_wb_of(&w), &w);
+            rtx_wb_index_flush();
+            RtxDoc_destroy(&w);
+        }
+        if (open_path(&w2, pw)) {
+            rtx_wb_counters(rtx_wb_of(&w2), &w2, &st);
+            expect(st.idx_state == 1 && st.idx_rows >= 9, "csv: reopen installs the file's rows");
+            expect_eval(&w2, "eu", "117.75", "csv: values from the index");
+            expect_eval(&w2, "note4", "\"two\nlines\"", "csv: records from the index");
+            RtxDoc_destroy(&w2);
+        }
+        /* the file changed since: the index is not used for it */
+        write_file(pcsv, g_csv1, strlen(g_csv1));
+        sleep_ms(5);
+        if (open_path(&w2, pw)) {
+            rtx_wb_counters(rtx_wb_of(&w2), &w2, &st);
+            expect(st.idx_state != 1, "csv: a changed file: its rows are read");
+            expect_eval(&w2, "eu", "17.75", "csv: the file's values after a change");
+            RtxDoc_destroy(&w2);
+        }
+        rtx_wb_set_cache_dir(NULL);
+    }
+    /* a bigger file: sums over many records, with quotes */
+    {
+        char pb[800];
+        FILE *f;
+        long i, want = 0;
+        snprintf(pb, sizeof pb, "%s/big.csv", dd);
+        f = fopen(pb, "wb");
+        if (f) {
+            fprintf(f, "k,v,s\n");
+            for (i = 0; i < 200000; i++) {
+                fprintf(f, "%ld,%ld,\"x, %ld\"\n", i, i % 97, i);
+                want += i % 97;
+            }
+            fclose(f);
+        }
+        snprintf(pw, sizeof pw, "%s/big.wb.md", dir);
+        {
+            const char t[] = "# B\n\n```table B\nsource: data/big.csv\n```\n\n```calc\nsv = sum(B.v)\nnb = count(B)\n"
+                             "s7 = B[k = 7].s\n```\n";
+            write_file(pw, t, strlen(t));
+        }
+        if (open_path(&w, pw)) {
+            char want_s[32];
+            snprintf(want_s, sizeof want_s, "%ld", want);
+            expect_eval(&w, "sv", want_s, "csv: a 200k-record sum");
+            expect_eval(&w, "nb", "200000", "csv: 200k records");
+            expect_eval(&w, "s7", "\"x, 7\"", "csv: a keyed lookup into the file");
+            RtxDoc_destroy(&w);
+        }
+    }
+    rtx_wb_uses_poll_ms(1000);
+    printf("wb_p2_smoke csv: RFC 4180 records, tsv, #schema, a missing file, a changed file, the index\n");
+}
+
+int main(int argc, char **argv) {
+    int steps = argc > 1 ? atoi(argv[1]) : 300;
+    const char *only = argc > 2 ? argv[2] : NULL;
+#define WB_P2_RUN(nm, call) if (!only || !strcmp(only, nm)) call
+    WB_P2_RUN("csv", csv());
+    WB_P2_RUN("uses", uses());
+    WB_P2_RUN("gminmax", gminmax(steps));
+    WB_P2_RUN("lookups", lookups(steps));
+    WB_P2_RUN("par", par());
+    WB_P2_RUN("persist", persist(steps));
+    if (fails) {
+        fprintf(stderr, "wb_p2_smoke: %d failures\n", fails);
+        return 1;
+    }
+    printf("wb_p2_smoke: ok\n");
+    return 0;
+}

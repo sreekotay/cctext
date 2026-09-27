@@ -17,8 +17,14 @@
  *   linear    — no backrefs / lookaround / atomic: Pike VM (captures),
  *               lazy DFA forward + reverse for unanchored search (find).
  *   backtrack — explicit-stack backtracker with a per-attempt step
- *               budget. A budget hit is "no match at this position"
- *               (RTX_RX_BUDGET) and bumps rtx_rx_budget_hits().
+ *               budget. A budget hit (or the stack / look-around cap)
+ *               is RTX_RX_INDET, "not decided here", never "no match":
+ *               a search stops at that start and reports it; it does
+ *               not go on to later starts. It bumps rtx_rx_budget_hits().
+ *               The DFA and the Pike VM are linear and never give up.
+ *               Grammars (TextMate) take INDET as "this rule does not
+ *               match here", a documented best effort (DESIGN.md);
+ *               find, replace and project search do not.
  *
  * Reentrant: the program is immutable after compile; every matcher's
  * state lives in a caller-owned RtxRxScratch (its own heap arenas).
@@ -28,12 +34,19 @@
  * an inner literal (bounded offset, or the literal's line when no match
  * crosses a newline) or a small literal set, ignore-case pairs included,
  * found 16 starts at a time (SSE2) and verified; the DFA rests it where
- * candidates come every few bytes and tries it again later.
+ * candidates come every few bytes and tries it again later. A pattern
+ * with no such literal (an unbounded part that may cross a newline before
+ * it: `\w+\s+Holmes`) may split as P L S instead: search finds L, runs P
+ * reversed from the hit to the leftmost start and the forward DFA
+ * anchored there (reverse inner / reverse suffix), only where compile
+ * proves the first confirmed hit is the leftmost match; linear-time
+ * guards hand the search back to the plain DFA.
  *
- * Word tests (\b, \w) treat ASCII [0-9A-Za-z_] as word; for scalars at
- * or above U+00A0, \w is "not space and not common punctuation"
- * (rtx_utf8_word_cp policy); \b compares the scalars on each side (an
- * invalid byte is not a word). Forward DFA states carry the look-behind
+ * Word tests (\b, \w) treat ASCII [0-9A-Za-z_] as word; past ASCII, \w is
+ * Oniguruma's (letters, marks, digits: U+207F ⁿ is a word, U+00B7 · and
+ * U+2070 ⁰ are not), exact in Latin-1 and the punctuation / super- and
+ * subscript blocks, by block elsewhere (rx_nonword_hi in rx.ccs);
+ * \b compares the scalars on each side (an invalid byte is not a word). Forward DFA states carry the look-behind
  * exactly (the UTF-8 scalar in progress and its lead's word class), and a
  * lead of an all-word range is taken as a word ahead, checked as its
  * continuation bytes arrive (broken UTF-8 reruns the search exactly), so
@@ -75,7 +88,8 @@ enum {
     RTX_RX_NONE = 0,
     RTX_RX_MATCH = 1,
     RTX_RX_PARTIAL = 2, /* search: a candidate reached the text end undecided */
-    RTX_RX_BUDGET = 3   /* backtrack step budget ran out: no match here */
+    RTX_RX_INDET = 3,   /* indeterminate: see rtx_rx_at / rtx_rx_search */
+    RTX_RX_BUDGET = RTX_RX_INDET /* the old name */
 };
 
 enum { RTX_RX_LINEAR = 0, RTX_RX_BACKTRACK = 1 };
@@ -106,7 +120,9 @@ typedef struct {
     const size_t *ext_e;
     unsigned ext_n;
     unsigned force;  /* tests: 1 = Pike VM, 2 = backtracker, 3 = DFA without
-                      * the prefilter, 0 = auto */
+                      * the prefilter, 4 = auto with the reverse inner
+                      * search wherever it was built (any text length, no
+                      * rest), 0 = auto */
 } RtxRxIn;
 
 /* Matcher scratch. Owns its arenas (made on first use); drop frees them.
@@ -118,21 +134,30 @@ typedef struct {
     size_t dfa_resets;
     size_t dfa_giveups;
     size_t dfa_exact;   /* reruns after broken UTF-8 met a \b's assumption */
+    size_t ri_work;     /* bytes the reverse inner search read (reverse + forward) */
+    size_t ri_bails;    /* reverse inner searches handed to the plain path from lo */
 } RtxRxScratch;
 
 /* Compile onto `a` (the program's lifetime). Errors are
  * CC_ERR_INVALID_ARG with a static message. */
 RtxRx *!>(CCError) rtx_rx_compile(char[:] pat, unsigned flags, CCArena a);
 
-/* Anchored at `at`: RTX_RX_MATCH (end, caps), RTX_RX_NONE, RTX_RX_BUDGET.
+/* Anchored at `at`: RTX_RX_MATCH (end, caps), RTX_RX_NONE, or
+ * RTX_RX_INDET: the step budget (or the backtrack stack, the look-around
+ * depth, scratch memory) ran out before the attempt was decided — there
+ * may or may not be a match at `at`.
  * Leftmost-first: the first alternative that matches wins. */
 int rtx_rx_at(const RtxRx *rx, const RtxRxIn *in, size_t at,
               RtxRxScratch *s, size_t *end, RtxRxCaps *caps);
 
 /* Unanchored leftmost-first search for a match starting in [lo, stop).
- * RTX_RX_MATCH: [*ms, *me). RTX_RX_PARTIAL (only when !eof): a match or
- * candidate starting at *ms may run past n — the caller reports it as a
- * leftover. Empty matches are reported (*ms == *me); the caller steps. */
+ * RTX_RX_MATCH: [*ms, *me). RTX_RX_NONE: no match starts in [lo, stop).
+ * RTX_RX_PARTIAL (only when !eof): a match or candidate starting at *ms
+ * depends on bytes past n (it runs to n, or an assertion or look-around
+ * read the end) — the caller reports it as a leftover. RTX_RX_INDET: no
+ * match starts in [lo, *ms), and the start at *ms could not be decided
+ * (budget); nothing is known from *ms on (*me == *ms). Empty matches are
+ * reported (*ms == *me); the caller steps. */
 int rtx_rx_search(const RtxRx *rx, const RtxRxIn *in, size_t lo, size_t stop,
                   int eof, RtxRxScratch *s, size_t *ms, size_t *me);
 
@@ -149,10 +174,24 @@ int rtx_rx_group_named(const RtxRx *rx, const char *name, size_t n);
 int rtx_rx_has_dfa(const RtxRx *rx);
 /* The search has a required-literal prefilter (tests / stats). */
 int rtx_rx_has_prefilter(const RtxRx *rx);
+/* The search has the reverse inner strategy (tests / stats). */
+int rtx_rx_has_inner(const RtxRx *rx);
+
+/* The prefilter's required literals: every match holds one of them
+ * (0 = none known). Literal k is *m byte positions; position i is a
+ * 256-bit set (32 bytes at ret + 32 * i: bit b = byte b may stand
+ * there; ignore-case pairs and tiny classes hold up to 3 bytes). The
+ * project search index (core/sindex.cch) derives its trigrams here. */
+unsigned rtx_rx_req_n(const RtxRx *rx);
+const uint8_t *rtx_rx_req_lit(const RtxRx *rx, unsigned k, size_t *m);
 /* Whole pattern is a case-sensitive literal (search is memmem). */
 int rtx_rx_is_literal(const RtxRx *rx);
 /* Longest possible match in bytes, or RTX_RX_UNSET when unbounded. */
 size_t rtx_rx_max_len(const RtxRx *rx);
+/* 1 = no consuming instruction (look-around included) takes '\n': every
+ * match, and all it looks at, lies on one line (the search index reads
+ * whole lines around the chunks that can match). */
+int rtx_rx_one_line(const RtxRx *rx);
 
 /* Process stats (monotonic; not matcher state). */
 size_t rtx_rx_budget_hits(void);

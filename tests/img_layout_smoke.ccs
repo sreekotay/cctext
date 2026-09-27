@@ -1,0 +1,215 @@
+#!ccc ccs
+/*
+ * Rich layout with images (docs/images.md): picture rows sized from the
+ * header, heights stable before and after the pixels decode, the caret
+ * on an image's line reveals its source (text rows, the picture below),
+ * the terminal's text stand-in `[image: alt WxH]`, and bytes untouched.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/img.cch"
+
+void rtx_safe_test_isol(void);
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+/* cctext-ui-like: 8 px per byte, 18 px lines. */
+static double px_meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 8.0 * (double)bytes.len;
+}
+
+static double px_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 18.0;
+}
+
+/* Terminal: one cell per byte (ASCII fixture), one line. */
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return (double)bytes.len;
+}
+
+static double cell_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+#define DIR "testdata/generated/imgdoc"
+
+static const char g_doc[] =
+    "# Pictures\n"
+    "\n"
+    "Some text.\n"
+    "\n"
+    "![a quad](quad.png)\n"
+    "\n"
+    "![big one](big.png \"Big\")\n"
+    "\n"
+    "Inline ![tiny](quad.png) in text.\n"
+    "\n"
+    "```\n"
+    "![not an image](quad.png)\n"
+    "```\n";
+
+static size_t off_of(const char *needle) {
+    const char *p = strstr(g_doc, needle);
+    return p ? (size_t)(p - g_doc) : 0;
+}
+
+static double row_h_at(RtxLayout *L, size_t off) {
+    size_t r = L->row_of(off);
+    return r < L->rows.len ? L->rows.data[r].height : -1;
+}
+
+int main(void) {
+    char cwd[512], path[700];
+    FILE *fp;
+    rtx_safe_test_isol();
+    if (system("rm -rf " DIR " && mkdir -p " DIR "/.git && cp testdata/img/quad.png "
+               "testdata/img/big.png " DIR "/") != 0)
+        return 1;
+    if (!getcwd(cwd, sizeof cwd)) return 1;
+    snprintf(path, sizeof path, "%s/" DIR "/doc.md", cwd);
+    fp = fopen(path, "wb");
+    if (!fp) return 1;
+    fwrite(g_doc, 1, sizeof g_doc - 1, fp);
+    fclose(fp);
+    {
+        @errhandler(CCError e) {
+            fprintf(stderr, "error: %s\n", e.message ? e.message : "?");
+            return 1;
+        }
+        RtxDoc d = {0} @destroy;
+        RtxLayout R = {0} @destroy;
+        RtxMeasure pm = {0}, cm = {0};
+        size_t quad = off_of("![a quad]"), big = off_of("![big one]");
+        size_t inl = off_of("![tiny]"), fence = off_of("![not an image]");
+        const RtxImgRec *rec;
+        double hq0, hb0, hq1, hb1;
+        size_t nrows_hidden;
+        pm.measure = px_meas;
+        pm.line_height = px_lh;
+        cm.measure = cell_meas;
+        cm.line_height = cell_lh;
+        d.from_path(cc_slice_cstr(path)) !>;
+        R.rich = 1;
+        R.wrap = 1;
+        R.doc(&d, &pm, 400.0) !>;
+        expect(R.has_marks && R.img_on, "layout: images seen in the window");
+        /* Before the header: a placeholder box of three lines. */
+        rec = rtx_layout_img_rec(&R, quad);
+        expect(rec != NULL && !rec->revealed, "layout: picture row for the quad line");
+        if (rec) expect(rec->h == 54.0 && row_h_at(&R, quad) == 60.0, "layout: placeholder box");
+        expect(rtx_layout_img_rec(&R, inl - 7) == NULL, "layout: inline image is no picture row");
+        expect(rtx_layout_img_rec(&R, fence) == NULL, "layout: an image in a fence is text");
+        /* Header arrives: the box is the picture's, fitted to the pane. */
+        rtx_img_finish();
+        expect(rtx_img_layout_changed(), "layout: header change reported");
+        R.doc(&d, &pm, 400.0) !>;
+        rec = rtx_layout_img_rec(&R, quad);
+        expect(rec && rec->w == 32 && rec->h == 24, "layout: quad box is its natural size");
+        rec = rtx_layout_img_rec(&R, big);
+        expect(rec && rec->w == 396 && rec->h == 297, "layout: big box fits the pane");
+        hq0 = row_h_at(&R, quad);
+        hb0 = row_h_at(&R, big);
+        expect(hq0 == 30.0 && hb0 == 303.0, "layout: rows are box + padding");
+        nrows_hidden = R.rows.len;
+        /* Pixels: the heights do not move. */
+        {
+            RtxImgSrc s;
+            RtxImgView v;
+            rtx_img_resolve(path, "quad.png", 8, &s);
+            rtx_img_frame();
+            rtx_img_want(&s, 32, 24, &v);
+            rtx_img_resolve(path, "big.png", 7, &s);
+            rtx_img_want(&s, 396, 297, &v);
+            rtx_img_finish();
+            rtx_img_want(&s, 396, 297, &v);
+            expect(v.state == RTX_IMG_S_OK && v.bmp && v.bmp->w == 396, "layout: big decoded at box size");
+            expect(v.bmp && v.bmp->bytes == 396u * 297u * 4u, "layout: only the scaled pixels held");
+        }
+        R.doc(&d, &pm, 400.0) !>;
+        hq1 = row_h_at(&R, quad);
+        hb1 = row_h_at(&R, big);
+        expect(hq1 == hq0 && hb1 == hb0 && R.rows.len == nrows_hidden,
+               "layout: heights stable after decode");
+        /* Caret on the image's line: its source shows, the picture below. */
+        expect(rtx_layout_reveal(&R, &d, quad + 3, quad + 3), "layout: reveal changes");
+        expect(R.reveal_lo <= quad && R.reveal_hi >= quad + strlen("![a quad](quad.png)"),
+               "layout: reveal covers the image");
+        R.doc(&d, &pm, 400.0) !>;
+        rec = rtx_layout_img_rec(&R, quad);
+        expect(rec && rec->revealed && rec->text_h == 18.0 && rec->top == 21.0,
+               "layout: revealed picture under its source");
+        expect(row_h_at(&R, quad) == 18.0 + 24.0 + 6.0, "layout: source row + picture");
+        {
+            size_t r = R.row_of(quad);
+            expect(R.rows.data[r].width >= px_meas(NULL, cc_slice_cstr("![a quad](quad.png)"),
+                                                   (RtxStyle){0}, RTX_SEC_MARKUP),
+                   "layout: the source text is laid out (no hidden bytes)");
+        }
+        rtx_layout_reveal(&R, &d, 0, 0);
+        R.doc(&d, &pm, 400.0) !>;
+        expect(row_h_at(&R, quad) == hq0, "layout: caret away hides the source again");
+        /* The terminal: a text stand-in, inline too. */
+        R.doc(&d, &cm, 80.0) !>;
+        {
+            size_t r = R.row_of(inl);
+            const char *want = "Inline [image: tiny 32x24] in text.";
+            expect(R.rows.data[r].width == (double)strlen(want),
+                   "layout: terminal stand-in width");
+            r = R.row_of(quad);
+            expect(R.rows.data[r].width == (double)strlen("[image: a quad 32x24]"),
+                   "layout: terminal stand-in for a picture line");
+            expect(rtx_layout_img_rec(&R, quad) == NULL, "layout: no picture rows in cells");
+        }
+        {
+            RtxHintVis hv;
+            char line[64];
+            size_t n = strlen("![a quad](quad.png)");
+            memcpy(line, g_doc + quad, n);
+            expect(rtx_layout_hint_vis(&R, &d, quad, line, 0, n, &hv) && hv.skip == n &&
+                       hv.gn == strlen("[image: a quad 32x24]") &&
+                       memcmp(hv.g, "[image: a quad 32x24]", hv.gn) == 0,
+                   "layout: stand-in text");
+        }
+        /* Bytes stay the truth. */
+        {
+            CCArena fr = cc_arena_heap(4096);
+            char[:] all = d.scratch_span(0, d.len(), fr) !>;
+            expect(all.len == sizeof g_doc - 1 && memcmp(all.ptr, g_doc, all.len) == 0,
+                   "layout: document bytes unchanged");
+            fr.destroy();
+        }
+    }
+    rtx_img_reset();
+    if (fails) {
+        fprintf(stderr, "img_layout_smoke: %d failures\n", fails);
+        return 1;
+    }
+    printf("img_layout_smoke: ok\n");
+    return 0;
+}

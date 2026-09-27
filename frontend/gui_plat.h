@@ -202,6 +202,19 @@ int gui_alert_changed(const char *path);
  * Returns 1=All files, 2=This file, 0=Cancel. */
 int gui_alert_xact(void);
 
+/* An image needs a decision (docs/images.md). remote 0: "Allow this
+ * file" 1, "Allow this directory" 2, "Allow ALL local images" 3; remote
+ * 1: "Load this image" 1, "Always load from this host" 2, "Always load
+ * remote images in this project" 3. Cancel 0. */
+int gui_alert_image(int remote, const char *msg);
+
+/* Image blit (ui_os_image_*): one platform image per decoded bitmap
+ * (BGRA premultiplied; the pixels outlive it), drawn scaled into a rect
+ * inside the current Draw. */
+void *gui_image_new(const unsigned char *bgra, int w, int h, int stride);
+void gui_image_free(void *img);
+void gui_image_draw(void *img, double x, double y, double w, double h, float alpha);
+
 /* Save dialog; 1=path chosen, 0=cancel, -1=unavailable. */
 int gui_save_panel(const char *dir, char *out, size_t n);
 

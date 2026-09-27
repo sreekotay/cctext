@@ -1,0 +1,766 @@
+#!ccc ccs
+/*
+ * Workbook W1 smoke (docs/workbook.md "W1: the lazy engine"):
+ *
+ *   anchors   — a property loop over a table with row anchors, anchored
+ *               references (T#a.col, T#a[+k].col, #first / #last), anchor
+ *               ranges in aggregates and running chains: cell edits, row
+ *               inserts / deletes / moves, anchors added / removed /
+ *               renamed / duplicated, undo / redo; with jobs forced (a
+ *               tiny inline budget) some steps leave work pending, run a
+ *               few idle slices, cancel, then edit again. After every
+ *               step, once settled, every value is bit-identical to a
+ *               workbook built from scratch.
+ *   chain     — a 100k-row running total: the top of the view is exact
+ *               at once, the bottom settles through the chain job; an
+ *               edit above a reset row converges there (checkpoints
+ *               equal: the rest is skipped); counters say so.
+ *   priority  — with jobs pending, a visible cell that does not depend
+ *               on them is fresh; a value that does paints stale (the
+ *               last value, marked) until the job ends.
+ *   rename    — a refused rename edits nothing: bytes, undo and redo
+ *               stacks (a redo branch included) are untouched.
+ *   sequence  — edit during a job, cancel, edit, undo: the next query is
+ *               exact.
+ *
+ *   ./bin/wb_w1_smoke [steps per seed]     (default 600)
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "../core/document.cch"
+#include "../core/wb.cch"
+
+static int fails = 0;
+static uint64_t rng;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static uint64_t rnd(void) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+}
+
+static size_t rnd_n(size_t n) {
+    return n ? (size_t)(rnd() % n) : 0;
+}
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
+static char *doc_bytes(RtxDoc *d, size_t *out_n) {
+    size_t n = d->len();
+    char *p = (char *)malloc(n + 1);
+    *out_n = 0;
+    if (!p) return NULL;
+    if (n) {
+        size_t got = d->read_at(0, cc_slice_from_buffer(p, n)) ?> 0;
+        if (got != n) {
+            free(p);
+            return NULL;
+        }
+    }
+    p[n] = 0;
+    *out_n = n;
+    return p;
+}
+
+static char g_last[256];
+
+static int rep(RtxDoc *d, size_t off, size_t n, const char *s) {
+    size_t sn = strlen(s);
+    snprintf(g_last, sizeof g_last, "replace %zu %zu \"%s\"", off, n, s);
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    d->replace(off, n, sn ? cc_slice_from_buffer((char *)s, sn) : cc_slice_empty()) !>;
+    return 1;
+}
+
+static int undo(RtxDoc *d) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    if (!d->can_undo()) return 0;
+    snprintf(g_last, sizeof g_last, "undo");
+    d->undo() !>;
+    return 1;
+}
+
+static int redo(RtxDoc *d) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    if (!d->can_redo()) return 0;
+    snprintf(g_last, sizeof g_last, "redo");
+    d->redo() !>;
+    return 1;
+}
+
+static size_t find_off(RtxDoc *d, const char *needle, int nth) {
+    size_t n = 0, off = (size_t)-1;
+    char *p = doc_bytes(d, &n), *q;
+    if (!p) return off;
+    q = p;
+    while ((q = strstr(q, needle)) != NULL) {
+        if (nth-- == 0) {
+            off = (size_t)(q - p);
+            break;
+        }
+        q++;
+    }
+    free(p);
+    return off;
+}
+
+static int open_buf(RtxDoc *d, CCArena *keep_a, const char *src, size_t n) {
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 0;
+    }
+    *keep_a = cc_arena_heap(n + 64);
+    {
+        char[:] sl = cc_slice_from_buffer((char *)src, n);
+        char[:] keep = sl.clone_into(*keep_a) !>;
+        d->from_buffer(keep) !>;
+    }
+    return rtx_wb_attach(d) != NULL;
+}
+
+#define DUMP_CAP (4u << 20)
+static char g_a[DUMP_CAP];
+static char g_b[DUMP_CAP];
+
+/* Settled dump of `d` against a scratch build of its bytes. 1 if equal. */
+static int same_as_scratch(RtxDoc *d, const char *what) {
+    const int flags = RTX_WB_DUMP_BITS | RTX_WB_DUMP_MAS;
+    RtxWb *wb = rtx_wb_of(d);
+    size_t n = 0, la, lb;
+    char *p = doc_bytes(d, &n);
+    RtxDoc x = {0};
+    CCArena sa;
+    int ok;
+    if (!wb || !p) {
+        free(p);
+        return 0;
+    }
+    rtx_wb_settle(wb, d);
+    la = rtx_wb_dump_ex(wb, d, flags, g_a, sizeof g_a);
+    if (!open_buf(&x, &sa, p, n)) {
+        free(p);
+        return 0;
+    }
+    rtx_wb_settle(rtx_wb_of(&x), &x);
+    lb = rtx_wb_dump_ex(rtx_wb_of(&x), &x, flags, g_b, sizeof g_b);
+    RtxDoc_destroy(&x);
+    sa.destroy();
+    ok = la == lb && !memcmp(g_a, g_b, la);
+    if (!ok) {
+        size_t i = 0, ls = 0, line = 1;
+        const char *ea, *eb;
+        while (i < la && i < lb && g_a[i] == g_b[i]) {
+            if (g_a[i] == '\n') {
+                line++;
+                ls = i + 1;
+            }
+            i++;
+        }
+        ea = strchr(g_a + ls, '\n');
+        eb = strchr(g_b + ls, '\n');
+        fprintf(stderr, "FAIL: %s (%s): incremental != scratch at dump line %zu\n  inc:     %.*s\n  scratch: %.*s\n",
+                what, g_last, line, (int)(ea ? ea - (g_a + ls) : 0), g_a + ls,
+                (int)(eb ? eb - (g_b + ls) : 0), g_b + ls);
+        if (getenv("WB_W1_VERBOSE")) fprintf(stderr, "--- doc\n%s\n", p);
+        fails++;
+    }
+    free(p);
+    return ok;
+}
+
+/* ------------------------------------------------------------- anchors */
+
+static const char g_anc_src[] =
+    "# A\n"
+    "\n"
+    "```params\n"
+    "k = 2\n"
+    "```\n"
+    "\n"
+    "Table: T\n"
+    "\n"
+    "| name | x | run | back | pin |\n"
+    "|------|---|-----|------|-----|\n"
+    "%s"
+    "\n"
+    "```calc\n"
+    "a1 = T#q1.x\n"
+    "a2 = T#q2[+1].x\n"
+    "a3 = T#first[+2].x\n"
+    "a4 = T#last[-1].run\n"
+    "a5 = sum(T[#q1 .. #q3].x)\n"
+    "a6 = count(T[#q2 .. #last])\n"
+    "a7 = avg(T[#first .. #q4].x)\n"
+    "a8 = max(T[#q1 .. #q2].run)\n"
+    "a9 = sum(T.x where x > k)\n"
+    "b1 = T#q3[-2].back\n"
+    "b2 = min(T[#q4 .. #q1].x)\n"
+    "b3 = K[id = 3].v\n"
+    "b4 = sum(T.pin where pin > 0)\n"
+    "```\n"
+    "\n"
+    "Table: K\n"
+    "\n"
+    "| id | v |\n"
+    "|----|---|\n"
+    "| 1 | 10 |\n"
+    "| 2 | 20 |\n"
+    "| 3 | 30 |\n"
+    "| 4 | 40 |\n"
+    "| 10 | 100 |\n"
+    "| 7 | =@id * 7 |\n"
+    "| 0 | 5 |\n"
+    "| 4.5 | 45 |\n";
+
+static const char *const g_names[] = {"", "", "", "{#q1} ", "{#q2} ", "{#q3} ", "{#q4} ", "{#q5} "};
+static const char *const g_xs[] = {"1", "2", "-3", "4.5", "0", "10", "", "=@x[-1] + 1", "7", "x"};
+static const char *const g_runs[] = {"=coalesce(@run[-1], 0) + @x", "=coalesce(@run[-1], 0) + @x",
+                                     "=coalesce(@run[-1], 0) + @x", "=@x", "=coalesce(@run[-2], 1) * 1"};
+static const char *const g_backs[] = {"=@x[-1]", "=@run[-1]", "=@x[+1]", "=T#q1.x + @x", "3"};
+static const char *const g_pins[] = {"=T#q2.x", "=T#first.run", "=sum(T[#q1 .. #q2].x)", "=@x * 2", "",
+                                     "=K[id = @x].v", "=first(K[id = @x]).v"};
+
+static void anc_row(char *buf, size_t cap, int i) {
+    snprintf(buf, cap, "| %sr%d | %s | %s | %s | %s |\n", g_names[rnd_n(8)], i,
+             g_xs[rnd_n(sizeof g_xs / sizeof g_xs[0])], g_runs[rnd_n(5)], g_backs[rnd_n(5)],
+             g_pins[rnd_n(7)]);
+}
+
+/* Rows of the table: [lo, hi) of each body line (hi at the '\n'). */
+static size_t anc_rows(const char *p, size_t n, size_t *lo, size_t *hi, size_t cap) {
+    const char *t = strstr(p, "|-----");
+    size_t k = 0, i;
+    if (!t) return 0;
+    i = (size_t)(strchr(t, '\n') - p) + 1;
+    while (i < n && p[i] == '|' && k < cap) {
+        const char *e = memchr(p + i, '\n', n - i);
+        if (!e) break;
+        lo[k] = i;
+        hi[k] = (size_t)(e - p);
+        k++;
+        i = hi[k - 1] + 1;
+    }
+    return k;
+}
+
+static int anc_step(RtxDoc *d, int s) {
+    size_t n = 0, lo[256], hi[256], nr;
+    char *p = doc_bytes(d, &n), buf[256];
+    int kind = (int)rnd_n(100), ok = 1;
+    if (!p) return 0;
+    nr = anc_rows(p, n, lo, hi, 256);
+    if (kind < 25 && nr) {
+        /* a cell: x, run, back or pin */
+        size_t r = rnd_n(nr), c = 2 + rnd_n(4), k = 0, i, clo = 0, chi = 0;
+        for (i = lo[r]; i < hi[r]; i++)
+            if (p[i] == '|') {
+                if (k == c) {
+                    chi = i;
+                    break;
+                }
+                k++;
+                if (k == c) clo = i + 1;
+            }
+        if (chi > clo) {
+            const char *v = c == 2 ? g_xs[rnd_n(sizeof g_xs / sizeof g_xs[0])]
+                            : c == 3 ? g_runs[rnd_n(5)]
+                            : c == 4 ? g_backs[rnd_n(5)]
+                                     : g_pins[rnd_n(7)];
+            snprintf(buf, sizeof buf, " %s ", v);
+            ok = rep(d, clo, chi - clo, buf);
+        }
+    } else if (kind < 35 && nr) {
+        /* anchor added / removed / changed on a row's first cell */
+        size_t r = rnd_n(nr), a = lo[r] + 2;
+        if (p[a] == '{') {
+            const char *e = strchr(p + a, '}');
+            size_t en = e ? (size_t)(e - (p + a)) + 2 : 0;
+            if (rnd_n(2)) ok = rep(d, a, en, "");
+            else ok = rep(d, a, en, g_names[3 + rnd_n(5)]);
+        } else {
+            ok = rep(d, a, 0, g_names[3 + rnd_n(5)]);
+        }
+    } else if (kind < 47) {
+        /* insert a row */
+        size_t at = nr ? lo[rnd_n(nr)] : 0;
+        if (nr && rnd_n(4) == 0) at = hi[nr - 1] + 1;
+        anc_row(buf, sizeof buf, 100 + s);
+        if (at) ok = rep(d, at, 0, buf);
+    } else if (kind < 57 && nr > 3) {
+        size_t r = rnd_n(nr);
+        ok = rep(d, lo[r], hi[r] - lo[r] + 1, "");
+    } else if (kind < 64 && nr > 3) {
+        /* move: swap two adjacent rows in one replace */
+        size_t r = rnd_n(nr - 1), la = hi[r] - lo[r], lb = hi[r + 1] - lo[r + 1];
+        char *m = (char *)malloc(la + lb + 3);
+        if (m) {
+            memcpy(m, p + lo[r + 1], lb);
+            m[lb] = '\n';
+            memcpy(m + lb + 1, p + lo[r], la);
+            m[la + lb + 1] = 0;
+            ok = rep(d, lo[r], la + lb + 1, m);
+            free(m);
+        }
+    } else if (kind < 70) {
+        /* rename an anchor (its definition), or refuse a taken name */
+        const char *q = strstr(p, "{#q");
+        if (q) {
+            char msg[160];
+            static const char *const to[] = {"q1", "q2", "q3", "q4", "q5", "zz", "q9"};
+            const char *nm = to[rnd_n(7)];
+            size_t off = (size_t)(q - p) + 2;
+            @errhandler(CCError e) {
+                cc_error_log(e);
+                free(p);
+                return 0;
+            }
+            snprintf(g_last, sizeof g_last, "rename anchor at %zu to %s", off, nm);
+            {
+                size_t sites = rtx_wb_rename(d, off, nm, strlen(nm), msg, sizeof msg) !>;
+                (void)sites;
+            }
+        }
+    } else if (kind < 73) {
+        /* the lookup table K: a key or a value, or a row in / out */
+        const char *q = strstr(p, "Table: K");
+        const char *r0 = q ? strstr(q, "|----|") : NULL;
+        if (r0) {
+            size_t klo[32], khi[32], kn = 0, i = (size_t)(strchr(r0, '\n') - p) + 1;
+            static const char *const kv[] = {"1", "2", "3", "4", "4.0", "7", "x", "=@v / 10", "30"};
+            while (i < n && p[i] == '|' && kn < 32) {
+                const char *e = memchr(p + i, '\n', n - i);
+                if (!e) break;
+                klo[kn] = i;
+                khi[kn++] = (size_t)(e - p);
+                i = (size_t)(e - p) + 1;
+            }
+            if (kn) {
+                size_t r = rnd_n(kn), sub = rnd_n(4);
+                if (sub == 0 && kn > 2) {
+                    ok = rep(d, klo[r], khi[r] - klo[r] + 1, "");
+                } else if (sub == 1) {
+                    snprintf(buf, sizeof buf, "| %s | %d |\n", kv[rnd_n(9)], (int)rnd_n(90));
+                    ok = rep(d, klo[r], 0, buf);
+                } else {
+                    /* the first or second cell */
+                    size_t a = klo[r] + 1, e = a;
+                    while (e < khi[r] && p[e] != '|') e++;
+                    if (sub == 3) {
+                        a = e + 1;
+                        e = a;
+                        while (e < khi[r] && p[e] != '|') e++;
+                    }
+                    snprintf(buf, sizeof buf, " %s ", kv[rnd_n(9)]);
+                    if (e > a) ok = rep(d, a, e - a, buf);
+                }
+            }
+        }
+    } else if (kind < 76) {
+        const char *q = strstr(p, "k = ");
+        if (q) {
+            static const char *const ks[] = {"2", "0", "5", "-1"};
+            size_t a = (size_t)(q - p) + 4, e = a;
+            while (e < n && p[e] != '\n') e++;
+            ok = rep(d, a, e - a, ks[rnd_n(4)]);
+        }
+    } else if (kind < 88) {
+        (void)undo(d);
+    } else {
+        (void)redo(d);
+    }
+    free(p);
+    return ok;
+}
+
+static void anchors_seed(uint64_t seed, int steps, int jobs) {
+    RtxDoc d = {0};
+    CCArena keep_a;
+    RtxWb *wb;
+    RtxWbStats st;
+    char rows[96 * 64], *src;
+    size_t at = 0, srcn;
+    int s, r, bad = 0;
+    rng = seed;
+    for (r = 0; r < 24; r++) {
+        anc_row(rows + at, sizeof rows - at, r + 1);
+        at += strlen(rows + at);
+    }
+    srcn = sizeof g_anc_src + at + 16;
+    src = (char *)malloc(srcn);
+    if (!src) return;
+    snprintf(src, srcn, g_anc_src, rows);
+    srcn = strlen(src);
+    if (!open_buf(&d, &keep_a, src, srcn)) {
+        free(src);
+        expect(0, "anchors: attach");
+        return;
+    }
+    free(src);
+    wb = rtx_wb_of(&d);
+    /* jobs: everything past a few rows of work waits for the idle loop */
+    if (jobs) rtx_wb_job_limits(8, 1);
+    for (s = 0; s < steps && bad < 3; s++) {
+        char what[96];
+        g_last[0] = 0;
+        if (!anc_step(&d, s)) {
+            fprintf(stderr, "FAIL: anchors seed %llx step %d: edit (%s)\n", (unsigned long long)seed,
+                    s, g_last);
+            fails++;
+            bad++;
+            continue;
+        }
+        if (jobs) {
+            /* work pending: a few slices, sometimes a cancel, sometimes an
+             * edit on top before anything settles */
+            int k = (int)rnd_n(3);
+            while (k-- > 0) (void)rtx_wb_idle(&d);
+            if (rnd_n(4) == 0) (void)rtx_wb_cancel(&d);
+            if (rnd_n(3) == 0) continue;
+        }
+        snprintf(what, sizeof what, "anchors seed %llx step %d%s", (unsigned long long)seed, s,
+                 jobs ? " (jobs)" : "");
+        if (!same_as_scratch(&d, what)) bad++;
+    }
+    if (jobs) rtx_wb_job_limits(RTX_WB_INLINE_WORK, RTX_WB_SLICE_MS);
+    rtx_wb_stats(wb, &d, &st);
+    printf("wb_w1_smoke anchors seed %llx%s: %d steps, rebuilds %zu, cell %zu, rows %zu, line %zu, "
+           "range queries %zu, chain rows %zu, cancels %zu, key probes %zu, key builds %zu\n",
+           (unsigned long long)seed, jobs ? " (jobs)" : "", s, st.rebuilds, st.fast_cell,
+           st.fast_rows, st.fast_line, st.range_q, st.chain_rows, st.cancels, st.kx_probe, st.kx_builds);
+    RtxDoc_destroy(&d);
+    keep_a.destroy();
+}
+
+/* --------------------------------------------------------------- chain */
+
+static char *chain_src(size_t rows, size_t reset_every, size_t *out_n) {
+    size_t cap = rows * 96 + 1024, at = 0, i;
+    char *s = (char *)malloc(cap);
+    if (!s) return NULL;
+    at += (size_t)snprintf(s + at, cap - at,
+                           "# C\n\n```calc\ntotal = T#last.run\ncnt = count(T)\n```\n\nTable: T\n\n"
+                           "| k | amount | run |\n|---|---|---|\n");
+    for (i = 0; i < rows; i++) {
+        const char *k = reset_every && i % reset_every == 0 ? "reset" : "r";
+        at += (size_t)snprintf(s + at, cap - at,
+                               "| %s | %zu | =if(@k = \"reset\", 0, coalesce(@run[-1], 0)) + @amount |\n", k,
+                               i % 10 + 1);
+    }
+    *out_n = at;
+    return s;
+}
+
+/* The painted value of T.run at row `r` (0-based): 1 fresh, 2 stale, 0 none. */
+static int run_at(RtxDoc *d, size_t r, char *g, size_t cap) {
+    size_t off = find_off(d, "=if(@k", (int)r), lo, hi, gn = 0;
+    int k;
+    if (off == (size_t)-1) return 0;
+    k = RtxDoc_derived_at(d, off, 0, &lo, &hi, g, cap - 1, &gn);
+    g[k ? gn : 0] = 0;
+    return k;
+}
+
+static long long run_want(size_t r, size_t reset_every) {
+    size_t i = reset_every ? r - r % reset_every : 0;
+    long long t = 0;
+    for (; i <= r; i++) t += (long long)(i % 10 + 1);
+    return t;
+}
+
+static void chain(void) {
+    const size_t rows = 100000;
+    size_t n = 0;
+    char *src = chain_src(rows, 0, &n), g[64];
+    RtxDoc d = {0};
+    CCArena keep_a;
+    RtxWb *wb;
+    RtxWbStats s0, s1;
+    double t0, t1;
+    int k, i;
+    if (!src) return;
+    /* a small inline budget: the chain past the first blocks is a job */
+    rtx_wb_job_limits(4096, RTX_WB_SLICE_MS);
+    t0 = now_ms();
+    if (!open_buf(&d, &keep_a, src, n)) {
+        free(src);
+        expect(0, "chain: attach");
+        return;
+    }
+    free(src);
+    wb = rtx_wb_of(&d);
+    /* a big workbook reads as a job: the first screen is its text; the
+     * idle loop's slices read it, then the top of the view is exact
+     * before the chain job has walked the rest */
+    t1 = now_ms();
+    for (i = 0; i < 100000 && rtx_wb_deferred(&d); i++) (void)rtx_wb_idle(&d);
+    k = run_at(&d, 2, g, sizeof g);
+    expect(k == 1 && atoll(g) == run_want(2, 0), "chain: the top of the view is exact once read");
+    printf("wb_w1_smoke chain: open %.1f ms, read (idle slices) %.1f ms, %zu rows\n", t1 - t0,
+           now_ms() - t1, rows);
+    /* the bottom: past the inline reach it paints stale (the view wants
+     * the chain there: a job), exact once the job has walked */
+    k = run_at(&d, rows - 1, g, sizeof g);
+    expect(k == 2, "chain: the bottom paints stale before the job");
+    t1 = now_ms();
+    for (i = 0; i < 100000 && rtx_wb_busy(&d); i++) (void)rtx_wb_idle(&d);
+    printf("wb_w1_smoke chain: the job walked to the bottom in %.1f ms (%d slices)\n", now_ms() - t1, i);
+    k = run_at(&d, rows - 1, g, sizeof g);
+    expect(k == 1 && atoll(g) == run_want(rows - 1, 0), "chain: the bottom settles through the job");
+    rtx_wb_settle(wb, &d);
+    /* an edit at the top: every row below moves (no convergence) */
+    rtx_wb_counters(wb, &d, &s0);
+    {
+        size_t off = find_off(&d, "| r | 2 |", 0);
+        expect(off != (size_t)-1 && rep(&d, off + 6, 1, "3"), "chain: edit row 2");
+    }
+    k = run_at(&d, 3, g, sizeof g);
+    expect(k == 1 && atoll(g) == run_want(3, 0) + 1, "chain: the view right below the edit is exact");
+    rtx_wb_settle(wb, &d);
+    rtx_wb_counters(wb, &d, &s1);
+    k = run_at(&d, rows - 1, g, sizeof g);
+    expect(k == 1 && atoll(g) == run_want(rows - 1, 0) + 1, "chain: the bottom after the edit");
+    printf("wb_w1_smoke chain: top edit: chain rows %zu, converged %zu, skipped blocks %zu\n",
+           s1.chain_rows - s0.chain_rows, s1.chain_conv - s0.chain_conv,
+           s1.chain_skip - s0.chain_skip);
+    expect(s1.chain_rows - s0.chain_rows >= rows - 512, "chain: a top edit walks every row below");
+    expect(s1.chain_conv == s0.chain_conv, "chain: a top edit does not converge");
+    RtxDoc_destroy(&d);
+    keep_a.destroy();
+
+    /* resets every 1000 rows: an edit converges at the next reset */
+    src = chain_src(rows, 1000, &n);
+    if (!src) return;
+    if (!open_buf(&d, &keep_a, src, n)) {
+        free(src);
+        expect(0, "chain: attach (resets)");
+        return;
+    }
+    free(src);
+    wb = rtx_wb_of(&d);
+    rtx_wb_settle(wb, &d);
+    rtx_wb_counters(wb, &d, &s0);
+    {
+        /* row 510 (0-based; resets at every 1000th): amount 1 -> 9 */
+        size_t off = find_off(&d, "| r | 1 |", 50);
+        expect(off != (size_t)-1 && rep(&d, off + 6, 1, "9"), "chain: edit a row mid-table");
+    }
+    rtx_wb_settle(wb, &d);
+    rtx_wb_counters(wb, &d, &s1);
+    printf("wb_w1_smoke chain: mid edit with resets: chain rows %zu, converged %zu, skipped blocks %zu\n",
+           s1.chain_rows - s0.chain_rows, s1.chain_conv - s0.chain_conv,
+           s1.chain_skip - s0.chain_skip);
+    expect(s1.chain_conv > s0.chain_conv, "chain: the walk converges at the next reset");
+    expect(s1.chain_rows - s0.chain_rows < 4096, "chain: a converged edit walks a few blocks, not the table");
+    k = run_at(&d, rows - 1, g, sizeof g);
+    expect(k == 1 && atoll(g) == run_want(rows - 1, 1000), "chain: the bottom is unchanged past the reset");
+    expect(same_as_scratch(&d, "chain: resets"), "chain: equal to scratch");
+    rtx_wb_job_limits(RTX_WB_INLINE_WORK, RTX_WB_SLICE_MS);
+    RtxDoc_destroy(&d);
+    keep_a.destroy();
+}
+
+/* ------------------------------------------------------------ priority */
+
+static void priority(void) {
+    const size_t rows = 200000;
+    size_t cap = rows * 40 + 512, at = 0, i, lo, hi, gn;
+    char *src = (char *)malloc(cap), g[64], g2[64];
+    RtxDoc d = {0};
+    CCArena keep_a;
+    RtxWb *wb;
+    int k, j;
+    if (!src) return;
+    at += (size_t)snprintf(src + at, cap - at,
+                           "# P\n\n```params\nlim = 5\n```\n\n```calc\nbig = sum(T.x where x > lim)\n```\n\n"
+                           "Table: T\n\n| x | y |\n|---|---|\n");
+    for (i = 0; i < rows; i++) at += (size_t)snprintf(src + at, cap - at, "| %zu | =@x * 2 |\n", i % 10);
+    if (!open_buf(&d, &keep_a, src, at)) {
+        free(src);
+        expect(0, "priority: attach");
+        return;
+    }
+    free(src);
+    wb = rtx_wb_of(&d);
+    rtx_wb_settle(wb, &d);
+    rtx_wb_job_limits(1024, 1);
+    {
+        size_t off = find_off(&d, "lim = 5", 0), boff = find_off(&d, "sum(T.x", 0),
+               yoff = find_off(&d, "=@x * 2", 7);
+        expect(rep(&d, off + 6, 1, "7"), "priority: flip the param");
+        expect(rtx_wb_busy(&d) && rtx_wb_progress(&d) < 100, "priority: the rebuild is a job");
+        k = RtxDoc_derived_at(&d, yoff, 0, &lo, &hi, g, sizeof g - 1, &gn);
+        g[k ? gn : 0] = 0;
+        expect(k == 1 && !strcmp(g, "14"), "priority: a visible cell off the job's path is fresh");
+        k = RtxDoc_derived_at(&d, boff, 0, &lo, &hi, g2, sizeof g2 - 1, &gn);
+        g2[k ? gn : 0] = 0;
+        expect(k == 2, "priority: the param's reader paints stale while the job runs");
+        for (j = 0; j < 200000 && rtx_wb_busy(&d); j++) (void)rtx_wb_idle(&d);
+        k = RtxDoc_derived_at(&d, boff, 0, &lo, &hi, g2, sizeof g2 - 1, &gn);
+        g2[k ? gn : 0] = 0;
+        expect(k == 1 && !strcmp(g2, "340000"), "priority: fresh once the job ends");
+    }
+    rtx_wb_job_limits(RTX_WB_INLINE_WORK, RTX_WB_SLICE_MS);
+    RtxDoc_destroy(&d);
+    keep_a.destroy();
+}
+
+/* -------------------------------------------------------------- rename */
+
+static void rename_refused(void) {
+    static const char src[] =
+        "# R\n\n```calc\nx = 1\ny = 2\nz = x + y\n```\n\nTable: T\n\n| a | b |\n|---|---|\n"
+        "| {#top} 1 | =@a * 2 |\n| 2 | =T#top.a |\n";
+    RtxDoc d = {0};
+    CCArena keep_a;
+    RtxWb *wb;
+    size_t n0 = 0, n1 = 0, head, len, gen, k;
+    char *p0, *p1, msg[160];
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        fails++;
+        return;
+    }
+    if (!open_buf(&d, &keep_a, src, sizeof src - 1)) {
+        expect(0, "rename: attach");
+        return;
+    }
+    wb = rtx_wb_of(&d);
+    /* history with a redo branch: two edits, one undone */
+    expect(rep(&d, find_off(&d, "x = 1", 0) + 4, 1, "5"), "rename: edit 1");
+    expect(rep(&d, find_off(&d, "y = 2", 0) + 4, 1, "6"), "rename: edit 2");
+    expect(undo(&d) && d.can_redo(), "rename: a redo branch");
+    p0 = doc_bytes(&d, &n0);
+    head = d.hist.head;
+    len = d.hist.len;
+    gen = d.edit_gen;
+    /* taken name, not a name, a capture: each refused before any edit */
+    k = rtx_wb_rename(&d, find_off(&d, "x = ", 0), "y", 1, msg, sizeof msg) !>;
+    if (k || !msg[0]) fprintf(stderr, "rename taken: k %zu msg %s\n", k, msg);
+    expect(k == 0 && msg[0], "rename: a taken name is refused");
+    k = rtx_wb_rename(&d, find_off(&d, "x = ", 0), "a|b", 3, msg, sizeof msg) !>;
+    if (k || !msg[0]) fprintf(stderr, "rename a|b: k %zu msg %s\n", k, msg);
+    expect(k == 0 && msg[0], "rename: not a name is refused");
+    k = rtx_wb_rename(&d, find_off(&d, "{#top}", 0) + 2, "bad name", 8, msg, sizeof msg) !>;
+    if (k || !msg[0]) fprintf(stderr, "rename anchor: k %zu msg %s\n", k, msg);
+    expect(k == 0 && msg[0], "rename: a bad anchor name is refused");
+    p1 = doc_bytes(&d, &n1);
+    expect(p0 && p1 && n0 == n1 && !memcmp(p0, p1, n0), "rename refused: bytes untouched");
+    expect(d.hist.head == head && d.hist.len == len && d.edit_gen == gen,
+           "rename refused: undo / redo stacks untouched");
+    expect(d.can_redo() && redo(&d), "rename refused: the redo branch survives");
+    free(p1);
+    p1 = doc_bytes(&d, &n1);
+    expect(p1 && strstr(p1, "y = 6"), "rename refused: redo lands the undone edit");
+    /* an accepted anchor rename: one undo step, references follow */
+    k = rtx_wb_rename(&d, find_off(&d, "{#top}", 0) + 2, "head", 4, msg, sizeof msg) !>;
+    expect(k == 2, "rename: anchor and its reference");
+    free(p1);
+    p1 = doc_bytes(&d, &n1);
+    expect(p1 && strstr(p1, "{#head}") && strstr(p1, "T#head.a"), "rename: anchor renamed everywhere");
+    expect(undo(&d), "rename: one undo");
+    free(p1);
+    p1 = doc_bytes(&d, &n1);
+    expect(p1 && strstr(p1, "{#top}") && strstr(p1, "T#top.a"), "rename: undone in one step");
+    expect(same_as_scratch(&d, "rename"), "rename: equal to scratch");
+    (void)wb;
+    free(p0);
+    free(p1);
+    RtxDoc_destroy(&d);
+    keep_a.destroy();
+}
+
+/* ------------------------------------------------------------ sequence */
+
+static void sequence(void) {
+    const size_t rows = 50000;
+    size_t cap = rows * 48 + 512, at = 0, i;
+    char *src = (char *)malloc(cap);
+    RtxDoc d = {0};
+    CCArena keep_a;
+    RtxWb *wb;
+    RtxWbStats st;
+    if (!src) return;
+    at += (size_t)snprintf(src + at, cap - at,
+                           "# S\n\n```params\nlim = 3\n```\n\n```calc\na = sum(T.x where x > lim)\n"
+                           "b = T#last.run\nc = max(T.run)\n```\n\nTable: T\n\n| x | run |\n|---|---|\n");
+    for (i = 0; i < rows; i++)
+        at += (size_t)snprintf(src + at, cap - at, "| %zu | =coalesce(@run[-1], 0) + @x |\n", i % 7);
+    if (!open_buf(&d, &keep_a, src, at)) {
+        free(src);
+        expect(0, "sequence: attach");
+        return;
+    }
+    free(src);
+    wb = rtx_wb_of(&d);
+    rtx_wb_settle(wb, &d);
+    rtx_wb_job_limits(256, 1);
+    /* edit (a job starts), edit again during it, cancel, edit, undo */
+    expect(rep(&d, find_off(&d, "lim = 3", 0) + 6, 1, "4"), "sequence: param edit");
+    expect(rtx_wb_busy(&d), "sequence: a job runs");
+    (void)rtx_wb_idle(&d);
+    expect(rep(&d, find_off(&d, "| 1 |", 3) + 2, 1, "6"), "sequence: an edit during the job");
+    (void)rtx_wb_idle(&d);
+    expect(rtx_wb_cancel(&d) && !rtx_wb_busy(&d), "sequence: cancel");
+    expect(rep(&d, find_off(&d, "| 2 |", 9) + 2, 1, "5"), "sequence: an edit after the cancel");
+    expect(undo(&d), "sequence: undo");
+    expect(same_as_scratch(&d, "sequence: edit, edit during job, cancel, edit, undo"),
+           "sequence: exact after settle");
+    expect(undo(&d) && undo(&d) && redo(&d), "sequence: more history");
+    (void)rtx_wb_cancel(&d);
+    expect(same_as_scratch(&d, "sequence: undo / redo after a cancel"), "sequence: exact again");
+    rtx_wb_counters(wb, &d, &st);
+    expect(st.cancels >= 1, "sequence: the cancels were counted");
+    rtx_wb_job_limits(RTX_WB_INLINE_WORK, RTX_WB_SLICE_MS);
+    RtxDoc_destroy(&d);
+    keep_a.destroy();
+}
+
+int main(int argc, char **argv) {
+    int steps = argc > 1 ? atoi(argv[1]) : 600;
+    static const uint64_t seeds[] = {0x9E3779B97F4A7C15ull, 0xD1B54A32D192ED03ull,
+                                     0x243F6A8885A308D3ull};
+    size_t i;
+    const char *only = getenv("WB_W1_ONLY"); /* one section: rename anchors sequence priority chain */
+    if (steps < 1) steps = 1;
+#define WANT(x) (!only || !strcmp(only, x))
+    if (WANT("rename")) rename_refused();
+    for (i = 0; i < sizeof seeds / sizeof seeds[0] && WANT("anchors"); i++) {
+        anchors_seed(seeds[i], steps, 0);
+        anchors_seed(seeds[i] ^ 0x55, steps, 1);
+    }
+    if (WANT("sequence")) sequence();
+    if (WANT("priority")) priority();
+    if (WANT("chain")) chain();
+    if (fails) {
+        fprintf(stderr, "wb_w1_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("wb_w1_smoke: ok\n");
+    return 0;
+}

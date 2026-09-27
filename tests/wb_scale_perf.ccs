@@ -1,0 +1,867 @@
+#!ccc ccs
+/*
+ * Workbook at scale (docs/workbook.md "W1 as built"): generated workbooks
+ * (tests/wb_gen.cch) of `rows` rows, 1000 aggregates over column a, 100
+ * over b, one over e, a group, a chain of names; and a running-total
+ * table of `rows` rows (a relative-row chain with checkpoints).
+ *
+ *   ./bin/wb_scale_perf [rows ...]          (default 10000 100000)
+ *   ./bin/wb_scale_perf --pins [rows]        (one size; RESULT lines for pins)
+ *   ./bin/wb_scale_perf 1000000 5000000 10000000   (the big tiers)
+ *   ./bin/wb_scale_perf --csv 1000000 10000000     (external CSV tables)
+ *
+ * Each tier checks free disk first (the file is streamed to /tmp and
+ * deleted after), predicts the model's RSS (WB_SCALE_BPR bytes a row,
+ * default 400: W1 keeps ~20 B a row plus the text) and runs the full
+ * model only under the guard
+ * (WB_SCALE_RSS_GB, default 8); over it, it reports what the parse costs
+ * with the table refused, and a watchdog stops the process cleanly if RSS
+ * passes the guard anyway. Tiers over the default caps (RTX_WB_ROWS_MAX /
+ * RTX_WB_MAX) lift them for the run (caps=lifted).
+ *
+ * RESULT op=... n= p50_ms= p95_ms= per size:
+ *   open            RtxDoc open + attach: the text's first screen (a big
+ *                   workbook's read is a job)
+ *   read            the structural read in idle slices: the view's values
+ *   settle          every job done (each aggregate's first build); rss_mb,
+ *                   B/row (RSS over the file's bytes), index / partials
+ *   chain_*         the running total: open, read, an edit at the top
+ *                   (keystroke), the view below it exact, full settle
+ *   edit_1 / edit_100 / edit_1000   one cell edit under 1 / 100 / 1000
+ *                   aggregates of its column (MA builds must stay 0)
+ *   row_ins_del     a new row, then its delete (row path)
+ *   param           k flips: `n_big = count(Big where a > k)`, one walk
+ *   reparse         a header edit: the whole-workbook parse
+ *   key_cell / key_cell_px   keystroke + Rich relayout in a cell (TUI cell
+ *                   measure / a GUI-like pixel measure)
+ *   key_formula     keystroke at a formula's end (live value annotation)
+ *   page            PageDown through the table (Rich)
+ *   read_serial     phase 2: the cold read with one lane (phase 1's)
+ *   index_write_wait / reopen / reopen_settle   phase 2: the settle's
+ *                   persisted index, then a reopen from it (open to first
+ *                   values; state, rows installed, partials restored)
+ *   csv_*           --csv: a Sales table bound to data/sales.csv (5
+ *                   columns, ~40 B a record): open, the file's read in idle
+ *                   slices, the aggregates' builds (RSS), the index, and a
+ *                   reopen from it (open to first values)
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/statvfs.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+#include "../core/wb.cch"
+#include "wb_gen.cch"
+
+#define PERF_W 120.0
+#define PERF_VIS 50
+
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return (double)rtx_utf8_cols(bytes);
+}
+
+/* A proportional-ish GUI stand-in: 8 px a column (the md_px path). */
+static double px_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 8.0 * (double)rtx_utf8_cols(bytes);
+}
+
+static double cell_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 1.0;
+}
+
+static double px_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 18.0;
+}
+
+static double mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static long proc_kb(const char *key) {
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    long v = -1;
+    size_t kn = strlen(key);
+    if (!f) return -1;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, key, kn)) {
+            v = atol(line + kn);
+            break;
+        }
+    fclose(f);
+    return v;
+}
+
+/* The RSS guard: a watchdog stops the run cleanly (the file removed). */
+static long g_guard_kb;
+static char g_file[512];
+static char g_cache[600]; /* the persisted index's cache dir ("" : off) */
+static const char *volatile g_phase = "start";
+
+static void *watchdog(void *arg) {
+    (void)arg;
+    for (;;) {
+        long kb = proc_kb("VmRSS:");
+        if (g_guard_kb > 0 && kb > g_guard_kb) {
+            fprintf(stdout, "STOP phase=%s: RSS %.2f GB passed the %.1f GB guard; stopping cleanly\n",
+                    g_phase, kb / 1048576.0, g_guard_kb / 1048576.0);
+            fflush(stdout);
+            if (g_file[0]) unlink(g_file);
+            _exit(3);
+        }
+        usleep(20000);
+    }
+    return NULL;
+}
+
+static int dcmp(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void report(long rows, const char *op, double *v, int n, const char *extra) {
+    qsort(v, (size_t)n, sizeof(double), dcmp);
+    printf("RESULT rows=%ld op=%s n=%d p50_ms=%.4f p95_ms=%.4f max_ms=%.4f %s\n", rows, op, n,
+           v[n / 2], v[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1], v[n - 1], extra ? extra : "");
+    fflush(stdout);
+}
+
+static size_t find_off(RtxDoc *d, const char *needle, size_t from) {
+    size_t n = d->len(), off = (size_t)-1, span;
+    char *p;
+    char *hit;
+    if (from >= n) return off;
+    span = n - from;
+    p = (char *)malloc(span + 1);
+    if (!p) return off;
+    if ((d->read_at(from, cc_slice_from_buffer(p, span)) ?> 0) != span) {
+        free(p);
+        return off;
+    }
+    p[span] = 0;
+    hit = strstr(p, needle);
+    if (hit) off = from + (size_t)(hit - p);
+    free(p);
+    return off;
+}
+
+/* The cell `col` (0-based) of row `id`: [lo, hi) of its bytes (trimmed). */
+static int cell_at(RtxDoc *d, long id, int col, size_t *lo, size_t *hi) {
+    char needle[48], buf[256];
+    size_t off, got, i, k = 0;
+    snprintf(needle, sizeof needle, "\n| %ld | ", id);
+    off = find_off(d, needle, 0);
+    if (off == (size_t)-1) return 0;
+    off++;
+    got = d->read_at(off, cc_slice_from_buffer(buf, sizeof buf - 1)) ?> 0;
+    buf[got] = 0;
+    *lo = *hi = 0;
+    for (i = 0; i < got && buf[i] != '\n'; i++) {
+        if (buf[i] != '|') continue;
+        if (k == (size_t)col + 1) {
+            *hi = off + i - 1;
+            return 1;
+        }
+        k++;
+        if (k == (size_t)col + 1) *lo = off + i + 2;
+    }
+    return 0;
+}
+
+static void !>(CCError) toggle_cell(RtxDoc *d, RtxWb *wb, long rows, long id, int col,
+                                    const char *op, int n) {
+    size_t lo, hi;
+    double v[64], t0;
+    int i;
+    RtxWbStats s0, s1;
+    char extra[160];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (!cell_at(d, id, col, &lo, &hi)) return cc_err(CC_ERR_INVALID_ARG, "cell");
+    rtx_wb_stats(wb, d, &s0);
+    for (i = 0; i < n; i++) {
+        t0 = mono_ms();
+        /* a leading digit: the column keeps its type and scale */
+        if (i % 2 == 0) d->replace(lo, 0, cc_slice_from_buffer((char *)"7", 1)) !>;
+        else d->replace(lo, 1, cc_slice_empty()) !>;
+        rtx_wb_sync(wb, d);
+        v[i] = mono_ms() - t0;
+    }
+    rtx_wb_stats(wb, d, &s1);
+    snprintf(extra, sizeof extra, "ma_builds=%zu ma_rows=%zu rebuilds=%zu", s1.ma_full - s0.ma_full,
+             (s1.ma_rows - s0.ma_rows) / (size_t)n, s1.rebuilds - s0.rebuilds);
+    report(rows, op, v, n, extra);
+    return cc_ok();
+}
+
+/* Idle slices until no job is left; ms. */
+static double idle_until_quiet(RtxDoc *d, int deferred_only) {
+    double t0 = mono_ms();
+    long k;
+    for (k = 0; k < 100000000L; k++) {
+        if (deferred_only ? !rtx_wb_deferred(d) : !rtx_wb_busy(d)) break;
+        (void)rtx_wb_idle(d);
+    }
+    return mono_ms() - t0;
+}
+
+static void !>(CCError) engine(const char *path, size_t n, long rows, int pins) {
+    char extra[400], rowbuf[256];
+    size_t off, rn;
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats st, s0, s1;
+    double t0, v[64], t_open, t_read, t_settle;
+    int i, nre;
+    long rss0 = proc_kb("VmRSS:");
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    if (!getenv("WB_SCALE_NOSERIAL")) {
+        /* the cold read with one lane (phase 1's), for comparison */
+        RtxDoc d0 = {0};
+        g_phase = "read_serial";
+        rtx_wb_set_cache_dir(NULL);
+        rtx_wb_read_lanes(1, 0);
+        d0.from_path(cc_slice_cstr(path)) !>;
+        v[0] = idle_until_quiet(&d0, 1);
+        report(rows, "read_serial", v, 1, "one lane (phase 1)");
+        RtxDoc_destroy(&d0);
+        rtx_wb_read_lanes(0, 0);
+    }
+    rtx_wb_set_cache_dir(g_cache[0] ? g_cache : NULL);
+    g_phase = "open";
+    t0 = mono_ms();
+    d.from_path(cc_slice_cstr(path)) !>;
+    wb = rtx_wb_of(&d);
+    if (!wb) return cc_err(CC_ERR_INVALID_ARG, "not a workbook");
+    t_open = mono_ms() - t0;
+    v[0] = t_open;
+    report(rows, "open", v, 1, "text first screen (the read is a job)");
+    g_phase = "read";
+    t_read = idle_until_quiet(&d, 1);
+    v[0] = t_read;
+    rtx_wb_counters(wb, &d, &st);
+    snprintf(extra, sizeof extra, "idle slices, parallel lanes: windows=%zu lanes_ms=%.1f window_mb=%.1f rows=%zu",
+             st.par_windows, st.par_us / 1000.0, st.par_bytes / 1048576.0, st.par_rows);
+    report(rows, "read", v, 1, extra);
+    g_phase = "settle";
+    t0 = mono_ms();
+    rtx_wb_settle(wb, &d);
+    t_settle = mono_ms() - t0;
+    rtx_wb_stats(wb, &d, &st);
+    v[0] = t_settle;
+    {
+        double rss_mb = (proc_kb("VmRSS:") - rss0) / 1024.0;
+        snprintf(extra, sizeof extra,
+                 "bytes=%zu rules=%zu aggs=%zu insts=%zu off=%d rss_mb=%.1f hwm_mb=%.1f "
+                 "rss_over_bytes_per_row=%.1f index_mb=%.1f partials_mb=%.1f model_mb=%.1f",
+                 n, st.rules, st.mas, st.insts, st.off, rss_mb, proc_kb("VmHWM:") / 1024.0,
+                 (rss_mb * 1048576.0 - (double)n) / (double)rows, st.mem_index / 1048576.0,
+                 st.mem_partials / 1048576.0, st.mem_model / 1048576.0);
+    }
+    report(rows, "settle", v, 1, extra);
+    if (g_cache[0] && !st.off) {
+        /* phase 2: the settle wrote the index; a reopen installs it */
+        RtxDoc d2 = {0};
+        RtxWb *wb2;
+        RtxWbStats s2;
+        long rss1 = proc_kb("VmRSS:");
+        int busy;
+        g_phase = "reopen";
+        t0 = mono_ms();
+        rtx_wb_index_flush();
+        v[0] = mono_ms() - t0;
+        snprintf(extra, sizeof extra, "index_mb=%.1f writes=%zu", st.idx_bytes / 1048576.0, st.idx_writes);
+        report(rows, "index_write_wait", v, 1, extra);
+        t0 = mono_ms();
+        d2.from_path(cc_slice_cstr(path)) !>;
+        wb2 = rtx_wb_of(&d2);
+        v[0] = mono_ms() - t0;
+        busy = rtx_wb_busy(&d2);
+        rtx_wb_counters(wb2, &d2, &s2);
+        {
+            char val[64];
+            val[0] = 0;
+            rtx_wb_eval(wb2, &d2, "total", 5, val, sizeof val);
+            snprintf(extra, sizeof extra,
+                     "state=%s rows_installed=%zu insts=%zu chains=%zu load_ms=%.1f busy=%d rss_mb=%.1f total=%s",
+                     rtx_wb_index_why(s2.idx_state), s2.idx_rows, s2.idx_insts, s2.idx_chains,
+                     s2.idx_load_us / 1000.0, busy, (proc_kb("VmRSS:") - rss1) / 1024.0, val);
+        }
+        report(rows, "reopen", v, 1, extra);
+        t0 = mono_ms();
+        rtx_wb_settle(wb2, &d2);
+        v[0] = mono_ms() - t0;
+        rtx_wb_counters(wb2, &d2, &s2);
+        snprintf(extra, sizeof extra, "builds=%zu job_rows=%zu", s2.ma_full, s2.job_rows);
+        report(rows, "reopen_settle", v, 1, extra);
+        RtxDoc_destroy(&d2);
+    }
+    g_phase = "edits";
+    if (st.off || getenv("WB_SCALE_OPENONLY")) {
+        RtxDoc_destroy(&d);
+        return cc_ok();
+    }
+    toggle_cell(&d, wb, rows, rows / 2 + 1, 6, "edit_1", 20) !>;    /* e: e_one */
+    toggle_cell(&d, wb, rows, rows / 2 + 1, 3, "edit_100", 20) !>;  /* b: 100 + group */
+    toggle_cell(&d, wb, rows, rows / 2 + 1, 2, "edit_1000", 20) !>; /* a: 1000 + group */
+    /* row insert / delete */
+    off = find_off(&d, "\n| 7 | ", 0) + 1;
+    rn = wbgen_row(rowbuf, sizeof rowbuf, rows + 1);
+    rtx_wb_stats(wb, &d, &s0);
+    for (i = 0; i < 20; i++) {
+        t0 = mono_ms();
+        if (i % 2 == 0) d.replace(off, 0, cc_slice_from_buffer(rowbuf, rn)) !>;
+        else d.replace(off, rn, cc_slice_empty()) !>;
+        rtx_wb_sync(wb, &d);
+        v[i] = mono_ms() - t0;
+    }
+    rtx_wb_settle(wb, &d);
+    rtx_wb_stats(wb, &d, &s1);
+    snprintf(extra, sizeof extra, "fast_rows=%zu rebuilds=%zu regraphs=%zu builds=%zu",
+             s1.fast_rows - s0.fast_rows, s1.rebuilds - s0.rebuilds, s1.regraphs - s0.regraphs,
+             s1.ma_full - s0.ma_full);
+    report(rows, "row_ins_del", v, 20, extra);
+    /* param k: n_big rebuilds (a job past the inline budget): the
+     * keystroke, then the job to the end */
+    off = find_off(&d, "k = 500", 0);
+    {
+        double vs[64];
+        rtx_wb_stats(wb, &d, &s0);
+        for (i = 0; i < 10; i++) {
+            t0 = mono_ms();
+            d.replace(off + 6, 1, cc_slice_from_buffer((char *)(i % 2 ? "0" : "1"), 1)) !>;
+            rtx_wb_sync(wb, &d);
+            v[i] = mono_ms() - t0;
+            vs[i] = v[i] + idle_until_quiet(&d, 0);
+        }
+        rtx_wb_stats(wb, &d, &s1);
+        snprintf(extra, sizeof extra, "builds=%zu job_rows=%zu", (s1.ma_full - s0.ma_full) / 10,
+                 (s1.job_rows - s0.job_rows) / 10);
+        report(rows, "param_key", v, 10, extra);
+        report(rows, "param_settle", vs, 10, "");
+    }
+    nre = rows > 100000 || pins ? 2 : 4;
+    if (!getenv("WB_SCALE_NOREPARSE")) {
+        /* the header: a structural edit; the read is a job */
+        g_phase = "reparse";
+        off = find_off(&d, "| id | key |", 0);
+        for (i = 0; i < nre; i++) {
+            t0 = mono_ms();
+            if (i % 2 == 0) d.replace(off + 1, 0, cc_slice_from_buffer((char *)" ", 1)) !>;
+            else d.replace(off + 1, 1, cc_slice_empty()) !>;
+            rtx_wb_sync(wb, &d);
+            v[i] = mono_ms() - t0;
+            v[nre + i] = v[i] + idle_until_quiet(&d, 1);
+        }
+        rtx_wb_stats(wb, &d, &st);
+        snprintf(extra, sizeof extra, "rebuilds=%zu", st.rebuilds);
+        report(rows, "reparse_key", v, nre, extra);
+        report(rows, "reparse_read", v + nre, nre, "");
+    }
+    RtxDoc_destroy(&d);
+    return cc_ok();
+}
+
+/* A running total over `rows` rows: `run = coalesce(@run[-1], 0) + @x`. */
+static size_t chain_file(const char *path, long rows) {
+    FILE *f = fopen(path, "wb");
+    long r;
+    int bad = 0;
+    if (!f) return 0;
+    if (fprintf(f, "# Chain\n\n```calc\nlast = T#last.run\nbig = max(T.run)\n```\n\nTable: T\n\n"
+                   "| id | x | run |\n|----|---|-----|\n") < 0)
+        bad = 1;
+    for (r = 1; r <= rows && !bad; r++)
+        if (fprintf(f, "| %ld | %ld | =coalesce(@run[-1], 0) + @x |\n", r, r % 10 + 1) < 0) bad = 1;
+    if (fclose(f) != 0) bad = 1;
+    if (bad) return 0;
+    {
+        FILE *g = fopen(path, "rb");
+        long n;
+        if (!g) return 0;
+        fseek(g, 0, SEEK_END);
+        n = ftell(g);
+        fclose(g);
+        return n > 0 ? (size_t)n : 0;
+    }
+}
+
+static void !>(CCError) chain_tier(const char *path, long rows) {
+    RtxDoc d = {0};
+    RtxWb *wb;
+    RtxWbStats s0, s1;
+    double t0, v[4], tk, tv, ts;
+    size_t off, lo, hi, gn;
+    char g[64], extra[256];
+    int k;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    g_phase = "chain";
+    t0 = mono_ms();
+    d.from_path(cc_slice_cstr(path)) !>;
+    wb = rtx_wb_of(&d);
+    if (!wb) return cc_err(CC_ERR_INVALID_ARG, "not a workbook");
+    v[0] = mono_ms() - t0;
+    report(rows, "chain_open", v, 1, "");
+    v[0] = idle_until_quiet(&d, 1);
+    report(rows, "chain_read", v, 1, "");
+    t0 = mono_ms();
+    rtx_wb_settle(wb, &d);
+    v[0] = mono_ms() - t0;
+    report(rows, "chain_settle", v, 1, "");
+    /* an edit at the top: every row below moves */
+    rtx_wb_counters(wb, &d, &s0);
+    {
+        /* row 3's run formula (the edit below keeps offsets: one byte for one) */
+        size_t r3 = find_off(&d, "| 3 | 4 |", 0);
+        off = find_off(&d, "| 2 | 3 |", 0);
+        if (off == (size_t)-1 || r3 == (size_t)-1) return cc_err(CC_ERR_INVALID_ARG, "chain rows");
+        t0 = mono_ms();
+        d.replace(off + 6, 1, cc_slice_from_buffer((char *)"4", 1)) !>;
+        rtx_wb_sync(wb, &d);
+        tk = mono_ms() - t0;
+        off = r3 + 10;
+    }
+    /* the view right below: row 3's run */
+    t0 = mono_ms();
+    k = RtxDoc_derived_at(&d, off, 0, &lo, &hi, g, sizeof g - 1, &gn);
+    tv = mono_ms() - t0;
+    g[k ? gn : 0] = 0;
+    t0 = mono_ms();
+    (void)idle_until_quiet(&d, 0);
+    rtx_wb_settle(wb, &d);
+    ts = mono_ms() - t0;
+    rtx_wb_counters(wb, &d, &s1);
+    v[0] = tk;
+    report(rows, "chain_edit_key", v, 1, "");
+    v[0] = tv;
+    snprintf(extra, sizeof extra, "row3=%s fresh=%d", g, k == 1);
+    report(rows, "chain_edit_view", v, 1, extra);
+    v[0] = ts;
+    snprintf(extra, sizeof extra, "chain_rows=%zu converged=%zu", s1.chain_rows - s0.chain_rows,
+             s1.chain_conv - s0.chain_conv);
+    report(rows, "chain_edit_settle", v, 1, extra);
+    RtxDoc_destroy(&d);
+    return cc_ok();
+}
+
+/* Keystrokes in a cell, the formula-end annotation, and paging: Rich. */
+static void !>(CCError) lens(const char *path, long rows, int px) {
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    size_t off = 0, line, lo, hi;
+    double v[120], t0, w = px ? 960.0 : PERF_W;
+    int k;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    m.measure = px ? px_meas : cell_meas;
+    m.line_height = px ? px_lh : cell_lh;
+    g_phase = px ? "lens_px" : "lens";
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.rich = 1;
+    b.layout.wrap = 1;
+    rtx_line_scan_to(&b.doc.tree, b.doc.len()) !>;
+    if (!cell_at(&b.doc, rows / 2 + 1, 2, &lo, &hi)) return cc_err(CC_ERR_INVALID_ARG, "cell");
+    line = b.doc.line_of(lo) !>;
+    b.top = line > 10 ? line - 10 : 0;
+    b.ensure_view(&m, w, PERF_VIS) !>;
+    b.doc.caret = b.doc.sel_anchor = hi;
+    for (k = 0; k < 100; k++) {
+        t0 = mono_ms();
+        if (k % 2 == 0) b.type_cp((uint32_t)('1' + k % 9)) !>;
+        else b.backspace() !>;
+        b.after_edit(&m, w, PERF_VIS) !>;
+        v[k] = mono_ms() - t0;
+    }
+    report(rows, px ? "key_cell_px" : "key_cell", v, 100, "");
+    if (px) return cc_ok();
+    /* the f1 formula's end: the annotation follows each keystroke */
+    if (!cell_at(&b.doc, rows / 2 + 1, 7, &lo, &hi)) return cc_err(CC_ERR_INVALID_ARG, "f1");
+    b.doc.caret = b.doc.sel_anchor = hi;
+    b.ensure_view(&m, w, PERF_VIS) !>;
+    for (k = 0; k < 100; k++) {
+        t0 = mono_ms();
+        if (k % 2 == 0) b.type_cp((uint32_t)'2') !>;
+        else b.backspace() !>;
+        b.after_edit(&m, w, PERF_VIS) !>;
+        v[k] = mono_ms() - t0;
+    }
+    report(rows, "key_formula", v, 100, b.layout.inl_on ? "annotation=1" : "annotation=0");
+    /* page down through the table */
+    for (k = 0; k < 40; k++) {
+        t0 = mono_ms();
+        b.page_vert(&m, w, 1, (size_t)PERF_VIS, 0) !>;
+        b.ensure_view(&m, w, PERF_VIS) !>;
+        v[k] = mono_ms() - t0;
+    }
+    report(rows, "page", v, 40, "");
+    (void)off;
+    return cc_ok();
+}
+
+/* Free bytes where `dir` lives. */
+static unsigned long long disk_free(const char *dir) {
+    struct statvfs v;
+    if (statvfs(dir, &v) != 0) return 0;
+    return (unsigned long long)v.f_bavail * (unsigned long long)v.f_frsize;
+}
+
+/* A tier over the guard: what opening it costs without the model (the
+ * byte cap as shipped, then the byte cap lifted with the row cap kept:
+ * the table refused, everything else parsed). */
+static void !>(CCError) refused(const char *path, size_t n, long rows) {
+    size_t caps[3], w;
+    int pass;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    rtx_wb_limits_get(&caps[0], &caps[1], &caps[2]);
+    for (pass = 0; pass < 2; pass++) {
+        RtxDoc d = {0};
+        RtxWb *wb;
+        RtxWbStats st;
+        double t0, v[1];
+        char extra[300], msg[200];
+        long rss0 = proc_kb("VmRSS:");
+        if (pass == 1) rtx_wb_limits((size_t)UINT32_MAX - 16, RTX_WB_ROWS_MAX, 0);
+        g_phase = pass ? "open_refused" : "open_default";
+        t0 = mono_ms();
+        d.from_path(cc_slice_cstr(path)) !>;
+        wb = rtx_wb_of(&d);
+        rtx_wb_stats(wb, &d, &st);
+        v[0] = mono_ms() - t0;
+        msg[0] = 0;
+        w = rtx_wb_eval(wb, &d, "total", 5, msg, sizeof msg);
+        (void)w;
+        snprintf(extra, sizeof extra, "bytes=%zu off=%d nodes=%zu rss_mb=%.1f total=\"%s\"", n,
+                 st.off, st.nodes, (proc_kb("VmRSS:") - rss0) / 1024.0, msg);
+        report(rows, pass ? "open_refused" : "open_default", v, 1, extra);
+        RtxDoc_destroy(&d);
+    }
+    rtx_wb_limits(caps[0], caps[1], caps[2]);
+    return cc_ok();
+}
+
+/* ---- phase 2: an external CSV table (--csv rows) */
+
+/* data/sales.csv: `id,region,amount,qty,note`, a quoted note with a
+ * delimiter in every 8th record; returns the file's bytes (0: failed). */
+static size_t csv_gen(const char *path, long rows) {
+    static const char *reg[4] = {"EU", "US", "APAC", "LATAM"};
+    FILE *f = fopen(path, "wb");
+    char buf[1 << 16];
+    size_t at = 0, total = 0;
+    long i;
+    if (!f) return 0;
+    at = (size_t)snprintf(buf, sizeof buf, "id,region,amount,qty,note\n");
+    for (i = 0; i < rows; i++) {
+        unsigned long h = (unsigned long)i * 2654435761ul;
+        if (at + 128 > sizeof buf) {
+            if (fwrite(buf, 1, at, f) != at) {
+                fclose(f);
+                return 0;
+            }
+            total += at;
+            at = 0;
+        }
+        if ((i & 7) == 0)
+            at += (size_t)snprintf(buf + at, sizeof buf - at, "%ld,%s,%lu.%02lu,%lu,\"n %ld, q\"\n", i + 1,
+                                   reg[h >> 7 & 3], h % 100000ul, h % 97ul, h % 50ul, i);
+        else
+            at += (size_t)snprintf(buf + at, sizeof buf - at, "%ld,%s,%lu.%02lu,%lu,n%ld\n", i + 1, reg[h >> 7 & 3],
+                                   h % 100000ul, h % 97ul, h % 50ul, i);
+    }
+    if (fwrite(buf, 1, at, f) != at) {
+        fclose(f);
+        return 0;
+    }
+    total += at;
+    if (fclose(f) != 0) return 0;
+    return total;
+}
+
+static const char g_csv_lookup[] = "one = Sales[id = 12345].amount\n";
+static const char g_csv_wb[] = "# Sales\n\n```table Sales\nsource: data/sales.csv\ncolumns:\n"
+                               "  id: int\n  region: text\n  amount: float\n  qty: int\n  note: text\n```\n\n"
+                               "```calc\ntotal = sum(Sales.amount)\n"
+                               "eu = sum(Sales.amount where region = \"EU\")\n"
+                               "n = count(Sales)\nq = sum(Sales.qty)\ntop = max(Sales.amount)\n"
+                               "one = Sales[id = 12345].amount\n```\n";
+
+static void !>(CCError) csv_tier(const char *dir, long rows) {
+    char dd[700], csvp[800], wbp[800], extra[400], val[64], val2[64];
+    unsigned long long need = (unsigned long long)rows * 48ull + (64ull << 20), freeb = disk_free(dir);
+    size_t n, caps[3];
+    double t0, v[2], gen_ms;
+    long rss0;
+    RtxWbStats st;
+    @errhandler(CCError e) {
+        unlink(csvp);
+        unlink(wbp);
+        rmdir(dd);
+        return cc_err(e);
+    }
+    snprintf(dd, sizeof dd, "%s/data", dir);
+    snprintf(csvp, sizeof csvp, "%s/sales.csv", dd);
+    snprintf(wbp, sizeof wbp, "%s/csv_%ld.wb.md", dir, rows);
+    if (freeb < need + (1ull << 30)) {
+        printf("SKIP csv rows=%ld: %.2f GB free in %s, the file needs %.2f GB (+1 GB kept free)\n", rows,
+               freeb / 1073741824.0, dir, need / 1073741824.0);
+        return cc_ok();
+    }
+    mkdir(dd, 0755);
+    g_phase = "csv_generate";
+    t0 = mono_ms();
+    n = csv_gen(csvp, rows);
+    gen_ms = mono_ms() - t0;
+    {
+        FILE *f = fopen(wbp, "wb");
+        if (!f || !n) {
+            if (f) fclose(f);
+            return cc_err(CC_ERR_INVALID_ARG, "could not write the CSV tier's files");
+        }
+        /* WB_CSV_NOLOOKUP: without the keyed lookup (no key index) */
+        fwrite(g_csv_wb, 1, strlen(g_csv_wb) - (getenv("WB_CSV_NOLOOKUP") ? strlen(g_csv_lookup) + 4 : 0), f);
+        if (getenv("WB_CSV_NOLOOKUP")) fwrite("```\n", 1, 4, f);
+        fclose(f);
+    }
+    usleep(250000);
+    printf("TIER csv rows=%ld bytes=%zu gen_ms=%.0f disk_free_gb=%.2f\n", rows, n, gen_ms, freeb / 1073741824.0);
+    fflush(stdout);
+    rtx_wb_limits_get(&caps[0], &caps[1], &caps[2]);
+    if ((size_t)rows + 16 > caps[1]) rtx_wb_limits(0, (size_t)rows + 1000, 0);
+    rtx_wb_set_cache_dir(g_cache[0] ? g_cache : NULL);
+    {
+        /* cold: no index; the file is read in idle slices */
+        RtxDoc d = {0};
+        RtxWb *wb;
+        g_phase = "csv_open";
+        rss0 = proc_kb("VmRSS:");
+        t0 = mono_ms();
+        d.from_path(cc_slice_cstr(wbp)) !>;
+        wb = rtx_wb_of(&d);
+        if (!wb) return cc_err(CC_ERR_INVALID_ARG, "not a workbook");
+        v[0] = mono_ms() - t0;
+        report(rows, "csv_open", v, 1, "the text's first screen (the file is a job)");
+        g_phase = "csv_read";
+        v[0] = idle_until_quiet(&d, 1);
+        val[0] = 0;
+        rtx_wb_eval(wb, &d, "n", 1, val, sizeof val);
+        snprintf(extra, sizeof extra, "the file's records in idle slices n=%s mb_s=%.0f", val,
+                 v[0] > 0 ? n / 1048576.0 / (v[0] / 1000.0) : 0.0);
+        report(rows, "csv_read", v, 1, extra);
+        g_phase = "csv_settle";
+        t0 = mono_ms();
+        rtx_wb_settle(wb, &d);
+        v[0] = mono_ms() - t0;
+        rtx_wb_stats(wb, &d, &st);
+        val[0] = val2[0] = 0;
+        rtx_wb_eval(wb, &d, "total", 5, val, sizeof val);
+        rtx_wb_eval(wb, &d, "one", 3, val2, sizeof val2);
+        {
+            double rss_mb = (proc_kb("VmRSS:") - rss0) / 1024.0;
+            snprintf(extra, sizeof extra,
+                     "aggregate builds: aggs=%zu rss_mb=%.1f rss_b_per_row=%.1f model_mb=%.1f index_mb=%.1f "
+                     "total=%s one=%s",
+                     st.mas, rss_mb, rss_mb * 1048576.0 / (double)rows, st.mem_model / 1048576.0,
+                     st.mem_index / 1048576.0, val, val2);
+        }
+        report(rows, "csv_settle", v, 1, extra);
+        v[0] = 0;
+        t0 = mono_ms();
+        rtx_wb_index_flush();
+        v[0] = mono_ms() - t0;
+        rtx_wb_counters(wb, &d, &st);
+        snprintf(extra, sizeof extra, "index_mb=%.1f writes=%zu", st.idx_bytes / 1048576.0, st.idx_writes);
+        report(rows, "csv_index_write_wait", v, 1, extra);
+        RtxDoc_destroy(&d);
+    }
+    if (g_cache[0]) {
+        /* persisted: the file's positions and partials from the index */
+        RtxDoc d = {0};
+        RtxWb *wb;
+        g_phase = "csv_reopen";
+        rss0 = proc_kb("VmRSS:");
+        t0 = mono_ms();
+        d.from_path(cc_slice_cstr(wbp)) !>;
+        wb = rtx_wb_of(&d);
+        if (!wb) return cc_err(CC_ERR_INVALID_ARG, "not a workbook");
+        v[1] = mono_ms() - t0;
+        val[0] = 0;
+        rtx_wb_eval(wb, &d, "total", 5, val, sizeof val);
+        v[0] = mono_ms() - t0;
+        rtx_wb_counters(wb, &d, &st);
+        snprintf(extra, sizeof extra,
+                 "open to first values: attach_ms=%.1f state=%s rows_installed=%zu insts=%zu load_ms=%.1f busy=%d rss_mb=%.1f "
+                 "total=%s",
+                 v[1], rtx_wb_index_why(st.idx_state), st.idx_rows, st.idx_insts, st.idx_load_us / 1000.0,
+                 rtx_wb_busy(&d), (proc_kb("VmRSS:") - rss0) / 1024.0, val);
+        report(rows, "csv_reopen", v, 1, extra);
+        t0 = mono_ms();
+        rtx_wb_settle(wb, &d);
+        v[0] = mono_ms() - t0;
+        rtx_wb_counters(wb, &d, &st);
+        snprintf(extra, sizeof extra, "builds=%zu job_rows=%zu kx_restored=%zu kx_builds=%zu", st.ma_full,
+                 st.job_rows, st.idx_kx, st.kx_builds);
+        report(rows, "csv_reopen_settle", v, 1, extra);
+        RtxDoc_destroy(&d);
+    }
+    rtx_wb_limits(caps[0], caps[1], caps[2]);
+    unlink(csvp);
+    unlink(wbp);
+    rmdir(dd);
+    return cc_ok();
+}
+
+int main(int argc, char **argv) {
+    char dir[] = "/tmp/wb_scale_XXXXXX";
+    long sizes[8];
+    int ns = 0, i, pins = 0, csv = 0;
+    double bpr = getenv("WB_SCALE_BPR") ? atof(getenv("WB_SCALE_BPR")) : 400.0;
+    double guard_gb = getenv("WB_SCALE_RSS_GB") ? atof(getenv("WB_SCALE_RSS_GB")) : 8.0;
+    pthread_t wd;
+    @errhandler(CCError e) {
+        fprintf(stderr, "wb_scale_perf: %s\n", e.message ? e.message : "error");
+        if (g_file[0]) unlink(g_file);
+        return 1;
+    }
+    for (i = 1; i < argc && ns < 8; i++) {
+        if (!strcmp(argv[i], "--pins")) pins = 1;
+        else if (!strcmp(argv[i], "--csv")) csv = 1;
+        else sizes[ns++] = atol(argv[i]);
+    }
+    if (!ns) {
+        sizes[ns++] = 10000;
+        sizes[ns++] = 100000;
+    }
+    if (!mkdtemp(dir)) return 1;
+    if (!getenv("WB_SCALE_NOINDEX")) {
+        snprintf(g_cache, sizeof g_cache, "%s/cache", dir);
+        mkdir(g_cache, 0700);
+    }
+    g_guard_kb = (long)(guard_gb * 1048576.0);
+    pthread_create(&wd, NULL, watchdog, NULL);
+    pthread_detach(wd);
+    for (i = 0; csv && i < ns; i++) {
+        csv_tier(dir, sizes[i]) !>;
+        fflush(stdout);
+    }
+    for (i = 0; !csv && i < ns; i++) {
+        WbGen g = {0};
+        long rows = sizes[i];
+        double pred_gb, t0, gen_ms;
+        unsigned long long need = (unsigned long long)rows * 90ull + (64ull << 20), freeb = disk_free(dir);
+        size_t n, caps[3];
+        g.rows = (int)rows;
+        g.nagg_a = getenv("WB_SCALE_NAGG") ? atoi(getenv("WB_SCALE_NAGG")) : 1000;
+        g.nagg_b = g.nagg_a >= 100 ? 100 : g.nagg_a;
+        g.chain = 50;
+        if (freeb < need + (1ull << 30)) {
+            printf("SKIP rows=%ld: %.2f GB free in %s, the file needs %.2f GB (+1 GB kept free)\n", rows,
+                   freeb / 1073741824.0, dir, need / 1073741824.0);
+            continue;
+        }
+        snprintf(g_file, sizeof g_file, "%s/scale_%ld.wb.md", dir, rows);
+        g_phase = "generate";
+        t0 = mono_ms();
+        n = wbgen_file(&g, g_file);
+        gen_ms = mono_ms() - t0;
+        if (!n) {
+            unlink(g_file);
+            fprintf(stderr, "wb_scale_perf: could not write %s\n", g_file);
+            return 1;
+        }
+        /* the index trusts stamps older than the read by the granularity
+         * (racily clean files are not indexed): let the file age */
+        usleep(250000);
+        pred_gb = ((double)rows * bpr + 2.0 * (double)n) / 1073741824.0 + 0.3;
+        printf("TIER rows=%ld bytes=%zu gen_ms=%.0f disk_free_gb=%.2f predicted_rss_gb=%.2f guard_gb=%.1f\n",
+               rows, n, gen_ms, freeb / 1073741824.0, pred_gb, guard_gb);
+        fflush(stdout);
+        rtx_wb_limits_get(&caps[0], &caps[1], &caps[2]);
+        if (pred_gb > guard_gb) {
+            refused(g_file, n, rows) !>;
+            /* the layout alone (the workbook off over the byte cap): what a
+             * Rich pane costs over a table this long */
+            if (!getenv("WB_SCALE_OPENONLY")) lens(g_file, rows, 0) !>;
+            printf("STOP rows=%ld: the model needs ~%.1f GB (%.0f B a row: a node per cell, row "
+                   "arrays, text) > the %.1f GB guard; embedded tables stop here (W1)\n",
+                   rows, pred_gb, bpr, guard_gb);
+        } else {
+            if ((size_t)rows + 16 > caps[1] || n + ((size_t)1 << 20) > caps[0]) {
+                rtx_wb_limits((size_t)UINT32_MAX - 16, (size_t)rows + 1000, 0);
+                printf("CAPS rows=%ld: at or over the default caps (%zu rows / %zu MiB): lifted for this run\n",
+                       rows, caps[1], caps[0] >> 20);
+            }
+            engine(g_file, n, rows, pins) !>;
+            if (!getenv("WB_SCALE_OPENONLY") && !getenv("WB_SCALE_NOLENS")) {
+                lens(g_file, rows, 0) !>;
+                lens(g_file, rows, 1) !>;
+            }
+            if (!getenv("WB_SCALE_NOCHAIN")) {
+                char cpath[560];
+                size_t cn;
+                snprintf(cpath, sizeof cpath, "%s.chain.wb.md", g_file);
+                cn = chain_file(cpath, rows);
+                if (cn) chain_tier(cpath, rows) !>;
+                unlink(cpath);
+            }
+            rtx_wb_limits(caps[0], caps[1], caps[2]);
+        }
+        fflush(stdout);
+        unlink(g_file);
+        g_file[0] = 0;
+    }
+    if (g_cache[0]) {
+        /* the index files: <cache>/w/*.wbi */
+        char w[700], p[1000];
+        DIR *dd;
+        struct dirent *e;
+        rtx_wb_index_flush();
+        snprintf(w, sizeof w, "%s/w", g_cache);
+        if ((dd = opendir(w)) != NULL) {
+            while ((e = readdir(dd)) != NULL) {
+                if (e->d_name[0] == '.') continue;
+                snprintf(p, sizeof p, "%s/%s", w, e->d_name);
+                unlink(p);
+            }
+            closedir(dd);
+        }
+        rmdir(w);
+        rmdir(g_cache);
+    }
+    rmdir(dir);
+    return 0;
+}

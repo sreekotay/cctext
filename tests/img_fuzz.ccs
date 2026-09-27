@@ -1,0 +1,197 @@
+#!ccc ccs
+/*
+ * Image loader fuzz harness (docs/images.md "Tests").
+ *
+ *   ./bin/img_fuzz [files or dirs...]        (default testdata/img)
+ *   RTX_IMG_FUZZ_ITERS=200000 RTX_IMG_FUZZ_SEED=7 ./bin/img_fuzz
+ *
+ * Mutates the corpus (bit flips, byte runs, truncation, header fields
+ * set to extremes, splices of two files) and runs every entry point that
+ * reads untrusted image bytes: sniff / probe (closed and as a prefix),
+ * decode at a display size with animation on, EXIF orientation, and the
+ * Markdown image parser. It asserts only that each returns (no crash, no
+ * sanitizer report) and that a success is self-consistent. @smoke runs a
+ * short, fixed-seed pass; build under @smoke_asan for the memory checks.
+ * rtx_img_fuzz_one is the whole per-input body, so a libFuzzer build can
+ * call it from LLVMFuzzerTestOneInput.
+ */
+#include <ccc/std/prelude.cch>
+#include <dirent.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include "../core/img.cch"
+
+static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
+
+static uint32_t rnd(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 7;
+    g_rng ^= g_rng << 17;
+    return (uint32_t)(g_rng >> 11);
+}
+
+typedef struct {
+    uint8_t *b;
+    size_t n;
+} Blob;
+
+static Blob g_corpus[256];
+static int g_nc;
+static size_t g_ok, g_err, g_sum;
+
+static void add_file(const char *path) {
+    FILE *fp;
+    long sz;
+    if (g_nc >= 256) return;
+    fp = fopen(path, "rb");
+    if (!fp) return;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz > 0 && sz < (4 << 20)) {
+        uint8_t *b = (uint8_t *)malloc((size_t)sz);
+        if (b && fread(b, 1, (size_t)sz, fp) == (size_t)sz) {
+            g_corpus[g_nc].b = b;
+            g_corpus[g_nc].n = (size_t)sz;
+            g_nc++;
+        } else {
+            free(b);
+        }
+    }
+    fclose(fp);
+}
+
+static void add_path(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        struct dirent *de;
+        if (!d) return;
+        while ((de = readdir(d))) {
+            char p[1024];
+            if (de->d_name[0] == '.') continue;
+            snprintf(p, sizeof p, "%s/%s", path, de->d_name);
+            add_file(p);
+        }
+        closedir(d);
+    } else {
+        add_file(path);
+    }
+}
+
+void rtx_img_fuzz_one(const uint8_t *b, size_t n) {
+    RtxImgLimits lim;
+    RtxImgInfo info;
+    RtxImgBmp bmp;
+    int rc;
+    size_t k;
+    rtx_img_limits_default(&lim);
+    lim.dim_max = 4096;
+    lim.px_max = 4u << 20;
+    lim.budget = 64u << 20;
+    (void)rtx_img_exif_orient(b, n);
+    rc = rtx_img_probe(b, n, 1, &lim, &info);
+    if (rc == RTX_IMG_OK && (!info.w || !info.h || info.w > lim.dim_max || info.h > lim.dim_max))
+        abort();
+    (void)rtx_img_probe(b, n / 2, 0, &lim, &info);
+    rc = rtx_img_decode(b, n, &lim, 64, 64, (int)(n & 1), 3, NULL, &bmp, &info);
+    if (rc == RTX_IMG_OK) {
+        if (!bmp.px || bmp.w > 64 || bmp.h > 64 || !bmp.nframe || bmp.nframe > 3 ||
+            bmp.bytes != (uint64_t)bmp.w * bmp.h * 4 * bmp.nframe)
+            abort();
+        /* Touch every byte: a short buffer would show under ASan. */
+        for (k = 0; k < bmp.bytes; k += 61) g_sum += bmp.px[k] & 1;
+        g_ok++;
+    } else {
+        if (bmp.px) abort();
+        g_err++;
+    }
+    rtx_img_bmp_free(&bmp);
+    {
+        size_t lo, hi, alo, ahi, slo, shi;
+        (void)rtx_img_md_line((const char *)b, n < 4096 ? n : 4096, &lo, &hi, &alo, &ahi, &slo,
+                              &shi);
+    }
+}
+
+static void mutate(uint8_t *b, size_t *n, size_t cap) {
+    int m = (int)(rnd() % 7), k;
+    size_t i;
+    if (!*n) return;
+    switch (m) {
+    case 0: /* bit flips */
+        for (k = 0; k < 1 + (int)(rnd() % 8); k++) b[rnd() % *n] ^= (uint8_t)(1u << (rnd() % 8));
+        break;
+    case 1: /* truncate */
+        *n = rnd() % *n;
+        break;
+    case 2: /* a run of one byte */
+        i = rnd() % *n;
+        for (k = 0; k < 1 + (int)(rnd() % 32) && i + (size_t)k < *n; k++)
+            b[i + (size_t)k] = (uint8_t)(rnd() % 3 == 0 ? 0xFF : rnd());
+        break;
+    case 3: /* extreme 16 / 32-bit field in the header area */
+        i = rnd() % (*n < 64 ? *n : 64);
+        if (i + 4 <= *n) {
+            uint32_t v = rnd() % 2 ? 0xFFFFFFFFu : (rnd() % 2 ? 0x7FFFu : 0);
+            memcpy(b + i, &v, 4);
+        }
+        break;
+    case 4: /* splice another corpus file's tail */
+        if (g_nc > 1) {
+            const Blob *o = &g_corpus[rnd() % (uint32_t)g_nc];
+            size_t at = rnd() % *n, from = o->n ? rnd() % o->n : 0, len = o->n - from;
+            if (at + len > cap) len = cap - at;
+            memcpy(b + at, o->b + from, len);
+            *n = at + len;
+        }
+        break;
+    case 5: /* duplicate a chunk */
+        if (*n > 8 && *n * 2 <= cap) {
+            size_t a = rnd() % (*n / 2), len = 1 + rnd() % (*n - a);
+            memmove(b + a + len, b + a, *n - a);
+            *n += len;
+        }
+        break;
+    default: /* zero a span */
+        i = rnd() % *n;
+        memset(b + i, 0, (size_t)(rnd() % 16) < *n - i ? (size_t)(rnd() % 16) : *n - i);
+        break;
+    }
+}
+
+int main(int argc, char **argv) {
+    const char *it = getenv("RTX_IMG_FUZZ_ITERS");
+    const char *sd = getenv("RTX_IMG_FUZZ_SEED");
+    long iters = it && it[0] ? atol(it) : 2000;
+    long i;
+    uint8_t *buf;
+    size_t cap = 8u << 20;
+    int a;
+    if (sd && sd[0]) g_rng ^= (uint64_t)strtoull(sd, NULL, 10) * 0x2545F4914F6CDD1Dull;
+    for (a = 1; a < argc; a++) add_path(argv[a]);
+    if (!g_nc) add_path("testdata/img");
+    if (!g_nc) {
+        fprintf(stderr, "img_fuzz: empty corpus\n");
+        return 1;
+    }
+    buf = (uint8_t *)malloc(cap);
+    if (!buf) return 1;
+    /* Every corpus file as is, then mutants. */
+    for (a = 0; a < g_nc; a++) rtx_img_fuzz_one(g_corpus[a].b, g_corpus[a].n);
+    for (i = 0; i < iters; i++) {
+        const Blob *s = &g_corpus[rnd() % (uint32_t)g_nc];
+        size_t n = s->n;
+        int rounds = 1 + (int)(rnd() % 3), r;
+        memcpy(buf, s->b, n);
+        for (r = 0; r < rounds; r++) mutate(buf, &n, cap);
+        rtx_img_fuzz_one(buf, n);
+    }
+    printf("img_fuzz: %d files, %ld mutants: %zu decoded, %zu refused\n", g_nc, iters, g_ok,
+           g_err);
+    free(buf);
+    return 0;
+}

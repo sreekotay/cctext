@@ -789,6 +789,17 @@ static void script_arm_frame(void) {
         g_script_have = 0;
         return;
     }
+    if (strncmp(g_script_line, "click ", 6) == 0) {
+        /* click <x> <y>: a left press and release at area (x, y). */
+        char *end = NULL;
+        g_mouse_x = (int)strtol(g_script_line + 6, &end, 10);
+        g_mouse_y = end ? (int)strtol(end, NULL, 10) : 0;
+        g_mouse_pressed = 1;
+        g_mouse_released = 1;
+        g_mouse_down = 0;
+        g_script_have = 0;
+        return;
+    }
     if (strncmp(g_script_line, "wheel ", 6) == 0) {
         /* wheel <dy> [dx]: notches this frame, +dy = up. */
         char *end = NULL;
@@ -868,13 +879,12 @@ static void dlg_click(uiButton *b, void *data) {
     g_dlg = (int)(intptr_t)data;
 }
 
-static int dlg_choice(const char *title, const char *msg,
-                      const char *a, int av,
-                      const char *b, int bv,
-                      const char *c, int cv) {
+/* A modal choice: n buttons (label, value); closing the window is 0. */
+static int dlg_choice_n(const char *title, const char *msg, const char *const *labels,
+                        const int *vals, int n) {
     uiBox *box, *row;
     uiWindow *w;
-    uiButton *ba, *bb, *bc;
+    int i;
     g_dlg = -1;
     g_dlg_open = 1;
     w = uiNewWindow(title, 440, 120, 0);
@@ -885,18 +895,12 @@ static int dlg_choice(const char *title, const char *msg,
     uiBoxAppend(box, uiControl(uiNewLabel(msg)), 0);
     row = uiNewHorizontalBox();
     uiBoxSetPadded(row, 1);
-    ba = uiNewButton(a);
-    uiButtonOnClicked(ba, dlg_click, (void *)(intptr_t)av);
-    uiBoxAppend(row, uiControl(ba), 1);
-    if (b && b[0]) {
-        bb = uiNewButton(b);
-        uiButtonOnClicked(bb, dlg_click, (void *)(intptr_t)bv);
-        uiBoxAppend(row, uiControl(bb), 1);
-    }
-    if (c && c[0]) {
-        bc = uiNewButton(c);
-        uiButtonOnClicked(bc, dlg_click, (void *)(intptr_t)cv);
-        uiBoxAppend(row, uiControl(bc), 1);
+    for (i = 0; i < n; i++) {
+        uiButton *bt;
+        if (!labels[i] || !labels[i][0]) continue;
+        bt = uiNewButton(labels[i]);
+        uiButtonOnClicked(bt, dlg_click, (void *)(intptr_t)vals[i]);
+        uiBoxAppend(row, uiControl(bt), 1);
     }
     uiBoxAppend(box, uiControl(row), 0);
     uiWindowSetMargined(w, 1);
@@ -917,6 +921,21 @@ static int dlg_choice(const char *title, const char *msg,
     }
     g_dlg_win = NULL;
     return g_dlg;
+}
+
+static int dlg_choice(const char *title, const char *msg,
+                      const char *a, int av,
+                      const char *b, int bv,
+                      const char *c, int cv) {
+    const char *labels[3];
+    int vals[3];
+    labels[0] = a;
+    vals[0] = av;
+    labels[1] = b;
+    vals[1] = bv;
+    labels[2] = c;
+    vals[2] = cv;
+    return dlg_choice_n(title, msg, labels, vals, 3);
 }
 
 static UiFace *face_new(const char *family, float size, int weight, int italic) {
@@ -1972,6 +1991,29 @@ int gui_alert_xact(void) {
                       "have changed since. Undo it in every file (undoing "
                       "their later edits too), or only in this file?",
                       "All Files", 1, "This File", 2, "Cancel", 0);
+}
+
+int gui_alert_image(int remote, const char *msg) {
+    static const char *const local_l[] = {"Allow this file", "Allow this directory",
+                                          "Allow ALL local images", "Cancel"};
+    static const char *const remote_l[] = {"Load this image", "Always load from this host",
+                                           "Always load remote images in this project",
+                                           "Cancel"};
+    static const int vals[] = {1, 2, 3, 0};
+    return dlg_choice_n(remote ? "Remote image" : "Image outside the project", msg,
+                        remote ? remote_l : local_l, vals, 4);
+}
+
+void *gui_image_new(const unsigned char *bgra, int w, int h, int stride) {
+    return ui_os_image_new(bgra, w, h, stride);
+}
+
+void gui_image_free(void *img) { ui_os_image_free(img); }
+
+void gui_image_draw(void *img, double x, double y, double w, double h, float alpha) {
+    run_flush();
+    if (!g_ctx || !img) return;
+    ui_os_image_draw(g_ctx, img, x, y, w, h, alpha);
 }
 
 int gui_save_panel(const char *dir, char *out, size_t n) {

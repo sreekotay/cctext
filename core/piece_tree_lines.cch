@@ -12,7 +12,7 @@ static void rtx_line_fault(RtxPieceTree *t) {
 int rtx_line_off_push(RtxPieceTree *t, size_t off) {
     if (t->line_off_len >= t->line_off_cap) {
         size_t c = t->line_off_cap ? t->line_off_cap * 2 : 256;
-        size_t *p = (size_t *)cc_arena_alloc(*t->arena, c * sizeof(size_t), 8);
+        size_t *p = (size_t *)cc_arena_alloc(t->arena_storage, c * sizeof(size_t), 8);
         if (!p) return 0;
         if (t->line_off && t->line_off_len) {
             char[:] dst = cc_slice_from_buffer(p, t->line_off_len * sizeof(size_t));
@@ -266,18 +266,23 @@ int rtx_lf_weights_ok(const RtxPieceTree *t) {
 
 /* One prefix wave. stop_line == (size_t)-1 means run the budget (idle). */
 static size_t rtx_line_scan_wave(RtxPieceTree *t, size_t budget, size_t stop_line) {
-    char buf[256 * 1024];
-    size_t len, take, got, used;
+    /* A wave covers up to RTX_LINE_WAVE_MAX bytes in 64 KiB reads, like the
+     * other line scans: a 256 KiB stack buffer made this a 260 KiB frame on
+     * whatever thread pumps the index. */
+    char buf[64 * 1024];
+    size_t len, take, got, used, chunk;
     int hit = 0;
+    int moved = 0;
     int cap = stop_line != (size_t)-1;
     @errhandler(CCError e) {
         (void)e;
-        return 0;
+        if (moved) rtx_line_pins_from_prefix(t);
+        return moved;
     }
     if (!t || t->lf_ready) return 0;
     len = RtxPieceTree_len(t);
     if (t->line_off_len == 0 && !rtx_line_off_push(t, 0)) return 0;
-    if (budget == 0 || budget > sizeof(buf)) budget = sizeof(buf);
+    if (budget == 0 || budget > RTX_LINE_WAVE_MAX) budget = RTX_LINE_WAVE_MAX;
     take = budget;
     if (t->line_scan_off >= len) take = 0;
     else if (take > len - t->line_scan_off) take = len - t->line_scan_off;
@@ -286,16 +291,23 @@ static size_t rtx_line_scan_wave(RtxPieceTree *t, size_t budget, size_t stop_lin
         if (t->line_scan_off >= len) rtx_line_scan_mark_eof(t);
         return 0;
     }
-    got = RtxPieceTree_read_uncached(t, t->line_scan_off, cc_slice_from_buffer(buf, take)) !>;
-    if (!got) return 0;
-    used = rtx_line_eat(t, buf, got, t->line_scan_off, &t->scan_line,
-                        cap ? stop_line : RTX_LINE_NO_STOP, &hit);
-    if (used == RTX_LINE_EAT_FAIL) return 0;
-    if (hit) {
-        t->line_scan_off += used;
-        return 1;
+    while (take > 0) {
+        chunk = take < sizeof(buf) ? take : sizeof(buf);
+        got = RtxPieceTree_read_uncached(t, t->line_scan_off, cc_slice_from_buffer(buf, chunk)) !>;
+        if (!got) break;
+        used = rtx_line_eat(t, buf, got, t->line_scan_off, &t->scan_line,
+                            cap ? stop_line : RTX_LINE_NO_STOP, &hit);
+        if (used == RTX_LINE_EAT_FAIL) break;
+        moved = 1;
+        if (hit) {
+            t->line_scan_off += used;
+            return 1;
+        }
+        t->line_scan_off += got;
+        if (got > take) break;
+        take -= got;
     }
-    t->line_scan_off += got;
+    if (!moved) return 0;
     if (t->line_scan_off >= len) rtx_line_scan_mark_eof(t);
     rtx_line_pins_from_prefix(t);
     return 1;

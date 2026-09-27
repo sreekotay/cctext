@@ -42,8 +42,9 @@ Landed (the "fix first" batch, 2026‑09‑05):
 | MD table child: classify + whole-table geom (header and every row, read up to `RTX_MARKUP_LOOKBACK` past the fill, so widths do not move as the pane scrolls); Rich aligns cells, hides `|`; TUI paints `│` rails and the sep as a `├─┼─┤` rule; GUI is a clipped stroked grid (pixel col widths, no box-drawing); Source stays raw; `x_of` / hit through cells; motion skips the rule (never lands on the separator line; a caret left there moves as from the first body byte), steps a wrapped cell line by line (up / down pass the cell's wrap lines under the goal x, then leave the record; up enters on the cell's last line), and classifies every table its scratch fill touches — PageUp / PageDown land where n `move_vert` do (`scroll_smoke` table walks); `|` and cell pad are not a caret landing (`rtx_layout_md_snap`); classify is window + `RTX_MARKUP_LOOKBACK` so a header above the fill still keeps body rows as a table; every table **fits the pane, soft wrap on or off** (see **Table fit**) and wraps its cells (GUI and TUI grow row height; paint every wrap line); Up / Down / Page step a wrapped cell unwrapped too; the delimiter line has no gutter number; paint / hit / `x_of` / caret share `rtx_layout_md_cell_wrap` | `rtx_md_fit_cols`, `rtx_md_table_*`, `RtxLayout.md_*`, TUI/GUI paint | done this cut; no invented top/bottom box |
 | TM lowering audit against the embed fixtures | [docs/grammar_audit.md](grammar_audit.md) | written |
 | Mark arity (pair / prefix / path): headings and links share the lens, not the pair-join | [docs/mark_arity.md](mark_arity.md) | prefix + path two-run plant + named apply table landed |
+| Images (the first opaque render): a lexed `![alt](src)` is hidden source with a stand-in until the caret or anchor is on its line (`rtx_layout_reveal` unions the images of those lines); the stand-in text is `[image: alt WxH]` (terminal; inline in cctext-ui); in a pixel layout a line that is one image is a **picture row** sized from the image header (a three-line placeholder box until it arrives), the source rows plus the picture when revealed; records per fill (`RtxLayout.img_recs`), a window with `![` refills instead of patching | `rtx_layout_img_*`, `core/img.ccs`, `frontend/gui_img.ccs`, [docs/images.md](images.md) | done (phase 1: cctext-ui pictures, terminal text) |
 
-Not landed: opaque renders, blocks‑as‑folds beyond heading sections,
+Not landed: opaque renders other than images (mermaid, math, dot), blocks‑as‑folds beyond heading sections,
 heredoc / lookaround regex spans. Rich hit‑test can still land
 between the two bytes of a *revealed* `**` (the next motion snaps out);
 hidden hints are never a landing.
@@ -443,7 +444,7 @@ Locked shape (unchanged from the first cut):
 |---|---|---|---|
 | Fence | `` ``` `` lines | grammar injection on the body span (see above); mono face; optional inner wrap | fence ⊃ table |
 | MD table | run of `\|` lines + optional `\|---\|` row (geom, not a record) | column geom = header ∪ every row (to `RTX_MARKUP_LOOKBACK` past the fill); per‑cell child with inline marks via `style_at`; sticky header as chrome; wheel steps records | widths of a table longer than the lookback; auto‑pad `\|`; CSV STRING hold; table ⊃ fence; recursive tables |
-| Opaque render (mermaid, math, dot, image) | fence body / `![]()` | one vis row of height H at fill time; content from a **Scan‑table row** (start / step / live / resume / deny) like find / island / browse; cached on layout epoch keyed (span hash, width); GUI only | TUI ASCII art (source or fixed box); blocking the frame; fetch on the layout thread |
+| Opaque render (mermaid, math, dot, image) | fence body / `![]()` | one vis row of height H at fill time; content from a **Scan‑table row** (start / step / live / resume / deny) like find / island / browse; cached on layout epoch keyed (span hash, width); GUI only. **Images landed** ([images.md](images.md)): H from the image header (a probe job), pixels from a decode job, a process cache keyed by source and size rather than the layout epoch (a bitmap outlives a relayout), the revealed source rows above the picture | TUI ASCII art (source or fixed box); blocking the frame; fetch on the layout thread |
 | Derived value (formula in a cell) | `=SUM(A1:A3)` literal | paint value in place of content, formula is the hint; layout‑epoch, read‑only, one record in window | editing the value; cross‑window refs; persisted values |
 
 ### Table fit
@@ -525,7 +526,7 @@ next heading is outside the window.
 | Highlight (`hl` bit) | background SGR 48;5;94 | a rect under the glyph (`rtx_theme_hl`) |
 | Prose vs mono face | no (one cell grid) | yes, by section kind + `st.mono` |
 | Table cells | aligned in columns | proportional, per‑cell child |
-| Opaque renders | source or fixed‑height box | rendered child |
+| Opaque renders | source or fixed‑height box; images: `[image: alt WxH]` | rendered child; images: the picture ([images.md](images.md)) |
 
 Say this out loud in the UI: Rich in a terminal is hidden hints, SGR, and
 aligned cells — never the GUI picture.
@@ -566,10 +567,10 @@ geometry) once its wedge lands.
 | Nav | `Ctrl-K/P` = discover (`hint_a > 0` in the window). Apply = transform. Do not hard-code keyword scopes as marks; a `.c` file has none |
 | Sidecar | One `cctext` object. Recognition (`bol` / `inline` / `flank` / `exact` / `abort` / `lit` / `info` / `block`) ≠ topology (`arity` / `face` / `wrap`) ≠ transform (`apply` / `insert` / `max`) ≠ paint (`bold` / `italic` / `mono` / `strike` / `highlight`). A new key answers one of those. |
 | Markdown blocks | A windowed, checkpointed block pass (`md_block.cch`) owns block structure; the grammar lexes inline content. Window + lookback + an anchor ≤ 256 KiB back; state in the checkpoint; an edit relexes to where stack and block state converge; zero cost for a grammar without `blocks`; leftover, never wrong at window edges. (Replaces "grammar-only, no block index" — still no file-wide index.) |
-| Leftover marks | images-as-opaque, a setext / table decided past the lex end; a shortcut `[x]` whose definition lies in an unlexed part of a file over 4 MiB; a collapsed / full reference with no definition still paints as a link |
+| Leftover marks | a reference image `![a][ref]` (text, no picture), an image inside a line of text in cctext-ui (text stand-in, no picture), a setext / table decided past the lex end; a shortcut `[x]` whose definition lies in an unlexed part of a file over 4 MiB; a collapsed / full reference with no definition still paints as a link |
 | Reference map | Label → definition line, staged by the block pass (lex walk, or a checkpointed sweep ≤ 4 MiB), shifted by edits; a relex only when a label the lex asked about comes or goes. Not a file-wide lex, not per frame |
 | Children | Layout‑epoch scratch, not an arity. Paint‑time recursion; one wrap oracle (`cell_wrap`) for paint / hit / `x_of` / caret; window classify; leftover, never wrong |
-| Renders | Opaque vis row of height H; Scan‑table job; epoch cache; GUI only |
+| Renders | Opaque vis row of height H; Scan‑table job; epoch cache; GUI only. Images: H from the header before any pixel; jobs cancel when a paint pass stops asking; bytes stay the source |
 | Derived values | Layout‑epoch, read‑only, one record in window |
 | Grid / hex | Untouched by `rich` |
 | Blocks | Folds are document state; a heading folds its section (level-aware, setext included); other blocks‑as‑folds deferred |

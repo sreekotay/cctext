@@ -29,6 +29,16 @@
 #include "../core/find.cch"
 #include "../core/nav_pair.cch"
 
+/* Window / scroll walk steps. TSan runs the lexer ~20x slower; half the
+ * walk still crosses every window, trim and back-jump case. */
+#if defined(__SANITIZE_THREAD__)
+#define INCR_WIN_STEPS 120
+#define INCR_SCROLL_STEPS 80
+#else
+#define INCR_WIN_STEPS 240
+#define INCR_SCROLL_STEPS 160
+#endif
+
 static int fails = 0;
 static unsigned g_rng = 12345u; /* RELEX_SEED overrides */
 
@@ -227,14 +237,39 @@ static void !>(CCError) run(const char *path, const char *tmp, const char *tag,
     return cc_ok();
 }
 
+/* The hinted runs of `d` that open in [lo, hi), in run order: hint_from
+ * over a window only ever looks at these. Collected once per window check
+ * so the per-byte walk is not O(all runs) (the scroll walk keeps tens of
+ * thousands of runs; the per-byte full scan took hours under TSan). */
+typedef struct {
+    const RtxRun **r;
+    size_t n;
+} HintSet;
+
+static HintSet hint_set(const RtxDoc *d, size_t lo, size_t hi) {
+    HintSet h = {0};
+    size_t i, c = 0;
+    for (i = 0; i < d->runs.len; i++) {
+        const RtxRun *r = &d->runs.data[i];
+        if (r->start >= lo && r->start < hi && r->hint_a) c++;
+    }
+    h.r = (const RtxRun **)malloc((c ? c : 1) * sizeof(*h.r));
+    if (!h.r) abort();
+    for (i = 0; i < d->runs.len; i++) {
+        const RtxRun *r = &d->runs.data[i];
+        if (r->start >= lo && r->start < hi && r->hint_a) h.r[h.n++] = r;
+    }
+    return h;
+}
+
 /* RtxDoc_hint_at over marks that open at or after `lo`. One lex may clip a
  * mark open across `lo` at the window (no hints) while another lexed its
  * whole section; marks that start inside must agree exactly. */
-static int hint_from(const RtxDoc *d, size_t off, size_t lo, size_t *hl, size_t *hh) {
+static int hint_from(const HintSet *hs, size_t off, size_t lo, size_t *hl, size_t *hh) {
     size_t i;
     int hit = 0;
-    for (i = 0; i < d->runs.len; i++) {
-        const RtxRun *r = &d->runs.data[i];
+    for (i = 0; i < hs->n; i++) {
+        const RtxRun *r = hs->r[i];
         size_t end = r->start + r->len;
         if (r->start < lo || r->start > off || off >= end || r->hint_a == 0) continue;
         if (off < r->start + r->hint_a) {
@@ -267,12 +302,13 @@ static void !>(CCError) same_as_window(RtxDoc *a, const char *tmp, const char *t
     n = a->len();
     expect(n == b.len(), "window: same length");
     if (hi > n) hi = n;
+    HintSet ha = hint_set(a, lo, hi), hb = hint_set(&b, lo, hi);
     for (off = lo; off < hi; off++) {
         RtxStyle x = a->style_at(off);
         RtxStyle y = b.style_at(off);
         size_t hl1 = 0, hh1 = 0, hl2 = 0, hh2 = 0;
-        int h1 = hint_from(a, off, lo, &hl1, &hh1);
-        int h2 = hint_from(&b, off, lo, &hl2, &hh2);
+        int h1 = hint_from(&ha, off, lo, &hl1, &hh1);
+        int h2 = hint_from(&hb, off, lo, &hl2, &hh2);
         if (x.scope != y.scope || x.bold != y.bold || x.italic != y.italic ||
             x.mono != y.mono || x.strike != y.strike || h1 != h2 ||
             (h1 && (hl1 != hl2 || hh1 != hh2))) {
@@ -280,6 +316,8 @@ static void !>(CCError) same_as_window(RtxDoc *a, const char *tmp, const char *t
             bad++;
         }
     }
+    free(ha.r);
+    free(hb.r);
     if (bad) {
         RtxDoc *dd[2] = {a, &b};
         int q;
@@ -555,12 +593,13 @@ static void !>(CCError) same_as_ref(RtxDoc *a, RtxDoc *ref, const char *tag, siz
     /* Always a fresh window lex on the reference (no resumed lex). */
     ref->hl_cov.live = 0;
     ref->ensure_hl(rtx_hl_span(lo, hi)) !>;
+    HintSet ha = hint_set(a, lo, hi), hr = hint_set(ref, lo, hi);
     for (off = lo; off < hi; off++) {
         RtxStyle x = a->style_at(off);
         RtxStyle y = ref->style_at(off);
         size_t hl1 = 0, hh1 = 0, hl2 = 0, hh2 = 0;
-        int h1 = hint_from(a, off, lo, &hl1, &hh1);
-        int h2 = hint_from(ref, off, lo, &hl2, &hh2);
+        int h1 = hint_from(&ha, off, lo, &hl1, &hh1);
+        int h2 = hint_from(&hr, off, lo, &hl2, &hh2);
         if (x.scope != y.scope || x.bold != y.bold || x.italic != y.italic ||
             x.mono != y.mono || x.strike != y.strike || h1 != h2 ||
             (h1 && (hl1 != hl2 || hh1 != hh2))) {
@@ -595,6 +634,8 @@ static void !>(CCError) same_as_ref(RtxDoc *a, RtxDoc *ref, const char *tag, siz
             bad++;
         }
     }
+    free(ha.r);
+    free(hr.r);
     g_scroll_checks++;
     snprintf(msg, sizeof msg, "%s step %zu window [%zu,%zu): %zu bytes differ from the reference (first %zu)",
              tag, step, lo, hi, bad, first);
@@ -1060,7 +1101,7 @@ int main(void) {
         const char *wo_j = "testdata/generated/relex_win_out.json";
         const char *wo_c = "testdata/generated/relex_win_out.c";
         const char *wo_m = "testdata/generated/relex_win_out.md";
-        size_t steps = getenv("RELEX_WIN_STEPS") ? (size_t)atol(getenv("RELEX_WIN_STEPS")) : 240;
+        size_t steps = getenv("RELEX_WIN_STEPS") ? (size_t)atol(getenv("RELEX_WIN_STEPS")) : INCR_WIN_STEPS;
         write_json(wj, 600 * 1024);
         write_c(wc, 600 * 1024);
         write_md_big(wm, 600 * 1024);
@@ -1085,7 +1126,7 @@ int main(void) {
         const char *sm = "testdata/generated/scroll_walk.md";
         const char *st = "testdata/generated/scroll_walk.txt";
         const char *sd = "testdata/generated/scroll_dense.txt";
-        size_t steps = getenv("SCROLL_STEPS") ? (size_t)atol(getenv("SCROLL_STEPS")) : 160;
+        size_t steps = getenv("SCROLL_STEPS") ? (size_t)atol(getenv("SCROLL_STEPS")) : INCR_SCROLL_STEPS;
         const char *only = getenv("SCROLL_ONLY");
         g_rng = getenv("SCROLL_SEED") ? (unsigned)atol(getenv("SCROLL_SEED")) : 4242u;
         write_json(sj, 1400 * 1024);

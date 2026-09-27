@@ -187,3 +187,27 @@ const char *ui_os_font_family(const char *path) {
     if (strncmp(path, "family:", 7) == 0 && path[7]) return path + 7;
     return "Consolas";
 }
+
+/* TODO images (ui_os.h): a DIB section (BGRA premultiplied is Win32's
+ * native 32-bit layout) and AlphaBlend / ID2D1Bitmap with the draw
+ * context's render target. Stubbed: images paint as placeholders. */
+void *ui_os_image_new(const unsigned char *bgra, int w, int h, int stride) {
+    (void)bgra;
+    (void)w;
+    (void)h;
+    (void)stride;
+    return NULL;
+}
+
+void ui_os_image_free(void *img) { (void)img; }
+
+void ui_os_image_draw(uiDrawContext *ctx, void *img, double x, double y, double w,
+                      double h, double alpha) {
+    (void)ctx;
+    (void)img;
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+    (void)alpha;
+}

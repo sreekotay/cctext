@@ -15,6 +15,7 @@
 #include "../core/ui.cch"
 #include "../core/ui_proj.cch"
 #include "../core/browse.cch"
+#include "../core/img.cch"
 #include "cctext.cch"
 
 /* Preview fill metrics (same as cctext_draw). */
@@ -93,6 +94,8 @@ int cctext_kind_of_row(int row) {
         case CMD_PROJ_NEXT: return KEY_PROJ_NEXT;
         case CMD_PROJ_PREV: return KEY_PROJ_PREV;
         case CMD_PROJ_REWALK: return KEY_PROJ_REWALK;
+        case CMD_PROJ_INDEX: return KEY_PROJ_INDEX;
+        case CMD_PROJ_INDEX_UPD: return KEY_PROJ_INDEX_UPD;
         default: return KEY_CMD;
     }
 }
@@ -963,6 +966,117 @@ static int cctext_run_row(RtxWs *w, RtxBuf *act, RtxMeasure *m, RtxUi *ui,
 }
 
 /* KEY_CMD outside the find / jump prompts: rows with no key of their own. */
+/* ---- images (docs/images.md): the terminal shows `[image: alt WxH]`;
+ * "Load Image" asks about the image on the caret's line. ---- */
+static int g_img_ask;             /* 0 none, 1 local file, 2 remote */
+static RtxImgSrc g_img_src;
+static char g_img_doc[RTX_IMG_PATH];
+
+int cctext_img_asking(void) {
+    return g_img_ask != 0;
+}
+
+static void cctext_img_prompt(void) {
+    if (g_img_ask == 2)
+        snprintf(g_status, sizeof(g_status),
+                 "remote image (%.40s%s): 1 load  2 always this host  3 always this project  Esc",
+                 g_img_src.host, g_img_src.http ? ", http" : "");
+    else
+        snprintf(g_status, sizeof(g_status),
+                 "image outside the project: 1 allow file  2 allow dir  3 allow ALL  Esc");
+}
+
+static void cctext_img_relayout(RtxWs *w) {
+    size_t i;
+    for (i = 0; i < w->len; i++) {
+        RtxBuf *b = w->bufs[i];
+        if (b && b->layout.img_on && b->layout.rows.len) b->layout.clear_rows();
+    }
+}
+
+static int cctext_img_line(RtxBuf *b, RtxImgSrc *src) {
+    char buf[4096];
+    size_t len, a, got, ls, le, i;
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    len = b->doc.len();
+    a = b->doc.caret > 2048 ? b->doc.caret - 2048 : 0;
+    got = b->doc.read_at(a, cc_slice_from_buffer(buf, sizeof buf < len - a ? sizeof buf : len - a)) !>;
+    ls = b->doc.caret - a;
+    if (ls > got) ls = got;
+    while (ls > 0 && buf[ls - 1] != '\n') ls--;
+    le = b->doc.caret - a;
+    if (le > got) le = got;
+    while (le < got && buf[le] != '\n') le++;
+    for (i = ls; i + 1 < le; i++) {
+        size_t alo, ahi, s0, s1;
+        if (buf[i] != '!' || buf[i + 1] != '[') continue;
+        if (!rtx_img_md_parse(buf, i, le, &alo, &ahi, &s0, &s1)) continue;
+        rtx_img_resolve(RtxDoc_file_path(&b->doc), buf + s0, s1 - s0, src);
+        return 1;
+    }
+    return 0;
+}
+
+static void cctext_img_load(RtxWs *w, RtxBuf *act) {
+    RtxImgView v;
+    char why[120];
+    const char *doc = RtxDoc_file_path(&act->doc);
+    if (!cctext_img_line(act, &g_img_src)) {
+        snprintf(g_status, sizeof(g_status), "image: no image on this line");
+        return;
+    }
+    rtx_img_info(&g_img_src, &v);
+    if (v.state == RTX_IMG_S_ASK) {
+        g_img_ask = g_img_src.kind == RTX_IMG_SRC_REMOTE ? 2 : 1;
+        snprintf(g_img_doc, sizeof g_img_doc, "%s", doc ? doc : "");
+        cctext_img_prompt();
+        return;
+    }
+    if (v.state == RTX_IMG_S_ERR)
+        snprintf(g_status, sizeof(g_status), "image: %s",
+                 rtx_img_err_text(v.err, why, sizeof why));
+    else if (v.have_info)
+        snprintf(g_status, sizeof(g_status), "image: %s %ux%u (terminal pictures: phase 2)",
+                 rtx_img_fmt_name(v.info.fmt), (unsigned)v.info.w, (unsigned)v.info.h);
+    else
+        snprintf(g_status, sizeof(g_status), "image: loading");
+    (void)w;
+}
+
+/* The prompt's answer: 1-3 decide, anything else cancels. */
+static void cctext_img_answer(RtxWs *w, int kind, int ch) {
+    int remote = g_img_ask == 2, what = 0;
+    if (kind == KEY_CHAR && ch >= '1' && ch <= '3') {
+        if (ch == '1') what = remote ? RTX_IMG_ALLOW_ONCE : RTX_IMG_ALLOW_FILE;
+        else if (ch == '2') what = remote ? RTX_IMG_ALLOW_HOST : RTX_IMG_ALLOW_DIR;
+        else what = remote ? RTX_IMG_ALLOW_ALL_REMOTE : RTX_IMG_ALLOW_ALL_LOCAL;
+    }
+    g_img_ask = 0;
+    if (!what) {
+        snprintf(g_status, sizeof(g_status), "image: cancelled");
+        return;
+    }
+    if (!rtx_img_allow(g_img_doc[0] ? g_img_doc : NULL, &g_img_src, what)) {
+        snprintf(g_status, sizeof(g_status), "image: could not store the permission");
+        return;
+    }
+    if (remote) {
+        RtxImgSrc again;
+        rtx_img_resolve(g_img_doc[0] ? g_img_doc : NULL, g_img_src.key, strlen(g_img_src.key),
+                        &again);
+        rtx_img_fetch(&again);
+    }
+    snprintf(g_status, sizeof(g_status), "image: %s",
+             ch == '1' ? (remote ? "loading" : "file allowed")
+             : ch == '2' ? (remote ? "host allowed" : "directory allowed")
+                         : (remote ? "remote images allowed in this project"
+                                   : "all local images allowed"));
+    cctext_img_relayout(w);
+}
+
 static void !>(CCError) cctext_run_cmd(RtxWs *w, RtxBuf *act, RtxMeasure *m,
                                        RtxUi *ui, int vis, int cols) {
     const RtxCmdDef *d = g_cmd_row >= 0 ? rtx_cmd_at((size_t)g_cmd_row) : NULL;
@@ -1004,6 +1118,17 @@ static void !>(CCError) cctext_run_cmd(RtxWs *w, RtxBuf *act, RtxMeasure *m,
     if (c == CMD_REPLACE) {
         rtx_ui_start_replace(ui, &act->doc);
         rtx_ui_find_apply(ui, &act->doc) !>;
+        return cc_ok();
+    }
+    if (c == CMD_IMG_LOAD) {
+        cctext_img_load(w, act);
+        return cc_ok();
+    }
+    if (c == CMD_IMG_REVOKE) {
+        int n = rtx_img_revoke(RtxDoc_file_path(&act->doc));
+        snprintf(g_status, sizeof(g_status), "image: %d permission%s revoked", n,
+                 n == 1 ? "" : "s");
+        cctext_img_relayout(w);
         return cc_ok();
     }
     if (c == CMD_PRESENT) {
@@ -1261,6 +1386,10 @@ int cctext_handle_input(RtxWs *w, RtxBuf *act, RtxMeasure *m, RtxUi *ui,
     if (!w || !act || !ui) return 0;
     cctext_sync_apply(act);
     if (rtx_present()->on) return cctext_present_key(w, act, ui, kind, ch, vis);
+    if (g_img_ask && kind != KEY_NONE) {
+        cctext_img_answer(w, kind, ch);
+        return 0;
+    }
 
 if (ui->ask_conflict) {
     int choice = -1;
@@ -1454,6 +1583,13 @@ if (kind == KEY_QUICK_OPEN || kind == KEY_PROJ_SEARCH) {
 if ((kind == KEY_PROJ_NEXT || kind == KEY_PROJ_PREV) && !ui->pick) {
     /* F4 / Shift-F4: next / previous project search result. */
     rtx_ui_psearch_step(ui, w, kind == KEY_PROJ_PREV ? -1 : 1, vis) !>;
+    snprintf(g_status, sizeof(g_status), "%s", ui->pick_msg);
+    return 0;
+}
+if (kind == KEY_PROJ_INDEX || kind == KEY_PROJ_INDEX_UPD) {
+    /* Palette: build / update the project search index (a background arm). */
+    if (kind == KEY_PROJ_INDEX_UPD) rtx_ui_proj_index_update(ui) !>;
+    else rtx_ui_proj_index(ui) !>;
     snprintf(g_status, sizeof(g_status), "%s", ui->pick_msg);
     return 0;
 }
@@ -1682,6 +1818,7 @@ if (kind == KEY_HELP) {
         ui->apply = 0;
         return 0;
     }
+    if (!ui->help && rtx_ui_wb_esc(act, g_status, sizeof g_status)) return 0;
     rtx_ui_toggle_help(ui);
     return 0;
 }

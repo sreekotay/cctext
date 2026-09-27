@@ -7,8 +7,9 @@
  * lines (core/slides.cch): headings larger and bold, lists with markers,
  * code in the mono face with the grammar's colours on a dark band,
  * tables in measured columns, block quotes with a bar, header / footer /
- * page number, and a labelled frame where an image goes (cctext-ui draws
- * no bitmaps). Painting scales the list; a transition paints two lists
+ * page number, and images: `![bg]` backgrounds (cover / contain / auto,
+ * left / right splits) and content images, drawn from the image cache
+ * (docs/images.md). Painting scales the list; a transition paints two lists
  * with an offset, a clip, a scale or an alpha, and `morph` moves each
  * line that has the same text on both slides from its old box to its new
  * one (magic move). Build steps fade in.
@@ -35,8 +36,22 @@ enum {
     GP_TEXT = 1,
     GP_RECT = 2,   /* filled */
     GP_FRAME = 3,  /* stroked */
-    GP_LINE = 4    /* horizontal rule / underline */
+    GP_LINE = 4,   /* horizontal rule / underline */
+    GP_IMAGE = 5   /* a bitmap in its box (GpImg) */
 };
+
+enum {
+    GP_FIT_COVER = 0,
+    GP_FIT_CONTAIN = 1,
+    GP_FIT_AUTO = 2
+};
+
+/* An image of the list: its source (resolved at build) and fit. */
+typedef struct {
+    RtxImgSrc src;
+    unsigned char fit;
+    unsigned alt, nalt;    /* alt bytes in the pool */
+} GpImg;
 
 enum {
     GP_F_PROSE = 0,
@@ -57,7 +72,7 @@ typedef struct {
     unsigned char ul;
     uint32_t rgb;
     int grp;               /* line group (-1 none) */
-    unsigned txt, ntxt;    /* bytes in the pool */
+    unsigned txt, ntxt;    /* bytes in the pool; GP_IMAGE: txt is the GpImg */
 } GpItem;
 
 typedef struct {
@@ -78,6 +93,10 @@ typedef struct {
     size_t pn, pcap;
     GpGroup *g;
     size_t ng, gcap;
+    GpImg *img;
+    size_t nimg, icap;
+    unsigned img_gen;      /* rtx_img_gen when built: a header or a
+                            * decision since reflows the slide */
     RtxSlideTheme th;
 } GpList;
 
@@ -155,6 +174,73 @@ static GpItem *gp_add(GpList *L, int kind, float x, float y, float w, float h, u
     it->frag = (unsigned char)frag;
     it->grp = grp;
     return it;
+}
+
+/* An image item in box (x, y, w, h), slide px. */
+static GpItem *gp_img_add(GpList *L, RtxDoc *d, float x, float y, float w, float h, int fit,
+                          const char *src, size_t sn, const char *alt, size_t an, int frag,
+                          int grp) {
+    GpItem *it;
+    GpImg *gi;
+    if (L->nimg >= L->icap) {
+        size_t cap = L->icap ? L->icap * 2 : 4;
+        GpImg *p = (GpImg *)realloc(L->img, cap * sizeof *p);
+        if (!p) return NULL;
+        L->img = p;
+        L->icap = cap;
+    }
+    gi = &L->img[L->nimg];
+    memset(gi, 0, sizeof *gi);
+    rtx_img_resolve(RtxDoc_file_path(d), src, sn, &gi->src);
+    gi->fit = (unsigned char)fit;
+    gi->alt = gp_pool(L, alt ? alt : "", alt ? an : 0);
+    gi->nalt = alt ? (unsigned)an : 0;
+    it = gp_add(L, GP_IMAGE, x, y, w, h, 0, frag, grp);
+    if (it) it->txt = (unsigned)L->nimg;
+    L->nimg++;
+    return it;
+}
+
+/* Natural size of an image source (0 while its header is on the way). */
+static int gp_img_size(RtxDoc *d, const char *src, size_t sn, float *w, float *h) {
+    RtxImgSrc s;
+    RtxImgView v;
+    rtx_img_resolve(RtxDoc_file_path(d), src, sn, &s);
+    rtx_img_info(&s, &v);
+    if (!v.have_info || v.state == RTX_IMG_S_ERR || v.state == RTX_IMG_S_ASK) return 0;
+    *w = (float)v.info.w;
+    *h = (float)v.info.h;
+    return 1;
+}
+
+/* Marp size keywords in an image alt: `w:320` / `width:320px`, `h:` /
+ * `height:`. 0 when absent. */
+static void gp_img_kw(const char *a, size_t n, float *w, float *h) {
+    size_t i = 0;
+    *w = *h = 0;
+    while (i < n) {
+        size_t s0, k;
+        float v = 0;
+        int which = 0;
+        while (i < n && (a[i] == ' ' || a[i] == '\t')) i++;
+        s0 = i;
+        while (i < n && a[i] != ' ' && a[i] != '\t') i++;
+        if (i - s0 > 2 && a[s0 + 1] == ':' && (a[s0] == 'w' || a[s0] == 'h')) {
+            which = a[s0] == 'w' ? 1 : 2;
+            k = s0 + 2;
+        } else if (i - s0 > 6 && strncmp(a + s0, "width:", 6) == 0) {
+            which = 1;
+            k = s0 + 6;
+        } else if (i - s0 > 7 && strncmp(a + s0, "height:", 7) == 0) {
+            which = 2;
+            k = s0 + 7;
+        } else {
+            continue;
+        }
+        for (; k < i && a[k] >= '0' && a[k] <= '9'; k++) v = v * 10 + (float)(a[k] - '0');
+        if (which == 1) *w = v;
+        else *h = v;
+    }
 }
 
 static float gp_measure(GuiFonts *f, int font, float size, const char *s) {
@@ -363,8 +449,9 @@ static int gp_build(GpList *L, GuiFonts *f, RtxDoc *d, const RtxDeck *k, int s) 
     size_t li;
     float W, H, cx0, cx1, top, bottom;
     RtxSlideTheme th;
-    L->n = L->pn = L->ng = 0;
+    L->n = L->pn = L->ng = L->nimg = 0;
     L->valid = 0;
+    L->img_gen = rtx_img_gen();
     if (!k || s < 0 || (size_t)s >= k->n) return 0;
     if (!rtx_slide_view(d, s, &g_gv)) return 0;
     sl = &k->s[s];
@@ -406,10 +493,13 @@ static int gp_build(GpList *L, GuiFonts *f, RtxDoc *d, const RtxDeck *k, int s) 
         }
     }
     if (sl->nbg) {
-        char src[160], lab[200];
+        /* `![bg]`: the slide's background image, under everything; a
+         * split keeps the content on the other side. Marp's default fit
+         * is cover; `fit` / `contain` letterbox it, `auto` is its size. */
+        char src[RTX_IMG_PATH];
         size_t sn = sl->bg_src_hi > sl->bg_src_lo ? sl->bg_src_hi - sl->bg_src_lo : 0;
         float ix = 0, iw = W;
-        GpItem *it;
+        int fit = sl->bg_fit == 1 ? GP_FIT_CONTAIN : sl->bg_fit == 2 ? GP_FIT_AUTO : GP_FIT_COVER;
         if (sn >= sizeof src) sn = sizeof src - 1;
         src[0] = 0;
         if (sn) {
@@ -418,25 +508,15 @@ static int gp_build(GpList *L, GuiFonts *f, RtxDoc *d, const RtxDeck *k, int s) 
                 @ok((size_t)0);
             };
             src[got] = 0;
+            sn = got;
         }
-        snprintf(lab, sizeof lab, "background image  %s", src);
         if (sl->bg_side) {
             iw = W * (float)sl->bg_pct / 100.0f;
             ix = sl->bg_side == 1 ? 0 : W - iw;
-            gp_add(L, GP_RECT, ix, 0, iw, H, gp_mix(th.bg, th.dim, 0.18), 0, -1);
-            gp_add(L, GP_FRAME, ix + 16, 16, iw - 32, H - 32, th.dim, 0, -1);
             if (sl->bg_side == 1) cx0 = ix + iw + 56;
             else cx1 = ix - 56;
-        } else {
-            gp_add(L, GP_FRAME, 12, 12, W - 24, H - 24, gp_mix(th.bg, th.dim, 0.5), 0, -1);
         }
-        it = gp_add(L, GP_TEXT, ix + 28, sl->bg_side ? H / 2 - 12 : H - 76, 0, 24, th.dim, 0, -1);
-        if (it) {
-            it->size = 18;
-            it->font = GP_F_ITAL;
-            it->txt = gp_pool(L, lab, strlen(lab));
-            it->ntxt = (unsigned)strlen(lab);
-        }
+        gp_img_add(L, d, ix, 0, iw, H, fit, src, sn, "background", 10, 0, -1);
     }
     C.L = L;
     C.f = f;
@@ -640,24 +720,48 @@ static int gp_build(GpList *L, GuiFonts *f, RtxDoc *d, const RtxDeck *k, int s) 
                 li++;
                 break;
             case RTX_SL_IMAGE: {
-                /* No bitmaps: a labelled frame the image's place. */
-                char lab[300];
+                /* A content image: its natural size, `w:` / `h:` from the
+                 * alt, fitted to the content box and what is left of the
+                 * slide; a placeholder box until the header is read. */
+                const RtxSlSeg *alt = l->nseg > 0 ? &g_gv.segs[l->seg0] : NULL;
                 const RtxSlSeg *src = l->nseg > 1 ? &g_gv.segs[l->seg0 + 1] : NULL;
-                float bw = (cx1 - qx) * 0.42f, bh = 150, bx = qx;
-                GpItem *it;
-                if (th.center) bx = qx + (cx1 - qx - bw) / 2;
-                snprintf(lab, sizeof lab, "image  %.*s", src ? (int)(src->hi - src->lo) : 0,
-                         src ? g_gv.text + (src->lo - g_gv.base) : "");
-                gp_add(L, GP_RECT, bx, C.y + 6, bw, bh, gp_mix(th.bg, th.dim, 0.12), l->frag, grp);
-                gp_add(L, GP_FRAME, bx, C.y + 6, bw, bh, th.dim, l->frag, grp);
-                it = gp_add(L, GP_TEXT, bx + 16, C.y + 6 + bh / 2 - 12, bw - 32, 24, th.dim,
-                            l->frag, grp);
-                if (it) {
-                    it->size = 18;
-                    it->font = GP_F_ITAL;
-                    it->txt = gp_pool(L, lab, strlen(lab));
-                    it->ntxt = (unsigned)strlen(lab);
+                const char *sp = src ? g_gv.text + (src->lo - g_gv.base) : "";
+                const char *ap = alt ? g_gv.text + (alt->lo - g_gv.base) : "";
+                size_t sn = src ? src->hi - src->lo : 0, an = alt ? alt->hi - alt->lo : 0;
+                float nw, nh, kw, kh, bw, bh, bx = qx, room_w = cx1 - qx, room_h;
+                room_h = bottom - C.y - 12;
+                if (room_h < 60) room_h = 60;
+                gp_img_kw(ap, an, &kw, &kh);
+                if (gp_img_size(d, sp, sn, &nw, &nh)) {
+                    if (kw > 0 && kh <= 0) {
+                        nh = nh * kw / nw;
+                        nw = kw;
+                    } else if (kh > 0 && kw <= 0) {
+                        nw = nw * kh / nh;
+                        nh = kh;
+                    } else if (kw > 0 && kh > 0) {
+                        nw = kw;
+                        nh = kh;
+                    }
+                    bw = nw;
+                    bh = nh;
+                    if (bw > room_w) {
+                        bh = bh * room_w / bw;
+                        bw = room_w;
+                    }
+                    if (bh > room_h) {
+                        bw = bw * room_h / bh;
+                        bh = room_h;
+                    }
+                } else {
+                    bw = kw > 0 ? kw : room_w * 0.42f;
+                    bh = kh > 0 ? kh : 150;
+                    if (bw > room_w) bw = room_w;
+                    if (bh > room_h) bh = room_h;
                 }
+                if (th.center) bx = qx + (room_w - bw) / 2;
+                gp_img_add(L, d, bx, C.y + 6, bw, bh, GP_FIT_CONTAIN, sp, sn, ap, an, l->frag,
+                           grp);
                 C.y += bh + 16;
                 li++;
                 break;
@@ -708,8 +812,10 @@ static int gp_build(GpList *L, GuiFonts *f, RtxDoc *d, const RtxDeck *k, int s) 
 static GpList *gp_list(int slot, GuiFonts *f, RtxDoc *d, const RtxDeck *k, int s) {
     GpList *L = &g_gl[slot];
     GpList *O = &g_gl[slot ^ 1];
-    if (L->valid && L->slide == s && L->gen == d->edit_gen && L->doc == d) return L;
-    if (O->valid && O->slide == s && O->gen == d->edit_gen && O->doc == d) {
+    unsigned ig = rtx_img_gen();
+    if (L->valid && L->slide == s && L->gen == d->edit_gen && L->doc == d && L->img_gen == ig)
+        return L;
+    if (O->valid && O->slide == s && O->gen == d->edit_gen && O->doc == d && O->img_gen == ig) {
         /* The other slot holds it (the slides swapped roles): swap. */
         GpList t = *L;
         *L = *O;
@@ -765,6 +871,33 @@ static void gp_item(GuiFonts *f, const GpList *L, const GpItem *it, const GpXf *
         int h = (int)(it->h * s + 0.5f);
         if (h < 1) h = 1;
         DrawRectangle((int)px, (int)py, (int)(it->w * s + 0.5f), h, c);
+        break;
+    }
+    case GP_IMAGE: {
+        /* The bitmap is decoded at the slide's own scale (zoom 1), so a
+         * zoom or morph scales one bitmap instead of decoding per frame. */
+        const GpImg *gi = it->txt < L->nimg ? &L->img[it->txt] : NULL;
+        RtxImgView v;
+        float pw = it->w * s, ph = it->h * s, k = X->zoom * zs, dw, dh;
+        if (!gi || pw < 1 || ph < 1) break;
+        rtx_img_info(&gi->src, &v);
+        if (v.have_info && v.info.w && v.info.h && v.state != RTX_IMG_S_ERR &&
+            v.state != RTX_IMG_S_ASK) {
+            float sx = pw / (float)v.info.w, sy = ph / (float)v.info.h, fs;
+            if (gi->fit == GP_FIT_CONTAIN) fs = sx < sy ? sx : sy;
+            else if (gi->fit == GP_FIT_AUTO) fs = s;
+            else fs = sx > sy ? sx : sy;
+            dw = (float)v.info.w * fs;
+            dh = (float)v.info.h * fs;
+            BeginScissorMode((int)px, (int)py, (int)(pw + 0.5f), (int)(ph + 0.5f));
+            gui_img_draw_at(f, &gi->src, px + (pw - dw) / 2, py + (ph - dh) / 2, dw, dh,
+                            k > 0 ? dw / k : dw, k > 0 ? dh / k : dh, a, L->pool + gi->alt,
+                            gi->nalt);
+            EndScissorMode();
+        } else {
+            gui_img_draw_at(f, &gi->src, px, py, pw, ph, pw, ph, a, L->pool + gi->alt,
+                            gi->nalt);
+        }
         break;
     }
     default:

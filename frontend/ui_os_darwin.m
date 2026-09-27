@@ -382,3 +382,50 @@ const char *ui_os_font_family(const char *path) {
     if (strstr(path, "Courier")) return "Courier New";
     return "Menlo";
 }
+
+/* ---- images (ui_os.h) ----------------------------------------------------
+ * UNTESTED here (no macOS build in this environment): mirrors the GTK
+ * path. libui's darwin draw context is { CGContextRef c; CGFloat height; }
+ * over a flipped NSView, so the image is drawn through a local flip. */
+
+struct uiDrawContext {
+    CGContextRef c;
+    CGFloat height;
+};
+
+void *ui_os_image_new(const unsigned char *bgra, int w, int h, int stride) {
+    CGColorSpaceRef cs;
+    CGDataProviderRef dp;
+    CGImageRef im;
+    if (!bgra || w <= 0 || h <= 0 || stride < w * 4) return NULL;
+    /* No copy: the cache frees this before the pixels. */
+    dp = CGDataProviderCreateWithData(NULL, bgra, (size_t)stride * (size_t)h, NULL);
+    if (!dp) return NULL;
+    cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    im = CGImageCreate((size_t)w, (size_t)h, 8, 32, (size_t)stride, cs,
+                       kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst, dp,
+                       NULL, true, kCGRenderingIntentDefault);
+    CGColorSpaceRelease(cs);
+    CGDataProviderRelease(dp);
+    return (void *)im;
+}
+
+void ui_os_image_free(void *img) {
+    if (img) CGImageRelease((CGImageRef)img);
+}
+
+void ui_os_image_draw(uiDrawContext *ctx, void *img, double x, double y, double w,
+                      double h, double alpha) {
+    CGContextRef c;
+    if (!ctx || !img || w <= 0 || h <= 0 || alpha <= 0) return;
+    c = ctx->c;
+    CGContextSaveGState(c);
+    CGContextClipToRect(c, CGRectMake(x, y, w, h));
+    /* The area view is flipped (y down); CGContextDrawImage assumes y up. */
+    CGContextTranslateCTM(c, x, y + h);
+    CGContextScaleCTM(c, 1.0, -1.0);
+    CGContextSetAlpha(c, alpha > 1.0 ? 1.0 : alpha);
+    CGContextSetInterpolationQuality(c, kCGInterpolationHigh);
+    CGContextDrawImage(c, CGRectMake(0, 0, w, h), (CGImageRef)img);
+    CGContextRestoreGState(c);
+}

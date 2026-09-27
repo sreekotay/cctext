@@ -96,6 +96,30 @@ Browse lane scratch lives in `wk->wslot[]` and the arm frees it after
 the join; a body-local scratch arena leaked 1 MiB per cancelled lane
 (`@smoke_asan` LeakSanitizer).
 
+RtxWs is ~400 KiB (eight `RtxBrowsePrev`, each a staging + shown
+`RtxDoc`). Never declare one per test case in one function: at -O0 blocks
+do not share stack slots and ASan keeps them apart (safe_smoke's main
+needed 28 MiB). Smokes use `RtxWsHeap w_h = rtx_ws_heap() @destroy;
+RtxWs *w = w_h.p;` (`tests/ws_heap.cch`). Reset big structs with
+`memset`, not `*w = (RtxWs){0}` (a stack temporary at -O0). Check
+frames with `--cc-flags -fstack-usage`; nothing in core/ is above
+~70 KiB. A struct that moves by value (RtxDoc staging -> doc) must not
+hold a pointer into itself: the piece tree's `arena = &arena_storage`
+alias leaked the adopted preview's arena.
+
+`@smoke_ubsan` (workbook / save / safe smokes) uses `scripts/ubsan.supp`:
+ccc's `CCTask` stores pointer-aligned payloads at `_data` offset 4
+(runtime/task.c `TASK_FIBER_V2`), reported on every `@parallel` spawn.
+Runtime-only; cctext UB is never listed there.
+
+`@smoke_tsan` on a host at load ~20 (4 cores): sysmon once declared
+DEADLOCK DETECTED in replace_smoke with three fibers RUNNING and both
+workers "idle" (exit 124), then TSan reported its own dump
+(`sched_v2_debug_dump_state` reading `park_reason`). 0 of 4 reruns and
+the next full list reproduced it; treat it as a runtime stall-detector
+false positive, not a find race. Smoke timing windows (sindex racy
+stamps) must not assume a 40 ms gap survives TSan on a loaded box.
+
 `ui.cch` is owned by `ui.ccs` (`rtx_ui`). `ui_types.cch` is decls;
 gutter / rail / blink bodies live in `workspace.ccs`. Tree chapters
 (`piece_tree_rb.cch`, `piece_tree_lines.cch`, `piece_tree_priv.cch`)

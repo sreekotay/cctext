@@ -19,8 +19,10 @@
 #include "cmd.cch"
 #include "keymap.cch"
 #include "palette.cch"
+#include "img.cch"
 #include "slides.cch"
 #include "wb.cch"
+#include "sindex.cch"
 
 const char *rtx_help_line(size_t i);
 /* Regenerate the help lines from the command table + keymap. */
@@ -365,7 +367,7 @@ void rtx_ui_find_stats(const RtxDoc *d, char *dst, size_t n) {
     char offb[16];
     char totb[16];
     char tags[32];
-    char lng[64];
+    char lng[160];
     int pct;
     size_t hits;
     size_t cur;
@@ -386,6 +388,12 @@ void rtx_ui_find_stats(const RtxDoc *d, char *dst, size_t n) {
         rtx_ui_fmt_bytes(ob, sizeof(ob), d->find.long_off);
         snprintf(lng, sizeof(lng), "  %zu over %d KiB @%s", nlong,
                  (int)(RTX_FIND_SPAN / 1024), ob);
+    }
+    if (d && d->find.indet) {
+        /* The list ends where the regex could not decide: say so. */
+        size_t k = strlen(lng);
+        snprintf(lng + k, sizeof(lng) - k, "  search incomplete: pattern too complex at line %zu",
+                 d->find.indet_line + 1);
     }
     if (pct >= 0) {
         rtx_ui_fmt_bytes(offb, sizeof(offb), d->find.scan_bytes);
@@ -1372,7 +1380,8 @@ void rtx_cli_usage(FILE *fp, const char *prog) {
     fprintf(fp, "                             $XDG_CONFIG_HOME/cctext/keys.json or\n");
     fprintf(fp, "                             ~/.config/cctext/keys.json)\n");
     fprintf(fp, "  --settings FILE            defaults (tab_spaces, autopair, blink, caret,\n");
-    fprintf(fp, "                             caret_fade, rich, scroll_regions); default\n");
+    fprintf(fp, "                             caret_fade, rich, scroll_regions,\n");
+    fprintf(fp, "                             search_index, search_index_pct); default\n");
     fprintf(fp, "                             settings.json beside keys.json\n");
     fprintf(fp, "                             ($RTX_SETTINGS); flags override\n");
     fprintf(fp, "  --tabs=auto|always|never   buffer tab bar (auto: 2+ buffers; also RTX_TABS)\n");
@@ -1389,7 +1398,8 @@ void rtx_cli_usage(FILE *fp, const char *prog) {
     fprintf(fp, "              undo, redo, replace [--all] [--regex] [--icase]\n");
     fprintf(fp, "              [--word] FIND REPL  ('..' / \"..\" quote; \"\" = empty),\n");
     fprintf(fp, "              project-files [--rewalk] [--follow] [QUERY],\n");
-    fprintf(fp, "              project-search [--regex] [--icase] [--word] QUERY\n");
+    fprintf(fp, "              project-search [--regex] [--icase] [--word] QUERY,\n");
+    fprintf(fp, "              project-index [--update] [--pct N]  (with --safe)\n");
     fprintf(fp, "  --hex                      hex view for the following files\n");
     fprintf(fp, "  --grid                     column view for the following files\n");
     fprintf(fp, "  --view=default|hex|grid    view for the following files\n");
@@ -1446,6 +1456,21 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
         if (st.has_rich) cli->rich = st.rich;
         if (st.has_esc_timeout_ms) cli->esc_ms = st.esc_timeout_ms;
         if (st.has_scroll_regions) cli->no_scroll_regions = !st.scroll_regions;
+        if (st.has_search_index) rtx_si_set_enabled(st.search_index);
+        if (st.has_search_index_pct) rtx_si_set_pct(st.search_index_pct);
+        {
+            /* Image limits (docs/images.md). */
+            RtxImgLimits *il = rtx_img_limits();
+            if (st.image_file_mb) il->file_max = (uint64_t)st.image_file_mb << 20;
+            if (st.image_max_side) il->dim_max = (uint32_t)st.image_max_side;
+            if (st.image_max_mp) il->px_max = (uint64_t)st.image_max_mp * 1000000ull;
+            if (st.image_budget_mb) il->budget = (uint64_t)st.image_budget_mb << 20;
+            if (st.image_max_height) il->max_h = (uint32_t)st.image_max_height;
+            if (st.has_image_animate) il->anim = st.image_animate;
+            if (st.image_anim_frames) il->anim_frames = (uint32_t)st.image_anim_frames;
+            if (st.image_remote_mb) il->remote_max = (uint64_t)st.image_remote_mb << 20;
+            if (st.image_timeout_s) il->timeout_s = (uint32_t)st.image_timeout_s;
+        }
     }
     {
         const char *sr = getenv("RTX_SCROLL_REGIONS");
@@ -1662,7 +1687,10 @@ void rtx_status_wb(const RtxBuf *b, char *dst, size_t n) {
 
 int rtx_ui_wb_enabled(const RtxCmdCtx *c) {
     const RtxBuf *b = c ? (const RtxBuf *)c->act : NULL;
-    return b && rtx_wb_of(&b->doc) != NULL;
+    /* the palette lists with no buffer in its context: listed, and the
+     * run hook says "not a workbook" off one */
+    if (!b) return 1;
+    return rtx_wb_of(&b->doc) != NULL;
 }
 
 /* "workbook.rename": the jump prompt, prefilled with the name at the
@@ -1688,6 +1716,98 @@ int rtx_ui_wb_rename_run(RtxCmdCtx *c) {
     ui->jump_msg[0] = 0;
     snprintf(ui->jump_buf, sizeof ui->jump_buf, "%s", name);
     ui->jump_len = strlen(ui->jump_buf);
+    return 1;
+}
+
+/* A big workbook's reparse waits for a pause in typing (docs/workbook.md
+ * "W2 at scale"): ms until the first buffer's is due, -1 when none is. */
+long rtx_ui_wb_next_ms(RtxWs *w) {
+    size_t i;
+    long best = -1;
+    if (!w) return -1;
+    for (i = 0; i < w->len; i++) {
+        long ms = rtx_wb_due_ms(&w->bufs[i]->doc);
+        if (ms >= 0 && (best < 0 || ms < best)) best = ms;
+    }
+    return best;
+}
+
+/* A slice of the due workbook jobs (host idle, never on a keystroke):
+ * views whose values moved relayout. 1 when any ran (repaint: the status
+ * shows the progress). */
+int rtx_ui_wb_idle(RtxWs *w) {
+    size_t i;
+    int did = 0;
+    if (!w) return 0;
+    for (i = 0; i < w->len; i++) {
+        int r = rtx_wb_idle(&w->bufs[i]->doc);
+        if (!r) continue;
+        if (r == 2) RtxWs_invalidate_buf_views(w, (int)i);
+        did = 1;
+    }
+    return did;
+}
+
+/* Esc while the active workbook recalculates: cancel its jobs (the stale
+ * values stay marked). 1 when it did (the key is spent). */
+int rtx_ui_wb_esc(RtxBuf *b, char *status, size_t n) {
+    if (!b || !rtx_wb_busy(&b->doc) || !rtx_wb_cancel(&b->doc)) return 0;
+    if (status && n)
+        snprintf(status, n, "recalculation cancelled: stale values stay marked (Workbook: Recalculate)");
+    return 1;
+}
+
+/* "workbook.cancel": Workbook: Cancel Recalculation. */
+int rtx_ui_wb_cancel_run(RtxCmdCtx *c) {
+    RtxBuf *b = c ? (RtxBuf *)c->act : NULL;
+    if (!b) return 0;
+    if (!rtx_ui_wb_esc(b, c->status, sizeof c->status))
+        snprintf(c->status, sizeof c->status, "workbook: nothing to cancel");
+    return 1;
+}
+
+/* "workbook.anchor_row": `{#name}` at the caret row's start, one undo. */
+int rtx_ui_wb_anchor_run(RtxCmdCtx *c) {
+    RtxBuf *b = c ? (RtxBuf *)c->act : NULL;
+    char msg[120];
+    size_t caret = 0, k;
+    if (!b) return 0;
+    msg[0] = 0;
+    k = rtx_wb_anchor_row(&b->doc, b->doc.caret, msg, sizeof msg, &caret) !> (e) {
+        (void)e;
+        snprintf(c->status, sizeof c->status, "anchor: edit failed");
+        return 1;
+    };
+    if (!k) {
+        snprintf(c->status, sizeof c->status, "anchor: %s", msg[0] ? msg : "not in a table row");
+        return 1;
+    }
+    b->doc.caret = caret;
+    b->doc.sel_anchor = caret;
+    c->changed = 1;
+    snprintf(c->status, sizeof c->status, "%s", msg);
+    return 1;
+}
+
+/* "workbook.copy_row_ref": `T#name.col` into the clip when the row has an
+ * anchor; otherwise say so and do nothing. */
+int rtx_ui_wb_row_ref_run(RtxCmdCtx *c) {
+    RtxBuf *b = c ? (RtxBuf *)c->act : NULL;
+    RtxWs *w = c ? (RtxWs *)c->ws : NULL;
+    RtxWb *wb = b ? rtx_wb_of(&b->doc) : NULL;
+    char ref[160], msg[120];
+    if (!b || !w) return 0;
+    msg[0] = 0;
+    if (!wb || !rtx_wb_row_ref(wb, &b->doc, b->doc.caret, ref, sizeof ref, msg, sizeof msg)) {
+        snprintf(c->status, sizeof c->status, "%s", msg[0] ? msg : "not in a workbook table row");
+        return 1;
+    }
+    RtxWs_set_clip(w, cc_slice_from_buffer(ref, strlen(ref))) !> (e) {
+        (void)e;
+        snprintf(c->status, sizeof c->status, "copy reference: out of memory");
+        return 1;
+    };
+    snprintf(c->status, sizeof c->status, "copied %s", ref);
     return 1;
 }
 
@@ -1742,6 +1862,39 @@ void rtx_ui_wb_register(void) {
     row.deny = RTX_CTX_BROWSE;
     row.enabled = rtx_ui_wb_enabled;
     row.run = rtx_ui_wb_recalc_run;
+    (void)rtx_cmd_register(&row);
+    memset(&row, 0, sizeof row);
+    row.id = "workbook.cancel";
+    row.title = "Workbook: Cancel Recalculation";
+    row.cat = "Edit";
+    row.cmd = CMD_NONE;
+    row.need = RTX_CTX_DOC;
+    row.deny = RTX_CTX_BROWSE;
+    row.notes = "  also Esc while the status says recalculating";
+    row.enabled = rtx_ui_wb_enabled;
+    row.run = rtx_ui_wb_cancel_run;
+    (void)rtx_cmd_register(&row);
+    memset(&row, 0, sizeof row);
+    row.id = "workbook.anchor_row";
+    row.title = "Workbook: Anchor Row";
+    row.cat = "Edit";
+    row.cmd = CMD_NONE;
+    row.need = RTX_CTX_DOC;
+    row.deny = RTX_CTX_BROWSE;
+    row.notes = "  {#name} at the caret row's start: T#name.col names the row";
+    row.enabled = rtx_ui_wb_enabled;
+    row.run = rtx_ui_wb_anchor_run;
+    (void)rtx_cmd_register(&row);
+    memset(&row, 0, sizeof row);
+    row.id = "workbook.copy_row_ref";
+    row.title = "Workbook: Copy Reference to Row";
+    row.cat = "Edit";
+    row.cmd = CMD_NONE;
+    row.need = RTX_CTX_DOC;
+    row.deny = RTX_CTX_BROWSE;
+    row.notes = "  T#name.col for the caret cell (anchored rows only)";
+    row.enabled = rtx_ui_wb_enabled;
+    row.run = rtx_ui_wb_row_ref_run;
     (void)rtx_cmd_register(&row);
 }
 

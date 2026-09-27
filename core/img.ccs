@@ -1,0 +1,2291 @@
+#!ccc ccs
+/*
+ * Images: loader, policy, cache, jobs (img.cch; docs/images.md).
+ *
+ * Memory: decoded pixels are malloc'd (a bitmap is handed to the host's
+ * platform image as is and outlives any arena epoch); the cache holds
+ * them under RtxImgLimits.budget and evicts least-recently painted
+ * first. The full-size decode canvas of a job lives only inside that job.
+ */
+#include <ccc/std/prelude.cch>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include <dirent.h>
+
+#include "img.cch"
+#include "img_wuffs.h"
+#include "img_net.h"
+#include "rtx_par.cch"
+/* From safe.ccs (safe.cch pulls the document face in; two decls do). */
+int rtx_safe_dir(char *dst, size_t n);
+int rtx_project_root(char *dst, size_t n, const char *start);
+
+/* ---- limits ----------------------------------------------------------- */
+
+void rtx_img_limits_default(RtxImgLimits *l) {
+    if (!l) return;
+    l->file_max = RTX_IMG_FILE_MAX;
+    l->dim_max = RTX_IMG_DIM_MAX;
+    l->px_max = RTX_IMG_PX_MAX;
+    l->budget = RTX_IMG_BUDGET;
+    l->max_h = RTX_IMG_MAX_H;
+    l->anim = 0;
+    l->anim_frames = RTX_IMG_ANIM_FRAMES;
+    l->data_max = RTX_IMG_DATA_MAX;
+    l->remote_max = RTX_IMG_REMOTE_MAX;
+    l->timeout_s = RTX_IMG_TIMEOUT_S;
+    l->cache_max = RTX_IMG_CACHE_MAX;
+}
+
+static RtxImgLimits g_img_lim;
+static int g_img_lim_set;
+
+RtxImgLimits *rtx_img_limits(void) {
+    if (!g_img_lim_set) {
+        rtx_img_limits_default(&g_img_lim);
+        g_img_lim_set = 1;
+    }
+    return &g_img_lim;
+}
+
+static void img_mib(char *buf, size_t n, uint64_t v) {
+    if (v >= (1ull << 20) && v % (1ull << 20) == 0)
+        snprintf(buf, n, "%llu MiB", (unsigned long long)(v >> 20));
+    else if (v >= 1024 && v % 1024 == 0)
+        snprintf(buf, n, "%llu KiB", (unsigned long long)(v >> 10));
+    else
+        snprintf(buf, n, "%llu bytes", (unsigned long long)v);
+}
+
+const char *rtx_img_err_text(int err, char *buf, size_t n) {
+    char m[32];
+    const RtxImgLimits *l = rtx_img_limits();
+    if (!buf || n < 2) return "";
+    switch (err) {
+    case RTX_IMG_OK: snprintf(buf, n, "ok"); break;
+    case RTX_IMG_EFORMAT: snprintf(buf, n, "not a supported image format"); break;
+    case RTX_IMG_ECORRUPT: snprintf(buf, n, "corrupt image"); break;
+    case RTX_IMG_ETRUNC: snprintf(buf, n, "truncated image"); break;
+    case RTX_IMG_ENOMEM: snprintf(buf, n, "out of memory"); break;
+    case RTX_IMG_ECANCEL: snprintf(buf, n, "cancelled"); break;
+    case RTX_IMG_EFILE:
+        img_mib(m, sizeof m, l->file_max);
+        snprintf(buf, n, "file over the %s limit", m);
+        break;
+    case RTX_IMG_EDIM:
+        snprintf(buf, n, "over the %u px side limit", (unsigned)l->dim_max);
+        break;
+    case RTX_IMG_EPX:
+        snprintf(buf, n, "over the %llu megapixel limit",
+                 (unsigned long long)(l->px_max / 1000000ull));
+        break;
+    case RTX_IMG_EBUDGET:
+        img_mib(m, sizeof m, l->budget);
+        snprintf(buf, n, "over the %s pixel budget", m);
+        break;
+    case RTX_IMG_EIO: snprintf(buf, n, "file not found or unreadable"); break;
+    case RTX_IMG_EDENIED: snprintf(buf, n, "outside the project: click to allow"); break;
+    case RTX_IMG_EREMOTE: snprintf(buf, n, "remote image: click to load"); break;
+    case RTX_IMG_EFETCH: snprintf(buf, n, "fetch failed"); break;
+    case RTX_IMG_EDATA:
+        img_mib(m, sizeof m, l->data_max);
+        snprintf(buf, n, "data: URI malformed or over %s", m);
+        break;
+    case RTX_IMG_ETIMEOUT: snprintf(buf, n, "fetch timed out (%us)", (unsigned)l->timeout_s); break;
+    case RTX_IMG_ESIZE:
+        img_mib(m, sizeof m, l->remote_max);
+        snprintf(buf, n, "download over the %s limit", m);
+        break;
+    case RTX_IMG_EHTTP: snprintf(buf, n, "plain http not allowed for this host"); break;
+    case RTX_IMG_ESRC: snprintf(buf, n, "no image source"); break;
+    default: snprintf(buf, n, "image error %d", err); break;
+    }
+    return buf;
+}
+
+const char *rtx_img_fmt_name(int fmt) {
+    switch (fmt) {
+    case RTX_IMG_FMT_PNG: return "PNG";
+    case RTX_IMG_FMT_JPEG: return "JPEG";
+    case RTX_IMG_FMT_GIF: return "GIF";
+    case RTX_IMG_FMT_BMP: return "BMP";
+    case RTX_IMG_FMT_WEBP: return "WebP";
+    case RTX_IMG_FMT_QOI: return "QOI";
+    default: return "?";
+    }
+}
+
+/* ---- EXIF orientation --------------------------------------------------- */
+
+static uint32_t img_rd16(const uint8_t *p, int le) {
+    return le ? (uint32_t)(p[0] | (p[1] << 8)) : (uint32_t)((p[0] << 8) | p[1]);
+}
+
+static uint32_t img_rd32(const uint8_t *p, int le) {
+    return le ? ((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+                 ((uint32_t)p[3] << 24))
+              : (((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) |
+                 (uint32_t)p[3]);
+}
+
+/* Orientation tag (0x0112) of IFD0 in a TIFF block t[0, n). */
+static int img_tiff_orient(const uint8_t *t, size_t n) {
+    int le;
+    uint32_t ifd, cnt, i;
+    if (n < 8) return 1;
+    if (t[0] == 'I' && t[1] == 'I') le = 1;
+    else if (t[0] == 'M' && t[1] == 'M') le = 0;
+    else return 1;
+    if (img_rd16(t + 2, le) != 42) return 1;
+    ifd = img_rd32(t + 4, le);
+    if (ifd > n || n - ifd < 2) return 1;
+    cnt = img_rd16(t + ifd, le);
+    for (i = 0; i < cnt && i < 512; i++) {
+        size_t e = (size_t)ifd + 2 + (size_t)i * 12;
+        uint32_t tag, type, v;
+        if (e + 12 > n) break;
+        tag = img_rd16(t + e, le);
+        if (tag != 0x0112) continue;
+        type = img_rd16(t + e + 2, le);
+        if (type != 3) return 1;
+        v = img_rd16(t + e + 8, le);
+        return v >= 1 && v <= 8 ? (int)v : 1;
+    }
+    return 1;
+}
+
+int rtx_img_exif_orient(const uint8_t *b, size_t n) {
+    size_t i;
+    if (!b || n < 12) return 1;
+    if (b[0] == 0xFF && b[1] == 0xD8) {
+        /* JPEG: markers up to the scan; APP1 "Exif\0\0" holds TIFF. */
+        i = 2;
+        while (i + 4 <= n) {
+            uint8_t m;
+            size_t len;
+            if (b[i] != 0xFF) return 1;
+            m = b[i + 1];
+            if (m == 0xFF) {
+                i++;
+                continue;
+            }
+            if (m == 0xD8 || (m >= 0xD0 && m <= 0xD7) || m == 0x01) {
+                i += 2;
+                continue;
+            }
+            if (m == 0xDA || m == 0xD9) return 1;
+            len = ((size_t)b[i + 2] << 8) | b[i + 3];
+            if (len < 2 || i + 2 + len > n) return 1;
+            if (m == 0xE1 && len >= 8 && memcmp(b + i + 4, "Exif\0\0", 6) == 0)
+                return img_tiff_orient(b + i + 10, len - 8);
+            i += 2 + len;
+        }
+        return 1;
+    }
+    if (n >= 8 && memcmp(b, "\x89PNG\r\n\x1a\n", 8) == 0) {
+        i = 8;
+        while (i + 12 <= n) {
+            uint32_t len = img_rd32(b + i, 0);
+            const uint8_t *ty = b + i + 4;
+            if ((size_t)len > n - i - 12) return 1;
+            if (memcmp(ty, "eXIf", 4) == 0) {
+                const uint8_t *t = b + i + 8;
+                size_t tn = len;
+                if (tn >= 6 && memcmp(t, "Exif\0\0", 6) == 0) {
+                    t += 6;
+                    tn -= 6;
+                }
+                return img_tiff_orient(t, tn);
+            }
+            if (memcmp(ty, "IDAT", 4) == 0 || memcmp(ty, "IEND", 4) == 0) return 1;
+            i += 12 + (size_t)len;
+        }
+        return 1;
+    }
+    if (n >= 12 && memcmp(b, "RIFF", 4) == 0 && memcmp(b + 8, "WEBP", 4) == 0) {
+        i = 12;
+        while (i + 8 <= n) {
+            uint32_t len = img_rd32(b + i + 4, 1);
+            if ((size_t)len > n - i - 8) return 1;
+            if (memcmp(b + i, "EXIF", 4) == 0) {
+                const uint8_t *t = b + i + 8;
+                size_t tn = len;
+                if (tn >= 6 && memcmp(t, "Exif\0\0", 6) == 0) {
+                    t += 6;
+                    tn -= 6;
+                }
+                return img_tiff_orient(t, tn);
+            }
+            i += 8 + (size_t)len + (len & 1);
+        }
+    }
+    return 1;
+}
+
+/* ---- probe / decode / scale ------------------------------------------- */
+
+static int img_fmt_of_wuffs(int f) {
+    switch (f) {
+    case RTX_WUFFS_FMT_PNG: return RTX_IMG_FMT_PNG;
+    case RTX_WUFFS_FMT_JPEG: return RTX_IMG_FMT_JPEG;
+    case RTX_WUFFS_FMT_GIF: return RTX_IMG_FMT_GIF;
+    case RTX_WUFFS_FMT_BMP: return RTX_IMG_FMT_BMP;
+    case RTX_WUFFS_FMT_WEBP: return RTX_IMG_FMT_WEBP;
+    case RTX_WUFFS_FMT_QOI: return RTX_IMG_FMT_QOI;
+    default: return RTX_IMG_FMT_NONE;
+    }
+}
+
+static int img_wuffs_of_fmt(int f) {
+    switch (f) {
+    case RTX_IMG_FMT_PNG: return RTX_WUFFS_FMT_PNG;
+    case RTX_IMG_FMT_JPEG: return RTX_WUFFS_FMT_JPEG;
+    case RTX_IMG_FMT_GIF: return RTX_WUFFS_FMT_GIF;
+    case RTX_IMG_FMT_BMP: return RTX_WUFFS_FMT_BMP;
+    case RTX_IMG_FMT_WEBP: return RTX_WUFFS_FMT_WEBP;
+    case RTX_IMG_FMT_QOI: return RTX_WUFFS_FMT_QOI;
+    default: return RTX_WUFFS_FMT_NONE;
+    }
+}
+
+static int img_code_of_wuffs(int rc) {
+    switch (rc) {
+    case RTX_WUFFS_OK: return RTX_IMG_OK;
+    case RTX_WUFFS_MORE: return RTX_IMG_MORE;
+    case RTX_WUFFS_UNKNOWN: return RTX_IMG_EFORMAT;
+    case RTX_WUFFS_TRUNC: return RTX_IMG_ETRUNC;
+    case RTX_WUFFS_NOMEM: return RTX_IMG_ENOMEM;
+    case RTX_WUFFS_CANCEL: return RTX_IMG_ECANCEL;
+    default: return RTX_IMG_ECORRUPT;
+    }
+}
+
+/* Limits on a header, before any pixel allocation. */
+static int img_check(const RtxImgInfo *in, const RtxImgLimits *lim) {
+    uint64_t px = (uint64_t)in->cw * in->ch;
+    if (!in->cw || !in->ch) return RTX_IMG_ECORRUPT;
+    if (in->cw > lim->dim_max || in->ch > lim->dim_max) return RTX_IMG_EDIM;
+    if (px > lim->px_max) return RTX_IMG_EPX;
+    /* A decoder that asks for more scratch than a few canvases is lying
+     * or hostile. */
+    if (in->workbuf > px * 16 + (16u << 20)) return RTX_IMG_ECORRUPT;
+    return RTX_IMG_OK;
+}
+
+static int img_head(RtxWuffsDec *d, const uint8_t *b, size_t n, int closed, int fmt,
+                    const RtxImgLimits *lim, RtxImgInfo *out) {
+    uint32_t w = 0, h = 0;
+    uint64_t wb = 0;
+    int rc = rtx_wuffs_head(d, b, n, closed, &w, &h, &wb);
+    memset(out, 0, sizeof *out);
+    out->fmt = img_fmt_of_wuffs(fmt);
+    if (rc != RTX_WUFFS_OK) return img_code_of_wuffs(rc);
+    out->cw = w;
+    out->ch = h;
+    out->workbuf = wb;
+    out->orient = rtx_img_exif_orient(b, n);
+    if (out->orient >= 5) {
+        out->w = h;
+        out->h = w;
+    } else {
+        out->w = w;
+        out->h = h;
+    }
+    return img_check(out, lim);
+}
+
+int rtx_img_sniff(const uint8_t *b, size_t n) {
+    return img_fmt_of_wuffs(rtx_wuffs_sniff(b, n, 1));
+}
+
+int rtx_img_probe(const uint8_t *b, size_t n, int closed, const RtxImgLimits *lim,
+                  RtxImgInfo *out) {
+    int fmt;
+    RtxWuffsDec *d;
+    int rc;
+    RtxImgInfo tmp;
+    if (!out) out = &tmp;
+    memset(out, 0, sizeof *out);
+    if (!lim) lim = rtx_img_limits();
+    if (!b || !n) return closed ? RTX_IMG_EFORMAT : RTX_IMG_MORE;
+    fmt = rtx_wuffs_sniff(b, n, closed);
+    if (fmt == RTX_WUFFS_FMT_NONE) return (!closed && n < 64) ? RTX_IMG_MORE : RTX_IMG_EFORMAT;
+    d = rtx_wuffs_open(fmt);
+    if (!d) return RTX_IMG_ENOMEM;
+    rc = img_head(d, b, n, closed, fmt, lim, out);
+    rtx_wuffs_close(d);
+    return rc;
+}
+
+void rtx_img_fit(uint32_t w, uint32_t h, uint32_t max_w, uint32_t max_h,
+                 uint32_t *ow, uint32_t *oh) {
+    double s = 1.0;
+    uint32_t rw, rh;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    if (max_w && w > max_w) s = (double)max_w / (double)w;
+    if (max_h && (double)h * s > (double)max_h) s = (double)max_h / (double)h;
+    rw = (uint32_t)((double)w * s + 0.5);
+    rh = (uint32_t)((double)h * s + 0.5);
+    if (rw < 1) rw = 1;
+    if (rh < 1) rh = 1;
+    if (rw > w) rw = w;
+    if (rh > h) rh = h;
+    if (ow) *ow = rw;
+    if (oh) *oh = rh;
+}
+
+/* Coded (cx, cy) of displayed (x, y) under EXIF orientation o. */
+static inline void img_orient_map(int o, uint32_t cw, uint32_t ch, uint32_t x, uint32_t y,
+                                  uint32_t *cx, uint32_t *cy) {
+    switch (o) {
+    case 2: *cx = cw - 1 - x; *cy = y; break;
+    case 3: *cx = cw - 1 - x; *cy = ch - 1 - y; break;
+    case 4: *cx = x; *cy = ch - 1 - y; break;
+    case 5: *cx = y; *cy = x; break;
+    case 6: *cx = y; *cy = ch - 1 - x; break;
+    case 7: *cx = cw - 1 - y; *cy = ch - 1 - x; break;
+    case 8: *cx = cw - 1 - y; *cy = x; break;
+    default: *cx = x; *cy = y; break;
+    }
+}
+
+void rtx_img_scale(const uint8_t *src, uint32_t cw, uint32_t ch, int orient,
+                   uint8_t *dst, uint32_t w, uint32_t h) {
+    uint32_t W = orient >= 5 ? ch : cw, H = orient >= 5 ? cw : ch;
+    uint32_t dx, dy;
+    if (!src || !dst || !w || !h || !cw || !ch) return;
+    for (dy = 0; dy < h; dy++) {
+        uint32_t y0 = (uint32_t)((uint64_t)dy * H / h);
+        uint32_t y1 = (uint32_t)((uint64_t)(dy + 1) * H / h);
+        uint32_t ys;
+        if (y1 <= y0) y1 = y0 + 1;
+        if (y1 > H) y1 = H;
+        /* At most ~5 samples per axis: a big downscale stays cheap. */
+        ys = (y1 - y0 + 4) / 5;
+        if (ys < 1) ys = 1;
+        for (dx = 0; dx < w; dx++) {
+            uint32_t x0 = (uint32_t)((uint64_t)dx * W / w);
+            uint32_t x1 = (uint32_t)((uint64_t)(dx + 1) * W / w);
+            uint32_t xs, x, y, cnt = 0;
+            uint32_t acc[4] = {0, 0, 0, 0};
+            uint8_t *o = dst + ((size_t)dy * w + dx) * 4;
+            if (x1 <= x0) x1 = x0 + 1;
+            if (x1 > W) x1 = W;
+            xs = (x1 - x0 + 4) / 5;
+            if (xs < 1) xs = 1;
+            for (y = y0; y < y1; y += ys) {
+                for (x = x0; x < x1; x += xs) {
+                    uint32_t cx, cy;
+                    const uint8_t *p;
+                    img_orient_map(orient, cw, ch, x, y, &cx, &cy);
+                    p = src + ((size_t)cy * cw + cx) * 4;
+                    acc[0] += p[0];
+                    acc[1] += p[1];
+                    acc[2] += p[2];
+                    acc[3] += p[3];
+                    cnt++;
+                }
+            }
+            if (!cnt) cnt = 1;
+            o[0] = (uint8_t)((acc[0] + cnt / 2) / cnt);
+            o[1] = (uint8_t)((acc[1] + cnt / 2) / cnt);
+            o[2] = (uint8_t)((acc[2] + cnt / 2) / cnt);
+            o[3] = (uint8_t)((acc[3] + cnt / 2) / cnt);
+        }
+    }
+}
+
+/* BGRA premultiplied → RGBA straight, in place. */
+static void img_to_rgba(uint8_t *px, size_t npx) {
+    size_t i;
+    for (i = 0; i < npx; i++) {
+        uint8_t *p = px + i * 4;
+        uint8_t b = p[0], g = p[1], r = p[2], a = p[3];
+        if (a && a != 255) {
+            r = (uint8_t)((r * 255u + a / 2) / a);
+            g = (uint8_t)((g * 255u + a / 2) / a);
+            b = (uint8_t)((b * 255u + a / 2) / a);
+        }
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
+        p[3] = a;
+    }
+}
+
+void rtx_img_bmp_free(RtxImgBmp *bmp) {
+    if (!bmp) return;
+    free(bmp->px);
+    free(bmp->delay);
+    memset(bmp, 0, sizeof *bmp);
+}
+
+int rtx_img_decode(const uint8_t *b, size_t n, const RtxImgLimits *lim,
+                   uint32_t max_w, uint32_t max_h, int pix, uint32_t max_frames,
+                   const _Atomic int *cancel, RtxImgBmp *out, RtxImgInfo *info) {
+    RtxImgInfo in;
+    RtxWuffsDec *d;
+    int fmt, rc;
+    uint32_t tw, th, f;
+    uint64_t canvas_n, frame_n, total;
+    uint8_t *canvas = NULL, *prev = NULL, *work = NULL;
+    if (out) memset(out, 0, sizeof *out);
+    if (info) memset(info, 0, sizeof *info);
+    if (!out || !b || !n) return RTX_IMG_EFORMAT;
+    if (!lim) lim = rtx_img_limits();
+    if ((uint64_t)n > lim->file_max) return RTX_IMG_EFILE;
+    if (max_frames < 1) max_frames = 1;
+    fmt = rtx_wuffs_sniff(b, n, 1);
+    if (fmt == RTX_WUFFS_FMT_NONE) return RTX_IMG_EFORMAT;
+    d = rtx_wuffs_open(fmt);
+    if (!d) return RTX_IMG_ENOMEM;
+    rc = img_head(d, b, n, 1, fmt, lim, &in);
+    if (info) *info = in;
+    if (rc != RTX_IMG_OK) {
+        rtx_wuffs_close(d);
+        return rc == RTX_IMG_MORE ? RTX_IMG_ETRUNC : rc;
+    }
+    rtx_img_fit(in.w, in.h, max_w, max_h, &tw, &th);
+    frame_n = (uint64_t)tw * th * 4;
+    if (frame_n > lim->budget) {
+        rtx_wuffs_close(d);
+        return RTX_IMG_EBUDGET;
+    }
+    if (fmt != RTX_WUFFS_FMT_GIF && fmt != RTX_WUFFS_FMT_WEBP) max_frames = 1;
+    if (frame_n * max_frames > lim->budget) {
+        max_frames = (uint32_t)(lim->budget / frame_n);
+        if (max_frames < 1) max_frames = 1;
+    }
+    canvas_n = (uint64_t)in.cw * in.ch * 4;
+    canvas = (uint8_t *)malloc((size_t)canvas_n);
+    work = in.workbuf ? (uint8_t *)malloc((size_t)in.workbuf) : NULL;
+    if (max_frames > 1) prev = (uint8_t *)malloc((size_t)canvas_n);
+    out->px = (uint8_t *)malloc((size_t)(frame_n * max_frames));
+    if (!canvas || (in.workbuf && !work) || !out->px || (max_frames > 1 && !prev)) {
+        free(canvas);
+        free(work);
+        free(prev);
+        rtx_img_bmp_free(out);
+        rtx_wuffs_close(d);
+        return RTX_IMG_ENOMEM;
+    }
+    if (max_frames > 1) {
+        out->delay = (uint32_t *)calloc(max_frames, sizeof(uint32_t));
+        if (!out->delay) max_frames = 1;
+    }
+    total = 0;
+    for (f = 0; f < max_frames; f++) {
+        uint32_t delay = 0;
+        rc = rtx_wuffs_frame(d, b, n, canvas, prev, work, in.workbuf, &delay, cancel);
+        if (rc == RTX_WUFFS_END) {
+            rc = RTX_WUFFS_OK;
+            break;
+        }
+        if (rc != RTX_WUFFS_OK) break;
+        rtx_img_scale(canvas, in.cw, in.ch, in.orient, out->px + total, tw, th);
+        if (out->delay) out->delay[f] = delay < 20 ? 100 : delay;
+        total += frame_n;
+        if (cancel && *cancel) {
+            rc = RTX_WUFFS_CANCEL;
+            break;
+        }
+    }
+    free(canvas);
+    free(work);
+    free(prev);
+    rtx_wuffs_close(d);
+    if (rc != RTX_WUFFS_OK || f == 0) {
+        rtx_img_bmp_free(out);
+        return rc == RTX_WUFFS_OK ? RTX_IMG_ECORRUPT : img_code_of_wuffs(rc);
+    }
+    out->w = tw;
+    out->h = th;
+    out->stride = tw * 4;
+    out->nframe = f;
+    out->pix = pix;
+    out->bytes = total;
+    if (out->nframe == 1 && out->delay) {
+        free(out->delay);
+        out->delay = NULL;
+    }
+    if (pix == RTX_IMG_PIX_RGBA) img_to_rgba(out->px, (size_t)(total / 4));
+    return RTX_IMG_OK;
+}
+
+/* ---- Markdown image syntax -------------------------------------------- */
+
+static int img_ws(char c) {
+    return c == ' ' || c == '\t';
+}
+
+size_t rtx_img_md_parse(const char *s, size_t i, size_t e, size_t *alo,
+                        size_t *ahi, size_t *slo, size_t *shi) {
+    size_t j, depth;
+    if (!s || i + 4 > e || s[i] != '!' || s[i + 1] != '[') return 0;
+    if (i > 0 && s[i - 1] == '\\') return 0;
+    j = i + 2;
+    depth = 0;
+    while (j < e) {
+        if (s[j] == '\\' && j + 1 < e) {
+            j += 2;
+            continue;
+        }
+        if (s[j] == '[') depth++;
+        else if (s[j] == ']') {
+            if (!depth) break;
+            depth--;
+        }
+        j++;
+    }
+    if (j + 1 >= e || s[j + 1] != '(') return 0;
+    *alo = i + 2;
+    *ahi = j;
+    j += 2;
+    while (j < e && img_ws(s[j])) j++;
+    if (j < e && s[j] == '<') {
+        size_t k = j + 1;
+        while (k < e && s[k] != '>' && s[k] != '\n') k++;
+        if (k >= e || s[k] != '>') return 0;
+        *slo = j + 1;
+        *shi = k;
+        j = k + 1;
+    } else {
+        size_t k = j;
+        depth = 0;
+        while (k < e && !img_ws(s[k])) {
+            if (s[k] == '\\' && k + 1 < e) {
+                k += 2;
+                continue;
+            }
+            if (s[k] == '(') depth++;
+            else if (s[k] == ')') {
+                if (!depth) break;
+                depth--;
+            }
+            k++;
+        }
+        *slo = j;
+        *shi = k;
+        j = k;
+    }
+    while (j < e && img_ws(s[j])) j++;
+    if (j < e && (s[j] == '"' || s[j] == '\'' || s[j] == '(')) {
+        char q = s[j] == '(' ? ')' : s[j];
+        j++;
+        while (j < e && s[j] != q) {
+            if (s[j] == '\\' && j + 1 < e) j++;
+            j++;
+        }
+        if (j >= e) return 0;
+        j++;
+        while (j < e && img_ws(s[j])) j++;
+    }
+    if (j >= e || s[j] != ')') return 0;
+    return j + 1;
+}
+
+int rtx_img_md_line(const char *s, size_t n, size_t *lo, size_t *hi,
+                    size_t *alo, size_t *ahi, size_t *slo, size_t *shi) {
+    size_t i = 0, nx, t;
+    if (!s) return 0;
+    while (i < n && img_ws(s[i])) i++;
+    if (i >= n || s[i] != '!' || i >= 4) return 0;
+    nx = rtx_img_md_parse(s, i, n, alo, ahi, slo, shi);
+    if (!nx) return 0;
+    t = nx;
+    while (t < n && (img_ws(s[t]) || s[t] == '\r')) t++;
+    if (t != n) return 0;
+    if (*shi <= *slo) return 0;
+    *lo = i;
+    *hi = nx;
+    return 1;
+}
+
+/* ---- policy ------------------------------------------------------------ */
+
+static uint64_t img_fnv(const void *p, size_t n) {
+    const uint8_t *s = (const uint8_t *)p;
+    uint64_t h = 1469598103934665603ull;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= s[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+#define IMG_ALLOW_MAX 256
+
+typedef struct {
+    char root[RTX_IMG_PATH];
+    int loaded;
+    int all_local;
+    int all_remote;
+    int nfile, ndir, nhost;
+    char *file[IMG_ALLOW_MAX];
+    char *dir[IMG_ALLOW_MAX];
+    char *host[IMG_ALLOW_MAX];
+    unsigned char host_http[IMG_ALLOW_MAX];
+    unsigned char host_always[IMG_ALLOW_MAX];
+} ImgAllow;
+
+#define IMG_PROJ_MAX 16
+static ImgAllow *g_allow[IMG_PROJ_MAX];
+static int g_nallow;
+/* Session "Load this image" decisions (not persisted). */
+static char *g_once[IMG_ALLOW_MAX];
+static int g_nonce;
+/* Cached doc dir → project root. */
+static char g_root_dir[RTX_IMG_PATH];
+static char g_root_val[RTX_IMG_PATH];
+static unsigned g_policy_gen = 1;
+
+unsigned rtx_img_policy_gen(void) {
+    return g_policy_gen;
+}
+
+static void img_allow_clear(ImgAllow *a) {
+    int i;
+    for (i = 0; i < a->nfile; i++) free(a->file[i]);
+    for (i = 0; i < a->ndir; i++) free(a->dir[i]);
+    for (i = 0; i < a->nhost; i++) free(a->host[i]);
+    a->nfile = a->ndir = a->nhost = 0;
+    a->all_local = a->all_remote = 0;
+}
+
+static int img_leaf_path(const char *root, char *out, size_t n) {
+    char dir[RTX_IMG_PATH];
+    if (!rtx_safe_dir(dir, sizeof dir)) return 0;
+    snprintf(out, n, "%s/img", dir);
+    (void)mkdir(out, 0700);
+    snprintf(out, n, "%s/img/%016llx.allow", dir,
+             (unsigned long long)img_fnv(root, strlen(root)));
+    return 1;
+}
+
+static int img_push(char **arr, int *n, const char *v) {
+    int i;
+    for (i = 0; i < *n; i++)
+        if (strcmp(arr[i], v) == 0) return 0;
+    if (*n >= IMG_ALLOW_MAX) return 0;
+    arr[*n] = strdup(v);
+    if (!arr[*n]) return 0;
+    (*n)++;
+    return 1;
+}
+
+static int img_host_idx(ImgAllow *a, const char *h) {
+    int i;
+    for (i = 0; i < a->nhost; i++)
+        if (strcmp(a->host[i], h) == 0) return i;
+    if (a->nhost >= IMG_ALLOW_MAX) return -1;
+    a->host[a->nhost] = strdup(h);
+    if (!a->host[a->nhost]) return -1;
+    a->host_http[a->nhost] = 0;
+    a->host_always[a->nhost] = 0;
+    return a->nhost++;
+}
+
+/* The sidecar (RTXI v1): text lines, the project root first, an FNV-1a 64
+ * trailer over every byte before it. Anything else is ignored whole. */
+static void img_allow_load(ImgAllow *a) {
+    char path[RTX_IMG_PATH];
+    FILE *fp;
+    char *buf = NULL;
+    long len;
+    size_t got;
+    char *line, *nl, *tr;
+    a->loaded = 1;
+    if (!img_leaf_path(a->root, path, sizeof path)) return;
+    fp = fopen(path, "rb");
+    if (!fp) return;
+    if (fseek(fp, 0, SEEK_END) != 0 || (len = ftell(fp)) <= 0 || len > (1 << 20) ||
+        fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return;
+    }
+    buf = (char *)malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(fp);
+        return;
+    }
+    got = fread(buf, 1, (size_t)len, fp);
+    fclose(fp);
+    buf[got] = 0;
+    tr = strstr(buf, "\nfnv ");
+    if (!tr || strncmp(buf, "RTXI 1\n", 7) != 0) {
+        free(buf);
+        return;
+    }
+    {
+        unsigned long long want = strtoull(tr + 5, NULL, 16);
+        if (img_fnv(buf, (size_t)(tr + 1 - buf)) != (uint64_t)want) {
+            free(buf);
+            return;
+        }
+    }
+    tr[1] = 0;
+    line = buf + 7;
+    {
+        size_t rn = strlen(a->root);
+        if (strncmp(line, "root ", 5) != 0 || strncmp(line + 5, a->root, rn) != 0 ||
+            line[5 + rn] != '\n') {
+            free(buf);
+            return;
+        }
+    }
+    for (; line && *line; line = nl ? nl + 1 : NULL) {
+        nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (strncmp(line, "file ", 5) == 0) img_push(a->file, &a->nfile, line + 5);
+        else if (strncmp(line, "dir ", 4) == 0) img_push(a->dir, &a->ndir, line + 4);
+        else if (strcmp(line, "all-local") == 0) a->all_local = 1;
+        else if (strcmp(line, "all-remote") == 0) a->all_remote = 1;
+        else if (strncmp(line, "host ", 5) == 0) {
+            int k = img_host_idx(a, line + 5);
+            if (k >= 0) a->host_always[k] = 1;
+        } else if (strncmp(line, "http ", 5) == 0) {
+            int k = img_host_idx(a, line + 5);
+            if (k >= 0) a->host_http[k] = 1;
+        }
+    }
+    free(buf);
+}
+
+static int img_allow_save(const ImgAllow *a) {
+    char path[RTX_IMG_PATH], tmp[RTX_IMG_PATH + 8];
+    char *buf;
+    size_t cap = 64 + strlen(a->root), n = 0;
+    int i;
+    FILE *fp;
+    if (!img_leaf_path(a->root, path, sizeof path)) return 0;
+    if (!a->nfile && !a->ndir && !a->nhost && !a->all_local && !a->all_remote) {
+        (void)unlink(path);
+        return 1;
+    }
+    for (i = 0; i < a->nfile; i++) cap += strlen(a->file[i]) + 8;
+    for (i = 0; i < a->ndir; i++) cap += strlen(a->dir[i]) + 8;
+    for (i = 0; i < a->nhost; i++) cap += 2 * strlen(a->host[i]) + 16;
+    cap += 64;
+    buf = (char *)malloc(cap);
+    if (!buf) return 0;
+    n += (size_t)snprintf(buf + n, cap - n, "RTXI 1\nroot %s\n", a->root);
+    for (i = 0; i < a->nfile; i++) n += (size_t)snprintf(buf + n, cap - n, "file %s\n", a->file[i]);
+    for (i = 0; i < a->ndir; i++) n += (size_t)snprintf(buf + n, cap - n, "dir %s\n", a->dir[i]);
+    if (a->all_local) n += (size_t)snprintf(buf + n, cap - n, "all-local\n");
+    if (a->all_remote) n += (size_t)snprintf(buf + n, cap - n, "all-remote\n");
+    for (i = 0; i < a->nhost; i++) {
+        if (a->host_always[i]) n += (size_t)snprintf(buf + n, cap - n, "host %s\n", a->host[i]);
+        if (a->host_http[i]) n += (size_t)snprintf(buf + n, cap - n, "http %s\n", a->host[i]);
+    }
+    n += (size_t)snprintf(buf + n, cap - n, "fnv %016llx\n",
+                          (unsigned long long)img_fnv(buf, n));
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    fp = fopen(tmp, "wb");
+    if (!fp) {
+        free(buf);
+        return 0;
+    }
+    if (fwrite(buf, 1, n, fp) != n || fflush(fp) != 0) {
+        fclose(fp);
+        free(buf);
+        (void)unlink(tmp);
+        return 0;
+    }
+    (void)fsync(fileno(fp));
+    fclose(fp);
+    free(buf);
+    return rename(tmp, path) == 0;
+}
+
+static ImgAllow *img_allow_for(const char *root) {
+    int i;
+    ImgAllow *a;
+    for (i = 0; i < g_nallow; i++)
+        if (strcmp(g_allow[i]->root, root) == 0) return g_allow[i];
+    if (g_nallow >= IMG_PROJ_MAX) {
+        /* Evict the oldest project (it reloads from disk when asked). */
+        img_allow_clear(g_allow[0]);
+        free(g_allow[0]);
+        memmove(g_allow, g_allow + 1, sizeof(g_allow[0]) * (IMG_PROJ_MAX - 1));
+        g_nallow--;
+    }
+    a = (ImgAllow *)calloc(1, sizeof *a);
+    if (!a) return NULL;
+    snprintf(a->root, sizeof a->root, "%s", root);
+    img_allow_load(a);
+    g_allow[g_nallow++] = a;
+    return a;
+}
+
+void rtx_img_policy_reload(void) {
+    int i;
+    for (i = 0; i < g_nallow; i++) {
+        img_allow_clear(g_allow[i]);
+        free(g_allow[i]);
+    }
+    g_nallow = 0;
+    for (i = 0; i < g_nonce; i++) free(g_once[i]);
+    g_nonce = 0;
+    g_root_dir[0] = 0;
+    g_policy_gen++;
+}
+
+static void img_dirname(const char *path, char *out, size_t n) {
+    const char *sl = strrchr(path, '/');
+    if (!sl) {
+        snprintf(out, n, ".");
+        return;
+    }
+    if (sl == path) {
+        snprintf(out, n, "/");
+        return;
+    }
+    snprintf(out, n, "%.*s", (int)(sl - path), path);
+}
+
+int rtx_img_project_of(const char *doc_path, char *out, size_t n) {
+    char dir[RTX_IMG_PATH], real[PATH_MAX];
+    if (!out || n < 2) return 0;
+    out[0] = 0;
+    if (!doc_path || !doc_path[0]) return 0;
+    img_dirname(doc_path, dir, sizeof dir);
+    if (g_root_dir[0] && strcmp(g_root_dir, dir) == 0) {
+        snprintf(out, n, "%s", g_root_val);
+        return 1;
+    }
+    if (!realpath(dir, real)) return 0;
+    if (!rtx_project_root(out, n, real)) snprintf(out, n, "%s", real);
+    snprintf(g_root_dir, sizeof g_root_dir, "%s", dir);
+    snprintf(g_root_val, sizeof g_root_val, "%s", out);
+    return 1;
+}
+
+static int img_under(const char *path, const char *dir) {
+    size_t dn = strlen(dir);
+    if (dn == 1 && dir[0] == '/') return path[0] == '/';
+    return strncmp(path, dir, dn) == 0 && (path[dn] == '/' || path[dn] == 0);
+}
+
+static int img_hexv(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Percent-decode and drop backslash escapes into out. 0: too long / NUL. */
+static int img_unescape(const char *s, size_t n, char *out, size_t cap) {
+    size_t i, k = 0;
+    for (i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '%' && i + 2 < n + 0 && img_hexv(s[i + 1]) >= 0 && img_hexv(s[i + 2]) >= 0) {
+            c = (char)(img_hexv(s[i + 1]) * 16 + img_hexv(s[i + 2]));
+            i += 2;
+        } else if (c == '\\' && i + 1 < n) {
+            c = s[++i];
+        }
+        if (!c || k + 1 >= cap) return 0;
+        out[k++] = c;
+    }
+    out[k] = 0;
+    return 1;
+}
+
+static int img_starts_ci(const char *s, size_t n, const char *p) {
+    size_t i, m = strlen(p);
+    if (n < m) return 0;
+    for (i = 0; i < m; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != p[i]) return 0;
+    }
+    return 1;
+}
+
+static int img_once_has(const char *url) {
+    int i;
+    for (i = 0; i < g_nonce; i++)
+        if (strcmp(g_once[i], url) == 0) return 1;
+    return 0;
+}
+
+static int img_resolve_raw(const char *doc_path, const char *src, size_t n, RtxImgSrc *out) {
+    char path[RTX_IMG_PATH], dir[RTX_IMG_PATH], real[PATH_MAX], root[RTX_IMG_PATH];
+    ImgAllow *a;
+    if (!out) return RTX_IMG_ESRC;
+    memset(out, 0, sizeof *out);
+    out->err = RTX_IMG_ESRC;
+    if (!src || !n) return out->err;
+    while (n && (src[0] == ' ' || src[0] == '\t')) {
+        src++;
+        n--;
+    }
+    while (n && (src[n - 1] == ' ' || src[n - 1] == '\t')) n--;
+    if (!n) return out->err;
+    if (img_starts_ci(src, n, "data:")) {
+        out->kind = RTX_IMG_SRC_DATA;
+        out->data = src;
+        out->data_n = n;
+        snprintf(out->key, sizeof out->key, "data:%016llx:%zu",
+                 (unsigned long long)img_fnv(src, n), n);
+        out->err = n > rtx_img_limits()->data_max * 4 / 3 + 256 ? RTX_IMG_EDATA : RTX_IMG_OK;
+        return out->err;
+    }
+    if (img_starts_ci(src, n, "http://") || img_starts_ci(src, n, "https://")) {
+        size_t hs = img_starts_ci(src, n, "https://") ? 8 : 7, he = hs;
+        out->kind = RTX_IMG_SRC_REMOTE;
+        out->http = hs == 7;
+        if (n >= sizeof out->key) return out->err = RTX_IMG_ESRC;
+        memcpy(out->key, src, n);
+        out->key[n] = 0;
+        while (he < n && src[he] != '/' && src[he] != ':' && src[he] != '?' && src[he] != '#')
+            he++;
+        {
+            size_t hn = he - hs, k;
+            if (!hn || hn >= sizeof out->host) return out->err = RTX_IMG_ESRC;
+            /* The userinfo@ form is not a host we name in a dialog. */
+            for (k = hs; k < he; k++)
+                if (src[k] == '@') return out->err = RTX_IMG_ESRC;
+            for (k = 0; k < hn; k++) {
+                char c = src[hs + k];
+                if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+                out->host[k] = c;
+            }
+            out->host[hn] = 0;
+        }
+        out->err = RTX_IMG_EREMOTE;
+        if (img_once_has(out->key)) {
+            out->once = 1;
+            out->err = RTX_IMG_OK;
+        } else if (doc_path && rtx_img_project_of(doc_path, root, sizeof root)) {
+            a = img_allow_for(root);
+            if (a) {
+                int i;
+                for (i = 0; i < a->nhost; i++) {
+                    if (strcmp(a->host[i], out->host) != 0) continue;
+                    if (a->host_always[i] && (!out->http || a->host_http[i]))
+                        out->err = RTX_IMG_OK;
+                }
+                if (a->all_remote && out->err != RTX_IMG_OK) {
+                    int http_ok = !out->http;
+                    for (i = 0; i < a->nhost && !http_ok; i++)
+                        if (strcmp(a->host[i], out->host) == 0 && a->host_http[i]) http_ok = 1;
+                    if (http_ok) out->err = RTX_IMG_OK;
+                }
+            }
+        }
+        return out->err;
+    }
+    out->kind = RTX_IMG_SRC_LOCAL;
+    if (img_starts_ci(src, n, "file://")) {
+        src += 7;
+        n -= 7;
+        if (!n || src[0] != '/') return out->err = RTX_IMG_ESRC;
+    }
+    if (!img_unescape(src, n, path, sizeof path)) return out->err = RTX_IMG_ESRC;
+    if (path[0] != '/') {
+        char joined[RTX_IMG_PATH + 8];
+        if (!doc_path || !doc_path[0]) return out->err = RTX_IMG_ESRC;
+        img_dirname(doc_path, dir, sizeof dir);
+        if (snprintf(joined, sizeof joined, "%s/%s", dir, path) >= (int)sizeof path)
+            return out->err = RTX_IMG_ESRC;
+        snprintf(path, sizeof path, "%s", joined);
+    }
+    if (!realpath(path, real)) {
+        snprintf(out->key, sizeof out->key, "%s", path);
+        return out->err = RTX_IMG_EIO;
+    }
+    snprintf(out->key, sizeof out->key, "%s", real);
+    if (!doc_path || !rtx_img_project_of(doc_path, root, sizeof root)) {
+        /* Untitled: an absolute path needs an allowance like any outside
+         * file, and there is no project to keep one: ask every time. */
+        return out->err = RTX_IMG_EDENIED;
+    }
+    if (img_under(real, root)) return out->err = RTX_IMG_OK;
+    a = img_allow_for(root);
+    out->err = RTX_IMG_EDENIED;
+    if (a) {
+        int i;
+        if (a->all_local) out->err = RTX_IMG_OK;
+        for (i = 0; i < a->nfile && out->err; i++)
+            if (strcmp(a->file[i], real) == 0) out->err = RTX_IMG_OK;
+        for (i = 0; i < a->ndir && out->err; i++)
+            if (img_under(real, a->dir[i])) out->err = RTX_IMG_OK;
+    }
+    return out->err;
+}
+
+/* Resolutions are asked for every frame a stand-in paints: a small memo
+ * (500 ms, cleared by any policy change) keeps realpath off the paint
+ * path. data: URIs are not kept (their bytes are the caller's). */
+#define IMG_MEMO 64
+typedef struct {
+    uint64_t h;
+    unsigned gen;
+    long t;
+    char *doc;
+    char *src;
+    size_t n;
+    RtxImgSrc out;
+} ImgMemo;
+static ImgMemo g_memo[IMG_MEMO];
+
+static long img_now_ms(void);
+
+int rtx_img_resolve(const char *doc_path, const char *src, size_t n, RtxImgSrc *out) {
+    uint64_t h;
+    ImgMemo *m;
+    long now;
+    int rc;
+    if (!out) return RTX_IMG_ESRC;
+    if (!src || !n || n > 2048 || (n >= 5 && img_starts_ci(src, n, "data:")))
+        return img_resolve_raw(doc_path, src, n, out);
+    h = img_fnv(src, n) ^ (doc_path ? img_fnv(doc_path, strlen(doc_path)) * 31 : 7);
+    m = &g_memo[h % IMG_MEMO];
+    now = img_now_ms();
+    if (m->src && m->h == h && m->gen == g_policy_gen && now - m->t < 500 && m->n == n &&
+        memcmp(m->src, src, n) == 0 &&
+        ((!doc_path && !m->doc) || (doc_path && m->doc && strcmp(doc_path, m->doc) == 0))) {
+        *out = m->out;
+        return out->err;
+    }
+    rc = img_resolve_raw(doc_path, src, n, out);
+    free(m->doc);
+    free(m->src);
+    m->doc = doc_path ? strdup(doc_path) : NULL;
+    m->src = (char *)malloc(n);
+    if (m->src) memcpy(m->src, src, n);
+    m->n = n;
+    m->h = h;
+    m->gen = g_policy_gen;
+    m->t = now;
+    m->out = *out;
+    return rc;
+}
+
+size_t rtx_img_standin(const RtxImgView *v, const char *alt, size_t altn, char *out,
+                       size_t cap) {
+    char tail[96], why[96];
+    size_t tn, k = 0, room, i;
+    if (!out || cap < 16) return 0;
+    tail[0] = 0;
+    if (v && v->have_info && v->state != RTX_IMG_S_ERR && v->state != RTX_IMG_S_ASK) {
+        snprintf(tail, sizeof tail, " %ux%u", (unsigned)v->info.w, (unsigned)v->info.h);
+    } else if (v && v->state == RTX_IMG_S_ASK && v->src.kind == RTX_IMG_SRC_REMOTE) {
+        snprintf(tail, sizeof tail, " - %s", v->src.host);
+    } else if (v && v->state == RTX_IMG_S_ASK) {
+        snprintf(tail, sizeof tail, " - outside project");
+    } else if (v && v->state == RTX_IMG_S_ERR) {
+        rtx_img_err_text(v->err, why, sizeof why);
+        snprintf(tail, sizeof tail, " - %s", why);
+    }
+    tn = strlen(tail);
+    k = (size_t)snprintf(out, cap, "[image:");
+    /* Room for " alt": what is left after the tail, ']' and the NUL (the
+     * tail is cut first when even it does not fit). */
+    if (k + tn + 2 > cap) tn = cap > k + 2 ? cap - k - 2 : 0;
+    room = cap - k - tn - 2;
+    if (alt && altn && room > 4) {
+        size_t take = altn;
+        out[k++] = ' ';
+        room--;
+        if (take > room) {
+            /* Cut on a UTF-8 boundary, mark with "..". */
+            take = room > 2 ? room - 2 : 0;
+            while (take && ((unsigned char)alt[take] & 0xC0) == 0x80) take--;
+        }
+        for (i = 0; i < take; i++) {
+            char c = alt[i];
+            out[k++] = (c == '\n' || c == '\t' || c == '\r') ? ' ' : c;
+        }
+        if (take < altn) {
+            out[k++] = '.';
+            out[k++] = '.';
+        }
+    }
+    if (k + tn + 2 > cap) tn = cap > k + 2 ? cap - k - 2 : 0;
+    memcpy(out + k, tail, tn);
+    k += tn;
+    out[k++] = ']';
+    out[k] = 0;
+    return k;
+}
+
+int rtx_img_src_file(const char *path, RtxImgSrc *out) {
+    char real[PATH_MAX];
+    if (!out) return RTX_IMG_ESRC;
+    memset(out, 0, sizeof *out);
+    out->kind = RTX_IMG_SRC_LOCAL;
+    if (!path || !path[0]) return out->err = RTX_IMG_ESRC;
+    if (!realpath(path, real)) {
+        snprintf(out->key, sizeof out->key, "%s", path);
+        return out->err = RTX_IMG_EIO;
+    }
+    snprintf(out->key, sizeof out->key, "%s", real);
+    return out->err = RTX_IMG_OK;
+}
+
+static void img_forget_key(const char *key);
+
+int rtx_img_allow(const char *doc_path, const RtxImgSrc *s, int what) {
+    char root[RTX_IMG_PATH], dir[RTX_IMG_PATH];
+    ImgAllow *a;
+    int k;
+    if (!s) return 0;
+    if (what == RTX_IMG_ALLOW_ONCE) {
+        if (s->kind != RTX_IMG_SRC_REMOTE || img_once_has(s->key)) return 1;
+        if (g_nonce >= IMG_ALLOW_MAX) {
+            free(g_once[0]);
+            memmove(g_once, g_once + 1, sizeof(g_once[0]) * (IMG_ALLOW_MAX - 1));
+            g_nonce--;
+        }
+        g_once[g_nonce] = strdup(s->key);
+        if (g_once[g_nonce]) g_nonce++;
+        img_forget_key(s->key);
+        g_policy_gen++;
+        return 1;
+    }
+    if (!doc_path || !rtx_img_project_of(doc_path, root, sizeof root)) return 0;
+    a = img_allow_for(root);
+    if (!a) return 0;
+    switch (what) {
+    case RTX_IMG_ALLOW_FILE:
+        if (s->kind != RTX_IMG_SRC_LOCAL || !s->key[0]) return 0;
+        img_push(a->file, &a->nfile, s->key);
+        break;
+    case RTX_IMG_ALLOW_DIR:
+        if (s->kind != RTX_IMG_SRC_LOCAL || !s->key[0]) return 0;
+        img_dirname(s->key, dir, sizeof dir);
+        img_push(a->dir, &a->ndir, dir);
+        break;
+    case RTX_IMG_ALLOW_ALL_LOCAL: a->all_local = 1; break;
+    case RTX_IMG_ALLOW_HOST:
+        if (s->kind != RTX_IMG_SRC_REMOTE) return 0;
+        k = img_host_idx(a, s->host);
+        if (k < 0) return 0;
+        a->host_always[k] = 1;
+        if (s->http) a->host_http[k] = 1;
+        break;
+    case RTX_IMG_ALLOW_ALL_REMOTE:
+        a->all_remote = 1;
+        if (s->kind == RTX_IMG_SRC_REMOTE && s->http) {
+            k = img_host_idx(a, s->host);
+            if (k >= 0) a->host_http[k] = 1;
+        }
+        break;
+    default: return 0;
+    }
+    img_forget_key(s->key);
+    g_policy_gen++;
+    return img_allow_save(a);
+}
+
+static void img_forget_all(void);
+
+int rtx_img_revoke(const char *doc_path) {
+    char root[RTX_IMG_PATH];
+    int n = 0, i;
+    if (doc_path && rtx_img_project_of(doc_path, root, sizeof root)) {
+        ImgAllow *a = img_allow_for(root);
+        if (a) {
+            n += a->nfile + a->ndir + a->nhost + a->all_local + a->all_remote;
+            img_allow_clear(a);
+            img_allow_save(a);
+        }
+    } else {
+        for (i = 0; i < g_nallow; i++) {
+            n += g_allow[i]->nfile + g_allow[i]->ndir + g_allow[i]->nhost +
+                 g_allow[i]->all_local + g_allow[i]->all_remote;
+            img_allow_clear(g_allow[i]);
+            img_allow_save(g_allow[i]);
+        }
+    }
+    n += g_nonce;
+    for (i = 0; i < g_nonce; i++) free(g_once[i]);
+    g_nonce = 0;
+    img_forget_all();
+    g_policy_gen++;
+    return n;
+}
+
+/* ---- data: URIs --------------------------------------------------------- */
+
+static int img_b64v(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+
+/* Payload of a data: URI (malloc'd). RTX_IMG_EDATA when malformed or
+ * over the limit. */
+static int img_data_decode(const char *s, size_t n, uint64_t max, uint8_t **out,
+                           size_t *out_n) {
+    size_t comma = 0, i, k = 0;
+    int b64 = 0;
+    uint8_t *buf;
+    *out = NULL;
+    *out_n = 0;
+    while (comma < n && s[comma] != ',') comma++;
+    if (comma >= n) return RTX_IMG_EDATA;
+    for (i = 5; i + 7 <= comma; i++)
+        if (img_starts_ci(s + i, comma - i, ";base64")) b64 = 1;
+    buf = (uint8_t *)malloc(n - comma + 4);
+    if (!buf) return RTX_IMG_ENOMEM;
+    if (b64) {
+        uint32_t acc = 0;
+        int bits = 0;
+        for (i = comma + 1; i < n; i++) {
+            unsigned char c = (unsigned char)s[i];
+            int v;
+            if (c == '=' || c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+            if (c == '%' && i + 2 < n && s[i + 1] == '3' && (s[i + 2] == 'D' || s[i + 2] == 'd')) {
+                i += 2;
+                continue;
+            }
+            v = img_b64v(c);
+            if (v < 0) {
+                free(buf);
+                return RTX_IMG_EDATA;
+            }
+            acc = (acc << 6) | (uint32_t)v;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                buf[k++] = (uint8_t)(acc >> bits);
+            }
+        }
+    } else {
+        for (i = comma + 1; i < n; i++) {
+            char c = s[i];
+            if (c == '%' && i + 2 < n && img_hexv(s[i + 1]) >= 0 && img_hexv(s[i + 2]) >= 0) {
+                c = (char)(img_hexv(s[i + 1]) * 16 + img_hexv(s[i + 2]));
+                i += 2;
+            }
+            buf[k++] = (uint8_t)c;
+        }
+    }
+    if (!k || (uint64_t)k > max) {
+        free(buf);
+        return RTX_IMG_EDATA;
+    }
+    *out = buf;
+    *out_n = k;
+    return RTX_IMG_OK;
+}
+
+/* ---- cache ------------------------------------------------------------- */
+
+enum {
+    IMG_H_NONE = 0,    /* not probed */
+    IMG_H_QUEUED,
+    IMG_H_RUN,
+    IMG_H_OK,
+    IMG_H_ERR
+};
+
+enum {
+    IMG_B_NONE = 0,
+    IMG_B_QUEUED,
+    IMG_B_RUN,
+    IMG_B_OK,
+    IMG_B_ERR
+};
+
+typedef struct ImgEnt ImgEnt;
+
+struct RtxImgBmpEnt {
+    ImgEnt *ent;
+    RtxImgBmpEnt *next;
+    uint32_t w, h;         /* the size asked for (fitted) */
+    int state;
+    int err;
+    RtxImgBmp bmp;
+    uint64_t used;         /* frame epoch last wanted */
+    uint64_t queued_at;
+    long t0_ms;            /* animation clock */
+    void **plat;           /* per frame */
+    void (*plat_free)(void *);
+    int cancel;            /* read by the job */
+};
+
+struct ImgEnt {
+    ImgEnt *hnext;
+    char *key;
+    uint64_t kh;
+    int kind;
+    char *path;            /* local file, or the fetch cache file */
+    uint8_t *data;         /* data: payload */
+    size_t data_n;
+    int hstate;
+    int herr;
+    RtxImgInfo info;
+    int64_t mtime;
+    uint64_t size;
+    long checked_ms;
+    RtxImgBmpEnt *bmps;
+    int jobs;              /* jobs holding path / data */
+    uint32_t want_w, want_h; /* pixels asked for before the header was known */
+    uint64_t want_epoch;
+    /* remote */
+    int fstate;            /* 0 none, 1 running, 2 cached, 3 failed */
+    int ferr;
+    RtxImgNet *net;
+    int http;
+    char tmp[RTX_IMG_PATH];
+};
+
+#define IMG_HASH 1024
+/* Whole paint passes a bitmap may go unpainted before it is dropped even
+ * under the budget (off screen, like far highlight runs). */
+#define IMG_FAR_PASSES 600
+static ImgEnt *g_ents[IMG_HASH];
+static size_t g_nent;
+static uint64_t g_epoch = 1;
+static uint64_t g_held;
+static size_t g_nbmp;
+static int g_changed;        /* pixels / states changed: repaint */
+static int g_layout_changed; /* a header arrived: refill */
+static unsigned g_img_gen;
+static size_t g_nfetch;
+
+typedef struct {
+    int kind;              /* 1 probe, 2 decode */
+    ImgEnt *ent;
+    RtxImgBmpEnt *be;
+    char path[RTX_IMG_PATH];
+    const uint8_t *data;
+    size_t data_n;
+    RtxImgLimits lim;
+    uint32_t w, h;
+    uint32_t frames;
+    _Atomic int cancel;
+    int rc;
+    RtxImgInfo info;
+    RtxImgBmp out;
+    int64_t mtime;
+    uint64_t size;
+    _Atomic int done;
+} ImgJob;
+
+typedef struct {
+    CCParallel h;
+    ImgJob job;
+    int busy;
+} ImgLane;
+
+static ImgLane g_lane[2];    /* 0: headers, 1: pixels */
+
+static long img_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static ImgEnt *img_ent_find(const char *key, uint64_t kh) {
+    ImgEnt *e;
+    for (e = g_ents[kh % IMG_HASH]; e; e = e->hnext)
+        if (e->kh == kh && strcmp(e->key, key) == 0) return e;
+    return NULL;
+}
+
+static void img_bmp_drop(RtxImgBmpEnt *be) {
+    uint32_t f;
+    if (!be) return;
+    if (be->plat) {
+        for (f = 0; f < (be->bmp.nframe ? be->bmp.nframe : 1); f++)
+            if (be->plat[f] && be->plat_free) be->plat_free(be->plat[f]);
+        free(be->plat);
+        be->plat = NULL;
+    }
+    if (be->state == IMG_B_OK) {
+        g_held -= be->bmp.bytes;
+        g_nbmp--;
+    }
+    rtx_img_bmp_free(&be->bmp);
+    be->state = IMG_B_NONE;
+}
+
+/* Drop an entry's bitmaps and header (not the entry: a job may hold it). */
+static void img_ent_reset(ImgEnt *e) {
+    RtxImgBmpEnt *be, *nx;
+    for (be = e->bmps; be; be = nx) {
+        nx = be->next;
+        if (be->state == IMG_B_RUN) {
+            /* The job owns it until adopted: cancel, leave it listed. */
+            be->cancel = 1;
+            continue;
+        }
+        img_bmp_drop(be);
+    }
+    {
+        RtxImgBmpEnt **pp = &e->bmps;
+        while (*pp) {
+            if ((*pp)->state != IMG_B_RUN) {
+                RtxImgBmpEnt *d = *pp;
+                *pp = d->next;
+                free(d);
+            } else {
+                pp = &(*pp)->next;
+            }
+        }
+    }
+    if (e->hstate != IMG_H_RUN) e->hstate = IMG_H_NONE;
+    e->herr = 0;
+    e->checked_ms = 0;
+    g_changed = 1;
+    g_layout_changed = 1;
+}
+
+static void img_forget_key(const char *key) {
+    ImgEnt *e = img_ent_find(key, img_fnv(key, strlen(key)));
+    if (e) {
+        img_ent_reset(e);
+        if (e->kind == RTX_IMG_SRC_REMOTE && e->fstate == 3) e->fstate = 0;
+    }
+}
+
+static void img_forget_all(void) {
+    size_t i;
+    ImgEnt *e;
+    for (i = 0; i < IMG_HASH; i++)
+        for (e = g_ents[i]; e; e = e->hnext) {
+            img_ent_reset(e);
+            if (e->kind == RTX_IMG_SRC_REMOTE && e->net) {
+                rtx_img_net_free(e->net);
+                e->net = NULL;
+            }
+            if (e->kind == RTX_IMG_SRC_REMOTE) e->fstate = 0;
+        }
+}
+
+/* The fetch cache directory (<safe>/img/cache); 0 when there is none. */
+static int img_cache_dir(char *out, size_t n) {
+    char dir[RTX_IMG_PATH];
+    if (!rtx_safe_dir(dir, sizeof dir)) return 0;
+    snprintf(out, n, "%s/img", dir);
+    (void)mkdir(out, 0700);
+    snprintf(out, n, "%s/img/cache", dir);
+    (void)mkdir(out, 0700);
+    return 1;
+}
+
+static void img_cache_file(const char *url, const char *ext, char *out, size_t n) {
+    char dir[RTX_IMG_PATH];
+    if (!img_cache_dir(dir, sizeof dir)) {
+        out[0] = 0;
+        return;
+    }
+    snprintf(out, n, "%s/%016llx%s", dir, (unsigned long long)img_fnv(url, strlen(url)), ext);
+}
+
+static ImgEnt *img_ent_get(const RtxImgSrc *s) {
+    uint64_t kh = img_fnv(s->key, strlen(s->key));
+    ImgEnt *e = img_ent_find(s->key, kh);
+    if (e) return e;
+    e = (ImgEnt *)calloc(1, sizeof *e);
+    if (!e) return NULL;
+    e->key = strdup(s->key);
+    if (!e->key) {
+        free(e);
+        return NULL;
+    }
+    e->kh = kh;
+    e->kind = s->kind;
+    e->http = s->http;
+    if (s->kind == RTX_IMG_SRC_LOCAL) {
+        e->path = strdup(s->key);
+    } else if (s->kind == RTX_IMG_SRC_DATA) {
+        int rc = img_data_decode(s->data, s->data_n, rtx_img_limits()->data_max, &e->data,
+                                 &e->data_n);
+        if (rc != RTX_IMG_OK) {
+            e->hstate = IMG_H_ERR;
+            e->herr = rc;
+        }
+    } else if (s->kind == RTX_IMG_SRC_REMOTE) {
+        char cf[RTX_IMG_PATH];
+        struct stat st;
+        img_cache_file(s->key, ".img", cf, sizeof cf);
+        if (cf[0]) {
+            e->path = strdup(cf);
+            if (stat(cf, &st) == 0 && st.st_size > 0) e->fstate = 2;
+        }
+    }
+    e->hnext = g_ents[kh % IMG_HASH];
+    g_ents[kh % IMG_HASH] = e;
+    g_nent++;
+    return e;
+}
+
+/* ---- jobs ------------------------------------------------------------- */
+
+/* Read a file whole (≤ cap) or its first `prefix` bytes (prefix > 0). */
+static int img_read_file(const char *path, uint64_t cap, size_t prefix, uint8_t **out,
+                         size_t *out_n, int *closed, int64_t *mtime, uint64_t *size) {
+    int fd;
+    struct stat st;
+    size_t want, got = 0;
+    uint8_t *buf;
+    *out = NULL;
+    *out_n = 0;
+    *closed = 1;
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return RTX_IMG_EIO;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return RTX_IMG_EIO;
+    }
+#if defined(__APPLE__)
+    *mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec;
+#else
+    *mtime = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+#endif
+    *size = (uint64_t)st.st_size;
+    if ((uint64_t)st.st_size > cap) {
+        close(fd);
+        return RTX_IMG_EFILE;
+    }
+    want = (size_t)st.st_size;
+    if (prefix && want > prefix) {
+        want = prefix;
+        *closed = 0;
+    }
+    buf = (uint8_t *)malloc(want ? want : 1);
+    if (!buf) {
+        close(fd);
+        return RTX_IMG_ENOMEM;
+    }
+    while (got < want) {
+        ssize_t r = read(fd, buf + got, want - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    if (got < want) *closed = 1;
+    *out = buf;
+    *out_n = got;
+    return RTX_IMG_OK;
+}
+
+static void img_job_run(ImgJob *j) {
+    uint8_t *buf = NULL;
+    size_t n = 0;
+    int closed = 1;
+    const uint8_t *b;
+    if (j->kind == 1) {
+        /* Header: 64 KiB, then 1 MiB, then the whole file (bounded by
+         * the file limit): EXIF and JPEG tables sit before the frame. */
+        size_t steps[3] = {64u << 10, 1u << 20, 0};
+        int s;
+        j->rc = RTX_IMG_EIO;
+        for (s = 0; s < 3; s++) {
+            if (j->data) {
+                b = j->data;
+                n = j->data_n;
+                closed = 1;
+            } else {
+                free(buf);
+                buf = NULL;
+                j->rc = img_read_file(j->path, j->lim.file_max, steps[s], &buf, &n, &closed,
+                                      &j->mtime, &j->size);
+                if (j->rc != RTX_IMG_OK) break;
+                b = buf;
+            }
+            j->rc = rtx_img_probe(b, n, closed, &j->lim, &j->info);
+            if (j->rc != RTX_IMG_MORE || closed) break;
+        }
+        if (j->rc == RTX_IMG_MORE) j->rc = RTX_IMG_ETRUNC;
+        free(buf);
+    } else {
+        if (j->data) {
+            b = j->data;
+            n = j->data_n;
+            j->rc = RTX_IMG_OK;
+        } else {
+            j->rc = img_read_file(j->path, j->lim.file_max, 0, &buf, &n, &closed, &j->mtime,
+                                  &j->size);
+            b = buf;
+        }
+        if (j->rc == RTX_IMG_OK)
+            j->rc = rtx_img_decode(b, n, &j->lim, j->w, j->h, RTX_IMG_PIX_BGRA_PREMUL,
+                                   j->frames, &j->cancel, &j->out, &j->info);
+        free(buf);
+    }
+    atomic_store_explicit(&j->done, 1, memory_order_release);
+}
+
+static void !>(CCError) img_lane_kick(ImgLane *L) {
+    int noop = 0;
+    ImgJob *scan = &L->job;
+    atomic_store_explicit(&L->job.done, 0, memory_order_release);
+    L->busy = 1;
+    if (rtx_parallel_inline()) {
+        img_job_run(scan);
+        return cc_ok();
+    }
+    L->h = @parallel {
+        @serial { noop = 0; }
+        img_job_run(scan);
+    } !>;
+    return cc_ok();
+}
+
+static void img_lane_join(ImgLane *L) {
+    if (!L->h.live()) return;
+    if (L->h.paused()) L->h.resume() !>(e) { (void)e; };
+    L->h.wait() !>(e) { (void)e; };
+}
+
+static void img_evict(uint64_t need, const RtxImgBmpEnt *keep);
+static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, RtxImgBmpEnt **anyp);
+
+static void img_adopt(ImgLane *L) {
+    ImgJob *j = &L->job;
+    ImgEnt *e = j->ent;
+    img_lane_join(L);
+    L->busy = 0;
+    if (e) e->jobs--;
+    if (j->kind == 1) {
+        if (e->hstate == IMG_H_RUN) {
+            e->hstate = j->rc == RTX_IMG_OK ? IMG_H_OK : IMG_H_ERR;
+            e->herr = j->rc;
+            e->info = j->info;
+            e->mtime = j->mtime;
+            e->size = j->size;
+            e->checked_ms = img_now_ms();
+            g_layout_changed = 1;
+            g_changed = 1;
+            if (j->rc == RTX_IMG_OK && e->want_epoch && e->want_epoch + 1 >= g_epoch)
+                (void)img_bmp_for(e, e->want_w, e->want_h, NULL);
+            e->want_epoch = 0;
+        }
+    } else {
+        RtxImgBmpEnt *be = j->be;
+        if (be->cancel || be->state != IMG_B_RUN) {
+            rtx_img_bmp_free(&j->out);
+            if (be->state == IMG_B_RUN) be->state = IMG_B_NONE;
+            be->cancel = 0;
+        } else if (j->rc == RTX_IMG_OK) {
+            img_evict(j->out.bytes, be);
+            be->bmp = j->out;
+            be->state = IMG_B_OK;
+            be->t0_ms = img_now_ms();
+            g_held += be->bmp.bytes;
+            g_nbmp++;
+            if (e->hstate != IMG_H_OK) {
+                e->hstate = IMG_H_OK;
+                e->info = j->info;
+                g_layout_changed = 1;
+            }
+            g_changed = 1;
+        } else {
+            be->state = j->rc == RTX_IMG_ECANCEL ? IMG_B_NONE : IMG_B_ERR;
+            be->err = j->rc;
+            if (j->rc != RTX_IMG_ECANCEL && e->hstate != IMG_H_OK) {
+                e->hstate = IMG_H_ERR;
+                e->herr = j->rc;
+                g_layout_changed = 1;
+            }
+            g_changed = 1;
+        }
+        memset(&j->out, 0, sizeof j->out);
+    }
+    j->ent = NULL;
+    j->be = NULL;
+}
+
+/* Evict least-recently painted bitmaps until `need` more fits. */
+static void img_evict(uint64_t need, const RtxImgBmpEnt *keep) {
+    uint64_t budget = rtx_img_limits()->budget;
+    while (g_held + need > budget) {
+        RtxImgBmpEnt *old = NULL;
+        size_t i;
+        ImgEnt *e;
+        for (i = 0; i < IMG_HASH; i++)
+            for (e = g_ents[i]; e; e = e->hnext) {
+                RtxImgBmpEnt *be;
+                for (be = e->bmps; be; be = be->next)
+                    if (be != keep && be->state == IMG_B_OK && (!old || be->used < old->used))
+                        old = be;
+            }
+        if (!old) break;
+        img_bmp_drop(old);
+    }
+}
+
+static int img_job_source(ImgJob *j, ImgEnt *e) {
+    j->data = NULL;
+    j->data_n = 0;
+    j->path[0] = 0;
+    if (e->data) {
+        j->data = e->data;
+        j->data_n = e->data_n;
+    } else if (e->path) {
+        snprintf(j->path, sizeof j->path, "%s", e->path);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/* Start the next job on each idle lane: headers FIFO, pixels most
+ * recently wanted first. */
+static void img_schedule(void) {
+    size_t i;
+    ImgEnt *e;
+    ImgLane *L;
+    L = &g_lane[0];
+    if (!L->busy) {
+        ImgEnt *pick = NULL;
+        for (i = 0; i < IMG_HASH && !pick; i++)
+            for (e = g_ents[i]; e; e = e->hnext)
+                if (e->hstate == IMG_H_QUEUED && (!e->path || e->kind != RTX_IMG_SRC_REMOTE ||
+                                                  e->fstate == 2)) {
+                    pick = e;
+                    break;
+                }
+        if (pick && img_job_source(&L->job, pick)) {
+            L->job.kind = 1;
+            L->job.ent = pick;
+            L->job.be = NULL;
+            L->job.lim = *rtx_img_limits();
+            L->job.cancel = 0;
+            pick->hstate = IMG_H_RUN;
+            pick->jobs++;
+            img_lane_kick(L) !>(err) {
+                (void)err;
+                pick->hstate = IMG_H_ERR;
+                pick->herr = RTX_IMG_ENOMEM;
+                pick->jobs--;
+                L->busy = 0;
+            };
+        }
+    }
+    L = &g_lane[1];
+    if (!L->busy) {
+        RtxImgBmpEnt *pick = NULL;
+        for (i = 0; i < IMG_HASH; i++)
+            for (e = g_ents[i]; e; e = e->hnext) {
+                RtxImgBmpEnt *be;
+                for (be = e->bmps; be; be = be->next) {
+                    if (be->state != IMG_B_QUEUED) continue;
+                    if (!pick || be->used > pick->used ||
+                        (be->used == pick->used && be->queued_at < pick->queued_at))
+                        pick = be;
+                }
+            }
+        if (pick && img_job_source(&L->job, pick->ent)) {
+            const RtxImgLimits *lim = rtx_img_limits();
+            L->job.kind = 2;
+            L->job.ent = pick->ent;
+            L->job.be = pick;
+            L->job.lim = *lim;
+            L->job.w = pick->w;
+            L->job.h = pick->h;
+            L->job.frames = lim->anim ? lim->anim_frames : 1;
+            L->job.cancel = 0;
+            memset(&L->job.out, 0, sizeof L->job.out);
+            pick->state = IMG_B_RUN;
+            pick->cancel = 0;
+            pick->ent->jobs++;
+            img_lane_kick(L) !>(err) {
+                (void)err;
+                pick->state = IMG_B_ERR;
+                pick->err = RTX_IMG_ENOMEM;
+                pick->ent->jobs--;
+                L->busy = 0;
+            };
+        }
+    }
+}
+
+/* Remote fetch progress (UI thread; the transfer is another process). */
+static void img_fetch_poll(ImgEnt *e) {
+    int nm = 0, rc;
+    if (!e->net) return;
+    rc = rtx_img_net_poll(e->net, &nm);
+    if (rc == 0) return;
+    rtx_img_net_free(e->net);
+    e->net = NULL;
+    if (rc == 1) {
+        struct stat st;
+        if (!nm && stat(e->tmp, &st) == 0 && st.st_size > 0) {
+            if (rename(e->tmp, e->path) != 0) {
+                e->fstate = 3;
+                e->ferr = RTX_IMG_EIO;
+            } else {
+                e->fstate = 2;
+            }
+        } else {
+            (void)unlink(e->tmp);
+            e->fstate = (e->path && stat(e->path, &st) == 0 && st.st_size > 0) ? 2 : 3;
+            e->ferr = RTX_IMG_EFETCH;
+        }
+        if (e->fstate == 2) {
+            /* Keep the cache under its cap: oldest files go first. */
+            char dir[RTX_IMG_PATH];
+            if (img_cache_dir(dir, sizeof dir)) {
+                for (;;) {
+                    DIR *dp = opendir(dir);
+                    struct dirent *de;
+                    uint64_t total = 0;
+                    time_t oldest = 0;
+                    char victim[RTX_IMG_PATH + 300];
+                    victim[0] = 0;
+                    if (!dp) break;
+                    while ((de = readdir(dp))) {
+                        char p[RTX_IMG_PATH + 300];
+                        if (de->d_name[0] == '.') continue;
+                        snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
+                        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                        total += (uint64_t)st.st_size;
+                        if (strcmp(p, e->path) != 0 && (!victim[0] || st.st_mtime < oldest)) {
+                            oldest = st.st_mtime;
+                            snprintf(victim, sizeof victim, "%s", p);
+                        }
+                    }
+                    closedir(dp);
+                    if (total <= rtx_img_limits()->cache_max || !victim[0]) break;
+                    (void)unlink(victim);
+                }
+            }
+            e->hstate = IMG_H_NONE;
+        }
+    } else {
+        (void)unlink(e->tmp);
+        e->fstate = 3;
+        e->ferr = rc;
+    }
+    g_changed = 1;
+    g_layout_changed = 1;
+}
+
+void rtx_img_fetch(const RtxImgSrc *s) {
+    ImgEnt *e;
+    char err[128];
+    char etag[RTX_IMG_PATH];
+    const RtxImgLimits *lim = rtx_img_limits();
+    if (!s || s->kind != RTX_IMG_SRC_REMOTE || s->err != RTX_IMG_OK) return;
+    e = img_ent_get(s);
+    if (!e || !e->path || e->net) return;
+    if (e->fstate == 2 && !s->once) return;
+    e->http = s->http;
+    snprintf(e->tmp, sizeof e->tmp, "%s.part", e->path);
+    img_cache_file(s->key, ".etag", etag, sizeof etag);
+    e->net = rtx_img_net_start(s->key, e->tmp, etag, s->http, lim->remote_max, lim->timeout_s,
+                               err, sizeof err);
+    if (!e->net) {
+        e->fstate = 3;
+        e->ferr = RTX_IMG_EFETCH;
+    } else {
+        e->fstate = 1;
+        g_nfetch++;
+    }
+    g_changed = 1;
+}
+
+int rtx_img_file(const RtxImgSrc *s, char *out, size_t n) {
+    ImgEnt *e;
+    struct stat st;
+    if (!s || !out || n < 2) return 0;
+    out[0] = 0;
+    if (s->err != RTX_IMG_OK) return 0;
+    if (s->kind == RTX_IMG_SRC_LOCAL) {
+        snprintf(out, n, "%s", s->key);
+        return 1;
+    }
+    e = img_ent_get(s);
+    if (!e) return 0;
+    if (s->kind == RTX_IMG_SRC_REMOTE) {
+        if (e->fstate != 2 || !e->path) return 0;
+        snprintf(out, n, "%s", e->path);
+        return 1;
+    }
+    if (s->kind == RTX_IMG_SRC_DATA && e->data) {
+        char dir[RTX_IMG_PATH];
+        const char *ext;
+        FILE *fp;
+        if (!img_cache_dir(dir, sizeof dir)) return 0;
+        switch (e->hstate == IMG_H_OK ? e->info.fmt : rtx_img_sniff(e->data, e->data_n)) {
+        case RTX_IMG_FMT_PNG: ext = "png"; break;
+        case RTX_IMG_FMT_JPEG: ext = "jpg"; break;
+        case RTX_IMG_FMT_GIF: ext = "gif"; break;
+        case RTX_IMG_FMT_BMP: ext = "bmp"; break;
+        case RTX_IMG_FMT_WEBP: ext = "webp"; break;
+        case RTX_IMG_FMT_QOI: ext = "qoi"; break;
+        default: ext = "bin"; break;
+        }
+        snprintf(out, n, "%s/data-%016llx.%s", dir,
+                 (unsigned long long)img_fnv(e->data, e->data_n), ext);
+        if (stat(out, &st) == 0 && (size_t)st.st_size == e->data_n) return 1;
+        fp = fopen(out, "wb");
+        if (!fp) return 0;
+        if (fwrite(e->data, 1, e->data_n, fp) != e->data_n) {
+            fclose(fp);
+            return 0;
+        }
+        fclose(fp);
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- queries ----------------------------------------------------------- */
+
+static void img_view_fill(RtxImgView *v, const RtxImgSrc *s, ImgEnt *e) {
+    memset(v, 0, sizeof *v);
+    v->src = *s;
+    if (!e) {
+        v->state = RTX_IMG_S_ERR;
+        v->err = s->err ? s->err : RTX_IMG_ENOMEM;
+        return;
+    }
+    if (e->hstate == IMG_H_OK || ((e->herr == RTX_IMG_EDIM || e->herr == RTX_IMG_EPX ||
+                                   e->herr == RTX_IMG_EBUDGET) && e->hstate == IMG_H_ERR)) {
+        v->have_info = e->info.w > 0;
+        v->info = e->info;
+    }
+    if (e->hstate == IMG_H_ERR) {
+        v->state = RTX_IMG_S_ERR;
+        v->err = e->herr;
+    } else if (e->hstate == IMG_H_OK) {
+        v->state = RTX_IMG_S_INFO;
+    } else {
+        v->state = RTX_IMG_S_WAIT;
+    }
+}
+
+/* Local file changed on disk since probed: drop what we have. */
+static void img_ent_recheck(ImgEnt *e) {
+    long now = img_now_ms();
+    struct stat st;
+    int64_t mt;
+    if (e->kind != RTX_IMG_SRC_LOCAL || !e->path || e->hstate < IMG_H_OK) return;
+    if (e->checked_ms && now - e->checked_ms < 1000) return;
+    e->checked_ms = now;
+    if (stat(e->path, &st) != 0) {
+        if (e->hstate != IMG_H_ERR || e->herr != RTX_IMG_EIO) img_ent_reset(e);
+        return;
+    }
+#if defined(__APPLE__)
+    mt = (int64_t)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec;
+#else
+    mt = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+#endif
+    if (mt != e->mtime || (uint64_t)st.st_size != e->size) img_ent_reset(e);
+}
+
+static ImgEnt *img_ent_ready(const RtxImgSrc *src, RtxImgView *v) {
+    ImgEnt *e;
+    if (src->err != RTX_IMG_OK) {
+        memset(v, 0, sizeof *v);
+        v->src = *src;
+        v->err = src->err;
+        v->state = (src->err == RTX_IMG_EDENIED || src->err == RTX_IMG_EREMOTE)
+                       ? RTX_IMG_S_ASK
+                       : RTX_IMG_S_ERR;
+        return NULL;
+    }
+    e = img_ent_get(src);
+    if (!e) {
+        img_view_fill(v, src, NULL);
+        return NULL;
+    }
+    img_ent_recheck(e);
+    if (e->kind == RTX_IMG_SRC_REMOTE) {
+        if (e->fstate == 0) rtx_img_fetch(src);
+        if (e->fstate == 1) {
+            img_view_fill(v, src, e);
+            v->state = RTX_IMG_S_WAIT;
+            return NULL;
+        }
+        if (e->fstate == 3) {
+            img_view_fill(v, src, e);
+            v->state = RTX_IMG_S_ERR;
+            v->err = e->ferr ? e->ferr : RTX_IMG_EFETCH;
+            return NULL;
+        }
+    }
+    if (e->hstate == IMG_H_NONE) {
+        e->hstate = IMG_H_QUEUED;
+        img_schedule();
+    }
+    img_view_fill(v, src, e);
+    return e;
+}
+
+int rtx_img_info(const RtxImgSrc *src, RtxImgView *v) {
+    RtxImgView tmp;
+    if (!v) v = &tmp;
+    if (!src) return RTX_IMG_S_ERR;
+    img_ent_ready(src, v);
+    return v->state;
+}
+
+/* The bitmap of e for a (w, h) box (created), marked wanted and queued
+ * when missing. *any: the largest decoded bitmap of another size (shown
+ * meanwhile). */
+static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, RtxImgBmpEnt **anyp) {
+    RtxImgBmpEnt *be, *best = NULL, *any = NULL;
+    uint32_t fw, fh;
+    rtx_img_fit(e->info.w, e->info.h, w, h, &fw, &fh);
+    for (be = e->bmps; be; be = be->next) {
+        uint32_t dw = be->w > fw ? be->w - fw : fw - be->w;
+        uint32_t dh = be->h > fh ? be->h - fh : fh - be->h;
+        if (dw * 10 <= fw && dh * 10 <= fh) {
+            best = be;
+            break;
+        }
+        if (be->state == IMG_B_OK && (!any || be->w > any->w)) any = be;
+    }
+    if (!best) {
+        best = (RtxImgBmpEnt *)calloc(1, sizeof *best);
+        if (!best) return NULL;
+        best->ent = e;
+        best->w = fw;
+        best->h = fh;
+        best->next = e->bmps;
+        e->bmps = best;
+    }
+    best->used = g_epoch;
+    if (any) any->used = g_epoch;
+    if (best->state == IMG_B_NONE) {
+        uint64_t need = (uint64_t)fw * fh * 4;
+        if (need > rtx_img_limits()->budget) {
+            best->state = IMG_B_ERR;
+            best->err = RTX_IMG_EBUDGET;
+        } else {
+            best->state = IMG_B_QUEUED;
+            best->queued_at = g_epoch;
+        }
+    }
+    if (anyp) *anyp = any;
+    return best;
+}
+
+int rtx_img_want(const RtxImgSrc *src, uint32_t w, uint32_t h, RtxImgView *v) {
+    RtxImgView tmp;
+    ImgEnt *e;
+    RtxImgBmpEnt *best = NULL, *any = NULL;
+    if (!v) v = &tmp;
+    if (!src) return RTX_IMG_S_ERR;
+    e = img_ent_ready(src, v);
+    if (!e) return v->state;
+    if (e->hstate != IMG_H_OK) {
+        /* The decode follows the header without another ask. */
+        e->want_w = w;
+        e->want_h = h;
+        e->want_epoch = g_epoch;
+        return v->state;
+    }
+    best = img_bmp_for(e, w, h, &any);
+    if (!best) return v->state;
+    if (best->state == IMG_B_QUEUED) img_schedule();
+    if (best->state == IMG_B_ERR) {
+        v->state = RTX_IMG_S_ERR;
+        v->err = best->err;
+        return v->state;
+    }
+    if (best->state != IMG_B_OK && any) best = any;
+    if (best->state == IMG_B_OK) {
+        v->state = RTX_IMG_S_OK;
+        v->bmp = &best->bmp;
+        v->be = best;
+        if (best->bmp.nframe > 1 && best->bmp.delay) {
+            uint64_t total = 0, t;
+            uint32_t f;
+            for (f = 0; f < best->bmp.nframe; f++) total += best->bmp.delay[f];
+            t = total ? (uint64_t)(img_now_ms() - best->t0_ms) % total : 0;
+            for (f = 0; f < best->bmp.nframe; f++) {
+                if (t < best->bmp.delay[f]) break;
+                t -= best->bmp.delay[f];
+            }
+            v->frame = f < best->bmp.nframe ? f : 0;
+        }
+    }
+    return v->state;
+}
+
+void rtx_img_frame(void) {
+    g_epoch++;
+}
+
+int rtx_img_pump(void) {
+    int ch;
+    size_t i;
+    ImgEnt *e;
+    for (i = 0; i < 2; i++) {
+        ImgLane *L = &g_lane[i];
+        if (L->busy && atomic_load_explicit(&L->job.done, memory_order_acquire)) img_adopt(L);
+    }
+    for (i = 0; i < IMG_HASH; i++)
+        for (e = g_ents[i]; e; e = e->hnext) {
+            RtxImgBmpEnt *be;
+            if (e->net) img_fetch_poll(e);
+            /* Scrolled away: a queued decode nobody painted last pass is
+             * dropped; a running one is told to stop. */
+            for (be = e->bmps; be; be = be->next) {
+                /* Far away: not painted for IMG_FAR_PASSES whole paints
+                 * (an idle window paints none, so keeps what it shows). */
+                if (be->state == IMG_B_OK && be->used + IMG_FAR_PASSES < g_epoch) {
+                    img_bmp_drop(be);
+                    continue;
+                }
+                if (be->used + 1 >= g_epoch) continue;
+                if (be->state == IMG_B_QUEUED) be->state = IMG_B_NONE;
+                else if (be->state == IMG_B_RUN) {
+                    be->cancel = 1;
+                    if (g_lane[1].job.be == be) g_lane[1].job.cancel = 1;
+                }
+            }
+        }
+    img_schedule();
+    ch = g_changed;
+    g_changed = 0;
+    return ch;
+}
+
+int rtx_img_layout_changed(void) {
+    int c = g_layout_changed;
+    g_layout_changed = 0;
+    if (c) g_img_gen++;
+    return c;
+}
+
+unsigned rtx_img_gen(void) {
+    return g_img_gen + g_policy_gen;
+}
+
+int rtx_img_busy(void) {
+    size_t i;
+    ImgEnt *e;
+    if (g_lane[0].busy || g_lane[1].busy) return 1;
+    for (i = 0; i < IMG_HASH; i++)
+        for (e = g_ents[i]; e; e = e->hnext) {
+            RtxImgBmpEnt *be;
+            if (e->net || e->hstate == IMG_H_QUEUED) return 1;
+            for (be = e->bmps; be; be = be->next)
+                if (be->state == IMG_B_QUEUED) return 1;
+        }
+    return 0;
+}
+
+long rtx_img_next_ms(long now_ms) {
+    size_t i;
+    ImgEnt *e;
+    long best = -1;
+    for (i = 0; i < IMG_HASH; i++)
+        for (e = g_ents[i]; e; e = e->hnext) {
+            RtxImgBmpEnt *be;
+            for (be = e->bmps; be; be = be->next) {
+                uint64_t total = 0, t;
+                uint32_t f;
+                long left;
+                if (be->state != IMG_B_OK || be->bmp.nframe < 2 || !be->bmp.delay) continue;
+                if (be->used + 1 < g_epoch) continue;
+                for (f = 0; f < be->bmp.nframe; f++) total += be->bmp.delay[f];
+                if (!total) continue;
+                t = (uint64_t)(now_ms - be->t0_ms) % total;
+                for (f = 0; f < be->bmp.nframe; f++) {
+                    if (t < be->bmp.delay[f]) break;
+                    t -= be->bmp.delay[f];
+                }
+                left = f < be->bmp.nframe ? (long)(be->bmp.delay[f] - t) : 1;
+                if (left < 1) left = 1;
+                if (best < 0 || left < best) best = left;
+            }
+        }
+    return best;
+}
+
+void rtx_img_finish(void) {
+    int guard = 0;
+    while (rtx_img_busy() && guard++ < 200000) {
+        rtx_img_pump();
+        if (g_lane[0].busy) img_lane_join(&g_lane[0]);
+        if (g_lane[1].busy) img_lane_join(&g_lane[1]);
+        {
+            size_t i;
+            ImgEnt *e;
+            int net = 0;
+            for (i = 0; i < IMG_HASH; i++)
+                for (e = g_ents[i]; e; e = e->hnext)
+                    if (e->net) net = 1;
+            if (net) {
+                struct timespec ts = {0, 5 * 1000000};
+                nanosleep(&ts, NULL);
+            }
+        }
+    }
+    rtx_img_pump();
+}
+
+void *rtx_img_plat(const RtxImgBmpEnt *be, uint32_t frame) {
+    if (!be || !be->plat || frame >= be->bmp.nframe) return NULL;
+    return be->plat[frame];
+}
+
+void rtx_img_plat_set(RtxImgBmpEnt *be, uint32_t frame, void *obj, void (*free_fn)(void *)) {
+    if (!be || be->state != IMG_B_OK || frame >= be->bmp.nframe) {
+        if (obj && free_fn) free_fn(obj);
+        return;
+    }
+    if (!be->plat) {
+        be->plat = (void **)calloc(be->bmp.nframe, sizeof(void *));
+        if (!be->plat) {
+            if (obj && free_fn) free_fn(obj);
+            return;
+        }
+    }
+    if (be->plat[frame] && be->plat_free) be->plat_free(be->plat[frame]);
+    be->plat[frame] = obj;
+    be->plat_free = free_fn;
+}
+
+uint64_t rtx_img_held(void) { return g_held; }
+size_t rtx_img_nbmp(void) { return g_nbmp; }
+size_t rtx_img_fetches(void) { return g_nfetch; }
+
+void rtx_img_reset(void) {
+    size_t i;
+    ImgEnt *e, *nx;
+    img_lane_join(&g_lane[0]);
+    img_lane_join(&g_lane[1]);
+    if (g_lane[0].busy) img_adopt(&g_lane[0]);
+    if (g_lane[1].busy) img_adopt(&g_lane[1]);
+    for (i = 0; i < IMG_HASH; i++) {
+        for (e = g_ents[i]; e; e = nx) {
+            RtxImgBmpEnt *be, *bn;
+            nx = e->hnext;
+            for (be = e->bmps; be; be = bn) {
+                bn = be->next;
+                img_bmp_drop(be);
+                free(be);
+            }
+            if (e->net) rtx_img_net_free(e->net);
+            free(e->key);
+            free(e->path);
+            free(e->data);
+            free(e);
+        }
+        g_ents[i] = NULL;
+    }
+    g_nent = 0;
+    g_held = 0;
+    g_nbmp = 0;
+    g_changed = 0;
+    g_layout_changed = 0;
+}

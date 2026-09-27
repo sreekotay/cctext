@@ -103,20 +103,39 @@ static Color gui_hl_color(RtxScope scope) {
     return (Color){c.r, c.g, c.b, 255};
 }
 
+/* A stand-in's glyphs; a workbook formula's (hv->ann) end with its live
+ * value, dimmed in the annotation style (docs/workbook.md). */
 static double gui_standin_w(GuiFonts *fonts, const RtxHintVis *hv, RtxStyle st,
                             RtxSectionKind sec) {
     if (!hv || !hv->gn || !fonts) return 0;
+    if (hv->stale && !hv->ann) st.scope = rtx_layout_stale_style().scope;
+    if (hv->ann && hv->ann < hv->gn)
+        return gui_measure(fonts, cc_slice_from_buffer((char *)hv->g, hv->ann), st, sec) +
+               gui_measure(fonts, cc_slice_from_buffer((char *)hv->g + hv->ann, hv->gn - hv->ann),
+                           rtx_layout_annot_style(), sec);
     return gui_measure(fonts, cc_slice_from_buffer((char *)hv->g, hv->gn), st, sec);
 }
 
 static void gui_draw_standin(GuiFonts *fonts, const RtxHintVis *hv, RtxStyle st,
                              RtxSectionKind sec, float x, float y) {
-    char tmp[RTX_HINT_STANDIN_MAX];
+    char tmp[RTX_HINT_STANDIN_MAX + 1];
+    size_t n;
     if (!hv || !hv->gn || !fonts) return;
-    memcpy(tmp, hv->g, hv->gn);
-    tmp[hv->gn] = 0;
+    /* a workbook value still recalculating: its last value, dimmed */
+    if (hv->stale && !hv->ann) st.scope = rtx_layout_stale_style().scope;
+    n = hv->ann && hv->ann < hv->gn ? hv->ann : hv->gn;
+    memcpy(tmp, hv->g, n);
+    tmp[n] = 0;
     DrawTextEx(gui_font(fonts, st, sec), tmp, (Vector2){x, y},
                gui_size(fonts, st, sec), 0, gui_hl_color(st.scope));
+    if (n < hv->gn) {
+        RtxStyle as = rtx_layout_annot_style();
+        float ax = x + (float)gui_measure(fonts, cc_slice_from_buffer((char *)hv->g, n), st, sec);
+        memcpy(tmp, hv->g + n, hv->gn - n);
+        tmp[hv->gn - n] = 0;
+        DrawTextEx(gui_font(fonts, as, sec), tmp, (Vector2){ax, y}, gui_size(fonts, as, sec), 0,
+                   gui_hl_color(as.scope));
+    }
 }
 
 static void gui_draw_link_ul(const RtxLayout *L, RtxDocLayout d, size_t off,
@@ -1674,7 +1693,9 @@ static void gui_draw_browse_prev(RtxWs *w, int pane, GuiFonts *fonts,
         msg = "cannot open";
         col = gui_face(RTX_BROWSE_FACE_DENY);
     } else if (pv->live) {
-        if (rtx_layout_is_hex(&pv->layout))
+        if (!rtx_layout_is_hex(&pv->layout) && gui_img_prev(pv, fonts, x0, y0, tw, ph)) {
+            /* An image file: the picture, its size and format. */
+        } else if (rtx_layout_is_hex(&pv->layout))
             gui_draw_browse_prev_hex(pv, fonts, x0, y0, tw, ph);
         else if (rtx_layout_is_grid(&pv->layout))
             gui_draw_browse_prev_grid(pv, fonts, x0, y0, tw, ph);
@@ -2512,6 +2533,11 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                       focused ? (Color){28, 30, 36, 255} : (Color){16, 16, 20, 255});
         if (focused) DrawRectangle(x0, y0, 3, ph, (Color){80, 200, 220, 255});
     }
+    if (gui_img_viewer_on(b)) {
+        /* An image file opened directly (docs/images.md). */
+        gui_img_viewer_draw(fonts, b, x0, y0, pw, ph);
+        return;
+    }
     if (rtx_layout_is_hex(&b->layout)) {
         gui_draw_hex_buf(b, ui, fonts, focused, x0, y0, pw, ph);
         return;
@@ -2580,6 +2606,20 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                 continue;
             }
             {
+            /* A picture row (docs/images.md): the image, not its bytes,
+             * until the caret is on its line; then the source rows paint
+             * as text and the picture sits under them. */
+            const RtxImgRec *irec = b->layout.img_on
+                                        ? rtx_layout_img_rec(&b->layout, row->byte_start)
+                                        : NULL;
+            double th = row->height;
+            if (irec) {
+                double ix = (double)x0 + (double)gpx + irec->x;
+                if (b->left_col && rtx_layout_uses_left(&b->layout)) ix -= (double)b->left_col;
+                gui_img_row(fonts, b, irec, bytes, row->byte_start, ix, y + irec->top);
+                if (!irec->revealed) continue;
+                th = irec->text_h;
+            }
             int md_row = b->layout.rich &&
                          rtx_layout_md_index(&b->layout, row->byte_start) >= 0;
             if (!md_row) {
@@ -2656,23 +2696,23 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                 gui_caret_put(ui, focused, b->doc.caret == off ||
                               (box_row && box_at == off),
                               (double)(int)pos.x, (double)(int)y,
-                              (double)(int)row->height);
+                              (double)(int)th);
                 /* Clusters well clear of a partial clip are measured (x
                  * advances) but not drawn; the margin keeps overhangs. */
-                if (gui_clip_hit(pos.x - 16.0, y, gw + 32.0, row->height)) {
+                if (gui_clip_hit(pos.x - 16.0, y, gw + 32.0, th)) {
                 if (has && (b->doc.sel_covers(off) !>)) {
-                    DrawRectangle((int)pos.x, (int)y, (int)gw + 1, (int)row->height,
+                    DrawRectangle((int)pos.x, (int)y, (int)gw + 1, (int)th,
                                   (Color){40, 70, 120, 255});
                 } else if (phave && (off == plo || off == phi)) {
-                    DrawRectangle((int)pos.x, (int)y, (int)gw + 1, (int)row->height,
+                    DrawRectangle((int)pos.x, (int)y, (int)gw + 1, (int)th,
                                   gui_pair_color());
                 } else if (st.hl) {
-                    DrawRectangle((int)pos.x, (int)y, (int)gw + 1, (int)row->height,
+                    DrawRectangle((int)pos.x, (int)y, (int)gw + 1, (int)th,
                                   gui_hl_bg());
                 }
                 DrawTextEx(gui_font(fonts, st, row->sec), tmp, pos,
                            gui_size(fonts, st, row->sec), 0, gui_hl_color(st.scope));
-                gui_draw_link_ul(&b->layout, &b->doc, off, pos, gw, row->height,
+                gui_draw_link_ul(&b->layout, &b->doc, off, pos, gw, th,
                                  gui_hl_color(st.scope));
                 gui_draw_strike(st, pos, gw, gui_size(fonts, st, row->sec),
                                 gui_hl_color(st.scope));
@@ -2686,7 +2726,7 @@ static void gui_draw_buf(RtxBuf *b, const RtxUi *ui, GuiFonts *fonts, int focuse
                 int ex = (int)(x - (b->left_col && rtx_layout_uses_left(&b->layout)
                                         ? (double)b->left_col : 0));
                 gui_caret_put(ui, focused, at_end, (double)ex, (double)(int)y,
-                              (double)(int)row->height);
+                              (double)(int)th);
             }
             }
             if (md_row)
@@ -2865,6 +2905,9 @@ void gui_draw_body(int ww, int hh, int pad, int top, int pane_w, int inner,
     if (!g_live.w || !g_live.fonts || !g_live.ui) return;
     (void)pane_w;
     (void)inner;
+    /* A whole paint is an image pass: what it does not ask for is off
+     * screen (pending decodes cancel, bitmaps may go). */
+    if (gui_clip_full()) rtx_img_frame();
     act = RtxWs_active(g_live.w);
     if (rtx_present()->on) {
         /* Presentation owns the window: no panes, chrome or caret. */

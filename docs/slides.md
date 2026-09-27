@@ -31,12 +31,12 @@ as styled lines, the presenter state), `core/md_block.ccs`
 | Local directives | `paginate` (`true` / `false` / `hold` / `skip`), `header`, `footer`, `class` (`lead` centres, `invert` swaps to the dark palette), `backgroundColor`, `color` (`#rgb`, `#rrggbb`, ~50 CSS names), `transition`. They apply to their slide and every later one; front matter sets them from slide 1. `backgroundImage` / `-Position` / `-Repeat` / `-Size` are recognised, not drawn. |
 | Spot directives `_key` | Apply to their slide only (`<!-- _class: lead -->`). |
 | HTML comment directives | `<!-- key: value -->`, one or many `key: value` lines, block level. A comment that is not all directives is a presenter note: not drawn, not applied. Inline comments are not read. |
-| `![bg](url)` | Background image of its slide. Keywords in the alt text: `bg`, `left` / `right` with an optional `:N%` (split background: the content keeps the other side), `fit` / `contain`, `cover`, `auto`. Several `bg` images are counted; the first is drawn. cctext-ui draws no bitmaps: a split background is a tinted, framed panel with the file name, a full one a frame and a label. The terminal hatches the split side. |
-| `![alt](url)` | A content image is a line of its own: a labelled frame (cctext-ui) or `[image url]` (cctext). Size keywords (`w:320`) are read as alt text. |
+| `![bg](url)` | Background image of its slide, drawn under the text in cctext-ui ([images.md](images.md)). Keywords in the alt text: `bg`, `left` / `right` with an optional `:N%` (split background: the image fills its side, the content keeps the other), `fit` / `contain` (letterboxed), `cover` (the default: fills, cropped), `auto` (natural size). Several `bg` images are counted; the first is drawn. The terminal hatches the split side. |
+| `![alt](url)` | A content image is a line of its own: the picture in cctext-ui at its natural size, or Marp's `w:320` / `h:200` (`width:` / `height:`) from the alt, fitted to the content width and what is left of the slide (a placeholder box until its header is read); `[image: alt WxH]` in cctext. Sources, permissions and limits are the editor's ([images.md](images.md)). |
 | Fragmented lists | `*` bullets and `1)` ordered items are build steps (Marp's fragmented list); `-`, `+` and `1.` are always shown. Everything inside a stepped item (continuation lines, nested non-stepped items) appears with it. Hidden steps keep their space, as Marp's inactive fragments do. |
 | `transition` (Marp CLI) | `none`, `fade`, `fade-out`, `slide`, `push`, `cover`, `reveal`, `wipe`, `zoom` are drawn as named; the rest of Marp CLI's set maps to the nearest (`wiper`, `melt`, `clockwise` → wipe; `cube`, `cylinder`, `swap` → push; `swoosh` → slide; `pull` → reveal; `drop` → cover; `implode`, `explode`, `iris-in/out`, `diamond`, `star` → zoom; `in-out` → fade-out; `overlap`, `glow`, `flip`, `pivot`, `rotate` → fade). An unknown name is a fade. `morph` / `magic-move` are cctext names (below). A duration follows the name: `fade 0.5s`, `push 400ms` (default 300 ms). |
 | Markdown | Everything the block pass and the Rich lens know: headings, paragraphs (every newline breaks, as Marp's `breaks: true`), lists with task boxes, block quotes, fences with the info string's grammar, indented code, `$$` math (as code), GFM tables with alignment, thematic breaks, emphasis / strong / strike / code spans / links (hints and link destinations hidden). |
-| Not supported | Theme CSS (`style`, custom `@theme` files), `<style>` / HTML rendering, math rendering, emoji shortcodes, image bitmaps, presenter view with notes, Marp's `fitting header`, `backgroundImage` directives, speaker timer. |
+| Not supported | Theme CSS (`style`, custom `@theme` files), `<style>` / HTML rendering, math rendering, emoji shortcodes, several `bg` images side by side, image filters (`blur`, `sepia` …), presenter view with notes, Marp's `fitting header`, `backgroundImage` directives, speaker timer. |
 
 ## Editing: the block pass in Marp mode
 
@@ -130,7 +130,9 @@ build step, line group), filled boxes, frames, rules. Headings are bold
 and larger (54 / 44 / 36 / 32 / 30 / 28 px over a 30 px body), code is
 the mono face on a dark band with the grammar's scope colours, tables are
 measured columns with a tinted header and rules, quotes get a bar, `lead`
-/ `uncover` centre the body. Header, footer and page number sit in the
+/ `uncover` centre the body, and images are display-list items (the
+background first, under everything; content images in the flow) drawn
+from the image cache at the slide's own scale. Header, footer and page number sit in the
 margins. Painting scales the list to the window, letterboxed on a dark
 ground; the list is cached per (slide, edit stamp) in two slots (shown,
 left), so a transition does no layout per frame.
@@ -160,6 +162,7 @@ in-out. Each host paints both slides from their cached layouts:
 | zoom | the new slide grows from 55 % about the centre while fading in | wipe |
 | morph | *magic move*: each line (heading, item, code line, table row) whose kind, level and text match a line of the other slide moves and scales from its old box to its new one; unmatched lines cross-fade; backgrounds blend | wipe |
 | build step | the step's lines fade in and rise 14 px | appears |
+| images | move, clip, fade and scale with their slide (morph moves a content image with its line group); the bitmap is decoded once at the slide's scale, a zoom scales it | stand-in text |
 
 Morph matches by content, first unmatched equal key wins, per line group
 (a list item's marker and text, one code line, one table row). An
@@ -193,6 +196,8 @@ writes 0 bytes.
 - `tests/tui_pty_test.py present`: Shift-F5, steps, Left, `N` Enter, a
   push then silence, End / Home, Esc back on the slide, `#N` in the jump
   field, `--batch -c slides`.
+- `tests/ui_img_test.py`: a `![bg left:40%]` picture fills the left of
+  the slide, the text side has none.
 - `tests/ui_present_test.py`: cctext-ui under Xvfb — 16:9 letterbox, no
   editor chrome, heading colour, a step adds ink and Left removes it, a
   spot background, frames during a transition and none after, the code
@@ -200,8 +205,9 @@ writes 0 bytes.
 
 ## Limits
 
-- No bitmaps: images are labelled frames (cctext-ui has no image API
-  yet; a later opaque-render child from md_view.md would draw them).
+- Images are pictures in cctext-ui only ([images.md](images.md)); the
+  terminal shows their stand-in text. A remote or out-of-project image
+  needs a decision in the editor first (a click on a slide advances).
 - No theme CSS; three built-in palettes. Fonts are the editor's prose /
   mono faces.
 - A slide's content taller than the slide is clipped (Marp scales
