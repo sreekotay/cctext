@@ -516,36 +516,38 @@ static int svg_request_once(SvgSlot *S, const uint8_t *b, size_t n, const RtxSvg
     for (;;) {
         CrReply r;
         rc = svg_read(S, &r, sizeof r, deadline, cancel);
+        /* A cancel is honoured only between frames: once a header is in,
+         * its payload is read whole (else the stream would desync). */
         if (rc) goto fail;
         if (r.magic != CR_MAGIC_REP || r.len > CR_PIXELS_HARD_MAX * 4u + 64u) goto dead;
         if (r.id != q.id) {
             /* A reply to a request we gave up on: drop it. */
             S->st.stale++;
-            rc = svg_skip(S, r.len, deadline, cancel);
+            rc = svg_skip(S, r.len, deadline, NULL);
             if (rc) goto fail;
             continue;
         }
         if (r.type == CR_R_ERROR) {
             uint32_t code = 0;
             size_t ml = r.len >= 4 ? r.len - 4 : 0, keep = 0;
-            if (r.len < 4 || r.len > 4 + 65536 || svg_read(S, &code, 4, deadline, cancel) != 0)
+            if (r.len < 4 || r.len > 4 + 65536 || svg_read(S, &code, 4, deadline, NULL) != 0)
                 goto dead;
             if (msg && msgcap) {
                 keep = ml < msgcap - 1 ? ml : msgcap - 1;
-                if (keep && svg_read(S, msg, keep, deadline, cancel) != 0) goto dead;
+                if (keep && svg_read(S, msg, keep, deadline, NULL) != 0) goto dead;
                 msg[keep] = 0;
                 /* Untrusted text: printable bytes only (it paints). */
                 for (size_t k = 0; k < keep; k++)
                     if ((unsigned char)msg[k] < 0x20 || msg[k] == 0x7f) msg[k] = ' ';
             }
-            if (svg_skip(S, ml - keep, deadline, cancel) != 0) goto dead;
+            if (svg_skip(S, ml - keep, deadline, NULL) != 0) goto dead;
             S->served++;
             S->busy_until = 0;
             return svg_err_of(code);
         }
         if (r.type == CR_R_SIZE) {
             CrSize sz;
-            if (r.len != sizeof sz || svg_read(S, &sz, sizeof sz, deadline, cancel) != 0) goto dead;
+            if (r.len != sizeof sz || svg_read(S, &sz, sizeof sz, deadline, NULL) != 0) goto dead;
             if (!(sz.w_css > 0) || !(sz.h_css > 0) || !isfinite(sz.w_css) || !isfinite(sz.h_css))
                 goto dead;
             *w = sz.w_css;
@@ -562,16 +564,16 @@ static int svg_request_once(SvgSlot *S, const uint8_t *b, size_t n, const RtxSvg
             uint32_t hdr[3];
             uint8_t *px;
             size_t nb = (size_t)pw * ph * 4;
-            if (r.len < 12 || svg_read(S, hdr, sizeof hdr, deadline, cancel) != 0) goto dead;
+            if (r.len < 12 || svg_read(S, hdr, sizeof hdr, deadline, NULL) != 0) goto dead;
             if (hdr[0] != pw || hdr[1] != ph || hdr[2] != pw * 4 || (size_t)r.len - 12 != nb)
                 goto dead;
             px = (uint8_t *)malloc(nb ? nb : 1);
             if (!px) {
-                rc = svg_skip(S, nb, deadline, cancel);
+                rc = svg_skip(S, nb, deadline, NULL);
                 if (rc) goto fail;
                 return RTX_SVG_ENOMEM;
             }
-            rc = svg_read(S, px, nb, deadline, cancel);
+            rc = svg_read(S, px, nb, deadline, NULL);
             if (rc) {
                 free(px);
                 goto fail;
