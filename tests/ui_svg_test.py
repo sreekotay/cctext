@@ -145,6 +145,21 @@ def case_markdown(exe, env, tmp):
 PURPLE = (142, 36, 170)
 
 
+def last_text_row(shot):
+    """The lowest row with light prose pixels in the text column (above the
+    status bar, the gutter's numbers excluded). A raster image would wait:
+    decodes share one lane with the slow SVG, so text is what shows first."""
+    for y in range(shot.h - 40, 0, -1):
+        hits = 0
+        for x in range(60, min(shot.w, 500), 2):
+            c = shot.at(x, y)
+            if min(c) > 150 and max(c) - min(c) < 40:
+                hits += 1
+        if hits >= 3:
+            return y
+    return None
+
+
 def case_stable(exe, env, tmp):
     """The SVG's size first, its pixels 1.5 s later (the self-test helper's
     `slowpx`): the picture below it does not move when they arrive."""
@@ -156,8 +171,7 @@ def case_stable(exe, env, tmp):
     with open(os.path.join(d, "slow.svg"), "wb") as f:
         f.write(b"<!--cr-selftest:slowpx-->" + PIPE.replace(b"#e61414", b"#8e24aa")
                 .replace(b"#14b428", b"#8e24aa").replace(b"#1e3cdc", b"#8e24aa"))
-    shutil.copy(os.path.join(I.IMG, "big.png"), d)
-    body = b"# Stable\n\n![slow](slow.svg)\n\n![big](big.png)\n\nend\n"
+    body = b"# Stable\n\n![slow](slow.svg)\n\nThe line of prose under the picture.\n"
     p, log = I.launch_in(exe, env, d, "doc.md", body, {"RTX_RENDER_BIN": selftest})
     try:
         win = I.window(env, p)
@@ -175,10 +189,10 @@ def case_stable(exe, env, tmp):
         if pa > 100:
             print("skip: stable (the pixels beat the first screenshot: %d px)" % pa)
             return
-        ta, tb = I.top_of(a, I.RED), I.top_of(b, I.RED)
+        ta, tb = last_text_row(a), last_text_row(b)
         I.check(pb > 2000, "svg stable: the SVG's pixels arrive late", "%d -> %d purple px" % (pa, pb))
-        I.check(ta is not None and ta == tb, "svg stable: the picture below does not move",
-                "big.png top %s -> %s" % (ta, tb))
+        I.check(ta is not None and ta == tb, "svg stable: the text below does not move",
+                "last prose row %s -> %s" % (ta, tb))
     finally:
         U.stop(p)
 

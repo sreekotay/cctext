@@ -560,6 +560,8 @@ the editor's 5 s budget ends; not yet reduced).
   fallback text shows instead).
 - HiDPI: cctext-ui has no device scale yet; pixels are at 1x.
 - A pool larger than one; `.svgz`; previewing an unsaved SVG buffer.
+- Pixel jobs share one lane: a slow SVG render (up to its budget) holds
+  back raster decodes queued behind it; SVG could get a lane of its own.
 - The terminal's browse preview sniffs the first 32 bytes, so an SVG
   whose root follows a prolog previews as text there (cctext-ui reads
   2 KiB); left to the terminal-images work in `cctext_draw.ccs`.
