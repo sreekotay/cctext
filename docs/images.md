@@ -7,7 +7,9 @@ images or Unicode block art, whichever the terminal answers for, else
 the text stand-in `[image: alt WxH]` (phase 2, [Terminal](#terminal-cctext)).
 SVG goes through the same cache and surfaces, rendered by a separate
 sandboxed process, `cctext-render`
-([Renderer](#svg-the-renderer-cctext-render)).
+([Renderer](#svg-the-renderer-cctext-render)); so do ` ```mermaid `
+fences, drawn by the official Mermaid in QuickJS inside that helper
+([Mermaid](#mermaid)).
 
 Bytes stay the truth. `![alt](path)` stays in the file exactly as typed;
 the picture is a painted stand-in over those bytes (the Rich lens, the
@@ -24,9 +26,13 @@ shim), `core/layout.ccs` (stand-ins and picture rows),
 (terminal stand-ins, prompt, picture rows, viewer, slides),
 `frontend/cctext_img.ccs` (terminal detection, encode cache and jobs,
 overlays, kitty ids), `core/img_term.c` / `.h` (terminal encoders).
-SVG: `core/img_svg.c` / `.h` (the helper process, its protocol, the
-content-hash cache), `render/` (the helper), `scripts/render_build.cch`
-(its build).
+SVG: `core/img_svg.c` / `.h` (the helper processes, their protocol,
+the content-hash cache), `render/` (the helper), `scripts/render_build.cch`
+(its build). Mermaid: `render/cr_js.c` (the QuickJS host), `render/js/`
+(our shims and entry point), `third_party/quickjs`, `third_party/mermaid`;
+in the editor the fence scan in `core/layout.ccs`, the diagram source,
+theme and stale display in `core/img.ccs`, the painters in
+`frontend/gui_img.ccs` and `frontend/cctext_img.ccs`.
 
 ## Decoder
 
@@ -385,9 +391,10 @@ SVG is a program-like format (a parser, CSS, text layout, a rasterizer
 with fixed-point geometry): none of it runs in the editor. A separate
 helper, `cctext-render`, parses and draws; it is locked down before it
 reads its first request, and the editor treats everything it sends as
-untrusted. This is step 1 of the renderer plan (C / C++ only); TeX /
-MathML (MathJax in QuickJS) and Mermaid are later steps, and the
-protocol and the pack already have room for them.
+untrusted. Step 1 of the renderer plan was SVG (C / C++ only); step 2
+is Mermaid, QuickJS in the same helper ([Mermaid](#mermaid)); TeX /
+MathML (MathJax in QuickJS) is a later step, and the protocol and the
+pack have room for it.
 
 **Engine.** [lunasvg](https://github.com/sammycage/lunasvg) 3.5.0
 (`cf3594d`, MIT) over [plutovg](https://github.com/sammycage/plutovg)
@@ -422,7 +429,9 @@ The helper then builds its own font pack: `bin/cctext-render
 --build-pack render/manifest.txt bin/cctext-render.pack` (every entry
 zlib-compressed with stb's deflate and checked by a round trip through
 Wuffs, which inflates it at run time; an FNV-1a trailer guards the file).
-Outputs: `bin/cctext-render` (≈ 450 KiB stripped), the pack (1.3 MiB) and
+Outputs: `bin/cctext-render` (1.4 MiB stripped: ≈ 450 KiB of it
+the SVG engine, the rest QuickJS), the pack (5.3 MiB: 1.3 MiB of fonts,
+the Mermaid bytecode — [Mermaid](#mermaid) has the two-step build) and
 `bin/cctext-render-selftest` (tests only). `@dist_cctext` packs the
 helper and its pack beside the editors; the editor looks for the helper
 beside its own binary (`RTX_RENDER_BIN` overrides; `../bin/` is tried for
@@ -430,12 +439,17 @@ beside its own binary (`RTX_RENDER_BIN` overrides; `../bin/` is tried for
 
 **Protocol** (`render/cr_proto.h`). Framed, little-endian, one request at
 a time over a socketpair on the helper's stdin / stdout. After lockdown
-the helper sends a hello (version, the kinds it carries, sandboxed or
-not). A request (`CRQ1`, 44 bytes, then the payload) carries a generation
-stamp, a kind (SVG; TeX / MathML / Mermaid reserved), flags (size only),
-the output box or a scale, a pixel cap and the payload length. The helper
-answers **SIZE** (the CSS size) or **ERROR**; then, unless size-only,
-**PIXELS** (premultiplied RGBA8 at exactly the box) or **ERROR**. A frame
+the helper sends a hello (version 2, the kinds it carries, sandboxed
+or not). A request (`CRQ2`, 52 bytes, then the payload) carries a
+generation stamp, a kind (SVG, MERMAID, STATS; TeX / MathML reserved),
+flags (size only), the output box or a scale, a pixel cap, the payload
+length, and for a script kind its time budget and node cap. The helper
+answers **SIZE** (the CSS size) or **ERROR** (a code and one line of
+text: parse, too large, timeout, script, engine, …); then, unless
+size-only, **PIXELS** (premultiplied RGBA8 at exactly the box) or
+**ERROR**. STATS answers **INFO** (the engine's counters as JSON, for
+tests and the bench). A box equal to the rounded-up CSS size draws 1:1
+(no fractional stretch). A frame
 it cannot parse (bad magic, a length over 64 MiB) ends the process; EOF
 ends it cleanly.
 
@@ -466,8 +480,10 @@ ends it cleanly.
   placeholder ("SVG renderer not available on this platform yet"); a
   helper built there says so in its hello and refuses every request.
 
-**The editor side** (`core/img_svg.c`, plain C). A pool of one helper,
-spawned lazily by the first SVG (from a background job, never the UI
+**The editor side** (`core/img_svg.c`, plain C). A pool of two
+helpers, one per slot — SVG and Mermaid, each with its own lock, process
+and stamps, so a slow diagram never holds back an SVG — each spawned
+lazily by its first request (from a background job, never the UI
 thread), kept for the next ones, and told to quit at exit (it also exits
 on EOF when the editor dies). Its environment is empty (nothing of the
 editor's leaks into the process that parses untrusted input). Requests
@@ -477,7 +493,8 @@ next SVG respawns one; a crash (EOF or a broken frame) is reported the
 same way (an old helper that dies is retried once on a fresh one, in
 case it died of `RLIMIT_CPU` old age). **Cancel** (the paint pass no
 longer wants the picture) returns at once and leaves the helper working;
-its late reply carries the old stamp and the next request drops it.
+its late reply carries the old stamp and the next request drops it
+(a cancel lands only between whole frames, never inside one).
 
 **Caches.** Keyed by the content (FNV-1a 64 of the bytes and their
 length), so the same SVG under two names is one entry: the intrinsic
@@ -562,14 +579,212 @@ the editor's 5 s budget ends; not yet reduced).
   `<foreignObject>` (HTML labels are skipped; draw.io's `<switch>`
   fallback text shows instead).
 - HiDPI: cctext-ui has no device scale yet; pixels are at 1x.
-- A pool larger than one; `.svgz`; previewing an unsaved SVG buffer.
+- More than one helper per kind; `.svgz`; previewing an unsaved SVG
+  buffer.
 - Pixel jobs share one lane: a slow SVG render (up to its budget) holds
-  back raster decodes queued behind it; SVG could get a lane of its own.
+  back raster decodes queued behind it; SVG could get a lane of its own
+  (Mermaid has one).
 - The terminal's browse preview sniffs the first 32 bytes, so an SVG
   whose root follows a prolog previews as text there (cctext-ui reads
   2 KiB); left to the terminal-images work in `cctext_draw.ccs`.
 - Windows: the AppContainer launcher; macOS: run the self-tests.
-- Math (MathJax in QuickJS) and Mermaid through the same helper.
+- Math (MathJax in QuickJS) through the same helper.
+
+## Mermaid
+
+A fenced block whose info string is `mermaid` (any case, backticks or
+tildes) is a diagram in the Rich lens and on slides, in both frontends.
+The official Mermaid 12.0.0 runs, unmodified, in QuickJS inside
+`cctext-render`, behind the same sandbox as SVG; the SVG it writes is
+drawn by the same lunasvg. Nothing needs a browser, Node, npm, Rust or a
+bundler to build: a C / C++ compiler and ccc.
+
+**Using it.**
+
+- In a Rich Markdown pane the fence is one picture row (its opening
+  line; the others lay out nothing, like a fold). Put the caret into the
+  fence (the arrow keys, or a jump to its line) and its source
+  shows as text with the diagram under the closing line; leave it and
+  the diagram is back. The bytes are the fence as typed: selection,
+  copy, search and undo act on the text.
+- While a diagram renders its row is a small box (`rendering diagram…`
+  in cctext-ui, `[diagram: rendering...]` in a terminal), sized from the
+  diagram once its size is known. Typing in a fence keeps the previous
+  diagram up, dimmed, with its box, until the new one has pixels (the
+  workbook's stale convention); a source that does not parse keeps it up
+  with the parse error as its caption in cctext-ui
+  (`mermaid: Parse error on line 3: …`); with no earlier diagram the box
+  says why (`[diagram: Parse error on line 3: …]`,
+  `diagram too large to render (N nodes, limit 150)`).
+- In a terminal a diagram is a picture like any other (kitty, sixel,
+  iTerm2 or block art: `tui_images` / `RTX_TUI_IMAGES`).
+- On a slide a fence is a diagram too, fitted to the content box and
+  moved, faded, clipped or scaled by transitions with everything else;
+  it takes the slide's colours (dark when the slide's background is).
+- Settings (`settings.json`): `mermaid` (on; off lays fences out as
+  code), `mermaid_nodes` (150; 0 = no cap), `mermaid_timeout_ms`
+  (10000), `mermaid_max_kb` (64: a longer source is not rendered),
+  `mermaid_max_height` (720 px: taller diagrams are scaled down),
+  `mermaid_recycle_jobs` (0: a fresh engine every N diagrams when set).
+
+**Themes.** A diagram is keyed by its source's hash, its length, the
+theme and the renderer version (`RTX_MERMAID_VERSION`). The theme is
+Mermaid's `default` or `dark` plus `themeVariables` from the host's
+foreground, background and accent: the editor panes are dark in both
+frontends (a terminal's own background is not asked: a light terminal
+still gets the dark theme); a slide passes its own colours. A theme
+change re-keys every diagram: the visible ones render again (the old
+pictures stay up, dimmed, meanwhile); diagrams off screen wait until
+they are scrolled to.
+
+**Security.** Everything the SVG path has (the seccomp sandbox, an empty
+environment, no fetches, the editor treating every byte back as
+untrusted, the budget enforced by killing), plus Mermaid's own strict
+mode: `securityLevel: 'strict'` (no click handlers, no links out, labels
+sanitized), `htmlLabels: false` everywhere (labels are SVG `<text>`; a
+`<foreignObject>` would need a browser), `deterministicIds`,
+`suppressErrorRendering`; and a `secure` list so no `%%{init}%%`
+directive or front matter can change those keys, the text limit, the
+edge limit or the font. The DOM Mermaid draws into (`render/js/mm_dom.js`)
+has no network, no timers beyond the job, no `Image` loading (its
+`decode()` rejects), no layout engine but the host's font metrics. The
+QuickJS bytecode is trusted input to QuickJS, so it is only ever read
+from the pack this build made: the pack's `js:mermaid` entry is checked
+against a SHA-256 compiled into the helper (`CR_PACK_JS_HASHES`) before
+`JS_ReadObject` sees it; a pack with other bytecode renders SVG and
+refuses Mermaid ("the Mermaid engine does not match this renderer
+(rebuild the pack)").
+
+**Limits.** Layout is what costs (≈ 25 ms a node at worst), so the node
+cap is counted from Mermaid's own parse before any layout — flowchart
+vertices and subgraphs, sequence actors and messages, classes and
+namespaces, every (nested) state, ER entities, Gantt tasks, pie slices —
+and a diagram over it is refused in milliseconds with "diagram too large
+to render (N nodes, limit 150)", keeping the engine. The time budget
+(`mermaid_timeout_ms`) is enforced twice: QuickJS's interrupt handler
+ends the script at the budget (the helper answers "diagram took too long
+to render" and lives), and the editor kills the helper 2 s past it
+should the helper itself stop answering. A source longer than
+`mermaid_max_kb` is not sent; Mermaid's `maxTextSize` is set to match.
+
+**The engine** (`render/cr_js.c`). Started lazily by the first diagram
+(an SVG-only session never pays for it): the bytecode is inflated once
+and kept, the realm starts from it, and each request is one call of
+`mmRender(id, source, options)` with its promise settled by a small
+event loop (timers are run to completion; a promise that can never
+settle is an error, not a hang). The allocator keeps an exact heap count
+(a 16-byte size header), so recycling decisions are O(1). A fresh engine
+replaces the old one after a script failure or a timeout (a failed call
+may leave the realm in any state), when the heap passes 256 MiB
+(`--recycle-mb`), and, when set, every N diagrams (`--recycle-jobs`,
+`mermaid_recycle_jobs`); a source that does not parse, or a node-cap
+refusal, keeps the engine (typing makes one every other keystroke). A
+cycle collection runs after every 16 MiB of heap growth. The helper keeps
+the last four diagrams' SVG by payload hash, so a pixel request after a
+size request (or at a second size) does not run the script again.
+
+**The editor side.** The fence scan is in the layout fill
+(`rtx_layout_mm_*`, gated like images: Rich, and a fence in the
+window); the source is hashed and handed to the image cache as
+`RTX_IMG_SRC_MERMAID` / `RTX_IMG_FMT_MERMAID`. Sizes and pixels are jobs
+on a lane of their own (lane 2), visible first, cancelled when scrolled
+away or typed past (a source nobody asked for in the last pass stops its
+job; the helper's late reply is dropped by its stamp). Sizes and pixels
+are cached in memory and in the Safe home (`<safe>/img/mermaid/`, the SVG
+cache's format: a `.size` file apart from the `.px` files, so a later
+session lays out cached diagrams without starting the helper). The stale
+display remembers, per (document, fence start), the last diagram that
+had pixels; its faded copy is made from those pixels at once (resampled
+when the box re-fits), never queued behind the render it is waiting
+for. Old diagram entries nobody asked for in 120 passes are freed. An
+idle editor with diagrams on screen does nothing (zero wakeups).
+
+**Vendored, pinned.**
+
+- QuickJS (Bellard / Gorlich, MIT) at `a38171d` (2026-06-04), the engine
+  files only: `third_party/quickjs` (`README.cctext.md`: the pin, the
+  files, how to update). Built with `-fwrapv`, warnings off for its
+  files only.
+- Mermaid 12.0.0: `third_party/mermaid/mermaid.min.js`, the npm dist file
+  byte for byte (SHA-256
+  `28fca7ae6ebc7ed7bb63bde63136a74bfef14f296a57e403657eeb8b32836073`,
+  checked against npm's integrity and again by every build: the manifest
+  names the hash and the build refuses another file). MIT; its bundled
+  dependencies' licences are in `THIRD_PARTY_LICENSES.txt` (83 packages:
+  MIT, ISC, BSD, Apache-2.0, and elkjs under EPL-2.0 — shipped as part of
+  the bundle, unused by the diagrams we lay out, which use dagre).
+- Our code around it, each file commented: `render/js/rt_shim.js`
+  (`console`, timers, `atob` / `btoa`, `TextEncoder` / `TextDecoder`, the
+  legacy `RegExp.$1`, an empty `Intl`), `render/js/mm_dom.js` (the DOM
+  subset Mermaid and d3 touch: elements, attributes, a CSS-selector
+  subset, `getBBox` / `getComputedTextLength` from the host's font
+  metrics, serialization), `render/js/mm_glue.js` (configuration, the
+  node count, the entry point).
+
+**Build.** Two steps, both driven by `scripts/render_build.cch`:
+`out/render/cctext-render-boot` (the helper built with `-DCR_BOOTSTRAP`)
+compiles each manifest bundle (`bundle|mermaid`: the shims, the verified
+Mermaid, the glue, concatenated) to QuickJS bytecode and writes the pack
+(deterministic: the same inputs give the same bytes) and
+`out/render/cr_pack_hash.h`; the helper proper is then compiled with that
+header. The pack is rebuilt when a font, a script, the manifest or the
+boot binary changes. Bytecode is 8.5 MB raw (from 5.6 MB of source) and
+4.2 MB in the pack.
+
+**Measured** (Linux x86-64, this container, release build;
+`python3 bench/render_client.py mermaid`, `mermaid_smoke`):
+
+| | |
+|---|---|
+| Helper spawn to ready (SVG only; the engine not started) | 14–20 ms |
+| First diagram in a helper (inflate 28–31 ms + engine start 50–75 ms + a small pie) | ≈ 140 ms |
+| Warm render, size + pixels: pie / Gantt | 17–21 / 26–32 ms |
+| sequence / ER / flowchart | 70–116 / 160–210 / 190–245 ms |
+| class / state | 325–425 / 275–400 ms |
+| Re-raster of a cached diagram (another size) | 3–5 ms |
+| Helper RSS: after hello (lazy) / engine loaded / after a flowchart | 12.1 / 38.6–40 / 46.5 MiB |
+| after the seven types / after 250 diagrams | 66 / 73 MiB (JS heap 33–47 MiB, stable) |
+| Parse error or node-cap refusal | a few ms, engine kept |
+| Pack / helper binary | 5.3 MiB / 1.4 MiB |
+
+Lazy start is what keeps an SVG-only session at 12 MiB: starting the
+engine eagerly would put every helper at ≈ 39 MiB (the inflated bytecode
+and the realm built from it) and add ≈ 100 ms to every spawn.
+
+Against Chromium (the same sources through mermaid 12.0.0 in a browser
+with `htmlLabels: false`, the SVGs in `testdata/mermaid/chromium`, drawn
+by our lunasvg): widths within +3.5 %, heights +0 to +11.7 % (sequence
+diagrams are the tallest: our text metrics lack kerning and line boxes
+round up), and the 16 × 16 ink maps correlate at r 0.929–1.000.
+
+**Fuzzing.** `bin/cctext-render-fuzz --mermaid` runs the engine in
+process under ASan + UBSan over `testdata/mermaid`: byte flips,
+truncation, lines deleted / duplicated / swapped, token garbage (arrows,
+brackets, `%%`, `click`, `<script>`, `javascript:`, bidi and astral
+characters), hostile lines (`%%{init}%%` overrides and the like), another
+type's lines spliced in, long labels and ids, deep subgraph / state /
+namespace nesting, node counts around the cap, control bytes and invalid
+UTF-8, extreme numbers, each in the light or dark theme within a budget
+(`CR_FUZZ_MM_BUDGET_MS`); a rendered SVG goes through the SVG path too. `@smoke` runs 16 mutants (5 s budget, ≈ 1
+minute under ASan); `@render_fuzz` runs `RENDER_FUZZ_MM_ITERS` (1000).
+The seeds must render. Found on the way (all in our shims and host,
+none in QuickJS or Mermaid): scripts reaching for `Intl` and `Image`, a
+node cap that nested subgraphs / namespaces / states slipped past, the
+engine recycled by every refusal and parse error. No sanitizer finding in 316 mutants under ASan and 400
+in a release build (outcomes: renders, parse errors, node-cap refusals,
+budget timeouts).
+
+**Leftovers.** macOS and Windows are untested (Windows has no helper at
+all). A terminal shows the stale diagram without its caption (the error
+reaches the one-line box only when there is no earlier diagram). The
+editor panes' theme is always dark (there is no light editor theme yet).
+A fence whose opening line is above the layout window's start lays out
+as text until the view reaches it. `htmlLabels` stays off, so Markdown
+strings in labels draw as plain text; KaTeX in labels, icons (`@{ icon
+}`), and the ELK layout are not supported. Diagram types beyond the seven
+we test (mindmap, timeline, git graph, quadrant, sankey, XY, block,
+architecture, …) are rendered by Mermaid but not checked against a
+browser.
 
 ## Tests
 
@@ -662,13 +877,49 @@ the editor's 5 s budget ends; not yet reduced).
   (sniffing, the permission rules, `data:image/svg+xml` base64 and
   percent-encoded, a Rich picture row whose height is the same before and
   after the pixels, the terminal stand-in).
-- `render/cr_fuzz.c` (`@smoke`: 400 mutants; `@render_fuzz`: 20000):
-  see [Fuzzing](#svg-the-renderer-cctext-render).
+- `render/cr_fuzz.c` (`@smoke`: 400 SVG and 16 Mermaid mutants;
+  `@render_fuzz`: 20000 and 1000): see
+  [Fuzzing](#svg-the-renderer-cctext-render) and [Mermaid](#mermaid).
+- `mermaid_smoke` (`@smoke`): the protocol raw (hello v2, no engine
+  before the first diagram, SIZE then PIXELS at the box, the pixel
+  request reusing the script's SVG, a parse error naming its line in one
+  line and keeping the engine, no diagram type, the node cap refused
+  before layout with its message and the engine kept, hostile
+  `%%{init}%%` directives ignored, `htmlLabels` forced off); the budget
+  (an endless script ends with a timeout and a fresh engine; the editor's
+  kill of a hung helper, budget + grace, and the respawn); the heap
+  recycle (`--recycle-mb`) and `--recycle-jobs`; the pack hash (a pack
+  with other bytecode renders SVG and refuses Mermaid before QuickJS);
+  the seven types (flowchart, sequence, class, state, Gantt, pie, ER)
+  against reference PNGs from our renderer (±2 px in size, ≤ 1 % of
+  pixels more than 24 levels off) and against Chromium's SVGs (width
+  ≤ 6 %, height ≤ 13 %, ink map r ≥ 0.90); light and dark themes and
+  `themeVariables`; the client (two slots, lazy spawn of the Mermaid slot
+  only, the setting for the cap, messages); the caches (memory, disk
+  with no helper, the theme in the key); the layout (a fence is one
+  picture row, the other lines nothing, the box from the size, the caret
+  reveal with the diagram under the closing line, `mermaid` off lays out
+  code, the bytes unchanged); the stale display (the old diagram and its
+  box while the new one renders, a parse error keeps it with its
+  message, replaced once sized); a theme change re-renders only the
+  visible diagram and keeps the old one up; idle once settled.
+- `tests/tui_pty_test.py mermaid_blocks` (`RTX_TUI_IMAGES=blocks`): a
+  fence becomes block art under its line with the fence lines hidden and
+  no graphics escapes; idle with no output or CPU once settled; the
+  caret shows the source with the diagram under it; typing keeps the old
+  diagram up until the new one lands.
+- `tests/ui_mermaid_test.py` (Xvfb, cctext-ui): a diagram on screen and
+  still, two helper processes (SVG and Mermaid), the dimmed stale
+  diagram while an edit renders and the new one after, the helpers exit
+  with the editor, a slide's diagram in the slide's light theme.
 - `tests/ui_svg_test.py` (Xvfb): an SVG picture in Rich Markdown, still
   while idle, the backing plate under a transparent SVG, one helper
   process that exits with the editor; an `.svg` opens as text and
   `Ctrl-D` swaps its picture in and out; a slide's `![bg left:40%]`; the
   browse preview. It saves `testdata/generated/ui_svg_markdown.png`.
+- `testdata/mermaid`: one source per type, `chromium/` (the browser's
+  SVGs with `htmlLabels: false`), `ref/` (our PNGs), regenerated by
+  `gen_refs.py`; `bench/render_client.py mermaid` / `leak` measure.
 - Samples (`testdata/svg/samples`, our own content: a draw.io-shaped
   diagram, matplotlib plots, Mermaid diagrams from our `.mmd` sources)
   and their references are regenerated by `testdata/svg/gen_samples.py`
