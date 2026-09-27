@@ -6,6 +6,9 @@
 
 /* cctext patch: most dash segments one stroke may produce (see plutovg_path_traverse_dashed). */
 #define PLUTOVG_MAX_DASHES 1000000.0
+/* cctext patch: most segments one flattening may produce; past it, the
+ * remaining curves are their chords (see plutovg_path_traverse_flatten). */
+#define PLUTOVG_MAX_FLATTEN 1048576u
 
 void plutovg_path_iterator_init(plutovg_path_iterator_t* it, const plutovg_path_t* path)
 {
@@ -478,6 +481,7 @@ void plutovg_path_traverse_flatten(const plutovg_path_t* path, plutovg_path_trav
     plutovg_path_iterator_init(&it, path);
 
     bezier_t beziers[32];
+    size_t emitted = 0; /* cctext patch: segments out of all curves */
     plutovg_point_t points[3];
     plutovg_point_t current_point = {0, 0};
     while(plutovg_path_iterator_has_next(&it)) {
@@ -513,8 +517,13 @@ void plutovg_path_traverse_flatten(const plutovg_path_t* path, plutovg_path_trav
 
                 /* cctext patch: with coordinates near FLT_MAX, d and l
                  * overflow to inf (or NaN) and the flatness test never
-                 * passes: 2^31 segments. Such a curve is drawn as its chord. */
-                if(d < threshold*l || b == beziers + 31 || !isfinite(d) || !isfinite(l)) {
+                 * passes: 2^31 segments. Such a curve is drawn as its chord.
+                 * And a huge finite curve (1e8 units) cannot get flat to
+                 * 0.25 in float precision either: depth stops at 16 (65536
+                 * segments; 16 levels flatten a curve up to ~1e9 units). */
+                if(d < threshold*l || b == beziers + 16 || !isfinite(d) || !isfinite(l) ||
+                   emitted >= PLUTOVG_MAX_FLATTEN) {
+                    ++emitted;
                     plutovg_point_t p = { b->x4, b->y4 };
                     traverse_func(closure, PLUTOVG_PATH_COMMAND_LINE_TO, &p, 1);
                     --b;

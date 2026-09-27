@@ -18,8 +18,9 @@ cctext-render fuzz run (ASan + UBSan):
    and rasterizer (signed overflows), and no `memcpy` from a NULL border.
 2. `0002-dash-and-flatten-bounds.patch`: over 1,000,000 dash segments in one
    stroke (a 1e-38 dash) draws it solid instead of overflowing the path
-   array; a curve with non-finite flatness measures is drawn as its chord
-   (was 2^31 segments).
+   array; a curve with non-finite flatness measures is drawn as its chord,
+   subdivision stops at depth 16 and one flattening emits at most 2^20
+   segments (a hostile arc took 3.3 s, a curve at FLT_MAX 16 s).
 
 Build defines: `PLUTOVG_BUILD_STATIC`, `PLUTOVG_DISABLE_FONT_FACE_CACHE_LOAD`
 (no system font scan), `STBI_MAX_DIMENSIONS=16384` (a `data:` image inside
