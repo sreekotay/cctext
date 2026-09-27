@@ -400,6 +400,10 @@ static void emit_svg(const CrReq *q, const char *src, size_t n)
         ph = q->box_h;
         sx = (float)pw / w;
         sy = (float)ph / h;
+        /* The natural size rounded up (a diagram's CSS size is fractional):
+         * draw at 1:1, not stretched by a fraction of a pixel (every edge
+         * would blur). */
+        if (pw == (uint32_t)ceil((double)w) && ph == (uint32_t)ceil((double)h)) sx = sy = 1.0f;
     } else {
         float s = q->scale > 0 && q->scale <= 64 && isfinite(q->scale) ? q->scale : 1.0f;
         double fw = ceil((double)w * s), fh = ceil((double)h * s);

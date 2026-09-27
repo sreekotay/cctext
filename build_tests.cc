@@ -190,3 +190,6 @@ CC_TARGET_DEPS img_layout_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx
 CC_TARGET svg_smoke exe tests/svg_smoke.ccs
 CC_TARGET_INCLUDE svg_smoke .
 CC_TARGET_DEPS svg_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout rtx_img rtx_safe rtx_rx rtx_page_store
+CC_TARGET mermaid_smoke exe tests/mermaid_smoke.ccs
+CC_TARGET_INCLUDE mermaid_smoke .
+CC_TARGET_DEPS mermaid_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout rtx_img rtx_safe rtx_rx rtx_page_store
