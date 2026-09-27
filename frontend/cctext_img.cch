@@ -1,0 +1,133 @@
+#!ccc cch
+/*
+ * cctext pictures (docs/images.md "Terminal"): capability detection, the
+ * encode cache and its background jobs, the cells a picture paints, and
+ * the frame writer's hooks for graphics that live outside the text grid.
+ *
+ * Protocols, best first as detected (a setting forces one):
+ *   kitty  graphics protocol with Unicode placeholders: the image is sent
+ *          once per (bitmap, box), then it is ordinary cells (U+10EEEE
+ *          with row / column diacritics, the id in the fg colour), so the
+ *          row diff, scroll regions, panes and tmux just work;
+ *   sixel  / iTerm2 inline images: drawn over blank cells after the rows;
+ *          the frame writer redraws one whenever a row it covers is
+ *          rewritten, never scrolls a region under one, crops to the pane;
+ *   blocks Unicode block art (half blocks, quadrants or sextants) in
+ *          24-bit or 256 colours: ordinary cells;
+ *   off    the text stand-in `[image: alt WxH]` (no colours at all, or
+ *          tui_images off).
+ *
+ * Pixels come only from the loader (rtx_img_want_pix, straight RGBA).
+ * Scaling and encoding are stamped jobs on one background lane, visible
+ * first; a paint pass that no longer asks for one cancels it.
+ */
+#ifndef RTX_CCTEXT_IMG_H
+#define RTX_CCTEXT_IMG_H
+
+#include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "../core/img.cch"
+
+enum {
+    CCTI_OFF = 0,          /* text stand-in */
+    CCTI_BLOCKS,
+    CCTI_KITTY,
+    CCTI_SIXEL,
+    CCTI_ITERM,
+    CCTI_AUTO = 99         /* setting only */
+};
+
+/* settings.json "tui_images" (auto | kitty | sixel | iterm | blocks | off;
+ * RTX_TUI_IMAGES overrides), "tui_blocks" (half | quadrant | sextant),
+ * "tui_dither", "tui_ssh_kpx" (over SSH, a picture of more than this many
+ * thousand display pixels uses block art unless tui_images names a
+ * protocol; default 64). NULL / <0 keeps the default. */
+void cctext_img_setup(const char *mode, const char *glyphs, int dither, int ssh_kpx);
+
+/* Startup, after the TTY is raw: ask the terminal (kitty a=q, DA1,
+ * XTSMGRAPHICS, XTVERSION, CSI 16 t, a truecolor DECRQSS; inside tmux the
+ * kitty query goes through DCS passthrough and counts only if its echo
+ * comes back) and read the replies for at most ~150 ms (DA1, answered by
+ * every terminal, ends the wait early). Bytes that are not replies (keys
+ * typed meanwhile) are handed back in left[0, *leftn). */
+void cctext_img_detect(unsigned char *left, size_t cap, size_t *leftn);
+/* The protocol in use (CCTI_*), and a one-line description. */
+int cctext_img_proto(void);
+const char *cctext_img_desc(char *buf, size_t n);
+/* The screen size changed (cell pixels may too). */
+void cctext_img_resize(int rows, int cols);
+
+/* A whole paint begins (cctext_draw). */
+void cctext_img_frame(int rows, int cols);
+
+/* A picture on screen: a box of cols x rows cells showing the image
+ * scaled to dw x dh pixels (0: fitted to the box, never above natural
+ * size) from the box's top-left. */
+typedef struct {
+    const RtxImgSrc *src;
+    const char *alt;
+    size_t altn;
+    int cols, rows;
+    uint32_t dw, dh;
+    int cells_only;        /* no sixel / iTerm here (a transition, text over it) */
+} CctiPic;
+
+/* One cell of a picture (the slide grid): UTF-8 bytes and colours
+ * (-1 default, 0-255 palette, RTX_TIMG_RGB). */
+typedef struct {
+    char s[16];
+    unsigned char n;
+    int32_t fg, bg;
+} CctiCell;
+
+/* Line li of the picture, its columns [c0, c0 + n), at absolute screen
+ * cell (srow, scol) (1-based): exactly n cells written to stdout (block
+ * art, kitty placeholders, or blanks under a sixel / iTerm overlay, or
+ * the stand-in text while pixels are on the way). Returns n. */
+int cctext_img_line(const CctiPic *p, int li, int c0, int n, int srow, int scol);
+/* The same into cells (out[0, n)). */
+int cctext_img_cells(const CctiPic *p, int li, int c0, int n, int srow, int scol,
+                     CctiCell *out);
+/* The cell box and display size of an iw x ih image fitted to at most
+ * cols x rows cells, never above natural size. */
+void cctext_img_fit(uint32_t iw, uint32_t ih, int cols, int rows, int *bc, int *br,
+                    uint32_t *dw, uint32_t *dh);
+
+/* ---- the frame writer (cctext_draw.ccs) ------------------------------- */
+/* Something to send even if no row changed (a kitty transmit, an
+ * overlay). */
+int cctext_img_pub_need(void);
+/* Kitty transmits / deletes: before the rows, inside the sync update. */
+void cctext_img_pub_pre(void);
+/* touch[r] = 1 for every screen row (0-based) an overlay covered last
+ * frame or covers now: no region scroll moves those rows. */
+void cctext_img_ov_rows(unsigned char *touch, int rows);
+/* force[r] = 1 for rows whose last-frame overlay is gone or changed: they
+ * are rewritten, which erases its pixels. */
+void cctext_img_ov_force(unsigned char *force, int rows);
+/* After the rows: draw every overlay that is new, changed, or has a row
+ * that was just written (written[r]). */
+void cctext_img_ov_emit(const unsigned char *written, int rows);
+/* The screen is unknown (erase, resume): overlays redraw, and kitty
+ * images are sent again when `lost`. */
+void cctext_img_invalidate(int lost);
+/* Set from a signal handler (^Z deleted our kitty images). */
+extern volatile sig_atomic_t g_ccti_lost;
+/* Async-signal-safe: delete every kitty image this process sent (exit,
+ * ^Z, a fatal signal). */
+void cctext_img_leave_write(int fd);
+
+/* Adopt finished encodes, start queued ones, drop ones nobody painted.
+ * 1 when a repaint would show something new. */
+int cctext_img_pump(void);
+int cctext_img_busy(void);
+/* ms until an animation frame is due (-1 none), capped at the terminal's
+ * frame budget. */
+long cctext_img_next_ms(long now_ms);
+
+/* Statistics (tests, stats): encodes run, kitty images sent, overlays
+ * drawn. */
+void cctext_img_stats(long *enc, long *sent, long *ovl);
+
+#endif

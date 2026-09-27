@@ -42,6 +42,7 @@
 #include "../core/browse.cch"
 #include "../core/img.cch"
 #include "cctext.cch"
+#include "cctext_img.cch"
 
 static struct termios g_old;
 static int g_raw = 0;
@@ -61,6 +62,7 @@ int g_nav;
 char g_status[160];
 static volatile sig_atomic_t g_winch;
 static volatile sig_atomic_t g_repaint; /* focus-in: the screen may hold anything */
+static long g_anim_due; /* an animated picture's next frame (ms clock), 0 none */
 /* Status-row spinner while piece-tree scan/save runs (blocking). */
 static void cctext_busy(void *ctx, const char *label, int pct) {
     struct winsize ws;
@@ -111,6 +113,7 @@ static void cctext_restore(void) {
     fflush(stdout);
     tcsetattr(STDIN_FILENO, TCSANOW, &g_old);
     cctext_osx_stop();
+    cctext_img_leave_write(STDOUT_FILENO); /* our kitty images */
     cctext_tty_write(g_tty_leave, sizeof(g_tty_leave) - 1);
     g_raw = 0;
 }
@@ -141,6 +144,7 @@ static void cctext_sig_reraise(int sig) {
 static void cctext_on_fatal(int sig) {
     if (g_term_on) {
         g_term_on = 0;
+        cctext_img_leave_write(STDOUT_FILENO);
         cctext_tty_write(g_tty_leave, sizeof(g_tty_leave) - 1);
         tcsetattr(STDIN_FILENO, TCSANOW, &g_old);
     }
@@ -153,6 +157,9 @@ static void cctext_on_cont(int sig);
 static void cctext_on_tstp(int sig) {
     int saved = errno;
     if (g_term_on) {
+        /* Kitty images go with the alt screen; resume sends them again. */
+        cctext_img_leave_write(STDOUT_FILENO);
+        g_ccti_lost = 1;
         cctext_tty_write(g_tty_leave, sizeof(g_tty_leave) - 1);
         tcsetattr(STDIN_FILENO, TCSANOW, &g_old);
     }
@@ -706,6 +713,9 @@ int main(int argc, char **argv) {
         cctext_scroll_regions_set(!cli.no_scroll_regions && !dumb);
     }
     ui.blink_idle_ms = rtx_ui_blink_idle_env();
+    /* Pictures (docs/images.md "Terminal"): tui_images etc.; detected
+     * once the terminal is ours. */
+    cctext_img_setup(cli.tui_images, cli.tui_blocks, cli.tui_dither, cli.tui_ssh_kpx);
     /* The terminal cursor is the caret. Terminal.app / iTerm blink it via
      * DECSCUSR; Cursor / VS Code ignore that blink bit, so we hide/show
      * on our timer there (--caret=cell: a painted reverse-video cell). */
@@ -741,6 +751,14 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    {
+        /* Ask the terminal what it can draw (kitty / sixel / iTerm2 / block
+         * art, cell pixels); keys typed meanwhile stay input. */
+        size_t kept = 0;
+        cctext_img_detect(g_inq, CCTEXT_INQ, &kept);
+        g_inq_h = 0;
+        g_inq_t = kept;
+    }
     {
         const char *tp = getenv("RTX_FRAME_TRACE");
         if (tp && tp[0]) {
@@ -813,7 +831,15 @@ int main(int argc, char **argv) {
                     due = 16;
                 /* Image headers / fetches in flight: poll at the frame
                  * tick; none, no wakeups (docs/images.md). */
-                if (rtx_img_busy() && (due < 0 || due > 16)) due = 16;
+                if ((rtx_img_busy() || cctext_img_busy()) && (due < 0 || due > 16)) due = 16;
+                g_anim_due = 0;
+                if (cctext_img_proto() != CCTI_OFF) {
+                    /* An animated picture on screen (image_animate): wake
+                     * for its next frame, within the frame budget. */
+                    long ad = cctext_img_next_ms(t_now);
+                    if (ad >= 0) g_anim_due = t_now + ad;
+                    if (ad >= 0 && (due < 0 || ad < due)) due = ad;
+                }
                 if (due > 60000) due = 60000;
                 wait_us = due < 0 ? -1 : (int)(due * 1000);
             }
@@ -885,6 +911,7 @@ int main(int argc, char **argv) {
                 g_winch = 0;
                 last_rows = rows;
                 last_cols = cols;
+                cctext_img_resize(rows, cols);
                 fputs("\x1b[H\x1b[J", stdout);
                 cctext_draw_invalidate();
                 dirty = 1;
@@ -947,7 +974,13 @@ int main(int argc, char **argv) {
             {
                 /* Images: a header size arrived (the stand-in text
                  * `[image: alt WxH]` grows): refill panes with images. */
-                (void)rtx_img_pump();
+                /* Pixels / encodes arrived: the pictures repaint. */
+                if (rtx_img_pump() && rtx_img_cells_on()) dirty = 1;
+                if (cctext_img_pump()) dirty = 1;
+                if (g_anim_due && rtx_ui_now_ms() >= g_anim_due) {
+                    g_anim_due = 0;
+                    dirty = 1;
+                }
                 if (rtx_img_layout_changed()) {
                     size_t bi;
                     for (bi = 0; bi < w.len; bi++) {

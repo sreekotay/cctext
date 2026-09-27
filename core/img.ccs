@@ -1310,6 +1310,7 @@ struct RtxImgBmpEnt {
     ImgEnt *ent;
     RtxImgBmpEnt *next;
     uint32_t w, h;         /* the size asked for (fitted) */
+    int pix;               /* RTX_IMG_PIX_* */
     int state;
     int err;
     RtxImgBmp bmp;
@@ -1338,6 +1339,7 @@ struct ImgEnt {
     RtxImgBmpEnt *bmps;
     int jobs;              /* jobs holding path / data */
     uint32_t want_w, want_h; /* pixels asked for before the header was known */
+    int want_pix;
     uint64_t want_epoch;
     /* remote */
     int fstate;            /* 0 none, 1 running, 2 cached, 3 failed */
@@ -1360,6 +1362,7 @@ static int g_changed;        /* pixels / states changed: repaint */
 static int g_layout_changed; /* a header arrived: refill */
 static unsigned g_img_gen;
 static size_t g_nfetch;
+static uint64_t g_bmp_serial;
 
 typedef struct {
     int kind;              /* 1 probe, 2 decode */
@@ -1370,6 +1373,7 @@ typedef struct {
     size_t data_n;
     RtxImgLimits lim;
     uint32_t w, h;
+    int pix;
     uint32_t frames;
     _Atomic int cancel;
     int rc;
@@ -1620,8 +1624,8 @@ static void img_job_run(ImgJob *j) {
             b = buf;
         }
         if (j->rc == RTX_IMG_OK)
-            j->rc = rtx_img_decode(b, n, &j->lim, j->w, j->h, RTX_IMG_PIX_BGRA_PREMUL,
-                                   j->frames, &j->cancel, &j->out, &j->info);
+            j->rc = rtx_img_decode(b, n, &j->lim, j->w, j->h, j->pix, j->frames, &j->cancel,
+                                   &j->out, &j->info);
         free(buf);
     }
     atomic_store_explicit(&j->done, 1, memory_order_release);
@@ -1650,7 +1654,8 @@ static void img_lane_join(ImgLane *L) {
 }
 
 static void img_evict(uint64_t need, const RtxImgBmpEnt *keep);
-static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, RtxImgBmpEnt **anyp);
+static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, int pix,
+                                 RtxImgBmpEnt **anyp);
 
 static void img_adopt(ImgLane *L) {
     ImgJob *j = &L->job;
@@ -1669,7 +1674,7 @@ static void img_adopt(ImgLane *L) {
             g_layout_changed = 1;
             g_changed = 1;
             if (j->rc == RTX_IMG_OK && e->want_epoch && e->want_epoch + 1 >= g_epoch)
-                (void)img_bmp_for(e, e->want_w, e->want_h, NULL);
+                (void)img_bmp_for(e, e->want_w, e->want_h, e->want_pix, NULL);
             e->want_epoch = 0;
         }
     } else {
@@ -1681,6 +1686,7 @@ static void img_adopt(ImgLane *L) {
         } else if (j->rc == RTX_IMG_OK) {
             img_evict(j->out.bytes, be);
             be->bmp = j->out;
+            be->bmp.id = ++g_bmp_serial;
             be->state = IMG_B_OK;
             be->t0_ms = img_now_ms();
             g_held += be->bmp.bytes;
@@ -1795,6 +1801,7 @@ static void img_schedule(void) {
             L->job.lim = *lim;
             L->job.w = pick->w;
             L->job.h = pick->h;
+            L->job.pix = pick->pix;
             L->job.frames = lim->anim ? lim->anim_frames : 1;
             L->job.cancel = 0;
             memset(&L->job.out, 0, sizeof L->job.out);
@@ -2038,13 +2045,17 @@ int rtx_img_info(const RtxImgSrc *src, RtxImgView *v) {
 /* The bitmap of e for a (w, h) box (created), marked wanted and queued
  * when missing. *any: the largest decoded bitmap of another size (shown
  * meanwhile). */
-static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, RtxImgBmpEnt **anyp) {
+static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, int pix,
+                                 RtxImgBmpEnt **anyp) {
     RtxImgBmpEnt *be, *best = NULL, *any = NULL;
     uint32_t fw, fh;
     rtx_img_fit(e->info.w, e->info.h, w, h, &fw, &fh);
     for (be = e->bmps; be; be = be->next) {
-        uint32_t dw = be->w > fw ? be->w - fw : fw - be->w;
-        uint32_t dh = be->h > fh ? be->h - fh : fh - be->h;
+        uint32_t dw;
+        uint32_t dh;
+        if (be->pix != pix) continue;
+        dw = be->w > fw ? be->w - fw : fw - be->w;
+        dh = be->h > fh ? be->h - fh : fh - be->h;
         if (dw * 10 <= fw && dh * 10 <= fh) {
             best = be;
             break;
@@ -2057,6 +2068,7 @@ static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, RtxImgBmpEnt
         best->ent = e;
         best->w = fw;
         best->h = fh;
+        best->pix = pix;
         best->next = e->bmps;
         e->bmps = best;
     }
@@ -2077,6 +2089,10 @@ static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, RtxImgBmpEnt
 }
 
 int rtx_img_want(const RtxImgSrc *src, uint32_t w, uint32_t h, RtxImgView *v) {
+    return rtx_img_want_pix(src, w, h, RTX_IMG_PIX_BGRA_PREMUL, v);
+}
+
+int rtx_img_want_pix(const RtxImgSrc *src, uint32_t w, uint32_t h, int pix, RtxImgView *v) {
     RtxImgView tmp;
     ImgEnt *e;
     RtxImgBmpEnt *best = NULL, *any = NULL;
@@ -2088,10 +2104,11 @@ int rtx_img_want(const RtxImgSrc *src, uint32_t w, uint32_t h, RtxImgView *v) {
         /* The decode follows the header without another ask. */
         e->want_w = w;
         e->want_h = h;
+        e->want_pix = pix;
         e->want_epoch = g_epoch;
         return v->state;
     }
-    best = img_bmp_for(e, w, h, &any);
+    best = img_bmp_for(e, w, h, pix, &any);
     if (!best) return v->state;
     if (best->state == IMG_B_QUEUED) img_schedule();
     if (best->state == IMG_B_ERR) {
@@ -2258,6 +2275,45 @@ void rtx_img_plat_set(RtxImgBmpEnt *be, uint32_t frame, void *obj, void (*free_f
 uint64_t rtx_img_held(void) { return g_held; }
 size_t rtx_img_nbmp(void) { return g_nbmp; }
 size_t rtx_img_fetches(void) { return g_nfetch; }
+
+/* ---- terminal picture rows --------------------------------------------- */
+
+static int g_cells_on;
+static uint32_t g_cell_w = 8, g_cell_h = 16, g_cell_rows = 20;
+
+void rtx_img_cells_set(int on, uint32_t cw, uint32_t ch, uint32_t max_rows) {
+    g_cells_on = on != 0;
+    g_cell_w = cw ? cw : 8;
+    g_cell_h = ch ? ch : 16;
+    g_cell_rows = max_rows ? max_rows : 20;
+}
+
+int rtx_img_cells_on(void) {
+    return g_cells_on;
+}
+
+void rtx_img_cells_px(uint32_t *cw, uint32_t *ch) {
+    if (cw) *cw = g_cell_w;
+    if (ch) *ch = g_cell_h;
+}
+
+void rtx_img_cell_box(uint32_t iw, uint32_t ih, int have, uint32_t cols, uint32_t *bc,
+                      uint32_t *br) {
+    uint32_t mh = rtx_img_limits()->max_h, fw = 0, fh = 0;
+    if (cols < 1) cols = 1;
+    if (mh > g_cell_rows * g_cell_h) mh = g_cell_rows * g_cell_h;
+    if (!have || !iw || !ih) {
+        *bc = cols < 45 ? cols : 45;
+        *br = 3;
+        return;
+    }
+    rtx_img_fit(iw, ih, cols * g_cell_w, mh, &fw, &fh);
+    *bc = (fw + g_cell_w - 1) / g_cell_w;
+    *br = (fh + g_cell_h - 1) / g_cell_h;
+    if (*bc < 1) *bc = 1;
+    if (*br < 1) *br = 1;
+    if (*bc > cols) *bc = cols;
+}
 
 void rtx_img_reset(void) {
     size_t i;

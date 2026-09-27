@@ -46,6 +46,36 @@ if pyte is not None:
     pyte.Screen.delete_lines = _pyte_delete_lines
 
 
+def strip_strings(b):
+    """Drop ESC _ .. ST, ESC P .. ST and ESC ] 1337 .. BEL/ST strings (the
+    pictures and the terminal queries) so pyte sees only the text."""
+    out = bytearray()
+    i, n = 0, len(b)
+    while i < n:
+        if b[i] == 0x1b and i + 1 < n and (b[i + 1] in b"_P" or
+                                           b[i + 1:i + 6] == b"]1337"):
+            j = i + 2
+            while j < n:
+                if b[j] == 0x07 and b[i + 1] == 0x5d:
+                    j += 1
+                    break
+                if b[j] == 0x1b and j + 1 < n and b[j + 1] == 0x5c:
+                    # tmux passthrough doubles inner ESCs: ESC ESC \ is
+                    # not the end.
+                    if b[i + 1] == 0x50 and b[i + 2:i + 7] == b"tmux;" and \
+                            b[j - 1] == 0x1b:
+                        j += 2
+                        continue
+                    j += 2
+                    break
+                j += 1
+            i = j
+            continue
+        out.append(b[i])
+        i += 1
+    return bytes(out)
+
+
 class Tui:
     """jobctl: run the editor as a foreground job below a waiting parent,
     the way a shell does, so SIGTSTP can stop it (a session leader's own
@@ -149,7 +179,9 @@ class Tui:
             return None
         sc = pyte.Screen(self.cols, self.rows)
         st = pyte.ByteStream(sc)
-        st.feed(bytes(self.out))
+        # pyte prints APC / DCS / OSC 1337 payloads (kitty graphics, sixel,
+        # iTerm2 images, the startup queries) as text; a terminal does not.
+        st.feed(strip_strings(bytes(self.out)))
         return sc
 
 
@@ -2205,7 +2237,10 @@ def case_image_placeholder(exe, tmp):
     path = os.path.join(proj, "doc.md")
     with open(path, "wb") as f:
         f.write(body)
-    t = Tui(exe, [path], {"RTX_SAFE_HOME": os.path.join(tmp, "safe_img")})
+    # tui_images off: every image is its text stand-in (the pictures have
+    # their own cases below).
+    t = Tui(exe, [path], {"RTX_SAFE_HOME": os.path.join(tmp, "safe_img"),
+                          "RTX_TUI_IMAGES": "off"})
     shots = {}
     try:
         t.pump(1.0)

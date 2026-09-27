@@ -57,7 +57,7 @@ CC_TARGET_INCLUDE rtx_scope .
 CC_TARGET rtx_rx obj core/rx.ccs
 CC_TARGET_INCLUDE rtx_rx .
 
-CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c
+CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c core/img_term.c
 CC_TARGET_INCLUDE rtx_img .
 CC_TARGET_DEPS rtx_img rtx_safe
 
