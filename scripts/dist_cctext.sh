@@ -51,6 +51,18 @@ rm -rf "$stage"
 mkdir -p "$stage/grammars"
 cp bin/cctext "$stage/cctext"
 chmod +x "$stage/cctext"
+# The sandboxed SVG renderer and its font pack (./make.shcc @cctext builds
+# them): the editors look for cctext-render beside themselves.
+if [[ ! -x bin/cctext-render || ! -f bin/cctext-render.pack ]]; then
+    ./make.shcc @cctext_render
+fi
+if [[ ! -x bin/cctext-render || ! -f bin/cctext-render.pack ]]; then
+    echo "dist_cctext: bin/cctext-render or its pack missing" >&2
+    exit 1
+fi
+cp bin/cctext-render "$stage/cctext-render"
+cp bin/cctext-render.pack "$stage/cctext-render.pack"
+chmod +x "$stage/cctext-render"
 if [[ "$have_ui" == 1 ]]; then
     cp bin/cctext-ui "$stage/cctext-ui"
     chmod +x "$stage/cctext-ui"
@@ -73,6 +85,8 @@ cp testdata/grammars/*.tmLanguage.json "$stage/grammars/"
     fi
     echo
     echo "Grammars load from ./grammars next to the binary."
+    echo "cctext-render (+ cctext-render.pack) draws SVG images in a sandboxed process;"
+    echo "keep it in the same folder."
     if command -v ccc >/dev/null 2>&1; then
         echo
         echo "Built with: $(ccc --version 2>/dev/null | head -1)"

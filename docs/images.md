@@ -5,6 +5,9 @@ browse preview and in an image viewer (phase 1); cctext paints them in
 the same places with the kitty graphics protocol, sixel, iTerm2 inline
 images or Unicode block art, whichever the terminal answers for, else
 the text stand-in `[image: alt WxH]` (phase 2, [Terminal](#terminal-cctext)).
+SVG goes through the same cache and surfaces, rendered by a separate
+sandboxed process, `cctext-render`
+([Renderer](#svg-the-renderer-cctext-render)).
 
 Bytes stay the truth. `![alt](path)` stays in the file exactly as typed;
 the picture is a painted stand-in over those bytes (the Rich lens, the
@@ -21,6 +24,9 @@ shim), `core/layout.ccs` (stand-ins and picture rows),
 (terminal stand-ins, prompt, picture rows, viewer, slides),
 `frontend/cctext_img.ccs` (terminal detection, encode cache and jobs,
 overlays, kitty ids), `core/img_term.c` / `.h` (terminal encoders).
+SVG: `core/img_svg.c` / `.h` (the helper process, its protocol, the
+content-hash cache), `render/` (the helper), `scripts/render_build.cch`
+(its build).
 
 ## Decoder
 
@@ -370,6 +376,192 @@ view is flipped — **not built or run here** (no macOS in this
 environment). Windows: a stub (placeholders only). One platform image is
 kept per decoded bitmap (per frame when animated) and freed with it.
 
+## SVG: the renderer (cctext-render)
+
+SVG is a program-like format (a parser, CSS, text layout, a rasterizer
+with fixed-point geometry): none of it runs in the editor. A separate
+helper, `cctext-render`, parses and draws; it is locked down before it
+reads its first request, and the editor treats everything it sends as
+untrusted. This is step 1 of the renderer plan (C / C++ only); TeX /
+MathML (MathJax in QuickJS) and Mermaid are later steps, and the
+protocol and the pack already have room for them.
+
+**Engine.** [lunasvg](https://github.com/sammycage/lunasvg) 3.5.0
+(`cf3594d`, MIT) over [plutovg](https://github.com/sammycage/plutovg)
+1.3.3 (MIT), vendored in `third_party/lunasvg` and `third_party/plutovg`
+with readable cctext patches (`patches/`, each with its reason; pins in
+`README.cctext.md`): `<switch>` / `systemLanguage` / `requiredExtensions`
+(draw.io labels), a 256-level nesting cap, the nested-`<svg>` viewport
+resolved in O(depth) (was 2^depth: 25 levels took 3.5 s), family names
+matched case-insensitively, bounded offscreen canvases; in plutovg,
+coordinates clamped before the fixed-point stroker, over-dense dashes
+drawn solid, non-finite curves drawn as chords (the fuzz findings below).
+Built with `LUNASVG_DISABLE_EXTERNAL_RESOURCES`: an `<image
+href="file:…">`, `http:` or relative href is never opened and renders as
+missing; a `data:` image inside the SVG is decoded by plutovg's
+stb_image, inside the sandbox, capped at 16384 px a side.
+
+**Fonts.** Only what is bundled: Noto Sans Regular / Bold / Italic, Noto
+Serif, Noto Sans Mono 2.0 (OFL, `third_party/fonts`). No system font
+discovery. A `font-family` list is walked in order; generic families
+(`sans-serif`, `serif`, `monospace`, `system-ui`, `cursive`, …) and the
+names drawing tools write (Arial, Helvetica, Verdana, Segoe UI, Times New
+Roman, Georgia, Courier New, Menlo, Consolas, DejaVu Sans, …) map to the
+bundled faces (`render/cr_svg.cpp`); anything else falls back to Noto
+Sans.
+
+**Build.** Only a C / C++ compiler and ccc: `./make.shcc @cctext_render`
+(`@cctext` and `@cctext_ui` run it first) spawns `$CC` / `$CXX` (default
+`cc` / `c++`) directly from `scripts/render_build.cch` — ccc builds C
+only, and no make, cmake, meson or shell script is involved — one
+compile per CPU, rebuilt when a source, a header or the flags change.
+The helper then builds its own font pack: `bin/cctext-render
+--build-pack render/manifest.txt bin/cctext-render.pack` (every entry
+zlib-compressed with stb's deflate and checked by a round trip through
+Wuffs, which inflates it at run time; an FNV-1a trailer guards the file).
+Outputs: `bin/cctext-render` (≈ 450 KiB stripped), the pack (1.3 MiB) and
+`bin/cctext-render-selftest` (tests only). `@dist_cctext` packs the
+helper and its pack beside the editors; the editor looks for the helper
+beside its own binary (`RTX_RENDER_BIN` overrides; `../bin/` is tried for
+`bin-asan/` builds).
+
+**Protocol** (`render/cr_proto.h`). Framed, little-endian, one request at
+a time over a socketpair on the helper's stdin / stdout. After lockdown
+the helper sends a hello (version, the kinds it carries, sandboxed or
+not). A request (`CRQ1`, 44 bytes, then the payload) carries a generation
+stamp, a kind (SVG; TeX / MathML / Mermaid reserved), flags (size only),
+the output box or a scale, a pixel cap and the payload length. The helper
+answers **SIZE** (the CSS size) or **ERROR**; then, unless size-only,
+**PIXELS** (premultiplied RGBA8 at exactly the box) or **ERROR**. A frame
+it cannot parse (bad magic, a length over 64 MiB) ends the process; EOF
+ends it cleanly.
+
+**Sandbox.**
+
+- Linux (`render/sandbox_linux.c`): after the fds above 2 are closed, the
+  pack read, the fonts registered and the engine warmed once (lazy
+  statics initialise before the lockdown): `RLIMIT_AS` 2 GiB,
+  `RLIMIT_CPU` 600 s over the process's life, `RLIMIT_NOFILE` /
+  `RLIMIT_NPROC` / `RLIMIT_CORE` 0 (no `RLIMIT_FSIZE`: stderr may be a
+  log the editor owns), `no_new_privs`, then a seccomp-bpf filter (raw
+  BPF): `read` on fd 0 only, `write` on fds 1 / 2 only, memory
+  (`mmap` / `mprotect` without `PROT_EXEC`, `munmap`, `mremap`,
+  `madvise`, `brk`), `futex`, signal return / mask, clocks, `getrandom`,
+  `close`, `fstat`, `lseek`, `exit`; `open` / `openat` / `stat` / `access`
+  / `readlink` fail with `EACCES`; everything else — `socket`, `execve`,
+  `fork` / `clone`, `ptrace`, an executable mapping, a read of any other
+  fd, the x32 ABI — kills the process (`SIGSYS`).
+- macOS (`render/sandbox_darwin.c`): the same rlimits (`RLIMIT_DATA`
+  where XNU ignores `RLIMIT_AS`) and `sandbox_init` with a deny-default
+  SBPL profile allowing only `sysctl-read` and signals to itself (open
+  descriptors keep working: Seatbelt checks at open). **Written against
+  the documented API and not built or run here** (no macOS in this
+  environment): the first macOS build must run the self-tests and
+  `svg_smoke` before it ships.
+- Windows (`render/sandbox_other.c`, `core/img_svg.c`): no launcher yet
+  (AppContainer is the plan), so no helper is spawned and every SVG is a
+  placeholder ("SVG renderer not available on this platform yet"); a
+  helper built there says so in its hello and refuses every request.
+
+**The editor side** (`core/img_svg.c`, plain C). A pool of one helper,
+spawned lazily by the first SVG (from a background job, never the UI
+thread), kept for the next ones, and told to quit at exit (it also exits
+on EOF when the editor dies). Its environment is empty (nothing of the
+editor's leaks into the process that parses untrusted input). Requests
+are serialized; each has a generation stamp. The **time budget** is the
+editor's (`svg_timeout_ms`, 5 s): past it the helper is killed and the
+next SVG respawns one; a crash (EOF or a broken frame) is reported the
+same way (an old helper that dies is retried once on a fresh one, in
+case it died of `RLIMIT_CPU` old age). **Cancel** (the paint pass no
+longer wants the picture) returns at once and leaves the helper working;
+its late reply carries the old stamp and the next request drops it.
+
+**Caches.** Keyed by the content (FNV-1a 64 of the bytes and their
+length), so the same SVG under two names is one entry: the intrinsic
+size in memory and, in the Safe home (`<safe>/img/svg/`), a `.size`
+file and one `.px` file per rendered size (RLE of premultiplied pixels,
+FNV trailer; a corrupt file is ignored). Sizes and pixels are separate
+files, so laying out a cached SVG reads only its size: a later session
+lays out and paints cached SVGs without starting the helper. Oldest
+files go past `svg_cache_mb` (64 MiB; 0 turns the disk cache off).
+
+**In the image cache.** An SVG is sniffed from its bytes (a BOM, blanks,
+an XML declaration, comments or a DOCTYPE with an internal subset, then
+`<svg`), not its name, so `data:image/svg+xml` URIs and files without the
+extension work. It is `RTX_IMG_FMT_SVG` in `core/img.ccs`: the header
+probe is a size-only request (the whole file, within `svg_file_mb`), the
+decode renders at the display box — scaled up as well as down (a vector
+stays sharp), within `svg_max_mp` and the side limit (past them it
+renders smaller and the blit scales) — and the pixels are converted to
+the layout the caller keeps (BGRA premultiplied for the GUI, straight
+RGBA for a terminal protocol). Everything else is the raster path:
+the permission rules (project root, the allow file / dir / ALL prompt,
+remote consent, `data:` URIs), the pixel budget and LRU, the jobs
+(visible first, cancelled when scrolled away), the placeholders.
+
+**Surfaces.** Everywhere raster images work: `![](x.svg)` in the Rich
+lens (a picture row; its box from the size, so nothing moves when the
+pixels arrive), slides (content and `![bg]`), the browse preview, and the
+viewer. **An `.svg` file opens as text** (it is text, and usually opened
+to edit); `Ctrl-D` (Rich / Source) swaps the pane to its picture and
+back, with the viewer's zoom keys (a zoom re-renders sharp) — the
+preview shows the file on disk, so save to see an edit. cctext (the
+terminal) shows the stand-in `[image: alt WxH]` until terminal graphics
+land. SVGs draw as they are; in cctext-ui's dark panes a light backing
+plate goes under them (`svg_backing`, default on; slides paint their own
+background and skip it), since many SVGs are dark lines on transparency.
+
+**Limits** (`settings.json`):
+
+| Limit | Default | Setting |
+|---|---|---|
+| SVG bytes one render may carry | 16 MiB | `svg_file_mb` |
+| Rendered pixels | 16 megapixels | `svg_max_mp` |
+| One render (then killed) | 5000 ms | `svg_timeout_ms` |
+| Disk cache (sizes + pixels) | 64 MiB | `svg_cache_mb` (0 = off) |
+| Backing plate in dark panes | on | `svg_backing` |
+
+The helper's own ceilings sit above these: 64 MiB of input, 64 megapixels
+and 32768 px a side per request, 2 GiB of address space.
+
+**Measured** (Linux x86-64, this container; `python3
+bench/render_client.py bench`, best of noisy runs): spawn to ready
+(fonts inflated and registered, sandbox on) **13.6 ms** median; warm
+size-only 0.1–0.9 ms and size + pixels **1–5 ms** per sample SVG
+(402 × 232 draw.io-shaped 1.2 ms, 461 × 288 matplotlib 2.5 ms, 569 × 450
+Mermaid pie 5.3 ms); helper RSS 7.6 MiB after hello, 10.2 MiB after the
+samples. `svg_smoke` sees the same through the editor's client.
+
+**Fuzzing.** `render/cr_fuzz.c` runs the same backend in process under
+ASan + UBSan (`bin/cctext-render-fuzz`) over `testdata/svg` with bit
+flips, truncations, duplicated chunks, extreme numbers (1e38, NaN, inf),
+deep nesting, self / mutual references, splices, attribute garbage and
+nested percentage `<svg>`. `@smoke` runs 400 mutants; `./make.shcc
+@render_fuzz` runs `RENDER_FUZZ_ITERS` (20000; `RENDER_FUZZ_SEED`).
+Findings, all fixed by the patches above: signed overflows in plutovg's
+CORDIC / MulDiv / rasterizer on huge coordinates, a `memcpy` from NULL,
+an int overflow from 1e-38 dashes, a NULL surface dereference after a
+failed 4 GiB group canvas, and a 16 s render from a curve at FLT_MAX.
+Three runs of 20000 are clean; the slowest mutant takes seconds under
+ASan, which is what the editor's time budget is for.
+
+**Follow-ups** (not in this step):
+
+- lunasvg gaps: **filters** (`<filter>` is ignored: content draws
+  unfiltered), **kerning** (none; text is a little wider than a
+  browser's), **per-glyph fallback** between faces plus a **CJK** face
+  (a glyph missing from the chosen face is a box), **synthetic bold /
+  italic** for Noto Serif and Noto Sans Mono (they use the regular face),
+  `<foreignObject>` (HTML labels are skipped; draw.io's `<switch>`
+  fallback text shows instead).
+- HiDPI: cctext-ui has no device scale yet; pixels are at 1x.
+- A pool larger than one; `.svgz`; previewing an unsaved SVG buffer.
+- The terminal's browse preview sniffs the first 32 bytes, so an SVG
+  whose root follows a prolog previews as text there (cctext-ui reads
+  2 KiB); left to the terminal-images work in `cctext_draw.ccs`.
+- Windows: the AppContainer launcher; macOS: run the self-tests.
+- Math (MathJax in QuickJS) and Mermaid through the same helper.
+
 ## Tests
 
 - `img_smoke` (`@smoke`): every format (sizes, quadrant colours,
@@ -438,14 +630,49 @@ kept per decoded bitmap (per frame when animated) and freed with it.
   `![bg left:40%]`, the viewer and its hex, the browse preview, and a
   remote image end to end (click, dialog via `RTX_UI_SCRIPT`, one fetch
   from a local server, the picture).
+- `svg_smoke` (`@smoke`; builds on `@cctext_render`): the seccomp
+  self-tests (`bin/cctext-render-selftest` with `CR_SELFTEST=socket`,
+  `exec`, `fork`, `mmapx`, `readfd`, `thread` each die of `SIGSYS`;
+  `open` gets `EACCES`); the protocol raw (hello, SIZE then PIXELS at the
+  box, the request's and the helper's pixel caps, parse / size / kind
+  errors with the helper serving on, bad magic and an oversized frame end
+  it with status 3, truncated frames end it cleanly); the client (no
+  helper before the first SVG, an input over the limit refused without a
+  spawn, lazy spawn once, sizes from memory, the time budget kills a
+  hanging render and the next request respawns, a crash likewise, a
+  cancelled request's late reply dropped by its stamp on the same
+  helper, a missing helper); the disk cache (a later "session" with no
+  helper binary lays out and paints from it, byte-identical; another
+  size needs the helper; a corrupted pixel file is ignored); hostile
+  input (40 nested percentage `<svg>` in well under a second, 100k
+  nested groups, external `file:` / `http:` references never fetched —
+  a listening socket sees no connection — and rendered as missing); the
+  seven samples against their reference PNGs (≤ 0.5 % of pixels more
+  than 24 levels off; they match exactly here); straight RGBA and BGRA
+  premultiplied from the same render; upscaling; SVG in the image cache
+  (sniffing, the permission rules, `data:image/svg+xml` base64 and
+  percent-encoded, a Rich picture row whose height is the same before and
+  after the pixels, the terminal stand-in).
+- `render/cr_fuzz.c` (`@smoke`: 400 mutants; `@render_fuzz`: 20000):
+  see [Fuzzing](#svg-the-renderer-cctext-render).
+- `tests/ui_svg_test.py` (Xvfb): an SVG picture in Rich Markdown, still
+  while idle, the backing plate under a transparent SVG, one helper
+  process that exits with the editor; an `.svg` opens as text and
+  `Ctrl-D` swaps its picture in and out; a slide's `![bg left:40%]`; the
+  browse preview. It saves `testdata/generated/ui_svg_markdown.png`.
+- Samples (`testdata/svg/samples`, our own content: a draw.io-shaped
+  diagram, matplotlib plots, Mermaid diagrams from our `.mmd` sources)
+  and their references are regenerated by `testdata/svg/gen_samples.py`
+  through the protocol; `bench/render_client.py bench` measures.
 
 ## Limits and leftovers
 
 - Reference-style images (`![a][ref]`) and HTML `<img>` are text.
 - An image inside a line of text in cctext-ui is the text stand-in, not
   a picture (only a line that is one image becomes a picture row).
-- No SVG, AVIF, HEIC, TIFF or lossy-WebP guarantee (Wuffs 0.4's WebP is
-  lossless; its VP8 support is partial).
+- No AVIF, HEIC, TIFF or lossy-WebP guarantee (Wuffs 0.4's WebP is
+  lossless; its VP8 support is partial). SVG goes through cctext-render
+  (its own follow-ups are listed there); no `.svgz`.
 - No scaled JPEG decode: the transient canvas is the full image.
 - The GUI's camera counts rows against 18 px slots (`GUI_ROW_H`) while a
   prose line is taller; with tall picture rows the caret can sit a few
