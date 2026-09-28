@@ -77,7 +77,7 @@ int main(void) {
 
 <!-- transition: reveal -->
 
-![bg left:40% fit](images/marp.png)
+![bg left:40% fit](../../docs/cctext-ui-linux.png)
 
 ## Split background
 
@@ -95,7 +95,7 @@ The image fills the left 40 %; the text keeps the right.
 
 **Bold**, *italic*, ~~strike~~, `code` and a [link](https://marp.app)
 
-![w:320](images/diagram.png)
+![w:320](../../docs/cctext-ui-linux-md.png)
 
 ---
 
