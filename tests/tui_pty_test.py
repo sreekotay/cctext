@@ -3535,7 +3535,116 @@ def case_mermaid_blocks(exe, tmp):
         t.kill()
 
 
+def case_math_blocks(exe, tmp):
+    """Math in the terminal (docs/images.md "Math"): RTX_TUI_IMAGES=blocks,
+    so a `$$` block is Unicode block art under its line with the block's
+    lines hidden; the caret into it shows the source with the formula
+    under it; typing keeps the old formula up until the new one lands;
+    inline math stays source (math_unicode off), or becomes Unicode text
+    for a simple formula with math_unicode on; nothing to do once
+    settled."""
+    if pyte is None:
+        print("skip: math blocks (no pyte)")
+        return
+    if not os.path.exists(os.path.join(os.path.dirname(exe), "cctext-render")):
+        print("skip: math blocks (no cctext-render)")
+        return
+    proj = os.path.join(tmp, "mtb")
+    os.makedirs(os.path.join(proj, ".git"), exist_ok=True)
+    body = (b"# Formula\n\nInline $x^2 + 1$ and $\\alpha \\le \\beta$ here.\n\n$$\n"
+            b"x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}\n$$\n\nAfter the block.\n" +
+            b"".join(b"line %d\n" % i for i in range(30)))
+    path = os.path.join(proj, "doc.md")
+    with open(path, "wb") as f:
+        f.write(body)
+    env = img_env(tmp, "mtb")
+    env["RTX_TUI_IMAGES"] = "blocks"
+    t = Tui(exe, ["--no-blink", path], env, fake=FakeTerm("silent"))
+
+    def art_rows(sc, y0, y1):
+        n = 0
+        for y in range(max(0, y0), min(sc.lines, y1)):
+            row = "".join(sc.buffer[y][x].data for x in range(sc.columns))
+            if any(ch in row for ch in "▀▄█"):
+                n += 1
+        return n
+    try:
+        t0 = time.time()
+        while time.time() - t0 < 2.0 and b"\x1b[?2026h" not in t.out:
+            t.pump(0.02)
+        t.pump(3.0)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        txt = "\n".join(sc.display)
+        top = find_row(sc, " 5 ")
+        after = find_row(sc, "After the block.")
+        check(top >= 0 and after > top + 2 and art_rows(sc, top, after) >= 2,
+              "math blocks: the formula is block art under line 5",
+              repr((top, after, art_rows(sc, top, after))) + "\n" + txt)
+        check("\\frac" not in txt and "$$" not in txt,
+              "math blocks: the block's lines are hidden")
+        # Rich hides the dollars as it hides other marks' delimiters.
+        check("x^2 + 1" in txt and "\\alpha \\le \\beta" in txt,
+              "math blocks: inline math stays source (math_unicode off)")
+        frames = t.out[t.out.find(b"\x1b[?2026h"):]
+        check(b"\x1b_G" not in frames and b"\x1bPq" not in frames,
+              "math blocks: no graphics escapes (cells only)")
+        mark = len(t.out)
+        c0 = proc_cpu(t.pid) if os.path.exists("/proc/self/stat") else 0
+        check_idle("math blocks: settled", t.pid, t.pump)
+        c1 = proc_cpu(t.pid) if os.path.exists("/proc/self/stat") else 0
+        check(len(t.out) == mark and c1 - c0 < 0.05, "math blocks: idle, no output",
+              repr((len(t.out) - mark, c1 - c0)))
+        # The caret into the block: the source, the formula under it.
+        t.send(b"\x1b[B" * 5, 0.8)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        close = find_row(sc, " 7 $$")
+        after = find_row(sc, "After the block.")
+        check(find_row(sc, "\\frac{-b") >= 0 and close >= 0 and after > close + 2 and
+              art_rows(sc, close + 1, after) >= 2,
+              "math blocks: the caret shows the source, the formula under it",
+              repr((close, after)) + "\n" + "\n".join(sc.display))
+        # Type into the formula: the old picture stays, then the new one.
+        t.send(b"\x1b[F + y", 0.12)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        close = find_row(sc, " 7 $$")
+        check(close > 0 and art_rows(sc, close + 1, close + 8) >= 2,
+              "math blocks: the old formula stays up while the source changes",
+              "\n".join(sc.display))
+        t.pump(2.0)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        close = find_row(sc, " 7 $$")
+        check(close > 0 and art_rows(sc, close + 1, close + 8) >= 2 and
+              "[math" not in "\n".join(sc.display),
+              "math blocks: the new formula lands", "\n".join(sc.display))
+        t.send(b"\x11", 0.3)
+        t.send(b"n", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    # math_unicode: a simple inline formula as Unicode text.
+    sp = os.path.join(proj, "settings.json")
+    with open(sp, "w") as f:
+        f.write('{"math_unicode": true}')
+    env = img_env(tmp, "mtu")
+    env["RTX_TUI_IMAGES"] = "off"
+    env["RTX_SETTINGS"] = sp
+    t = Tui(exe, ["--no-blink", path], env, fake=FakeTerm("silent"))
+    try:
+        t.pump(1.5)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        txt = "\n".join(sc.display)
+        check("x\u00b2 + 1" in txt and "\u03b1 \u2264 \u03b2" in txt and "$x^2" not in txt,
+              "math unicode: simple inline math as Unicode text", txt[:600])
+        check("\\frac{-b" in txt, "math unicode: no pictures here, the block stays source")
+        t.send(b"\x11", 0.3)
+        t.send(b"n", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
 CASES = {
+    "math_blocks": case_math_blocks,
     "image_idle": case_image_idle,
     "idle_threads": case_idle_threads,
     "image_viewer": case_image_viewer,

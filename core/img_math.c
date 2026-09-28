@@ -348,15 +348,15 @@ static void mu_expr(MuSt *m, size_t end, int stop_brace) {
             }
             {
                 /* A control word eats the blanks after it (TeX); keep one
-                 * where the source had one on both sides ("x \le y"), and
+                 * where the source had some ("\alpha \le \beta" reads
+                 * "α ≤ β"), unless a script or a group's end follows, and
                  * after an operator name before a letter ("\sin x"). */
-                int before = m->k > 0 && m->o[m->k - 1] == ' ';
                 int after = m->i < end && (m->s[m->i] == ' ' || m->s[m->i] == '\t');
                 mu_put(m, y->u);
                 mu_skip_ws(m);
-                if ((before && after && m->i < end) ||
-                    (mu_letter(y->u[0]) && m->i < end &&
-                     (mu_letter(m->s[m->i]) || m->s[m->i] == '\\')))
+                if (m->i < end && m->s[m->i] != '^' && m->s[m->i] != '_' && m->s[m->i] != '}' &&
+                    (after || (mu_letter(y->u[0]) &&
+                               (mu_letter(m->s[m->i]) || m->s[m->i] == '\\'))))
                     mu_putc(m, ' ');
             }
             continue;
