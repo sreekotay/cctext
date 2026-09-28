@@ -455,7 +455,7 @@ back to Noto Sans, and its CJK characters to the CJK face below.
   draws as glyphs, not boxes. The CJK face is Noto Sans SC Regular subset
   to GB 2312 + JIS X 0208 (9,788 ideographs), kana, CJK punctuation and
   full-width forms (`third_party/fonts/subset_cjk.py`, deterministic):
-  Simplified Chinese glyph shapes, no Hangul; +2.3 MiB in the pack. It is
+  Simplified Chinese glyph shapes, no Hangul; +2.0 MiB in the pack (3.4 MB raw). It is
   a fallback only (not a family), inflated from the pack the first time a
   glyph reaches it (a face over 1 MiB is loaded lazily: `fonts_init`), so
   a helper that never meets CJK pays nothing for it at spawn.
@@ -479,7 +479,8 @@ inflates it at run time; format `CRPK0003`: the table of
 names, lengths and offsets at the front, guarded by an FNV-1a trailer;
 the helper maps the file read-only and pages in only what it uses).
 Outputs: `bin/cctext-render` (1.45 MiB stripped: ≈ 535 KiB of it
-the SVG engine, the rest QuickJS), the pack (PACKSIZE —
+the SVG engine, the rest QuickJS), the pack (8.9 MiB: 3.1 MiB of fonts, 2.0 MiB of them CJK, 2.2 MiB of
+Mermaid bytecode, 3.6 MiB of math —
 [Mermaid](#mermaid) has the two-step build, [Math](#math) the breakdown)
 and
 `bin/cctext-render-selftest` (tests only). `@dist_cctext` packs the
@@ -715,7 +716,7 @@ is 6.15 MB raw and 2.26 MB packed, `js:math` 1.59 and 0.61 MB. Together:
 
 | | before | now |
 |---|---|---|
-| `bin/cctext-render.pack` | 11,393,329 B (10.9 MiB) | 7,211,183 B (6.9 MiB) |
+| `bin/cctext-render.pack` | 11,393,329 B (10.9 MiB) | 7,211,183 B (6.9 MiB); 9,323,242 B (8.9 MiB) with the CJK font added later |
 | `--build-pack` wall time | 5.5–6.0 s | 4.1–4.3 s (less bytecode to write outweighs the slower encoder) |
 | Mermaid engine: bytecode inflate / start / first pie | 30–32 / 59–65 / 153–162 ms | 22–23 / 54–55 / 132–137 ms |
 | Math engine: bytecode inflate / first formula | 6.0–6.2 / 43–46 ms | 5.3–5.6 / 38–40 ms |
