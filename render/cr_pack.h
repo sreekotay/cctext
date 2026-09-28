@@ -10,12 +10,16 @@
  * them at run time, checking each stream's Adler-32). Names:
  *   font:<family>:<bold>:<italic>   a TrueType face (family lowercase)
  *   js:<bundle>                     QuickJS bytecode (render/js + third_party)
+ *   src:<key>                       JavaScript source a bundle loads on
+ *                                   demand (math: MathJax's TeX extensions
+ *                                   and dynamic font files)
  *
- * The FNV trailer catches a damaged file. A js: entry is also checked
- * against the SHA-256 of its stored bytes compiled into the helper
+ * The FNV trailer catches a damaged file. A js: or src: entry is also
+ * checked against the SHA-256 of its stored bytes compiled into the helper
  * (CR_PACK_JS_HASHES, a header the build step writes) before QuickJS
  * reads it: bytecode is trusted input to QuickJS, never to be read from
- * anything but the pack this build made.
+ * anything but the pack this build made (and source is held to the same
+ * rule, so everything the engines run is what this build pinned).
  */
 #ifndef CR_PACK_H
 #define CR_PACK_H
@@ -40,6 +44,8 @@ int cr_pack_open(CrPack *p, const uint8_t *buf, size_t n);
 CrAsset *cr_pack_find(CrPack *p, const char *name);
 /* Inflated bytes (raw_len of them), or NULL when the stream is corrupt. */
 const uint8_t *cr_asset_data(CrAsset *a);
+/* Free the inflated copy (the next cr_asset_data inflates again). */
+void cr_asset_drop(CrAsset *a);
 
 /* zlib, for the build step (stb) and tests. The result is malloc'd. */
 uint8_t *cr_zlib_compress(const uint8_t *in, size_t n, size_t *out_n);

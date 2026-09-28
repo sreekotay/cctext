@@ -16,11 +16,11 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# CrReq v2: magic id kind flags reserved scale em_px fg bg box_w box_h max_px len budget_ms node_max
+# CrReq v2: magic id kind flags max_w scale em_px fg bg box_w box_h max_px len budget_ms node_max
 REQ = struct.Struct('<IIBBHffIIIIIIII')
 REP = struct.Struct('<IIII')
 MAGIC_REQ, MAGIC_REP = 0x32515243, 0x31535243
-K_SVG, K_MERMAID, K_STATS = 1, 4, 5
+K_SVG, K_TEX, K_MML, K_MERMAID, K_STATS = 1, 2, 3, 4, 5
 R_HELLO, R_SIZE, R_PIXELS, R_ERROR, R_INFO = 0, 1, 2, 3, 4
 MMD = os.path.join(ROOT, 'testdata', 'mermaid')
 TYPES = ['flowchart', 'sequence', 'class', 'state', 'gantt', 'pie', 'er']
@@ -51,18 +51,18 @@ class Helper:
         return typ, rid, self._read(ln)
 
     def send(self, src, kind=K_SVG, flags=0, scale=1.0, box=(0, 0), max_px=0, bg=0, rid=None,
-             budget_ms=0, node_max=0):
+             budget_ms=0, node_max=0, em=16.0, fg=0x000000ff, max_w=0):
         if rid is None:
             self.id += 1
             rid = self.id
         b = src if isinstance(src, bytes) else src.encode()
-        self.p.stdin.write(REQ.pack(MAGIC_REQ, rid, kind, flags, 0, scale, 16.0, 0, bg,
+        self.p.stdin.write(REQ.pack(MAGIC_REQ, rid, kind, flags, max_w, scale, em, fg, bg,
                                     box[0], box[1], max_px, len(b), budget_ms, node_max) + b)
         self.p.stdin.flush()
         return rid
 
-    def render(self, src, size_only=False, **kw):
-        rid = self.send(src, flags=4 if size_only else 0, **kw)
+    def render(self, src, size_only=False, flags=0, **kw):
+        rid = self.send(src, flags=flags | (4 if size_only else 0), **kw)
         out = {}
         while True:
             typ, got, payload = self._frame()
@@ -87,6 +87,13 @@ class Helper:
             opts['themeVariables'] = variables
         payload = json.dumps(opts, separators=(',', ':')) + '\n' + src
         return self.render(payload, size_only=size_only, kind=K_MERMAID, scale=scale,
+                           node_max=node_max, budget_ms=budget_ms, **kw)
+
+    def math(self, src, mml=False, display=True, size_only=False, em=16.0, fg=0x000000ff,
+             max_w=0, node_max=0, budget_ms=0, **kw):
+        """TeX (or MathML) -> SIZE (w, h, baseline from the bottom) + PIXELS."""
+        return self.render(src, size_only=size_only, kind=K_MML if mml else K_TEX,
+                           flags=1 if display else 0, em=em, fg=fg, max_w=max_w,
                            node_max=node_max, budget_ms=budget_ms, **kw)
 
     def stats(self):

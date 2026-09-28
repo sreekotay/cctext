@@ -30,6 +30,7 @@
 #define CR_PACK_MAGIC "CRPK0002"
 #define CR_PACK_MAX_ENTRIES 4096u
 #define CR_PACK_MAX_RAW (256u << 20)
+#define CR_PACK_BUILD_MAX 512 /* manifest entries one build takes */
 
 static uint64_t cr_fnv(const uint8_t *p, size_t n)
 {
@@ -139,6 +140,12 @@ const uint8_t *cr_asset_data(CrAsset *a)
     return o;
 }
 
+void cr_asset_drop(CrAsset *a) {
+    if (!a) return;
+    free(a->raw);
+    a->raw = NULL;
+}
+
 /* ---- build step ------------------------------------------------------ */
 
 static uint8_t *cr_slurp(const char *path, size_t *n)
@@ -203,6 +210,34 @@ static int cr_is_hex64(const char *h)
     return h[64] == 0;
 }
 
+/* A manifest input read whole; with `hash` ("sha256=<hex>") refused
+ * unless its SHA-256 matches (a vendored file that is not the pinned one). */
+static uint8_t *cr_slurp_pinned(const char *manifest, const char *path, const char *hash,
+                                size_t *n) {
+    uint8_t *d = cr_slurp(path, n);
+    char got[65];
+    if (!d) {
+        fprintf(stderr, "build-pack: cannot read %s\n", path);
+        return NULL;
+    }
+    if (!hash) return d;
+    if (strncmp(hash, "sha256=", 7) != 0 || !cr_is_hex64(hash + 7)) {
+        fprintf(stderr, "build-pack: %s: bad hash field %s\n", manifest, hash);
+        free(d);
+        return NULL;
+    }
+    cr_sha256_hex(d, *n, got);
+    if (strcmp(got, hash + 7) != 0) {
+        fprintf(stderr,
+                "build-pack: %s: SHA-256 %s, the manifest records %s: refusing a file that is "
+                "not the vendored one\n",
+                path, got, hash + 7);
+        free(d);
+        return NULL;
+    }
+    return d;
+}
+
 /* The hash header: rewritten only when its text changes (the helper's
  * main object depends on its mtime). */
 static int cr_write_hash_header(const char *path, const char *rows)
@@ -256,15 +291,26 @@ static int cr_write_hash_header(const char *path, const char *rows)
  *   bundle|<name>                  start a JavaScript bundle (entry js:<name>)
  *   raw|<path>[|sha256=<hex>]      append a file verbatim (and a ";\n"),
  *                                  refusing it unless its SHA-256 matches
+ *   wrap|<key>|<path>[|sha256=<hex>]
+ *                                  append the file verbatim as the body of
+ *                                  __cctextMods["<key>"] = function () {...};
+ *                                  (a module the bundle's own loader runs on
+ *                                  demand: MathJax's components)
  *   end                            compile the bundle to QuickJS bytecode
+ *   src|<key>|<path>[|sha256=<hex>]
+ *                                  (outside a bundle) the file's bytes as
+ *                                  entry src:<key>: JavaScript source the
+ *                                  helper evaluates only when a render asks
+ *                                  for it (MathJax's TeX extensions and
+ *                                  dynamic font files); never bytecode
  * `compile` turns a bundle's source into bytecode (cr_js_compile); NULL
  * refuses bundles. `hash_hdr` (may be NULL) receives a C header with the
- * SHA-256 of every js: entry's stored bytes (cr_pack.h). */
+ * SHA-256 of every js: and src: entry's stored bytes (cr_pack.h). */
 int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile compile,
                   const char *hash_hdr)
 {
     FILE *m = fopen(manifest, "r"), *o;
-    CrPackIn in[256];
+    CrPackIn in[CR_PACK_BUILD_MAX];
     int nin = 0, rc = 1;
     char line[4096], tmp[4096], bundle[128];
     size_t total_raw = 0, total_comp = 0;
@@ -283,7 +329,7 @@ int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile comp
         line[strcspn(line, "\r\n")] = 0;
         if (!line[0] || line[0] == '#') continue;
         while (nf < 6 && (t = strsep(&p, "|"))) f[nf++] = t;
-        if (nin >= 256) {
+        if (nin >= CR_PACK_BUILD_MAX) {
             fprintf(stderr, "build-pack: too many entries\n");
             goto out;
         }
@@ -293,33 +339,41 @@ int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile comp
             in_bundle = 1;
         } else if (strcmp(f[0], "raw") == 0 && (nf == 2 || nf == 3) && in_bundle) {
             size_t n = 0;
-            uint8_t *d = cr_slurp(f[1], &n);
-            if (!d) {
-                fprintf(stderr, "build-pack: cannot read %s\n", f[1]);
-                goto out;
-            }
-            if (nf == 3) {
-                char got[65];
-                if (strncmp(f[2], "sha256=", 7) != 0 || !cr_is_hex64(f[2] + 7)) {
-                    fprintf(stderr, "build-pack: %s: bad hash field %s\n", manifest, f[2]);
-                    free(d);
-                    goto out;
-                }
-                cr_sha256_hex(d, n, got);
-                if (strcmp(got, f[2] + 7) != 0) {
-                    fprintf(stderr,
-                            "build-pack: %s: SHA-256 %s, the manifest records %s: refusing a file "
-                            "that is not the vendored one\n",
-                            f[1], got, f[2] + 7);
-                    free(d);
-                    goto out;
-                }
-            }
+            uint8_t *d = cr_slurp_pinned(manifest, f[1], nf == 3 ? f[2] : NULL, &n);
+            if (!d) goto out;
             if (cr_sb_add(&src, d, n) != 0 || cr_sb_add(&src, "\n;\n", 3) != 0) {
                 free(d);
                 goto out;
             }
             free(d);
+        } else if (strcmp(f[0], "wrap") == 0 && (nf == 3 || nf == 4) && in_bundle) {
+            size_t n = 0;
+            char head[640];
+            int hn;
+            uint8_t *d;
+            if (strpbrk(f[1], "\"\\") || !f[1][0]) {
+                fprintf(stderr, "build-pack: %s: bad module key %s\n", manifest, f[1]);
+                goto out;
+            }
+            d = cr_slurp_pinned(manifest, f[2], nf == 4 ? f[3] : NULL, &n);
+            if (!d) goto out;
+            hn = snprintf(head, sizeof head, "\n;__cctextMods[\"%s\"] = function () {\n", f[1]);
+            if (hn <= 0 || (size_t)hn >= sizeof head || cr_sb_add(&src, head, (size_t)hn) != 0 ||
+                cr_sb_add(&src, d, n) != 0 || cr_sb_add(&src, "\n};\n", 4) != 0) {
+                free(d);
+                goto out;
+            }
+            free(d);
+        } else if (strcmp(f[0], "src") == 0 && (nf == 3 || nf == 4) && !in_bundle) {
+            char nm[512];
+            size_t n = 0;
+            uint8_t *d = cr_slurp_pinned(manifest, f[2], nf == 4 ? f[3] : NULL, &n);
+            if (!d) goto out;
+            snprintf(nm, sizeof nm, "src:%s", f[1]);
+            in[nin].name = strdup(nm);
+            in[nin].raw = d;
+            in[nin].raw_len = n;
+            nin++;
         } else if (strcmp(f[0], "end") == 0 && nf == 1 && in_bundle) {
             char nm[160], err[512];
             uint8_t *bc = NULL;
@@ -401,7 +455,7 @@ int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile comp
                 goto out;
             }
         }
-        if (strncmp(in[i].name, "js:", 3) == 0) {
+        if (strncmp(in[i].name, "js:", 3) == 0 || strncmp(in[i].name, "src:", 4) == 0) {
             char hx[65], ln[256];
             int k;
             cr_sha256_hex(c, cn, hx);

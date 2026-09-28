@@ -37,9 +37,24 @@
  * STATS answers one INFO frame (a line of JSON: engine starts, recycles,
  * heap, cache hits) for tests and benchmarks.
  *
- * Kinds 2-3 (TeX, MathML) are reserved for the next step of the renderer
- * plan: a helper answers ERROR CR_E_KIND for a kind it does not carry
- * (its hello lists what it does).
+ * MATH_TEX / MATH_MML (docs/images.md, "Math"): the payload is the
+ * formula's source (TeX without delimiters, or a MathML <math> element).
+ * The header carries the options: CR_F_DISPLAY (display style, else
+ * inline), em_px (the font size the formula is set at), fg (0xRRGGBBAA:
+ * what MathJax's currentColor becomes), max_w (CSS px a display formula
+ * may take before MathJax breaks its lines; 0: none), node_max (refuse a
+ * formula with more MathML nodes: CR_E_TOO_LARGE, "formula too large (N
+ * nodes, limit M)") and budget_ms (the script's time; CR_E_TIMEOUT). The
+ * helper runs MathJax 4 in QuickJS (its own engine, lazily started),
+ * rasterizes the SVG with lunasvg and answers SIZE (baseline_css: the
+ * baseline's distance from the bottom, so inline math sits on the text's
+ * baseline), then PIXELS unless size-only. A formula that does not parse
+ * is ERROR CR_E_SCRIPT with MathJax's message ("TeX: Missing close brace"),
+ * never a picture of the error: the editor keeps the last good picture
+ * up and says why. The last few formulas' SVG is kept by request key.
+ *
+ * A helper answers ERROR CR_E_KIND for a kind it does not carry (its
+ * hello lists what it does).
  */
 #ifndef CR_PROTO_H
 #define CR_PROTO_H
@@ -58,14 +73,14 @@
 enum {
     CR_KIND_QUIT = 0,
     CR_KIND_SVG = 1,
-    CR_KIND_TEX = 2,       /* reserved: math (MathJax in QuickJS) */
-    CR_KIND_MATHML = 3,    /* reserved */
+    CR_KIND_TEX = 2,       /* math: TeX source (MathJax in QuickJS) */
+    CR_KIND_MATHML = 3,    /* math: MathML source */
     CR_KIND_MERMAID = 4,   /* payload: options JSON line + source */
     CR_KIND_STATS = 5      /* answer INFO (JSON counters) */
 };
 
 enum {
-    CR_F_DISPLAY = 1,      /* math: display style (reserved) */
+    CR_F_DISPLAY = 1,      /* math: display style (else inline) */
     CR_F_DARK = 2,         /* unused (Mermaid's theme is in its options) */
     CR_F_SIZE_ONLY = 4     /* answer SIZE only, no pixels */
 };
@@ -91,10 +106,10 @@ enum {
     CR_E_NOMEM = 4,
     CR_E_KIND = 5,         /* a kind this helper does not carry */
     CR_E_DISABLED = 6,     /* the platform stub: no sandbox, no rendering */
-    CR_E_TOO_LARGE = 7,    /* Mermaid: over node_max (message says how many) */
-    CR_E_TIMEOUT = 8,      /* Mermaid: the script passed budget_ms */
-    CR_E_SCRIPT = 9,       /* Mermaid: the diagram does not parse (mermaid's message) */
-    CR_E_ENGINE = 10       /* Mermaid: no engine (missing or damaged bytecode) */
+    CR_E_TOO_LARGE = 7,    /* Mermaid / math: over node_max (message says how many) */
+    CR_E_TIMEOUT = 8,      /* Mermaid / math: the script passed budget_ms */
+    CR_E_SCRIPT = 9,       /* Mermaid / math: does not parse (the engine's message) */
+    CR_E_ENGINE = 10       /* Mermaid / math: no engine (missing or damaged bytecode) */
 };
 
 /* 52 bytes, naturally aligned (no padding). */
@@ -103,16 +118,16 @@ typedef struct {
     uint32_t id;           /* generation stamp, echoed */
     uint8_t kind;          /* CR_KIND_* */
     uint8_t flags;         /* CR_F_* */
-    uint16_t reserved;
+    uint16_t max_w;        /* math: display line-break width, CSS px (0: none) */
     float scale;           /* device px per CSS px, when box_w / box_h are 0 */
-    float em_px;           /* math: font size (reserved) */
-    uint32_t fg;           /* 0xRRGGBBAA (reserved: math / mermaid) */
+    float em_px;           /* math: font size, px (0: 16) */
+    uint32_t fg;           /* math: 0xRRGGBBAA for currentColor (Mermaid: unused) */
     uint32_t bg;           /* 0xRRGGBBAA under the drawing; 0 = transparent */
     uint32_t box_w, box_h; /* output pixels exactly (both set), else scale */
     uint32_t max_px;       /* output pixel cap for this request (0 = hard max) */
     uint32_t len;          /* payload bytes that follow */
-    uint32_t budget_ms;    /* Mermaid: script time budget (0: the helper's 10 s) */
-    uint32_t node_max;     /* Mermaid: refuse diagrams with more nodes (0: no cap) */
+    uint32_t budget_ms;    /* Mermaid / math: script time budget (0: the helper's 10 s) */
+    uint32_t node_max;     /* Mermaid / math: refuse larger inputs (0: no cap) */
 } CrReq;
 
 /* 16 bytes. */
