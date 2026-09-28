@@ -30,3 +30,17 @@ copy `package/dist/mermaid.min.js` and `package/LICENSE`, regenerate
 tree, put the new SHA-256 here and in `scripts/render_build.cch`
 (`RN_MERMAID_SHA256`), and run `mermaid_smoke` (the reference PNGs will
 move).
+
+## elkjs (EPL-2.0) inside the bundle
+
+`mermaid.min.js` contains elkjs (Eclipse Layout Kernel, EPL-2.0), used
+only by Mermaid's optional ELK layout; cctext never selects it (dagre
+layouts only). EPL-2.0 is a weak, file-level copyleft: it covers the
+elkjs code itself, not cctext or the rest of the bundle. We ship the
+file unmodified with its licence text in `THIRD_PARTY_LICENSES.txt`.
+Because the bundle is minified, its source for the elkjs portion is
+available from upstream at <https://github.com/kieler/elkjs> (the
+version pinned by mermaid 12.0.0's dependency tree) and from the npm
+package `elkjs`; this notice is our pointer to that source. Modifying
+the elkjs part of the file would oblige us to publish those changes
+under EPL-2.0 — we don't.
