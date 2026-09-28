@@ -14,6 +14,11 @@
 static int rtx_layout_img_span(RtxDocLayout d, size_t off, size_t *lo, size_t *hi);
 static size_t rtx_layout_img_text(RtxDocLayout d, const char *row, size_t rel, size_t row_n,
                                   char *out, size_t cap);
+static int rtx_layout_md_role_at(const RtxLayout *L, size_t off);
+static int rtx_layout_math_span(const RtxLayout *L, RtxDocLayout d, size_t off, size_t *lo,
+                                size_t *hi);
+static void rtx_layout_math_vis(const RtxLayout *L, RtxDocLayout d, size_t lo, size_t hi,
+                                RtxHintVis *out);
 
 void rtx_layout_set_view(RtxLayout *L, int view) {
     if (!L) return;
@@ -145,6 +150,28 @@ static int rtx_layout_push_row(RtxLayout *L, const RtxMeasure *m,
         return 0;
     }
     return 1;
+}
+
+/* Inline formulas on the row just pushed reach `up` above and `dn` below
+ * the text's baseline (docs/images.md "Math"): the row grows so they fit,
+ * the text moves down by what grew above (RtxVisRow.ytop). The baseline
+ * sits rtx_layout_math_metrics' asc of the text line below its top. */
+static double rtx_layout_math_asc_frac(void);
+static void rtx_layout_row_math(RtxLayout *L, double up, double dn) {
+    RtxVisRow *r;
+    double lh, asc, top, bot;
+    if (!L || !L->rows.len || (up <= 0 && dn <= 0)) return;
+    r = &L->rows.data[L->rows.len - 1];
+    lh = r->height;
+    asc = lh * rtx_layout_math_asc_frac();
+    top = up > asc ? up - asc : 0;
+    bot = dn > lh - asc ? dn - (lh - asc) : 0;
+    /* whole units: rows stack on integer pixels */
+    top = (double)(long)(top + 0.999);
+    bot = (double)(long)(bot + 0.999);
+    r->ytop = top;
+    r->height += top + bot;
+    L->total_height += top + bot;
 }
 
 static int rtx_layout_push_grid_row(RtxLayout *L, const RtxMeasure *m,
@@ -666,6 +693,8 @@ int rtx_layout_hint_vis_cur(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
     out->gn = 0;
     out->ann = 0;
     out->stale = 0;
+    out->pic = 0;
+    out->pic_dim = 0;
     if (!L) return 0;
     if (L->inl_on && off == L->inl_lo && rtx_layout_inlay_vis(L, d, off, row, rel, row_n, out))
         return 1;
@@ -683,6 +712,13 @@ int rtx_layout_hint_vis_cur(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
         size_t dlo, dhi, gn = 0;
         int got;
         size_t ilo, ihi;
+        /* Inline math (docs/images.md "Math"): the formula's picture, or
+         * its Unicode text in a terminal, over the whole `$...$`. */
+        if (L->math_on && to > off && rtx_layout_math_span(L, d, off, &ilo, &ihi) &&
+            ilo == off && ihi == to) {
+            rtx_layout_math_vis(L, d, ilo, ihi, out);
+            return 1;
+        }
         /* A workbook value paints over its formula, once, at the start. */
         got = d->derived_at(off, 0, &dlo, &dhi, out->g, sizeof(out->g), &gn);
         if (!got && L->img_on && to > off && rtx_layout_img_span(d, off, &ilo, &ihi) &&
@@ -699,6 +735,7 @@ int rtx_layout_hint_vis_cur(const RtxLayout *L, RtxDocLayout d, RtxHideCur *hc,
 
 static double rtx_layout_standin_w(const RtxMeasure *m, const RtxHintVis *hv,
                                    RtxStyle st, RtxSectionKind sec) {
+    if (hv && hv->pic) return hv->pw;
     if (!hv || !hv->gn || !m || !m->measure) return 0;
     if (hv->ann && hv->ann < hv->gn)
         return m->measure(m->ctx, cc_slice_from_buffer((char *)hv->g, hv->ann), st, sec) +
@@ -750,7 +787,9 @@ static int rtx_layout_list_hang(const RtxLayout *L, RtxDocLayout d,
         RtxHintVis hv;
         size_t off = from + i;
         if (rtx_layout_hint_vis_cur(L, d, hc, off, bytes.ptr, i, hi, &hv)) {
-            /* An image's stand-in is no list marker. */
+            /* An image's (or a formula's) stand-in is no list marker. */
+            if (hv.pic || (hv.gn && L->math_on && rtx_layout_math_span(L, d, off, NULL, NULL)))
+                return 0;
             if (hv.gn && L->img_on && rtx_layout_img_span(d, off, NULL, NULL)) return 0;
             if (hv.gn) {
                 if (lead_w) *lead_w = lead;
@@ -957,7 +996,7 @@ static int rtx_layout_img_push(RtxLayout *L, const RtxImgRec *r) {
     return L->img_recs.push(*r) == 0;
 }
 
-/* ---- Mermaid fences (docs/images.md "Mermaid") -------------------------- */
+/* ---- Mermaid fences and display math (docs/images.md "Mermaid", "Math") -- */
 
 static int rtx_mm_ci(const char *s, size_t n, const char *w) {
     size_t i, k = strlen(w);
@@ -970,11 +1009,14 @@ static int rtx_mm_ci(const char *s, size_t n, const char *w) {
     return 1;
 }
 
-/* A line that could open a Mermaid fence: <= 3 spaces, >= 3 backticks or
- * tildes, blanks, "mermaid" and then a blank, `{` or the end. */
+/* A line that could open a picture fence: <= 3 spaces, >= 3 backticks or
+ * tildes, blanks, "mermaid" (1) or "math" (2) and then a blank, `{` or the
+ * end; each only while its setting is on. 0: none. */
 static int rtx_layout_mm_candidate(const char *s, size_t n, size_t *ind, size_t *run) {
-    size_t i = 0, r;
+    size_t i = 0, r, k;
     char c;
+    int kind;
+    const RtxImgLimits *lim = rtx_img_limits();
     while (i < n && i < 3 && s[i] == ' ') i++;
     if (i >= n || (s[i] != '`' && s[i] != '~')) return 0;
     c = s[i];
@@ -984,15 +1026,100 @@ static int rtx_layout_mm_candidate(const char *s, size_t n, size_t *ind, size_t 
     if (ind) *ind = r;
     if (run) *run = i - r;
     while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
-    if (!rtx_mm_ci(s + i, n - i, "mermaid")) return 0;
-    i += 7;
-    return i == n || s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '{';
+    if (lim->mermaid && rtx_mm_ci(s + i, n - i, "mermaid")) {
+        kind = 1;
+        k = 7;
+    } else if (lim->math && rtx_mm_ci(s + i, n - i, "math")) {
+        kind = 2;
+        k = 4;
+    } else {
+        return 0;
+    }
+    i += k;
+    return i == n || s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '{' ? kind : 0;
+}
+
+/* A line that could open a `$$` math block: <= 3 spaces then `$$`. */
+static int rtx_layout_dollar_line(const char *s, size_t n) {
+    size_t i = 0;
+    if (!rtx_img_limits()->math) return 0;
+    while (i < n && i < 3 && s[i] == ' ') i++;
+    return i + 1 < n && s[i] == '$' && s[i + 1] == '$';
+}
+
+/* A closed `$$` block holding `off`, as a fence (kind RTX_BLK_MATH_DOLLAR). */
+static int rtx_layout_dollar_block(RtxDocLayout d, size_t off, RtxMmFence *f) {
+    char buf[520];
+    size_t len, lo = 0, hi = 0, got, a, k, q[3];
+    int closed = 0, found = 0, nq = 0, qi;
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    len = d->len();
+    q[nq++] = off;
+    if (off > 0) q[nq++] = off - 1;
+    q[nq++] = off + 3 < len ? off + 3 : off;
+    for (qi = 0; qi < nq && !found; qi++) {
+        if (q[qi] >= len) continue;
+        if (!d->md_math_at(q[qi], &lo, &hi, &closed)) continue;
+        if (!closed || hi < lo + 4) return 0;
+        found = 1;
+    }
+    if (!found) return 0;
+    /* the opener: `$$` after <= 3 blanks at a line start */
+    a = lo > 3 ? lo - 3 : 0;
+    got = d->read_at(a, cc_slice_from_buffer(buf, sizeof buf - 1)) !>;
+    buf[got] = 0;
+    k = lo - a;
+    if (k + 1 >= got || buf[k] != '$' || buf[k + 1] != '$') return 0;
+    while (k > 0 && buf[k - 1] == ' ') k--;
+    if (k > 0 && buf[k - 1] != '\n') return 0;
+    f->open_lo = a + k;
+    {
+        size_t e = lo - a;
+        while (e < got && buf[e] != '\n') e++;
+        if (e >= got && a + got < len) {
+            /* an opening line over 512 bytes: its end, the slow way */
+            size_t p = a + got;
+            char c = 0;
+            while (p < len) {
+                d->read_at(p, cc_slice_from_buffer(&c, 1)) !>;
+                if (c == '\n') break;
+                p++;
+            }
+            f->open_eol = p;
+        } else {
+            f->open_eol = a + e;
+        }
+    }
+    /* the closer: `$$` ending at hi, then blanks to the line's end */
+    a = hi > 256 ? hi - 256 : 0;
+    got = d->read_at(a, cc_slice_from_buffer(buf, sizeof buf - 1)) !>;
+    buf[got] = 0;
+    {
+        size_t e = hi - a, s0;
+        if (e < 2 || e > got || buf[e - 1] != '$' || buf[e - 2] != '$') return 0;
+        s0 = e - 2;
+        while (s0 > 0 && buf[s0 - 1] != '\n') s0--;
+        f->close_lo = a + s0;
+        if (s0 == 0 && a > 0) f->close_lo = f->open_lo > a ? f->open_lo : a; /* a long last line */
+        if (f->close_lo < f->open_lo) f->close_lo = f->open_lo;
+        while (e < got && (buf[e] == ' ' || buf[e] == '\t' || buf[e] == '\r')) e++;
+        if (e < got && buf[e] != '\n') return 0;
+        f->close_eol = a + e;
+    }
+    f->body_lo = lo + 2;
+    f->body_hi = hi - 2;
+    f->ind = 0;
+    f->kind = RTX_BLK_MATH_DOLLAR;
+    return 1;
 }
 
 int rtx_layout_mm_fence(RtxDocLayout d, size_t off, RtxMmFence *f) {
     char buf[520];
     size_t len, lo = 0, hi = 0, got, a, k, ind = 0, run = 0, q[3];
-    int closed = 0, found = 0, nq = 0, qi;
+    int closed = 0, found = 0, nq = 0, qi, cand;
     @errhandler(CCError e) {
         (void)e;
         return 0;
@@ -1012,7 +1139,7 @@ int rtx_layout_mm_fence(RtxDocLayout d, size_t off, RtxMmFence *f) {
         if (!closed || hi <= lo) return 0;
         found = 1;
     }
-    if (!found) return 0;
+    if (!found) return rtx_layout_dollar_block(d, off, f);
     /* The opening line: [a, lo) blanks after a line start. */
     a = lo > 3 ? lo - 3 : 0;
     got = d->read_at(a, cc_slice_from_buffer(buf, sizeof buf - 1)) !>;
@@ -1025,9 +1152,11 @@ int rtx_layout_mm_fence(RtxDocLayout d, size_t off, RtxMmFence *f) {
         size_t e = k, ls = k;
         while (e < got && buf[e] != '\n') e++;
         if (e >= got && a + got < len) return 0; /* an opener over 512 bytes */
-        if (!rtx_layout_mm_candidate(buf + ls, e - ls, &ind, &run)) return 0;
+        cand = rtx_layout_mm_candidate(buf + ls, e - ls, &ind, &run);
+        if (!cand) return 0;
         f->open_eol = a + e;
         f->ind = (unsigned)ind;
+        f->kind = cand == 2 ? RTX_BLK_MATH_FENCE : RTX_BLK_MERMAID;
     }
     if (hi <= f->open_eol) return 0;
     /* The closing line: the run ending at hi, after <= 3 blanks. */
@@ -1053,7 +1182,7 @@ int rtx_layout_mm_fence(RtxDocLayout d, size_t off, RtxMmFence *f) {
 }
 
 char *rtx_layout_mm_source(RtxDocLayout d, const RtxMmFence *f, size_t cap, size_t *n) {
-    size_t bn = f->body_hi - f->body_lo, got, i, o = 0, col = 0;
+    size_t bn = f->body_hi > f->body_lo ? f->body_hi - f->body_lo : 0, got, i, o = 0, col = 0;
     char *raw, *out;
     *n = 0;
     if (bn > cap + cap / 4 + 4096) {
@@ -1088,67 +1217,89 @@ char *rtx_layout_mm_source(RtxDocLayout d, const RtxMmFence *f, size_t cap, size
     return out;
 }
 
+/* The block pictures this build draws: Mermaid fences, math blocks. */
+static int rtx_layout_blk_any(void) {
+    const RtxImgLimits *lim = rtx_img_limits();
+    return lim->mermaid || lim->math;
+}
+
 size_t rtx_layout_mm_snap(const RtxLayout *L, RtxDocLayout d, size_t off, int dir) {
     RtxMmFence f;
-    if (!L || !L->rich || !d || !d->has_marks() || !rtx_img_limits()->mermaid) return off;
+    if (!L || !L->rich || !d || !d->has_marks() || !rtx_layout_blk_any()) return off;
     if (!rtx_layout_mm_fence(d, off, &f)) return off;
+    if (f.close_eol == f.open_eol) return off; /* a one-line block: nothing hidden */
     if (off <= f.open_lo || off > f.close_eol) return off;
     if (f.open_lo >= L->reveal_lo && f.open_lo < L->reveal_hi) return off;
     if (dir < 0) return f.open_lo;
     return f.close_eol < d->len() ? f.close_eol + 1 : f.open_lo;
 }
 
-/* The window holds a Mermaid opener (a line starting a fence whose info
- * is "mermaid"): the fill looks at those lines. */
+/* The window holds a picture block's opener (a Mermaid or math fence, a
+ * `$$` line): the fill looks at those lines. */
 static int rtx_layout_mm_scan(const char *b, size_t n) {
     size_t i = 0;
     while (i < n) {
         size_t e = i;
         while (e < n && b[e] != '\n') e++;
-        if (e - i >= 10 && rtx_layout_mm_candidate(b + i, e - i, NULL, NULL)) return 1;
+        if (e - i >= 2 && rtx_layout_dollar_line(b + i, e - i)) return 1;
+        if (e - i >= 7 && rtx_layout_mm_candidate(b + i, e - i, NULL, NULL)) return 1;
         i = e + 1;
     }
     return 0;
 }
 
-/* A picture record for the fence f (lh: a text line; room: the width a
+/* The key parts of a block's picture source (Mermaid or math). */
+static void rtx_layout_blk_key(const RtxImgSrc *s, uint64_t *h, uint64_t *n, uint32_t *id) {
+    if (s->kind == RTX_IMG_SRC_MATH) rtx_img_math_key(s, h, n, id);
+    else rtx_img_mermaid_key(s, h, n, id);
+}
+
+/* A picture record for the block f (lh: a text line; room: the width a
  * picture may take; cells: a terminal layout). */
 static void rtx_layout_mm_rec(RtxLayout *L, RtxDocLayout d, const RtxMmFence *f, double lh,
                               double room, int cells, RtxImgRec *rec) {
     RtxImgSrc src, prev;
     RtxImgView v, pv;
     const RtxImgLimits *lim = rtx_img_limits();
+    int math = f->kind != RTX_BLK_MERMAID;
     size_t sn = 0;
-    char *sb = rtx_layout_mm_source(d, f, (size_t)lim->mm_max, &sn);
-    uint32_t iw = 0, ih = 0;
+    char *sb = rtx_layout_mm_source(d, f, (size_t)(math ? lim->math_max : lim->mm_max), &sn);
+    uint32_t iw = 0, ih = 0, max_h = lim->mm_max_h;
     int have = 0;
+    RtxMathLook look;
     (void)L;
     memset(rec, 0, sizeof *rec);
     rec->mm = 1;
+    rec->math = math;
     rec->lo = f->open_lo;
     rec->hi = f->close_eol;
-    if (sb) {
+    if (math) rtx_layout_math_look(1, lh, cells, &look);
+    if (sb && math) {
+        rtx_img_src_math(sb, sn, &look, &src);
+    } else if (sb) {
         rtx_img_src_mermaid(sb, sn, rtx_img_mm_theme(), &src);
     } else {
         /* Unreadable or over the size limit: a keyed source that errs. */
-        rtx_img_src_mermaid("", 0, rtx_img_mm_theme(), &src);
+        if (math) rtx_img_src_math("", 0, &look, &src);
+        else rtx_img_src_mermaid("", 0, rtx_img_mm_theme(), &src);
         src.err = sn ? RTX_IMG_ESVGBIG : RTX_IMG_ESRC;
     }
     rtx_img_info(&src, &v);
     free(sb);
-    rtx_img_mermaid_key(&src, &rec->mm_h, &rec->mm_n, &rec->mm_theme);
+    rtx_layout_blk_key(&src, &rec->mm_h, &rec->mm_n, &rec->mm_theme);
     rec->state = v.state;
     if (v.have_info && v.state != RTX_IMG_S_ERR) {
         iw = v.info.w;
         ih = v.info.h;
         have = 1;
     }
-    /* The fence's previous diagram (another source or theme). */
-    if (rtx_img_mm_prev(d, f->open_lo, &prev) && strcmp(prev.key, src.key) != 0) {
+    /* The block's previous picture (another source or theme). */
+    if (rtx_img_mm_prev(d, f->open_lo, &prev) && strcmp(prev.key, src.key) != 0 &&
+        prev.kind == src.kind) {
         rtx_img_info(&prev, &pv);
         if (pv.have_info && pv.state != RTX_IMG_S_ERR) {
             rec->mm_prev = 1;
-            rtx_img_mermaid_key(&prev, &rec->mm_prev_h, &rec->mm_prev_n, &rec->mm_prev_theme);
+            rtx_layout_blk_key(&prev, &rec->mm_prev_h, &rec->mm_prev_n, &rec->mm_prev_theme);
             if (!have) {
                 iw = pv.info.w;
                 ih = pv.info.h;
@@ -1157,14 +1308,14 @@ static void rtx_layout_mm_rec(RtxLayout *L, RtxDocLayout d, const RtxMmFence *f,
             }
         }
     }
-    /* The fence's last good diagram: one with pixels to show meanwhile
+    /* The block's last good picture: one with pixels to show meanwhile
      * (a source typed past before it was drawn never becomes it). */
     if (v.have_info && v.state != RTX_IMG_S_ERR && rtx_img_has_pixels(&src))
         rtx_img_mm_note(d, f->open_lo, &src);
     if (cells) {
         uint32_t bc = 0, br = 0, cols = room >= 1 ? (uint32_t)room : 1;
         if (have) {
-            rtx_img_cell_box_h(iw, ih, 1, cols, lim->mm_max_h, &bc, &br);
+            rtx_img_cell_box_h(iw, ih, 1, cols, max_h, &bc, &br);
         } else {
             /* One line of text: "[diagram: rendering…]" or why not. */
             bc = cols;
@@ -1172,16 +1323,181 @@ static void rtx_layout_mm_rec(RtxLayout *L, RtxDocLayout d, const RtxMmFence *f,
         }
         rec->w = (double)bc;
         rec->h = (double)br * lh;
+        /* a formula sits in the middle of the pane */
+        if (math && have && bc < cols) rec->x = (double)((cols - bc) / 2);
     } else if (have) {
         uint32_t fw = 0, fh = 0, mw = room > 32 ? (uint32_t)room : 32;
-        rtx_img_fit(iw, ih, mw, lim->mm_max_h, &fw, &fh);
+        rtx_img_fit(iw, ih, mw, max_h, &fw, &fh);
         rec->w = (double)fw;
         rec->h = (double)fh;
+        if (math && room > rec->w) rec->x = (double)(long)((room - rec->w) / 2);
+    } else if (math) {
+        /* a formula on its way: one text line (it says why when it fails) */
+        rec->w = room < 400 ? room : 400;
+        rec->h = lh * (v.state == RTX_IMG_S_ERR ? 1.5 : 1.2);
     } else {
         rec->w = room < (v.state == RTX_IMG_S_ERR ? 560 : 300) ? room
                  : (v.state == RTX_IMG_S_ERR ? 560 : 300);
         rec->h = lh * 2;
     }
+}
+
+/* ---- inline math (docs/images.md "Math") ---------------------------------- */
+
+static double g_math_asc = 0.8, g_math_em = 0.96;
+
+static double rtx_layout_math_asc_frac(void) { return g_math_asc; }
+
+void rtx_layout_math_metrics(double asc_frac, double em_frac) {
+    if (asc_frac > 0.3 && asc_frac < 1.2) g_math_asc = asc_frac;
+    if (em_frac > 0.3 && em_frac < 3.0) g_math_em = em_frac;
+}
+
+void rtx_layout_math_metrics_get(double *asc_frac, double *em_frac) {
+    if (asc_frac) *asc_frac = g_math_asc;
+    if (em_frac) *em_frac = g_math_em;
+}
+
+void rtx_layout_math_look(int display, double lh, int cells, RtxMathLook *out) {
+    double em;
+    memset(out, 0, sizeof *out);
+    out->display = display != 0;
+    out->fg = rtx_img_math_fg();
+    if (cells) {
+        /* a terminal: a formula's text a little over the cell's height */
+        uint32_t cw = 8, ch = 16;
+        rtx_img_cells_px(&cw, &ch);
+        em = (double)ch * 1.25;
+    } else {
+        em = (lh > 0 ? lh : 20.0) * g_math_em;
+    }
+    /* half-pixel steps: a key that does not move with rounding noise */
+    em = (double)(long)(em * 2.0 + 0.5) / 2.0;
+    if (em < 4) em = 4;
+    if (em > 400) em = 400;
+    out->em = (float)em;
+}
+
+/* The inline formula at `off` this layout replaces: a lexed `$...$` on one
+ * line, within the size limit, outside a table row; in cells only one the
+ * Unicode approximation can write. */
+static int rtx_layout_math_span(const RtxLayout *L, RtxDocLayout d, size_t off, size_t *lo,
+                                size_t *hi) {
+    size_t a = 0, b = 0, n, got;
+    char sb[512], *buf;
+    int ok = 1, role;
+    const RtxImgLimits *lim = rtx_img_limits();
+    if (!L || !L->math_on || !d->md_math_inline_at(off, &a, &b)) return 0;
+    if (b - a < 3 || b - a - 2 > lim->math_max) return 0;
+    role = rtx_layout_md_role_at(L, a);
+    if (role == RTX_MD_ROLE_HDR || role == RTX_MD_ROLE_SEP || role == RTX_MD_ROLE_BODY) return 0;
+    n = b - a;
+    if (L->math_on == 2 && n > sizeof sb) return 0; /* longer than Unicode would take */
+    buf = n <= sizeof sb ? sb : (char *)malloc(n);
+    if (!buf) return 0;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            ok = 0;
+        }
+        got = d->read_at(a, cc_slice_from_buffer(buf, n)) !>;
+    }
+    if (ok && got != n) ok = 0;
+    if (ok && memchr(buf, '\n', n)) ok = 0;
+    if (ok && L->math_on == 2) {
+        char u[RTX_HINT_STANDIN_MAX];
+        ok = rtx_math_unicode(buf + 1, n - 2, u, sizeof u) > 0;
+    }
+    if (buf != sb) free(buf);
+    if (!ok) return 0;
+    if (lo) *lo = a;
+    if (hi) *hi = b;
+    return 1;
+}
+
+int rtx_layout_math_at(const RtxLayout *L, RtxDocLayout d, size_t off, size_t *lo, size_t *hi) {
+    return rtx_layout_math_span(L, d, off, lo, hi);
+}
+
+/* The stand-in of the formula [lo, hi) (dollars included). Cells: its
+ * Unicode text. Pixels: its picture once its size is known; while it
+ * renders, the span's previous formula (dimmed); else the source as
+ * text (math styled: the run's own style). */
+static void rtx_layout_math_vis(const RtxLayout *L, RtxDocLayout d, size_t lo, size_t hi,
+                                RtxHintVis *out) {
+    size_t n = hi - lo, got;
+    char sb[1024], *buf;
+    int ok = 1;
+    RtxImgSrc src, prev;
+    RtxImgView v, pv;
+    RtxMathLook k;
+    out->gn = 0;
+    buf = n <= sizeof sb ? sb : (char *)malloc(n);
+    if (!buf) return;
+    {
+        @errhandler(CCError e) {
+            (void)e;
+            ok = 0;
+        }
+        got = d->read_at(lo, cc_slice_from_buffer(buf, n)) !>;
+    }
+    if (!ok || got != n || n < 3) {
+        if (buf != sb) free(buf);
+        return;
+    }
+    if (L->math_on == 2) {
+        out->gn = rtx_math_unicode(buf + 1, n - 2, out->g, sizeof out->g);
+        if (buf != sb) free(buf);
+        return;
+    }
+    rtx_layout_math_look(0, L->unit_h, 0, &k);
+    if (n >= 6 && buf[1] == '$' && buf[n - 2] == '$') {
+        /* `$$...$$` inside a line of text: display style, in the line */
+        k.display = 1;
+        rtx_img_src_math(buf + 2, n - 4, &k, &src);
+    } else {
+        rtx_img_src_math(buf + 1, n - 2, &k, &src);
+    }
+    rtx_img_info(&src, &v);
+    if (v.have_info && v.state != RTX_IMG_S_ERR) {
+        out->pic = 1;
+        out->pw = (double)v.info.w;
+        out->ph = (double)v.info.h;
+        out->pb = (double)v.info.baseline;
+        rtx_img_math_key(&src, &out->pic_h, &out->pic_n, &out->pic_look);
+        /* the span's last good formula: one with pixels to show meanwhile */
+        if (rtx_img_has_pixels(&src)) rtx_img_mm_note(d, lo, &src);
+    } else if (rtx_img_mm_prev(d, lo, &prev) && strcmp(prev.key, src.key) != 0 &&
+               prev.kind == RTX_IMG_SRC_MATH) {
+        rtx_img_info(&prev, &pv);
+        if (pv.have_info && pv.state != RTX_IMG_S_ERR) {
+            out->pic = 1;
+            out->pic_dim = 1;
+            out->pw = (double)pv.info.w;
+            out->ph = (double)pv.info.h;
+            out->pb = (double)pv.info.baseline;
+            rtx_img_math_key(&prev, &out->pic_h, &out->pic_n, &out->pic_look);
+        }
+    }
+    if (out->pic) {
+        out->g[0] = ' ';
+        out->gn = 1;
+    } else {
+        /* the source itself until the picture's size is known (or when it
+         * does not parse: then the source shows what to fix) */
+        size_t take = n;
+        if (take > sizeof out->g - 4) {
+            take = sizeof out->g - 4;
+            while (take && ((unsigned char)buf[take] & 0xC0) == 0x80) take--;
+        }
+        memcpy(out->g, buf, take);
+        out->gn = take;
+        if (take < n) {
+            memcpy(out->g + take, "\xe2\x80\xa6", 3);
+            out->gn += 3;
+        }
+    }
+    if (buf != sb) free(buf);
 }
 
 size_t rtx_layout_hidden_to(const RtxLayout *L, RtxDocLayout d, size_t off) {
@@ -1195,6 +1511,11 @@ size_t rtx_layout_hidden_to(const RtxLayout *L, RtxDocLayout d, size_t off) {
     if (L->img_on && rtx_layout_img_span(d, off, &lo, &hi) &&
         !(off >= L->reveal_lo && off < L->reveal_hi))
         return hi;
+    /* Inline math is one stand-in (its picture, or Unicode in a terminal)
+     * until the caret is in it (docs/images.md "Math"). */
+    if (L->math_on && rtx_layout_math_span(L, d, off, &lo, &hi)) {
+        if (!(off >= L->reveal_lo && off < L->reveal_hi)) return hi;
+    }
     if (d->dest_at(off, &lo, &hi)) {
         if (!(off >= L->reveal_lo && off < L->reveal_hi)) return hi;
     }
@@ -1244,7 +1565,7 @@ int rtx_layout_reveal(RtxLayout *L, RtxDocLayout d, size_t caret, size_t anchor)
         }
         /* The caret (or anchor) inside a Mermaid fence shows its source
          * (the picture stays under it). */
-        if (rtx_img_limits()->mermaid) {
+        if (rtx_layout_blk_any()) {
             RtxMmFence mf;
             if (rtx_layout_mm_fence(d, caret, &mf) && caret >= mf.open_lo &&
                 caret <= mf.close_eol) {
@@ -2926,7 +3247,8 @@ static double rtx_layout_row_measure(const RtxLayout *L, RtxDocLayout d,
                                      RtxStyleCur *sc, RtxHideCur *hc,
                                      const RtxMeasure *m, size_t from,
                                      char[:] bytes, size_t lo, size_t hi,
-                                     RtxSectionKind sec, double *h_out) {
+                                     RtxSectionKind sec, double *h_out, double *up,
+                                     double *dn) {
     RtxStyle cur;
     size_t seg = lo, k = lo;
     double w = 0, h;
@@ -2946,6 +3268,10 @@ static double rtx_layout_row_measure(const RtxLayout *L, RtxDocLayout d,
                     w += m->measure(m->ctx, sp, cur, sec);
                 }
                 w += rtx_layout_standin_w(m, &hv, d->style_cur(sc, from + k), sec);
+                if (hv.pic) {
+                    if (up && hv.ph - hv.pb > *up) *up = hv.ph - hv.pb;
+                    if (dn && hv.pb > *dn) *dn = hv.pb;
+                }
                 k += hv.skip;
                 if (k > hi) k = hi;
                 seg = k;
@@ -3049,7 +3375,8 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
          * lines lay out nothing (like a fold); revealed, the source lays
          * out as text and the picture joins the closing line's last row. */
         if (L->mm_on && (rtx_layout_md_unit(m, sec) >= 2.0 || rtx_img_cells_on()) &&
-            rtx_layout_mm_candidate(bytes.ptr + i, line_end - i, NULL, NULL)) {
+            (rtx_layout_mm_candidate(bytes.ptr + i, line_end - i, NULL, NULL) ||
+             rtx_layout_dollar_line(bytes.ptr + i, line_end - i))) {
             RtxMmFence mf;
             if (rtx_layout_mm_fence(d, from + i, &mf) && mf.open_lo == from + i) {
                 int cells = rtx_layout_md_unit(m, sec) < 2.0;
@@ -3067,7 +3394,7 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                     size_t endrel = mf.close_eol - from;
                     rec.row = from + i;
                     rec.top = pad;
-                    if (!rtx_layout_push_row(L, m, from + i, line_end - i, phys, rec.w,
+                    if (!rtx_layout_push_row(L, m, from + i, line_end - i, phys, rec.x + rec.w,
                                              rec.h + 2 * pad, 0, sec) ||
                         !rtx_layout_img_push(L, &rec))
                         return cc_err(CC_ERR_OUT_OF_MEMORY, "layout row");
@@ -3170,13 +3497,14 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                 hanging = 1;
             }
         if (!wrap) {
-            double h = 0;
+            double h = 0, up = 0, dn = 0;
             double w = rtx_layout_row_measure(L, d, &sc, &hc, m, from, bytes, i, line_end,
-                                              sec, &h);
+                                              sec, &h, &up, &dn);
             if (!rtx_layout_push_row(L, m, from + i, line_end - i, phys,
                                      w + first_pad, h, first_pad, sec)) {
                 return cc_err(CC_ERR_OUT_OF_MEMORY, "layout row");
             }
+            rtx_layout_row_math(L, up, dn);
             i = line_end;
         } else {
             int first_vis = 1;
@@ -3194,6 +3522,9 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                 size_t last_br = i;
                 double last_br_w = 0;
                 double last_br_h = 0;
+                /* inline formulas on the row: extent above / below the
+                 * baseline (and as of the last break) */
+                double up = 0, dn = 0, last_br_up = 0, last_br_dn = 0;
                 double pad = hanging ? (first_vis ? first_pad : hang) : 0;
                 double limit = max_width - pad;
                 int overflow = 0;
@@ -3217,6 +3548,10 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                                 }
                                 w += sw;
                                 if (sh > h) h = sh;
+                                if (hv.pic) {
+                                    if (hv.ph - hv.pb > up) up = hv.ph - hv.pb;
+                                    if (hv.pb > dn) dn = hv.pb;
+                                }
                             }
                             i += hv.skip;
                             continue;
@@ -3255,6 +3590,8 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                                 i = last_br;
                                 w = last_br_w;
                                 h = last_br_h;
+                                up = last_br_up;
+                                dn = last_br_dn;
                             }
                             overflow = 1;
                             break;
@@ -3266,6 +3603,8 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                             last_br = i;
                             last_br_w = w;
                             last_br_h = h;
+                            last_br_up = up;
+                            last_br_dn = dn;
                         }
                     }
                 }
@@ -3284,6 +3623,7 @@ static void !>(CCError) rtx_layout_range_walk(RtxLayout *L, RtxDocLayout d,
                                          phys, w + pad, h, pad, sec)) {
                     return cc_err(CC_ERR_OUT_OF_MEMORY, "layout row");
                 }
+                rtx_layout_row_math(L, up, dn);
                 first_vis = 0;
             }
         }
@@ -3357,6 +3697,19 @@ void !>(CCError) RtxLayout_range(RtxLayout *L, RtxDocLayout d, const RtxMeasure 
         /* Rich images (docs/images.md): only a window that holds `![`. */
         L->img_on = 0;
         L->mm_on = 0;
+        L->math_on = 0;
+        if (L->has_marks) {
+            /* Inline math (docs/images.md "Math"): a window with a `$`;
+             * pictures in pixel layouts, Unicode in cells when asked. */
+            const RtxImgLimits *lim = rtx_img_limits();
+            if (lim->math && memchr(bytes.ptr, '$', bytes.len)) {
+                int px = rtx_layout_md_unit(m, RTX_SEC_MARKUP) >= 2.0;
+                if (px && lim->math_inline) L->math_on = 1;
+                else if (!px && lim->math_unicode) L->math_on = 2;
+                /* a window that replaces spans refills rather than patches */
+                if (L->math_on) L->img_on = 1;
+            }
+        }
         if (L->has_marks) {
             size_t k;
             for (k = 0; k + 1 < bytes.len; k++)
@@ -3365,7 +3718,7 @@ void !>(CCError) RtxLayout_range(RtxLayout *L, RtxDocLayout d, const RtxMeasure 
                     break;
                 }
             /* Mermaid fences (docs/images.md "Mermaid"). */
-            if (rtx_img_limits()->mermaid && rtx_layout_mm_scan(bytes.ptr, bytes.len)) {
+            if (rtx_layout_blk_any() && rtx_layout_mm_scan(bytes.ptr, bytes.len)) {
                 L->mm_on = 1;
                 L->img_on = 1;
             }
