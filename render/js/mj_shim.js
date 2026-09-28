@@ -94,6 +94,9 @@
       // One SVG per formula: MathJax 4 would split long inline math into
       // several pieces for the page's line breaker; there is no page here.
       linebreaks: { inline: false },
+      // A display formula wider than the request's max width breaks its
+      // lines there (mjRender's containerWidth; none: never).
+      displayOverflow: 'linebreak',
     },
   };
 }

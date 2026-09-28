@@ -123,7 +123,7 @@
     const o = JSON.parse(optsJSON || '{}');
     if (!ready) ready = setup();
     await ready;
-    return MathJax.tex2mml(src, { display: !!o.display });
+    return MathJax.tex2mmlPromise(src, { display: !!o.display });
   };
 
   // Test hooks: only bin/cctext-render-selftest calls these (a source
