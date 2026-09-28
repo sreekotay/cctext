@@ -29,6 +29,10 @@ cctext-render fuzz run (ASan + UBSan):
    drawing and measuring, which adds the font's GPOS pair adjustment (or
    its kern table) between consecutive glyphs (stb_truetype);
    `plutovg_font_face_get_text_path` / `_traverse_text_path`.
+5. `0005-glyph-fallback.patch`: a glyph the drawing face lacks comes from
+   the first face registered with `plutovg_font_face_add_fallback` that
+   has it (cctext-render: its regular faces in manifest order, the CJK
+   face last); kerning only within one face.
 
 Build defines: `PLUTOVG_BUILD_STATIC`, `PLUTOVG_DISABLE_FONT_FACE_CACHE_LOAD`
 (no system font scan), `STBI_MAX_DIMENSIONS=16384` (a `data:` image inside

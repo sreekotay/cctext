@@ -175,7 +175,16 @@ struct plutovg_font_face {
     plutovg_glyph_cache_t cache;
     plutovg_destroy_func_t destroy_func;
     void* closure;
+    /* cctext patch 0005: the face whose font data this face shares (itself;
+     * two registrations of one face are one fallback). */
+    struct plutovg_font_face* base;
 };
+
+/* cctext patch 0005: per-glyph fallback faces, tried in order when a face
+ * lacks a glyph (plutovg_font_face_add_fallback). */
+#define PLUTOVG_MAX_FALLBACKS 16
+static plutovg_font_face_t* fallback_faces[PLUTOVG_MAX_FALLBACKS];
+static int fallback_count;
 
 static void plutovg_glyph_cache_init(plutovg_glyph_cache_t* cache)
 {
@@ -316,7 +325,26 @@ plutovg_font_face_t* plutovg_font_face_load_from_data(const void* data, unsigned
     plutovg_glyph_cache_init(&face->cache);
     face->destroy_func = destroy_func;
     face->closure = closure;
+    face->base = face;
     return face;
+}
+
+void plutovg_font_face_add_fallback(plutovg_font_face_t* face)
+{
+    if(face == NULL || fallback_count >= PLUTOVG_MAX_FALLBACKS)
+        return;
+    for(int i = 0; i < fallback_count; i++) {
+        if(fallback_faces[i]->base == face->base)
+            return;
+    }
+    fallback_faces[fallback_count++] = plutovg_font_face_reference(face->base);
+}
+
+void plutovg_font_face_clear_fallbacks(void)
+{
+    for(int i = 0; i < fallback_count; i++)
+        plutovg_font_face_destroy(fallback_faces[i]);
+    fallback_count = 0;
 }
 
 plutovg_font_face_t* plutovg_font_face_reference(plutovg_font_face_t* face)
@@ -458,6 +486,28 @@ float plutovg_font_face_traverse_glyph_path(plutovg_font_face_t* face, float siz
     return glyph->advance_width * scale;
 }
 
+/* cctext patch 0005: the face that draws `codepoint` for `face`: face itself
+ * when it has the glyph, else the first fallback face that has it, else face
+ * (its .notdef box). */
+static plutovg_font_face_t* plutovg_font_face_resolve(plutovg_font_face_t* face, plutovg_codepoint_t codepoint, plutovg_glyph_t** out)
+{
+    plutovg_glyph_t* glyph = plutovg_font_face_get_glyph(face, codepoint);
+    *out = glyph;
+    if(glyph->index != 0 || codepoint < 0x20 || fallback_count == 0)
+        return face;
+    for(int i = 0; i < fallback_count; i++) {
+        plutovg_font_face_t* fallback = fallback_faces[i];
+        if(fallback->base == face->base)
+            continue;
+        plutovg_glyph_t* g = plutovg_font_face_get_glyph(fallback, codepoint);
+        if(g->index != 0) {
+            *out = g;
+            return fallback;
+        }
+    }
+    return face;
+}
+
 /* cctext patch 0004: kerning (the font's GPOS pair adjustments or its kern
  * table, through stb_truetype) between two glyphs of one face, font units. */
 static int plutovg_font_face_kerning(plutovg_font_face_t* face, int glyph1, int glyph2)
@@ -469,22 +519,27 @@ static int plutovg_font_face_kerning(plutovg_font_face_t* face, int glyph1, int 
 
 typedef void (*plutovg_glyph_func_t)(void* closure, plutovg_font_face_t* face, plutovg_codepoint_t codepoint, plutovg_glyph_t* glyph, float x);
 
-/* Lay out text: each glyph's pen x, kerned against the previous glyph;
- * func is called per glyph. Returns the total advance. */
+/* Lay out text: each glyph's face (fallback) and pen x, kerned against the
+ * previous glyph when one face draws both; func is called per glyph.
+ * Returns the total advance. */
 static float plutovg_font_face_layout(plutovg_font_face_t* face, float size, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_glyph_func_t func, void* closure)
 {
     plutovg_text_iterator_t it;
     plutovg_text_iterator_init(&it, text, length, encoding);
     float x = 0.f;
-    float scale = plutovg_font_face_get_scale(face, size);
+    plutovg_font_face_t* last_face = NULL;
     int last_index = 0;
     while(plutovg_text_iterator_has_next(&it)) {
         plutovg_codepoint_t codepoint = plutovg_text_iterator_next(&it);
-        plutovg_glyph_t* glyph = plutovg_font_face_get_glyph(face, codepoint);
-        x += plutovg_font_face_kerning(face, last_index, glyph->index) * scale;
+        plutovg_glyph_t* glyph;
+        plutovg_font_face_t* used = plutovg_font_face_resolve(face, codepoint, &glyph);
+        float scale = plutovg_font_face_get_scale(used, size);
+        if(last_face && last_face->base == used->base)
+            x += plutovg_font_face_kerning(used, last_index, glyph->index) * scale;
         if(func)
-            func(closure, face, codepoint, glyph, x);
+            func(closure, used, codepoint, glyph, x);
         x += glyph->advance_width * scale;
+        last_face = used;
         last_index = glyph->index;
     }
     return x;

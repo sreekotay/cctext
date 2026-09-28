@@ -86,6 +86,28 @@ const Alias kAliases[] = {
     {"noto sans mono", "source code pro"},
     {"noto sans mono", "fira code"},
     {"noto sans mono", "fira mono"},
+    // CJK: the subset Noto Sans SC (Simplified Chinese glyph shapes; also
+    // the per-glyph fallback for CJK in any other family).
+    {"noto sans sc", "noto sans cjk sc"},
+    {"noto sans sc", "noto sans cjk jp"},
+    {"noto sans sc", "noto sans cjk tc"},
+    {"noto sans sc", "noto sans jp"},
+    {"noto sans sc", "noto sans tc"},
+    {"noto sans sc", "source han sans"},
+    {"noto sans sc", "source han sans sc"},
+    {"noto sans sc", "microsoft yahei"},
+    {"noto sans sc", "pingfang sc"},
+    {"noto sans sc", "hiragino sans"},
+    {"noto sans sc", "hiragino sans gb"},
+    {"noto sans sc", "heiti sc"},
+    {"noto sans sc", "simhei"},
+    {"noto sans sc", "simsun"},
+    {"noto sans sc", "songti sc"},
+    {"noto sans sc", "wenquanyi micro hei"},
+    {"noto sans sc", "meiryo"},
+    {"noto sans sc", "yu gothic"},
+    {"noto sans sc", "ms gothic"},
+    {"noto sans sc", "ms mincho"},
 };
 
 void lower(char* s)
@@ -184,6 +206,14 @@ extern "C" int cr_svg_add_font(const char* family, int bold, int italic, const v
     lower(fam);
     if(!lunasvg_add_font_face_from_data(fam, bold != 0, italic != 0, data, n, nullptr, nullptr))
         return -1;
+    // Per-glyph fallback: a glyph the chosen face lacks comes from the first
+    // regular face (in registration order: render/manifest.txt) that has it,
+    // emboldened / slanted as the text asks (plutovg patch 0004).
+    if(!bold && !italic) {
+        auto face = lunasvg::fontFaceCache()->getFontFace(fam, false, false);
+        if(!face.isNull())
+            plutovg_font_face_add_fallback(face.get());
+    }
     for(const auto& a : kAliases) {
         if(std::strcmp(a.face, fam) == 0)
             lunasvg_add_font_face_from_data(a.name, bold != 0, italic != 0, data, n, nullptr, nullptr);

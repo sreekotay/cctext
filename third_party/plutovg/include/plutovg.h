@@ -894,7 +894,21 @@ PLUTOVG_API float plutovg_font_face_traverse_glyph_path(plutovg_font_face_t* fac
 PLUTOVG_API float plutovg_font_face_text_extents(plutovg_font_face_t* face, float size, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_rect_t* extents);
 
 /**
- * @brief cctext patch: the path of a text run as it is drawn (kerned).
+ * @brief cctext patch: adds a face tried, in the order added, for a glyph the
+ * drawing face lacks (text drawing and measuring; at most 16).
+ *
+ * @param face A pointer to a `plutovg_font_face_t` object (referenced).
+ */
+PLUTOVG_API void plutovg_font_face_add_fallback(plutovg_font_face_t* face);
+
+/**
+ * @brief cctext patch: removes every fallback face.
+ */
+PLUTOVG_API void plutovg_font_face_clear_fallbacks(void);
+
+/**
+ * @brief cctext patch: the path of a text run as it is drawn: per-glyph
+ * fallback faces and kerning.
  *
  * @return The total advance width of the text.
  */
