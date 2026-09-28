@@ -57,6 +57,85 @@ def wakeups(pid):
     return n
 
 
+def thread_wakeups(pid):
+    """{tid: context switches} for every thread of `pid`."""
+    out = {}
+    try:
+        tids = os.listdir("/proc/%d/task" % pid)
+    except OSError:
+        return out
+    for tid in tids:
+        n = 0
+        try:
+            with open("/proc/%d/task/%s/status" % (pid, tid)) as f:
+                for line in f:
+                    if line.startswith(("voluntary_ctxt_switches",
+                                        "nonvoluntary_ctxt_switches")):
+                        n += int(line.split()[1])
+        except OSError:
+            continue
+        out[tid] = n
+    return out
+
+
+def runtime_tick(pid, tid):
+    """The ccc runtime's sysmon between its 20 ms ticks: a raw
+    FUTEX_WAIT_PRIVATE (op 0x80) with a timeout (runtime/wake_primitive.h
+    wait_timeout). Nothing cctext or GTK runs waits so (condvars are
+    FUTEX_WAIT_BITSET, the runtime's workers park with no timeout); a
+    runtime whose sysmon sleeps while quiescent has no such thread."""
+    for _ in range(20):
+        try:
+            with open("/proc/%d/task/%s/syscall" % (pid, tid)) as f:
+                v = f.read().split()
+        except OSError:
+            return False
+        if v and v[0] == "running":
+            time.sleep(0.001)
+            continue
+        return (len(v) > 4 and v[0] == "202" and int(v[2], 16) == 0x80 and
+                int(v[4], 16) != 0)
+    return False
+
+
+IDLE_STRICT = os.environ.get("RTX_IDLE_STRICT", "") not in ("", "0")
+
+
+def idle_threads(pid, secs=3.0):
+    """Wakeups of every thread over `secs` once work has settled (a 0.5 s
+    window where nothing but the runtime's tick wakes; 8 s at most):
+    (own, tick, detail) — the host's threads (UI, GTK, cctext workers),
+    the ccc runtime's sysmon, and 'tid:comm:n' per thread that woke."""
+    def split(a, b):
+        own = tick = 0
+        detail = []
+        for tid, n in b.items():
+            d = n - a.get(tid, n)
+            if d <= 0:
+                continue
+            try:
+                with open("/proc/%d/task/%s/comm" % (pid, tid)) as f:
+                    comm = f.read().strip()
+            except OSError:
+                comm = "?"
+            if runtime_tick(pid, tid):
+                tick += d
+                detail.append("%s:ccc-sysmon:%d" % (tid, d))
+            else:
+                own += d
+                detail.append("%s:%s:%d" % (tid, comm, d))
+        return own, tick, " ".join(detail)
+    end = time.time() + 8.0
+    while time.time() < end:
+        a = thread_wakeups(pid)
+        time.sleep(0.5)
+        if split(a, thread_wakeups(pid))[0] == 0:
+            break
+    a = thread_wakeups(pid)
+    time.sleep(secs)
+    return split(a, thread_wakeups(pid))
+
+
 def strip_ms(line):
     """Host trace lines lead with a monotonic ms stamp; plat notes do not."""
     head, _, rest = line.partition(" ")
@@ -422,6 +501,97 @@ def table_right_edge(px, y0, y1, x_hi):
     return xr, runs_on * 4 >= (y1 - y0)
 
 
+def text_ink(env, tmp, win, name):
+    """Light (glyph) pixels in the window's text area — below the menu,
+    above the status bar, right of the gutter — or None without a shot."""
+    if not shutil.which("import") or not shutil.which("convert"):
+        return None
+    geo = subprocess.run(["xdotool", "getwindowgeometry", "--shell", win], env=env,
+                         capture_output=True, text=True).stdout
+    g = dict(l.split("=", 1) for l in geo.split() if "=" in l)
+    x, y, w, h = (int(g.get(k, 0)) for k in ("X", "Y", "WIDTH", "HEIGHT"))
+    if w < 200 or h < 120:
+        return None
+    shot = os.path.join(tmp, name)
+    subprocess.run(["import", "-window", "root", shot], env=env, capture_output=True)
+    x0, y0, cw, ch = x + 60, y + 36, w - 90, h - 36 - 34
+    raw = subprocess.run(["convert", shot, "-crop", "%dx%d+%d+%d" % (cw, ch, x0, y0),
+                          "+repage", "-depth", "8", "rgb:-"], capture_output=True).stdout
+    if len(raw) < cw * ch * 3:
+        return None
+    n = 0
+    for i in range(0, cw * ch * 3, 3 * 3):
+        if max(raw[i], raw[i + 1], raw[i + 2]) > 150:
+            n += 1
+    return n
+
+
+def case_last_line(exe, env, tmp):
+    """The caret on a document's last line — the empty one after a final
+    newline — by Down, Ctrl-End and PageDown, and the wheel to EOF: the
+    text area keeps text on it (it used to go blank: that line has no
+    row, and the camera put it at the top). Wrap on and off, Rich and
+    Source, with and without a final newline."""
+    if not shutil.which("xdotool"):
+        print("skip: last line (no xdotool)")
+        return
+    body = b"".join(b"line %d of some text here\n" % i for i in range(1, 60))
+    for nl in (1, 0):
+        for mode in ("rich wrap", "rich nowrap", "source wrap"):
+            name = "last%d_%s.txt" % (nl, mode.replace(" ", "_"))
+            p, log = launch(exe, env, tmp, name, body if nl else body[:-1])
+            got = {}
+            try:
+                time.sleep(2.0)
+                win = xdo(env, "search", "--onlyvisible", "--pid", str(p.pid))
+                if not win:
+                    print("skip: last line (window not found)")
+                    return
+                win = win[0]
+                xdo(env, "windowfocus", "--sync", win)
+                time.sleep(0.2)
+
+                def keys(*ks, settle=0.6):
+                    for k in ks:
+                        xdo(env, "key", "--window", win, k)
+                        time.sleep(0.03)
+                    time.sleep(settle)
+
+                if "nowrap" in mode:
+                    keys("ctrl+shift+m")
+                if "source" in mode:
+                    keys("ctrl+d")
+                got["top"] = text_ink(env, tmp, win, "top.png")
+                keys(*(["Down"] * 59))
+                got["Down"] = text_ink(env, tmp, win, "down.png")
+                keys("ctrl+Home")
+                keys("ctrl+End")
+                got["Ctrl-End"] = text_ink(env, tmp, win, "cend.png")
+                keys("ctrl+Home")
+                keys(*(["Next"] * 4))
+                got["PageDown"] = text_ink(env, tmp, win, "pgdn.png")
+                keys("ctrl+Home")
+                xdo(env, "mousemove", "--window", win, "400", "300")
+                xdo(env, "click", "--repeat", "40", "--delay", "10", "5")
+                time.sleep(0.6)
+                got["wheel"] = text_ink(env, tmp, win, "wheel.png")
+            finally:
+                stop(p)
+            if got.get("top") is None:
+                print("skip: last line (no import / convert)")
+                return
+            full = got["top"]
+            for how in ("Down", "Ctrl-End", "PageDown"):
+                check(got[how] is not None and got[how] * 2 >= full,
+                      "last line: %s to EOF keeps the pane full (%s, %s)" %
+                      (how, mode, "final newline" if nl else "no final newline"),
+                      "%s lit px vs %s at the top" % (got[how], full))
+            check(got["wheel"] is not None and got["wheel"] > 0,
+                  "last line: wheel to EOF keeps text on screen (%s, %s)" %
+                  (mode, "final newline" if nl else "no final newline"),
+                  "%s lit px" % got["wheel"])
+
+
 FIT_W, FIT_H = 1260, 760  # the window is resized to this first (a refit)
 
 
@@ -496,6 +666,7 @@ def main(argv):
             case_blink_unfocused(exe, env, tmp)
             case_tabs_panes(exe, env, tmp)
             case_md_table_fit(exe, env, tmp)
+            case_last_line(exe, env, tmp)
     finally:
         if xvfb:
             xvfb.terminate()

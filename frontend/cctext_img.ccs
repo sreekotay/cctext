@@ -1,0 +1,1448 @@
+#!ccc ccs
+/*
+ * cctext pictures (cctext_img.cch, docs/images.md "Terminal").
+ *
+ * State is the UI thread's: the detected terminal, the encode cache
+ * (TiEnc: one per bitmap x box x protocol x crop), the kitty ids we
+ * sent, and the overlays (sixel / iTerm2) of this frame and the last.
+ * One background lane runs encodes (the img.ccs lane shape: a job
+ * record, a done flag, adopt on the UI thread); a job owns a copy of
+ * its input pixels, so the loader may evict the bitmap meanwhile.
+ */
+#include <ccc/std/prelude.cch>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/stat.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "../core/img.cch"
+#include "../core/img_term.h"
+#include "../core/rtx_par.cch"
+#include "../core/utf8.cch"
+#include "cctext_img.cch"
+
+int cctext_put_text(const char *s, size_t n, int maxc, size_t *used);
+
+volatile sig_atomic_t g_ccti_lost;
+
+/* ---- configuration + detection ------------------------------------------ */
+
+static struct {
+    int want;              /* CCTI_* or CCTI_AUTO */
+    int glyphs;            /* RTX_TIMG_HALF.. */
+    int dither;
+    int ssh_kpx;
+    int proto;             /* in use */
+    int colors;            /* RTX_TIMG_TRUE / RTX_TIMG_256 / -1 none */
+    int tmux, ssh;
+    int local;             /* kitty reads our temp files (t=t) */
+    int kitty_ok, kitty_file_ok, pass_echo;
+    int da1, da1_sixel, sixel_regs, rgb_ok;
+    uint32_t cw, ch;
+    int px_known;
+    int rows, cols;
+    int msb;               /* kitty id top byte (per process) */
+    char name[64];         /* XTVERSION */
+    char tmpdir[160];
+    int detected;
+} G = {CCTI_AUTO, RTX_TIMG_HALF, 0, 64, CCTI_OFF, -1, 0, 0, 0, 0, 0, 0,
+       0, 0, 0, 0, 8, 16, 0, 24, 80, 1, "", "/tmp", 0};
+
+static long ti_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int ti_mode_of(const char *s) {
+    if (!s || !s[0]) return -1;
+    if (!strcmp(s, "auto")) return CCTI_AUTO;
+    if (!strcmp(s, "kitty")) return CCTI_KITTY;
+    if (!strcmp(s, "sixel")) return CCTI_SIXEL;
+    if (!strcmp(s, "iterm") || !strcmp(s, "iterm2")) return CCTI_ITERM;
+    if (!strcmp(s, "blocks")) return CCTI_BLOCKS;
+    if (!strcmp(s, "off") || !strcmp(s, "text")) return CCTI_OFF;
+    return -1;
+}
+
+void cctext_img_setup(const char *mode, const char *glyphs, int dither, int ssh_kpx) {
+    int m = ti_mode_of(mode);
+    const char *env = getenv("RTX_TUI_IMAGES");
+    if (m >= 0) G.want = m;
+    m = ti_mode_of(env);
+    if (m >= 0) G.want = m;
+    if (glyphs && glyphs[0]) {
+        if (!strcmp(glyphs, "quadrant") || !strcmp(glyphs, "quad")) G.glyphs = RTX_TIMG_QUAD;
+        else if (!strcmp(glyphs, "sextant") || !strcmp(glyphs, "sext")) G.glyphs = RTX_TIMG_SEXT;
+        else if (!strcmp(glyphs, "half")) G.glyphs = RTX_TIMG_HALF;
+    }
+    env = getenv("RTX_TUI_BLOCKS");
+    if (env && env[0]) {
+        if (env[0] == 'q') G.glyphs = RTX_TIMG_QUAD;
+        else if (env[0] == 's') G.glyphs = RTX_TIMG_SEXT;
+        else G.glyphs = RTX_TIMG_HALF;
+    }
+    if (dither >= 0) G.dither = dither != 0;
+    if (ssh_kpx >= 0) G.ssh_kpx = ssh_kpx;
+}
+
+int cctext_img_proto(void) {
+    return G.proto;
+}
+
+const char *cctext_img_desc(char *buf, size_t n) {
+    static const char *nm[] = {"text", "blocks", "kitty", "sixel", "iterm"};
+    snprintf(buf, n, "%s%s%s, %s colour, cell %ux%u%s%s", nm[G.proto],
+             G.proto == CCTI_KITTY && G.tmux ? " (tmux passthrough)" : "",
+             G.proto == CCTI_KITTY && G.local ? " (temp files)" : "",
+             G.colors == RTX_TIMG_TRUE ? "24-bit" : G.colors == RTX_TIMG_256 ? "256" : "no",
+             (unsigned)G.cw, (unsigned)G.ch, G.px_known ? "" : " (assumed)",
+             G.ssh ? ", ssh" : "");
+    return buf;
+}
+
+/* Cell pixels from TIOCGWINSZ (0 when the terminal does not fill them). */
+static int ti_winsz_px(int *rows, int *cols) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0 || !ws.ws_row || !ws.ws_col) return 0;
+    if (rows) *rows = ws.ws_row;
+    if (cols) *cols = ws.ws_col;
+    if (ws.ws_xpixel && ws.ws_ypixel) {
+        uint32_t cw = ws.ws_xpixel / ws.ws_col, ch = ws.ws_ypixel / ws.ws_row;
+        if (cw >= 2 && ch >= 4 && cw <= 256 && ch <= 512) {
+            G.cw = cw;
+            G.ch = ch;
+            G.px_known = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void ti_cells_publish(void) {
+    int max_rows = G.rows > 6 ? G.rows - 4 : 2;
+    rtx_img_cells_set(G.proto != CCTI_OFF, G.cw, G.ch, (uint32_t)max_rows);
+}
+
+void cctext_img_resize(int rows, int cols) {
+    uint32_t cw = G.cw, ch = G.ch;
+    G.rows = rows;
+    G.cols = cols;
+    ti_winsz_px(NULL, NULL);
+    (void)cw;
+    (void)ch;
+    ti_cells_publish();
+}
+
+/* Write all of b (the terminal) with write(2). */
+static void ti_write(int fd, const char *b, size_t n) {
+    while (n > 0) {
+        ssize_t k = write(fd, b, n);
+        if (k < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        b += k;
+        n -= (size_t)k;
+    }
+}
+
+/* A new private temp file at `path` (a name kitty deletes after reading
+ * it: in a temp directory, "tty-graphics-protocol" in it). Never follows
+ * or reuses what is there (O_EXCL | O_NOFOLLOW): on a clash a suffix is
+ * added to path. -1 on failure. Any thread. */
+static int ti_tmp_create(char *path, size_t cap) {
+    size_t base = strlen(path);
+    int k;
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+    for (k = 0; k < 8; k++) {
+        int fd;
+        if (k) snprintf(path + base, cap - base, "-%d", k);
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd >= 0) return fd;
+        if (errno != EEXIST) break;
+    }
+    path[base] = 0;
+    return -1;
+}
+
+/* An unpredictable tag for temp names (the clock's nanoseconds and pid). */
+static unsigned ti_rand(void) {
+    struct timespec ts;
+    unsigned v;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    v = (unsigned)ts.tv_nsec ^ ((unsigned)ts.tv_sec << 20) ^ ((unsigned)getpid() << 8);
+    v ^= v >> 13;
+    v *= 0x5bd1e995u;
+    return v ^ (v >> 15);
+}
+
+/* Wrap an escape sequence for tmux's DCS passthrough (every ESC doubled). */
+static size_t ti_tmux_wrap(const char *s, size_t n, char *out, size_t cap) {
+    size_t o = 0, i;
+    const char *pre = "\x1bPtmux;";
+    if (cap < 12) return 0;
+    memcpy(out, pre, 7);
+    o = 7;
+    for (i = 0; i < n && o + 4 < cap; i++) {
+        if (s[i] == '\x1b') out[o++] = '\x1b';
+        out[o++] = s[i];
+    }
+    out[o++] = '\x1b';
+    out[o++] = '\\';
+    return o;
+}
+
+/* Parse one reply at b[0, n). Returns bytes used, 0 when incomplete, and
+ * -k for k bytes that are not a reply (handed back as input). */
+static long ti_reply(const unsigned char *b, size_t n, int qid, int qid2) {
+    size_t i;
+    if (!n) return 0;
+    if (b[0] != 0x1b) {
+        for (i = 1; i < n && b[i] != 0x1b; i++) {
+        }
+        return -(long)i;
+    }
+    if (n < 2) return 0;
+    if (b[1] == '_' || b[1] == 'P' || b[1] == ']') {
+        /* APC / DCS / OSC up to ST (or BEL). */
+        size_t e = 0;
+        for (i = 2; i < n; i++) {
+            if (b[i] == 0x07) {
+                e = i + 1;
+                break;
+            }
+            if (b[i] == 0x1b && i + 1 < n && b[i + 1] == '\\') {
+                e = i + 2;
+                break;
+            }
+            if (b[i] == 0x1b && i + 1 >= n) return 0;
+        }
+        if (!e) return i >= 4096 ? -(long)n : 0;
+        if (b[1] == '_' && b[2] == 'G') {
+            char body[256];
+            size_t bn = e - 3 < sizeof body - 1 ? e - 3 : sizeof body - 1;
+            const char *ip;
+            memcpy(body, b + 3, bn);
+            body[bn] = 0;
+            ip = strstr(body, "i=");
+            if (ip) {
+                int id = atoi(ip + 2);
+                int ok = strstr(body, ";OK") != NULL;
+                if (id == qid && ok) G.kitty_ok = 1;
+                if (id == qid2 && ok) G.kitty_file_ok = 1;
+                if (id == qid || id == qid2) G.pass_echo = 1;
+            }
+        } else if (b[1] == 'P') {
+            char body[256];
+            size_t bn = e - 2 < sizeof body - 1 ? e - 2 : sizeof body - 1;
+            memcpy(body, b + 2, bn);
+            body[bn] = 0;
+            if (body[0] == '>' && body[1] == '|') {
+                size_t k = 0;
+                const char *s = body + 2;
+                while (*s && *s != 0x1b && k + 1 < sizeof G.name) G.name[k++] = *s++;
+                G.name[k] = 0;
+                if (G.tmux) G.pass_echo = 1;
+            } else if (strstr(body, "$r")) {
+                if (strstr(body, "2:1:2:3") || strstr(body, "2;1;2;3")) G.rgb_ok = 1;
+            }
+        }
+        return (long)e;
+    }
+    if (b[1] == '[') {
+        int priv = 0, par[8] = {0}, np = 0;
+        for (i = 2; i < n; i++) {
+            unsigned char c = b[i];
+            if (i == 2 && (c == '?' || c == '>' || c == '=')) {
+                priv = c;
+                continue;
+            }
+            if (c >= '0' && c <= '9') {
+                if (np == 0) np = 1;
+                if (np <= 8 && par[np - 1] < 100000) par[np - 1] = par[np - 1] * 10 + (c - '0');
+                continue;
+            }
+            if (c == ';') {
+                if (np == 0) np = 1;
+                if (np < 8) par[np++] = 0;
+                else np = 9;
+                continue;
+            }
+            if (c >= 0x20 && c <= 0x3f) continue;
+            break;
+        }
+        if (i >= n) return 0;
+        if (b[i] == 'c' && priv == '?') {
+            int k;
+            G.da1 = 1;
+            for (k = 1; k < np && k < 8; k++)
+                if (par[k] == 4) G.da1_sixel = 1;
+            return (long)(i + 1);
+        }
+        if (b[i] == 'S' && priv == '?') {
+            if (np >= 3 && par[0] == 1 && par[1] == 0 && par[2] > 0) G.sixel_regs = par[2];
+            return (long)(i + 1);
+        }
+        if (b[i] == 't' && !priv && np >= 3 && par[0] == 6) {
+            if (!G.px_known && par[1] >= 4 && par[2] >= 2 && par[1] <= 512 && par[2] <= 256) {
+                G.ch = (uint32_t)par[1];
+                G.cw = (uint32_t)par[2];
+                G.px_known = 1;
+            }
+            return (long)(i + 1);
+        }
+        return -(long)(i + 1);
+    }
+    return -1;
+}
+
+void cctext_img_detect(unsigned char *left, size_t cap, size_t *leftn) {
+    const char *ct = getenv("COLORTERM"), *term = getenv("TERM"), *ms;
+    char q[2048], w[4096], tfile[256];
+    size_t qn = 0;
+    unsigned char buf[8192];
+    size_t bn = 0, ln = 0;
+    int qid, qid2, timeout = 150, need_q, got_file = 0; /* ids < 2^31 */
+    long t0;
+    if (leftn) *leftn = 0;
+    G.detected = 1;
+    G.tmux = getenv("TMUX") && getenv("TMUX")[0];
+    G.ssh = (getenv("SSH_TTY") && getenv("SSH_TTY")[0]) ||
+            (getenv("SSH_CONNECTION") && getenv("SSH_CONNECTION")[0]);
+    {
+        const char *td = getenv("TMPDIR");
+        snprintf(G.tmpdir, sizeof G.tmpdir, "%s", td && td[0] && strlen(td) < 120 ? td : "/tmp");
+    }
+    G.msb = 1 + (int)(getpid() % 126); /* ids stay below 2^31 */
+    ti_winsz_px(&G.rows, &G.cols);
+    if (ct && (!strcmp(ct, "truecolor") || !strcmp(ct, "24bit"))) G.colors = RTX_TIMG_TRUE;
+    else if (term && (strstr(term, "256") || strstr(term, "direct") || !strncmp(term, "tmux", 4) ||
+                      !strncmp(term, "screen", 6) || strstr(term, "kitty")))
+        G.colors = RTX_TIMG_256;
+    ms = getenv("RTX_TUI_DETECT_MS");
+    if (ms && ms[0]) timeout = atoi(ms);
+    if (timeout < 0) timeout = 0;
+    if (timeout > 2000) timeout = 2000;
+    qid = (G.msb << 24) | 250;
+    qid2 = (G.msb << 24) | 251;
+    need_q = G.want != CCTI_OFF;
+    if (need_q) {
+        char k1[128], k2[512], b64[400];
+        int n1, n2 = 0;
+        n1 = snprintf(k1, sizeof k1, "\x1b_Gi=%d,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\", qid);
+        if (!G.ssh) {
+            /* A file only this host can read: an OK means the terminal
+             * reads our temp files (t=t, no base64 over the pty). */
+            int fd;
+            snprintf(tfile, sizeof tfile, "%s/tty-graphics-protocol-cctext-%d-q%08x", G.tmpdir,
+                     (int)getpid(), ti_rand());
+            fd = ti_tmp_create(tfile, sizeof tfile);
+            if (fd >= 0) {
+                static const char px[3] = {0, 0, 0};
+                if (write(fd, px, 3) == 3) got_file = 1;
+                close(fd);
+            }
+            if (got_file) {
+                rtx_timg_b64((const uint8_t *)tfile, strlen(tfile), b64);
+                n2 = snprintf(k2, sizeof k2, "\x1b_Gi=%d,s=1,v=1,a=q,t=t,f=24;%s\x1b\\", qid2, b64);
+            }
+        }
+        if (G.tmux) {
+            /* The echo test: only an outer terminal behind an open
+             * passthrough can answer these. */
+            qn += ti_tmux_wrap(k1, (size_t)n1, q + qn, sizeof q - qn);
+            if (n2 > 0) qn += ti_tmux_wrap(k2, (size_t)n2, q + qn, sizeof q - qn);
+            qn += ti_tmux_wrap("\x1b[>0q", 5, q + qn, sizeof q - qn);
+        } else {
+            memcpy(q + qn, k1, (size_t)n1);
+            qn += (size_t)n1;
+            if (n2 > 0) {
+                memcpy(q + qn, k2, (size_t)n2);
+                qn += (size_t)n2;
+            }
+            memcpy(q + qn, "\x1b[>0q", 5);
+            qn += 5;
+        }
+        if (!G.px_known) {
+            memcpy(q + qn, "\x1b[16t", 5);
+            qn += 5;
+        }
+        memcpy(q + qn, "\x1b[?1;1;0S", 9);
+        qn += 9;
+        if (G.colors != RTX_TIMG_TRUE) {
+            static const char rq[] = "\x1b[48:2:1:2:3m\x1bP$qm\x1b\\\x1b[0m";
+            memcpy(q + qn, rq, sizeof rq - 1);
+            qn += sizeof rq - 1;
+        }
+        memcpy(q + qn, "\x1b[c", 3);
+        qn += 3;
+        fflush(stdout);
+        ti_write(STDOUT_FILENO, q, qn);
+        t0 = ti_now_ms();
+        for (;;) {
+            long left_ms = (long)timeout - (ti_now_ms() - t0);
+            fd_set rf;
+            struct timeval tv;
+            ssize_t got;
+            size_t at = 0;
+            if (G.da1 && (!G.tmux || G.pass_echo)) break;
+            if (left_ms <= 0) break;
+            FD_ZERO(&rf);
+            FD_SET(STDIN_FILENO, &rf);
+            tv.tv_sec = 0;
+            tv.tv_usec = left_ms * 1000;
+            if (select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv) <= 0) continue;
+            got = read(STDIN_FILENO, buf + bn, sizeof buf - bn);
+            if (got <= 0) break;
+            bn += (size_t)got;
+            while (at < bn) {
+                long r = ti_reply(buf + at, bn - at, qid, qid2);
+                if (r == 0) break;
+                if (r < 0) {
+                    size_t k = (size_t)(-r);
+                    if (left && ln + k <= cap) {
+                        memcpy(left + ln, buf + at, k);
+                        ln += k;
+                    }
+                    at += k;
+                } else {
+                    at += (size_t)r;
+                }
+            }
+            memmove(buf, buf + at, bn - at);
+            bn -= at;
+            if (bn == sizeof buf) bn = 0;
+        }
+        if (bn && left && ln + bn <= cap) {
+            /* An unfinished tail after the wait: input, not a reply. */
+            memcpy(left + ln, buf, bn);
+            ln += bn;
+        }
+        if (got_file) unlink(tfile);
+    }
+    if (leftn) *leftn = ln;
+    if (G.rgb_ok) G.colors = RTX_TIMG_TRUE;
+    if (G.colors < 0 && (G.kitty_ok || G.da1_sixel)) G.colors = RTX_TIMG_256;
+    G.local = G.kitty_file_ok && !G.ssh;
+    if (G.want == CCTI_AUTO) {
+        int no_ph = !strncmp(G.name, "WezTerm", 7) || !strncmp(G.name, "Konsole", 7);
+        int iterm = !strncmp(G.name, "iTerm2", 6) || !strncmp(G.name, "WezTerm", 7);
+        if (G.kitty_ok && !no_ph) G.proto = CCTI_KITTY;
+        else if (iterm && (!G.tmux || G.pass_echo)) G.proto = CCTI_ITERM;
+        else if (G.da1_sixel) G.proto = CCTI_SIXEL;
+        else if (G.colors >= 0) G.proto = CCTI_BLOCKS;
+        else G.proto = CCTI_OFF;
+    } else {
+        G.proto = G.want;
+        if (G.proto == CCTI_BLOCKS && G.colors < 0) G.colors = RTX_TIMG_256;
+    }
+    if (G.proto != CCTI_OFF && G.colors < 0) G.colors = RTX_TIMG_256;
+    if (!G.sixel_regs) G.sixel_regs = 256;
+    if (G.sixel_regs > 256) G.sixel_regs = 256;
+    ti_cells_publish();
+}
+
+/* ---- the encode cache ----------------------------------------------------------- */
+
+enum { TE_QUEUED = 0, TE_RUN, TE_OK, TE_FAIL };
+
+typedef struct TiEnc TiEnc;
+struct TiEnc {
+    TiEnc *next;
+    uint64_t serial;
+    uint64_t bmp;          /* RtxImgBmp.id */
+    uint32_t frame;
+    int kind;              /* CCTI_BLOCKS .. CCTI_ITERM */
+    int cols, rows;
+    uint32_t dw, dh;
+    int cx, cy, cn, rn;    /* crop, cells (overlays); else 0, 0, cols, rows */
+    int glyphs, colors, dither;
+    int state;
+    uint64_t used;
+    uint8_t *in;           /* queued: its own copy of the pixels */
+    uint32_t in_w, in_h;
+    RtxTimgCell *cells;    /* blocks */
+    char *bytes;           /* kitty: the transmit; sixel / iTerm: the image */
+    size_t n;
+    uint8_t *z;            /* kitty t=t: zlib data (sent again after a loss) */
+    size_t zn;
+    char tfile[200];
+    uint32_t kid;          /* kitty id; low byte in the fg colour */
+    int sent;
+    int ever_sent;
+    size_t mem;
+    int cancel;
+};
+
+static TiEnc *g_enc;
+static uint64_t g_serial;
+static uint64_t g_epoch = 1;
+static size_t g_enc_mem;
+static long g_st_enc, g_st_sent, g_st_ovl;
+static int g_changed;
+#define TI_MEM_MAX (96u << 20)
+#define TI_FAR 600
+
+/* kitty ids: low byte 1..255 under this process's top byte. */
+static TiEnc *g_kid[256];
+static uint32_t g_kdel[256];
+static int g_nkdel;
+static int g_kfile_seq;
+
+/* The leave string (kitty deletes), double-buffered for signal handlers. */
+static char g_leave[2][256 * 64];
+static size_t g_leave_n[2];
+static volatile sig_atomic_t g_leave_i;
+
+static size_t ti_apc(char *out, size_t cap, const char *body) {
+    char one[128];
+    int n = snprintf(one, sizeof one, "\x1b_G%s\x1b\\", body);
+    if (n <= 0) return 0;
+    if (G.tmux) return ti_tmux_wrap(one, (size_t)n, out, cap);
+    if ((size_t)n >= cap) return 0;
+    memcpy(out, one, (size_t)n);
+    return (size_t)n;
+}
+
+static void ti_leave_rebuild(void) {
+    int nb = g_leave_i ? 0 : 1, i;
+    size_t o = 0;
+    for (i = 1; i < 256; i++) {
+        char body[64];
+        if (!g_kid[i] || !g_kid[i]->sent) continue;
+        snprintf(body, sizeof body, "a=d,d=I,i=%u,q=2", (unsigned)g_kid[i]->kid);
+        o += ti_apc(g_leave[nb] + o, sizeof g_leave[nb] - o, body);
+    }
+    g_leave_n[nb] = o;
+    g_leave_i = nb;
+}
+
+void cctext_img_leave_write(int fd) {
+    int i = g_leave_i;
+    if (g_leave_n[i]) ti_write(fd, g_leave[i], g_leave_n[i]);
+}
+
+static void ti_enc_free(TiEnc *e) {
+    if (!e) return;
+    if (e->kind == CCTI_KITTY && e->kid) {
+        int lo = (int)(e->kid & 255);
+        if (g_kid[lo] == e) {
+            g_kid[lo] = NULL;
+            if (e->sent && g_nkdel < 256) g_kdel[g_nkdel++] = e->kid;
+        }
+    }
+    if (e->tfile[0]) unlink(e->tfile);
+    g_enc_mem -= e->mem;
+    free(e->in);
+    free(e->cells);
+    free(e->bytes);
+    free(e->z);
+    free(e);
+}
+
+static void ti_enc_unlink(TiEnc *e) {
+    TiEnc **pp;
+    for (pp = &g_enc; *pp; pp = &(*pp)->next)
+        if (*pp == e) {
+            *pp = e->next;
+            return;
+        }
+}
+
+/* The encode job lane. */
+typedef struct {
+    TiEnc *e;
+    int kind;
+    uint8_t *px;
+    uint32_t w, h, dw, dh, cw, ch;
+    int cols, rows, cx, cy, cn, rn;
+    int glyphs, colors, dither, tmux, local, regs;
+    uint32_t kid;
+    char tfile[200];
+    RtxTimgCell *cells;
+    char *bytes;
+    size_t n;
+    uint8_t *z;
+    size_t zn;
+    int ok;
+    volatile int cancel;
+    _Atomic int done;
+} TiJob;
+
+typedef struct {
+    CCParallel h;
+    TiJob job;
+    int busy;
+} TiLane;
+
+static TiLane g_lane;
+
+/* Byte buffer for a job (malloc). */
+typedef struct {
+    char *p;
+    size_t n, cap;
+    int bad;
+} TiOut;
+
+static void ti_out(TiOut *o, const char *s, size_t n) {
+    if (o->bad) return;
+    if (o->n + n > o->cap) {
+        size_t cap = o->cap ? o->cap : 8192;
+        char *p;
+        while (cap < o->n + n) cap *= 2;
+        p = (char *)realloc(o->p, cap);
+        if (!p) {
+            o->bad = 1;
+            return;
+        }
+        o->p = p;
+        o->cap = cap;
+    }
+    memcpy(o->p + o->n, s, n);
+    o->n += n;
+}
+
+/* One escape string, wrapped for tmux when needed. */
+static void ti_out_seq(TiOut *o, const char *s, size_t n, int tmux) {
+    size_t i, st = 0;
+    if (!tmux) {
+        ti_out(o, s, n);
+        return;
+    }
+    ti_out(o, "\x1bPtmux;", 7);
+    for (i = 0; i < n; i++) {
+        if (s[i] == '\x1b') {
+            ti_out(o, s + st, i - st);
+            ti_out(o, "\x1b", 1);
+            st = i;
+        }
+    }
+    ti_out(o, s + st, n - st);
+    ti_out(o, "\x1b\\", 2);
+}
+
+/* The kitty transmit of j's pixels (zlib, f=32) with a virtual placement
+ * of cols x rows (U=1): direct (chunked base64) or a temp file. */
+static int ti_kitty_build(TiJob *j, const uint8_t *z, size_t zn, TiOut *o) {
+    char head[256];
+    int hn;
+    if (j->local && j->tfile[0]) {
+        char b64[300];
+        char seq[512];
+        int fd = ti_tmp_create(j->tfile, sizeof j->tfile);
+        size_t off = 0;
+        if (fd < 0) return 0;
+        while (off < zn) {
+            ssize_t k = write(fd, z + off, zn - off);
+            if (k <= 0) {
+                close(fd);
+                unlink(j->tfile);
+                return 0;
+            }
+            off += (size_t)k;
+        }
+        close(fd);
+        rtx_timg_b64((const uint8_t *)j->tfile, strlen(j->tfile), b64);
+        hn = snprintf(seq, sizeof seq,
+                      "\x1b_Ga=T,U=1,i=%u,f=32,s=%u,v=%u,c=%d,r=%d,o=z,t=t,q=2;%s\x1b\\",
+                      (unsigned)j->kid, (unsigned)j->w, (unsigned)j->h, j->cols, j->rows, b64);
+        ti_out_seq(o, seq, (size_t)hn, j->tmux);
+        return !o->bad;
+    }
+    {
+        size_t bl = rtx_timg_b64_len(zn), off = 0;
+        char *b = (char *)malloc(bl + 1);
+        int first = 1;
+        if (!b) return 0;
+        rtx_timg_b64(z, zn, b);
+        do {
+            size_t take = bl - off > 4096 ? 4096 : bl - off;
+            int more = off + take < bl;
+            TiOut one = {0};
+            if (first)
+                hn = snprintf(head, sizeof head,
+                              "\x1b_Ga=T,U=1,i=%u,f=32,s=%u,v=%u,c=%d,r=%d,o=z,q=2,m=%d;",
+                              (unsigned)j->kid, (unsigned)j->w, (unsigned)j->h, j->cols,
+                              j->rows, more);
+            else
+                hn = snprintf(head, sizeof head, "\x1b_Gm=%d;", more);
+            ti_out(&one, head, (size_t)hn);
+            ti_out(&one, b + off, take);
+            ti_out(&one, "\x1b\\", 2);
+            if (one.bad) {
+                free(one.p);
+                free(b);
+                return 0;
+            }
+            ti_out_seq(o, one.p, one.n, j->tmux);
+            free(one.p);
+            off += take;
+            first = 0;
+        } while (off < bl && !j->cancel);
+        free(b);
+    }
+    return !o->bad && !j->cancel;
+}
+
+static void ti_job_run(TiJob *j) {
+    j->ok = 0;
+    if (j->kind == CCTI_BLOCKS) {
+        j->cells = (RtxTimgCell *)malloc((size_t)j->cols * (size_t)j->rows * sizeof(RtxTimgCell));
+        if (j->cells)
+            j->ok = rtx_timg_blocks(j->px, j->w, j->h, j->w * 4, j->dw, j->dh, j->cw, j->ch,
+                                    (uint32_t)j->cols, (uint32_t)j->rows, j->glyphs, j->colors,
+                                    j->dither, j->cells);
+    } else if (j->kind == CCTI_KITTY) {
+        TiOut o = {0};
+        if (rtx_timg_zlib(j->px, (size_t)j->w * j->h * 4, &j->z, &j->zn) &&
+            ti_kitty_build(j, j->z, j->zn, &o)) {
+            j->bytes = o.p;
+            j->n = o.n;
+            j->ok = 1;
+        } else {
+            free(o.p);
+        }
+    } else {
+        /* Sixel / iTerm2: the crop of the picture at its display size. */
+        uint32_t x0 = (uint32_t)j->cx * j->cw, y0 = (uint32_t)j->cy * j->ch;
+        uint32_t x1 = (uint32_t)(j->cx + j->cn) * j->cw, y1 = (uint32_t)(j->cy + j->rn) * j->ch;
+        uint8_t *crop;
+        if (x1 > j->dw) x1 = j->dw;
+        if (y1 > j->dh) y1 = j->dh;
+        if (x1 <= x0 || y1 <= y0) {
+            j->ok = 1; /* nothing of the picture in this crop */
+        } else if ((crop = (uint8_t *)malloc((size_t)(x1 - x0) * (y1 - y0) * 4)) != NULL) {
+            if (rtx_timg_scale(j->px, j->w, j->h, j->w * 4, j->dw, j->dh, x0, y0, x1 - x0,
+                               y1 - y0, crop)) {
+                if (j->kind == CCTI_SIXEL) {
+                    j->ok = rtx_timg_sixel(crop, x1 - x0, y1 - y0, (x1 - x0) * 4, j->regs,
+                                           &j->cancel, &j->bytes, &j->n);
+                } else {
+                    uint8_t *png = NULL;
+                    size_t pn = 0;
+                    if (rtx_timg_png(crop, x1 - x0, y1 - y0, (x1 - x0) * 4, &png, &pn)) {
+                        TiOut o = {0}, s = {0};
+                        char head[160];
+                        size_t bl = rtx_timg_b64_len(pn);
+                        char *b = (char *)malloc(bl + 1);
+                        int hn;
+                        if (b) {
+                            rtx_timg_b64(png, pn, b);
+                            hn = snprintf(head, sizeof head,
+                                          "\x1b]1337;File=inline=1;size=%zu;width=%d;height=%d;"
+                                          "preserveAspectRatio=1;doNotMoveCursor=1:",
+                                          pn, (int)((x1 - x0 + j->cw - 1) / j->cw),
+                                          (int)((y1 - y0 + j->ch - 1) / j->ch));
+                            ti_out(&s, head, (size_t)hn);
+                            ti_out(&s, b, bl);
+                            ti_out(&s, "\x07", 1);
+                            if (!s.bad) ti_out_seq(&o, s.p, s.n, j->tmux);
+                            free(s.p);
+                            free(b);
+                            if (!o.bad) {
+                                j->bytes = o.p;
+                                j->n = o.n;
+                                j->ok = 1;
+                            } else {
+                                free(o.p);
+                            }
+                        }
+                        free(png);
+                    }
+                }
+            }
+            free(crop);
+        }
+    }
+    atomic_store_explicit(&j->done, 1, memory_order_release);
+}
+
+static void !>(CCError) ti_lane_kick(TiLane *L) {
+    int noop = 0;
+    TiJob *scan = &L->job;
+    atomic_store_explicit(&L->job.done, 0, memory_order_release);
+    L->busy = 1;
+    if (rtx_parallel_inline()) {
+        ti_job_run(scan);
+        return cc_ok();
+    }
+    L->h = @parallel {
+        @serial { noop = 0; }
+        ti_job_run(scan);
+    } !>;
+    return cc_ok();
+}
+
+static void ti_lane_join(TiLane *L) {
+    if (!L->h.live()) return;
+    if (L->h.paused()) L->h.resume() !>(e) { (void)e; };
+    L->h.wait() !>(e) { (void)e; };
+}
+
+static void ti_evict(size_t need);
+
+static void ti_adopt(void) {
+    TiJob *j = &g_lane.job;
+    TiEnc *e = j->e;
+    ti_lane_join(&g_lane);
+    g_lane.busy = 0;
+    free(j->px);
+    j->px = NULL;
+    if (!e || e->cancel || j->cancel || !j->ok) {
+        if (e) {
+            if (e->cancel || j->cancel) {
+                /* Nobody painted it since (or it stopped early): drop it;
+                 * a later paint asks again. */
+                ti_enc_unlink(e);
+                ti_enc_free(e);
+            } else {
+                e->state = TE_FAIL;
+            }
+        }
+        free(j->cells);
+        free(j->bytes);
+        free(j->z);
+        if (j->tfile[0]) unlink(j->tfile);
+        memset(j, 0, sizeof *j);
+        g_changed = 1;
+        return;
+    }
+    e->cells = j->cells;
+    e->bytes = j->bytes;
+    e->n = j->n;
+    e->z = j->local ? j->z : NULL;
+    e->zn = j->local ? j->zn : 0;
+    if (!j->local) free(j->z);
+    if (j->local) snprintf(e->tfile, sizeof e->tfile, "%s", j->tfile);
+    e->mem = e->n + e->zn + (e->cells ? (size_t)e->cols * e->rows * sizeof(RtxTimgCell) : 0);
+    ti_evict(e->mem);
+    g_enc_mem += e->mem;
+    e->state = TE_OK;
+    g_st_enc++;
+    g_changed = 1;
+    memset(j, 0, sizeof *j);
+}
+
+/* Least recently painted first, never one painted this frame. */
+static void ti_evict(size_t need) {
+    while (g_enc_mem + need > TI_MEM_MAX) {
+        TiEnc *e, *old = NULL;
+        for (e = g_enc; e; e = e->next)
+            if (e->state == TE_OK && e->used < g_epoch && (!old || e->used < old->used)) old = e;
+        if (!old) break;
+        ti_enc_unlink(old);
+        ti_enc_free(old);
+    }
+}
+
+static void ti_schedule(void) {
+    TiEnc *e, *pick = NULL;
+    TiJob *j = &g_lane.job;
+    if (g_lane.busy) return;
+    for (e = g_enc; e; e = e->next)
+        if (e->state == TE_QUEUED && e->in && (!pick || e->used > pick->used)) pick = e;
+    if (!pick) return;
+    memset(j, 0, sizeof *j);
+    j->e = pick;
+    j->kind = pick->kind;
+    j->px = pick->in;
+    pick->in = NULL;
+    j->w = pick->in_w;
+    j->h = pick->in_h;
+    j->dw = pick->dw;
+    j->dh = pick->dh;
+    j->cw = G.cw;
+    j->ch = G.ch;
+    j->cols = pick->cols;
+    j->rows = pick->rows;
+    j->cx = pick->cx;
+    j->cy = pick->cy;
+    j->cn = pick->cn;
+    j->rn = pick->rn;
+    j->glyphs = pick->glyphs;
+    j->colors = pick->colors;
+    j->dither = pick->dither;
+    j->tmux = G.tmux;
+    j->local = pick->kind == CCTI_KITTY && G.local;
+    j->regs = G.sixel_regs;
+    j->kid = pick->kid;
+    if (j->local) {
+        snprintf(j->tfile, sizeof j->tfile, "%s/tty-graphics-protocol-cctext-%d-%d-%08x",
+                 G.tmpdir, (int)getpid(), ++g_kfile_seq, ti_rand());
+    }
+    pick->state = TE_RUN;
+    ti_lane_kick(&g_lane) !>(err) {
+        (void)err;
+        pick->state = TE_FAIL;
+        free(j->px);
+        j->px = NULL;
+        g_lane.busy = 0;
+    };
+}
+
+/* A free kitty id (recycling the least recently painted). */
+static uint32_t ti_kid_alloc(TiEnc *e) {
+    int i, pick = 0;
+    for (i = 1; i < 256; i++)
+        if (!g_kid[i]) {
+            pick = i;
+            break;
+        }
+    if (!pick) {
+        TiEnc *old = NULL;
+        for (i = 1; i < 256; i++)
+            if (g_kid[i]->used < g_epoch && g_kid[i]->state != TE_RUN &&
+                (!old || g_kid[i]->used < old->used))
+                old = g_kid[i];
+        if (!old) return 0;
+        pick = (int)(old->kid & 255);
+        ti_enc_unlink(old);
+        ti_enc_free(old);
+    }
+    g_kid[pick] = e;
+    return ((uint32_t)G.msb << 24) | (uint32_t)pick;
+}
+
+/* The encode for (bmp, frame, kind, box, crop): found, or queued with a
+ * copy of the pixels. */
+static TiEnc *ti_enc_get(const RtxImgBmp *bmp, uint32_t frame, int kind, int cols, int rows,
+                         uint32_t dw, uint32_t dh, int cx, int cy, int cn, int rn) {
+    TiEnc *e;
+    size_t fb;
+    for (e = g_enc; e; e = e->next) {
+        if (e->bmp == bmp->id && e->frame == frame && e->kind == kind && e->cols == cols &&
+            e->rows == rows && e->dw == dw && e->dh == dh && e->cx == cx && e->cy == cy &&
+            e->cn == cn && e->rn == rn &&
+            (kind != CCTI_BLOCKS || (e->glyphs == G.glyphs && e->colors == G.colors &&
+                                     e->dither == G.dither))) {
+            e->used = g_epoch;
+            if (e->state == TE_RUN && e->cancel) {
+                e->cancel = 0;
+                if (g_lane.job.e == e) g_lane.job.cancel = 0;
+            }
+            return e;
+        }
+    }
+    e = (TiEnc *)calloc(1, sizeof *e);
+    if (!e) return NULL;
+    fb = (size_t)bmp->h * bmp->stride;
+    e->in = (uint8_t *)malloc((size_t)bmp->w * bmp->h * 4);
+    if (!e->in) {
+        free(e);
+        return NULL;
+    }
+    {
+        uint32_t y;
+        const uint8_t *src = bmp->px + (size_t)frame * fb;
+        for (y = 0; y < bmp->h; y++)
+            memcpy(e->in + (size_t)y * bmp->w * 4, src + (size_t)y * bmp->stride,
+                   (size_t)bmp->w * 4);
+    }
+    e->in_w = bmp->w;
+    e->in_h = bmp->h;
+    e->serial = ++g_serial;
+    e->bmp = bmp->id;
+    e->frame = frame;
+    e->kind = kind;
+    e->cols = cols;
+    e->rows = rows;
+    e->dw = dw;
+    e->dh = dh;
+    e->cx = cx;
+    e->cy = cy;
+    e->cn = cn;
+    e->rn = rn;
+    e->glyphs = G.glyphs;
+    e->colors = G.colors;
+    e->dither = G.dither;
+    e->used = g_epoch;
+    e->state = TE_QUEUED;
+    if (kind == CCTI_KITTY) {
+        e->kid = ti_kid_alloc(e);
+        if (!e->kid) {
+            free(e->in);
+            free(e);
+            return NULL;
+        }
+    }
+    e->next = g_enc;
+    g_enc = e;
+    ti_schedule();
+    return e;
+}
+
+/* ---- pictures ------------------------------------------------------------------- */
+
+void cctext_img_fit(uint32_t iw, uint32_t ih, int cols, int rows, int *bc, int *br,
+                    uint32_t *dw, uint32_t *dh) {
+    uint32_t fw = 0, fh = 0;
+    if (cols < 1) cols = 1;
+    if (rows < 1) rows = 1;
+    if (!iw || !ih) {
+        *bc = cols;
+        *br = rows;
+        *dw = (uint32_t)cols * G.cw;
+        *dh = (uint32_t)rows * G.ch;
+        return;
+    }
+    rtx_img_fit(iw, ih, (uint32_t)cols * G.cw, (uint32_t)rows * G.ch, &fw, &fh);
+    *dw = fw;
+    *dh = fh;
+    *bc = (int)((fw + G.cw - 1) / G.cw);
+    *br = (int)((fh + G.ch - 1) / G.ch);
+    if (*bc < 1) *bc = 1;
+    if (*br < 1) *br = 1;
+    if (*bc > cols) *bc = cols;
+    if (*br > rows) *br = rows;
+}
+
+/* The protocol this picture uses. */
+static int ti_kind_for(const CctiPic *p, uint32_t dw, uint32_t dh) {
+    int k = G.proto;
+    if (k == CCTI_OFF) return CCTI_OFF;
+    if ((k == CCTI_SIXEL || k == CCTI_ITERM) && p->cells_only) k = CCTI_BLOCKS;
+    /* Over SSH a big picture is block art unless a protocol was named. */
+    if (G.ssh && G.want == CCTI_AUTO && k != CCTI_BLOCKS &&
+        (uint64_t)dw * dh > (uint64_t)G.ssh_kpx * 1000)
+        k = CCTI_BLOCKS;
+    return k;
+}
+
+/* Overlay lines painted this frame (grouped at publish). */
+typedef struct {
+    uint64_t bmp;
+    uint32_t frame;
+    int kind, cols, rows, c0, n, li, srow, scol;
+    uint32_t dw, dh;
+    const RtxImgBmp *bp;   /* valid until the next rtx_img_pump */
+} TiLine;
+
+#define TI_LINES 1024
+static TiLine g_lines[TI_LINES];
+static int g_nlines;
+
+typedef struct {
+    int row, col, cn, rn;  /* 0-based screen */
+    uint64_t eser;
+} TiOv;
+
+#define TI_OV 64
+static TiOv g_ov_old[TI_OV], g_ov_new[TI_OV];
+static int g_nov_old, g_nov_new;
+static TiEnc *g_ov_enc[TI_OV];
+static int g_ov_built;
+
+void cctext_img_frame(int rows, int cols) {
+    if (g_ccti_lost) {
+        cctext_img_invalidate(1);
+        g_ccti_lost = 0;
+    }
+    G.rows = rows;
+    G.cols = cols;
+    g_epoch++;
+    g_nlines = 0;
+    g_ov_built = 0;
+    rtx_img_frame();
+}
+
+/* Pixels for the picture (straight RGBA); NULL while on their way. */
+static const RtxImgBmp *ti_pixels(const CctiPic *p, uint32_t *dw, uint32_t *dh,
+                                  uint32_t *frame, RtxImgView *v) {
+    uint32_t w, h;
+    rtx_img_info(p->src, v);
+    if (!v->have_info || v->state == RTX_IMG_S_ERR || v->state == RTX_IMG_S_ASK) return NULL;
+    w = p->dw;
+    h = p->dh;
+    if (!w || !h) {
+        rtx_img_fit(v->info.w, v->info.h, (uint32_t)p->cols * G.cw, (uint32_t)p->rows * G.ch,
+                    &w, &h);
+    }
+    *dw = w;
+    *dh = h;
+    /* Decode at the display size, never above natural (the encoders
+     * scale up for a zoom). */
+    rtx_img_want_pix(p->src, w < v->info.w ? w : v->info.w, h < v->info.h ? h : v->info.h,
+                     p->dim ? RTX_IMG_PIX_RGBA | RTX_IMG_PIX_DIM : RTX_IMG_PIX_RGBA, v);
+    if (v->state != RTX_IMG_S_OK || !v->bmp || !v->bmp->id) return NULL;
+    *frame = v->frame < v->bmp->nframe ? v->frame : 0;
+    return v->bmp;
+}
+
+/* The stand-in text while pixels are on their way (first line). */
+static int ti_wait_text(const CctiPic *p, const RtxImgView *v, char *buf, size_t cap) {
+    size_t k = rtx_img_standin(v, p->alt, p->altn, buf, cap);
+    if (k >= cap) k = cap - 1;
+    buf[k] = 0;
+    return (int)k;
+}
+
+/* Fill out[0, n) for line li, columns [c0, c0 + n). */
+static void ti_fill(const CctiPic *p, int li, int c0, int n, int srow, int scol,
+                    CctiCell *out, int *loading) {
+    uint32_t dw = 0, dh = 0, frame = 0;
+    RtxImgView v;
+    const RtxImgBmp *bmp;
+    int i, kind;
+    *loading = 0;
+    for (i = 0; i < n; i++) {
+        out[i].s[0] = ' ';
+        out[i].n = 1;
+        out[i].fg = -1;
+        out[i].bg = -1;
+    }
+    if (n <= 0 || li < 0 || li >= p->rows) return;
+    bmp = ti_pixels(p, &dw, &dh, &frame, &v);
+    if (!bmp && p->prev) {
+        /* The stale display: the previous picture, faded, meanwhile (the
+         * ask above keeps the new one's decode going). */
+        static CctiPic q;
+        q = *p;
+        q.src = p->prev;
+        q.prev = NULL;
+        q.dim = 1;
+        bmp = ti_pixels(&q, &dw, &dh, &frame, &v);
+        if (bmp) p = &q;
+    }
+    kind = ti_kind_for(p, dw, dh);
+    if (!bmp || kind == CCTI_OFF) {
+        *loading = 1;
+        return;
+    }
+    if (kind == CCTI_SIXEL || kind == CCTI_ITERM) {
+        /* Blanks under the overlay; the lines group at publish. */
+        if (g_nlines < TI_LINES) {
+            TiLine *L = &g_lines[g_nlines++];
+            L->bmp = bmp->id;
+            L->frame = frame;
+            L->kind = kind;
+            L->cols = p->cols;
+            L->rows = p->rows;
+            L->c0 = c0;
+            L->n = n;
+            L->li = li;
+            L->srow = srow;
+            L->scol = scol;
+            L->dw = dw;
+            L->dh = dh;
+            L->bp = bmp;
+        }
+        return;
+    }
+    {
+        TiEnc *e = ti_enc_get(bmp, frame, kind, p->cols, p->rows, dw, dh, 0, 0, p->cols, p->rows);
+        if (!e || e->state != TE_OK) {
+            *loading = !e || e->state == TE_FAIL;
+            return;
+        }
+        if (kind == CCTI_BLOCKS && e->cells) {
+            for (i = 0; i < n; i++) {
+                int c = c0 + i;
+                const RtxTimgCell *tc;
+                if (c < 0 || c >= p->cols) continue;
+                tc = &e->cells[(size_t)li * (size_t)p->cols + (size_t)c];
+                out[i].n = (unsigned char)rtx_timg_utf8(tc->cp, out[i].s);
+                out[i].fg = tc->fg;
+                out[i].bg = tc->bg;
+            }
+        } else if (kind == CCTI_KITTY) {
+            int lo = (int)(e->kid & 255);
+            for (i = 0; i < n; i++) {
+                int c = c0 + i;
+                if (c < 0 || c >= p->cols) continue;
+                out[i].n = (unsigned char)rtx_timg_kitty_ph(li, c, G.msb, out[i].s);
+                out[i].fg = lo;
+                out[i].bg = -1;
+            }
+        }
+    }
+}
+
+int cctext_img_cells(const CctiPic *p, int li, int c0, int n, int srow, int scol,
+                     CctiCell *out) {
+    int loading = 0;
+    if (!p || !out || n <= 0) return 0;
+    ti_fill(p, li, c0, n, srow, scol, out, &loading);
+    if (loading && li == 0) {
+        char buf[256];
+        RtxImgView v;
+        int k, i, o = 0;
+        rtx_img_info(p->src, &v);
+        k = ti_wait_text(p, &v, buf, sizeof buf);
+        for (i = 0; i < k && o < n; i++) {
+            unsigned char ch = (unsigned char)buf[i];
+            if (i < c0) continue;
+            out[o].s[0] = (char)(ch >= 0x20 && ch < 0x7f ? ch : '?');
+            out[o].n = 1;
+            out[o].fg = 244;
+            o++;
+            if (ch >= 0x80) {
+                while (i + 1 < k && ((unsigned char)buf[i + 1] & 0xC0) == 0x80) i++;
+            }
+        }
+    }
+    return n;
+}
+
+int cctext_img_line(const CctiPic *p, int li, int c0, int n, int srow, int scol) {
+    CctiCell cells[512];
+    int loading = 0, i;
+    int32_t cf = -2, cb = -2;
+    if (!p || n <= 0) return 0;
+    if (n > 512) {
+        /* Wider than one batch: the rest after the first 512 cells. */
+        int done = cctext_img_line(p, li, c0, 512, srow, scol);
+        return done + cctext_img_line(p, li, c0 + 512, n - 512, srow, scol + 512);
+    }
+    ti_fill(p, li, c0, n, srow, scol, cells, &loading);
+    if (loading && li == 0) {
+        char buf[256];
+        RtxImgView v;
+        int k, used;
+        rtx_img_info(p->src, &v);
+        k = ti_wait_text(p, &v, buf, sizeof buf);
+        fputs("\x1b[0;90m", stdout);
+        used = c0 < k ? cctext_put_text(buf + c0, (size_t)(k - c0), n, NULL) : 0;
+        for (i = used; i < n; i++) fputc(' ', stdout);
+        fputs("\x1b[0m", stdout);
+        return n;
+    }
+    for (i = 0; i < n; i++) {
+        if (cells[i].fg != cf || cells[i].bg != cb) {
+            char sgr[64];
+            int k = rtx_timg_sgr(cells[i].fg, cells[i].bg, sgr, sizeof sgr);
+            fwrite(sgr, 1, (size_t)k, stdout);
+            cf = cells[i].fg;
+            cb = cells[i].bg;
+        }
+        fwrite(cells[i].s, 1, cells[i].n, stdout);
+    }
+    fputs("\x1b[0m", stdout);
+    return n;
+}
+
+/* ---- publish ----------------------------------------------------------------------- */
+
+/* Group this frame's overlay lines into rectangles and find their encodes. */
+static void ti_ov_build(void) {
+    int i;
+    if (g_ov_built) return;
+    g_ov_built = 1;
+    g_nov_new = 0;
+    for (i = 0; i < g_nlines; i++) {
+        TiLine *a = &g_lines[i];
+        int k = i + 1, rn = 1;
+        TiEnc *e;
+        if (!a->bp) continue;
+        while (k < g_nlines) {
+            TiLine *b = &g_lines[k];
+            if (b->bmp != a->bmp || b->frame != a->frame || b->c0 != a->c0 || b->n != a->n ||
+                b->scol != a->scol || b->li != a->li + rn || b->srow != a->srow + rn ||
+                b->cols != a->cols || b->rows != a->rows)
+                break;
+            b->bp = NULL;
+            rn++;
+            k++;
+        }
+        if (g_nov_new >= TI_OV) break;
+        e = ti_enc_get(a->bp, a->frame, a->kind, a->cols, a->rows, a->dw, a->dh, a->c0, a->li,
+                       a->n, rn);
+        if (!e || e->state != TE_OK || !e->bytes) continue;
+        g_ov_new[g_nov_new].row = a->srow - 1;
+        g_ov_new[g_nov_new].col = a->scol - 1;
+        g_ov_new[g_nov_new].cn = a->n;
+        g_ov_new[g_nov_new].rn = rn;
+        g_ov_new[g_nov_new].eser = e->serial;
+        g_ov_enc[g_nov_new] = e;
+        g_nov_new++;
+    }
+}
+
+static int ti_ov_same(const TiOv *a, const TiOv *b) {
+    return a->row == b->row && a->col == b->col && a->cn == b->cn && a->rn == b->rn &&
+           a->eser == b->eser;
+}
+
+int cctext_img_pub_need(void) {
+    TiEnc *e;
+    int i, j;
+    ti_ov_build();
+    if (g_nkdel) return 1;
+    for (e = g_enc; e; e = e->next)
+        if (e->kind == CCTI_KITTY && e->state == TE_OK && !e->sent && e->used == g_epoch)
+            return 1;
+    if (g_nov_new != g_nov_old) return 1;
+    for (i = 0; i < g_nov_new; i++) {
+        for (j = 0; j < g_nov_old; j++)
+            if (ti_ov_same(&g_ov_new[i], &g_ov_old[j])) break;
+        if (j == g_nov_old) return 1;
+    }
+    return 0;
+}
+
+void cctext_img_pub_pre(void) {
+    TiEnc *e;
+    int i, changed = 0;
+    for (i = 0; i < g_nkdel; i++) {
+        char body[64], seq[160];
+        size_t k;
+        snprintf(body, sizeof body, "a=d,d=I,i=%u,q=2", (unsigned)g_kdel[i]);
+        k = ti_apc(seq, sizeof seq, body);
+        fwrite(seq, 1, k, stdout);
+        changed = 1;
+    }
+    g_nkdel = 0;
+    for (e = g_enc; e; e = e->next) {
+        if (e->kind != CCTI_KITTY || e->state != TE_OK || e->sent || e->used != g_epoch) continue;
+        if (e->z && e->zn && e->tfile[0] == 0 && G.local && e->ever_sent) {
+            /* Sent before, lost since (^Z): the temp file is gone; write
+             * it again. */
+            TiJob tj;
+            TiOut o = {0};
+            memset(&tj, 0, sizeof tj);
+            tj.kid = e->kid;
+            tj.w = e->in_w;
+            tj.h = e->in_h;
+            tj.cols = e->cols;
+            tj.rows = e->rows;
+            tj.tmux = G.tmux;
+            tj.local = 1;
+            snprintf(tj.tfile, sizeof tj.tfile, "%s/tty-graphics-protocol-cctext-%d-%d-%08x",
+                     G.tmpdir, (int)getpid(), ++g_kfile_seq, ti_rand());
+            if (ti_kitty_build(&tj, e->z, e->zn, &o)) {
+                free(e->bytes);
+                e->bytes = o.p;
+                e->n = o.n;
+            } else {
+                free(o.p);
+            }
+        }
+        if (e->bytes && e->n) fwrite(e->bytes, 1, e->n, stdout);
+        /* The terminal reads (and deletes) the temp file now. */
+        e->tfile[0] = 0;
+        e->sent = 1;
+        e->ever_sent = 1;
+        g_st_sent++;
+        changed = 1;
+    }
+    if (changed) ti_leave_rebuild();
+}
+
+void cctext_img_ov_rows(unsigned char *touch, int rows) {
+    int i, r;
+    ti_ov_build();
+    for (i = 0; i < g_nov_old; i++)
+        for (r = g_ov_old[i].row; r < g_ov_old[i].row + g_ov_old[i].rn; r++)
+            if (r >= 0 && r < rows) touch[r] = 1;
+    for (i = 0; i < g_nov_new; i++)
+        for (r = g_ov_new[i].row; r < g_ov_new[i].row + g_ov_new[i].rn; r++)
+            if (r >= 0 && r < rows) touch[r] = 1;
+    /* Lines whose overlay is not encoded yet are plain blanks: nothing to
+     * protect there. */
+}
+
+void cctext_img_ov_force(unsigned char *force, int rows) {
+    int i, j, r;
+    ti_ov_build();
+    for (i = 0; i < g_nov_old; i++) {
+        for (j = 0; j < g_nov_new; j++)
+            if (ti_ov_same(&g_ov_old[i], &g_ov_new[j])) break;
+        if (j < g_nov_new) continue;
+        for (r = g_ov_old[i].row; r < g_ov_old[i].row + g_ov_old[i].rn; r++)
+            if (r >= 0 && r < rows) force[r] = 1;
+    }
+}
+
+void cctext_img_ov_emit(const unsigned char *written, int rows) {
+    int i, j, r;
+    ti_ov_build();
+    for (i = 0; i < g_nov_new; i++) {
+        TiOv *o = &g_ov_new[i];
+        int need = 1;
+        for (j = 0; j < g_nov_old; j++)
+            if (ti_ov_same(o, &g_ov_old[j])) {
+                need = 0;
+                break;
+            }
+        for (r = o->row; r < o->row + o->rn && !need; r++)
+            if (r >= 0 && r < rows && written && written[r]) need = 1;
+        if (!need || !g_ov_enc[i] || !g_ov_enc[i]->bytes) continue;
+        fprintf(stdout, "\x1b[0m\x1b[%d;%dH", o->row + 1, o->col + 1);
+        fwrite(g_ov_enc[i]->bytes, 1, g_ov_enc[i]->n, stdout);
+        g_st_ovl++;
+    }
+    memcpy(g_ov_old, g_ov_new, sizeof(TiOv) * (size_t)g_nov_new);
+    g_nov_old = g_nov_new;
+}
+
+void cctext_img_invalidate(int lost) {
+    TiEnc *e;
+    /* The screen is being cleared: old overlays are gone with it. */
+    g_nov_old = 0;
+    if (!lost) return;
+    /* Our kitty images were deleted (^Z): send each again when painted
+     * (a temp file the terminal already read is written anew). */
+    for (e = g_enc; e; e = e->next)
+        if (e->kind == CCTI_KITTY) e->sent = 0;
+    g_nkdel = 0;
+    ti_leave_rebuild();
+}
+
+int cctext_img_pump(void) {
+    TiEnc *e, *nx;
+    int ch;
+    if (g_lane.busy && atomic_load_explicit(&g_lane.job.done, memory_order_acquire)) ti_adopt();
+    /* Scrolled away: a queued encode nobody painted in the last whole
+     * paint is dropped; a running one is told to stop. Far ones go. */
+    for (e = g_enc; e; e = nx) {
+        nx = e->next;
+        if (e->used >= g_epoch) continue;
+        if (e->state == TE_QUEUED || e->state == TE_FAIL ||
+            (e->state == TE_OK && e->used + TI_FAR < g_epoch)) {
+            ti_enc_unlink(e);
+            ti_enc_free(e);
+        } else if (e->state == TE_RUN && g_lane.job.e == e) {
+            e->cancel = 1;
+            g_lane.job.cancel = 1;
+        }
+    }
+    ti_schedule();
+    ch = g_changed;
+    g_changed = 0;
+    if (g_nkdel) ch = 1;
+    return ch;
+}
+
+int cctext_img_busy(void) {
+    TiEnc *e;
+    if (g_lane.busy) return 1;
+    for (e = g_enc; e; e = e->next)
+        if (e->state == TE_QUEUED) return 1;
+    return 0;
+}
+
+long cctext_img_next_ms(long now_ms) {
+    long d = rtx_img_next_ms(now_ms);
+    /* The terminal's frame budget: at most ~12 frames a second. */
+    if (d >= 0 && d < 80) d = 80;
+    return d;
+}
+
+void cctext_img_stats(long *enc, long *sent, long *ovl) {
+    if (enc) *enc = g_st_enc;
+    if (sent) *sent = g_st_sent;
+    if (ovl) *ovl = g_st_ovl;
+}

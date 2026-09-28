@@ -741,6 +741,7 @@ static void rtx_buf_swap_cam(RtxBuf *b, RtxPaneSnap *s) {
     i = b->pin_view; b->pin_view = s->pin_view; s->pin_view = i;
     i = b->unlock; b->unlock = s->unlock; s->unlock = i;
     i = b->hex_nib; b->hex_nib = s->hex_nib; s->hex_nib = i;
+    i = b->cam_bottom; b->cam_bottom = s->cam_bottom; s->cam_bottom = i;
     d = b->scroll; b->scroll = s->scroll; s->scroll = d;
     d = b->layout_width; b->layout_width = s->layout_width; s->layout_width = d;
     pr = b->pref; b->pref = s->pref; s->pref = pr;
@@ -4652,6 +4653,21 @@ void !>(CCError) RtxBuf_delete_forward(RtxBuf *b) {
     return b->doc.delete_forward();
 }
 
+/* The last line a camera may start on. The empty line after a final
+ * newline has no row (layout.cch), so a camera whose top is that line
+ * fills nothing: the pane is blank. */
+static size_t rtx_buf_last_top(RtxBuf *b, size_t nlines) {
+    size_t n, ls;
+    if (!b || nlines < 2) return 0;
+    n = b->len();
+    if (!n || !b->doc.index_covers(n)) return nlines - 1;
+    ls = b->doc.line_start(nlines - 1) !>(e) {
+        (void)e;
+        return nlines - 1;
+    };
+    return ls >= n ? nlines - 2 : nlines - 1;
+}
+
 static void rtx_buf_origin_from_row(RtxBuf *b, size_t origin) {
     size_t first;
     if (!b || b->layout.rows.len == 0) return;
@@ -4751,6 +4767,12 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
         return cc_ok();
     }
     if (b->layout.rows.len == 0) {
+        /* No rows in a pane with pictures: a refill is pending (a
+         * picture's size arrived, or a diagram re-rendered while its fence
+         * is edited). A caret within the pane's lines keeps the camera;
+         * the refill lays it out. (Other panes keep the old rule: the
+         * keys after it lay out from the caret's line.) */
+        if (b->layout.img_on && cl >= b->top && cl < b->top + (size_t)vis) return cc_ok();
         b->top = cl;
         b->top_wrap = 0;
         return cc_ok();
@@ -4763,8 +4785,24 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
     {
         RtxVisRow *last = &b->layout.rows.data[b->layout.rows.len - 1];
         if (cl > last->line && off >= last->byte_start + last->byte_len) {
+            /* Below the laid-out rows (Down / PageDown / Ctrl-End off
+             * the fill, or the empty line after a final newline, which
+             * has no row). The line right under rows that end above the
+             * pane's bottom is on screen. Otherwise the next ensure_view
+             * lays out the lines above it and puts it at the bottom —
+             * as its top (the old snap) that empty line filled nothing
+             * and the pane was blank. */
+            if (cl == last->line + 1) {
+                size_t screen = 0;
+                size_t i;
+                for (i = b->top_wrap; i < b->layout.rows.len; i++)
+                    screen += (size_t)rtx_layout_row_lines(&b->layout,
+                                                           &b->layout.rows.data[i]);
+                if (screen < (size_t)vis) return cc_ok();
+            }
             b->top = cl;
             b->top_wrap = 0;
+            b->cam_bottom = 1;
             return cc_ok();
         }
     }
@@ -4987,14 +5025,18 @@ static void !>(RtxIndexErr) rtx_buf_fold_skip_cam(RtxBuf *b, int dir) {
     @errhandler(RtxIndexErr e) {
         return cc_err(e);
     }
-    if (!b || !b->doc.fold_n) return cc_ok();
+    if (!b) return cc_ok();
     if (rtx_layout_is_hex(&b->layout)) return cc_ok();
+    /* A hidden Mermaid fence is one picture row (docs/images.md
+     * "Mermaid"): the camera never rests on its other lines. */
+    if (!b->doc.fold_n && !b->layout.rich) return cc_ok();
     if (b->seek_valid) {
-        rtx_buf_seek_set(b, b->doc.fold_snap(b->seek_off, dir));
+        rtx_buf_seek_set(b, rtx_layout_mm_snap(&b->layout, &b->doc,
+                                               b->doc.fold_snap(b->seek_off, dir), dir));
         return cc_ok();
     }
     off = b->doc.line_start(b->top) !>;
-    snap = b->doc.fold_snap(off, dir);
+    snap = rtx_layout_mm_snap(&b->layout, &b->doc, b->doc.fold_snap(off, dir), dir);
     if (snap != off) {
         if (b->doc.index_covers(snap))
             b->top = b->doc.line_of(snap) !>;
@@ -5093,10 +5135,11 @@ void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double width,
         rtx_buf_fold_skip_cam(b, dir) !>;
         return cc_ok();
     }
+    b->cam_bottom = 0;
     if (!b->layout.wrap) {
         b->top_wrap = 0;
         if (dir < 0 && b->top > 0) b->top--;
-        if (dir > 0 && b->top + 1 < nlines) b->top++;
+        if (dir > 0 && b->top < rtx_buf_last_top(b, nlines)) b->top++;
         rtx_buf_fold_skip_cam(b, dir) !>;
         return cc_ok();
     }
@@ -5116,7 +5159,7 @@ void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double width,
         if (wraps == 0) wraps = 1;
         b->top_wrap++;
         if (b->top_wrap >= wraps) {
-            if (b->top + 1 < nlines) {
+            if (b->top < rtx_buf_last_top(b, nlines)) {
                 b->top++;
                 b->top_wrap = 0;
             } else {
@@ -5267,6 +5310,43 @@ int rtx_buf_seek_cam_row(const RtxBuf *b) {
     return b->seek_off >= rec0 && b->seek_off < rec0 + recn;
 }
 
+/* RtxBuf_reveal_off past the rows: line `b->top` goes to the pane's
+ * bottom. Lay out the lines above it (each takes at least one screen
+ * line, so `vis` of them fill the pane) and start at the row where the
+ * screen lines up to it are `vis`. The empty line after a final newline
+ * has no row: it is one screen line under the last. */
+static void !>(CCError) rtx_buf_cam_bottom(RtxBuf *b, RtxMeasure *m, double width, int vis,
+                                          size_t nlines) {
+    size_t line, last, lo, i, screen = 0;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    line = b->top;
+    last = rtx_buf_last_top(b, nlines);
+    b->top_wrap = 0;
+    if (line > last) {
+        screen = 1;
+        line = last;
+    }
+    lo = line >= (size_t)vis ? line - (size_t)vis + 1 : 0;
+    b->layout.lines(&b->doc, m, width, lo, line - lo + 1) !>;
+    b->layout_width = width;
+    if (!b->layout.rows.len) {
+        b->top = line;
+        return cc_ok();
+    }
+    i = b->layout.rows.len;
+    while (i > 0) {
+        size_t h = (size_t)rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i - 1]);
+        if (screen + h > (size_t)vis && screen > 0) break;
+        screen += h;
+        i--;
+    }
+    if (i >= b->layout.rows.len) i = b->layout.rows.len - 1;
+    rtx_buf_origin_from_row(b, i);
+    return cc_ok();
+}
+
 void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int vis) {
     size_t nlines;
     size_t want;
@@ -5274,6 +5354,7 @@ void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int 
     size_t need;
     size_t n;
     size_t rows;
+    int bottom;
     @errhandler(CCError e) {
         return cc_err(e);
     }
@@ -5282,6 +5363,8 @@ void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int 
     }
     if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
     if (vis < 1) vis = 1;
+    bottom = b->cam_bottom;
+    b->cam_bottom = 0;
     /* Rich: the mark under the caret / anchor shows its hints. A changed
      * reveal span changes row widths, so it invalidates the fill (one
      * compare when the pane is Source or the doc has no marks). */
@@ -5339,7 +5422,14 @@ void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int 
         }
     }
     nlines = b->line_count();
-    if (b->top >= nlines && nlines) b->top = nlines - 1;
+    if (bottom) rtx_buf_cam_bottom(b, m, width, vis, nlines) !>;
+    {
+        size_t lt = rtx_buf_last_top(b, nlines);
+        if (b->top > lt) {
+            b->top = lt;
+            b->top_wrap = 0;
+        }
+    }
     want = (size_t)vis + 8;
     /* Tall MD table rows (fitted cells wrap, soft wrap or not) consume
      * several screen slots; fill extra vis rows. */

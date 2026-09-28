@@ -5,7 +5,9 @@
  * twice as tall as it is wide), rendered from the slide's lines
  * (core/slides.cch): headings bold, lists with their markers, code with
  * the grammar's colours on a dark band, tables in columns, a placeholder
- * for images, header / footer / page number. Build steps hide their
+ * or the picture (docs/images.md "Terminal": block art, kitty cells, a
+ * sixel / iTerm2 overlay) for images, header / footer / page number.
+ * Build steps hide their
  * lines (the space stays, as in Marp). Transitions are a wipe or a
  * horizontal move of cell columns; a fade has no terminal form.
  *
@@ -25,6 +27,7 @@
 #include "../core/ui.cch"
 #include "../core/slides.cch"
 #include "../core/img.cch"
+#include "cctext_img.cch"
 
 void cctext_draw_present(RtxUi *ui, RtxBuf *act, int rows, int cols);
 
@@ -42,7 +45,8 @@ typedef struct {
     unsigned char n;
     unsigned char attr;    /* TP_* */
     unsigned char wide;    /* a two-column cluster (the next cell is n == 0) */
-    short fg, bg;          /* xterm-256 index, -1 = terminal default */
+    int32_t fg, bg;        /* xterm-256 index, -1 = terminal default,
+                            * RTX_TIMG_RGB (a picture's 24-bit cell) */
 } TpCell;
 
 typedef struct {
@@ -268,6 +272,201 @@ typedef struct {
     int x0, x1, y0, y1;    /* content area */
 } TpArea;
 
+/* ---- pictures (docs/images.md "Terminal") ---------------------------- */
+
+/* 1 while a transition paints: pictures are cells (they move with the
+ * columns), never an overlay. */
+static int g_tp_moving;
+static RtxImgSrc g_tp_src;
+static const char *g_tp_doc_path; /* the deck's path (set per slide below) */
+
+/* Marp `w:` / `h:` (`width:` / `height:`) in the alt, deck pixels. */
+static void tp_img_kw(const char *a, size_t n, double *w, double *h) {
+    size_t i = 0;
+    *w = *h = 0;
+    while (i < n) {
+        size_t s0, k;
+        double v = 0;
+        int which = 0;
+        while (i < n && (a[i] == ' ' || a[i] == '\t')) i++;
+        s0 = i;
+        while (i < n && a[i] != ' ' && a[i] != '\t') i++;
+        if (i - s0 > 2 && a[s0 + 1] == ':' && (a[s0] == 'w' || a[s0] == 'h')) {
+            which = a[s0] == 'w' ? 1 : 2;
+            k = s0 + 2;
+        } else if (i - s0 > 6 && strncmp(a + s0, "width:", 6) == 0) {
+            which = 1;
+            k = s0 + 6;
+        } else if (i - s0 > 7 && strncmp(a + s0, "height:", 7) == 0) {
+            which = 2;
+            k = s0 + 7;
+        } else {
+            continue;
+        }
+        for (; k < i && a[k] >= '0' && a[k] <= '9'; k++) v = v * 10 + (double)(a[k] - '0');
+        if (which == 1) *w = v;
+        else *h = v;
+    }
+}
+
+/* Cells of picture P: its lines [li0, li0 + h) and columns [c0, c0 + w)
+ * at grid (y, x). */
+static void tp_pic(TpGrid *G, const CctiPic *P, int y, int x, int h, int w, int li0, int c0) {
+    CctiCell cells[512];
+    int r, k;
+    if (w > 512) w = 512;
+    for (r = 0; r < h; r++) {
+        if (y + r < 0 || y + r >= G->rows) continue;
+        cctext_img_cells(P, li0 + r, c0, w, y + r + 1, x + 1, cells);
+        for (k = 0; k < w; k++) {
+            TpCell *c = tp_at(G, y + r, x + k);
+            if (!c) continue;
+            memcpy(c->s, cells[k].s, cells[k].n);
+            c->n = cells[k].n;
+            c->attr = 0;
+            c->wide = 0;
+            c->fg = cells[k].fg;
+            if (cells[k].bg >= 0 || cells[k].s[0] != ' ' || cells[k].n != 1) c->bg = cells[k].bg;
+        }
+    }
+}
+
+/* Terminal pixels per deck pixel on a slide box bw cells wide. */
+static double tp_scale(const RtxDeck *k, int bw) {
+    uint32_t cw = 8, ch = 16;
+    double dw = k && k->w ? (double)k->w : 1280.0;
+    rtx_img_cells_px(&cw, &ch);
+    return (double)bw * (double)cw / dw;
+}
+
+static const RtxDeck *g_tp_deck;
+static int g_tp_bw;
+
+/* A content image line: the picture's height in rows (0: the stand-in
+ * line instead); drawn when `draw`. */
+static int tp_content_img(TpGrid *G, const char *sp, size_t sn, const char *ap, size_t an,
+                          int qx, int x1, int y, int ymax, int center, int draw,
+                          const RtxMmTheme *mm) {
+    RtxImgView iv;
+    double kw, kh, nw, nh, s, room_w, room_h;
+    uint32_t cw = 8, ch = 16, dw, dh;
+    int bc, br, x;
+    CctiPic P;
+    if (cctext_img_proto() == CCTI_OFF) return 0;
+    /* mm: a Mermaid diagram's source (docs/images.md "Mermaid"). */
+    if (mm) rtx_img_src_mermaid(sp, sn, mm, &g_tp_src);
+    else rtx_img_resolve(g_tp_doc_path, sp, sn, &g_tp_src);
+    rtx_img_info(&g_tp_src, &iv);
+    if (!iv.have_info || iv.state == RTX_IMG_S_ERR || iv.state == RTX_IMG_S_ASK) return 0;
+    rtx_img_cells_px(&cw, &ch);
+    s = tp_scale(g_tp_deck, g_tp_bw);
+    tp_img_kw(ap, an, &kw, &kh);
+    nw = (double)iv.info.w;
+    nh = (double)iv.info.h;
+    if (kw > 0 && kh <= 0) {
+        nh = nh * kw / nw;
+        nw = kw;
+    } else if (kh > 0 && kw <= 0) {
+        nw = nw * kh / nh;
+        nh = kh;
+    } else if (kw > 0 && kh > 0) {
+        nw = kw;
+        nh = kh;
+    }
+    nw *= s;
+    nh *= s;
+    room_w = (double)(x1 - qx) * cw;
+    room_h = (double)(ymax - y) * ch;
+    if (room_h < ch) return 0;
+    if (nw > room_w) {
+        nh = nh * room_w / nw;
+        nw = room_w;
+    }
+    if (nh > room_h) {
+        nw = nw * room_h / nh;
+        nh = room_h;
+    }
+    dw = nw < 1 ? 1 : (uint32_t)(nw + 0.5);
+    dh = nh < 1 ? 1 : (uint32_t)(nh + 0.5);
+    bc = (int)((dw + cw - 1) / cw);
+    br = (int)((dh + ch - 1) / ch);
+    if (bc > x1 - qx) bc = x1 - qx;
+    if (bc < 1 || br < 1) return 0;
+    if (!draw) return br;
+    x = qx + (center && x1 - qx > bc ? (x1 - qx - bc) / 2 : 0);
+    memset(&P, 0, sizeof P);
+    P.src = &g_tp_src;
+    P.alt = ap;
+    P.altn = an;
+    P.cols = bc;
+    P.rows = br;
+    P.dw = dw;
+    P.dh = dh;
+    P.cells_only = g_tp_moving;
+    tp_pic(G, &P, y, x, br, bc, 0, 0);
+    return br;
+}
+
+/* `![bg]`: cover (fill, cropped), contain / fit (letterboxed) or auto
+ * (natural size at the slide's scale) into the region; 1 when drawn. */
+static int tp_bg_img(TpGrid *G, RtxDoc *d, const RtxSlide *sl, int rx, int ry, int rw, int rh,
+                     int text_over) {
+    char sp[1024];
+    size_t sn = sl->bg_src_hi > sl->bg_src_lo ? sl->bg_src_hi - sl->bg_src_lo : 0;
+    RtxImgView iv;
+    uint32_t cw = 8, ch = 16, dw, dh;
+    double iw, ih, bw, bh, sx, sy, s;
+    int bc, br, li0 = 0, c0 = 0, x, y, vw, vh;
+    CctiPic P;
+    if (cctext_img_proto() == CCTI_OFF || rw < 1 || rh < 1 || !sn) return 0;
+    if (sn >= sizeof sp) return 0;
+    sn = RtxDoc_read_at(d, sl->bg_src_lo, cc_slice_from_buffer(sp, sn)) !>(e) {
+        (void)e;
+        @ok((size_t)0);
+    };
+    rtx_img_resolve(g_tp_doc_path, sp, sn, &g_tp_src);
+    rtx_img_info(&g_tp_src, &iv);
+    if (!iv.have_info || iv.state == RTX_IMG_S_ERR || iv.state == RTX_IMG_S_ASK) return 0;
+    rtx_img_cells_px(&cw, &ch);
+    iw = (double)iv.info.w;
+    ih = (double)iv.info.h;
+    bw = (double)rw * cw;
+    bh = (double)rh * ch;
+    sx = bw / iw;
+    sy = bh / ih;
+    if (sl->bg_fit == 0) s = sx > sy ? sx : sy;              /* cover */
+    else if (sl->bg_fit == 1) s = sx < sy ? sx : sy;         /* contain / fit */
+    else {
+        s = tp_scale(g_tp_deck, g_tp_bw);                    /* auto */
+        if (iw * s > bw || ih * s > bh) s = sx < sy ? sx : sy;
+    }
+    dw = (uint32_t)(iw * s + 0.5);
+    dh = (uint32_t)(ih * s + 0.5);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    bc = (int)((dw + cw - 1) / cw);
+    br = (int)((dh + ch - 1) / ch);
+    if (bc > RTX_IMG_VIEW_CELLS) bc = RTX_IMG_VIEW_CELLS;
+    if (br > RTX_IMG_VIEW_CELLS) br = RTX_IMG_VIEW_CELLS;
+    /* Centred; a cover crops the middle. */
+    vw = bc < rw ? bc : rw;
+    vh = br < rh ? br : rh;
+    x = rx + (rw - vw) / 2;
+    y = ry + (rh - vh) / 2;
+    if (bc > rw) c0 = (bc - rw) / 2;
+    if (br > rh) li0 = (br - rh) / 2;
+    memset(&P, 0, sizeof P);
+    P.src = &g_tp_src;
+    P.cols = bc;
+    P.rows = br;
+    P.dw = dw;
+    P.dh = dh;
+    /* Text over a whole-slide background, or a transition: cells only. */
+    P.cells_only = g_tp_moving || text_over;
+    tp_pic(G, &P, y, x, vh, vw, li0, c0);
+    return 1;
+}
+
 /* Lay the slide's lines out; `draw` 0 measures the height. */
 /* The deck's path while a slide lays out (image sources resolve against it). */
 static const char *g_tp_doc_path;
@@ -436,18 +635,63 @@ static int tp_layout(TpGrid *G, const RtxSlideView *v, const TpPal *P, TpArea A,
             break;
         }
         case RTX_SL_IMAGE: {
-            /* The terminal's stand-in (docs/images.md): [image: alt WxH]. */
+            /* The picture (fitted to the content box and what is left of
+             * the slide), else the stand-in `[image: alt WxH]`. */
             char buf[256];
             size_t k = 0;
             const RtxSlSeg *alt = l->nseg > 0 ? &v->segs[l->seg0] : NULL;
             const RtxSlSeg *src = l->nseg > 1 ? &v->segs[l->seg0 + 1] : NULL;
             RtxImgSrc is;
             RtxImgView iv;
+            {
+                int ph = tp_content_img(G, src ? v->text + (src->lo - v->base) : "",
+                                        src ? src->hi - src->lo : 0,
+                                        alt ? v->text + (alt->lo - v->base) : "",
+                                        alt ? alt->hi - alt->lo : 0, qx, A.x1, y, A.y1, center,
+                                        dr && y >= A.y0, NULL);
+                if (ph > 0) {
+                    y += ph;
+                    li++;
+                    break;
+                }
+            }
             rtx_img_resolve(g_tp_doc_path, src ? v->text + (src->lo - v->base) : "",
                             src ? src->hi - src->lo : 0, &is);
             rtx_img_info(&is, &iv);
             k = rtx_img_standin(&iv, alt ? v->text + (alt->lo - v->base) : NULL,
                                 alt ? alt->hi - alt->lo : 0, buf, sizeof buf);
+            if (k >= sizeof buf) k = sizeof buf - 1;
+            if (dr && y >= A.y0 && y < A.y1) {
+                int w = tp_cols(buf, k);
+                int x = qx + (center && A.x1 - qx > w ? (A.x1 - qx - w) / 2 : 0);
+                tp_put(G, y, x, A.x1, buf, k, P->dim, TP_ITAL);
+            }
+            y++;
+            li++;
+            break;
+        }
+        case RTX_SL_DIAGRAM: {
+            /* A ```mermaid fence: the diagram in the slide's colours, else
+             * the stand-in `[diagram: rendering...]` / why not. */
+            char buf[256];
+            size_t k;
+            const RtxSlSeg *sg = l->nseg > 0 ? &v->segs[l->seg0] : NULL;
+            const char *sp = sg ? v->text + (sg->lo - v->base) : "";
+            size_t sn = sg ? sg->hi - sg->lo : 0;
+            RtxMmTheme mt;
+            RtxImgView iv;
+            int ph;
+            rtx_img_mm_theme_rgb(P->th.bg, P->th.fg, P->th.accent, &mt);
+            ph = tp_content_img(G, sp, sn, "diagram", 7, qx, A.x1, y, A.y1, center,
+                                dr && y >= A.y0, &mt);
+            if (ph > 0) {
+                y += ph;
+                li++;
+                break;
+            }
+            rtx_img_src_mermaid(sp, sn, &mt, &g_tp_src);
+            rtx_img_info(&g_tp_src, &iv);
+            k = rtx_img_standin(&iv, "diagram", 7, buf, sizeof buf);
             if (k >= sizeof buf) k = sizeof buf - 1;
             if (dr && y >= A.y0 && y < A.y1) {
                 int w = tp_cols(buf, k);
@@ -541,7 +785,21 @@ static void tp_slide(TpGrid *G, RtxDoc *d, const RtxDeck *k, int slot, int s, in
         int n = snprintf(pg, sizeof pg, "%d", sl->page);
         if (n > 0) tp_put(G, by + bh - 2, bx + bw - 3 - n, bx + bw - 2, pg, (size_t)n, P.dim, 0);
     }
-    /* Background image: a hatched side (split) or a note (whole slide). */
+    g_tp_deck = k;
+    g_tp_bw = bw;
+    /* Background image: the picture (docs/images.md "Terminal"), else a
+     * hatched side (split) or a note (whole slide). */
+    if (sl->nbg && sl->bg_side) {
+        int iw = (bw - 2) * sl->bg_pct / 100;
+        int ix = sl->bg_side == 1 ? bx + 1 : bx + bw - 1 - iw;
+        if (tp_bg_img(G, d, sl, ix, by + 1, iw, bh - 2, 0)) {
+            if (sl->bg_side == 1) A.x0 = ix + iw + 2;
+            else A.x1 = ix - 2;
+            goto bg_done;
+        }
+    } else if (sl->nbg && tp_bg_img(G, d, sl, bx + 1, by + 1, bw - 2, bh - 2, 1)) {
+        goto bg_done;
+    }
     if (sl->nbg) {
         char lab[160];
         size_t sn = sl->bg_src_hi > sl->bg_src_lo ? sl->bg_src_hi - sl->bg_src_lo : 0;
@@ -574,6 +832,7 @@ static void tp_slide(TpGrid *G, RtxDoc *d, const RtxDeck *k, int slot, int s, in
             tp_put(G, by + 1, bx + bw - 2 - ln, bx + bw - 1, lab, (size_t)ln, P.dim, TP_ITAL);
         }
     }
+bg_done:
     if (!v) return;
     {
         int center = P.th.center;
@@ -600,8 +859,16 @@ static void tp_emit(const TpGrid *G, int rows, int cols) {
                 if (c->attr & TP_ITAL) fputs(";3", stdout);
                 if (c->attr & TP_UL) fputs(";4", stdout);
                 if (c->attr & TP_STRIKE) fputs(";9", stdout);
-                if (c->fg >= 0) fprintf(stdout, ";38;5;%d", c->fg);
-                if (c->bg >= 0) fprintf(stdout, ";48;5;%d", c->bg);
+                if (c->fg >= 0x1000000)
+                    fprintf(stdout, ";38;2;%d;%d;%d", (int)((c->fg >> 16) & 255),
+                            (int)((c->fg >> 8) & 255), (int)(c->fg & 255));
+                else if (c->fg >= 0)
+                    fprintf(stdout, ";38;5;%d", (int)c->fg);
+                if (c->bg >= 0x1000000)
+                    fprintf(stdout, ";48;2;%d;%d;%d", (int)((c->bg >> 16) & 255),
+                            (int)((c->bg >> 8) & 255), (int)(c->bg & 255));
+                else if (c->bg >= 0)
+                    fprintf(stdout, ";48;5;%d", (int)c->bg);
                 fputc('m', stdout);
                 cf = c->fg;
                 cb = c->bg;
@@ -708,8 +975,10 @@ void cctext_draw_present(RtxUi *ui, RtxBuf *act, int rows, int cols) {
     if (p->tr && p->tr != RTX_TR_FRAG && p->from_slide != p->slide &&
         tp_grid(&g_tg[1], rows, cols) && tp_grid(&g_tg[2], rows, cols)) {
         double t = rtx_ease(rtx_present_t(p, now));
+        g_tp_moving = 1;
         tp_slide(&g_tg[1], d, k, 1, p->from_slide, p->from_step, bx, by, bw, bh);
         tp_slide(&g_tg[2], d, k, 0, p->slide, p->step, bx, by, bw, bh);
+        g_tp_moving = 0;
         memcpy(g_tg[0].c, g_tg[2].c, (size_t)rows * (size_t)cols * sizeof(TpCell));
         tp_mix(&g_tg[0], &g_tg[1], &g_tg[2], p->tr, p->dir, t, bx, by, bw, bh);
         p->frames++;

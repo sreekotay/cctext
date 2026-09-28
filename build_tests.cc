@@ -57,7 +57,7 @@ CC_TARGET_INCLUDE rtx_scope .
 CC_TARGET rtx_rx obj core/rx.ccs
 CC_TARGET_INCLUDE rtx_rx .
 
-CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c
+CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c core/img_term.c core/img_svg.c
 CC_TARGET_INCLUDE rtx_img .
 CC_TARGET_DEPS rtx_img rtx_safe
 
@@ -179,6 +179,17 @@ CC_TARGET img_fuzz exe tests/img_fuzz.ccs
 CC_TARGET_INCLUDE img_fuzz .
 CC_TARGET_DEPS img_fuzz rtx_img rtx_safe rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_rx rtx_page_store
 
+CC_TARGET img_term_smoke exe tests/img_term_smoke.ccs
+CC_TARGET_INCLUDE img_term_smoke .
+CC_TARGET_DEPS img_term_smoke rtx_img rtx_safe rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_rx rtx_page_store
+
 CC_TARGET img_layout_smoke exe tests/img_layout_smoke.ccs
 CC_TARGET_INCLUDE img_layout_smoke .
 CC_TARGET_DEPS img_layout_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout rtx_img rtx_safe rtx_rx rtx_page_store
+
+CC_TARGET svg_smoke exe tests/svg_smoke.ccs
+CC_TARGET_INCLUDE svg_smoke .
+CC_TARGET_DEPS svg_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout rtx_img rtx_safe rtx_rx rtx_page_store
+CC_TARGET mermaid_smoke exe tests/mermaid_smoke.ccs
+CC_TARGET_INCLUDE mermaid_smoke .
+CC_TARGET_DEPS mermaid_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout rtx_img rtx_safe rtx_rx rtx_page_store

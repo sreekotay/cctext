@@ -1,0 +1,398 @@
+/*
+ * cctext-render build (included by make.shcc; docs/images.md, "Renderer").
+ *
+ * ccc builds C only, so the helper's C++ (lunasvg) and its C (plutovg,
+ * the helper, the pack reader with Wuffs) are compiled here by spawning
+ * the platform's compilers directly: $CC (default cc) and $CXX (default
+ * c++). Nothing else is needed: no make, cmake, meson, shell, Node or npm.
+ * Objects rebuild when their source, any header, or the flags changed;
+ * compiles run in parallel (one per CPU). QuickJS (third_party/quickjs)
+ * is plain C with its own flags.
+ *
+ * The pack holds fonts and JavaScript bytecode, and the helper refuses
+ * bytecode whose SHA-256 it was not built with, so the release link is
+ * two-step (docs/images.md, "Mermaid"):
+ *   1. out/render/cctext-render-boot (-DCR_BOOTSTRAP: it only builds packs)
+ *      runs `--build-pack render/manifest.txt bin/cctext-render.pack
+ *      out/render/cr_pack_hash.h`: the fonts, and the Mermaid bundle
+ *      (render/js shims around third_party/mermaid/mermaid.min.js, whose
+ *      SHA-256 the manifest records) compiled to bytecode, all zlib;
+ *   2. the helper's main objects include that header and link.
+ *
+ * Variants (rn_build):
+ *   release  out/render      -> bin/cctext-render, bin/cctext-render-selftest
+ *                               (CR_SELFTEST: tests only), bin/cctext-render.pack
+ *   san      out-render-san  -> bin/cctext-render-fuzz (ASan + UBSan, the
+ *                               fuzz driver render/cr_fuzz.c; no sandbox)
+ */
+#include <dirent.h>
+#include <errno.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+extern char **environ;
+
+#define RN_MAX_JOBS 96
+#define RN_ARGV 96
+
+typedef struct {
+    char src[512];
+    char obj[512];
+    int cxx;
+    int extra;             /* main: 0 release, 1 selftest (-DCR_SELFTEST), 2 bootstrap */
+    int qjs;               /* QuickJS: its own C flags */
+} RnJob;
+
+#define RN_MAIN 0
+#define RN_SELFTEST 1
+#define RN_BOOT 2
+static const char *const rn_extra_flag[] = {"", " -DCR_SELFTEST", " -DCR_BOOTSTRAP"};
+
+static long long rn_mtime(const char *p) {
+    struct stat st;
+    if (stat(p, &st) != 0) return -1;
+#if defined(__APPLE__)
+    return (long long)st.st_mtimespec.tv_sec * 1000000000ll + st.st_mtimespec.tv_nsec;
+#else
+    return (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec;
+#endif
+}
+
+static int rn_has_suffix(const char *s, const char *suf) {
+    size_t n = strlen(s), k = strlen(suf);
+    return n >= k && strcmp(s + n - k, suf) == 0;
+}
+
+/* Newest *.h / *.hpp in dir (and wuffs-v0.4.c, which cr_pack.c includes). */
+static long long rn_newest(const char *dir, const char *suf, long long cur) {
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    char p[1024];
+    if (!d) return cur;
+    while ((e = readdir(d))) {
+        long long t;
+        if (!rn_has_suffix(e->d_name, suf)) continue;
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        t = rn_mtime(p);
+        if (t > cur) cur = t;
+    }
+    closedir(d);
+    return cur;
+}
+
+static int rn_mkdirs(const char *p) {
+    char b[1024];
+    size_t i, n = strlen(p);
+    if (n >= sizeof b) return -1;
+    memcpy(b, p, n + 1);
+    for (i = 1; i <= n; i++) {
+        if (b[i] == '/' || b[i] == 0) {
+            char c = b[i];
+            b[i] = 0;
+            if (mkdir(b, 0755) != 0 && errno != EEXIST) return -1;
+            b[i] = c;
+        }
+    }
+    return 0;
+}
+
+/* Split `s` on blanks into argv (no quoting: flags have no spaces). */
+static int rn_split(char *s, char **argv, int at, int max) {
+    char *t = strtok(s, " \t");
+    while (t && at < max - 1) {
+        argv[at++] = t;
+        t = strtok(NULL, " \t");
+    }
+    argv[at] = NULL;
+    return at;
+}
+
+static pid_t rn_spawn(char **argv) {
+    pid_t pid;
+    if (posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ) != 0) {
+        fprintf(stderr, "render: cannot run %s\n", argv[0]);
+        return -1;
+    }
+    return pid;
+}
+
+static int rn_wait(pid_t pid) {
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0)
+        if (errno != EINTR) return -1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 128;
+}
+
+static int rn_run(char **argv) {
+    pid_t pid = rn_spawn(argv);
+    return pid < 0 ? -1 : rn_wait(pid);
+}
+
+static const char *rn_env(const char *k, const char *d) {
+    const char *v = getenv(k);
+    return v && v[0] ? v : d;
+}
+
+/* Compile jobs[0, n) that are out of date, ncpu at a time. */
+static int rn_compile(RnJob *jobs, int n, const char *cflags, const char *cxxflags,
+                      const char *qflags, long long newest_hdr, int *relinked) {
+    const char *cc = rn_env("CC", "cc"), *cxx = rn_env("CXX", "c++");
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    pid_t pids[64];
+    int slot_job[64], running = 0, i = 0, rc = 0;
+    if (ncpu < 1) ncpu = 1;
+    if (ncpu > 64) ncpu = 64;
+    for (;;) {
+        while (i < n && running < ncpu && rc == 0) {
+            RnJob *j = &jobs[i++];
+            long long to = rn_mtime(j->obj), ts = rn_mtime(j->src);
+            char buf[4096];
+            char *argv[RN_ARGV];
+            int a = 0;
+            if (to >= 0 && to >= ts && to >= newest_hdr) continue;
+            snprintf(buf, sizeof buf, "%s %s%s -c %s -o %s", j->cxx ? cxx : cc,
+                     j->cxx ? cxxflags : j->qjs ? qflags : cflags, rn_extra_flag[j->extra],
+                     j->src, j->obj);
+            printf("render: %s %s\n", j->cxx ? "c++" : "cc", j->src);
+            fflush(stdout);
+            a = rn_split(buf, argv, 0, RN_ARGV);
+            (void)a;
+            pids[running] = rn_spawn(argv);
+            if (pids[running] < 0) {
+                rc = 1;
+                break;
+            }
+            slot_job[running] = i - 1;
+            running++;
+            *relinked = 1;
+        }
+        if (!running) break;
+        {
+            int st = 0, k;
+            pid_t done;
+            do done = wait(&st);
+            while (done < 0 && errno == EINTR);
+            if (done < 0) return 1;
+            for (k = 0; k < running; k++)
+                if (pids[k] == done) break;
+            if (k < running) {
+                if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+                    fprintf(stderr, "render: compile failed: %s\n", jobs[slot_job[k]].src);
+                    (void)unlink(jobs[slot_job[k]].obj);
+                    rc = 1;
+                }
+                pids[k] = pids[running - 1];
+                slot_job[k] = slot_job[running - 1];
+                running--;
+            }
+        }
+    }
+    return rc;
+}
+
+static int rn_add_dir(RnJob *jobs, int n, const char *dir, const char *suf, int cxx,
+                      const char *outdir, const char *prefix) {
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    if (!d) return n;
+    while ((e = readdir(d)) && n < RN_MAX_JOBS) {
+        size_t l = strlen(e->d_name);
+        if (!rn_has_suffix(e->d_name, suf)) continue;
+        snprintf(jobs[n].src, sizeof jobs[n].src, "%s/%s", dir, e->d_name);
+        snprintf(jobs[n].obj, sizeof jobs[n].obj, "%s/%s%.*s.o", outdir, prefix,
+                 (int)(l - strlen(suf)), e->d_name);
+        jobs[n].cxx = cxx;
+        jobs[n].extra = 0;
+        jobs[n].qjs = 0;
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+
+static int rn_add(RnJob *jobs, int n, const char *src, int cxx, const char *outdir,
+                  const char *obj, int extra) {
+    snprintf(jobs[n].src, sizeof jobs[n].src, "%s", src);
+    snprintf(jobs[n].obj, sizeof jobs[n].obj, "%s/%s", outdir, obj);
+    jobs[n].cxx = cxx;
+    jobs[n].extra = extra;
+    jobs[n].qjs = 0;
+    return n + 1;
+}
+
+/* A flags stamp: a changed flag set rebuilds everything. */
+static long long rn_flags_stamp(const char *outdir, const char *flags) {
+    char p[1024], old[4096];
+    FILE *f;
+    size_t n = 0;
+    snprintf(p, sizeof p, "%s/flags.txt", outdir);
+    f = fopen(p, "r");
+    if (f) {
+        n = fread(old, 1, sizeof old - 1, f);
+        fclose(f);
+    }
+    old[n] = 0;
+    if (strcmp(old, flags) != 0) {
+        f = fopen(p, "w");
+        if (f) {
+            fputs(flags, f);
+            fclose(f);
+        }
+    }
+    return rn_mtime(p);
+}
+
+static int rn_link(const char *out, RnJob *jobs, int n, int want_main, int want_fuzz,
+                   const char *ldflags, int force) {
+    const char *cxx = rn_env("CXX", "c++");
+    char *argv[RN_MAX_JOBS + RN_ARGV];
+    char lf[1024];
+    int a = 0, i;
+    long long tout = rn_mtime(out);
+    int stale = force || tout < 0;
+    argv[a++] = (char *)cxx;
+    argv[a++] = "-o";
+    argv[a++] = (char *)out;
+    for (i = 0; i < n; i++) {
+        const char *s = jobs[i].src;
+        int is_main = strstr(s, "cctext-render.c") != NULL;
+        int is_fuzz = strstr(s, "cr_fuzz.c") != NULL;
+        if (is_main && jobs[i].extra != want_main) continue;
+        if (is_main && want_fuzz) continue;
+        if (is_fuzz && !want_fuzz) continue;
+        if (rn_mtime(jobs[i].obj) > tout) stale = 1;
+        argv[a++] = jobs[i].obj;
+    }
+    if (!stale) return 0;
+    snprintf(lf, sizeof lf, "%s", ldflags);
+    rn_split(lf, argv, a, RN_MAX_JOBS + RN_ARGV);
+    printf("render: link %s\n", out);
+    fflush(stdout);
+    return rn_run(argv) == 0 ? 0 : 1;
+}
+
+/* The first line of a small text file (QuickJS's VERSION), or "". */
+static void rn_first_line(const char *path, char *out, size_t n) {
+    FILE *f = fopen(path, "r");
+    out[0] = 0;
+    if (!f) return;
+    if (!fgets(out, (int)n, f)) out[0] = 0;
+    fclose(f);
+    out[strcspn(out, "\r\n \t\"")] = 0;
+}
+
+/* variant: "release" or "san". */
+static int rn_build(const char *variant) {
+    int san = strcmp(variant, "san") == 0;
+    const char *outdir = san ? "out-render-san" : "out/render";
+    const char *dbg = getenv("DEBUG");
+    const char *opt = san ? "-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined "
+                            "-fno-sanitize-recover=undefined"
+                          : (dbg && dbg[0] && dbg[0] != '0') ? "-O1 -g" : "-O2";
+    char common[1400], cflags[1600], cxxflags[1600], qflags[1200], ldflags[512], stamp[5000];
+    char qver[64];
+    RnJob jobs[RN_MAX_JOBS];
+    int n = 0, nmain, relinked = 0, rc;
+    long long hdr = -1;
+    if (rn_mkdirs(outdir) != 0 || rn_mkdirs("bin") != 0) return 1;
+    rn_first_line("third_party/quickjs/VERSION", qver, sizeof qver);
+    if (!qver[0]) {
+        fprintf(stderr, "render: third_party/quickjs/VERSION missing\n");
+        return 1;
+    }
+    snprintf(common, sizeof common,
+             "%s -ffunction-sections -fdata-sections -DPLUTOVG_BUILD -DPLUTOVG_BUILD_STATIC "
+             "-DPLUTOVG_DISABLE_FONT_FACE_CACHE_LOAD -DLUNASVG_BUILD -DLUNASVG_BUILD_STATIC "
+             "-DLUNASVG_DISABLE_LOAD_SYSTEM_FONTS -DLUNASVG_DISABLE_EXTERNAL_RESOURCES "
+             "-DSTBI_MAX_DIMENSIONS=16384 -Ithird_party/plutovg/include "
+             "-Ithird_party/plutovg/source -Ithird_party/lunasvg/include "
+             "-Ithird_party/lunasvg/source -Ithird_party/wuffs -Ithird_party/quickjs -Irender "
+             "-I%s",
+             opt, outdir);
+    snprintf(cflags, sizeof cflags, "-std=c11 %s", common);
+    snprintf(cxxflags, sizeof cxxflags, "-std=c++17 -fno-exceptions -fno-rtti %s", common);
+    /* QuickJS's own Makefile flags: GNU C, wrapping signed arithmetic;
+     * warnings off for vendored code. */
+    snprintf(qflags, sizeof qflags,
+             "-std=gnu11 %s -ffunction-sections -fdata-sections -fwrapv -w -D_GNU_SOURCE "
+             "-DCONFIG_VERSION=\"%s\"",
+             opt, qver);
+#if defined(__APPLE__)
+    snprintf(ldflags, sizeof ldflags, "%s -lm%s", san ? opt : "",
+             san ? "" : " -Wl,-dead_strip");
+#else
+    snprintf(ldflags, sizeof ldflags, "%s -lm -lpthread%s", san ? opt : "",
+             san ? "" : " -Wl,--gc-sections -s");
+#endif
+    snprintf(stamp, sizeof stamp, "%s|%s|%s|%s", cflags, cxxflags, qflags, ldflags);
+    hdr = rn_flags_stamp(outdir, stamp);
+    hdr = rn_newest("render", ".h", hdr);
+    hdr = rn_newest("third_party/plutovg/include", ".h", hdr);
+    hdr = rn_newest("third_party/plutovg/source", ".h", hdr);
+    hdr = rn_newest("third_party/lunasvg/include", ".h", hdr);
+    hdr = rn_newest("third_party/lunasvg/source", ".h", hdr);
+    hdr = rn_newest("third_party/quickjs", ".h", hdr);
+    n = rn_add_dir(jobs, n, "third_party/plutovg/source", ".c", 0, outdir, "p_");
+    n = rn_add_dir(jobs, n, "third_party/lunasvg/source", ".cpp", 1, outdir, "l_");
+    {
+        static const char *const q[] = {"quickjs", "libregexp", "libunicode", "cutils", "dtoa"};
+        for (int k = 0; k < 5; k++) {
+            char src[128], obj[64];
+            snprintf(src, sizeof src, "third_party/quickjs/%s.c", q[k]);
+            snprintf(obj, sizeof obj, "q_%s.o", q[k]);
+            n = rn_add(jobs, n, src, 0, outdir, obj, 0);
+            jobs[n - 1].qjs = 1;
+        }
+    }
+    n = rn_add(jobs, n, "render/cr_pack.c", 0, outdir, "cr_pack.o", 0);
+    n = rn_add(jobs, n, "render/cr_sha256.c", 0, outdir, "cr_sha256.o", 0);
+    n = rn_add(jobs, n, "render/cr_js.c", 0, outdir, "cr_js.o", 0);
+    n = rn_add(jobs, n, "render/cr_svg.cpp", 1, outdir, "cr_svg.o", 0);
+    n = rn_add(jobs, n, "render/sandbox_linux.c", 0, outdir, "sandbox_linux.o", 0);
+    n = rn_add(jobs, n, "render/sandbox_darwin.c", 0, outdir, "sandbox_darwin.o", 0);
+    n = rn_add(jobs, n, "render/sandbox_other.c", 0, outdir, "sandbox_other.o", 0);
+    if (san) {
+        n = rn_add(jobs, n, "render/cr_fuzz.c", 0, outdir, "cr_fuzz.o", 0);
+        rc = rn_compile(jobs, n, cflags, cxxflags, qflags, hdr, &relinked);
+        if (rc) return rc;
+        return rn_link("bin/cctext-render-fuzz", jobs, n, 0, 1, ldflags, 0);
+    }
+    /* Step 1: everything but the mains that include the pack's hashes. */
+    n = rn_add(jobs, n, "render/cctext-render.c", 0, outdir, "main_boot.o", RN_BOOT);
+    rc = rn_compile(jobs, n, cflags, cxxflags, qflags, hdr, &relinked);
+    if (rc) return rc;
+    rc = rn_link("out/render/cctext-render-boot", jobs, n, RN_BOOT, 0, ldflags, 0);
+    if (rc) return rc;
+    {
+        /* The pack: fonts + bytecode -> zlib; the hashes header beside it.
+         * Rebuilt when the builder, the manifest or any input changed. */
+        long long tp = rn_mtime("bin/cctext-render.pack");
+        long long th = rn_mtime("out/render/cr_pack_hash.h");
+        long long src = rn_mtime("out/render/cctext-render-boot");
+        long long mf = rn_newest("third_party/fonts", ".ttf", rn_mtime("render/manifest.txt"));
+        mf = rn_newest("render/js", ".js", mf);
+        mf = rn_newest("third_party/mermaid", ".js", mf);
+        if (tp < 0 || th < 0 || tp < src || tp < mf) {
+            char *argv[] = {"out/render/cctext-render-boot", "--build-pack", "render/manifest.txt",
+                            "bin/cctext-render.pack", "out/render/cr_pack_hash.h", NULL};
+            printf("render: pack (fonts, Mermaid bytecode)\n");
+            fflush(stdout);
+            if (rn_run(argv) != 0) return 1;
+        }
+    }
+    /* Step 2: the helper (and its -selftest build) with the hashes. */
+    nmain = n;
+    n = rn_add(jobs, n, "render/cctext-render.c", 0, outdir, "main.o", RN_MAIN);
+    n = rn_add(jobs, n, "render/cctext-render.c", 0, outdir, "main_selftest.o", RN_SELFTEST);
+    {
+        long long h2 = rn_mtime("out/render/cr_pack_hash.h");
+        rc = rn_compile(jobs + nmain, n - nmain, cflags, cxxflags, qflags, h2 > hdr ? h2 : hdr,
+                        &relinked);
+        if (rc) return rc;
+    }
+    rc = rn_link("bin/cctext-render", jobs, n, RN_MAIN, 0, ldflags, 0);
+    if (rc) return rc;
+    return rn_link("bin/cctext-render-selftest", jobs, n, RN_SELFTEST, 0, ldflags, 0);
+}

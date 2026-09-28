@@ -23,6 +23,7 @@
 #include "img.cch"
 #include "img_wuffs.h"
 #include "img_net.h"
+#include "img_svg.h"
 #include "rtx_par.cch"
 /* From safe.ccs (safe.cch pulls the document face in; two decls do). */
 int rtx_safe_dir(char *dst, size_t n);
@@ -43,6 +44,17 @@ void rtx_img_limits_default(RtxImgLimits *l) {
     l->remote_max = RTX_IMG_REMOTE_MAX;
     l->timeout_s = RTX_IMG_TIMEOUT_S;
     l->cache_max = RTX_IMG_CACHE_MAX;
+    l->svg_max = RTX_IMG_SVG_MAX;
+    l->svg_px_max = RTX_IMG_SVG_PX_MAX;
+    l->svg_timeout_ms = RTX_IMG_SVG_TIMEOUT_MS;
+    l->svg_cache_max = RTX_IMG_SVG_CACHE_MAX;
+    l->svg_backing = 1;
+    l->mermaid = 1;
+    l->mm_max = RTX_IMG_MM_MAX;
+    l->mm_nodes = RTX_IMG_MM_NODES;
+    l->mm_timeout_ms = RTX_IMG_MM_TIMEOUT_MS;
+    l->mm_recycle_jobs = 0;
+    l->mm_max_h = RTX_IMG_MM_MAX_H;
 }
 
 static RtxImgLimits g_img_lim;
@@ -106,6 +118,25 @@ const char *rtx_img_err_text(int err, char *buf, size_t n) {
         break;
     case RTX_IMG_EHTTP: snprintf(buf, n, "plain http not allowed for this host"); break;
     case RTX_IMG_ESRC: snprintf(buf, n, "no image source"); break;
+    case RTX_IMG_ERENDER: snprintf(buf, n, "SVG renderer failed on this file"); break;
+    case RTX_IMG_ERTIME:
+        snprintf(buf, n, "SVG took over %u ms to render", (unsigned)l->svg_timeout_ms);
+        break;
+    case RTX_IMG_ENORENDER:
+#if defined(_WIN32)
+        snprintf(buf, n, "SVG renderer not available on this platform yet");
+#else
+        snprintf(buf, n, "SVG renderer (cctext-render) not found");
+#endif
+        break;
+    case RTX_IMG_ESVGBIG:
+        img_mib(m, sizeof m, l->svg_max);
+        snprintf(buf, n, "SVG over the %s limit", m);
+        break;
+    case RTX_IMG_ESCRIPT: snprintf(buf, n, "diagram does not parse"); break;
+    case RTX_IMG_ELARGE:
+        snprintf(buf, n, "diagram too large to render (limit %u nodes)", (unsigned)l->mm_nodes);
+        break;
     default: snprintf(buf, n, "image error %d", err); break;
     }
     return buf;
@@ -119,6 +150,8 @@ const char *rtx_img_fmt_name(int fmt) {
     case RTX_IMG_FMT_BMP: return "BMP";
     case RTX_IMG_FMT_WEBP: return "WebP";
     case RTX_IMG_FMT_QOI: return "QOI";
+    case RTX_IMG_FMT_SVG: return "SVG";
+    case RTX_IMG_FMT_MERMAID: return "Mermaid";
     default: return "?";
     }
 }
@@ -302,12 +335,244 @@ static int img_head(RtxWuffsDec *d, const uint8_t *b, size_t n, int closed, int 
     return img_check(out, lim);
 }
 
-int rtx_img_sniff(const uint8_t *b, size_t n) {
-    return img_fmt_of_wuffs(rtx_wuffs_sniff(b, n, 1));
+/* ---- SVG: the sandboxed renderer (core/img_svg.c) ----------------------- */
+
+typedef char img_svg_codes_match[(RTX_SVG_ECORRUPT == RTX_IMG_ECORRUPT &&
+                                  RTX_SVG_ENOMEM == RTX_IMG_ENOMEM &&
+                                  RTX_SVG_ECANCEL == RTX_IMG_ECANCEL &&
+                                  RTX_SVG_EPX == RTX_IMG_EPX &&
+                                  RTX_SVG_ECRASH == RTX_IMG_ERENDER &&
+                                  RTX_SVG_ETIMEOUT == RTX_IMG_ERTIME &&
+                                  RTX_SVG_ENONE == RTX_IMG_ENORENDER &&
+                                  RTX_SVG_EBIG == RTX_IMG_ESVGBIG &&
+                                  RTX_SVG_ESCRIPT == RTX_IMG_ESCRIPT &&
+                                  RTX_SVG_ELARGE == RTX_IMG_ELARGE)
+                                     ? 1
+                                     : -1];
+
+static void img_svg_cfg(const RtxImgLimits *lim, const char *dir, RtxSvgCfg *c) {
+    c->input_max = lim->svg_max < lim->file_max ? lim->svg_max : lim->file_max;
+    c->px_max = lim->svg_px_max;
+    c->timeout_ms = lim->svg_timeout_ms ? lim->svg_timeout_ms : RTX_IMG_SVG_TIMEOUT_MS;
+    c->cache_max = dir && dir[0] ? lim->svg_cache_max : 0;
+    c->cache_dir = dir && dir[0] ? dir : NULL;
 }
+
+/* libm is not linked: the two helpers the SVG box needs. */
+static uint32_t img_ceil_u32(float v) {
+    uint32_t u;
+    if (!(v > 1.0f)) return 1;
+    u = (uint32_t)v;
+    return (float)u < v ? u + 1 : u;
+}
+
+static double img_sqrt(double v) {
+    double x = v > 1 ? v : 1;
+    int i;
+    if (!(v > 0)) return 0;
+    for (i = 0; i < 64; i++) x = 0.5 * (x + v / x);
+    return x;
+}
+
+/* Size of an SVG: its CSS size rounded up (the displayed size at 1x). */
+static int img_svg_info(const uint8_t *b, size_t n, const RtxImgLimits *lim, const char *dir,
+                        const _Atomic int *cancel, RtxImgInfo *out) {
+    RtxSvgCfg c;
+    float w = 0, h = 0;
+    int rc;
+    memset(out, 0, sizeof *out);
+    out->fmt = RTX_IMG_FMT_SVG;
+    img_svg_cfg(lim, dir, &c);
+    rc = rtx_svg_size(b, n, &c, cancel, &w, &h);
+    if (rc != RTX_SVG_OK) return rc;
+    out->cw = out->w = w >= 1e6f ? 1000000u : img_ceil_u32(w);
+    out->ch = out->h = h >= 1e6f ? 1000000u : img_ceil_u32(h);
+    out->orient = 1;
+    return RTX_IMG_OK;
+}
+
+/* Fit for a vector image: aspect kept, scaled up or down to the box
+ * (0 = no cap on that side; both 0 = natural size). */
+static void img_svg_fit(uint32_t w, uint32_t h, uint32_t max_w, uint32_t max_h, uint32_t *ow,
+                        uint32_t *oh) {
+    double s = 1.0, rw, rh;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    if (max_w || max_h) {
+        s = 1e30;
+        if (max_w) s = (double)max_w / (double)w;
+        if (max_h && (double)max_h / (double)h < s) s = (double)max_h / (double)h;
+    }
+    rw = (double)w * s + 0.5;
+    rh = (double)h * s + 0.5;
+    *ow = rw < 1 ? 1 : rw > 1e9 ? 1000000000u : (uint32_t)rw;
+    *oh = rh < 1 ? 1 : rh > 1e9 ? 1000000000u : (uint32_t)rh;
+}
+
+/* The pixel box an SVG renders at for a (max_w, max_h) ask: fitted (up or
+ * down), then within the render caps (svg_px_max, the side limit): past
+ * them it renders smaller and the blit scales. */
+static void img_svg_box(const RtxImgLimits *lim, uint32_t w, uint32_t h, uint32_t max_w,
+                        uint32_t max_h, uint32_t *ow, uint32_t *oh) {
+    uint32_t tw, th;
+    img_svg_fit(w, h, max_w, max_h, &tw, &th);
+    if ((uint64_t)tw * th > lim->svg_px_max || tw > lim->dim_max || th > lim->dim_max) {
+        double s = img_sqrt((double)lim->svg_px_max / ((double)tw * (double)th));
+        double sd = (double)lim->dim_max / (double)(tw > th ? tw : th);
+        if (sd < s) s = sd;
+        if (s > 1) s = 1;
+        tw = (uint32_t)((double)tw * s);
+        th = (uint32_t)((double)th * s);
+        if (tw < 1) tw = 1;
+        if (th < 1) th = 1;
+    }
+    *ow = tw;
+    *oh = th;
+}
+
+/* RGBA8 premultiplied (the helper's wire format) -> the layout `pix`. */
+static void img_from_rgba_premul(uint8_t *px, size_t npx, int pix) {
+    size_t i;
+    pix = RTX_IMG_PIX_LAYOUT(pix);
+    for (i = 0; i < npx; i++) {
+        uint8_t *p = px + i * 4;
+        uint8_t r = p[0], g = p[1], b = p[2], a = p[3];
+        if (pix == RTX_IMG_PIX_RGBA) {
+            if (a && a != 255) {
+                r = (uint8_t)((r * 255u + a / 2) / a);
+                g = (uint8_t)((g * 255u + a / 2) / a);
+                b = (uint8_t)((b * 255u + a / 2) / a);
+            }
+            p[0] = r;
+            p[1] = g;
+            p[2] = b;
+        } else {
+            p[0] = b;
+            p[2] = r;
+        }
+    }
+}
+
+static int img_svg_decode(const uint8_t *b, size_t n, const RtxImgLimits *lim, const char *dir,
+                          uint32_t max_w, uint32_t max_h, int pix, const _Atomic int *cancel,
+                          RtxImgBmp *out, RtxImgInfo *info) {
+    RtxImgInfo in;
+    RtxSvgCfg c;
+    uint32_t tw, th;
+    uint8_t *px = NULL;
+    int rc = img_svg_info(b, n, lim, dir, cancel, &in);
+    if (info) *info = in;
+    if (rc != RTX_IMG_OK) return rc;
+    img_svg_box(lim, in.w, in.h, max_w, max_h, &tw, &th);
+    if ((uint64_t)tw * th * 4 > lim->budget) return RTX_IMG_EBUDGET;
+    img_svg_cfg(lim, dir, &c);
+    rc = rtx_svg_render(b, n, &c, tw, th, cancel, &px);
+    if (rc != RTX_SVG_OK) return rc;
+    img_from_rgba_premul(px, (size_t)tw * th, pix);
+    out->px = px;
+    out->w = tw;
+    out->h = th;
+    out->stride = tw * 4;
+    out->pix = RTX_IMG_PIX_LAYOUT(pix);
+    out->nframe = 1;
+    out->delay = NULL;
+    out->bytes = (uint64_t)tw * th * 4;
+    return RTX_IMG_OK;
+}
+
+/* A stale picture (RTX_IMG_PIX_DIM): premultiplied, faded toward
+ * transparency (it reads as the old diagram over whatever is behind it);
+ * straight RGBA (a terminal, where block art cuts alpha at 50 %), its
+ * colours darkened and its alpha kept. */
+static void img_dim(uint8_t *px, size_t npx, int layout) {
+    size_t i;
+    for (i = 0; i < npx; i++) {
+        uint8_t *p = px + i * 4;
+        if (layout == RTX_IMG_PIX_RGBA) {
+            p[0] = (uint8_t)((p[0] * 102u + 127u) / 255u);
+            p[1] = (uint8_t)((p[1] * 102u + 127u) / 255u);
+            p[2] = (uint8_t)((p[2] * 102u + 127u) / 255u);
+        } else {
+            p[0] = (uint8_t)((p[0] * 102u + 127u) / 255u);
+            p[1] = (uint8_t)((p[1] * 102u + 127u) / 255u);
+            p[2] = (uint8_t)((p[2] * 102u + 127u) / 255u);
+            p[3] = (uint8_t)((p[3] * 102u + 127u) / 255u);
+        }
+    }
+}
+
+/* ---- Mermaid: the helper's second slot (core/img_svg.c) ------------------ */
+
+static void img_mm_cfg(const RtxImgLimits *lim, const char *dir, RtxSvgCfg *c) {
+    memset(c, 0, sizeof *c);
+    c->input_max = lim->mm_max + 8192; /* the options line rides along */
+    c->px_max = lim->svg_px_max;
+    c->timeout_ms = lim->mm_timeout_ms ? lim->mm_timeout_ms : RTX_IMG_MM_TIMEOUT_MS;
+    c->cache_max = dir && dir[0] ? lim->svg_cache_max : 0;
+    c->cache_dir = dir && dir[0] ? dir : NULL;
+    c->node_max = lim->mm_nodes;
+    c->recycle_jobs = lim->mm_recycle_jobs;
+}
+
+static int img_mm_info(const uint8_t *b, size_t n, const RtxImgLimits *lim, const char *dir,
+                       const _Atomic int *cancel, RtxImgInfo *out, char *msg, size_t msgcap) {
+    RtxSvgCfg c;
+    float w = 0, h = 0;
+    int rc;
+    memset(out, 0, sizeof *out);
+    out->fmt = RTX_IMG_FMT_MERMAID;
+    img_mm_cfg(lim, dir, &c);
+    rc = rtx_mermaid_size(b, n, &c, cancel, &w, &h, msg, msgcap);
+    if (rc != RTX_SVG_OK) return rc;
+    out->cw = out->w = w >= 1e6f ? 1000000u : img_ceil_u32(w);
+    out->ch = out->h = h >= 1e6f ? 1000000u : img_ceil_u32(h);
+    out->orient = 1;
+    return RTX_IMG_OK;
+}
+
+static int img_mm_decode(const uint8_t *b, size_t n, const RtxImgLimits *lim, const char *dir,
+                         uint32_t max_w, uint32_t max_h, int pix, const _Atomic int *cancel,
+                         RtxImgBmp *out, RtxImgInfo *info, char *msg, size_t msgcap) {
+    RtxImgInfo in;
+    RtxSvgCfg c;
+    uint32_t tw, th;
+    uint8_t *px = NULL;
+    int rc = img_mm_info(b, n, lim, dir, cancel, &in, msg, msgcap);
+    if (info) *info = in;
+    if (rc != RTX_IMG_OK) return rc;
+    img_svg_box(lim, in.w, in.h, max_w, max_h, &tw, &th);
+    if ((uint64_t)tw * th * 4 > lim->budget) return RTX_IMG_EBUDGET;
+    img_mm_cfg(lim, dir, &c);
+    rc = rtx_mermaid_render(b, n, &c, tw, th, cancel, &px, msg, msgcap);
+    if (rc != RTX_SVG_OK) return rc;
+    img_from_rgba_premul(px, (size_t)tw * th, pix);
+    out->px = px;
+    out->w = tw;
+    out->h = th;
+    out->stride = tw * 4;
+    out->pix = RTX_IMG_PIX_LAYOUT(pix);
+    out->nframe = 1;
+    out->delay = NULL;
+    out->bytes = (uint64_t)tw * th * 4;
+    return RTX_IMG_OK;
+}
+
+int rtx_img_sniff(const uint8_t *b, size_t n) {
+    int f = img_fmt_of_wuffs(rtx_wuffs_sniff(b, n, 1));
+    if (f == RTX_IMG_FMT_NONE && rtx_svg_sniff(b, n)) f = RTX_IMG_FMT_SVG;
+    return f;
+}
+
+static int img_probe_ex(const uint8_t *b, size_t n, int closed, const RtxImgLimits *lim,
+                        const char *svg_dir, const _Atomic int *cancel, RtxImgInfo *out);
 
 int rtx_img_probe(const uint8_t *b, size_t n, int closed, const RtxImgLimits *lim,
                   RtxImgInfo *out) {
+    return img_probe_ex(b, n, closed, lim, NULL, NULL, out);
+}
+
+static int img_probe_ex(const uint8_t *b, size_t n, int closed, const RtxImgLimits *lim,
+                        const char *svg_dir, const _Atomic int *cancel, RtxImgInfo *out) {
     int fmt;
     RtxWuffsDec *d;
     int rc;
@@ -317,6 +582,12 @@ int rtx_img_probe(const uint8_t *b, size_t n, int closed, const RtxImgLimits *li
     if (!lim) lim = rtx_img_limits();
     if (!b || !n) return closed ? RTX_IMG_EFORMAT : RTX_IMG_MORE;
     fmt = rtx_wuffs_sniff(b, n, closed);
+    if (fmt == RTX_WUFFS_FMT_NONE && rtx_svg_sniff(b, n)) {
+        /* SVG: the whole document goes to the renderer for its size. */
+        out->fmt = RTX_IMG_FMT_SVG;
+        if (!closed) return RTX_IMG_MORE;
+        return img_svg_info(b, n, lim, svg_dir, cancel, out);
+    }
     if (fmt == RTX_WUFFS_FMT_NONE) return (!closed && n < 64) ? RTX_IMG_MORE : RTX_IMG_EFORMAT;
     d = rtx_wuffs_open(fmt);
     if (!d) return RTX_IMG_ENOMEM;
@@ -429,9 +700,21 @@ void rtx_img_bmp_free(RtxImgBmp *bmp) {
     memset(bmp, 0, sizeof *bmp);
 }
 
+static int img_decode_ex(const uint8_t *b, size_t n, const RtxImgLimits *lim,
+                         uint32_t max_w, uint32_t max_h, int pix, uint32_t max_frames,
+                         const _Atomic int *cancel, RtxImgBmp *out, RtxImgInfo *info,
+                         const char *svg_dir);
+
 int rtx_img_decode(const uint8_t *b, size_t n, const RtxImgLimits *lim,
                    uint32_t max_w, uint32_t max_h, int pix, uint32_t max_frames,
                    const _Atomic int *cancel, RtxImgBmp *out, RtxImgInfo *info) {
+    return img_decode_ex(b, n, lim, max_w, max_h, pix, max_frames, cancel, out, info, NULL);
+}
+
+static int img_decode_ex(const uint8_t *b, size_t n, const RtxImgLimits *lim,
+                         uint32_t max_w, uint32_t max_h, int pix, uint32_t max_frames,
+                         const _Atomic int *cancel, RtxImgBmp *out, RtxImgInfo *info,
+                         const char *svg_dir) {
     RtxImgInfo in;
     RtxWuffsDec *d;
     int fmt, rc;
@@ -445,6 +728,8 @@ int rtx_img_decode(const uint8_t *b, size_t n, const RtxImgLimits *lim,
     if ((uint64_t)n > lim->file_max) return RTX_IMG_EFILE;
     if (max_frames < 1) max_frames = 1;
     fmt = rtx_wuffs_sniff(b, n, 1);
+    if (fmt == RTX_WUFFS_FMT_NONE && rtx_svg_sniff(b, n))
+        return img_svg_decode(b, n, lim, svg_dir, max_w, max_h, pix, cancel, out, info);
     if (fmt == RTX_WUFFS_FMT_NONE) return RTX_IMG_EFORMAT;
     d = rtx_wuffs_open(fmt);
     if (!d) return RTX_IMG_ENOMEM;
@@ -511,13 +796,13 @@ int rtx_img_decode(const uint8_t *b, size_t n, const RtxImgLimits *lim,
     out->h = th;
     out->stride = tw * 4;
     out->nframe = f;
-    out->pix = pix;
+    out->pix = RTX_IMG_PIX_LAYOUT(pix);
     out->bytes = total;
     if (out->nframe == 1 && out->delay) {
         free(out->delay);
         out->delay = NULL;
     }
-    if (pix == RTX_IMG_PIX_RGBA) img_to_rgba(out->px, (size_t)(total / 4));
+    if (RTX_IMG_PIX_LAYOUT(pix) == RTX_IMG_PIX_RGBA) img_to_rgba(out->px, (size_t)(total / 4));
     return RTX_IMG_OK;
 }
 
@@ -1075,11 +1360,20 @@ int rtx_img_resolve(const char *doc_path, const char *src, size_t n, RtxImgSrc *
 
 size_t rtx_img_standin(const RtxImgView *v, const char *alt, size_t altn, char *out,
                        size_t cap) {
-    char tail[96], why[96];
+    char tail[200], why[96];
     size_t tn, k = 0, room, i;
+    int mm = v && v->src.kind == RTX_IMG_SRC_MERMAID;
     if (!out || cap < 16) return 0;
     tail[0] = 0;
-    if (v && v->have_info && v->state != RTX_IMG_S_ERR && v->state != RTX_IMG_S_ASK) {
+    if (mm && v->state == RTX_IMG_S_ERR) {
+        /* "[diagram: Parse error on line 3: ...]" */
+        snprintf(tail, sizeof tail, " %s",
+                 v->msg && v->msg[0] ? v->msg : rtx_img_err_text(v->err, why, sizeof why));
+        alt = NULL;
+    } else if (mm && !v->have_info) {
+        snprintf(tail, sizeof tail, " rendering...");
+        alt = NULL;
+    } else if (v && v->have_info && v->state != RTX_IMG_S_ERR && v->state != RTX_IMG_S_ASK) {
         snprintf(tail, sizeof tail, " %ux%u", (unsigned)v->info.w, (unsigned)v->info.h);
     } else if (v && v->state == RTX_IMG_S_ASK && v->src.kind == RTX_IMG_SRC_REMOTE) {
         snprintf(tail, sizeof tail, " - %s", v->src.host);
@@ -1090,7 +1384,7 @@ size_t rtx_img_standin(const RtxImgView *v, const char *alt, size_t altn, char *
         snprintf(tail, sizeof tail, " - %s", why);
     }
     tn = strlen(tail);
-    k = (size_t)snprintf(out, cap, "[image:");
+    k = (size_t)snprintf(out, cap, mm ? "[diagram:" : "[image:");
     /* Room for " alt": what is left after the tail, ']' and the NUL (the
      * tail is cut first when even it does not fit). */
     if (k + tn + 2 > cap) tn = cap > k + 2 ? cap - k - 2 : 0;
@@ -1310,6 +1604,7 @@ struct RtxImgBmpEnt {
     ImgEnt *ent;
     RtxImgBmpEnt *next;
     uint32_t w, h;         /* the size asked for (fitted) */
+    int pix;               /* RTX_IMG_PIX_* */
     int state;
     int err;
     RtxImgBmp bmp;
@@ -1327,8 +1622,10 @@ struct ImgEnt {
     uint64_t kh;
     int kind;
     char *path;            /* local file, or the fetch cache file */
-    uint8_t *data;         /* data: payload */
+    uint8_t *data;         /* data: payload; Mermaid: options line + '\n' + source */
     size_t data_n;
+    char *msg;             /* Mermaid: the renderer's message for the last error */
+    uint64_t asked;        /* frame epoch a layout or paint last asked (Mermaid) */
     int hstate;
     int herr;
     RtxImgInfo info;
@@ -1338,6 +1635,7 @@ struct ImgEnt {
     RtxImgBmpEnt *bmps;
     int jobs;              /* jobs holding path / data */
     uint32_t want_w, want_h; /* pixels asked for before the header was known */
+    int want_pix;
     uint64_t want_epoch;
     /* remote */
     int fstate;            /* 0 none, 1 running, 2 cached, 3 failed */
@@ -1360,6 +1658,7 @@ static int g_changed;        /* pixels / states changed: repaint */
 static int g_layout_changed; /* a header arrived: refill */
 static unsigned g_img_gen;
 static size_t g_nfetch;
+static uint64_t g_bmp_serial;
 
 typedef struct {
     int kind;              /* 1 probe, 2 decode */
@@ -1370,6 +1669,7 @@ typedef struct {
     size_t data_n;
     RtxImgLimits lim;
     uint32_t w, h;
+    int pix;
     uint32_t frames;
     _Atomic int cancel;
     int rc;
@@ -1377,6 +1677,9 @@ typedef struct {
     RtxImgBmp out;
     int64_t mtime;
     uint64_t size;
+    char svg_dir[RTX_IMG_PATH]; /* SVG / Mermaid size + pixel cache (safe home), or "" */
+    int mm;                /* a Mermaid entry (lane 2) */
+    char msg[256];         /* Mermaid: the renderer's message */
     _Atomic int done;
 } ImgJob;
 
@@ -1386,7 +1689,10 @@ typedef struct {
     int busy;
 } ImgLane;
 
-static ImgLane g_lane[2];    /* 0: headers, 1: pixels */
+/* 0: headers, 1: pixels, 2: Mermaid (sizes and pixels: a slow diagram
+ * never holds back an image, and the other way round). */
+#define IMG_LANES 3
+static ImgLane g_lane[IMG_LANES];
 
 static long img_now_ms(void) {
     struct timespec ts;
@@ -1482,6 +1788,29 @@ static int img_cache_dir(char *out, size_t n) {
     return 1;
 }
 
+/* The SVG size + pixel cache (<safe>/img/svg; img_svg.c), or "" (no safe
+ * home, or svg_cache_mb 0). UI thread: jobs get a copy. */
+static void img_svg_dir(char *out, size_t n) {
+    char dir[RTX_IMG_PATH];
+    out[0] = 0;
+    if (!rtx_img_limits()->svg_cache_max || !rtx_safe_dir(dir, sizeof dir)) return;
+    snprintf(out, n, "%s/img", dir);
+    (void)mkdir(out, 0700);
+    snprintf(out, n, "%s/img/svg", dir);
+    if (mkdir(out, 0700) != 0 && errno != EEXIST) out[0] = 0;
+}
+
+/* The Mermaid size + pixel cache (<safe>/img/mermaid), or "". */
+static void img_mm_dir(char *out, size_t n) {
+    char dir[RTX_IMG_PATH];
+    out[0] = 0;
+    if (!rtx_img_limits()->svg_cache_max || !rtx_safe_dir(dir, sizeof dir)) return;
+    snprintf(out, n, "%s/img", dir);
+    (void)mkdir(out, 0700);
+    snprintf(out, n, "%s/img/mermaid", dir);
+    if (mkdir(out, 0700) != 0 && errno != EEXIST) out[0] = 0;
+}
+
 static void img_cache_file(const char *url, const char *ext, char *out, size_t n) {
     char dir[RTX_IMG_PATH];
     if (!img_cache_dir(dir, sizeof dir)) {
@@ -1489,6 +1818,215 @@ static void img_cache_file(const char *url, const char *ext, char *out, size_t n
         return;
     }
     snprintf(out, n, "%s/%016llx%s", dir, (unsigned long long)img_fnv(url, strlen(url)), ext);
+}
+
+/* ---- Mermaid sources, themes, stale display ------------------------------ */
+
+static RtxMmTheme g_mm_theme = {1, {220, 220, 224}, {24, 24, 28}, {110, 150, 230}};
+/* Themes seen, by id (a key names its theme by id; the payload needs the
+ * colours back). */
+#define IMG_MM_THEMES 16
+static struct {
+    uint32_t id;
+    RtxMmTheme t;
+} g_mm_themes[IMG_MM_THEMES];
+static int g_mm_nthemes;
+
+uint32_t rtx_img_mm_theme_id(const RtxMmTheme *t) {
+    uint64_t h = img_fnv(t, sizeof *t);
+    uint32_t id = (uint32_t)(h ^ (h >> 32));
+    return id ? id : 1;
+}
+
+static void img_mm_theme_keep(const RtxMmTheme *t, uint32_t id) {
+    int i;
+    for (i = 0; i < g_mm_nthemes; i++)
+        if (g_mm_themes[i].id == id) return;
+    if (g_mm_nthemes == IMG_MM_THEMES) {
+        memmove(g_mm_themes, g_mm_themes + 1, sizeof g_mm_themes[0] * (IMG_MM_THEMES - 1));
+        g_mm_nthemes--;
+    }
+    g_mm_themes[g_mm_nthemes].id = id;
+    g_mm_themes[g_mm_nthemes].t = *t;
+    g_mm_nthemes++;
+}
+
+void rtx_img_mm_theme_set(const RtxMmTheme *t) {
+    if (!t || !memcmp(t, &g_mm_theme, sizeof *t)) return;
+    g_mm_theme = *t;
+    /* Every diagram's key moved: layouts refill (the stale display keeps
+     * the old pictures up until the new renders land). */
+    g_layout_changed = 1;
+    g_changed = 1;
+}
+
+const RtxMmTheme *rtx_img_mm_theme(void) { return &g_mm_theme; }
+
+void rtx_img_mm_theme_rgb(uint32_t bg, uint32_t fg, uint32_t accent, RtxMmTheme *out) {
+    int i;
+    unsigned lum;
+    memset(out, 0, sizeof *out);
+    for (i = 0; i < 3; i++) {
+        out->bg[i] = (unsigned char)(bg >> (16 - 8 * i));
+        out->fg[i] = (unsigned char)(fg >> (16 - 8 * i));
+        out->accent[i] = (unsigned char)(accent >> (16 - 8 * i));
+    }
+    lum = (unsigned)out->bg[0] * 299u + (unsigned)out->bg[1] * 587u + (unsigned)out->bg[2] * 114u;
+    out->dark = lum < 128000u;
+}
+
+static void img_mm_hex(char *o, const unsigned char c[3]) {
+    snprintf(o, 8, "#%02x%02x%02x", c[0], c[1], c[2]);
+}
+
+static void img_mm_mix(unsigned char *o, const unsigned char a[3], const unsigned char b[3],
+                       int pct) {
+    int i;
+    for (i = 0; i < 3; i++) o[i] = (unsigned char)((a[i] * (100 - pct) + b[i] * pct + 50) / 100);
+}
+
+/* The options line (render/cr_proto.h): mermaid's theme and the colours. */
+static size_t img_mm_opts(const RtxMmTheme *t, char *o, size_t n) {
+    char bg[8], fg[8], ac[8], fill[8], line[8], sec[8], ter[8];
+    unsigned char m[3];
+    img_mm_hex(bg, t->bg);
+    img_mm_hex(fg, t->fg);
+    img_mm_hex(ac, t->accent);
+    if (!t->dark)
+        return (size_t)snprintf(o, n,
+                                "{\"theme\":\"default\",\"themeVariables\":{\"background\":\"%s\"}}",
+                                bg);
+    img_mm_mix(m, t->bg, t->accent, 22);
+    img_mm_hex(fill, m);
+    img_mm_mix(m, t->fg, t->bg, 30);
+    img_mm_hex(line, m);
+    img_mm_mix(m, t->bg, t->fg, 14);
+    img_mm_hex(sec, m);
+    img_mm_mix(m, t->bg, t->fg, 7);
+    img_mm_hex(ter, m);
+    return (size_t)snprintf(
+        o, n,
+        "{\"theme\":\"dark\",\"themeVariables\":{\"darkMode\":true,\"background\":\"%s\","
+        "\"primaryColor\":\"%s\",\"primaryTextColor\":\"%s\",\"primaryBorderColor\":\"%s\","
+        "\"secondaryColor\":\"%s\",\"tertiaryColor\":\"%s\",\"lineColor\":\"%s\","
+        "\"textColor\":\"%s\",\"mainBkg\":\"%s\",\"nodeBorder\":\"%s\"}}",
+        bg, fill, fg, ac, sec, ter, line, fg, fill, ac);
+}
+
+static int img_mm_payload(const RtxImgSrc *s, uint8_t **out, size_t *out_n) {
+    uint64_t h = 0, n = 0;
+    uint32_t th = 0;
+    const RtxMmTheme *t = &g_mm_theme;
+    char opts[1024];
+    size_t on;
+    int i;
+    uint8_t *b;
+    if (!rtx_img_mermaid_key(s, &h, &n, &th)) return 0;
+    for (i = 0; i < g_mm_nthemes; i++)
+        if (g_mm_themes[i].id == th) t = &g_mm_themes[i].t;
+    on = img_mm_opts(t, opts, sizeof opts);
+    if (on >= sizeof opts) return 0;
+    b = (uint8_t *)malloc(on + 1 + s->data_n + 1);
+    if (!b) return 0;
+    memcpy(b, opts, on);
+    b[on] = '\n';
+    memcpy(b + on + 1, s->data, s->data_n);
+    b[on + 1 + s->data_n] = 0;
+    *out = b;
+    *out_n = on + 1 + s->data_n;
+    return 1;
+}
+
+int rtx_img_src_mermaid(const char *src, size_t n, const RtxMmTheme *t, RtxImgSrc *out) {
+    uint32_t id;
+    if (!out) return RTX_IMG_ESRC;
+    if (!t) t = &g_mm_theme;
+    id = rtx_img_mm_theme_id(t);
+    img_mm_theme_keep(t, id);
+    rtx_img_src_mermaid_key(img_fnv(src ? src : "", src ? n : 0), src ? n : 0, id, out);
+    out->data = src;
+    out->data_n = src ? n : 0;
+    if (!src || !n) out->err = RTX_IMG_ESRC;
+    else if ((uint64_t)n > rtx_img_limits()->mm_max) out->err = RTX_IMG_ESVGBIG;
+    return out->err;
+}
+
+void rtx_img_src_mermaid_key(uint64_t h, uint64_t n, uint32_t theme, RtxImgSrc *out) {
+    memset(out, 0, sizeof *out);
+    out->kind = RTX_IMG_SRC_MERMAID;
+    snprintf(out->key, sizeof out->key, "mermaid:%016llx:%llu:%08x", (unsigned long long)h,
+             (unsigned long long)n, (unsigned)theme);
+    out->err = RTX_IMG_OK;
+}
+
+int rtx_img_mermaid_key(const RtxImgSrc *s, uint64_t *h, uint64_t *n, uint32_t *theme) {
+    unsigned long long a = 0, b = 0;
+    unsigned c = 0;
+    if (!s || s->kind != RTX_IMG_SRC_MERMAID) return 0;
+    if (sscanf(s->key, "mermaid:%16llx:%llu:%8x", &a, &b, &c) != 3) return 0;
+    if (h) *h = a;
+    if (n) *n = b;
+    if (theme) *theme = c;
+    return 1;
+}
+
+/* Stale display: (owner, fence start) -> the last key that had a size. */
+#define IMG_MM_PREV 64
+static struct {
+    const void *owner;
+    size_t lo;
+    char key[96];
+    uint64_t at;
+} g_mm_prev[IMG_MM_PREV];
+
+void rtx_img_mm_note(const void *owner, size_t lo, const RtxImgSrc *src) {
+    int i, slot = -1;
+    if (!src || src->kind != RTX_IMG_SRC_MERMAID || strlen(src->key) >= sizeof g_mm_prev[0].key)
+        return;
+    for (i = 0; i < IMG_MM_PREV; i++)
+        if (g_mm_prev[i].owner == owner && g_mm_prev[i].lo == lo) {
+            slot = i;
+            break;
+        }
+    if (slot < 0) {
+        slot = 0;
+        for (i = 1; i < IMG_MM_PREV; i++)
+            if (g_mm_prev[i].at < g_mm_prev[slot].at) slot = i;
+    }
+    g_mm_prev[slot].owner = owner;
+    g_mm_prev[slot].lo = lo;
+    snprintf(g_mm_prev[slot].key, sizeof g_mm_prev[slot].key, "%s", src->key);
+    g_mm_prev[slot].at = g_epoch;
+}
+
+int rtx_img_has_pixels(const RtxImgSrc *src) {
+    ImgEnt *e;
+    RtxImgBmpEnt *be;
+    if (!src) return 0;
+    e = img_ent_find(src->key, img_fnv(src->key, strlen(src->key)));
+    if (!e) return 0;
+    for (be = e->bmps; be; be = be->next)
+        if (be->state == IMG_B_OK) return 1;
+    return 0;
+}
+
+int rtx_img_mm_prev(const void *owner, size_t lo, RtxImgSrc *out) {
+    int i;
+    for (i = 0; i < IMG_MM_PREV; i++)
+        if (g_mm_prev[i].owner == owner && g_mm_prev[i].lo == lo && g_mm_prev[i].key[0]) {
+            memset(out, 0, sizeof *out);
+            out->kind = RTX_IMG_SRC_MERMAID;
+            snprintf(out->key, sizeof out->key, "%s", g_mm_prev[i].key);
+            return 1;
+        }
+    return 0;
+}
+
+static int img_mm_prev_holds(const ImgEnt *e) {
+    int i;
+    for (i = 0; i < IMG_MM_PREV; i++)
+        if (g_mm_prev[i].key[0] && strcmp(g_mm_prev[i].key, e->key) == 0) return 1;
+    return 0;
 }
 
 static ImgEnt *img_ent_get(const RtxImgSrc *s) {
@@ -1513,6 +2051,13 @@ static ImgEnt *img_ent_get(const RtxImgSrc *s) {
         if (rc != RTX_IMG_OK) {
             e->hstate = IMG_H_ERR;
             e->herr = rc;
+        }
+    } else if (s->kind == RTX_IMG_SRC_MERMAID) {
+        /* The payload the helper reads: the theme's options line, then the
+         * source. Without the source (a key-only src), nothing to render. */
+        if (!s->data || !img_mm_payload(s, &e->data, &e->data_n)) {
+            e->hstate = IMG_H_ERR;
+            e->herr = s->data ? RTX_IMG_ENOMEM : RTX_IMG_ESRC;
         }
     } else if (s->kind == RTX_IMG_SRC_REMOTE) {
         char cf[RTX_IMG_PATH];
@@ -1585,6 +2130,20 @@ static void img_job_run(ImgJob *j) {
     size_t n = 0;
     int closed = 1;
     const uint8_t *b;
+    j->msg[0] = 0;
+    if (j->mm) {
+        /* Mermaid: the payload is in memory (the entry's copy). */
+        if (j->kind == 1)
+            j->rc = img_mm_info(j->data, j->data_n, &j->lim, j->svg_dir, &j->cancel, &j->info,
+                                j->msg, sizeof j->msg);
+        else
+            j->rc = img_mm_decode(j->data, j->data_n, &j->lim, j->svg_dir, j->w, j->h, j->pix,
+                                  &j->cancel, &j->out, &j->info, j->msg, sizeof j->msg);
+        if (j->kind == 2 && j->rc == RTX_IMG_OK && (j->pix & RTX_IMG_PIX_DIM))
+            img_dim(j->out.px, (size_t)j->out.w * j->out.h, RTX_IMG_PIX_LAYOUT(j->pix));
+        atomic_store_explicit(&j->done, 1, memory_order_release);
+        return;
+    }
     if (j->kind == 1) {
         /* Header: 64 KiB, then 1 MiB, then the whole file (bounded by
          * the file limit): EXIF and JPEG tables sit before the frame. */
@@ -1604,7 +2163,7 @@ static void img_job_run(ImgJob *j) {
                 if (j->rc != RTX_IMG_OK) break;
                 b = buf;
             }
-            j->rc = rtx_img_probe(b, n, closed, &j->lim, &j->info);
+            j->rc = img_probe_ex(b, n, closed, &j->lim, j->svg_dir, &j->cancel, &j->info);
             if (j->rc != RTX_IMG_MORE || closed) break;
         }
         if (j->rc == RTX_IMG_MORE) j->rc = RTX_IMG_ETRUNC;
@@ -1620,8 +2179,10 @@ static void img_job_run(ImgJob *j) {
             b = buf;
         }
         if (j->rc == RTX_IMG_OK)
-            j->rc = rtx_img_decode(b, n, &j->lim, j->w, j->h, RTX_IMG_PIX_BGRA_PREMUL,
-                                   j->frames, &j->cancel, &j->out, &j->info);
+            j->rc = img_decode_ex(b, n, &j->lim, j->w, j->h, RTX_IMG_PIX_LAYOUT(j->pix),
+                                   j->frames, &j->cancel, &j->out, &j->info, j->svg_dir);
+        if (j->rc == RTX_IMG_OK && (j->pix & RTX_IMG_PIX_DIM))
+            img_dim(j->out.px, (size_t)(j->out.bytes / 4), RTX_IMG_PIX_LAYOUT(j->pix));
         free(buf);
     }
     atomic_store_explicit(&j->done, 1, memory_order_release);
@@ -1650,7 +2211,8 @@ static void img_lane_join(ImgLane *L) {
 }
 
 static void img_evict(uint64_t need, const RtxImgBmpEnt *keep);
-static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, RtxImgBmpEnt **anyp);
+static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, int pix,
+                                 RtxImgBmpEnt **anyp);
 
 static void img_adopt(ImgLane *L) {
     ImgJob *j = &L->job;
@@ -1658,8 +2220,15 @@ static void img_adopt(ImgLane *L) {
     img_lane_join(L);
     L->busy = 0;
     if (e) e->jobs--;
+    if (e && j->mm && j->rc != RTX_IMG_OK && j->rc != RTX_IMG_ECANCEL) {
+        free(e->msg);
+        e->msg = j->msg[0] ? strdup(j->msg) : NULL;
+    }
     if (j->kind == 1) {
-        if (e->hstate == IMG_H_RUN) {
+        if (j->mm && j->rc == RTX_IMG_ECANCEL && e->hstate == IMG_H_RUN) {
+            /* Abandoned (nobody asks any more): asked again, it queues. */
+            e->hstate = IMG_H_NONE;
+        } else if (e->hstate == IMG_H_RUN) {
             e->hstate = j->rc == RTX_IMG_OK ? IMG_H_OK : IMG_H_ERR;
             e->herr = j->rc;
             e->info = j->info;
@@ -1669,7 +2238,7 @@ static void img_adopt(ImgLane *L) {
             g_layout_changed = 1;
             g_changed = 1;
             if (j->rc == RTX_IMG_OK && e->want_epoch && e->want_epoch + 1 >= g_epoch)
-                (void)img_bmp_for(e, e->want_w, e->want_h, NULL);
+                (void)img_bmp_for(e, e->want_w, e->want_h, e->want_pix, NULL);
             e->want_epoch = 0;
         }
     } else {
@@ -1681,6 +2250,7 @@ static void img_adopt(ImgLane *L) {
         } else if (j->rc == RTX_IMG_OK) {
             img_evict(j->out.bytes, be);
             be->bmp = j->out;
+            be->bmp.id = ++g_bmp_serial;
             be->state = IMG_B_OK;
             be->t0_ms = img_now_ms();
             g_held += be->bmp.bytes;
@@ -1705,6 +2275,7 @@ static void img_adopt(ImgLane *L) {
     }
     j->ent = NULL;
     j->be = NULL;
+    j->mm = 0;
 }
 
 /* Evict least-recently painted bitmaps until `need` more fits. */
@@ -1741,6 +2312,66 @@ static int img_job_source(ImgJob *j, ImgEnt *e) {
     return 1;
 }
 
+/* The Mermaid lane: a bitmap asked for (most recently painted first),
+ * else a size (most recently asked first). The newest source while
+ * typing goes before the ones it replaced. */
+static void img_mm_dir(char *out, size_t n);
+static void img_schedule_mm(void) {
+    ImgLane *L = &g_lane[2];
+    RtxImgBmpEnt *bpick = NULL;
+    ImgEnt *hpick = NULL, *e;
+    size_t i;
+    if (L->busy) return;
+    for (i = 0; i < IMG_HASH; i++)
+        for (e = g_ents[i]; e; e = e->hnext) {
+            RtxImgBmpEnt *be;
+            if (e->kind != RTX_IMG_SRC_MERMAID || !e->data) continue;
+            if (e->hstate == IMG_H_QUEUED && (!hpick || e->asked > hpick->asked)) hpick = e;
+            for (be = e->bmps; be; be = be->next)
+                if (be->state == IMG_B_QUEUED && (!bpick || be->used > bpick->used)) bpick = be;
+        }
+    if (!bpick && !hpick) return;
+    L->job.lim = *rtx_img_limits();
+    L->job.cancel = 0;
+    L->job.mm = 1;
+    L->job.path[0] = 0;
+    img_mm_dir(L->job.svg_dir, sizeof L->job.svg_dir);
+    memset(&L->job.out, 0, sizeof L->job.out);
+    if (bpick) {
+        e = bpick->ent;
+        L->job.kind = 2;
+        L->job.ent = e;
+        L->job.be = bpick;
+        L->job.w = bpick->w;
+        L->job.h = bpick->h;
+        L->job.pix = bpick->pix;
+        L->job.frames = 1;
+        bpick->state = IMG_B_RUN;
+        bpick->cancel = 0;
+    } else {
+        e = hpick;
+        L->job.kind = 1;
+        L->job.ent = e;
+        L->job.be = NULL;
+        e->hstate = IMG_H_RUN;
+    }
+    L->job.data = e->data;
+    L->job.data_n = e->data_n;
+    e->jobs++;
+    img_lane_kick(L) !>(err) {
+        (void)err;
+        if (bpick) {
+            bpick->state = IMG_B_ERR;
+            bpick->err = RTX_IMG_ENOMEM;
+        } else {
+            e->hstate = IMG_H_ERR;
+            e->herr = RTX_IMG_ENOMEM;
+        }
+        e->jobs--;
+        L->busy = 0;
+    };
+}
+
 /* Start the next job on each idle lane: headers FIFO, pixels most
  * recently wanted first. */
 static void img_schedule(void) {
@@ -1752,8 +2383,8 @@ static void img_schedule(void) {
         ImgEnt *pick = NULL;
         for (i = 0; i < IMG_HASH && !pick; i++)
             for (e = g_ents[i]; e; e = e->hnext)
-                if (e->hstate == IMG_H_QUEUED && (!e->path || e->kind != RTX_IMG_SRC_REMOTE ||
-                                                  e->fstate == 2)) {
+                if (e->hstate == IMG_H_QUEUED && e->kind != RTX_IMG_SRC_MERMAID &&
+                    (!e->path || e->kind != RTX_IMG_SRC_REMOTE || e->fstate == 2)) {
                     pick = e;
                     break;
                 }
@@ -1763,6 +2394,8 @@ static void img_schedule(void) {
             L->job.be = NULL;
             L->job.lim = *rtx_img_limits();
             L->job.cancel = 0;
+            L->job.mm = 0;
+            img_svg_dir(L->job.svg_dir, sizeof L->job.svg_dir);
             pick->hstate = IMG_H_RUN;
             pick->jobs++;
             img_lane_kick(L) !>(err) {
@@ -1780,6 +2413,7 @@ static void img_schedule(void) {
         for (i = 0; i < IMG_HASH; i++)
             for (e = g_ents[i]; e; e = e->hnext) {
                 RtxImgBmpEnt *be;
+                if (e->kind == RTX_IMG_SRC_MERMAID) continue;
                 for (be = e->bmps; be; be = be->next) {
                     if (be->state != IMG_B_QUEUED) continue;
                     if (!pick || be->used > pick->used ||
@@ -1795,8 +2429,11 @@ static void img_schedule(void) {
             L->job.lim = *lim;
             L->job.w = pick->w;
             L->job.h = pick->h;
+            L->job.pix = pick->pix;
             L->job.frames = lim->anim ? lim->anim_frames : 1;
             L->job.cancel = 0;
+            L->job.mm = 0;
+            img_svg_dir(L->job.svg_dir, sizeof L->job.svg_dir);
             memset(&L->job.out, 0, sizeof L->job.out);
             pick->state = IMG_B_RUN;
             pick->cancel = 0;
@@ -1810,6 +2447,7 @@ static void img_schedule(void) {
             };
         }
     }
+    img_schedule_mm();
 }
 
 /* Remote fetch progress (UI thread; the transfer is another process). */
@@ -1926,6 +2564,7 @@ int rtx_img_file(const RtxImgSrc *s, char *out, size_t n) {
         case RTX_IMG_FMT_BMP: ext = "bmp"; break;
         case RTX_IMG_FMT_WEBP: ext = "webp"; break;
         case RTX_IMG_FMT_QOI: ext = "qoi"; break;
+        case RTX_IMG_FMT_SVG: ext = "svg"; break;
         default: ext = "bin"; break;
         }
         snprintf(out, n, "%s/data-%016llx.%s", dir,
@@ -1953,6 +2592,7 @@ static void img_view_fill(RtxImgView *v, const RtxImgSrc *s, ImgEnt *e) {
         v->err = s->err ? s->err : RTX_IMG_ENOMEM;
         return;
     }
+    v->msg = e->hstate == IMG_H_ERR ? e->msg : NULL;
     if (e->hstate == IMG_H_OK || ((e->herr == RTX_IMG_EDIM || e->herr == RTX_IMG_EPX ||
                                    e->herr == RTX_IMG_EBUDGET) && e->hstate == IMG_H_ERR)) {
         v->have_info = e->info.w > 0;
@@ -2005,6 +2645,7 @@ static ImgEnt *img_ent_ready(const RtxImgSrc *src, RtxImgView *v) {
         return NULL;
     }
     img_ent_recheck(e);
+    e->asked = g_epoch;
     if (e->kind == RTX_IMG_SRC_REMOTE) {
         if (e->fstate == 0) rtx_img_fetch(src);
         if (e->fstate == 1) {
@@ -2038,13 +2679,20 @@ int rtx_img_info(const RtxImgSrc *src, RtxImgView *v) {
 /* The bitmap of e for a (w, h) box (created), marked wanted and queued
  * when missing. *any: the largest decoded bitmap of another size (shown
  * meanwhile). */
-static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, RtxImgBmpEnt **anyp) {
+static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, int pix,
+                                 RtxImgBmpEnt **anyp) {
     RtxImgBmpEnt *be, *best = NULL, *any = NULL;
     uint32_t fw, fh;
-    rtx_img_fit(e->info.w, e->info.h, w, h, &fw, &fh);
+    if (e->info.fmt == RTX_IMG_FMT_SVG || e->info.fmt == RTX_IMG_FMT_MERMAID)
+        img_svg_box(rtx_img_limits(), e->info.w, e->info.h, w, h, &fw, &fh);
+    else
+        rtx_img_fit(e->info.w, e->info.h, w, h, &fw, &fh);
     for (be = e->bmps; be; be = be->next) {
-        uint32_t dw = be->w > fw ? be->w - fw : fw - be->w;
-        uint32_t dh = be->h > fh ? be->h - fh : fh - be->h;
+        uint32_t dw;
+        uint32_t dh;
+        if (be->pix != pix) continue;
+        dw = be->w > fw ? be->w - fw : fw - be->w;
+        dh = be->h > fh ? be->h - fh : fh - be->h;
         if (dw * 10 <= fw && dh * 10 <= fh) {
             best = be;
             break;
@@ -2057,6 +2705,7 @@ static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, RtxImgBmpEnt
         best->ent = e;
         best->w = fw;
         best->h = fh;
+        best->pix = pix;
         best->next = e->bmps;
         e->bmps = best;
     }
@@ -2077,6 +2726,10 @@ static RtxImgBmpEnt *img_bmp_for(ImgEnt *e, uint32_t w, uint32_t h, RtxImgBmpEnt
 }
 
 int rtx_img_want(const RtxImgSrc *src, uint32_t w, uint32_t h, RtxImgView *v) {
+    return rtx_img_want_pix(src, w, h, RTX_IMG_PIX_BGRA_PREMUL, v);
+}
+
+int rtx_img_want_pix(const RtxImgSrc *src, uint32_t w, uint32_t h, int pix, RtxImgView *v) {
     RtxImgView tmp;
     ImgEnt *e;
     RtxImgBmpEnt *best = NULL, *any = NULL;
@@ -2088,15 +2741,68 @@ int rtx_img_want(const RtxImgSrc *src, uint32_t w, uint32_t h, RtxImgView *v) {
         /* The decode follows the header without another ask. */
         e->want_w = w;
         e->want_h = h;
+        e->want_pix = pix;
         e->want_epoch = g_epoch;
         return v->state;
     }
-    best = img_bmp_for(e, w, h, &any);
+    best = img_bmp_for(e, w, h, pix, &any);
     if (!best) return v->state;
+    if ((pix & RTX_IMG_PIX_DIM) && best->state == IMG_B_QUEUED) {
+        /* A stale picture's faded copy: made here from a plain bitmap of it
+         * (that size when there is one, else the largest, resampled; no
+         * job, no helper round trip, while the helper is busy with the
+         * new render). */
+        RtxImgBmpEnt *pl, *src = NULL;
+        for (pl = e->bmps; pl; pl = pl->next) {
+            if (pl->state != IMG_B_OK || pl->pix != (pix & ~RTX_IMG_PIX_DIM) ||
+                pl->bmp.nframe != 1 || !pl->bmp.w || !pl->bmp.h)
+                continue;
+            if (pl->bmp.w == best->w && pl->bmp.h == best->h) {
+                src = pl;
+                break;
+            }
+            if (!src || (uint64_t)pl->bmp.w * pl->bmp.h > (uint64_t)src->bmp.w * src->bmp.h)
+                src = pl;
+        }
+        if (src && best->w && best->h) {
+            uint32_t W = best->w, H = best->h, x, y;
+            uint64_t bytes = (uint64_t)W * H * 4;
+            uint8_t *cp = (uint8_t *)malloc((size_t)bytes);
+            if (cp) {
+                for (y = 0; y < H; y++) {
+                    const uint8_t *row =
+                        src->bmp.px + (size_t)((uint64_t)y * src->bmp.h / H) * src->bmp.stride;
+                    uint8_t *o = cp + (size_t)y * W * 4;
+                    if (W == src->bmp.w) {
+                        memcpy(o, row, (size_t)W * 4);
+                        continue;
+                    }
+                    for (x = 0; x < W; x++)
+                        memcpy(o + (size_t)x * 4, row + (size_t)((uint64_t)x * src->bmp.w / W) * 4, 4);
+                }
+                img_dim(cp, (size_t)W * H, RTX_IMG_PIX_LAYOUT(pix));
+                img_evict(bytes, best);
+                best->bmp = src->bmp;
+                best->bmp.w = W;
+                best->bmp.h = H;
+                best->bmp.stride = W * 4;
+                best->bmp.px = cp;
+                best->bmp.bytes = bytes;
+                best->bmp.delay = NULL;
+                best->bmp.id = ++g_bmp_serial;
+                best->state = IMG_B_OK;
+                best->t0_ms = img_now_ms();
+                g_held += bytes;
+                g_nbmp++;
+                g_changed = 1;
+            }
+        }
+    }
     if (best->state == IMG_B_QUEUED) img_schedule();
     if (best->state == IMG_B_ERR) {
         v->state = RTX_IMG_S_ERR;
         v->err = best->err;
+        v->msg = e->msg;
         return v->state;
     }
     if (best->state != IMG_B_OK && any) best = any;
@@ -2123,17 +2829,63 @@ void rtx_img_frame(void) {
     g_epoch++;
 }
 
+/* Diagram sources pile up while a fence is edited (one entry per
+ * version): free those nobody asked for in a while, that hold no bitmap
+ * and no job, and that the stale display does not point at. */
+#define IMG_MM_GC_PASSES 120
+static void img_mm_gc(void) {
+    size_t i;
+    for (i = 0; i < IMG_HASH; i++) {
+        ImgEnt **pp = &g_ents[i];
+        while (*pp) {
+            ImgEnt *e = *pp;
+            RtxImgBmpEnt *be;
+            int keep = e->kind != RTX_IMG_SRC_MERMAID || e->jobs ||
+                       e->asked + IMG_MM_GC_PASSES >= g_epoch || e->hstate == IMG_H_RUN;
+            for (be = e->bmps; be && !keep; be = be->next)
+                if (be->state == IMG_B_OK || be->state == IMG_B_RUN) keep = 1;
+            if (!keep && img_mm_prev_holds(e)) keep = 1;
+            if (keep) {
+                pp = &e->hnext;
+                continue;
+            }
+            *pp = e->hnext;
+            while (e->bmps) {
+                be = e->bmps;
+                e->bmps = be->next;
+                img_bmp_drop(be);
+                free(be);
+            }
+            free(e->key);
+            free(e->path);
+            free(e->data);
+            free(e->msg);
+            free(e);
+            g_nent--;
+        }
+    }
+}
+
 int rtx_img_pump(void) {
     int ch;
     size_t i;
     ImgEnt *e;
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < IMG_LANES; i++) {
         ImgLane *L = &g_lane[i];
         if (L->busy && atomic_load_explicit(&L->job.done, memory_order_acquire)) img_adopt(L);
     }
+    img_mm_gc();
     for (i = 0; i < IMG_HASH; i++)
         for (e = g_ents[i]; e; e = e->hnext) {
             RtxImgBmpEnt *be;
+            /* A diagram source nobody asked for in the last pass (typed
+             * past): its size job stops (the helper's late reply is
+             * dropped by its stamp). */
+            if (e->kind == RTX_IMG_SRC_MERMAID && e->hstate == IMG_H_RUN && e->asked + 1 < g_epoch &&
+                g_lane[2].job.ent == e && g_lane[2].job.kind == 1)
+                g_lane[2].job.cancel = 1;
+            if (e->kind == RTX_IMG_SRC_MERMAID && e->hstate == IMG_H_QUEUED && e->asked + 1 < g_epoch)
+                e->hstate = IMG_H_NONE;
             if (e->net) img_fetch_poll(e);
             /* Scrolled away: a queued decode nobody painted last pass is
              * dropped; a running one is told to stop. */
@@ -2149,6 +2901,7 @@ int rtx_img_pump(void) {
                 else if (be->state == IMG_B_RUN) {
                     be->cancel = 1;
                     if (g_lane[1].job.be == be) g_lane[1].job.cancel = 1;
+                    if (g_lane[2].job.be == be) g_lane[2].job.cancel = 1;
                 }
             }
         }
@@ -2172,7 +2925,7 @@ unsigned rtx_img_gen(void) {
 int rtx_img_busy(void) {
     size_t i;
     ImgEnt *e;
-    if (g_lane[0].busy || g_lane[1].busy) return 1;
+    if (g_lane[0].busy || g_lane[1].busy || g_lane[2].busy) return 1;
     for (i = 0; i < IMG_HASH; i++)
         for (e = g_ents[i]; e; e = e->hnext) {
             RtxImgBmpEnt *be;
@@ -2217,6 +2970,7 @@ void rtx_img_finish(void) {
         rtx_img_pump();
         if (g_lane[0].busy) img_lane_join(&g_lane[0]);
         if (g_lane[1].busy) img_lane_join(&g_lane[1]);
+        if (g_lane[2].busy) img_lane_join(&g_lane[2]);
         {
             size_t i;
             ImgEnt *e;
@@ -2259,13 +3013,59 @@ uint64_t rtx_img_held(void) { return g_held; }
 size_t rtx_img_nbmp(void) { return g_nbmp; }
 size_t rtx_img_fetches(void) { return g_nfetch; }
 
+/* ---- terminal picture rows --------------------------------------------- */
+
+static int g_cells_on;
+static uint32_t g_cell_w = 8, g_cell_h = 16, g_cell_rows = 20;
+
+void rtx_img_cells_set(int on, uint32_t cw, uint32_t ch, uint32_t max_rows) {
+    g_cells_on = on != 0;
+    g_cell_w = cw ? cw : 8;
+    g_cell_h = ch ? ch : 16;
+    g_cell_rows = max_rows ? max_rows : 20;
+}
+
+int rtx_img_cells_on(void) {
+    return g_cells_on;
+}
+
+void rtx_img_cells_px(uint32_t *cw, uint32_t *ch) {
+    if (cw) *cw = g_cell_w;
+    if (ch) *ch = g_cell_h;
+}
+
+void rtx_img_cell_box(uint32_t iw, uint32_t ih, int have, uint32_t cols, uint32_t *bc,
+                      uint32_t *br) {
+    rtx_img_cell_box_h(iw, ih, have, cols, rtx_img_limits()->max_h, bc, br);
+}
+
+void rtx_img_cell_box_h(uint32_t iw, uint32_t ih, int have, uint32_t cols, uint32_t max_h,
+                        uint32_t *bc, uint32_t *br) {
+    uint32_t mh = max_h, fw = 0, fh = 0;
+    if (cols < 1) cols = 1;
+    if (mh > g_cell_rows * g_cell_h) mh = g_cell_rows * g_cell_h;
+    if (!have || !iw || !ih) {
+        *bc = cols < 45 ? cols : 45;
+        *br = 3;
+        return;
+    }
+    rtx_img_fit(iw, ih, cols * g_cell_w, mh, &fw, &fh);
+    *bc = (fw + g_cell_w - 1) / g_cell_w;
+    *br = (fh + g_cell_h - 1) / g_cell_h;
+    if (*bc < 1) *bc = 1;
+    if (*br < 1) *br = 1;
+    if (*bc > cols) *bc = cols;
+}
+
 void rtx_img_reset(void) {
     size_t i;
     ImgEnt *e, *nx;
     img_lane_join(&g_lane[0]);
     img_lane_join(&g_lane[1]);
+    img_lane_join(&g_lane[2]);
     if (g_lane[0].busy) img_adopt(&g_lane[0]);
     if (g_lane[1].busy) img_adopt(&g_lane[1]);
+    if (g_lane[2].busy) img_adopt(&g_lane[2]);
     for (i = 0; i < IMG_HASH; i++) {
         for (e = g_ents[i]; e; e = nx) {
             RtxImgBmpEnt *be, *bn;
@@ -2279,6 +3079,7 @@ void rtx_img_reset(void) {
             free(e->key);
             free(e->path);
             free(e->data);
+            free(e->msg);
             free(e);
         }
         g_ents[i] = NULL;
@@ -2288,4 +3089,5 @@ void rtx_img_reset(void) {
     g_nbmp = 0;
     g_changed = 0;
     g_layout_changed = 0;
+    memset(g_mm_prev, 0, sizeof g_mm_prev);
 }

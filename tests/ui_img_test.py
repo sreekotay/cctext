@@ -248,6 +248,64 @@ def case_browse(exe, env, tmp):
         U.stop(p)
 
 
+def check_idle(tag, pid, secs=3.0):
+    """Zero wakeups on every thread once work settles (U.idle_threads).
+    The pinned ccc's sysmon ticks 50 times a second once any `@parallel`
+    ran (the image lanes, browse): a note, a failure with
+    RTX_IDLE_STRICT=1 (a runtime whose sysmon sleeps has no such tick)."""
+    own, tick, detail = U.idle_threads(pid, secs)
+    check(own == 0, "%s: idle, no thread wakes" % tag,
+          "%d wakeups in %.1f s: %s" % (own, secs, detail))
+    if tick:
+        if U.IDLE_STRICT:
+            check(False, "%s: idle, the runtime's sysmon sleeps" % tag,
+                  "%d ticks in %.1f s: %s" % (tick, secs, detail))
+        else:
+            print("note: %s: ccc runtime sysmon ticked %d times in %.1f s "
+                  "(needs the quiescent-sysmon runtime)" % (tag, tick, secs))
+
+
+def case_idle_threads(exe, env, tmp):
+    """Every thread of cctext-ui idle once work settles: a Markdown file
+    with pictures, a workbook (a big one: its read job), a Marp deck
+    presenting a picture slide, and browse with a preview open."""
+    d = proj(tmp, "idle")
+    shutil.copy(os.path.join(HERE, "..", "testdata", "wb", "revenue.wb.md"), d)
+    with open(os.path.join(d, "big.wb.md"), "w") as f:
+        f.write("# Big\n\nTable: T\n\n| id | amount | cost | margin |\n|----|----|----|----|\n")
+        for i in range(60000):
+            f.write("| %d | %d.50 | %d.25 | `=@amount - @cost` |\n" % (i, i % 997, i % 13))
+        f.write("\n```calc\ntotal = sum(T.margin)\n```\n")
+    md = (b"# Pictures\n\n![big one](big.png)\n\n![quad](quad.png)\n\nThe end.\n")
+    deck = (b"---\nmarp: true\n---\n\n# Title\n\n![bg left:40%](big.png)\n\nText beside.\n")
+    runs = [("markdown with pictures", "doc.md", md, ()),
+            ("workbook", "revenue.wb.md", None, ()),
+            ("big workbook (read job)", "big.wb.md", None, ()),
+            ("Marp deck presenting", "deck.md", deck, ("shift+F5",)),
+            ("browse preview", None, None, ("Down", "Down"))]
+    for tag, name, body, keys in runs:
+        if name:
+            p, log = launch_in(exe, env, d, name, body)
+        else:
+            e = dict(env)
+            e.update({"RTX_SAFE_HOME": os.path.join(tmp, "safe_idle"),
+                      "RTX_BLINK_IDLE_MS": "300"})
+            e.pop("RTX_UI_SCRIPT", None)
+            p = subprocess.Popen([exe, d], env=e, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        try:
+            win = window(env, p)
+            if not win:
+                print("skip: idle threads %s (no window)" % tag)
+                continue
+            time.sleep(0.8)
+            if keys:
+                key(env, win, *keys, settle=1.0)
+            check_idle("idle threads: " + tag, p.pid)
+        finally:
+            U.stop(p)
+
+
 class _Quiet(http.server.SimpleHTTPRequestHandler):
     hits = 0
 
@@ -323,7 +381,7 @@ def main(argv):
     try:
         with tempfile.TemporaryDirectory(prefix="cctext_img_") as tmp:
             for case in (case_markdown, case_anim, case_slide, case_viewer, case_browse,
-                         case_remote):
+                         case_remote, case_idle_threads):
                 case(exe, env, tmp)
     finally:
         if xvfb:

@@ -1,0 +1,144 @@
+cctext patch 0001: conditional processing (<switch>, systemLanguage,
+requiredExtensions).
+
+Upstream lunasvg ignores <switch> and renders every child, so draw.io
+exports (a <foreignObject> with HTML labels and a <text> fallback inside a
+<switch>) drew both, or nothing readable. <switch> now parses as a <g> that
+keeps only its first child whose conditions pass, for an "en" user agent
+with no extensions: requiredExtensions is always false (an empty list is
+false too, SVG 1.1), systemLanguage matches a primary tag "en",
+requiredFeatures is always true (dropped in SVG 2; Chrome and resvg agree).
+Conditions are read from the start tag without consuming it. Paint servers,
+<defs>, <clipPath>, <mask>, <marker>, <style>, <symbol> and <stop> are not
+conditional (SVG 1.1 section 5.8). A failing element is skipped like an
+unknown one.
+
+Apply (from the repository root, onto the pristine upstream files):
+  patch -p1 -d third_party/lunasvg < third_party/lunasvg/patches/0001-switch-conditional-processing.patch
+
+--- a/source/svgparser.cpp
++++ b/source/svgparser.cpp
+@@ -708,12 +708,71 @@
+     return true;
+ }
+ 
++// --- cctext patch: conditional processing (<switch>, systemLanguage, requiredExtensions) ---
++// Peeks the attributes of the start tag at `input` without consuming it and
++// returns false when the element's conditions fail for an "en" user agent.
++static bool evaluateConditions(std::string_view input)
++{
++    std::string name;
++    bool ok = true;
++    skipOptionalSpaces(input);
++    while(readIdentifier(input, name)) {
++        skipOptionalSpaces(input);
++        if(!skipDelimiter(input, '='))
++            break;
++        skipOptionalSpaces(input);
++        if(input.empty() || !(input.front() == '"' || input.front() == '\''))
++            break;
++        auto quote = input.front();
++        input.remove_prefix(1);
++        auto n = input.find(quote);
++        if(n == std::string_view::npos)
++            break;
++        auto value = input.substr(0, n);
++        if(name == "requiredExtensions") {
++            ok = false; // no extensions supported (an empty list is false too, per SVG 1.1)
++        } else if(name == "systemLanguage") {
++            bool match = false;
++            while(!value.empty()) {
++                auto comma = value.find(',');
++                auto tag = value.substr(0, comma);
++                while(!tag.empty() && IS_WS(tag.front())) tag.remove_prefix(1);
++                while(!tag.empty() && IS_WS(tag.back())) tag.remove_suffix(1);
++                auto primary = tag.substr(0, tag.find('-'));
++                if(primary.size() == 2 && (primary[0] | 0x20) == 'e' && (primary[1] | 0x20) == 'n')
++                    match = true;
++                if(comma == std::string_view::npos) break;
++                value.remove_prefix(comma + 1);
++            }
++            if(!match) ok = false;
++        }
++        // requiredFeatures: dropped in SVG 2, always true (Chrome, resvg).
++        input.remove_prefix(n + 1);
++        skipOptionalSpaces(input);
++    }
++    return ok;
++}
++
++static bool isConditionalTarget(ElementID id)
++{
++    switch(id) {
++    case ElementID::Defs: case ElementID::ClipPath: case ElementID::Mask: case ElementID::Marker:
++    case ElementID::LinearGradient: case ElementID::RadialGradient: case ElementID::Pattern:
++    case ElementID::Stop: case ElementID::Style: case ElementID::Symbol:
++        return false;
++    default:
++        return true;
++    }
++}
++
+ bool Document::parse(const char* data, size_t length)
+ {
+     std::string buffer;
+     std::string styleSheet;
+     SVGElement* currentElement = nullptr;
+     int ignoring = 0;
++    // <switch> is parsed as a <g> that keeps only its first child whose conditions pass.
++    std::vector<std::pair<SVGElement*, bool>> switches; // (switch element, a child was chosen)
+     auto handleText = [&](std::string_view text, bool in_cdata) {
+         if(text.empty() || currentElement == nullptr || ignoring > 0)
+             return;
+@@ -821,8 +880,12 @@
+                 return false;
+             if(ignoring == 0) {
+                 auto id = elementid(buffer);
++                if(buffer == "switch")
++                    id = ElementID::G;
+                 if(id != currentElement->id())
+                     return false;
++                if(!switches.empty() && switches.back().first == currentElement)
++                    switches.pop_back();
+                 currentElement = currentElement->parentElement();
+             } else {
+                 --ignoring;
+@@ -840,7 +903,19 @@
+         if(ignoring > 0) {
+             ++ignoring;
+         } else {
+-            auto id = elementid(buffer);
++            auto isSwitch = buffer == "switch";
++            auto id = isSwitch ? ElementID::G : elementid(buffer);
++            std::pair<SVGElement*, bool>* parentSwitch = nullptr;
++            if(currentElement && !switches.empty() && switches.back().first == currentElement)
++                parentSwitch = &switches.back();
++            if(id != ElementID::Unknown && currentElement && isConditionalTarget(id) && !evaluateConditions(input))
++                id = ElementID::Unknown;
++            if(parentSwitch && id != ElementID::Unknown) {
++                if(parentSwitch->second)
++                    id = ElementID::Unknown;  // a previous child already won
++                else
++                    parentSwitch->second = true;
++            }
+             if(id == ElementID::Unknown) {
+                 ignoring = 1;
+             } else {
+@@ -856,6 +931,8 @@
+                     element = child.get();
+                     currentElement->addChild(std::move(child));
+                 }
++                if(isSwitch)
++                    switches.emplace_back(element, false);
+             }
+         }
+ 
+@@ -902,6 +979,8 @@
+                 return false;
+             if(ignoring > 0)
+                 --ignoring;
++            if(element != nullptr && !switches.empty() && switches.back().first == element)
++                switches.pop_back();
+             continue;
+         }
+ 

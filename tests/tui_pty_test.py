@@ -46,15 +46,383 @@ if pyte is not None:
     pyte.Screen.delete_lines = _pyte_delete_lines
 
 
+def strip_strings(b):
+    """Drop ESC _ .. ST, ESC P .. ST and ESC ] 1337 .. BEL/ST strings (the
+    pictures and the terminal queries) so pyte sees only the text."""
+    out = bytearray()
+    i, n = 0, len(b)
+    while i < n:
+        if b[i] == 0x1b and i + 1 < n and (b[i + 1] in b"_P" or
+                                           b[i + 1:i + 6] == b"]1337"):
+            j = i + 2
+            while j < n:
+                if b[j] == 0x07 and b[i + 1] == 0x5d:
+                    j += 1
+                    break
+                if b[j] == 0x1b and j + 1 < n and b[j + 1] == 0x5c:
+                    # tmux passthrough doubles inner ESCs: ESC ESC \ is
+                    # not the end.
+                    if b[i + 1] == 0x50 and b[i + 2:i + 7] == b"tmux;" and \
+                            b[j - 1] == 0x1b:
+                        j += 2
+                        continue
+                    j += 2
+                    break
+                j += 1
+            i = j
+            continue
+        out.append(b[i])
+        i += 1
+    return bytes(out)
+
+
+def sixel_decode(data):
+    """A sixel DCS body (after ESC P .. q, up to ST) -> (w, h, {(x, y): rgb})."""
+    import re
+    pal = {}
+    px = {}
+    x = y = 0
+    cur = 0
+    w = h = 0
+    i, n = 0, len(data)
+    while i < n:
+        c = data[i]
+        if c == ord('"'):
+            m = re.match(rb'"(\d+);(\d+);(\d+);(\d+)', data[i:])
+            if m:
+                w, h = int(m.group(3)), int(m.group(4))
+                i += m.end()
+                continue
+            i += 1
+        elif c == ord('#'):
+            m = re.match(rb'#(\d+)(?:;(\d+);(\d+);(\d+);(\d+))?', data[i:])
+            cur = int(m.group(1))
+            if m.group(2):
+                pal[cur] = tuple(int(int(m.group(k)) * 255 / 100 + 0.5) for k in (3, 4, 5))
+            i += m.end()
+        elif c == ord('!'):
+            m = re.match(rb'!(\d+)(.)', data[i:], re.S)
+            cnt, ch = int(m.group(1)), m.group(2)[0]
+            for _ in range(cnt):
+                bits = ch - 63
+                for k in range(6):
+                    if bits & (1 << k):
+                        px[(x, y + k)] = pal.get(cur, (0, 0, 0))
+                x += 1
+            i += m.end()
+        elif c == ord('$'):
+            x = 0
+            i += 1
+        elif c == ord('-'):
+            x = 0
+            y += 6
+            i += 1
+        elif 63 <= c <= 126:
+            bits = c - 63
+            for k in range(6):
+                if bits & (1 << k):
+                    px[(x, y + k)] = pal.get(cur, (0, 0, 0))
+            x += 1
+            i += 1
+        else:
+            i += 1
+    return w, h, px
+
+
+class FakeTerm:
+    """A terminal on the far side of the pty for the picture cases: it
+    answers the startup queries as a terminal of kind `mode` would ('kitty',
+    'sixel', 'iterm', or 'none' = answers DA1 only; 'silent' answers
+    nothing), optionally inside tmux (passthrough = the echo comes back),
+    and records every graphics command (kitty APC, with t=t temp files
+    read and deleted as kitty does)."""
+
+    def __init__(self, mode, cell=(10, 20), truecolor=True, tmux=None):
+        self.mode, self.cell, self.truecolor, self.tmux = mode, cell, truecolor, tmux
+        self.buf = b""
+        self.files = {}   # t=t path -> bytes read
+        self.cmds = []    # kitty commands: dict of keys (+ 'payload')
+
+    def _kitty(self, body, wrapped):
+        import base64
+        keys, _, payload = body.partition(b";")
+        kv = dict(p.split(b"=", 1) for p in keys.split(b",") if b"=" in p)
+        kv = {k.decode(): v.decode() for k, v in kv.items()}
+        kv["payload"] = payload
+        kv["tmux"] = wrapped
+        self.cmds.append(kv)
+        if kv.get("t") == "t" and payload:
+            path = base64.b64decode(payload).decode()
+            try:
+                with open(path, "rb") as f:
+                    self.files[path] = f.read()
+                os.unlink(path)
+            except OSError:
+                self.files[path] = None
+        if kv.get("a") == "q" and self.mode == "kitty":
+            if kv.get("t") == "t" and self.files.get(
+                    __import__("base64").b64decode(payload).decode()) is None:
+                return b"\x1b_Gi=%s;ENOENT\x1b\\" % kv["i"].encode()
+            return b"\x1b_Gi=%s;OK\x1b\\" % kv["i"].encode()
+        return b""
+
+    def replies(self, chunk):
+        self.buf += chunk
+        out = b""
+        b = self.buf
+        i = 0
+        while True:
+            j = b.find(b"\x1b", i)
+            if j < 0:
+                i = len(b)
+                break
+            if j + 1 >= len(b):
+                i = j
+                break
+            k = b[j + 1:j + 2]
+            if k in (b"_", b"P", b"]"):
+                end = j + 2
+                while True:
+                    e = b.find(b"\x1b\\", end)
+                    if e < 0:
+                        break
+                    if b[j + 2:j + 7] == b"tmux;" and b[e - 1:e] == b"\x1b":
+                        end = e + 2
+                        continue
+                    break
+                if k == b"]":
+                    bel = b.find(b"\x07", j)
+                    if bel >= 0 and (e < 0 or bel < e):
+                        i = bel + 1
+                        continue
+                if e < 0:
+                    i = j
+                    break
+                body = b[j + 2:e]
+                i = e + 2
+                if k == b"_" and body[:1] == b"G":
+                    out += self._kitty(body[1:], False)
+                elif k == b"P" and body.startswith(b"tmux;"):
+                    inner = body[5:].replace(b"\x1b\x1b", b"\x1b")
+                    if self.tmux == "passthrough":
+                        out += self.replies_inner(inner)
+                elif k == b"P" and body == b"$qm":
+                    if self.truecolor and self.mode != "silent":
+                        out += b"\x1bP1$r0;48:2:1:2:3m\x1b\\"
+                continue
+            if k == b"[":
+                m = __import__("re").match(rb"\x1b\[([?>]?)([\d;]*)([a-zA-Z])", b[j:])
+                if not m:
+                    if len(b) - j < 16:
+                        i = j
+                        break
+                    i = j + 2
+                    continue
+                i = j + m.end()
+                pre, par, fin = m.group(1), m.group(2), m.group(3)
+                if self.mode == "silent":
+                    continue
+                if fin == b"c" and pre == b"" and par in (b"", b"0"):
+                    if self.tmux:
+                        out += b"\x1b[?1;2;4c" if self.mode == "sixel" else b"\x1b[?1;2c"
+                    else:
+                        out += b"\x1b[?62;4;22c" if self.mode == "sixel" else b"\x1b[?62;22c"
+                elif fin == b"q" and pre == b">" and not self.tmux:
+                    out += self._xtversion()
+                elif fin == b"t" and par == b"16":
+                    out += b"\x1b[6;%d;%dt" % (self.cell[1], self.cell[0])
+                elif fin == b"S" and pre == b"?" and self.mode == "sixel":
+                    out += b"\x1b[?1;0;256S"
+                continue
+            i = j + 1
+        self.buf = b[i:]
+        return out
+
+    def _xtversion(self):
+        name = {"kitty": b"kitty(0.35.2)", "iterm": b"iTerm2 3.5.0",
+                "sixel": b"foot(1.17.2)"}.get(self.mode, b"xterm(390)")
+        return b"\x1bP>|" + name + b"\x1b\\"
+
+    def replies_inner(self, inner):
+        # A query that went through tmux's passthrough: the outer terminal.
+        out = b""
+        if inner.startswith(b"\x1b_G") and inner.endswith(b"\x1b\\"):
+            out += self._kitty(inner[3:-2], True)
+        elif inner == b"\x1b[>0q":
+            out += self._xtversion()
+        return out
+
+    def images(self):
+        """kitty images alive at the end: id -> (w, h, c, r, pixels)."""
+        import base64
+        import zlib
+        live, acc = {}, None
+        for c in self.cmds:
+            a = c.get("a")
+            if a == "d":
+                if "i" in c:
+                    live.pop(int(c["i"]), None)
+                continue
+            if a in ("T", "t") and "i" in c:
+                acc = dict(c)
+                acc["data"] = b""
+            elif a is not None or acc is None:
+                continue
+            if acc.get("t") == "t":
+                path = base64.b64decode(c["payload"]).decode()
+                acc["data"] = self.files.get(path) or b""
+            else:
+                acc["data"] += base64.b64decode(c["payload"])
+            if c.get("m", "0") == "0":
+                data = acc["data"]
+                if acc.get("o") == "z":
+                    data = zlib.decompress(data)
+                live[int(acc["i"])] = (int(acc["s"]), int(acc["v"]), int(acc.get("c", 0)),
+                                       int(acc.get("r", 0)), data)
+                acc = None
+        return live
+
+    def deletes(self):
+        return [int(c["i"]) for c in self.cmds if c.get("a") == "d" and "i" in c]
+
+    def sent(self):
+        return [int(c["i"]) for c in self.cmds if c.get("a") in ("T", "t") and "i" in c]
+
+
+if pyte is not None:
+    class FakeScreen(pyte.Screen):
+        """pyte plus a pixel layer: a sixel (or an iTerm2 image, as a solid
+        marker) paints its cells at the cursor; text written over a cell,
+        EL / ED and line moves erase or move those pixels, as terminals
+        that keep images in cells do. fg keeps the 256-colour index
+        (kitty placeholders carry the image id there)."""
+
+        def __init__(self, cols, rows, cell):
+            super().__init__(cols, rows)
+            self.cw, self.ch = cell
+            self.pix = {}   # (cx, cy) -> {(dx, dy): rgb}
+            self.nimg = 0
+
+        def select_graphic_rendition(self, *attrs, **kw):
+            super().select_graphic_rendition(*attrs, **kw)
+            a = list(attrs)
+            for k in range(len(a) - 2):
+                if a[k] == 38 and a[k + 1] == 5:
+                    self.cursor.attrs = self.cursor.attrs._replace(fg="i%d" % a[k + 2])
+
+        def _clear(self, y, x0, x1):
+            for x in range(x0, x1):
+                self.pix.pop((x, y), None)
+
+        def draw(self, data):
+            y, x0 = self.cursor.y, self.cursor.x
+            super().draw(data)
+            x1 = self.cursor.x if self.cursor.y == y else self.columns
+            self._clear(y, x0, max(x1, x0 + 1))
+
+        def erase_in_line(self, how=0, private=False):
+            y, x = self.cursor.y, self.cursor.x
+            super().erase_in_line(how, private)
+            if how == 0:
+                self._clear(y, x, self.columns)
+            elif how == 1:
+                self._clear(y, 0, x + 1)
+            else:
+                self._clear(y, 0, self.columns)
+
+        def erase_in_display(self, how=0, *args, **kw):
+            super().erase_in_display(how, *args, **kw)
+            if how in (2, 3):
+                self.pix = {}
+
+        def _move(self, count, up):
+            top, bot = self.margins or pyte.screens.Margins(0, self.lines - 1)
+            y = self.cursor.y
+            if not (top <= y <= bot):
+                return
+            new = {}
+            for (cx, cy), v in self.pix.items():
+                if cy < y or cy > bot:
+                    new[(cx, cy)] = v
+                    continue
+                ny = cy - count if up else cy + count
+                if (up and cy - count < y) or ny > bot or ny < y:
+                    continue
+                new[(cx, ny)] = v
+            self.pix = new
+
+        def delete_lines(self, count=None):
+            super().delete_lines(count)
+            self._move(count or 1, True)
+
+        def insert_lines(self, count=None):
+            super().insert_lines(count)
+            self._move(count or 1, False)
+
+        def image(self, px, w, h):
+            x0, y0 = self.cursor.x, self.cursor.y
+            for (x, y), rgb in px.items():
+                if x >= w or y >= h:
+                    continue
+                cx, cy = x0 + x // self.cw, y0 + y // self.ch
+                if cx >= self.columns or cy >= self.lines:
+                    continue
+                self.pix.setdefault((cx, cy), {})[(x % self.cw, y % self.ch)] = rgb
+            self.nimg += 1
+
+    def fake_screen(out, cols, rows, cell=(10, 20)):
+        """Feed the output in order: text to pyte, pictures to the pixel
+        layer at the cursor."""
+        sc = FakeScreen(cols, rows, cell)
+        st = pyte.ByteStream(sc)
+        b = bytes(out)
+        i, n = 0, len(b)
+        while i < n:
+            j = b.find(b"\x1b", i)
+            while j >= 0 and j + 1 < n and b[j + 1:j + 2] not in (b"_", b"P", b"]"):
+                j = b.find(b"\x1b", j + 1)
+            if j < 0:
+                st.feed(b[i:])
+                break
+            st.feed(b[i:j])
+            k = b[j + 1:j + 2]
+            e = b.find(b"\x07" if k == b"]" else b"\x1b\\", j)
+            if k == b"]" and b[j:j + 6] != b"\x1b]1337":
+                e2 = b.find(b"\x1b\\", j)
+                e = min(x for x in (e, e2) if x >= 0) if (e >= 0 or e2 >= 0) else -1
+            if e < 0:
+                break
+            body = b[j + 2:e]
+            i = e + (1 if b[e:e + 1] == b"\x07" else 2)
+            if k == b"P" and body.startswith(b"tmux;"):
+                continue
+            if k == b"P":
+                q = body.find(b"q")
+                if q >= 0 and all(c in b"0123456789;" for c in body[:q]):
+                    w, h, px = sixel_decode(body[q + 1:])
+                    sc.image(px, w, h)
+            elif k == b"]" and body.startswith(b"1337;File="):
+                import re
+                m = re.search(rb"width=(\d+);height=(\d+)", body)
+                if m:
+                    w, h = int(m.group(1)) * cell[0], int(m.group(2)) * cell[1]
+                    mark = hash(body) & 0xffffff
+                    px = {(x, y): (mark >> 16, (mark >> 8) & 255, mark & 255)
+                          for x in range(0, w, cell[0]) for y in range(0, h, cell[1])}
+                    sc.image(px, w, h)
+        return sc
+
+
 class Tui:
     """jobctl: run the editor as a foreground job below a waiting parent,
     the way a shell does, so SIGTSTP can stop it (a session leader's own
     group is orphaned and the kernel drops stop signals to it)."""
 
     def __init__(self, exe, args, env_extra=None, rows=ROWS, cols=COLS,
-                 jobctl=False):
+                 jobctl=False, fake=None):
         self.rows, self.cols = rows, cols
         self.out = bytearray()
+        self.fake = fake
         pid, fd = pty.fork()
         if pid == 0:
             env = dict(os.environ)
@@ -110,6 +478,10 @@ class Tui:
             if not chunk:
                 break
             self.out += chunk
+            if self.fake is not None:
+                rep = self.fake.replies(chunk)
+                if rep:
+                    os.write(self.fd, rep)
 
     def send(self, data, settle=0.25):
         if isinstance(data, str):
@@ -149,7 +521,9 @@ class Tui:
             return None
         sc = pyte.Screen(self.cols, self.rows)
         st = pyte.ByteStream(sc)
-        st.feed(bytes(self.out))
+        # pyte prints APC / DCS / OSC 1337 payloads (kitty graphics, sixel,
+        # iTerm2 images, the startup queries) as text; a terminal does not.
+        st.feed(strip_strings(bytes(self.out)))
         return sc
 
 
@@ -247,6 +621,43 @@ def case_page_keys(exe, tmp):
     got2, _ = edit_session(exe, tmp, [b"\x1b[1;5F", b"#"], body=body,
                            name="cend.txt")
     check(got2.endswith(b"#"), "Ctrl-End goes to EOF", repr(got2[-12:]))
+
+
+def case_last_line(exe, tmp):
+    """The caret onto the empty line after a final newline (Down, Ctrl-End,
+    PageDown) and the wheel to EOF: the pane keeps the document's end on
+    screen instead of going blank ('~' rows only). Wrap on and off, Rich
+    and Source, with and without the final newline."""
+    if pyte is None:
+        print("skip: last line (no pyte)")
+        return
+    body = b"".join(b"line %d of some text here\n" % i for i in range(1, 60))
+    src = os.path.join(tmp, "source.json")
+    with open(src, "w") as f:
+        f.write('{"rich": false}')
+    moves = {"Down": b"\x1b[B" * 59, "Ctrl-End": b"\x1b[1;5F",
+             "PageDown": b"\x1b[6~" * 5, "wheel": b"\x1b[<65;10;5M" * 40}
+    for nl in (1, 0):
+        for mode in ("rich wrap", "rich nowrap", "source wrap"):
+            for how, seq in moves.items():
+                args = ["--settings", src] if "source" in mode else []
+                name = "last_%d_%s_%s.txt" % (nl, mode.replace(" ", "_"), how)
+                t, _ = open_tui(exe, tmp, name, body if nl else body[:-1], args=args)
+                try:
+                    if "nowrap" in mode:
+                        t.send(b"\x1bm", 0.2)
+                    t.send(seq, 0.6)
+                    rows = (screen_text(t) or "").split("\n")
+                    t.send(b"\x11", 0.2)
+                    t.wait_exit(5.0)
+                finally:
+                    t.kill()
+                text = [r for r in rows[:-1] if r.strip() and not r.strip().startswith("~")]
+                want = 1 if how == "wheel" else len(rows) // 2
+                check(len(text) >= want and any("line 59" in r for r in text),
+                      "last line: %s to EOF keeps text on screen (%s, %s)" %
+                      (how, mode, "final newline" if nl else "no final newline"),
+                      "%d text rows: %r" % (len(text), rows[:2]))
 
 
 def case_mouse_click(exe, tmp):
@@ -778,6 +1189,105 @@ def proc_wakeups(pid):
         except OSError:
             pass
     return n
+
+
+def thread_wakeups(pid):
+    """{tid: context switches} for every thread of `pid`."""
+    out = {}
+    try:
+        tids = os.listdir("/proc/%d/task" % pid)
+    except OSError:
+        return out
+    for tid in tids:
+        n = 0
+        try:
+            with open("/proc/%d/task/%s/status" % (pid, tid)) as f:
+                for line in f:
+                    if line.startswith(("voluntary_ctxt_switches",
+                                        "nonvoluntary_ctxt_switches")):
+                        n += int(line.split()[1])
+        except OSError:
+            continue
+        out[tid] = n
+    return out
+
+
+def runtime_tick(pid, tid):
+    """The ccc runtime's sysmon between its 20 ms ticks: a raw
+    FUTEX_WAIT_PRIVATE (op 0x80) with a timeout, runtime/wake_primitive.h
+    wait_timeout. Nothing cctext runs waits so (its condvars are
+    FUTEX_WAIT_BITSET; the runtime's workers park with no timeout). A
+    runtime whose sysmon sleeps while the scheduler is quiescent has no
+    such thread at idle."""
+    for _ in range(20):
+        try:
+            with open("/proc/%d/task/%s/syscall" % (pid, tid)) as f:
+                v = f.read().split()
+        except OSError:
+            return False
+        if v and v[0] == "running":
+            time.sleep(0.001)
+            continue
+        return (len(v) > 4 and v[0] == "202" and int(v[2], 16) == 0x80 and
+                int(v[4], 16) != 0)
+    return False
+
+
+IDLE_STRICT = os.environ.get("RTX_IDLE_STRICT", "") not in ("", "0")
+
+
+def idle_threads(pid, secs, pump):
+    """Wakeups of every thread over `secs` once work has settled (a 0.5 s
+    window where nothing but the runtime's tick wakes; 8 s at most):
+    (own, tick, detail) — cctext's threads, the ccc runtime's sysmon, and
+    'tid:comm:n' for each thread that woke."""
+    def split(a, b):
+        own = tick = 0
+        detail = []
+        for tid, n in b.items():
+            d = n - a.get(tid, n)
+            if d <= 0:
+                continue
+            try:
+                with open("/proc/%d/task/%s/comm" % (pid, tid)) as f:
+                    comm = f.read().strip()
+            except OSError:
+                comm = "?"
+            if runtime_tick(pid, tid):
+                tick += d
+                detail.append("%s:ccc-sysmon:%d" % (tid, d))
+            else:
+                own += d
+                detail.append("%s:%s:%d" % (tid, comm, d))
+        return own, tick, " ".join(detail)
+    end = time.time() + 8.0
+    while time.time() < end:
+        a = thread_wakeups(pid)
+        pump(0.5)
+        if split(a, thread_wakeups(pid))[0] == 0:
+            break
+    a = thread_wakeups(pid)
+    pump(secs)
+    return split(a, thread_wakeups(pid))
+
+
+def check_idle(tag, pid, pump, secs=3.0):
+    """Zero wakeups on every thread over `secs` of idle. The pinned ccc's
+    sysmon ticks 50 times a second once any `@parallel` ran (the image
+    lanes, browse, find); that is a note, and a failure with
+    RTX_IDLE_STRICT=1 or a runtime whose sysmon sleeps (then it has no
+    such tick to excuse)."""
+    own, tick, detail = idle_threads(pid, secs, pump)
+    check(own == 0, "%s: idle, no thread wakes" % tag,
+          "%d wakeups in %.1f s: %s" % (own, secs, detail))
+    if tick:
+        if IDLE_STRICT:
+            check(False, "%s: idle, the runtime's sysmon sleeps" % tag,
+                  "%d ticks in %.1f s: %s" % (tick, secs, detail))
+        else:
+            print("note: %s: ccc runtime sysmon ticked %d times in %.1f s "
+                  "(needs the quiescent-sysmon runtime)" % (tag, tick, secs))
+    return own, tick
 
 
 def quiet_window(t, secs):
@@ -2205,7 +2715,10 @@ def case_image_placeholder(exe, tmp):
     path = os.path.join(proj, "doc.md")
     with open(path, "wb") as f:
         f.write(body)
-    t = Tui(exe, [path], {"RTX_SAFE_HOME": os.path.join(tmp, "safe_img")})
+    # tui_images off: every image is its text stand-in (the pictures have
+    # their own cases below).
+    t = Tui(exe, [path], {"RTX_SAFE_HOME": os.path.join(tmp, "safe_img"),
+                          "RTX_TUI_IMAGES": "off"})
     shots = {}
     try:
         t.pump(1.0)
@@ -2292,7 +2805,747 @@ def case_wb_uses(exe, tmp):
           "wb uses: the edit reached the reader's pane; fresh again", repr(res["after"]))
 
 
+def img_project(tmp, name, extra=b"", repo=True):
+    """A project with quad.png (32x24, quadrants red / green / blue / white)
+    and big.png (1200x900, the same quadrants) and a Markdown file that
+    shows both as picture rows, one inline, and 40 lines after. repo=False:
+    no repository marker (the document's directory is the root)."""
+    import shutil
+    here = os.path.dirname(os.path.abspath(__file__))
+    proj = os.path.join(tmp, name)
+    os.makedirs(os.path.join(proj, ".git") if repo else proj, exist_ok=True)
+    for f in ("quad.png", "big.png", "anim.gif"):
+        shutil.copy(os.path.join(here, "..", "testdata", "img", f), proj)
+    body = (b"# Pics\n\n![a quad](quad.png)\n\nInline ![tiny](quad.png) here.\n\n"
+            b"![big one](big.png)\n\n" + extra +
+            b"".join(b"line %d\n" % i for i in range(40)))
+    path = os.path.join(proj, "doc.md")
+    with open(path, "wb") as f:
+        f.write(body)
+    return proj, path, body
+
+
+def img_env(tmp, name, **kw):
+    e = {"RTX_SAFE_HOME": os.path.join(tmp, "safe_" + name)}
+    e.update(kw)
+    return e
+
+
+def fg_rgb(c):
+    """pyte fg / bg of a cell as rgb (a 256 index 'iN' or a hex string)."""
+    if c.startswith("i"):
+        i = int(c[1:])
+        h = pyte.graphics.FG_BG_256[i]
+    elif c == "default":
+        return None
+    else:
+        h = c
+    return tuple(int(h[k:k + 2], 16) for k in (0, 2, 4))
+
+
+def near(rgb, want, tol=60):
+    return rgb is not None and all(abs(a - b) <= tol for a, b in zip(rgb, want))
+
+
+def find_row(sc, needle):
+    for y in range(sc.lines):
+        if needle in "".join(sc.buffer[y][x].data for x in range(sc.columns)):
+            return y
+    return -1
+
+
+def full_repaint_equal(t, fake, cell=(10, 20)):
+    """The screen (text, colours, pixel layer) now, then after a focus-in
+    (which clears and repaints every row): equal when nothing is stale."""
+    def snap():
+        sc = fake_screen(t.out, t.cols, t.rows, cell)
+        cells = [[(sc.buffer[y][x].data, sc.buffer[y][x].fg, sc.buffer[y][x].bg)
+                  for x in range(t.cols)] for y in range(t.rows)]
+        return cells, {k: tuple(sorted(v.items())) for k, v in sc.pix.items()}
+    a = snap()
+    t.send(b"\x1b[I", 0.5)
+    b = snap()
+    rows = [y for y in range(t.rows) if a[0][y] != b[0][y]]
+    pix = sorted(set(a[1]) ^ set(b[1]) | {k for k in a[1] if k in b[1] and a[1][k] != b[1][k]})
+    return not rows and not pix, (rows[:4], pix[:4])
+
+
+def kitty_cells(sc):
+    """Every kitty placeholder cell: (x, y, image id, row, col)."""
+    out = []
+    for y in range(sc.lines):
+        for x in range(sc.columns):
+            c = sc.buffer[y][x]
+            if not c.data.startswith("\U0010eeee"):
+                continue
+            d = [DIAC.index(ord(ch)) if ord(ch) in DIAC else -1 for ch in c.data[1:]]
+            lo = int(c.fg[1:]) if c.fg.startswith("i") else -1
+            msb = d[2] if len(d) > 2 else 0
+            out.append((x, y, (msb << 24) | lo, d[0] if d else -1, d[1] if len(d) > 1 else -1))
+    return out
+
+
+DIAC = []
+
+
+def load_diac():
+    """kitty's row / column diacritics, read from core/img_term.c."""
+    import re
+    if DIAC:
+        return
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = open(os.path.join(here, "..", "core", "img_term.c")).read()
+    tab = src[src.index("g_diac[RTX_TIMG_PH_MAX] = {"):]
+    tab = tab[:tab.index("};")]
+    DIAC.extend(int(h, 16) for h in re.findall(r"0x([0-9A-Fa-f]+)", tab))
+
+
+def case_image_blocks(exe, tmp):
+    """No graphics protocol answers (the harness is silent), TERM says 256
+    colours: a Rich picture row is Unicode block art — ordinary cells —
+    sized from the header at the assumed 8x16 cell; an inline image stays
+    `[image: alt WxH]`; the caret on the line shows the source with the
+    picture under it; truecolor (COLORTERM) uses 24-bit SGR; quadrants and
+    sextants are settings; scrolling with and without scroll regions
+    leaves exactly what a full repaint would."""
+    if pyte is None:
+        print("skip: image blocks (no pyte)")
+        return
+    proj, path, body = img_project(tmp, "blk")
+    fake = FakeTerm("silent")
+    t0 = time.time()
+    t = Tui(exe, ["--no-blink", path], img_env(tmp, "blk"), fake=fake)
+    first = None
+    try:
+        while time.time() - t0 < 2.0 and first is None:
+            t.pump(0.02)
+            if b"\x1b[?2026h" in t.out:
+                first = time.time() - t0
+        t.pump(1.2)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        y = find_row(sc, " 3 ")
+        cells = [sc.buffer[y][x] for x in range(3, 7)] if y >= 0 else []
+        low = [sc.buffer[y + 1][x] for x in range(3, 7)] if y >= 0 else []
+        txt = "\n".join(sc.display)
+        check(first is not None and first < 0.8, "image blocks: first frame within the detection "
+              "timeout (no replies)", repr(first))
+        check(y >= 0 and all(c.data == "▀" for c in cells), "image blocks: half blocks",
+              repr([c.data for c in cells]))
+        check(y >= 0 and near(fg_rgb(cells[0].fg), (220, 30, 30)) and
+              near(fg_rgb(cells[3].fg), (30, 200, 40)) and near(fg_rgb(low[0].fg), (40, 60, 220)),
+              "image blocks: quadrant colours (256)", repr([(c.fg, c.bg) for c in cells + low]))
+        check("Inline [image: tiny 32x24] here." in txt, "image blocks: inline stays text")
+        check(b"\x1b_G" not in t.out[t.out.find(b"\x1b[?2026h"):] and b"\x1bPq" not in t.out,
+              "image blocks: no graphics escapes")
+        big = find_row(sc, " 7 ")
+        check(big > 0 and near(fg_rgb(sc.buffer[big + 1][4].bg), (220, 30, 30)) and
+              sc.buffer[big + 1][4].bg == sc.buffer[big + 2][4].bg,
+              "image blocks: a big picture spans rows")
+        t.send(b"\x1b[B\x1b[B", 0.6)  # caret onto the image's line
+        sc2 = fake_screen(t.out, t.cols, t.rows)
+        y2 = find_row(sc2, "![a quad](quad.png)")
+        check(y2 >= 0 and sc2.buffer[y2 + 1][3].data == "▀",
+              "image blocks: the caret shows the source, the picture under it")
+        t.send(b"\x1b[A\x1b[A", 0.4)
+        bad = []
+        for keys in (b"\x1b[<65;10;10M", b"\x1b[<65;10;10M", b"\x1b[6~", b"\x1b[<64;10;10M",
+                     b"\x1b[5~", b"\x1b[B" * 8):
+            t.send(keys, 0.4)
+            ok, why = full_repaint_equal(t, fake, (8, 16))
+            if not ok:
+                bad.append((keys[:8], why))
+        check(not bad, "image blocks: scrolled frames equal a full repaint", repr(bad[:2]))
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    # --no-scroll-regions: the same pictures by whole-row rewrites.
+    t = Tui(exe, ["--no-blink", "--no-scroll-regions", path], img_env(tmp, "blk2"),
+            fake=FakeTerm("silent"))
+    try:
+        t.pump(1.2)
+        bad = []
+        for keys in (b"\x1b[<65;10;10M", b"\x1b[6~", b"\x1b[<64;10;10M", b"\x1b[5~"):
+            t.send(keys, 0.4)
+            ok, why = full_repaint_equal(t, t.fake, (8, 16))
+            if not ok:
+                bad.append((keys[:8], why))
+        check(not bad, "image blocks: --no-scroll-regions frames equal a full repaint",
+              repr(bad[:2]))
+        check(b"\x1b[" not in b"".join(__import__("re").findall(rb"\x1b\[\d+;\d+r", t.out)),
+              "image blocks: --no-scroll-regions sets no region")
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    # 24-bit, quadrants, sextants; no colours at all -> the text stand-in.
+    for env, name, want in (({"COLORTERM": "truecolor"}, "24-bit", b"38;2;"),
+                            ({"RTX_TUI_BLOCKS": "quadrant"}, "quadrants", None),
+                            ({"RTX_TUI_BLOCKS": "sextant"}, "sextants", None),
+                            ({"TERM": "xterm"}, "no colours", None)):
+        e = img_env(tmp, "blk3")
+        e.update(env)
+        t = Tui(exe, ["--no-blink", path], e, fake=FakeTerm("silent", truecolor=False))
+        try:
+            t.pump(1.4)
+            sc = fake_screen(t.out, t.cols, t.rows)
+            y = find_row(sc, " 3 ")
+            glyphs = "".join(sc.buffer[y][x].data for x in range(3, 7)) if y >= 0 else ""
+            txt = "\n".join(sc.display)
+            if want:
+                check(want in bytes(t.out), "image blocks: %s SGR" % name)
+            elif name == "quadrants":
+                check(any(0x2596 <= ord(c[:1] or " ") <= 0x259F or c in "▀▄▌▐ "
+                          for c in glyphs) and glyphs.strip() != "",
+                      "image blocks: quadrant glyphs", repr(glyphs))
+            elif name == "sextants":
+                check(glyphs.strip() != "" and all(c == " " or 0x1FB00 <= ord(c[0]) <= 0x1FB3B or
+                                                   c[0] in "▀▄▌▐█"
+                                                   for c in glyphs if c),
+                      "image blocks: sextant glyphs", repr(glyphs))
+            else:
+                check("[image: a quad 32x24]" in txt,
+                      "image blocks: no colours -> the text stand-in", repr(txt[:200]))
+            t.send(b"\x11", 0.3)
+            t.wait_exit(5.0)
+        finally:
+            t.kill()
+
+
+def case_image_kitty(exe, tmp):
+    """A kitty terminal (fake): each picture is sent once (a=T, U=1 virtual
+    placement, f=32, o=z, q=2; a temp file t=t when the terminal reads our
+    files, chunked base64 otherwise) and then painted as Unicode
+    placeholder cells whose id, row and column match; scrolling, a
+    side-by-side split and a stacked split leave what a full repaint
+    would; ^Z and exit delete every image sent, resume sends them again."""
+    if pyte is None:
+        print("skip: image kitty (no pyte)")
+        return
+    load_diac()
+    proj, path, body = img_project(tmp, "kit")
+    for ssh in (False, True):
+        fake = FakeTerm("kitty")
+        env = img_env(tmp, "kit")
+        if ssh:
+            env["SSH_TTY"] = "/dev/pts/99"
+            env["RTX_TUI_IMAGES"] = "kitty"
+        t = Tui(exe, ["--no-blink", path], env, fake=fake, jobctl=not ssh)
+        try:
+            t.pump(1.5)
+            sent = [c for c in fake.cmds if c.get("a") == "T"]
+            live = fake.images()
+            sc = fake_screen(t.out, t.cols, t.rows)
+            ph = kitty_cells(sc)
+            tag = " (ssh, direct)" if ssh else ""
+            check(len(sent) == 2 and all(c.get("U") == "1" and c.get("f") == "32" and
+                                         c.get("o") == "z" and c.get("q") == "2" for c in sent),
+                  "image kitty: two transmits with a virtual placement" + tag,
+                  repr([{k: v for k, v in c.items() if k != "payload"} for c in sent]))
+            if ssh:
+                check(all(c.get("t", "d") == "d" for c in sent) and
+                      any(c.get("m") == "1" for c in fake.cmds),
+                      "image kitty: over SSH the data is chunked base64")
+            else:
+                check(all(c.get("t") == "t" for c in sent) and not any(
+                    os.path.exists(p) for p in fake.files),
+                    "image kitty: local transmits use temp files (read and deleted)")
+            check(all(len(v[4]) == v[0] * v[1] * 4 for v in live.values()),
+                  "image kitty: zlib data inflates to s x v x 4 bytes" + tag)
+            ids = {i for (_, _, i, _, _) in ph}
+            check(ph and ids <= set(live), "image kitty: placeholders name live images" + tag,
+                  repr((sorted(ids), sorted(live))))
+            ok = True
+            for (x, y, i, r, c) in ph:
+                x0 = min(px for (px, py, j, rr, cc) in ph if j == i and rr == r)
+                y0 = min(py for (px, py, j, rr, cc) in ph if j == i)
+                if i not in live or r != y - y0 or c != x - x0 or r >= live[i][3] or \
+                        c >= live[i][2]:
+                    ok = False
+            check(ok, "image kitty: row / column diacritics match the cells" + tag)
+            if not ssh:
+                bad = []
+                for keys in (b"\x1b[<65;10;10M", b"\x1b[6~", b"\x1b[<64;10;10M", b"\x1b[5~",
+                             b"\x1c", b"\x1b[<65;60;10M", b"\x1d", b"\x1f",
+                             b"\x1b[<65;10;18M", b"\x1d"):
+                    t.send(keys, 0.5)
+                    ok, why = full_repaint_equal(t, fake)
+                    sc = fake_screen(t.out, t.cols, t.rows)
+                    live = fake.images()
+                    if not ok or not {i for (_, _, i, _, _) in kitty_cells(sc)} <= set(live):
+                        bad.append((keys[:8], why))
+                check(not bad, "image kitty: scroll / splits leave no stale cells", repr(bad[:2]))
+                sent_ids = set(fake.sent())
+                mark = len(fake.cmds)
+                os.kill(t.target, signal.SIGTSTP)
+                t.pump(0.4)
+                dels = {int(c["i"]) for c in fake.cmds[mark:] if c.get("a") == "d"}
+                check(dels >= set(fake.images()) and fake.images() == {},
+                      "image kitty: ^Z deletes our images", repr((dels, sent_ids)))
+                mark = len(fake.cmds)
+                os.kill(t.target, signal.SIGCONT)
+                t.pump(1.0)
+                again = [c for c in fake.cmds[mark:] if c.get("a") == "T"]
+                check(again and fake.images(), "image kitty: resume sends them again")
+            t.send(b"\x11", 0.3)
+            t.wait_exit(5.0)
+            check(fake.images() == {} and fake.deletes(),
+                  "image kitty: exit deletes every image sent" + tag,
+                  repr((sorted(fake.images()), fake.deletes())))
+        finally:
+            t.kill()
+
+
+def case_image_sixel(exe, tmp):
+    """A sixel terminal (fake, DA1 attribute 4): pictures are drawn over
+    blank cells after the rows, cropped to the pane; after every scroll
+    (wheel, page, arrows), a side-by-side split and a close, the pixels
+    and text equal a full repaint — nothing torn or stale; a region
+    scroll never moves rows under a picture."""
+    if pyte is None:
+        print("skip: image sixel (no pyte)")
+        return
+    import re
+    proj, path, body = img_project(tmp, "six")
+    fake = FakeTerm("sixel")
+    t = Tui(exe, ["--no-blink", path], img_env(tmp, "six"), fake=fake)
+    try:
+        t.pump(1.5)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        y = find_row(sc, " 3 ")
+        tl = sc.pix.get((3, y), {}) if y >= 0 else {}
+        tr = sc.pix.get((6, y), {}) if y >= 0 else {}
+        check(b"\x1bP0;1;0q" in t.out and sc.nimg >= 2, "image sixel: pictures drawn",
+              repr(sc.nimg))
+        check(tl and near(max(set(tl.values()), key=list(tl.values()).count), (220, 30, 30), 20)
+              and tr and near(max(set(tr.values()), key=list(tr.values()).count),
+                              (30, 200, 40), 20),
+              "image sixel: quadrant colours in their cells")
+        check(sc.buffer[y][3].data == " ", "image sixel: blank text under a picture")
+        bad = []
+        steps = (b"\x1b[<65;10;10M", b"\x1b[<65;10;10M", b"\x1b[6~", b"\x1b[<64;10;10M",
+                 b"\x1b[5~", b"\x1b[B" * 9, b"\x1b[A" * 9, b"\x1c", b"\x1b[<65;60;10M",
+                 b"\x1b[<64;60;10M", b"\x1d")
+        for keys in steps:
+            t.send(keys, 0.6)
+            ok, why = full_repaint_equal(t, fake)
+            if not ok:
+                bad.append((keys[:8], why))
+        check(not bad, "image sixel: frames equal a full repaint (no torn / stale pixels)",
+              repr(bad[:3]))
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
+def case_image_iterm(exe, tmp):
+    """iTerm2 (XTVERSION): OSC 1337 inline PNGs sized in cells, over blank
+    cells; scrolling equals a full repaint."""
+    if pyte is None:
+        print("skip: image iterm (no pyte)")
+        return
+    import base64
+    import re
+    proj, path, body = img_project(tmp, "itm")
+    fake = FakeTerm("iterm")
+    t = Tui(exe, ["--no-blink", path], img_env(tmp, "itm"), fake=fake)
+    try:
+        t.pump(1.5)
+        m = re.findall(rb"\x1b\]1337;File=inline=1;size=(\d+);width=(\d+);height=(\d+);"
+                       rb"[^:]*:([A-Za-z0-9+/=]+)\x07", bytes(t.out))
+        check(len(m) >= 2 and all(base64.b64decode(p)[:8] == b"\x89PNG\r\n\x1a\n" and
+                                  len(base64.b64decode(p)) == int(s) for s, w, h, p in m),
+              "image iterm: inline PNGs", repr([(s, w, h) for s, w, h, p in m]))
+        check(any((w, h) == (b"4", b"2") for s, w, h, p in m), "image iterm: sized in cells")
+        bad = []
+        for keys in (b"\x1b[<65;10;10M", b"\x1b[6~", b"\x1b[5~"):
+            t.send(keys, 0.6)
+            ok, why = full_repaint_equal(t, fake)
+            if not ok:
+                bad.append((keys[:8], why))
+        check(not bad, "image iterm: frames equal a full repaint", repr(bad[:2]))
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
+def case_image_tmux(exe, tmp):
+    """Inside tmux: kitty graphics only when the passthrough echo comes back
+    (every APC then wrapped in DCS tmux;), else block art."""
+    if pyte is None:
+        print("skip: image tmux (no pyte)")
+        return
+    proj, path, body = img_project(tmp, "tmx")
+    for mode in ("passthrough", "closed"):
+        fake = FakeTerm("kitty", tmux=mode)
+        env = img_env(tmp, "tmx", TMUX="/tmp/tmux-0/default,1,0", TERM="tmux-256color")
+        t = Tui(exe, ["--no-blink", path], env, fake=fake)
+        try:
+            t.pump(1.5)
+            out = bytes(t.out)
+            sent = [c for c in fake.cmds if c.get("a") == "T"]
+            if mode == "passthrough":
+                check(sent and all(c["tmux"] for c in sent) and
+                      not __import__("re").search(rb"(?<!\x1b)\x1b_Ga=T", out),
+                      "image tmux: kitty through passthrough (wrapped)")
+            else:
+                sc = fake_screen(t.out, t.cols, t.rows)
+                y = find_row(sc, " 3 ")
+                check(not sent and y >= 0 and sc.buffer[y][3].data == "▀",
+                      "image tmux: passthrough off -> block art")
+            t.send(b"\x11", 0.3)
+            t.wait_exit(5.0)
+        finally:
+            t.kill()
+
+
+def case_image_viewer(exe, tmp):
+    """An image file opened directly is the viewer: the picture fitted to
+    the pane (block art here) with its caption; + zooms, 1 is actual
+    size, arrows pan, 0 fits again; typing never edits; Ctrl-D is its hex
+    and back. The browse preview of an image file shows its picture over
+    the size line."""
+    if pyte is None:
+        print("skip: image viewer (no pyte)")
+        return
+    proj, path, body = img_project(tmp, "vw")
+    big = os.path.join(proj, "big.png")
+    with open(big, "rb") as f:
+        disk = f.read()
+    fake = FakeTerm("silent")
+    t = Tui(exe, ["--no-blink", big], img_env(tmp, "vw"), fake=fake)
+    try:
+        t.pump(1.5)
+        sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+        txt = "\n".join(sc.display)
+        # 1200x900 into 80 x 22 cells of 8x16: 10 rows of 16 = 352 px tall.
+        mid = sc.buffer[5]
+        check("PNG 1200x900" in txt and "(fit)" in txt, "image viewer: caption", repr(txt[-300:]))
+        check(near(fg_rgb(mid[20].bg), (220, 30, 30)) and near(fg_rgb(mid[60].bg), (30, 200, 40)),
+              "image viewer: the picture, fitted", repr((mid[20].bg, mid[60].bg)))
+        t.send(b"1", 0.8)
+        sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+        txt = "\n".join(sc.display)
+        check("100%" in txt and near(fg_rgb(sc.buffer[5][40].bg), (220, 30, 30)),
+              "image viewer: 1 = actual size (red corner fills the pane)")
+        t.send(b"\x1b[C" * 30 + b"\x1b[B" * 20, 0.8)
+        sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+        check(near(fg_rgb(sc.buffer[10][40].bg), (250, 250, 250)),
+              "image viewer: arrows pan to the white corner",
+              repr(sc.buffer[10][40].bg))
+        t.send(b"abc\x7f\r", 0.4)
+        t.send(b"0", 0.6)
+        txt = "\n".join(fake_screen(t.out, t.cols, t.rows, (8, 16)).display)
+        check("(fit)" in txt, "image viewer: 0 fits again")
+        t.send(b"\x04", 0.6)
+        txt = "\n".join(fake_screen(t.out, t.cols, t.rows, (8, 16)).display)
+        check("89 50 4e 47" in txt.lower(), "image viewer: Ctrl-D shows the hex",
+              repr(txt[:200]))
+        t.send(b"\x04", 0.6)
+        txt = "\n".join(fake_screen(t.out, t.cols, t.rows, (8, 16)).display)
+        check("PNG 1200x900" in txt, "image viewer: Ctrl-D back to the picture")
+        t.send(b"\x13", 0.3)
+        t.send(b"\x11", 0.3)
+        t.send(b"q", 0.2)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    with open(big, "rb") as f:
+        check(f.read() == disk, "image viewer: bytes unchanged")
+    # Browse preview: the picture, then the size line.
+    t = Tui(exe, ["--no-blink", proj], img_env(tmp, "vw2"), fake=FakeTerm("silent"), cols=120)
+    try:
+        t.pump(1.0)
+        for _ in range(8):
+            sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+            if "big.png" in "\n".join(sc.display):
+                break
+            t.pump(0.3)
+        # ../, anim.gif, big.png: two steps down.
+        t.send(b"\x1b[B", 0.5)
+        t.send(b"\x1b[B", 0.5)
+        y = -1
+        for _ in range(10):
+            sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+            y = find_row(sc, "[image: PNG 1200x900")
+            if y > 3:
+                break
+            t.pump(0.3)
+        txt = "\n".join(sc.display)
+        colored = [x for x in range(t.cols) if y > 3 and near(fg_rgb(sc.buffer[y - 3][x].bg),
+                                                                  (250, 250, 250))]
+        check(y > 3 and colored and min(colored) > t.cols // 2,
+              "image preview: the picture above the size line", repr((y, txt[-600:])))
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
+def case_image_present(exe, tmp):
+    """Terminal presentation: a slide's content image and a split
+    `![bg left]` are pictures in the slide box (block art); a kitty
+    terminal gets placeholder cells for them."""
+    if pyte is None:
+        print("skip: image present (no pyte)")
+        return
+    import shutil
+    here = os.path.dirname(os.path.abspath(__file__))
+    proj = os.path.join(tmp, "prs")
+    os.makedirs(os.path.join(proj, ".git"), exist_ok=True)
+    shutil.copy(os.path.join(here, "..", "testdata", "img", "big.png"), proj)
+    deck = (b"---\nmarp: true\n---\n\n# One\n\n![pic w:400](big.png)\n\n---\n\n"
+            b"![bg left:40%](big.png)\n\n# Two\n\ntext\n")
+    path = os.path.join(proj, "deck.md")
+    with open(path, "wb") as f:
+        f.write(deck)
+    for mode in ("silent", "kitty"):
+        fake = FakeTerm(mode)
+        t = Tui(exe, ["--no-blink", path], img_env(tmp, "prs"), fake=fake)
+        cell = (10, 20) if mode == "kitty" else (8, 16)
+        try:
+            t.pump(1.0)
+            t.send(b"\x1b[15;2~", 1.2)            # Shift-F5 on slide 1
+            sc = fake_screen(t.out, t.cols, t.rows, cell)
+            if mode == "silent":
+                red = [(x, y) for y in range(t.rows) for x in range(t.cols)
+                       if near(fg_rgb(sc.buffer[y][x].bg), (220, 30, 30))]
+                check(red and "One" in "\n".join(sc.display),
+                      "image present: a content picture (blocks)")
+            else:
+                load_diac()
+                check(kitty_cells(sc) and fake.images(), "image present: kitty cells")
+            t.send(b" ", 1.2)                      # slide 2: bg left
+            sc = fake_screen(t.out, t.cols, t.rows, cell)
+            if mode == "silent":
+                left = [x for x in range(t.cols // 2)
+                        if near(fg_rgb(sc.buffer[t.rows // 3][x].bg), (220, 30, 30)) or
+                        near(fg_rgb(sc.buffer[t.rows // 3][x].bg), (30, 200, 40))]
+                check(left and "Two" in "\n".join(sc.display),
+                      "image present: ![bg left] is a picture on its side")
+            t.send(b"\x1b", 0.5)
+            t.send(b"\x11", 0.3)
+            t.wait_exit(5.0)
+            if mode == "kitty":
+                check(fake.images() == {}, "image present: kitty images deleted on exit")
+        finally:
+            t.kill()
+
+
+def main_wakeups(pid):
+    """Context switches of the main (UI) thread: the editor's own loop
+    (an animation's frame budget; idle counts every thread, check_idle)."""
+    n = 0
+    try:
+        with open("/proc/%d/task/%d/status" % (pid, pid)) as f:
+            for line in f:
+                if line.startswith(("voluntary_ctxt_switches", "nonvoluntary_ctxt_switches")):
+                    n += int(line.split()[1])
+    except OSError:
+        pass
+    return n
+
+
+def case_idle_threads(exe, tmp):
+    """Every thread idle once work settles (check_idle): a Markdown file
+    with pictures (terminal pictures off too), a workbook, a Marp deck
+    presenting a picture slide, and browse with a Markdown preview open."""
+    if pyte is None or not os.path.exists("/proc/self/task"):
+        print("skip: idle threads (no pyte or /proc)")
+        return
+    import shutil
+    here = os.path.dirname(os.path.abspath(__file__))
+    proj, path, body = img_project(tmp, "idt", repo=False)
+    shutil.copy(os.path.join(here, "..", "testdata", "wb", "revenue.wb.md"), proj)
+    deck = os.path.join(proj, "deck.md")
+    with open(deck, "wb") as f:
+        f.write(b"---\nmarp: true\n---\n\n# One\n\n![pic w:400](big.png)\n\n---\n\n"
+                b"![bg left:40%](big.png)\n\n# Two\n\ntext\n")
+    big = os.path.join(proj, "big.wb.md")
+    with open(big, "w") as f:
+        f.write("# Big\n\nTable: T\n\n| id | amount | cost | margin |\n|----|----|----|----|\n")
+        for i in range(60000):
+            f.write("| %d | %d.50 | %d.25 | `=@amount - @cost` |\n" % (i, i % 997, i % 13))
+        f.write("\n```calc\ntotal = sum(T.margin)\n```\n")
+    runs = [("markdown with pictures", [path], {}, b""),
+            ("markdown, pictures off", [path], {"RTX_TUI_IMAGES": "off"}, b""),
+            ("workbook", [os.path.join(proj, "revenue.wb.md")], {}, b""),
+            ("big workbook (read job)", [big], {}, b""),
+            ("Marp deck presenting", [deck], {}, b"\x1b[15;2~"),
+            ("browse preview", [proj], {}, b"doc.md")]
+    for tag, args, extra, keys in runs:
+        t = Tui(exe, ["--no-blink"] + args, img_env(tmp, "idt", **extra),
+                fake=FakeTerm("silent"))
+        try:
+            t.pump(1.0)
+            if keys:
+                t.send(keys, 1.0)
+            check_idle("idle threads: " + tag, t.pid, t.pump)
+            t.send(b"\x1b", 0.2)
+            t.send(b"\x11", 0.3)
+        finally:
+            t.kill()
+
+
+def case_image_idle(exe, tmp):
+    """Pictures on screen and nothing to do: no output, no wakeups (block
+    art and kitty). With image_animate on, an animated GIF paints its
+    frames (at most ~12 a second) and a still file stays quiet again once
+    it scrolls away."""
+    if pyte is None or not os.path.exists("/proc/self/stat"):
+        print("skip: image idle (no pyte or /proc)")
+        return
+    proj, path, body = img_project(tmp, "idl", extra=b"![spin](anim.gif)\n\n", repo=False)
+    for mode in ("silent", "kitty"):
+        fake = FakeTerm(mode)
+        t = Tui(exe, ["--no-blink", path], img_env(tmp, "idl"), fake=fake)
+        try:
+            t.pump(1.5)
+            c0 = proc_cpu(t.pid)
+            mark = len(t.out)
+            check_idle("image idle: %s pictures on screen" % mode, t.pid, t.pump)
+            nbytes = len(t.out) - mark
+            c1 = proc_cpu(t.pid)
+            check(nbytes == 0 and c1 - c0 < 0.05,
+                  "image idle: %s pictures on screen, nothing to do" % mode,
+                  repr((nbytes, c1 - c0)))
+            t.send(b"\x11", 0.3)
+            t.wait_exit(5.0)
+        finally:
+            t.kill()
+    home = config_home(tmp, "idl_cfg", settings='{ "image_animate": true }')
+    spin = os.path.join(proj, "spin.md")
+    with open(spin, "wb") as f:
+        f.write(b"# A\n\n![spin](anim.gif)\n\nend\n")
+    t = Tui(exe, ["--no-blink", spin], img_env(tmp, "idl2", XDG_CONFIG_HOME=home),
+            fake=FakeTerm("silent"))
+    try:
+        t.pump(1.5)
+        seen = set()
+        for _ in range(14):
+            t.pump(0.1)
+            sc = fake_screen(t.out, t.cols, t.rows, (8, 16))
+            seen.add(sc.buffer[2][2].bg)  # line 3 (a two-column gutter)
+        check(len(seen) >= 2, "image idle: image_animate paints the GIF's frames", repr(seen))
+        w0 = main_wakeups(t.pid)
+        t.pump(1.0)
+        wakes = main_wakeups(t.pid) - w0
+        check(0 < wakes <= 30, "image idle: animation wakes within the frame budget",
+              repr(wakes))
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
+def case_mermaid_blocks(exe, tmp):
+    """A ```mermaid fence in the terminal (docs/images.md "Mermaid"):
+    RTX_TUI_IMAGES=blocks, so the diagram cctext-render draws is Unicode
+    block art in ordinary cells; the fence's lines are hidden (the picture
+    row is its opening line); the caret into the fence shows the source
+    with the diagram under it; typing keeps the old diagram up (darkened)
+    until the new one lands; nothing to do once it settles."""
+    if pyte is None:
+        print("skip: mermaid blocks (no pyte)")
+        return
+    if not os.path.exists(os.path.join(os.path.dirname(exe), "cctext-render")):
+        print("skip: mermaid blocks (no cctext-render)")
+        return
+    proj = os.path.join(tmp, "mmb")
+    os.makedirs(os.path.join(proj, ".git"), exist_ok=True)
+    body = (b"# Diagram\n\nBefore.\n\n```mermaid\nflowchart LR\n  A[Start] --> B{Ok?}\n"
+            b"  B --> C[Done]\n```\n\nAfter the fence.\n" +
+            b"".join(b"line %d\n" % i for i in range(30)))
+    path = os.path.join(proj, "doc.md")
+    with open(path, "wb") as f:
+        f.write(body)
+    env = img_env(tmp, "mmb")
+    env["RTX_TUI_IMAGES"] = "blocks"
+    t = Tui(exe, ["--no-blink", path], env, fake=FakeTerm("silent"))
+
+    def art_rows(sc, y0, y1):
+        """Rows in [y0, y1) holding block glyphs."""
+        n = 0
+        for y in range(max(0, y0), min(sc.lines, y1)):
+            row = "".join(sc.buffer[y][x].data for x in range(sc.columns))
+            if any(ch in row for ch in "▀▄█"):
+                n += 1
+        return n
+    try:
+        t0 = time.time()
+        while time.time() - t0 < 2.0 and b"\x1b[?2026h" not in t.out:
+            t.pump(0.02)
+        t.pump(0.05)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        txt = "\n".join(sc.display)
+        check("[diagram: rendering...]" in txt or art_rows(sc, 4, 20) > 0,
+              "mermaid blocks: a one-line box while it renders", txt[:400])
+        t.pump(3.0)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        txt = "\n".join(sc.display)
+        top = find_row(sc, " 5 ")
+        after = find_row(sc, "After the fence.")
+        check(top >= 0 and after > top + 4 and art_rows(sc, top, after) >= 4,
+              "mermaid blocks: the diagram is block art under line 5",
+              repr((top, after, art_rows(sc, top, after))))
+        check("flowchart LR" not in txt and "```mermaid" not in txt,
+              "mermaid blocks: the fence's lines are hidden")
+        frames = t.out[t.out.find(b"\x1b[?2026h"):]
+        check(b"\x1b_G" not in frames and b"\x1bPq" not in frames,
+              "mermaid blocks: no graphics escapes (cells only)")
+        # Settled: nothing to do.
+        mark = len(t.out)
+        c0 = proc_cpu(t.pid) if os.path.exists("/proc/self/stat") else 0
+        check_idle("mermaid blocks: settled", t.pid, t.pump)
+        c1 = proc_cpu(t.pid) if os.path.exists("/proc/self/stat") else 0
+        check(len(t.out) == mark and c1 - c0 < 0.05, "mermaid blocks: idle, no output",
+              repr((len(t.out) - mark, c1 - c0)))
+        # The caret into the fence: the source, the diagram under it.
+        t.send(b"\x1b[B" * 4, 0.8)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        close = find_row(sc, " 9 ```")
+        after = find_row(sc, "After the fence.")
+        check(find_row(sc, "flowchart LR") >= 0 and close >= 0 and after > close + 3 and
+              art_rows(sc, close + 1, after) >= 4,
+              "mermaid blocks: the caret shows the source, the diagram under it",
+              repr((close, after)))
+        # Type into the fence: the old diagram stays (darkened), then the new.
+        # Looked at well inside the new render (a flowchart takes ~200 ms
+        # warm): its size lands a moment before its pixels, and the box
+        # re-fits in that gap.
+        t.send(b"\x1b[B\x1b[B\x1b[B\x1b[F", 0.3)
+        t.send(b"\r  C --> D[More]", 0.12)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        close = find_row(sc, "10 ```")
+        check(close > 0 and art_rows(sc, close + 1, close + 14) >= 4,
+              "mermaid blocks: the old diagram stays up while the source changes",
+              "\n".join(sc.display))
+        t.pump(3.0)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        close = find_row(sc, "10 ```")
+        check(close > 0 and art_rows(sc, close + 1, close + 14) >= 4 and
+              "[diagram" not in "\n".join(sc.display),
+              "mermaid blocks: the new diagram lands", "\n".join(sc.display))
+        t.send(b"\x11", 0.3)
+        t.send(b"n", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
 CASES = {
+    "image_idle": case_image_idle,
+    "idle_threads": case_idle_threads,
+    "image_viewer": case_image_viewer,
+    "image_present": case_image_present,
+    "image_blocks": case_image_blocks,
+    "mermaid_blocks": case_mermaid_blocks,
+    "image_kitty": case_image_kitty,
+    "image_sixel": case_image_sixel,
+    "image_iterm": case_image_iterm,
+    "image_tmux": case_image_tmux,
     "present": case_present,
     "image_placeholder": case_image_placeholder,
     "tabs_and_panes": case_tabs_and_panes,
@@ -2302,6 +3555,7 @@ CASES = {
     "unbracketed_typing": case_unbracketed_typing,
     "dangling_csi": case_dangling_csi,
     "page_keys": case_page_keys,
+    "last_line": case_last_line,
     "mouse_click": case_mouse_click,
     "find_run": case_find_run,
     "find_options": case_find_options,

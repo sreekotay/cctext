@@ -13,8 +13,10 @@
 //   table, keys.json / settings.json, the palette model, the fuzzy scorer),
 //   core/workspace.ccs, core/layout.ccs, core/document.ccs,
 //   core/img.ccs + core/img_wuffs.c (Wuffs, third_party/wuffs) + core/img_net.c (images)
+//   + core/img_term.c (terminal encoders: block art, sixel, PNG, zlib, kitty cells)
 //   frontend/gui_draw.ccs, frontend/gui_input.ccs, frontend/gui_chrome.ccs,
-//   frontend/cctext_draw.ccs, frontend/cctext_grid_draw.ccs,
+//   frontend/cctext_draw.ccs (+ cctext_present.ccs, cctext_img.ccs: terminal pictures),
+//   frontend/cctext_grid_draw.ccs,
 //   frontend/cctext_input.ccs, frontend/cctext_keys.ccs, frontend/cctext_osx.ccs
 //   cctext-ui platform (outside ccc, linked in by @cctext_ui): frontend/ui_plat.c
 //   (portable libui-ng) + frontend/ui_os_darwin.m (AppKit) or ui_os_gtk.c (GTK 3)
@@ -135,7 +137,7 @@ CC_TARGET perf_matrix_smoke exe tests/perf_matrix_smoke.ccs
 CC_TARGET_INCLUDE perf_matrix_smoke .
 CC_TARGET_DEPS perf_matrix_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout
 
-CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c
+CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c core/img_term.c core/img_svg.c
 CC_TARGET_INCLUDE rtx_img .
 CC_TARGET_DEPS rtx_img rtx_safe
 
@@ -195,7 +197,7 @@ CC_TARGET pair_page_probe exe tests/pair_page_probe.ccs
 CC_TARGET_INCLUDE pair_page_probe .
 CC_TARGET_DEPS pair_page_probe rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout
 
-CC_TARGET rtx_cctext_draw obj frontend/cctext_draw.ccs frontend/cctext_present.ccs
+CC_TARGET rtx_cctext_draw obj frontend/cctext_draw.ccs frontend/cctext_present.ccs frontend/cctext_img.ccs
 CC_TARGET_INCLUDE rtx_cctext_draw .
 CC_TARGET_DEPS rtx_cctext_draw rtx_ui
 

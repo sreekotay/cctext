@@ -1,0 +1,696 @@
+/*
+ * cctext-render fuzz driver (docs/images.md, "Renderer"): the SVG backend
+ * (lunasvg + plutovg, the same code the helper runs) over mutated inputs,
+ * in process, built with ASan + UBSan (scripts/render_build.cch, variant
+ * "san" -> bin/cctext-render-fuzz). Any sanitizer report aborts the run.
+ *
+ *   cctext-render-fuzz PACK CORPUS_DIR [ITERS] [SEED]
+ *   cctext-render-fuzz --mermaid PACK CORPUS_DIR [ITERS] [SEED]
+ *
+ * Every *.svg under CORPUS_DIR (and one level of subdirectories) is a
+ * seed; each seed renders once unmutated, then ITERS mutants follow
+ * (bit flips, truncation, duplicated chunks, extreme numbers, deep
+ * nesting, self / mutual references, splices, attribute garbage, nested
+ * percentage <svg>). Fixed hostile cases run first. The sandbox is not
+ * involved (the policy has its own tests); this is about memory safety
+ * and undefined behaviour in the parser and rasterizer.
+ *
+ * --mermaid: every *.mmd is a seed for the whole Mermaid path the helper
+ * runs (QuickJS executing mermaid.min.js from the pack's bytecode, then
+ * lunasvg on its SVG), under the same sanitizers (QuickJS's C included):
+ * line deletions / duplications / swaps, token and arrow garbage, splices
+ * between diagram types, long labels and ids, deep subgraph nesting,
+ * directives (%%{init}%% with hostile config), click / href / callback
+ * lines, HTML and script in labels, classDef CSS garbage, control bytes
+ * and truncations. Each mutant has the editor's limits: 150 nodes and a
+ * time budget (an interrupted script is an outcome, not a finding). The
+ * engine restarts after every failure, as in the helper.
+ */
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+
+#include "cr_js.h"
+#include "cr_pack.h"
+#include "cr_svg.h"
+
+typedef struct {
+    char *b;
+    size_t n, cap;
+} Buf;
+
+static void buf_add(Buf *o, const char *s, size_t n)
+{
+    if (o->n + n + 1 > o->cap) {
+        size_t c = (o->n + n + 1) * 2;
+        char *nb = realloc(o->b, c);
+        if (!nb) abort();
+        o->b = nb;
+        o->cap = c;
+    }
+    memcpy(o->b + o->n, s, n);
+    o->n += n;
+    o->b[o->n] = 0;
+}
+
+static void buf_str(Buf *o, const char *s) { buf_add(o, s, strlen(s)); }
+
+static uint64_t g_rng = 88172645463325252ull;
+static uint32_t rnd(void)
+{
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 7;
+    g_rng ^= g_rng << 17;
+    return (uint32_t)(g_rng >> 11);
+}
+static size_t rndn(size_t n) { return n ? rnd() % n : 0; }
+
+static double now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+
+typedef struct {
+    char *d;
+    size_t n;
+    char name[256];
+} Seed;
+
+static Seed g_seed[512];
+static int g_nseed;
+
+static const char *g_ext = ".svg";
+
+static void load_dir(const char *dir, int depth)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    if (!d) return;
+    while ((e = readdir(d)) && g_nseed < 512) {
+        char p[2048];
+        struct stat st;
+        size_t l = strlen(e->d_name);
+        if (e->d_name[0] == '.') continue;
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        if (stat(p, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (depth < 1) load_dir(p, depth + 1);
+            continue;
+        }
+        if (l < 5 || strcmp(e->d_name + l - 4, g_ext) != 0 || st.st_size > (1 << 20)) continue;
+        {
+            FILE *f = fopen(p, "rb");
+            Seed *s = &g_seed[g_nseed];
+            if (!f) continue;
+            s->d = malloc((size_t)st.st_size + 1);
+            s->n = fread(s->d, 1, (size_t)st.st_size, f);
+            s->d[s->n] = 0;
+            fclose(f);
+            snprintf(s->name, sizeof s->name, "%s", e->d_name);
+            g_nseed++;
+        }
+    }
+    closedir(d);
+}
+
+static double g_worst_ms;
+static char g_worst[64];
+static long g_ok, g_rej;
+
+static void render_one(const char *what, const char *s, size_t n)
+{
+    float w = 0, h = 0;
+    double t0 = now_ms(), dt;
+    cr_svg *doc = cr_svg_parse(s, n, &w, &h);
+    if (doc) {
+        /* The helper's own checks, then a small box (fast under ASan). */
+        if (w > 0 && h > 0 && w < 1e7f && h < 1e7f) {
+            float sc = 192.0f / (w > h ? w : h);
+            uint32_t pw = (uint32_t)(w * sc + 0.999f), ph = (uint32_t)(h * sc + 0.999f);
+            uint8_t *px;
+            if (pw < 1) pw = 1;
+            if (ph < 1) ph = 1;
+            px = malloc((size_t)pw * ph * 4);
+            if (px) {
+                cr_svg_render(doc, (float)pw / w, (float)ph / h, pw, ph, 0x00000000u, px);
+                free(px);
+            }
+        }
+        cr_svg_free(doc);
+        g_ok++;
+    } else {
+        g_rej++;
+    }
+    dt = now_ms() - t0;
+    if (dt > g_worst_ms) {
+        g_worst_ms = dt;
+        snprintf(g_worst, sizeof g_worst, "%s", what);
+    }
+}
+
+static const char *const NUMS[] = {"0",        "-1",         "1e38", "-1e38", "1e-38", "NaN", "inf",
+                                   "99999999", "-99999999",  "0.0000001",   "4294967296", "1e400",
+                                   ""};
+static const char *const TAGS[] = {"g", "svg", "text", "tspan", "switch", "a", "mask", "symbol"};
+static const char *const GARBAGE[] = {"", "(", "url(#", "calc(", "%", "e", "1e", "#", ";;;", "\\"};
+
+static const char *snippet(Buf *o)
+{
+    switch (rndn(13)) {
+    case 0: return "<g id=\"a\"><use href=\"#a\"/></g>";
+    case 1: return "<use id=\"b\" href=\"#c\"/><use id=\"c\" href=\"#b\"/>";
+    case 2:
+        return "<pattern id=\"p\" width=\"10\" height=\"10\"><rect fill=\"url(#p)\" width=\"5\" "
+               "height=\"5\"/></pattern><rect fill=\"url(#p)\" width=\"50\" height=\"50\"/>";
+    case 3:
+        return "<mask id=\"m\"><rect mask=\"url(#m)\" width=\"10\" height=\"10\"/></mask><rect "
+               "mask=\"url(#m)\" width=\"9\" height=\"9\"/>";
+    case 4:
+        return "<clipPath id=\"cp\" clip-path=\"url(#cp)\"><rect width=\"10\" "
+               "height=\"10\"/></clipPath><rect clip-path=\"url(#cp)\" width=\"9\" height=\"9\"/>";
+    case 5:
+        return "<marker id=\"mk\"><path d=\"M0 0L9 9\" marker-start=\"url(#mk)\"/></marker><path "
+               "d=\"M0 0L9 9L20 3\" marker-start=\"url(#mk)\" marker-mid=\"url(#mk)\"/>";
+    case 6: {
+        int i;
+        buf_str(o, "<path stroke=\"black\" stroke-dasharray=\"0.5\" d=\"M0 0");
+        for (i = 0; i < 2000; i++) buf_str(o, " L1 1 L2 0");
+        buf_str(o, "\"/>");
+        return NULL;
+    }
+    case 7: return "<rect width=\"1e9\" height=\"1e9\" stroke-width=\"1e9\" stroke=\"red\"/>";
+    case 8: {
+        int i;
+        buf_str(o, "<text font-size=\"1e6\">");
+        for (i = 0; i < 500; i++) buf_str(o, "W");
+        buf_str(o, "</text>");
+        return NULL;
+    }
+    case 9: {
+        int i;
+        buf_str(o, "<text x=\"");
+        for (i = 0; i < 5000; i++) buf_str(o, "1 ");
+        buf_str(o, "\">abc</text>");
+        return NULL;
+    }
+    case 10: {
+        int i;
+        buf_str(o, "<linearGradient id=\"lg\">");
+        for (i = 0; i < 2000; i++) buf_str(o, "<stop offset=\"0.5\"/>");
+        buf_str(o, "</linearGradient><rect fill=\"url(#lg)\" width=\"9\" height=\"9\"/>");
+        return NULL;
+    }
+    case 11:
+        return "<image width=\"10\" height=\"10\" href=\"data:image/png;base64,iVBORw0KGgoAAAANSU"
+               "hEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR4nGP4z8AAQmDqP5D6\"/>";
+    default:
+        return "<image width=\"10\" height=\"10\" href=\"file:///etc/passwd\"/><image width=\"10\" "
+               "height=\"10\" href=\"http://127.0.0.1:9/x.png\"/>";
+    }
+}
+
+/* One mutant of seed s into o. */
+static void mutate(const Seed *s, Buf *o)
+{
+    size_t n = s->n, i, j;
+    const char *b = s->d;
+    o->n = 0;
+    switch (rndn(9)) {
+    case 0: /* byte flips */
+        buf_add(o, b, n);
+        for (i = rndn(20) + 1; i-- && o->n;) o->b[rndn(o->n)] = (char)rnd();
+        break;
+    case 1: /* truncate */
+        buf_add(o, b, rndn(n + 1));
+        break;
+    case 2: { /* duplicate a chunk */
+        size_t a = rndn(n + 1), e = a + rndn(400) + 1, k = rndn(50) + 1;
+        if (e > n) e = n;
+        buf_add(o, b, e);
+        while (k--) buf_add(o, b + a, e - a);
+        buf_add(o, b + e, n - e);
+        break;
+    }
+    case 3: /* extreme numbers */
+        for (i = 0; i < n;) {
+            if ((b[i] >= '0' && b[i] <= '9') || (b[i] == '-' && i + 1 < n && b[i + 1] >= '0' &&
+                                                 b[i + 1] <= '9')) {
+                j = i + 1;
+                while (j < n && ((b[j] >= '0' && b[j] <= '9') || b[j] == '.')) j++;
+                if (rndn(10) < 3) buf_str(o, NUMS[rndn(sizeof NUMS / sizeof NUMS[0])]);
+                else buf_add(o, b + i, j - i);
+                i = j;
+            } else {
+                buf_add(o, b + i, 1);
+                i++;
+            }
+        }
+        break;
+    case 4: { /* deep nesting after the root's start tag */
+        const char *r = strstr(b, "<svg");
+        const char *gt = r ? strchr(r, '>') : NULL;
+        size_t at = gt ? (size_t)(gt + 1 - b) : 0, d, k;
+        static const size_t depths[] = {100, 1000, 5000};
+        const char *t = TAGS[rndn(sizeof TAGS / sizeof TAGS[0])];
+        char tag[32];
+        d = depths[rndn(3)];
+        buf_add(o, b, at);
+        for (k = 0; k < d; k++) {
+            snprintf(tag, sizeof tag, "<%s>", t);
+            buf_str(o, tag);
+        }
+        buf_str(o, "<rect width=\"10\" height=\"10\"/>");
+        for (k = 0; k < d; k++) {
+            snprintf(tag, sizeof tag, "</%s>", t);
+            buf_str(o, tag);
+        }
+        buf_add(o, b + at, n - at);
+        break;
+    }
+    case 5: { /* self / mutual references and other hostile snippets */
+        const char *r = strstr(b, "<svg");
+        const char *gt = r ? strchr(r, '>') : NULL;
+        size_t at = gt ? (size_t)(gt + 1 - b) : 0;
+        const char *sn;
+        buf_add(o, b, at);
+        sn = snippet(o);
+        if (sn) buf_str(o, sn);
+        buf_add(o, b + at, n - at);
+        break;
+    }
+    case 6: { /* splice from another seed */
+        const Seed *t = &g_seed[rndn((size_t)g_nseed)];
+        size_t a = rndn(n + 1), f = rndn(t->n + 1), l = rndn(2000) + 1;
+        if (f + l > t->n) l = t->n - f;
+        buf_add(o, b, a);
+        buf_add(o, t->d + f, l);
+        buf_add(o, b + a, n - a);
+        break;
+    }
+    case 7: /* attribute garbage */
+        for (i = 0; i < n; i++) {
+            if (b[i] == '=' && i + 1 < n && b[i + 1] == '"' && rndn(100) < 15) {
+                j = i + 2;
+                while (j < n && b[j] != '"') j++;
+                buf_str(o, "=\"");
+                if (rndn(4) == 0) {
+                    size_t k;
+                    for (k = 0; k < 3000; k++) buf_str(o, "a");
+                } else if (rndn(4) == 0 && j > i + 2) {
+                    size_t k;
+                    for (k = 0; k < 50; k++) buf_add(o, b + i + 2, j - i - 2);
+                } else {
+                    buf_str(o, GARBAGE[rndn(sizeof GARBAGE / sizeof GARBAGE[0])]);
+                }
+                i = j - 1;
+                continue;
+            }
+            buf_add(o, b + i, 1);
+        }
+        break;
+    default: { /* nested percentage <svg> (was 2^depth before patch 0003) */
+        size_t k, d = 20 + rndn(30);
+        buf_str(o, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">");
+        for (k = 0; k < d; k++) buf_str(o, "<svg width=\"90%\" height=\"90%\">");
+        buf_str(o, "<rect width=\"50%\" height=\"50%\" fill=\"red\"/>");
+        for (k = 0; k < d; k++) buf_str(o, "</svg>");
+        buf_str(o, "</svg>");
+        break;
+    }
+    }
+}
+
+static int fonts_init(CrPack *p)
+{
+    int nf = 0;
+    for (int i = 0; i < p->n; i++) {
+        CrAsset *a = &p->e[i];
+        char fam[256];
+        int bold = 0, italic = 0;
+        const char *s, *c1;
+        const uint8_t *d;
+        if (strncmp(a->name, "font:", 5) != 0) continue;
+        s = a->name + 5;
+        c1 = strchr(s, ':');
+        if (!c1 || (size_t)(c1 - s) >= sizeof fam) continue;
+        memcpy(fam, s, (size_t)(c1 - s));
+        fam[c1 - s] = 0;
+        if (sscanf(c1 + 1, "%d:%d", &bold, &italic) != 2) continue;
+        d = cr_asset_data(a);
+        if (d && cr_svg_add_font(fam, bold, italic, d, a->raw_len) == 0) nf++;
+    }
+    return nf;
+}
+
+/* ---- Mermaid ------------------------------------------------------------ */
+
+static CrJs *g_mm;
+static long g_mm_ok, g_mm_err, g_mm_timeout, g_mm_large;
+
+static void mm_one(const char *what, const char *src, size_t n, uint32_t budget_ms, int dark)
+{
+    static const char opts_l[] = "{\"nodeMax\":150,\"theme\":\"default\"}";
+    static const char opts_d[] =
+        "{\"nodeMax\":150,\"theme\":\"dark\",\"themeVariables\":{\"primaryColor\":\"#223344\"}}";
+    char err[1024], *svg, *z;
+    const char *a[3];
+    int to = 0;
+    double t0 = now_ms(), dt;
+    z = malloc(n + 1);
+    if (!z) abort();
+    memcpy(z, src, n);
+    z[n] = 0; /* a NUL inside ends the source (as a JS string from the helper) */
+    a[0] = "cctext-mermaid";
+    a[1] = z;
+    a[2] = dark ? opts_d : opts_l;
+    svg = cr_js_call(g_mm, "mmRender", 3, a, budget_ms, err, sizeof err, &to);
+    if (svg && !strncmp(svg, "CCTEXT_TOO_LARGE", 16)) g_mm_large++;
+    else if (svg && !strncmp(svg, "CCTEXT_PARSE ", 13)) g_mm_err++; /* engine kept */
+    else if (svg) {
+        g_mm_ok++;
+        render_one(what, svg, strlen(svg));
+    } else if (to) g_mm_timeout++;
+    else g_mm_err++;
+    free(svg);
+    free(z);
+    dt = now_ms() - t0;
+    if (dt > g_worst_ms) {
+        g_worst_ms = dt;
+        snprintf(g_worst, sizeof g_worst, "%s", what);
+    }
+}
+
+static const char *const MM_TOK[] = {
+    "-->", "---", "-.->", "==>", "--x", "--o", "<-->", "->>", "-->>", "-x", "-)", "||--o{", "}|..|{",
+    "<|--", "*--", "o--", "..>", "[*]", "((", "))", "{{", "}}", "[/", "/]", "[(", ")]", ">", "|",
+    ":", ";", "\"", "'", "`", "%%", "#", "&", "<br>", "<b>", "<script>alert(1)</script>",
+    "<img src=x onerror=alert(1)>", "javascript:alert(1)", "\\u0000", "\xef\xbf\xbf", "\xf0\x9f\x98\x80",
+    "\xe2\x80\xae", "subgraph", "end", "classDef", "class", "style", "linkStyle", "click", "call",
+    "href", "note", "loop", "alt", "else", "opt", "par", "and", "rect", "activate", "deactivate",
+    "section", "dateFormat", "axisFormat", "excludes", "after", "crit", "done", "active", "title",
+    "direction", "TB", "LR", "RL", "BT", "state", "fork", "join", "choice", "<<interface>>",
+    "1e308", "-1", "NaN", "9999999999", "0x7fffffff", "2020-13-45", "::", ":::", "~T~", "{", "}"};
+
+static const char *const MM_LINES[] = {
+    "%%{init: {\"securityLevel\": \"loose\", \"htmlLabels\": true, \"startOnLoad\": true}}%%",
+    "%%{init: {\"theme\": \"forest\", \"themeCSS\": \"* { font-size: 1e9px } svg { width: 1e9px }\"}}%%",
+    "%%{init: {\"flowchart\": {\"htmlLabels\": true, \"curve\": \"__proto__\"}, \"fontSize\": 1e9}}%%",
+    "%%{init: {\"maxTextSize\": 1e12, \"maxEdges\": 1e12, \"deterministicIDSeed\": \"<svg\"}}%%",
+    "%%{wrap}%%",
+    "---\nconfig:\n  theme: dark\n  look: handDrawn\n  layout: elk\n---",
+    "---\nconfig:\n  layout: elk\n---",
+    "  click A callback \"tip\"", "  click A href \"javascript:alert(1)\" _blank",
+    "  click A call alert(1)", "  A[\"<a href='javascript:alert(1)'>x</a>\"]",
+    "  classDef x fill:url(#a),stroke:expression(alert(1)),font-size:1e9px;",
+    "  style A fill:#f9f,stroke:#333,stroke-width:1e9px",
+    "  linkStyle 999999 stroke:red", "  A@{ shape: cyl, label: \"x\" }",
+    "  A@{ icon: \"fa:user\", img: \"https://example.com/x.png\", w: 1e9 }",
+    "  accTitle: <script>", "  accDescr: x", "  note right of A: <b>x</b>",
+    "  A -->|\"<img src=x>\"| B"};
+
+static void mm_mutate(const Seed *s, Buf *o)
+{
+    const char *b = s->d;
+    size_t n = s->n, i, k;
+    o->n = 0;
+    switch (rndn(12)) {
+    case 0: /* byte flips */
+        buf_add(o, b, n);
+        for (i = rndn(8) + 1; i-- && o->n;) o->b[rndn(o->n)] = (char)rnd();
+        break;
+    case 1: /* truncate */
+        buf_add(o, b, rndn(n + 1));
+        break;
+    case 2: { /* delete / duplicate / swap lines */
+        const char *ls[256];
+        size_t ll[256], nl = 0, p = 0;
+        while (p < n && nl < 256) {
+            size_t e = p;
+            while (e < n && b[e] != '\n') e++;
+            ls[nl] = b + p;
+            ll[nl++] = e - p;
+            p = e + 1;
+        }
+        for (i = 0; i < nl; i++) {
+            size_t r = rndn(10), j = i;
+            if (r == 0) continue;                /* delete */
+            if (r == 1) j = rndn(nl);             /* another line instead */
+            buf_add(o, ls[j], ll[j]);
+            buf_str(o, "\n");
+            if (r == 2)
+                for (k = rndn(20) + 1; k--;) { buf_add(o, ls[j], ll[j]); buf_str(o, "\n"); }
+        }
+        break;
+    }
+    case 3: /* token garbage at random places */
+        buf_add(o, b, n);
+        for (i = rndn(6) + 1; i--;) {
+            const char *t = MM_TOK[rndn(sizeof MM_TOK / sizeof MM_TOK[0])];
+            size_t at = rndn(o->n + 1), tl = strlen(t);
+            buf_add(o, t, tl);                    /* grow, then move the tail */
+            memmove(o->b + at + tl, o->b + at, o->n - tl - at);
+            memcpy(o->b + at, t, tl);
+        }
+        break;
+    case 4: { /* hostile lines after the header */
+        const char *nl = memchr(b, '\n', n);
+        size_t at = nl ? (size_t)(nl + 1 - b) : n;
+        if (rndn(3) == 0) {
+            buf_str(o, MM_LINES[rndn(4)]);
+            buf_str(o, "\n");
+            buf_add(o, b, n);
+            break;
+        }
+        buf_add(o, b, at);
+        for (i = rndn(3) + 1; i--;) {
+            buf_str(o, MM_LINES[rndn(sizeof MM_LINES / sizeof MM_LINES[0])]);
+            buf_str(o, "\n");
+        }
+        buf_add(o, b + at, n - at);
+        break;
+    }
+    case 5: { /* splice another type's lines in */
+        const Seed *t = &g_seed[rndn((size_t)g_nseed)];
+        size_t a = rndn(n + 1), f = rndn(t->n + 1), l = rndn(300) + 1;
+        if (f + l > t->n) l = t->n - f;
+        buf_add(o, b, a);
+        buf_add(o, t->d + f, l);
+        buf_add(o, b + a, n - a);
+        break;
+    }
+    case 6: { /* long labels / ids */
+        size_t at = rndn(n + 1), L = (size_t)1 << (8 + rndn(9));
+        buf_add(o, b, at);
+        for (k = 0; k < L; k++) buf_add(o, (rndn(20) ? "W" : " "), 1);
+        buf_add(o, b + at, n - at);
+        break;
+    }
+    case 7: { /* deep subgraph / state / namespace nesting */
+        static const size_t depths[] = {20, 100, 400};
+        size_t d = depths[rndn(3)];
+        int kind = (int)rndn(3);
+        buf_str(o, kind == 0 ? "flowchart TD\n" : kind == 1 ? "stateDiagram-v2\n" : "classDiagram\n");
+        for (k = 0; k < d; k++) {
+            char l[64];
+            if (kind == 0) snprintf(l, sizeof l, "subgraph s%zu\n", k);
+            else if (kind == 1) snprintf(l, sizeof l, "state S%zu {\n", k);
+            else snprintf(l, sizeof l, "namespace N%zu {\n", k);
+            buf_str(o, l);
+        }
+        buf_str(o, kind == 0 ? "a --> b\n" : kind == 1 ? "[*] --> x\n" : "class A\n");
+        for (k = 0; k < d; k++) buf_str(o, kind == 0 ? "end\n" : "}\n");
+        break;
+    }
+    case 8: { /* many nodes / edges around the cap */
+        size_t m = 100 + rndn(200);
+        buf_str(o, "flowchart LR\n");
+        for (k = 0; k < m; k++) {
+            char l[64];
+            snprintf(l, sizeof l, "n%zu --> n%zu\n", rndn(m / 2 + 1), rndn(m));
+            buf_str(o, l);
+        }
+        break;
+    }
+    case 9: /* control bytes and invalid UTF-8 */
+        for (i = 0; i < n; i++) {
+            buf_add(o, b + i, 1);
+            if (rndn(40) == 0) {
+                static const char junk[] = "\x01\x7f\xc0\xff\xed\xa0\x80\x00\r\t\x1b";
+                buf_add(o, junk + rndn(sizeof junk - 1), 1);
+            }
+        }
+        break;
+    case 10: /* extreme numbers (gantt dates, pie values, sizes) */
+        for (i = 0; i < n; i++) {
+            if (b[i] >= '0' && b[i] <= '9' && rndn(4) == 0) {
+                while (i + 1 < n && b[i + 1] >= '0' && b[i + 1] <= '9') i++;
+                buf_str(o, NUMS[rndn(sizeof NUMS / sizeof NUMS[0])]);
+            } else {
+                buf_add(o, b + i, 1);
+            }
+        }
+        break;
+    default: /* the seed unchanged, in the other theme */
+        buf_add(o, b, n);
+        break;
+    }
+}
+
+static int mm_main(int argc, char **argv, CrPack *pack)
+{
+    long iters = argc > 3 ? atol(argv[3]) : 200, i;
+    uint32_t budget = getenv("CR_FUZZ_MM_BUDGET_MS") ? (uint32_t)atol(getenv("CR_FUZZ_MM_BUDGET_MS"))
+                                                     : 20000u;
+    CrAsset *a = cr_pack_find(pack, "js:mermaid");
+    const uint8_t *bc = a ? cr_asset_data(a) : NULL;
+    CrJsPolicy pol = {(size_t)1 << 30, (size_t)256 << 20, 0, (size_t)16 << 20};
+    Buf o = {0};
+    double t0 = now_ms();
+    if (!bc) {
+        fprintf(stderr, "cctext-render-fuzz: no js:mermaid in the pack\n");
+        return 2;
+    }
+    g_mm = cr_js_new("mermaid", bc, a->raw_len, &pol);
+    g_ext = ".mmd";
+    load_dir(argv[2], 0);
+    if (!g_nseed) {
+        fprintf(stderr, "cctext-render-fuzz: no *.mmd under %s\n", argv[2]);
+        return 2;
+    }
+    for (i = 0; i < g_nseed && !getenv("CR_FUZZ_DUMP_ONLY"); i++)
+        mm_one(g_seed[i].name, g_seed[i].d, g_seed[i].n, budget > 60000 ? budget : 60000,
+               (int)(i & 1)); /* seeds must render: a generous budget under ASan */
+    if (g_mm_ok < g_nseed && !getenv("CR_FUZZ_DUMP_ONLY")) {
+        fprintf(stderr, "cctext-render-fuzz: only %ld of %d Mermaid seeds rendered\n", g_mm_ok,
+                g_nseed);
+        return 1;
+    }
+    for (i = 0; i < iters; i++) {
+        const Seed *s = &g_seed[rndn((size_t)g_nseed)];
+        char what[64];
+        int dark = (int)rndn(2);
+        mm_mutate(s, &o);
+        snprintf(what, sizeof what, "mermaid #%ld of %s", i, s->name);
+        if (getenv("CR_FUZZ_DUMP") && (atol(getenv("CR_FUZZ_DUMP")) == i ||
+                                       !strcmp(getenv("CR_FUZZ_DUMP"), "all"))) {
+            /* CR_FUZZ_DUMP=N (or all) writes the mutant to cr-fuzz-N.mmd */
+            char p[64];
+            FILE *df;
+            snprintf(p, sizeof p, "cr-fuzz-%ld.mmd", i);
+            df = fopen(p, "wb");
+            if (df) {
+                fwrite(o.b ? o.b : "", 1, o.n, df);
+                fclose(df);
+            }
+        }
+        /* CR_FUZZ_DUMP_ONLY: write the dumped mutant, render nothing */
+        if (!getenv("CR_FUZZ_DUMP_ONLY")) mm_one(what, o.b ? o.b : "", o.n, budget, dark);
+    }
+    {
+        CrJsStats st;
+        cr_js_stats(g_mm, &st);
+        printf("cctext-render-fuzz --mermaid: %d seeds, %ld mutants: %ld rendered, %ld errors, %ld "
+               "over the node cap, %ld timeouts, %u engine starts, %.1f s; slowest %.0f ms (%s)\n",
+               g_nseed, iters, g_mm_ok - g_nseed, g_mm_err, g_mm_large, g_mm_timeout, st.starts,
+               (now_ms() - t0) / 1000.0, g_worst_ms, g_worst);
+    }
+    cr_js_stop(g_mm);
+    free(g_mm);
+    free(o.b);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    static CrPack pack;
+    FILE *f;
+    long len;
+    static uint8_t *pb;
+    long iters;
+    long i;
+    Buf o = {0};
+    double t0 = now_ms();
+    int mermaid = argc > 1 && !strcmp(argv[1], "--mermaid");
+    if (mermaid) {
+        argv++;
+        argc--;
+    }
+    iters = argc > 3 ? atol(argv[3]) : 2000;
+    if (argc < 3) {
+        fprintf(stderr, "usage: cctext-render-fuzz [--mermaid] PACK CORPUS_DIR [ITERS] [SEED]\n");
+        return 2;
+    }
+    if (argc > 4) g_rng ^= (uint64_t)strtoull(argv[4], NULL, 10) * 0x9E3779B97F4A7C15ull;
+    f = fopen(argv[1], "rb");
+    if (!f || fseek(f, 0, SEEK_END) != 0 || (len = ftell(f)) <= 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "cctext-render-fuzz: cannot read %s\n", argv[1]);
+        return 2;
+    }
+    pb = malloc((size_t)len);
+    if (!pb || fread(pb, 1, (size_t)len, f) != (size_t)len || cr_pack_open(&pack, pb, (size_t)len)) {
+        fprintf(stderr, "cctext-render-fuzz: bad pack %s\n", argv[1]);
+        return 2;
+    }
+    fclose(f);
+    if (fonts_init(&pack) < 1) return 2;
+    if (mermaid) return mm_main(argc, argv, &pack);
+    load_dir(argv[2], 0);
+    if (!g_nseed) {
+        fprintf(stderr, "cctext-render-fuzz: no *.svg under %s\n", argv[2]);
+        return 2;
+    }
+    /* Fixed hostile cases. */
+    {
+        size_t k;
+        o.n = 0;
+        buf_str(&o, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">");
+        for (k = 0; k < 40; k++) buf_str(&o, "<svg width=\"99%\" height=\"99%\">");
+        buf_str(&o, "<rect width=\"50%\" height=\"50%\"/>");
+        for (k = 0; k < 40; k++) buf_str(&o, "</svg>");
+        buf_str(&o, "</svg>");
+        render_one("nested-svg-40", o.b, o.n);
+        if (g_worst_ms > 2000) {
+            fprintf(stderr, "cctext-render-fuzz: 40 nested <svg> took %.0f ms (exponential?)\n",
+                    g_worst_ms);
+            return 1;
+        }
+        o.n = 0;
+        buf_str(&o, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">");
+        for (k = 0; k < 100000; k++) buf_str(&o, "<g>");
+        buf_str(&o, "<rect width=\"5\" height=\"5\"/>");
+        for (k = 0; k < 100000; k++) buf_str(&o, "</g>");
+        buf_str(&o, "</svg>");
+        render_one("nest-100k", o.b, o.n);
+    }
+    for (i = 0; i < g_nseed; i++) render_one(g_seed[i].name, g_seed[i].d, g_seed[i].n);
+    for (i = 0; i < iters; i++) {
+        const Seed *s = &g_seed[rndn((size_t)g_nseed)];
+        char what[64];
+        mutate(s, &o);
+        snprintf(what, sizeof what, "#%ld of %s", i, s->name);
+        if (getenv("CR_FUZZ_DUMP") && atol(getenv("CR_FUZZ_DUMP")) == i) {
+            /* reproduce one mutant: CR_FUZZ_DUMP=N writes it to cr-fuzz-N.svg */
+            char p[64];
+            FILE *df;
+            snprintf(p, sizeof p, "cr-fuzz-%ld.svg", i);
+            df = fopen(p, "wb");
+            if (df) {
+                fwrite(o.b ? o.b : "", 1, o.n, df);
+                fclose(df);
+            }
+        }
+        render_one(what, o.b ? o.b : "", o.n);
+    }
+    printf("cctext-render-fuzz: %d seeds, %ld mutants: %ld parsed, %ld rejected, %.1f s; slowest "
+           "%.0f ms (%s)\n",
+           g_nseed, iters, g_ok, g_rej, (now_ms() - t0) / 1000.0, g_worst_ms, g_worst);
+    free(o.b);
+    return 0;
+}

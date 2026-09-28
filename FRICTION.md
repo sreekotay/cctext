@@ -90,6 +90,26 @@ sysmon's slack settle (`sched_v2_settle_pool`) ignores the noblock pin,
 but it only runs while a grow request is pending, which a full pool
 never raises.
 
+CCC V2 sysmon ticks forever (2026-09-27): the first `@parallel` in a
+process (an image probe for a Markdown file with pictures, even with
+pictures off; browse; find; a workbook read job) starts
+`sched_v2_sysmon_main`, which waits on a 20 ms timeout for the rest of
+the process: 50 wakeups a second at idle, the only thread that wakes
+(measured 99-100 in 2 s, TUI and cctext-ui; the UI thread, GTK threads
+and the parked workers stay at 0). Not a cctext loop, and nothing on
+the cctext side can stop it (static, `pthread_once` init, no quiesce
+API). `scripts/ccc_sysmon_quiescent.patch` (concurrent-c
+`cc/runtime/sched_v2.c`; applies to e59f6b9 and later): sysmon waits
+with no timeout while nothing is queued / running / growing / due and
+the pool is settled; a ready push, a worklet or a park deadline pokes
+it (store / fence / load both sides). With it every thread is at 0
+wakeups idle in every case below. Until the pin carries it,
+`tests/tui_pty_test.py idle_threads` and `tests/ui_img_test.py`'s idle
+case count every thread and fail on any wakeup except that tick, which
+they recognise (a raw `FUTEX_WAIT_PRIVATE` with a timeout in
+`/proc/<tid>/syscall`) and print as a note; `RTX_IDLE_STRICT=1` fails
+on it too.
+
 `@parallel wait` body locals' `@destroy` does not run when the body's
 `@stage` wait fails (the lowering jumps to the construct's done label).
 Browse lane scratch lives in `wk->wslot[]` and the arm frees it after
