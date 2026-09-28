@@ -30,6 +30,13 @@ void ui_os_init(uiWindow *win, uiArea *area) {
      * cctext uses a non-scrolling area, so the subclass sees them. */
 }
 
+/* TODO: HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize
+ * AppsUseLightTheme, and WM_SETTINGCHANGE ("ImmersiveColorSet") for a
+ * change. Unknown for now: theme auto is dark. */
+int ui_os_appearance_dark(void) {
+    return -1;
+}
+
 void ui_os_fini(void) {
     /* TODO: RemoveWindowSubclass(hwnd, area_proc, 1). */
     g_win = NULL;

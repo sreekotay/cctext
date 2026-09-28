@@ -524,6 +524,23 @@ void ui_plat_focus(int in) {
 
 int IsWindowFocused(void) { return g_focused; }
 
+/* The OS appearance (theme "auto"): the last change the toolkit reported,
+ * taken once by the host's turn. */
+static int g_appear_edge = -1;
+
+void ui_plat_appearance(int dark) {
+    if (dark < 0) return;
+    g_appear_edge = dark ? 1 : 0;
+}
+
+int gui_appearance_edge(void) {
+    int e = g_appear_edge;
+    g_appear_edge = -1;
+    return e;
+}
+
+int gui_appearance_dark(void) { return ui_os_appearance_dark(); }
+
 int gui_focus_edge(void) {
     int e = g_focus_edge;
     g_focus_edge = -1;

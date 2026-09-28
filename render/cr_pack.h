@@ -18,8 +18,8 @@
  * Adler-32 as it inflates it, and a js: / src: entry's SHA-256 is checked
  * before that (below).
  *
- * Entries are zlib streams (stb's deflate at build time; Wuffs inflates
- * them at run time, checking each stream's Adler-32). Names:
+ * Entries are zlib streams (miniz's deflate, level 9, at build time;
+ * Wuffs inflates them at run time, checking each stream's Adler-32). Names:
  *   font:<family>:<bold>:<italic>   a TrueType face (family lowercase)
  *   js:<bundle>                     QuickJS bytecode (render/js + third_party)
  *   src:<key>                       JavaScript source a bundle loads on
@@ -60,7 +60,7 @@ const uint8_t *cr_asset_data(CrAsset *a);
 /* Free the inflated copy (the next cr_asset_data inflates again). */
 void cr_asset_drop(CrAsset *a);
 
-/* zlib, for the build step (stb) and tests. The result is malloc'd. */
+/* zlib, for the build step (miniz) and tests. The result is malloc'd. */
 uint8_t *cr_zlib_compress(const uint8_t *in, size_t n, size_t *out_n);
 int cr_zlib_decompress(const uint8_t *in, size_t n, uint8_t *out, size_t raw_len);
 

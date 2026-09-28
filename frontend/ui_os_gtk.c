@@ -12,6 +12,11 @@
  *     them).
  *   - focus-in / focus-out on the toplevel: the caret stops blinking
  *     while the window is not focused.
+ * Appearance (theme "auto"): notify:: on GtkSettings' prefer-dark and
+ * theme name, and the desktop portal's SettingChanged signal (read once,
+ * asynchronously, when a session bus is there). With
+ * RTX_UI_TEST_APPEARANCE=1, SIGUSR1 flips gtk-application-prefer-dark-
+ * theme, so a test drives the same notify path a desktop does.
  * Clipboard is GtkClipboard (CLIPBOARD selection). The Apply submenu is
  * found in the window's GtkMenuBar by label and position.
  *
@@ -32,6 +37,8 @@
  * frame) — both seen under Xvfb, GTK 3.24.
  */
 #include <gtk/gtk.h>
+#include <glib-unix.h>
+#include <signal.h>
 #include "ui_os.h"
 #include <math.h>
 #include <stdlib.h>
@@ -412,8 +419,164 @@ void ui_os_frame_set(uiWindow *win, int x, int y, int w, int h) {
     gtk_window_move(gw, f.x, f.y);
 }
 
+/* ---- appearance ---------------------------------------------------------- */
+
+static int g_portal_scheme = -1; /* portal color-scheme: 0 none, 1 dark, 2 light */
+static GDBusConnection *g_bus;
+static guint g_portal_sub;
+static gulong g_sig_dark, g_sig_tname;
+static guint g_usr1;
+
+int ui_os_appearance_dark(void) {
+    GtkSettings *st = gtk_settings_get_default();
+    gboolean dark = FALSE;
+    gchar *name = NULL;
+    int r;
+    if (g_portal_scheme == 1) return 1;
+    if (g_portal_scheme == 2) return 0;
+    if (!st) return -1;
+    g_object_get(st, "gtk-application-prefer-dark-theme", &dark, "gtk-theme-name", &name,
+                 NULL);
+    r = dark ? 1 : 0;
+    if (!r && name) {
+        gchar *low = g_ascii_strdown(name, -1);
+        if (strstr(low, "dark")) r = 1;
+        g_free(low);
+    }
+    g_free(name);
+    return r;
+}
+
+static void appearance_changed(void) {
+    ui_plat_appearance(ui_os_appearance_dark());
+}
+
+static void on_settings_notify(GObject *o, GParamSpec *ps, gpointer data) {
+    (void)o;
+    (void)ps;
+    (void)data;
+    appearance_changed();
+}
+
+/* The portal answers color-scheme as a uint32 inside one or two variants. */
+static int portal_scheme_of(GVariant *v) {
+    int r = -1;
+    GVariant *in = v ? g_variant_ref(v) : NULL;
+    while (in && g_variant_is_of_type(in, G_VARIANT_TYPE_VARIANT)) {
+        GVariant *c = g_variant_get_variant(in);
+        g_variant_unref(in);
+        in = c;
+    }
+    if (in && g_variant_is_of_type(in, G_VARIANT_TYPE_UINT32)) r = (int)g_variant_get_uint32(in);
+    if (in) g_variant_unref(in);
+    return r;
+}
+
+static void on_portal_read(GObject *src, GAsyncResult *res, gpointer data) {
+    GVariant *ret = g_dbus_connection_call_finish(G_DBUS_CONNECTION(src), res, NULL);
+    (void)data;
+    if (!ret) return;
+    {
+        GVariant *v = g_variant_get_child_value(ret, 0);
+        int sch = portal_scheme_of(v);
+        g_variant_unref(v);
+        if (sch >= 0 && sch != g_portal_scheme) {
+            g_portal_scheme = sch;
+            appearance_changed();
+        }
+    }
+    g_variant_unref(ret);
+}
+
+static void on_portal_changed(GDBusConnection *c, const gchar *sender, const gchar *path,
+                              const gchar *iface, const gchar *sig, GVariant *params,
+                              gpointer data) {
+    const gchar *ns = NULL, *key = NULL;
+    GVariant *v = NULL;
+    (void)c;
+    (void)sender;
+    (void)path;
+    (void)iface;
+    (void)sig;
+    (void)data;
+    if (!g_variant_is_of_type(params, G_VARIANT_TYPE("(ssv)"))) return;
+    g_variant_get(params, "(&s&sv)", &ns, &key, &v);
+    if (ns && key && !strcmp(ns, "org.freedesktop.appearance") && !strcmp(key, "color-scheme")) {
+        int sch = portal_scheme_of(v);
+        if (sch >= 0 && sch != g_portal_scheme) {
+            g_portal_scheme = sch;
+            appearance_changed();
+        }
+    }
+    if (v) g_variant_unref(v);
+}
+
+static void on_bus(GObject *src, GAsyncResult *res, gpointer data) {
+    (void)src;
+    (void)data;
+    g_bus = g_bus_get_finish(res, NULL);
+    if (!g_bus) return;
+    g_portal_sub = g_dbus_connection_signal_subscribe(
+        g_bus, "org.freedesktop.portal.Desktop", "org.freedesktop.portal.Settings",
+        "SettingChanged", "/org/freedesktop/portal/desktop", "org.freedesktop.appearance",
+        G_DBUS_SIGNAL_FLAGS_NONE, on_portal_changed, NULL, NULL);
+    g_dbus_connection_call(g_bus, "org.freedesktop.portal.Desktop",
+                           "/org/freedesktop/portal/desktop", "org.freedesktop.portal.Settings",
+                           "Read", g_variant_new("(ss)", "org.freedesktop.appearance",
+                                                 "color-scheme"),
+                           G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NO_AUTO_START, 500, NULL,
+                           on_portal_read, NULL);
+}
+
+/* Tests: SIGUSR1 flips prefer-dark (the notify above follows). */
+static gboolean on_usr1(gpointer data) {
+    GtkSettings *st = gtk_settings_get_default();
+    gboolean dark = FALSE;
+    (void)data;
+    if (st) {
+        g_object_get(st, "gtk-application-prefer-dark-theme", &dark, NULL);
+        g_object_set(st, "gtk-application-prefer-dark-theme", !dark, NULL);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void appearance_init(void) {
+    GtkSettings *st = gtk_settings_get_default();
+    const char *t = getenv("RTX_UI_TEST_APPEARANCE");
+    if (st) {
+        g_sig_dark = g_signal_connect(st, "notify::gtk-application-prefer-dark-theme",
+                                      G_CALLBACK(on_settings_notify), NULL);
+        g_sig_tname = g_signal_connect(st, "notify::gtk-theme-name",
+                                       G_CALLBACK(on_settings_notify), NULL);
+    }
+    /* The portal only where a session bus is: never autolaunch one. */
+    {
+        const char *bus = getenv("DBUS_SESSION_BUS_ADDRESS");
+        if (bus && bus[0]) g_bus_get(G_BUS_TYPE_SESSION, NULL, on_bus, NULL);
+    }
+    if (t && t[0] == '1') g_usr1 = g_unix_signal_add(SIGUSR1, on_usr1, NULL);
+}
+
+static void appearance_fini(void) {
+    GtkSettings *st = gtk_settings_get_default();
+    if (st) {
+        if (g_sig_dark) g_signal_handler_disconnect(st, g_sig_dark);
+        if (g_sig_tname) g_signal_handler_disconnect(st, g_sig_tname);
+    }
+    g_sig_dark = g_sig_tname = 0;
+    if (g_bus) {
+        if (g_portal_sub) g_dbus_connection_signal_unsubscribe(g_bus, g_portal_sub);
+        g_object_unref(g_bus);
+    }
+    g_portal_sub = 0;
+    g_bus = NULL;
+    if (g_usr1) g_source_remove(g_usr1);
+    g_usr1 = 0;
+}
+
 void ui_os_init(uiWindow *win, uiArea *area) {
     GtkWidget *top;
+    appearance_init();
     g_win = win;
     g_area = area;
     g_area_w = area_widget();
@@ -458,6 +621,7 @@ void ui_os_init(uiWindow *win, uiArea *area) {
 
 void ui_os_fini(void) {
     GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    appearance_fini();
     /* Hand the text to a clipboard manager (if any) before we exit. */
     if (cb) gtk_clipboard_store(cb);
     if (g_area_w) {

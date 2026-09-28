@@ -236,7 +236,15 @@ int cr_js_compile(const char *name, const char *src, size_t n, uint8_t **out, si
         return 1;
     }
     JS_SetMaxStackSize(rt, 64u << 20);
-    JS_SetStripInfo(rt, JS_STRIP_SOURCE); /* keep line numbers, drop the source text */
+    /* All debug info off (QuickJS's `qjsc -s`): no source text, no file
+     * name or line table, no local variable names (kept in any function
+     * that calls eval). Mermaid's bytecode shrinks from 8.5 to 6.2 MB (2.3
+     * MB in the pack instead of 3.5). What a user sees is unchanged: the
+     * helper reports an exception's "Name: message" (exc_text), never its
+     * stack, and Mermaid's and MathJax's messages are their own strings.
+     * Lost: line numbers in `.stack`, and the variable's name in a
+     * "lexical variable is not initialized" ReferenceError. */
+    JS_SetStripInfo(rt, JS_STRIP_DEBUG);
     ctx = JS_NewContext(rt);
     fn = JS_Eval(ctx, src, n, name, JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
     if (JS_IsException(fn)) {

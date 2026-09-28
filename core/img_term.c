@@ -463,6 +463,23 @@ static void ti_cell(int glyphs, int colors, int n, const int *pr, const int *pg,
     }
 }
 
+void rtx_timg_matte(uint8_t *rgba, uint32_t w, uint32_t h, uint32_t stride, uint32_t bg) {
+    unsigned br = (bg >> 16) & 255u, bgc = (bg >> 8) & 255u, bb = bg & 255u;
+    uint32_t x, y;
+    if (!rgba) return;
+    for (y = 0; y < h; y++) {
+        uint8_t *p = rgba + (size_t)y * stride;
+        for (x = 0; x < w; x++, p += 4) {
+            unsigned a = p[3], ia;
+            if (a == 0 || a == 255) continue;
+            ia = 255u - a;
+            p[0] = (uint8_t)((p[0] * a + br * ia + 127u) / 255u);
+            p[1] = (uint8_t)((p[1] * a + bgc * ia + 127u) / 255u);
+            p[2] = (uint8_t)((p[2] * a + bb * ia + 127u) / 255u);
+        }
+    }
+}
+
 int rtx_timg_blocks(const uint8_t *rgba, uint32_t w, uint32_t h, uint32_t stride,
                     uint32_t disp_w, uint32_t disp_h, uint32_t cell_w, uint32_t cell_h,
                     uint32_t cols, uint32_t rows, int glyphs, int colors, int dither,

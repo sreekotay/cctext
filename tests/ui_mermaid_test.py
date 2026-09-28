@@ -140,11 +140,13 @@ def case_slide(exe, env, tmp):
         if not s.ok:
             print("skip: slide (no screenshot)")
             return
-        # Marp's default theme is light: mermaid's default theme, whose
-        # node fill is a pale lavender (#ECECFF).
-        lav = I.count(s, (236, 236, 255), tol=6)
+        # Marp's default theme is light: mermaid's default theme with the
+        # slide's colours, the node fill its white mixed 12 % toward its
+        # accent #0969da (core/img.ccs img_mm_opts).
+        fill = tuple((b * 88 + a * 12 + 50) // 100 for b, a in zip((255, 255, 255), (9, 105, 218)))
+        lav = I.count(s, fill, tol=6)
         I.check(lav > 1500, "mermaid slide: the diagram in the slide's (light) theme",
-                "%d lavender px" % lav)
+                "%d fill px %s" % (lav, fill))
     finally:
         U.stop(p)
 

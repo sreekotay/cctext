@@ -848,27 +848,52 @@ static void serve(int sandboxed)
 
 #ifdef CR_SELFTEST
 #include <sys/mman.h>
+#include <sys/socket.h>
 static int selftest(const char *t)
 {
     /* The policy: a file open fails soft, then the named escape must kill
-     * the process (SIGSYS) before "survived" prints. */
+     * the process (SIGSYS) before "survived" prints. Seatbelt (macOS)
+     * refuses with an error instead: exit 0 when the call failed, 1 when
+     * it went through. It cannot refuse a thread ("thread" survives). */
     FILE *f = fopen("/etc/passwd", "r");
+    int esc = -1;
     fprintf(stderr, "[selftest] fopen(/etc/passwd) -> %s (errno %d)\n", f ? "OPENED" : "denied",
             f ? 0 : errno);
+#if defined(__linux__)
     if (!strcmp(t, "open")) return f ? 1 : (errno == EACCES ? 0 : 2);
-    if (!strcmp(t, "socket")) syscall(SYS_socket, 2, 1, 0);
+    if (!strcmp(t, "socket")) esc = syscall(SYS_socket, 2, 1, 0) >= 0;
+#else
+    /* the rlimit on descriptors may refuse the open before the profile */
+    if (!strcmp(t, "open"))
+        return f ? 1 : (errno == EACCES || errno == EPERM || errno == EMFILE ? 0 : 2);
+    if (!strcmp(t, "socket")) esc = socket(AF_INET, SOCK_STREAM, 0) >= 0;
+#endif
     if (!strcmp(t, "exec")) {
         char *a[] = {"/bin/true", NULL};
         execve(a[0], a, NULL);
+        esc = 0;
     }
-    if (!strcmp(t, "fork")) (void)fork();
-    if (!strcmp(t, "mmapx")) (void)mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
-                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (!strcmp(t, "fork")) {
+        pid_t p = fork();
+        if (p == 0) _exit(0);
+        esc = p > 0;
+    }
+    if (!strcmp(t, "mmapx"))
+        esc = mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1,
+                   0) != MAP_FAILED;
     if (!strcmp(t, "readfd")) {
         char c;
-        if (read(3, &c, 1) < 0) fprintf(stderr, "[selftest] read(3) failed\n");
+        esc = read(3, &c, 1) >= 0;
+        if (!esc) fprintf(stderr, "[selftest] read(3) failed\n");
     }
+#if defined(__linux__)
     if (!strcmp(t, "thread")) syscall(SYS_clone, 0x50f00, 0, 0, 0, 0);
+#else
+    if (esc >= 0) {
+        fprintf(stderr, "[selftest] %s %s\n", t, esc ? "ESCAPED" : "denied");
+        return esc ? 1 : 0;
+    }
+#endif
     fprintf(stderr, "[selftest] %s survived\n", t);
     return 9;
 }

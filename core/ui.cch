@@ -23,6 +23,7 @@
 #include "slides.cch"
 #include "wb.cch"
 #include "sindex.cch"
+#include "theme.cch"
 
 const char *rtx_help_line(size_t i);
 /* Regenerate the help lines from the command table + keymap. */
@@ -1302,6 +1303,9 @@ typedef struct {
                      * the text (reverse-video cell, painted bar) instead of
                      * the terminal cursor / OS caret layer */
     int caret_fade; /* --caret-fade: the GUI caret layer fades (~100 ms) */
+    int theme;      /* --theme / settings "theme" / RTX_THEME: RTX_THEME_DARK,
+                     * _LIGHT or _AUTO (the default: the OS appearance in
+                     * cctext-ui, the terminal's background in cctext) */
     int backup;
     int no_autopair; /* --no-autopair: typed openers do not close themselves */
     int tab_spaces;  /* --tab-spaces=N: Tab inserts N spaces (0 = a tab) */
@@ -1377,6 +1381,7 @@ void rtx_cli_usage(FILE *fp, const char *prog) {
     fprintf(fp, "                             (default), or painted into the text (cell;\n");
     fprintf(fp, "                             also RTX_CARET=cell)\n");
     fprintf(fp, "  --caret-fade               cctext-ui: the caret fades in and out\n");
+    fprintf(fp, "  --theme=dark|light|auto    colours (auto: the OS / terminal background)\n");
     fprintf(fp, "  --backup                   save in place (keep symlink); path~ is dirty span\n");
     fprintf(fp, "  --no-autopair              typed ( [ { \" ` * _ do not insert their closer\n");
     fprintf(fp, "  --tab-spaces=N             Tab inserts N spaces (0-16; default a tab)\n");
@@ -1457,6 +1462,7 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
         if (st.has_blink) cli->no_blink = !st.blink;
         if (st.has_caret) cli->caret_cell = st.caret_cell;
         if (st.has_caret_fade) cli->caret_fade = st.caret_fade;
+        cli->theme = st.theme ? st.theme - 1 : RTX_THEME_AUTO;
         if (st.has_rich) cli->rich = st.rich;
         if (st.has_esc_timeout_ms) cli->esc_ms = st.esc_timeout_ms;
         if (st.has_scroll_regions) cli->no_scroll_regions = !st.scroll_regions;
@@ -1506,6 +1512,11 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
     }
     cli->tabs = -1;
     {
+        /* RTX_THEME (tests, scripts) beats settings.json; --theme beats both. */
+        int th = rtx_theme_mode_parse(getenv("RTX_THEME"));
+        if (th >= 0) cli->theme = th;
+    }
+    {
         const char *ce = getenv("RTX_CARET");
         if (ce && ce[0] && cc_slice_cstr(ce).eq_cstr("cell")) cli->caret_cell = 1;
     }
@@ -1552,6 +1563,15 @@ int rtx_cli_parse(int argc, char **argv, char **files, int max_files,
             }
             if (opt.eq_cstr("--caret-fade")) {
                 cli->caret_fade = 1;
+                continue;
+            }
+            if (opt.starts_with(CC_SLICE_LIT("--theme="))) {
+                int th = rtx_theme_mode_parse(a + 8);
+                if (th < 0) {
+                    fprintf(stderr, "unknown --theme (dark|light|auto)\n");
+                    return 1;
+                }
+                cli->theme = th;
                 continue;
             }
             if (opt.eq_cstr("--backup")) {
@@ -1926,6 +1946,67 @@ void rtx_ui_wb_register(void) {
     (void)rtx_cmd_register(&row);
 }
 
+/* ---- theme (core/theme.cch; README "Settings") ---------------------------- */
+
+/* The renderers follow the palette: Mermaid's colours and the formula
+ * colour (a change re-keys every diagram and formula: the visible ones
+ * render first, the rest when they scroll into view; the old pictures
+ * stay up, dimmed, meanwhile). In a terminal that answered OSC 11 the
+ * diagram's background and a stale picture's fade are its background. */
+void rtx_ui_theme_sync(void) {
+    RtxMmTheme mt;
+    int32_t tb = rtx_theme_term_bg();
+    uint32_t bg = tb >= 0 ? (uint32_t)tb : rtx_pal(RTX_P_MM_BG);
+    rtx_img_mm_theme_rgb(bg, rtx_pal(RTX_P_MM_FG), rtx_pal(RTX_P_MM_ACCENT), &mt);
+    /* The palette decides dark / light, not a mid-grey terminal. */
+    mt.dark = !rtx_theme_light();
+    rtx_img_mm_theme_set(&mt);
+    rtx_img_math_fg_set(rtx_pal(RTX_P_MATH_FG));
+    rtx_img_dim_bg_set(tb >= 0 ? (uint32_t)tb : (rtx_theme_light() ? 0xffffffu : 0));
+}
+
+/* Set the theme (1 light) and sync the renderers. 1 = it changed: the
+ * host repaints everything (rtx_theme_gen moved). */
+int rtx_ui_theme_apply(int light) {
+    int ch = rtx_theme_set(light);
+    rtx_ui_theme_sync();
+    return ch;
+}
+
+/* The mode's answer: dark / light as set, auto from what the OS or the
+ * terminal says (sys: 1 light, 0 dark, -1 unknown: dark). */
+int rtx_ui_theme_pick(int mode, int sys) {
+    if (mode == RTX_THEME_LIGHT) return 1;
+    if (mode == RTX_THEME_DARK) return 0;
+    return sys == 1;
+}
+
+/* "view.theme": flip light / dark for this session. A flip pins the
+ * mode, so a later OS appearance change does not undo it. */
+int rtx_ui_theme_toggle_run(RtxCmdCtx *c) {
+    int light = !rtx_theme_light();
+    rtx_theme_mode_set(light ? RTX_THEME_LIGHT : RTX_THEME_DARK);
+    rtx_ui_theme_apply(light);
+    if (c) snprintf(c->status, sizeof c->status, "theme: %s", light ? "light" : "dark");
+    return 1;
+}
+
+void rtx_ui_theme_register(void) {
+    static int done;
+    RtxCmdDef row;
+    if (done) return;
+    done = 1;
+    memset(&row, 0, sizeof row);
+    row.id = "view.theme";
+    row.title = "Toggle Light/Dark";
+    row.cat = "View";
+    row.cmd = CMD_NONE;
+    row.menu = "View";
+    row.notes = "  this session; settings.json \"theme\": auto / dark / light";
+    row.run = rtx_ui_theme_toggle_run;
+    (void)rtx_cmd_register(&row);
+}
+
 /* Host start: settings that live outside RtxCli (rich default), the
  * keymap for this host, and the help lines. Trouble with either file goes
  * to `status` (the status bar), never a failure. */
@@ -1935,6 +2016,8 @@ void rtx_cli_setup_keys(RtxCli *cli, int host, char *status, size_t status_n) {
     if (!cli) return;
     if (cli->rich >= 0) rtx_safe_set_rich_default(cli->rich);
     rtx_ui_wb_register();
+    rtx_ui_theme_register();
+    rtx_theme_mode_set(cli->theme);
     rtx_keymap_setup(host, cli->keys_path, kerr, sizeof kerr);
     rtx_help_rebuild();
     if (!status || !status_n) return;

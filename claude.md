@@ -180,3 +180,12 @@ builtins and fine). `core/wb.ccs` carries its own `wb_floor` & co.
 and refuses an untracked one (`cc_slice_from_buffer` → `untracked
 buffer`): tests clone into an arena that outlives the doc
 (`src.clone_into(a)`, as edit_group_smoke does).
+
+## `third_party/quickjs/VERSION` is `<version>` on macOS (2026-09-28)
+
+APFS is case-insensitive: with `-Ithird_party/quickjs`, libc++'s
+`#include <version>` opens QuickJS's `VERSION` file and every lunasvg
+`.cpp` fails with `third_party/quickjs/version:1:1: error: expected
+unqualified-id` (`2026-06-04`). `scripts/render_build.cch` adds QuickJS
+with `-iquote`. Any vendored dir holding a file named like a standard
+header (`VERSION`, `ASSERT`, ...) must not be a `-I` dir.

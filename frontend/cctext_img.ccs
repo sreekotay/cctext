@@ -26,6 +26,7 @@
 #include "../core/img.cch"
 #include "../core/img_term.h"
 #include "../core/rtx_par.cch"
+#include "../core/theme.cch"
 #include "../core/utf8.cch"
 #include "cctext_img.cch"
 
@@ -53,8 +54,22 @@ static struct {
     char name[64];         /* XTVERSION */
     char tmpdir[160];
     int detected;
+    int32_t term_bg;       /* OSC 11 answer, 0xRRGGBB; -1 none */
 } G = {CCTI_AUTO, RTX_TIMG_HALF, 0, 64, CCTI_OFF, -1, 0, 0, 0, 0, 0, 0,
-       0, 0, 0, 0, 8, 16, 0, 24, 80, 1, "", "/tmp", 0};
+       0, 0, 0, 0, 8, 16, 0, 24, 80, 1, "", "/tmp", 0, -1};
+
+int32_t cctext_img_term_bg(void) {
+    return G.term_bg;
+}
+
+/* What a translucent pixel composites against in block art and sixel:
+ * the terminal's background when it said (OSC 11), else the theme's
+ * guess (white for light, black for dark). */
+static uint32_t ti_matte(void) {
+    int32_t tb = rtx_theme_term_bg();
+    if (tb >= 0) return (uint32_t)tb;
+    return rtx_theme_light() ? 0xffffffu : 0;
+}
 
 static long ti_now_ms(void) {
     struct timespec ts;
@@ -100,12 +115,15 @@ int cctext_img_proto(void) {
 
 const char *cctext_img_desc(char *buf, size_t n) {
     static const char *nm[] = {"text", "blocks", "kitty", "sixel", "iterm"};
-    snprintf(buf, n, "%s%s%s, %s colour, cell %ux%u%s%s", nm[G.proto],
+    char bg[24];
+    if (G.term_bg >= 0) snprintf(bg, sizeof bg, ", bg #%06x", (unsigned)G.term_bg);
+    else snprintf(bg, sizeof bg, ", bg unknown");
+    snprintf(buf, n, "%s%s%s, %s colour, cell %ux%u%s%s%s", nm[G.proto],
              G.proto == CCTI_KITTY && G.tmux ? " (tmux passthrough)" : "",
              G.proto == CCTI_KITTY && G.local ? " (temp files)" : "",
              G.colors == RTX_TIMG_TRUE ? "24-bit" : G.colors == RTX_TIMG_256 ? "256" : "no",
              (unsigned)G.cw, (unsigned)G.ch, G.px_known ? "" : " (assumed)",
-             G.ssh ? ", ssh" : "");
+             G.ssh ? ", ssh" : "", bg);
     return buf;
 }
 
@@ -264,6 +282,11 @@ static long ti_reply(const unsigned char *b, size_t n, int qid, int qid2) {
             } else if (strstr(body, "$r")) {
                 if (strstr(body, "2:1:2:3") || strstr(body, "2;1;2;3")) G.rgb_ok = 1;
             }
+        } else if (b[1] == ']') {
+            /* OSC 11: the background colour (the theme's auto, the
+             * pictures' matte). */
+            uint32_t rgb;
+            if (rtx_theme_osc11(b, e, &rgb)) G.term_bg = (int32_t)rgb;
         }
         return (long)e;
     }
@@ -344,7 +367,18 @@ void cctext_img_detect(unsigned char *left, size_t cap, size_t *leftn) {
     qid = (G.msb << 24) | 250;
     qid2 = (G.msb << 24) | 251;
     need_q = G.want != CCTI_OFF;
-    if (need_q) {
+    {
+        /* OSC 11 (the background) goes first, whatever the pictures:
+         * DA1 after it bounds the wait. A reply after the budget is an
+         * OSC string the key decoder swallows. */
+        static const char q11[] = "\x1b]11;?\x1b\\";
+        memcpy(q + qn, q11, sizeof q11 - 1);
+        qn += sizeof q11 - 1;
+    }
+    if (!need_q) {
+        memcpy(q + qn, "\x1b[c", 3);
+        qn += 3;
+    } else {
         char k1[128], k2[512], b64[400];
         int n1, n2 = 0;
         n1 = snprintf(k1, sizeof k1, "\x1b_Gi=%d,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\", qid);
@@ -394,6 +428,8 @@ void cctext_img_detect(unsigned char *left, size_t cap, size_t *leftn) {
         }
         memcpy(q + qn, "\x1b[c", 3);
         qn += 3;
+    }
+    {
         fflush(stdout);
         ti_write(STDOUT_FILENO, q, qn);
         t0 = ti_now_ms();
@@ -403,7 +439,7 @@ void cctext_img_detect(unsigned char *left, size_t cap, size_t *leftn) {
             struct timeval tv;
             ssize_t got;
             size_t at = 0;
-            if (G.da1 && (!G.tmux || G.pass_echo)) break;
+            if (G.da1 && (!need_q || !G.tmux || G.pass_echo)) break;
             if (left_ms <= 0) break;
             FD_ZERO(&rf);
             FD_SET(STDIN_FILENO, &rf);
@@ -475,6 +511,7 @@ struct TiEnc {
     uint32_t dw, dh;
     int cx, cy, cn, rn;    /* crop, cells (overlays); else 0, 0, cols, rows */
     int glyphs, colors, dither;
+    uint32_t matte;        /* blocks / sixel: the background composited under */
     int state;
     uint64_t used;
     uint8_t *in;           /* queued: its own copy of the pixels */
@@ -575,6 +612,7 @@ typedef struct {
     uint32_t w, h, dw, dh, cw, ch;
     int cols, rows, cx, cy, cn, rn;
     int glyphs, colors, dither, tmux, local, regs;
+    uint32_t matte;        /* blocks / sixel: translucency over this */
     uint32_t kid;
     char tfile[200];
     RtxTimgCell *cells;
@@ -704,6 +742,11 @@ static int ti_kitty_build(TiJob *j, const uint8_t *z, size_t zn, TiOut *o) {
 
 static void ti_job_run(TiJob *j) {
     j->ok = 0;
+    /* Block art and sixel keep no alpha between clear and opaque: a
+     * translucent pixel shows over the terminal's background. kitty and
+     * iTerm2 composite themselves. */
+    if (j->kind == CCTI_BLOCKS || j->kind == CCTI_SIXEL)
+        rtx_timg_matte(j->px, j->w, j->h, j->w * 4, j->matte);
     if (j->kind == CCTI_BLOCKS) {
         j->cells = (RtxTimgCell *)malloc((size_t)j->cols * (size_t)j->rows * sizeof(RtxTimgCell));
         if (j->cells)
@@ -883,6 +926,7 @@ static void ti_schedule(void) {
     j->tmux = G.tmux;
     j->local = pick->kind == CCTI_KITTY && G.local;
     j->regs = G.sixel_regs;
+    j->matte = pick->matte;
     j->kid = pick->kid;
     if (j->local) {
         snprintf(j->tfile, sizeof j->tfile, "%s/tty-graphics-protocol-cctext-%d-%d-%08x",
@@ -932,7 +976,8 @@ static TiEnc *ti_enc_get(const RtxImgBmp *bmp, uint32_t frame, int kind, int col
             e->rows == rows && e->dw == dw && e->dh == dh && e->cx == cx && e->cy == cy &&
             e->cn == cn && e->rn == rn &&
             (kind != CCTI_BLOCKS || (e->glyphs == G.glyphs && e->colors == G.colors &&
-                                     e->dither == G.dither))) {
+                                     e->dither == G.dither)) &&
+            ((kind != CCTI_BLOCKS && kind != CCTI_SIXEL) || e->matte == ti_matte())) {
             e->used = g_epoch;
             if (e->state == TE_RUN && e->cancel) {
                 e->cancel = 0;
@@ -973,6 +1018,7 @@ static TiEnc *ti_enc_get(const RtxImgBmp *bmp, uint32_t frame, int kind, int col
     e->glyphs = G.glyphs;
     e->colors = G.colors;
     e->dither = G.dither;
+    e->matte = ti_matte();
     e->used = g_epoch;
     e->state = TE_QUEUED;
     if (kind == CCTI_KITTY) {
@@ -1218,7 +1264,7 @@ int cctext_img_line(const CctiPic *p, int li, int c0, int n, int srow, int scol)
         int k, used;
         rtx_img_info(p->src, &v);
         k = ti_wait_text(p, &v, buf, sizeof buf);
-        fputs("\x1b[0;90m", stdout);
+        fputs(rtx_theme_light() ? "\x1b[0;38;5;243m" : "\x1b[0;90m", stdout);
         used = c0 < k ? cctext_put_text(buf + c0, (size_t)(k - c0), n, NULL) : 0;
         for (i = used; i < n; i++) fputc(' ', stdout);
         fputs("\x1b[0m", stdout);

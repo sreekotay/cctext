@@ -51,7 +51,7 @@ CC_TARGET rtx_find obj core/find.ccs core/proj.ccs core/sindex.ccs
 CC_TARGET_INCLUDE rtx_find .
 CC_TARGET_DEPS rtx_find rtx_piece_tree rtx_scope rtx_document rtx_rx
 
-CC_TARGET rtx_scope obj core/scope.ccs
+CC_TARGET rtx_scope obj core/scope.ccs core/theme.ccs
 CC_TARGET_INCLUDE rtx_scope .
 
 CC_TARGET rtx_rx obj core/rx.ccs
@@ -99,6 +99,10 @@ CC_TARGET_DEPS slides_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav
 CC_TARGET cmd_table_smoke exe tests/cmd_table_smoke.ccs
 CC_TARGET_INCLUDE cmd_table_smoke .
 CC_TARGET_DEPS cmd_table_smoke rtx_ui_help rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_rx rtx_page_store
+
+CC_TARGET theme_smoke exe tests/theme_smoke.ccs
+CC_TARGET_INCLUDE theme_smoke .
+CC_TARGET_DEPS theme_smoke rtx_ui_help rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_rx rtx_page_store
 CC_TARGET workspace_smoke exe tests/workspace_smoke.ccs
 CC_TARGET_INCLUDE workspace_smoke .
 CC_TARGET_DEPS workspace_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui

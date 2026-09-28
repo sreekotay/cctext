@@ -121,6 +121,18 @@ void ui_os_image_free(void *img);
 void ui_os_image_draw(uiDrawContext *ctx, void *img, double x, double y, double w,
                       double h, double alpha);
 
+/* The OS appearance for theme "auto" (README "Settings"): 1 dark, 0
+ * light, -1 unknown. GTK: the desktop portal's color-scheme when it has
+ * answered (org.freedesktop.appearance), else the GtkSettings
+ * gtk-application-prefer-dark-theme, else a gtk-theme-name that says
+ * "dark". AppKit: NSApp.effectiveAppearance (Dark Aqua or not). Valid
+ * after ui_os_init. A change arrives as ui_plat_appearance (signals /
+ * key-value observation: nothing polls). */
+int ui_os_appearance_dark(void);
+
+/* Toolkit → portable: the OS appearance changed (dark 1 / 0). */
+void ui_plat_appearance(int dark);
+
 /* Toolkit → portable: wheel notches this event. +y = up (away from the
  * user); +x = scroll_x(+1), the view moves right. Fractions accumulate. */
 void ui_plat_wheel(float dx, float dy);

@@ -302,17 +302,30 @@ xterm cube / grey ramp (Floyd–Steinberg with `tui_dither`), build sixel
 bands with run-length repeats, and write PNG and zlib (a fixed-Huffman
 deflate with LZ77) for kitty's `o=z` and iTerm2 — no zlib dependency.
 
-**Detection** runs once the TTY is raw, before the first frame: a kitty
-query (and, when not over SSH, a second one naming a temp file, `t=t`:
-an OK means the terminal reads our files), XTVERSION, `CSI 16 t` when
-`TIOCGWINSZ` has no pixel size, `XTSMGRAPHICS`, a truecolor `DECRQSS`
-probe (unless `COLORTERM` says so), then DA1. Every terminal answers DA1,
+**Detection** runs once the TTY is raw, before the first frame: OSC 11
+(the background colour; asked even with pictures off, for the theme), a
+kitty query (and, when not over SSH, a second one naming a temp file,
+`t=t`: an OK means the terminal reads our files), XTVERSION, `CSI 16 t`
+when `TIOCGWINSZ` has no pixel size, `XTSMGRAPHICS`, a truecolor
+`DECRQSS` probe (unless `COLORTERM` says so), then DA1. Every terminal answers DA1,
 so its reply ends the wait; with no reply at all the wait is at most
 150 ms (`RTX_TUI_DETECT_MS`), then block art (or the text stand-in).
 Keys typed meanwhile stay input; a reply that comes later is swallowed
 by the key decoder (an `APC G`, a DCS or an OSC string), never typed.
 The cell size is `ws_xpixel / ws_col` × `ws_ypixel / ws_row`, else the
 `CSI 16 t` reply, else 8 × 16 (1:2).
+
+**The background** (OSC 11's answer, any X11 spec: `rgb:RRRR/GGGG/BBBB`
+with 1-4 hex digits a channel, `rgba:`, `#rrggbb`; ST or BEL) decides
+theme auto by luminance (light above a relative luminance of 0.18, where
+black text contrasts more than white), is the diagram background Mermaid
+gets in the terminal, and is what pictures composite over: block art and
+sixel keep only clear (alpha < 50 %) or opaque, so a translucent pixel's
+colour is first blended over it (`rtx_timg_matte`; kitty and iTerm2
+composite alpha themselves), and a stale picture fades toward it rather
+than toward black. With no answer the theme's guess stands in (white for
+light, black for dark); a terminal that answers late (after DA1) has its
+reply swallowed like any other.
 
 **tmux**: the kitty query and XTVERSION go through DCS passthrough; only
 if the outer terminal's echo comes back (`allow-passthrough` on) are
@@ -430,13 +443,14 @@ only, and no make, cmake, meson or shell script is involved — one
 compile per CPU, rebuilt when a source, a header or the flags change.
 The helper then builds its own font pack: `bin/cctext-render
 --build-pack render/manifest.txt bin/cctext-render.pack` (every entry
-zlib-compressed with stb's deflate and checked by a round trip through
-Wuffs, which inflates it at run time; format `CRPK0003`: the table of
+zlib-compressed at level 9 with miniz's deflate (`third_party/miniz`,
+build time only) and checked by a round trip through Wuffs, which
+inflates it at run time; format `CRPK0003`: the table of
 names, lengths and offsets at the front, guarded by an FNV-1a trailer;
 the helper maps the file read-only and pages in only what it uses).
 Outputs: `bin/cctext-render` (1.4 MiB stripped: ≈ 450 KiB of it
-the SVG engine, the rest QuickJS), the pack (10.9 MiB: 1.3 MiB of fonts,
-4.2 MiB of Mermaid bytecode, 5.7 MiB of math — [Mermaid](#mermaid) has
+the SVG engine, the rest QuickJS), the pack (6.9 MiB: 1.1 MiB of fonts,
+2.2 MiB of Mermaid bytecode, 3.6 MiB of math — [Mermaid](#mermaid) has
 the two-step build, [Math](#math) the breakdown) and
 `bin/cctext-render-selftest` (tests only). `@dist_cctext` packs the
 helper and its pack beside the editors; the editor looks for the helper
@@ -535,9 +549,10 @@ to edit); `Ctrl-D` (Rich / Source) swaps the pane to its picture and
 back, with the viewer's zoom keys (a zoom re-renders sharp) — the
 preview shows the file on disk, so save to see an edit. cctext (the
 terminal) shows the stand-in `[image: alt WxH]` until terminal graphics
-land. SVGs draw as they are; in cctext-ui's dark panes a light backing
+land. SVGs draw as they are; in cctext-ui's dark theme a light backing
 plate goes under them (`svg_backing`, default on; slides paint their own
 background and skip it), since many SVGs are dark lines on transparency.
+The light theme never draws the plate (the pane already is light).
 
 **Limits** (`settings.json`):
 
@@ -547,7 +562,7 @@ background and skip it), since many SVGs are dark lines on transparency.
 | Rendered pixels | 16 megapixels | `svg_max_mp` |
 | One render (then killed) | 5000 ms | `svg_timeout_ms` |
 | Disk cache (sizes + pixels) | 64 MiB | `svg_cache_mb` (0 = off) |
-| Backing plate in dark panes | on | `svg_backing` |
+| Backing plate in the dark theme | on | `svg_backing` |
 
 The helper's own ceilings sit above these: 64 MiB of input, 64 megapixels
 and 32768 px a side per request, 2 GiB of address space.
@@ -597,6 +612,48 @@ the editor's 5 s budget ends; not yet reduced).
   2 KiB); left to the terminal-images work in `cctext_draw.ccs`.
 - Windows: the AppContainer launcher; macOS: run the self-tests.
 
+### Pack compression
+
+The pack's entries are compressed once, by `--build-pack`, and inflated
+by Wuffs in the helper; only the build side changed. Measured on this
+container (`python3 bench/render_client.py`, and a harness running each
+encoder over every entry and Wuffs over each result, best of 5):
+
+| | stb (fixed Huffman) | miniz level 9 | zopfli (15 iterations) |
+|---|---|---|---|
+| Fonts (5 faces, 2.2 MB) | 1.31 MB | 1.14 MB | 1.06 MB |
+| `js:mermaid` bytecode (8.46 MB with line tables) | 4.22 MB | 3.45 MB | 3.33 MB |
+| `js:math` bytecode (1.76 MB with line tables) | 0.96 MB | 0.71 MB | 0.65 MB |
+| Math source modules (74 entries, 10.2 MB) | 4.90 MB | 3.20 MB | 2.88 MB |
+| Pack | 11.39 MB | 8.49 MB | 7.91 MB |
+| Encoder time, all entries, one core | 1.5 s | 2.3 s | 89 s (42 s at 1 iteration: 7.97 MB) |
+| Wuffs inflate, all entries | 67 ms | 72 ms | 76 ms |
+
+miniz (`third_party/miniz`, MIT, only its deflate encoder, compiled into
+`cr_pack.c`) is the default and the only encoder: zopfli would save
+another 0.6 MB (7 %) for 40 times the encoder time on every pack
+rebuild, so it is not vendored. The bytecode is also compiled without
+debug information (`JS_STRIP_DEBUG`, [Mermaid](#mermaid)): `js:mermaid`
+is 6.15 MB raw and 2.26 MB packed, `js:math` 1.59 and 0.61 MB. Together:
+
+| | before | now |
+|---|---|---|
+| `bin/cctext-render.pack` | 11,393,329 B (10.9 MiB) | 7,211,183 B (6.9 MiB) |
+| `--build-pack` wall time | 5.5–6.0 s | 4.1–4.3 s (less bytecode to write outweighs the slower encoder) |
+| Mermaid engine: bytecode inflate / start / first pie | 30–32 / 59–65 / 153–162 ms | 22–23 / 54–55 / 132–137 ms |
+| Math engine: bytecode inflate / first formula | 6.0–6.2 / 43–46 ms | 5.3–5.6 / 38–40 ms |
+| RSS with the Mermaid / math engine up | 42.0 / 21.8 MiB | 34.5 / 19.4 MiB |
+
+Dynamic Huffman blocks inflate about 7 % slower than stb's fixed ones for
+the same bytes; stripping the bytecode more than pays for it. Not done:
+the fonts and MathJax's files are the vendored files byte for byte
+(pinned by SHA-256), never minified; no two entries are identical, and
+compressing the 40 font modules as one stream would save 13 KB (a
+32 KiB window finds little across files), so entries stay independent
+streams. The format is `CRPK0003` as before and the pack is still
+deterministic; a pack changes only in its payload bytes, whose hashes
+the build writes into `cr_pack_hash.h` as before.
+
 ## Mermaid
 
 A fenced block whose info string is `mermaid` (any case, backticks or
@@ -634,15 +691,23 @@ bundler to build: a C / C++ compiler and ccc.
   `mermaid_max_height` (720 px: taller diagrams are scaled down),
   `mermaid_recycle_jobs` (0: a fresh engine every N diagrams when set).
 
-**Themes.** A diagram is keyed by its source's hash, its length, the
+<a id="themes"></a>**Themes.** A diagram is keyed by its source's hash, its length, the
 theme and the renderer version (`RTX_MERMAID_VERSION`). The theme is
-Mermaid's `default` or `dark` plus `themeVariables` from the host's
-foreground, background and accent: the editor panes are dark in both
-frontends (a terminal's own background is not asked: a light terminal
-still gets the dark theme); a slide passes its own colours. A theme
-change re-keys every diagram: the visible ones render again (the old
-pictures stay up, dimmed, meanwhile); diagrams off screen wait until
-they are scrolled to.
+Mermaid's `dark` (the dark editor theme) or `default` (the light one),
+plus `themeVariables` from the palette's diagram roles (`mm_bg`,
+`mm_fg`, `mm_accent` in `core/theme.cch`): the node fill is the
+background mixed toward the accent (22 % dark, 12 % light), text and
+labels the foreground, lines the foreground toward the background. In a
+terminal that answered OSC 11 the background is the terminal's. A slide
+passes its own colours (dark or light by its background's luminance).
+Switching the editor theme (`theme` auto following the OS or the
+terminal, **Toggle Light/Dark**) calls `rtx_img_mm_theme_set` and
+`rtx_img_math_fg_set` once (`rtx_ui_theme_sync`): every diagram and
+formula is re-keyed, the layouts refill, and the visible ones render
+again first on their lanes (the old pictures stay up, dimmed,
+meanwhile); diagrams and formulas off screen are not rendered until they
+are scrolled to, and switching back finds the first theme's pictures
+still in the memory / disk caches.
 
 **Security.** Everything the SVG path has (the seccomp sandbox, an empty
 environment, no fetches, the editor treating every byte back as
@@ -735,8 +800,12 @@ Mermaid, the glue, concatenated) to QuickJS bytecode and writes the pack
 (deterministic: the same inputs give the same bytes) and
 `out/render/cr_pack_hash.h`; the helper proper is then compiled with that
 header. The pack is rebuilt when a font, a script, the manifest or the
-boot binary changes. Bytecode is 8.5 MB raw (from 5.6 MB of source) and
-4.2 MB in the pack.
+boot binary changes. Bytecode is compiled with all debug information
+stripped (QuickJS's `JS_STRIP_DEBUG`, as `qjsc -s`: no source text, file
+name, line table or local variable names; the helper reports an
+exception's message, never its stack, so what a user sees is the same):
+6.2 MB raw (from 5.6 MB of source; 8.5 MB with line tables) and 2.3 MB
+in the pack (4.2 MB before: line tables and stb's fixed-Huffman deflate).
 
 **Measured** (Linux x86-64, this container, release build;
 `python3 bench/render_client.py mermaid`, `mermaid_smoke`):
@@ -744,12 +813,12 @@ boot binary changes. Bytecode is 8.5 MB raw (from 5.6 MB of source) and
 | | |
 |---|---|
 | Helper spawn to ready (SVG only; the engine not started) | 14–20 ms |
-| First diagram in a helper (inflate 28–31 ms + engine start 50–75 ms + a small pie) | ≈ 140 ms |
+| First diagram in a helper (inflate 22–23 ms + engine start 54–55 ms + a small pie) | ≈ 135 ms (was 150–160 ms with line tables in the bytecode) |
 | Warm render, size + pixels: pie / Gantt | 17–21 / 26–32 ms |
 | sequence / ER / flowchart | 70–116 / 160–210 / 190–245 ms |
 | class / state | 325–425 / 275–400 ms |
 | Re-raster of a cached diagram (another size) | 3–5 ms |
-| Helper RSS: after hello (lazy) / engine loaded / after a flowchart | 12.1 / 38.6–40 / 46.5 MiB |
+| Helper RSS: after hello (lazy) / engine loaded / after a flowchart | 12.1 / 34.5 / 46.5 MiB (engine loaded: 38.6–42 before the bytecode lost its debug info) |
 | after the seven types / after 250 diagrams | 66 / 73 MiB (JS heap 33–47 MiB, stable) |
 | Parse error or node-cap refusal | a few ms, engine kept |
 | Pack / helper binary (before math; with it: [Math](#math)) | 5.3 MiB / 1.4 MiB |
@@ -783,8 +852,7 @@ budget timeouts).
 
 **Leftovers.** macOS and Windows are untested (Windows has no helper at
 all). A terminal shows the stale diagram without its caption (the error
-reaches the one-line box only when there is no earlier diagram). The
-editor panes' theme is always dark (there is no light editor theme yet).
+reaches the one-line box only when there is no earlier diagram). 
 A fence whose opening line is above the layout window's start lays out
 as text until the view reaches it. `htmlLabels` stays off, so Markdown
 strings in labels draw as plain text; KaTeX in labels, icons (`@{ icon
@@ -851,8 +919,9 @@ C / C++ compiler and ccc: no Node, npm, Rust or bundler.
   `currentColor` becomes the request's `fg`), which is part of its key:
   a colour change (`rtx_img_math_fg_set`) re-keys every formula; the
   visible ones render again (the old pictures stay up, dimmed,
-  meanwhile), the rest when scrolled to. The editor panes are dark in
-  both frontends (as for Mermaid: there is no light editor theme).
+  meanwhile), the rest when scrolled to. The colour is the palette's
+  `math_fg`: light text in the dark theme, dark text in the light one
+  ([Themes](#themes)).
 - Settings (`settings.json`):
 
 | Setting | Default | |
@@ -976,25 +1045,24 @@ Mermaid).
 
 | | |
 |---|---|
-| Pack: before math / with math | 5.3 / 10.9 MiB (+0.9 MiB bytecode, +4.9 MiB source modules) |
-| `js:math` bytecode | 1.76 MB raw (from 1.49 MB of source), 0.96 MB in the pack |
-| Dynamic font files / TeX extensions (source) | 10.0 / 0.2 MB raw, 4.8 / 0.1 MB in the pack |
+| Pack: before math / with math | 5.3 / 10.9 MiB with stb's deflate (+0.9 MiB bytecode, +4.9 MiB source modules); 6.9 MiB now (miniz level 9, bytecode without debug info) |
+| `js:math` bytecode | 1.59 MB raw (from 1.49 MB of source), 0.61 MB in the pack |
+| Dynamic font files / TeX extensions (source) | 10.0 / 0.2 MB raw, 3.1 / 0.08 MB in the pack |
 | Helper binary | 1.4 MiB (unchanged: MathJax is data) |
 | Spawn to ready (any slot; the engine not started) | 12 ms (was 13.6 ms before math) |
 | Helper RSS after hello | 8.7 MiB |
-| First formula in a helper (inflate 6 ms + engine start 9 ms + `x^2+1`) | ≈ 50 ms |
+| First formula in a helper (inflate 5.5 ms + engine start 7 ms + `x^2+1`) | ≈ 40–50 ms |
 | First use of a formula (33 in `formulas.json`, fonts loading on demand) | median 11.6 ms, max 63–80 ms |
 | Warm formula, size + pixels / size only | median 9.8 / 8.8 ms (max 18 ms) |
 | Re-raster of a cached formula | ≈ 2 ms |
-| Helper RSS: first formula / after 33 formulas | 22 / 33 MiB (JS heap 6 / 14 MiB) |
+| Helper RSS: first formula / after 33 formulas | 19.5 / 33 MiB (JS heap 6 / 14 MiB) |
 
 The pack doubled; a helper does not pay for it: the pack is mapped
 read-only, not read, and its table sits together at the front (format
 `CRPK0003`), so an SVG helper pages in the table and the fonts, a math
 helper the fonts, `js:math` and the source modules it loads. Reading the
-pack whole cost 36 ms and 17 MiB per spawn at 10.9 MiB. stb's deflate
-uses fixed Huffman codes; zlib -9 would store the font source in 3.1 MB
-instead of 4.8 MB (a better deflate in the build step is a follow-up).
+pack whole cost 36 ms and 17 MiB per spawn at 10.9 MiB. [Pack
+compression](#pack-compression) has how the pack went from 10.9 to 6.9 MiB.
 
 **Fuzzing.** `bin/cctext-render-fuzz --math PACK testdata/math [ITERS]
 [SEED]` runs the engine in process under ASan + UBSan: the TeX of
@@ -1146,6 +1214,12 @@ under a running helper (the build writes a new file and renames it).
   still, two helper processes (SVG and Mermaid), the dimmed stale
   diagram while an edit renders and the new one after, the helpers exit
   with the editor, a slide's diagram in the slide's light theme.
+- `tests/ui_theme_test.py` (Xvfb): the light theme's Markdown (Mermaid's
+  light theme with the palette's fill, no SVG plate — the dark theme
+  keeps it), formulas in the theme's text colour, a light slide's
+  letterbox, a live GTK prefer-dark switch re-rendering the diagram
+  (zero wakeups after it), and Toggle Light/Dark. The other Xvfb tests
+  run pinned to the dark theme (`RTX_THEME=dark`).
 - `tests/ui_svg_test.py` (Xvfb): an SVG picture in Rich Markdown, still
   while idle, the backing plate under a transparent SVG, one helper
   process that exits with the editor; an `.svg` opens as text and
@@ -1234,9 +1308,9 @@ under a running helper (the build writes a new file and renames it).
   are block art in sixel / iTerm2 terminals. A picture row is one layout
   row N cells tall: like a tall table record it leaves the top of the
   pane whole when the view scrolls past it (its bottom is clipped, never
-  its top). OSC 11 (the background
-  colour) is not asked: a half-transparent pixel composites against the
-  terminal's own background only at the 50 % alpha cut.
+  its top). A terminal that does not answer OSC 11 gets translucency
+  composited over the theme's guess (white / black), which is off for a
+  light-grey or tinted background.
 - macOS drawing and the Win32 blit are untested / stubbed; NSURLSession
   and libcurl backends are not wired (curl is spawned).
 - Decisions are per project root; a document outside any project (no

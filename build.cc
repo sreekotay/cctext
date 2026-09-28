@@ -69,7 +69,7 @@ CC_TARGET rtx_find obj core/find.ccs core/proj.ccs core/sindex.ccs
 CC_TARGET_INCLUDE rtx_find .
 CC_TARGET_DEPS rtx_find rtx_piece_tree rtx_scope rtx_document rtx_rx
 
-CC_TARGET rtx_scope obj core/scope.ccs
+CC_TARGET rtx_scope obj core/scope.ccs core/theme.ccs
 CC_TARGET_INCLUDE rtx_scope .
 
 CC_TARGET rtx_rx obj core/rx.ccs
@@ -224,7 +224,7 @@ CC_TARGET_DEPS term_safe_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_
 
 CC_TARGET browse_walk_smoke exe tests/browse_walk_smoke.ccs
 CC_TARGET_INCLUDE browse_walk_smoke .
-CC_TARGET_DEPS browse_walk_smoke rtx_browse rtx_piece_tree rtx_hex rtx_grid rtx_page_store
+CC_TARGET_DEPS browse_walk_smoke rtx_browse rtx_piece_tree rtx_hex rtx_grid rtx_page_store rtx_scope
 
 CC_TARGET tui_pane_smoke exe tests/tui_pane_smoke.ccs
 CC_TARGET_INCLUDE tui_pane_smoke .

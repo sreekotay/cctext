@@ -61,6 +61,11 @@ int rtx_timg_blocks(const uint8_t *rgba, uint32_t w, uint32_t h, uint32_t stride
                     uint32_t cols, uint32_t rows, int glyphs, int colors, int dither,
                     RtxTimgCell *out);
 
+/* Composite translucent pixels (0 < alpha < 255) of a straight RGBA
+ * picture over bg (0xRRGGBB), in place; alpha is kept (block art and
+ * sixel still cut at 50 %, the colour of what stays is the blend). */
+void rtx_timg_matte(uint8_t *rgba, uint32_t w, uint32_t h, uint32_t stride, uint32_t bg);
+
 /* Nearest xterm palette index (16-255) for an sRGB colour. */
 int rtx_timg_256(uint8_t r, uint8_t g, uint8_t b);
 /* The sRGB colour of xterm palette index i (16-255; 0-15 as xterm's). */

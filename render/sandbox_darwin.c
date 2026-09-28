@@ -2,10 +2,10 @@
  * cctext-render macOS lockdown: rlimits + sandbox_init() with a
  * deny-default profile (the Seatbelt SBPL the system's own services use).
  *
- * NOT BUILT OR RUN in the reference environment (no macOS there): written
- * against the documented API and Chromium's / WebKit's renderer profiles;
- * the first macOS build must run `CR_SELFTEST=...` (the test build) and
- * the svg_smoke protocol tests before this ships.
+ * Written against the documented API and Chromium's / WebKit's renderer
+ * profiles; checked on macOS 26 (arm64) with the `CR_SELFTEST=...` probes
+ * and svg_smoke. A refused call fails with an error (Seatbelt does not
+ * kill as seccomp does); threads cannot be refused.
  *
  * What the profile allows after lockdown: nothing but what a process can
  * do without asking the kernel for a new resource — reading its already

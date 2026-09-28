@@ -41,6 +41,7 @@
  */
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,11 +146,12 @@ static void render_one(const char *what, const char *s, size_t n)
     if (doc) {
         /* The helper's own checks, then a small box (fast under ASan). */
         if (w > 0 && h > 0 && w < 1e7f && h < 1e7f) {
-            float sc = 192.0f / (w > h ? w : h);
-            uint32_t pw = (uint32_t)(w * sc + 0.999f), ph = (uint32_t)(h * sc + 0.999f);
+            /* double: 192 / a denormal side overflows a float to inf */
+            double sc = 192.0 / (w > h ? w : h);
+            double fw = ceil((double)w * sc), fh = ceil((double)h * sc);
+            uint32_t pw = fw < 1 ? 1 : fw > 192 ? 192 : (uint32_t)fw;
+            uint32_t ph = fh < 1 ? 1 : fh > 192 ? 192 : (uint32_t)fh;
             uint8_t *px;
-            if (pw < 1) pw = 1;
-            if (ph < 1) ph = 1;
             px = malloc((size_t)pw * ph * 4);
             if (px) {
                 cr_svg_render(doc, (float)pw / w, (float)ph / h, pw, ph, 0x00000000u, px);

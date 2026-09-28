@@ -80,6 +80,10 @@ int IsWindowResized(void);
 int IsWindowFocused(void);
 /* Focus edge since the last call: 1 in, 0 out, -1 none. */
 int gui_focus_edge(void);
+/* The OS appearance now (1 dark, 0 light, -1 unknown; after InitWindow),
+ * and its change since the last call (1 dark, 0 light, -1 none). */
+int gui_appearance_dark(void);
+int gui_appearance_edge(void);
 void SetExitKey(int key);
 void SetTargetFPS(int fps);
 void *GetWindowHandle(void);

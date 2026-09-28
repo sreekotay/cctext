@@ -54,9 +54,52 @@ static void note_scroll(NSEvent *ev) {
         ui_plat_wheel((float)dx, (float)dy);
 }
 
+/* ---- appearance (theme "auto") ------------------------------------------- */
+
+/* Key-value observation of NSApp.effectiveAppearance (10.14+): AppKit
+ * calls it on the main thread when the user switches Light / Dark (or
+ * Auto flips at dusk). Nothing polls. */
+@interface RtxAppearanceObserver : NSObject
+@end
+
+@implementation RtxAppearanceObserver
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary *)change
+                       context:(void *)context {
+    (void)keyPath;
+    (void)object;
+    (void)change;
+    (void)context;
+    ui_plat_appearance(ui_os_appearance_dark());
+}
+@end
+
+static RtxAppearanceObserver *g_appear_obs;
+
+int ui_os_appearance_dark(void) {
+    if (@available(macOS 10.14, *)) {
+        NSAppearance *ap = [NSApp effectiveAppearance];
+        NSAppearanceName n;
+        if (!ap) return -1;
+        n = [ap bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
+        return [n isEqualToString:NSAppearanceNameDarkAqua] ? 1 : 0;
+    }
+    return 0; /* before Mojave: always light */
+}
+
 void ui_os_init(uiWindow *win, uiArea *area) {
     NSWindow *w;
     NSView *view;
+    if (!g_appear_obs) {
+        if (@available(macOS 10.14, *)) {
+            g_appear_obs = [RtxAppearanceObserver new];
+            [NSApp addObserver:g_appear_obs
+                    forKeyPath:@"effectiveAppearance"
+                       options:NSKeyValueObservingOptionNew
+                       context:NULL];
+        }
+    }
     g_win = win;
     g_area = area;
     if (!g_scroll_mon && win) {
@@ -97,6 +140,10 @@ void ui_os_init(uiWindow *win, uiArea *area) {
 }
 
 void ui_os_fini(void) {
+    if (g_appear_obs) {
+        [NSApp removeObserver:g_appear_obs forKeyPath:@"effectiveAppearance"];
+        g_appear_obs = nil;
+    }
     if (g_scroll_mon) {
         [NSEvent removeMonitor:g_scroll_mon];
         g_scroll_mon = nil;

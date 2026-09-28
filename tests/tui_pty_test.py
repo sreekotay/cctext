@@ -137,8 +137,11 @@ class FakeTerm:
     and records every graphics command (kitty APC, with t=t temp files
     read and deleted as kitty does)."""
 
-    def __init__(self, mode, cell=(10, 20), truecolor=True, tmux=None):
+    def __init__(self, mode, cell=(10, 20), truecolor=True, tmux=None, bg=None, bel=False):
         self.mode, self.cell, self.truecolor, self.tmux = mode, cell, truecolor, tmux
+        # OSC 11 (the background): bg is the X11 colour spec to answer
+        # (b"rgb:ffff/ffff/ffff"), None = no answer; bel ends it with BEL.
+        self.bg, self.bel = bg, bel
         self.buf = b""
         self.files = {}   # t=t path -> bytes read
         self.cmds = []    # kitty commands: dict of keys (+ 'payload')
@@ -209,6 +212,8 @@ class FakeTerm:
                 elif k == b"P" and body == b"$qm":
                     if self.truecolor and self.mode != "silent":
                         out += b"\x1bP1$r0;48:2:1:2:3m\x1b\\"
+                elif k == b"]" and body == b"11;?" and self.bg is not None:
+                    out += b"\x1b]11;" + self.bg + (b"\x07" if self.bel else b"\x1b\\")
                 continue
             if k == b"[":
                 m = __import__("re").match(rb"\x1b\[([?>]?)([\d;]*)([a-zA-Z])", b[j:])
@@ -428,7 +433,7 @@ class Tui:
             env = dict(os.environ)
             env["TERM"] = "xterm-256color"
             for k in ("TMUX", "TERM_PROGRAM", "WAYLAND_DISPLAY", "DISPLAY",
-                      "SSH_TTY", "SSH_CONNECTION"):
+                      "SSH_TTY", "SSH_CONNECTION", "COLORFGBG"):
                 env.pop(k, None)
             if env_extra:
                 env.update(env_extra)
@@ -528,9 +533,11 @@ class Tui:
 
 
 FAILS = []
+PREFIX = [""]  # "light: " while a case re-runs in the light theme
 
 
 def check(cond, name, detail=""):
+    name = PREFIX[0] + name
     if not cond:
         FAILS.append(name)
         print("FAIL: %s %s" % (name, detail))
@@ -3643,7 +3650,173 @@ def case_math_blocks(exe, tmp):
         t.kill()
 
 
+# ---- themes (README "Settings", core/theme.cch) ----------------------------
+
+LIGHT_GUTTER = b"\x1b[38;5;243m"   # the light theme's line numbers / greys
+DARK_GUTTER = b"\x1b[90m"
+
+
+def in_light(case):
+    """Run a colour-checking case again with RTX_THEME=light: the same
+    properties must hold on the light palette (its own SGRs)."""
+    def run(exe, tmp):
+        os.environ["RTX_THEME"] = "light"
+        PREFIX[0] = "light: "
+        try:
+            d = os.path.join(tmp, "light_" + case.__name__)
+            os.makedirs(d, exist_ok=True)
+            case(exe, d)
+        finally:
+            os.environ.pop("RTX_THEME", None)
+            PREFIX[0] = ""
+    return run
+
+
+def theme_run(exe, tmp, name, fake=None, env=None, args=(), keys=None):
+    """Open a small file, optionally send keys; the bytes written."""
+    body = b"alpha\nbeta\n  gamma\n"
+    path = scratch_file(tmp, name, body)
+    e = {"RTX_SAFE_HOME": os.path.join(tmp, "safe_" + name), "RTX_TUI_IMAGES": "off",
+         "XDG_CONFIG_HOME": os.path.join(tmp, "cfg_" + name)}
+    if env:
+        e.update(env)
+    t = Tui(exe, ["--no-blink"] + list(args) + [path], e, fake=fake)
+    try:
+        t.pump(1.0)
+        first = bytes(t.out)
+        for k in keys or ():
+            t.send(k, 0.4)
+        after = bytes(t.out[len(first):])
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    return first, after
+
+
+def is_light_out(b):
+    return LIGHT_GUTTER in b and DARK_GUTTER not in b
+
+
+def is_dark_out(b):
+    return DARK_GUTTER in b and LIGHT_GUTTER not in b
+
+
+def case_theme_osc11(exe, tmp):
+    """Theme auto in a terminal: the startup detection asks OSC 11; a light
+    background (any X11 spec form, ST or BEL) picks the light palette, a
+    dark one the dark palette, no answer falls back to COLORFGBG, then to
+    dark. --theme / RTX_THEME beat the terminal. Images off still ask."""
+    rows = (
+        ("white 16-bit", FakeTerm("none", bg=b"rgb:ffff/ffff/ffff"), None, (), "light"),
+        ("cream 8-bit BEL", FakeTerm("none", bg=b"rgb:fd/f6/e3", bel=True), None, (), "light"),
+        ("black", FakeTerm("none", bg=b"rgb:0000/0000/0000"), None, (), "dark"),
+        ("solarized dark #hex", FakeTerm("none", bg=b"#002b36"), None, (), "dark"),
+        ("no answer", FakeTerm("none"), None, (), "dark"),
+        ("no answer, COLORFGBG light", FakeTerm("none"), {"COLORFGBG": "0;15"}, (), "light"),
+        ("no answer, COLORFGBG dark", FakeTerm("none"), {"COLORFGBG": "15;default;0"}, (), "dark"),
+        ("silent terminal", FakeTerm("silent"), None, (), "dark"),
+        ("light terminal, --theme=dark", FakeTerm("none", bg=b"rgb:ffff/ffff/ffff"), None,
+         ("--theme=dark",), "dark"),
+        ("dark terminal, RTX_THEME=light", FakeTerm("none", bg=b"rgb:0000/0000/0000"),
+         {"RTX_THEME": "light"}, (), "light"),
+    )
+    for i, (label, fake, env, args, want) in enumerate(rows):
+        t0 = time.time()
+        first, _ = theme_run(exe, tmp, "th%d.txt" % i, fake=fake, env=env, args=args)
+        asked = b"\x1b]11;?\x1b\\" in first
+        got = "light" if is_light_out(first) else "dark" if is_dark_out(first) else "?"
+        check(asked, "theme %s: OSC 11 asked" % label)
+        check(got == want, "theme %s: %s palette" % (label, want), "got %s" % got)
+        if label == "silent terminal":
+            # No DA1 either: the detection budget bounds the wait.
+            check(time.time() - t0 < 4.0, "theme: a silent terminal costs only the budget")
+
+
+def case_theme_toggle(exe, tmp):
+    """Toggle Light/Dark (the palette) repaints every row in the other
+    palette, and back."""
+    cfg = config_home(tmp, "cfg_toggle")
+    first, after = theme_run(exe, tmp, "tog.txt", fake=FakeTerm("none"),
+                             env={"XDG_CONFIG_HOME": cfg},
+                             keys=(F1, b"Toggle Light", b"\r"))
+    check(is_dark_out(first), "toggle: starts dark")
+    check(LIGHT_GUTTER in after and b"alpha" in after,
+          "toggle: Toggle Light/Dark repaints in the light palette", repr(after[-400:]))
+    first, after = theme_run(exe, tmp, "tog2.txt", fake=FakeTerm("none", bg=b"rgb:ffff/ffff/ffff"),
+                             env={"XDG_CONFIG_HOME": cfg},
+                             keys=(F1, b"Toggle Light", b"\r"))
+    check(is_light_out(first), "toggle: a light terminal starts light")
+    check(DARK_GUTTER in after and b"alpha" in after,
+          "toggle: and flips to dark", repr(after[-400:]))
+
+
+def case_theme_settings(exe, tmp):
+    """settings.json "theme": "light" wins over a dark terminal; a bad
+    value is reported and ignored."""
+    sp = os.path.join(tmp, "theme_settings.json")
+    with open(sp, "w") as f:
+        f.write('{"theme": "light"}')
+    first, _ = theme_run(exe, tmp, "ts.txt", fake=FakeTerm("none", bg=b"rgb:0000/0000/0000"),
+                         env={"RTX_SETTINGS": sp})
+    check(is_light_out(first), "settings theme light: light palette in a dark terminal")
+    with open(sp, "w") as f:
+        f.write('{"theme": "sepia"}')
+    first, _ = theme_run(exe, tmp, "ts2.txt", fake=FakeTerm("none"), env={"RTX_SETTINGS": sp})
+    check(b"theme is dark, light or auto" in first and is_dark_out(first),
+          "settings theme: a bad value is reported, auto stays")
+
+
+def case_theme_light_colours(exe, tmp):
+    """The light palette in cells (pyte): a selection is a light blue
+    background (256-colour 153), not ANSI blue under dark text; a grid's
+    header row is a light grey band (254), not the dark theme's 236."""
+    if pyte is None:
+        print("skip: theme light colours (no pyte)")
+        return
+
+    def row_of(sc, t, needle):
+        for y in range(t.rows):
+            row = "".join(sc.buffer[y][x].data for x in range(t.cols))
+            if needle in row:
+                return y, row
+        return -1, ""
+
+    body = b"# t\n\nplain words here\n"
+    t, _ = open_tui(exe, tmp, "lc.md", body, env={"RTX_THEME": "light"})
+    try:
+        t.send(b"\x1b[B\x1b[B", 0.3)
+        t.send(b"\x1b[1;2C" * 5, 0.4)  # Shift-Right x5: select "plain"
+        sc = t.screen()
+        y, row = row_of(sc, t, "plain words")
+        x = row.find("plain")
+        sel_bg = sc.buffer[y][x + 1].bg if y >= 0 and x >= 0 else None
+        t.send(b"\x11", 0.3)
+        t.send(b"d", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    t, _ = open_tui(exe, tmp, "lc.csv", b"name,value\nalpha,1\nbeta,2\n", args=("--grid",),
+                    env={"RTX_THEME": "light"})
+    try:
+        sc = t.screen()
+        y, row = row_of(sc, t, "name")
+        x = row.find("name")
+        hdr_bg = sc.buffer[y][x].bg if y >= 0 and x >= 0 else None
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    # pyte names 256-colour cells by hex: 153 = afd7ff, 254 = e4e4e4
+    check(sel_bg == "afd7ff", "light: the selection is a light blue background", repr(sel_bg))
+    check(hdr_bg == "e4e4e4", "light: a grid header is a light grey band", repr(hdr_bg))
+
+
 CASES = {
+    "theme_osc11": case_theme_osc11,
+    "theme_toggle": case_theme_toggle,
+    "theme_settings": case_theme_settings,
+    "theme_light_colours": case_theme_light_colours,
     "math_blocks": case_math_blocks,
     "image_idle": case_image_idle,
     "idle_threads": case_idle_threads,
@@ -3714,6 +3887,11 @@ CASES = {
     "wb_stale": case_wb_stale,
     "wb_anchor": case_wb_anchor,
     "wb_uses": case_wb_uses,
+    # colour-checking cases again on the light palette
+    "md_highlight_light": in_light(case_md_highlight),
+    "wb_annotation_light": in_light(case_wb_annotation),
+    "wb_stale_light": in_light(case_wb_stale),
+    "wb_anchor_light": in_light(case_wb_anchor),
 }
 
 

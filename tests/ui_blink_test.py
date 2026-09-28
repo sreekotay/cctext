@@ -151,8 +151,12 @@ def read_log(path):
 
 
 def start_x():
-    """Return (env, xvfb_proc or None), or None when no display is usable."""
+    """Return (env, xvfb_proc or None), or None when no display is usable.
+    The editor runs in the dark theme unless RTX_THEME says otherwise: the
+    colour checks here are the dark palette's (tests/ui_theme_test.py has
+    the light pass), and theme auto would follow the display's GTK."""
     env = dict(os.environ)
+    env.setdefault("RTX_THEME", "dark")
     if env.get("DISPLAY"):
         return env, None
     xvfb = shutil.which("Xvfb")

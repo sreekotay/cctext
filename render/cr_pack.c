@@ -1,7 +1,7 @@
 /*
- * cctext-render asset pack: build (stb's zlib, vendored inside plutovg)
- * and load (Wuffs' zlib decoder, third_party/wuffs). cr_pack.h has the
- * layout.
+ * cctext-render asset pack: build (miniz's tdefl deflate encoder,
+ * third_party/miniz) and load (Wuffs' zlib decoder, third_party/wuffs).
+ * cr_pack.h has the layout.
  */
 #define _GNU_SOURCE
 #include <stdint.h>
@@ -19,10 +19,15 @@
 #define WUFFS_CONFIG__MODULE__ZLIB
 #include "wuffs-v0.4.c"
 
-#define STB_IMAGE_WRITE_STATIC
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#define STBI_WRITE_NO_STDIO
-#include "plutovg-stb-image-write.h"
+/* miniz, unmodified (third_party/miniz/README.cctext.md): only its deflate
+ * encoder (tdefl), and only by the build step (--build-pack, which every
+ * helper build keeps: about 12 KiB); nothing compresses at run time. */
+#define MINIZ_NO_STDIO
+#define MINIZ_NO_TIME
+#define MINIZ_NO_ARCHIVE_APIS
+#define MINIZ_NO_ZLIB_APIS
+#define MINIZ_NO_INFLATE_APIS
+#include "miniz.c"
 
 #include "cr_pack.h"
 #include "cr_sha256.h"
@@ -42,14 +47,19 @@ static uint64_t cr_fnv(const uint8_t *p, size_t n)
     return h;
 }
 
+/* zlib (RFC 1950) at miniz's level 9: dynamic Huffman blocks, lazy
+ * matching, a 32 KiB window. Build time only (pack entries are made once
+ * per build); 25 % smaller than stb's fixed-Huffman deflate on the pack. */
 uint8_t *cr_zlib_compress(const uint8_t *in, size_t n, size_t *out_n)
 {
-    int ol = 0;
-    uint8_t *o;
+    size_t ol = 0;
+    void *o;
     if (n > (size_t)0x7fffffff) return NULL;
-    o = stbi_zlib_compress((unsigned char *)in, (int)n, &ol, 24);
-    *out_n = (size_t)ol;
-    return o; /* STBIW_MALLOC is malloc */
+    o = tdefl_compress_mem_to_heap(
+        in, n, &ol, TDEFL_WRITE_ZLIB_HEADER | tdefl_create_comp_flags_from_zip_params(9, 15, 0));
+    if (!o) return NULL;
+    *out_n = ol;
+    return o; /* MZ_MALLOC is malloc */
 }
 
 int cr_zlib_decompress(const uint8_t *in, size_t n, uint8_t *out, size_t raw_len)
