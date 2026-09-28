@@ -63,6 +63,11 @@
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
+#if defined(__linux__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
 
 #include "cr_js.h"
 #include "cr_pack.h"
@@ -881,10 +886,35 @@ static void close_extra_fds(void)
 #endif
 }
 
+/* The pack, mapped read-only before lockdown (POSIX): pages come in as
+ * they are used, so a helper holds the fonts and its own bundle, not the
+ * whole 11 MB (cr_pack.h). Elsewhere, read whole. Kept: assets point into
+ * it. */
+static uint8_t *map_pack(const char *path, size_t *n)
+{
+#if defined(__linux__) || defined(__APPLE__)
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    void *m;
+    if (fd < 0) return NULL;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > (256l << 20)) {
+        close(fd);
+        return NULL;
+    }
+    m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return NULL;
+    *n = (size_t)st.st_size;
+    return m;
+#else
+    return slurp(path, n);
+#endif
+}
+
 static int open_pack(const char *pack)
 {
     size_t pn = 0;
-    uint8_t *pb = slurp(pack, &pn); /* kept: assets point into it */
+    uint8_t *pb = map_pack(pack, &pn); /* kept: assets point into it */
     if (!pb || cr_pack_open(&g_pack, pb, pn) != 0) {
         fprintf(stderr, "cctext-render: cannot read pack %s\n", pack);
         return -1;

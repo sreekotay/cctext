@@ -27,7 +27,7 @@
 #include "cr_pack.h"
 #include "cr_sha256.h"
 
-#define CR_PACK_MAGIC "CRPK0002"
+#define CR_PACK_MAGIC "CRPK0003"
 #define CR_PACK_MAX_ENTRIES 4096u
 #define CR_PACK_MAX_RAW (256u << 20)
 #define CR_PACK_BUILD_MAX 512 /* manifest entries one build takes */
@@ -86,36 +86,45 @@ int cr_zlib_decompress(const uint8_t *in, size_t n, uint8_t *out, size_t raw_len
 int cr_pack_open(CrPack *p, const uint8_t *buf, size_t n)
 {
     uint32_t cnt;
-    size_t o = 12;
+    size_t o = 12, end_payload = 0;
     uint64_t want;
     memset(p, 0, sizeof *p);
     if (n < 20 || memcmp(buf, CR_PACK_MAGIC, 8) != 0) return -1;
     memcpy(&want, buf + n - 8, 8);
-    if (cr_fnv(buf, n - 8) != want) return -1;
     n -= 8;
     memcpy(&cnt, buf + 8, 4);
     if (cnt > CR_PACK_MAX_ENTRIES) return -1;
     p->e = calloc(cnt ? cnt : 1, sizeof *p->e);
     if (!p->e) return -1;
+    /* The table: every entry's name, lengths and offset, together at the
+     * front (one or two pages). */
     for (uint32_t i = 0; i < cnt; i++) {
         uint16_t nl;
         CrAsset *a = &p->e[i];
         if (o + 2 > n) return -1;
         memcpy(&nl, buf + o, 2);
         o += 2;
-        if (o + nl + 8 > n) return -1;
+        if (o + nl + 12 > n) return -1;
         a->name = strndup((const char *)buf + o, nl);
         if (!a->name) return -1;
         o += nl;
         memcpy(&a->raw_len, buf + o, 4);
         memcpy(&a->comp_len, buf + o + 4, 4);
-        o += 8;
-        if (a->comp_len > n - o || a->raw_len > CR_PACK_MAX_RAW) return -1;
-        a->comp = buf + o;
-        o += a->comp_len;
+        memcpy(&a->off, buf + o + 8, 4);
+        o += 12;
+        if (a->raw_len > CR_PACK_MAX_RAW) return -1;
         p->n++;
     }
-    return o == n ? 0 : -1;
+    if (cr_fnv(buf, o) != want) return -1;
+    /* Payloads: after the table, in order, inside the file. */
+    end_payload = o;
+    for (int i = 0; i < p->n; i++) {
+        CrAsset *a = &p->e[i];
+        if (a->off != end_payload || a->comp_len > n - a->off) return -1;
+        a->comp = buf + a->off;
+        end_payload = (size_t)a->off + a->comp_len;
+    }
+    return end_payload == n ? 0 : -1;
 }
 
 CrAsset *cr_pack_find(CrPack *p, const char *name)
@@ -173,6 +182,8 @@ typedef struct {
     char *name;
     uint8_t *raw;
     size_t raw_len;
+    uint8_t *comp; /* zlib of raw, made before the table is written */
+    size_t comp_len;
 } CrPackIn;
 
 static void cr_lower(char *s)
@@ -316,6 +327,8 @@ int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile comp
     size_t total_raw = 0, total_comp = 0;
     uint8_t *img = NULL;
     size_t img_n = 0, img_cap = 0;
+    uint64_t th = 0;
+    size_t off = 0;
     CrSb src = {0}, hdr = {0};
     int in_bundle = 0;
     if (!m) {
@@ -323,6 +336,7 @@ int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile comp
         return 1;
     }
     bundle[0] = 0;
+    memset(in, 0, sizeof in);
     while (fgets(line, sizeof line, m)) {
         char *f[6] = {0}, *p = line, *t;
         int nf = 0;
@@ -418,7 +432,7 @@ int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile comp
         fprintf(stderr, "build-pack: %s: bundle %s has no end\n", manifest, bundle);
         goto out;
     }
-    /* Assemble in memory: the trailer hashes every byte. */
+    /* Assemble in memory (layout: cr_pack.h). */
 #define CR_PUT(p_, n_)                                                              \
     do {                                                                            \
         size_t n__ = (n_);                                                          \
@@ -432,17 +446,14 @@ int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile comp
         memcpy(img + img_n, (p_), n__);                                             \
         img_n += n__;                                                               \
     } while (0)
-    {
-        uint32_t cnt = (uint32_t)nin;
-        CR_PUT(CR_PACK_MAGIC, 8);
-        CR_PUT(&cnt, 4);
-    }
+    /* Compress (and round-trip) every entry first: the table at the front
+     * holds each payload's offset. */
     for (int i = 0; i < nin; i++) {
         size_t cn = 0;
         uint8_t *c = cr_zlib_compress(in[i].raw, in[i].raw_len, &cn);
-        uint16_t nl = (uint16_t)strlen(in[i].name);
-        uint32_t rl = (uint32_t)in[i].raw_len, cl = (uint32_t)cn;
         if (!c) goto out;
+        in[i].comp = c;
+        in[i].comp_len = cn;
         /* Round-trip through the run-time decoder before shipping it. */
         {
             uint8_t *chk = malloc(in[i].raw_len + 1);
@@ -451,7 +462,6 @@ int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile comp
             free(chk);
             if (bad) {
                 fprintf(stderr, "build-pack: %s: zlib round trip failed\n", in[i].name);
-                free(c);
                 goto out;
             }
         }
@@ -460,24 +470,35 @@ int cr_pack_build(const char *manifest, const char *out_path, CrPackCompile comp
             int k;
             cr_sha256_hex(c, cn, hx);
             k = snprintf(ln, sizeof ln, "    {\"%s\", \"%s\"},\n", in[i].name, hx);
-            if (cr_sb_add(&hdr, ln, (size_t)k) != 0) {
-                free(c);
-                goto out;
-            }
+            if (cr_sb_add(&hdr, ln, (size_t)k) != 0) goto out;
+        }
+        total_raw += in[i].raw_len;
+        total_comp += cn;
+    }
+    off = 12;
+    for (int i = 0; i < nin; i++) off += 2 + strlen(in[i].name) + 12;
+    {
+        uint32_t cnt = (uint32_t)nin;
+        CR_PUT(CR_PACK_MAGIC, 8);
+        CR_PUT(&cnt, 4);
+    }
+    for (int i = 0; i < nin; i++) {
+        uint16_t nl = (uint16_t)strlen(in[i].name);
+        uint32_t rl = (uint32_t)in[i].raw_len, cl = (uint32_t)in[i].comp_len, ol = (uint32_t)off;
+        if (off + in[i].comp_len > 0xffffffffu) {
+            fprintf(stderr, "build-pack: pack over 4 GB\n");
+            goto out;
         }
         CR_PUT(&nl, 2);
         CR_PUT(in[i].name, nl);
         CR_PUT(&rl, 4);
         CR_PUT(&cl, 4);
-        CR_PUT(c, cn);
-        total_raw += in[i].raw_len;
-        total_comp += cn;
-        free(c);
+        CR_PUT(&ol, 4);
+        off += in[i].comp_len;
     }
-    {
-        uint64_t h = cr_fnv(img, img_n);
-        CR_PUT(&h, 8);
-    }
+    th = cr_fnv(img, img_n); /* the trailer: header and table */
+    for (int i = 0; i < nin; i++) CR_PUT(in[i].comp, in[i].comp_len);
+    CR_PUT(&th, 8);
 #undef CR_PUT
     snprintf(tmp, sizeof tmp, "%s.tmp", out_path);
     o = fopen(tmp, "wb");
@@ -504,6 +525,7 @@ out:
     for (int i = 0; i < nin; i++) {
         free(in[i].name);
         free(in[i].raw);
+        free(in[i].comp);
     }
     free(img);
     return rc;
