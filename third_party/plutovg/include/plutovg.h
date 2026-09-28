@@ -894,6 +894,14 @@ PLUTOVG_API float plutovg_font_face_traverse_glyph_path(plutovg_font_face_t* fac
 PLUTOVG_API float plutovg_font_face_text_extents(plutovg_font_face_t* face, float size, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_rect_t* extents);
 
 /**
+ * @brief cctext patch: the path of a text run as it is drawn (kerned).
+ *
+ * @return The total advance width of the text.
+ */
+PLUTOVG_API float plutovg_font_face_get_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_path_t* path);
+PLUTOVG_API float plutovg_font_face_traverse_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_path_traverse_func_t traverse_func, void* closure);
+
+/**
  * @brief Represents a cache of loaded font faces.
  */
 typedef struct plutovg_font_face_cache plutovg_font_face_cache_t;

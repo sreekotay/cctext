@@ -25,6 +25,10 @@ cctext-render fuzz run (ASan + UBSan):
    texture / gradient coordinates clamped before float -> integer
    conversion (a 1e38 translation computed `0 - INT_MIN`); the
    transformed blenders step in 64-bit.
+4. `0004-kerning.patch`: text is laid out by one function shared by
+   drawing and measuring, which adds the font's GPOS pair adjustment (or
+   its kern table) between consecutive glyphs (stb_truetype);
+   `plutovg_font_face_get_text_path` / `_traverse_text_path`.
 
 Build defines: `PLUTOVG_BUILD_STATIC`, `PLUTOVG_DISABLE_FONT_FACE_CACHE_LOAD`
 (no system font scan), `STBI_MAX_DIMENSIONS=16384` (a `data:` image inside
