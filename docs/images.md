@@ -419,22 +419,52 @@ with readable cctext patches (`patches/`, each with its reason; pins in
 `README.cctext.md`): `<switch>` / `systemLanguage` / `requiredExtensions`
 (draw.io labels), a 256-level nesting cap, the nested-`<svg>` viewport
 resolved in O(depth) (was 2^depth: 25 levels took 3.5 s), family names
-matched case-insensitively, bounded offscreen canvases; in plutovg,
-coordinates clamped before the fixed-point stroker, over-dense dashes
-drawn solid, non-finite curves drawn as chords (the fuzz findings below).
+matched case-insensitively, bounded offscreen canvases, **filter effects**
+([Filters](#filters)); in plutovg, coordinates clamped before the
+fixed-point stroker, over-dense dashes drawn solid, non-finite curves
+drawn as chords (the fuzz findings below), and text laid out by one
+function shared by drawing and measuring: **kerning** (the font's GPOS
+pair adjustments, else its kern table), **per-glyph fallback** between
+the bundled faces and **synthetic bold / italic** ([Fonts](#fonts)).
 Built with `LUNASVG_DISABLE_EXTERNAL_RESOURCES`: an `<image
 href="file:…">`, `http:` or relative href is never opened and renders as
 missing; a `data:` image inside the SVG is decoded by plutovg's
 stb_image, inside the sandbox, capped at 16384 px a side.
 
-**Fonts.** Only what is bundled: Noto Sans Regular / Bold / Italic, Noto
-Serif, Noto Sans Mono 2.0 (OFL, `third_party/fonts`). No system font
-discovery. A `font-family` list is walked in order; generic families
-(`sans-serif`, `serif`, `monospace`, `system-ui`, `cursive`, …) and the
-names drawing tools write (Arial, Helvetica, Verdana, Segoe UI, Times New
-Roman, Georgia, Courier New, Menlo, Consolas, DejaVu Sans, …) map to the
-bundled faces (`render/cr_svg.cpp`); anything else falls back to Noto
-Sans.
+<a id="fonts"></a>**Fonts.** Only what is bundled: Noto Sans Regular / Bold / Italic, Noto
+Serif, Noto Sans Mono 2.0 and a subset of Noto Sans SC (CJK) (OFL,
+`third_party/fonts`). No system font discovery. A `font-family` list is
+walked in order; generic families (`sans-serif`, `serif`, `monospace`,
+`system-ui`, `cursive`, …) and the names drawing tools write (Arial,
+Helvetica, Verdana, Segoe UI, Times New Roman, Georgia, Courier New,
+Menlo, Consolas, DejaVu Sans, …) map to the bundled faces
+(`render/cr_svg.cpp`); anything else — a CJK family name included — falls
+back to Noto Sans, and its CJK characters to the CJK face below.
+
+- **Kerning** (plutovg patch 0004): pair adjustments from the font's
+  GPOS table (else its kern table) through stb_truetype, between glyphs of
+  one face in one run (per-character positioning and `letter-spacing`
+  split runs, so they are not kerned; `font-kerning: none` is not
+  honoured). Drawing and measuring share the layout, so Mermaid's boxes
+  (measured through `getBBox`) and lunasvg's `text-anchor` see the kerned
+  widths.
+- **Per-glyph fallback** (patch 0005): a glyph the chosen face lacks is
+  drawn by the first regular face that has it, in `render/manifest.txt`'s
+  order (Noto Sans, Noto Serif, Noto Sans Mono, Noto Sans SC), at the same
+  em size. CJK in a Latin label, a MathJax `\text{…}` or a Mermaid node
+  draws as glyphs, not boxes. The CJK face is Noto Sans SC Regular subset
+  to GB 2312 + JIS X 0208 (9,788 ideographs), kana, CJK punctuation and
+  full-width forms (`third_party/fonts/subset_cjk.py`, deterministic):
+  Simplified Chinese glyph shapes, no Hangul; +2.3 MiB in the pack. It is
+  a fallback only (not a family), inflated from the pack the first time a
+  glyph reaches it (a face over 1 MiB is loaded lazily: `fonts_init`), so
+  a helper that never meets CJK pays nothing for it at spawn.
+- **Synthetic bold / italic** (patch 0006): a family without the face
+  asked for (Noto Serif and Noto Sans Mono have no bold or italic) draws
+  its regular face slanted by tan 12° and / or overstruck by size / 24 ..
+  size / 32 (the copies unite under the non-zero fill); advances do not
+  change. A fallback glyph gets the style its own face lacks (a CJK
+  character in a bold serif label is emboldened).
 
 **Build.** Only a C / C++ compiler and ccc: `./make.shcc @cctext_render`
 (`@cctext` and `@cctext_ui` run it first) spawns `$CC` / `$CXX` (default
@@ -448,10 +478,10 @@ build time only) and checked by a round trip through Wuffs, which
 inflates it at run time; format `CRPK0003`: the table of
 names, lengths and offsets at the front, guarded by an FNV-1a trailer;
 the helper maps the file read-only and pages in only what it uses).
-Outputs: `bin/cctext-render` (1.4 MiB stripped: ≈ 450 KiB of it
-the SVG engine, the rest QuickJS), the pack (6.9 MiB: 1.1 MiB of fonts,
-2.2 MiB of Mermaid bytecode, 3.6 MiB of math — [Mermaid](#mermaid) has
-the two-step build, [Math](#math) the breakdown) and
+Outputs: `bin/cctext-render` (1.45 MiB stripped: ≈ 535 KiB of it
+the SVG engine, the rest QuickJS), the pack (PACKSIZE —
+[Mermaid](#mermaid) has the two-step build, [Math](#math) the breakdown)
+and
 `bin/cctext-render-selftest` (tests only). `@dist_cctext` packs the
 helper and its pack beside the editors; the editor looks for the helper
 beside its own binary (`RTX_RENDER_BIN` overrides; `../bin/` is tried for
@@ -565,7 +595,11 @@ The light theme never draws the plate (the pane already is light).
 | Backing plate in the dark theme | on | `svg_backing` |
 
 The helper's own ceilings sit above these: 64 MiB of input, 64 megapixels
-and 32768 px a side per request, 2 GiB of address space.
+and 32768 px a side per request, 2 GiB of address space; and for filters
+(`render/cr_proto.h`, [Filters](#filters)): 16 megapixels per filter
+region, a blur deviation of 512 px, 64 primitives per filter, 512 MiB of
+live intermediate images and 64 M weighted pixel-passes of filter work
+per render.
 
 **Measured** (Linux x86-64, this container; `python3
 bench/render_client.py bench`, best of noisy runs): spawn to ready
@@ -592,15 +626,58 @@ about 2 minutes each; the slowest mutants took 23 s, 1.5 s and 0.5 s
 under ASan (the first, a mutated Mermaid diagram, is the kind of input
 the editor's 5 s budget ends; not yet reduced).
 
+The filter and text work added hostile snippets to the mutator: a 1e30
+deviation with 1e38 offsets over a 2e9-unit region, 400-primitive chains
+reading named results back and forth with arithmetic k1 = 1e38, `href`
+cycles and filters referencing themselves from their content, zero /
+negative / NaN regions and subregions, 20 nested drop-shadowed groups,
+CSS filter lists with extreme values and missing urls, 20000-entry
+transfer tables, and a filter under `scale(1e-30 1e30)`; plus a filter
+seed (`testdata/svg/fuzz/filters.svg`) and `CR_FUZZ_TRACE` (name each
+mutant on stderr, to find a slow or crashing one). Findings, fixed:
+lunasvg's `paintBoundingBox` assertion on a non-finite box (reached once
+containers ask their filtered children's boxes), and slow renders of
+nested filtered groups (70 s under ASan) that led to the reach-cut
+canvases and the work budget. After them: 20000 SVG mutants (seed 11)
+clean in 268 s, the slowest 8.3 s under ASan (nested filtered groups,
+within the work budget; about 1 s in a release build); every file of
+resvg's test suite (1,722) renders with no ASan or UBSan report.
+
+<a id="filters"></a>**Filters** (lunasvg patch 0006, `source/svgfilterelement.*`). `<filter>`
+with its region (`x` / `y` / `width` / `height`, `filterUnits`),
+`primitiveUnits`, `xlink:href` inheritance and primitive subregions;
+feGaussianBlur (the spec's three box blurs; a true Gaussian kernel below
+d = 2), feOffset, feFlood, feMerge, feComposite (over / in / out / atop /
+xor / arithmetic / lighter), feColorMatrix, feBlend (every blend mode),
+feComponentTransfer and feDropShadow; `color-interpolation-filters`
+(linearRGB by default), `flood-color` / `flood-opacity`; and the CSS
+filter functions (`blur()`, `drop-shadow()`, `grayscale()`, `sepia()`,
+`saturate()`, `hue-rotate()`, `invert()`, `opacity()`, `brightness()`,
+`contrast()`, `url()` in a list). draw.io's "Shadow" chain, Mermaid 12's
+node shadows (feDropShadow) and `filter: drop-shadow(…)` styles draw. An
+invalid filter reference draws nothing (Filter Effects 1); feImage,
+feTile, feTurbulence, feMorphology, the lighting primitives,
+feConvolveMatrix and feDisplacementMap pass their input through. A
+filter runs in device pixels on the element's offscreen canvas, which
+covers the filter region cut to what the filter can bring into view (the
+parent canvas grown by 3 deviations per blur plus every offset); blurs
+touch only the painted pixels plus their reach. Bounds, as settings in
+`render/cr_proto.h` passed to `lunasvg_set_filter_limits()`: a filter
+region over 16 megapixels, over 512 MiB of live intermediate images, or
+past the render's 64 M weighted pixel-passes of filter work (blur 4,
+drop shadow 8, others 2 per region pixel) draws unfiltered; blur
+deviations clamp at 512 device px; primitives past 64 are ignored.
+resvg's test suite, filters: 82 → 257 of 398 (the 82 were cases whose
+expected output is unfiltered).
+
 **Follow-ups** (not in this step):
 
-- lunasvg gaps: **filters** (`<filter>` is ignored: content draws
-  unfiltered), **kerning** (none; text is a little wider than a
-  browser's), **per-glyph fallback** between faces plus a **CJK** face
-  (a glyph missing from the chosen face is a box), **synthetic bold /
-  italic** for Noto Serif and Noto Sans Mono (they use the regular face),
-  `<foreignObject>` (HTML labels are skipped; draw.io's `<switch>`
-  fallback text shows instead).
+- lunasvg gaps: a rotated or skewed element's filter runs along the
+  device axes (resvg rotates the filter space); the primitives above
+  that pass through; `<foreignObject>` (HTML labels are skipped;
+  draw.io's `<switch>` fallback text shows instead); `textPath`,
+  vertical writing modes; kerning across `letter-spacing` and per-glyph
+  `x` / `dx`, `font-kerning: none`; Hangul (no Korean face).
 - HiDPI: cctext-ui has no device scale yet; pixels are at 1x.
 - More than one helper per kind; `.svgz`; previewing an unsaved SVG
   buffer.
@@ -829,9 +906,11 @@ and the realm built from it) and add ≈ 100 ms to every spawn.
 
 Against Chromium (the same sources through mermaid 12.0.0 in a browser
 with `htmlLabels: false`, the SVGs in `testdata/mermaid/chromium`, drawn
-by our lunasvg): widths within +3.5 %, heights +0 to +11.7 % (sequence
-diagrams are the tallest: our text metrics lack kerning and line boxes
-round up), and the 16 × 16 ink maps correlate at r 0.929–1.000.
+by our lunasvg): widths −0.4 to +3.3 %, heights +0 to +11.7 % (sequence
+diagrams are the tallest: line boxes round up), and the 16 × 16 ink maps
+correlate at r 0.929–1.000. Text is kerned as Chromium kerns it, node
+shadows (feDropShadow) draw, and CJK labels draw through the per-glyph
+fallback (`mermaid_smoke` checks a CJK flowchart).
 
 **Fuzzing.** `bin/cctext-render-fuzz --mermaid` runs the engine in
 process under ASan + UBSan over `testdata/mermaid`: byte flips,
@@ -1078,7 +1157,10 @@ cap refusals, 12 budget timeouts; 180 s): no sanitizer finding in
 QuickJS, MathJax or our glue.
 
 **Leftovers.** Inline math on a slide stays source (display math is a
-picture). A glyph outside the NewCM font (CJK in `\text{…}`) is a box.
+picture). A glyph outside the NewCM font (CJK in `\text{…}`) is drawn
+by the renderer's per-glyph fallback (Noto Sans SC for CJK; MathJax sets
+its width from its own estimate, so the space after it can be a little
+off); a character no bundled face has is a box.
 `\binom` differs slightly between TeX and the equivalent MathML (width
 within 5 %: MathJax sets the TeX one with its own spacing). No
 `\ce{…}` (mhchem needs a font extension). The terminal's inline formula
@@ -1171,9 +1253,18 @@ under a running helper (the build writes a new file and renames it).
   size needs the helper; a corrupted pixel file is ignored); hostile
   input (40 nested percentage `<svg>` in well under a second, 100k
   nested groups, external `file:` / `http:` references never fetched —
-  a listening socket sees no connection — and rendered as missing); the
-  seven samples against their reference PNGs (≤ 0.5 % of pixels more
-  than 24 levels off; they match exactly here); straight RGBA and BGRA
+  a listening socket sees no connection — and rendered as missing); text
+  and filters (synthetic bold has more ink and synthetic italic is
+  slanted for Noto Serif and Noto Sans Mono, a kerned "AVAVAVAV" ends at
+  least 8 px before the same letters unkerned, a drop shadow adds ink, a
+  blur has soft edges; four hostile filter chains — a 1e30 deviation over
+  a 2e9-unit region with 1e38 offsets, 500 blurs under 20 filtered groups
+  at 800 × 600, href cycles and self-references, zero / negative regions
+  — each render within 4 s, about 1 s here); the nine samples (a
+  draw.io-shaped diagram with and without shadows, `text-styles`:
+  kerning, real and synthetic styles, CJK fallback in Latin families)
+  against their reference PNGs (≤ 0.5 % of pixels more than 24 levels
+  off; they match exactly here); straight RGBA and BGRA
   premultiplied from the same render; upscaling; SVG in the image cache
   (sniffing, the permission rules, `data:image/svg+xml` base64 and
   percent-encoded, a Rich picture row whose height is the same before and
@@ -1195,7 +1286,9 @@ under a running helper (the build writes a new file and renames it).
   the seven types (flowchart, sequence, class, state, Gantt, pie, ER)
   against reference PNGs from our renderer (±2 px in size, ≤ 1 % of
   pixels more than 24 levels off) and against Chromium's SVGs (width
-  ≤ 6 %, height ≤ 13 %, ink map r ≥ 0.90); light and dark themes and
+  ≤ 6 %, height ≤ 13 %, ink map r ≥ 0.90); CJK labels (two flowcharts
+  with different CJK labels of the same length render differently —
+  as tofu they would be identical); light and dark themes and
   `themeVariables`; the client (two slots, lazy spawn of the Mermaid slot
   only, the setting for the cap, messages); the caches (memory, disk
   with no helper, the theme in the key); the layout (a fence is one
@@ -1243,7 +1336,9 @@ under a running helper (the build writes a new file and renames it).
   baseline, pixels, messages, the byte limit refused without a request,
   the editor's kill past budget + grace and the respawn, a cancelled
   request's late reply dropped); the disk cache (a later "session" with
-  no helper lays out and paints from it, the baseline included); the 31
+  no helper lays out and paints from it, the baseline included); CJK in
+  `\text{}` (two different pairs render differently, not as the same
+  boxes); the 31
   formulas of `testdata/math/formulas.json` (fractions, continued
   fractions, roots, sums, integrals, limits, matrices, `cases`, `align`,
   accents, braces, text with Unicode and CJK, Greek, fonts, big
