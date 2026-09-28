@@ -28,6 +28,9 @@ struct CrJs {
     double deadline;       /* interrupt: ms on the monotonic clock (0: none) */
     int interrupted;
     CrJsStats st;
+    CrJsSrcGet src_get;    /* __hostLoad (NULL: not offered) */
+    CrJsSrcPut src_put;
+    void *src_ctx;
 };
 
 static double now_ms(void)
@@ -171,6 +174,41 @@ static JSValue js_metrics(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     return r;
 }
 
+/* __hostLoad(key) -> true (evaluated), false (no such module); throws the
+ * module's own error. The source comes from the pack through the helper's
+ * loader (cctext-render.c: SHA-256 checked, then inflated). */
+static JSValue js_host_load(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    CrJs *e = JS_GetContextOpaque(ctx);
+    const char *key, *src = NULL;
+    size_t n = 0;
+    char err[256];
+    JSValue r;
+    (void)this_val;
+    if (!e || !e->src_get || argc < 1) return JS_FALSE;
+    key = JS_ToCString(ctx, argv[0]);
+    if (!key) return JS_EXCEPTION;
+    err[0] = 0;
+    if (e->src_get(e->src_ctx, key, &src, &n, err, sizeof err) != 0) {
+        JS_FreeCString(ctx, key);
+        if (err[0]) return JS_ThrowInternalError(ctx, "%s", err);
+        return JS_FALSE;
+    }
+    r = JS_Eval(ctx, src, n, key, JS_EVAL_TYPE_GLOBAL);
+    if (e->src_put) e->src_put(e->src_ctx, key);
+    JS_FreeCString(ctx, key);
+    if (JS_IsException(r)) return r;
+    JS_FreeValue(ctx, r);
+    return JS_TRUE;
+}
+
+void cr_js_set_loader(CrJs *e, CrJsSrcGet get, CrJsSrcPut put, void *ctx)
+{
+    e->src_get = get;
+    e->src_put = put;
+    e->src_ctx = ctx;
+}
+
 static void exc_text(JSContext *ctx, char *out, size_t cap)
 {
     JSValue ex = JS_GetException(ctx);
@@ -273,6 +311,11 @@ int cr_js_start(CrJs *e, char *err, size_t errcap)
                       JS_NewCFunction(e->ctx, js_measure, "__hostMeasure", 5));
     JS_SetPropertyStr(e->ctx, g, "__hostFontMetrics",
                       JS_NewCFunction(e->ctx, js_metrics, "__hostFontMetrics", 3));
+    if (e->src_get) {
+        JS_SetContextOpaque(e->ctx, e);
+        JS_SetPropertyStr(e->ctx, g, "__hostLoad",
+                          JS_NewCFunction(e->ctx, js_host_load, "__hostLoad", 1));
+    }
     JS_FreeValue(e->ctx, g);
     /* The bytecode came from this build's own pack, checked against the
      * hash compiled into the helper (cctext-render.c) before this call:

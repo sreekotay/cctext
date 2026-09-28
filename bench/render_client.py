@@ -4,6 +4,7 @@
     python3 bench/render_client.py bench [BIN]          SVG: spawn-to-ready, warm per-SVG time, RSS
     python3 bench/render_client.py mermaid [BIN]        Mermaid: cold engine, warm per type, memory
     python3 bench/render_client.py leak [BIN] [JOBS]    Mermaid: RSS / heap over many jobs
+    python3 bench/render_client.py math [BIN]           Math: cold engine, warm per formula, memory
     python3 bench/render_client.py png IN.svg OUT.png [SCALE]
     python3 bench/render_client.py mmd IN.mmd OUT.png [dark] [SCALE]
 """
@@ -16,11 +17,11 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# CrReq v2: magic id kind flags reserved scale em_px fg bg box_w box_h max_px len budget_ms node_max
+# CrReq v2: magic id kind flags max_w scale em_px fg bg box_w box_h max_px len budget_ms node_max
 REQ = struct.Struct('<IIBBHffIIIIIIII')
 REP = struct.Struct('<IIII')
 MAGIC_REQ, MAGIC_REP = 0x32515243, 0x31535243
-K_SVG, K_MERMAID, K_STATS = 1, 4, 5
+K_SVG, K_TEX, K_MML, K_MERMAID, K_STATS = 1, 2, 3, 4, 5
 R_HELLO, R_SIZE, R_PIXELS, R_ERROR, R_INFO = 0, 1, 2, 3, 4
 MMD = os.path.join(ROOT, 'testdata', 'mermaid')
 TYPES = ['flowchart', 'sequence', 'class', 'state', 'gantt', 'pie', 'er']
@@ -51,18 +52,18 @@ class Helper:
         return typ, rid, self._read(ln)
 
     def send(self, src, kind=K_SVG, flags=0, scale=1.0, box=(0, 0), max_px=0, bg=0, rid=None,
-             budget_ms=0, node_max=0):
+             budget_ms=0, node_max=0, em=16.0, fg=0x000000ff, max_w=0):
         if rid is None:
             self.id += 1
             rid = self.id
         b = src if isinstance(src, bytes) else src.encode()
-        self.p.stdin.write(REQ.pack(MAGIC_REQ, rid, kind, flags, 0, scale, 16.0, 0, bg,
+        self.p.stdin.write(REQ.pack(MAGIC_REQ, rid, kind, flags, max_w, scale, em, fg, bg,
                                     box[0], box[1], max_px, len(b), budget_ms, node_max) + b)
         self.p.stdin.flush()
         return rid
 
-    def render(self, src, size_only=False, **kw):
-        rid = self.send(src, flags=4 if size_only else 0, **kw)
+    def render(self, src, size_only=False, flags=0, **kw):
+        rid = self.send(src, flags=flags | (4 if size_only else 0), **kw)
         out = {}
         while True:
             typ, got, payload = self._frame()
@@ -87,6 +88,13 @@ class Helper:
             opts['themeVariables'] = variables
         payload = json.dumps(opts, separators=(',', ':')) + '\n' + src
         return self.render(payload, size_only=size_only, kind=K_MERMAID, scale=scale,
+                           node_max=node_max, budget_ms=budget_ms, **kw)
+
+    def math(self, src, mml=False, display=True, size_only=False, em=16.0, fg=0x000000ff,
+             max_w=0, node_max=0, budget_ms=0, **kw):
+        """TeX (or MathML) -> SIZE (w, h, baseline from the bottom) + PIXELS."""
+        return self.render(src, size_only=size_only, kind=K_MML if mml else K_TEX,
+                           flags=1 if display else 0, em=em, fg=fg, max_w=max_w,
                            node_max=node_max, budget_ms=budget_ms, **kw)
 
     def stats(self):
@@ -195,6 +203,55 @@ def bench_mermaid(binary=None, runs=6):
     h.close()
 
 
+def bench_math(binary=None):
+    """Cold engine start (first formula), warm time per formula over
+    testdata/math/formulas.json (size + pixels, display, 16 px em), memory."""
+    med = statistics.median
+    forms = json.load(open(os.path.join(ROOT, 'testdata', 'math', 'formulas.json')))
+    colds = []
+    for k in range(5):
+        h = Helper(binary)
+        rss0 = rss_kb(h.p.pid)
+        t0 = time.perf_counter()
+        h.math('x^%d + 1' % (k + 2))
+        colds.append((time.perf_counter() - t0) * 1000)
+        st = h.stats()
+        if k == 0:
+            print('helper RSS after hello %.1f MB, after the first formula %.1f MB; engine start %.1f ms, '
+                  'bytecode inflate %.1f ms, heap %.1f MB' % (
+                      rss0 / 1024, rss_kb(h.p.pid) / 1024, st['math_start_ms'],
+                      st['math_inflate_ms'], st['math_heap'] / 1048576))
+        h.close()
+    print('cold: first formula (engine start + x^2+1): median %.0f ms %s' % (
+        med(colds), ['%.0f' % c for c in colds]))
+    h = Helper(binary)
+    first, warm, sizes = [], [], []
+    for name, src in forms:
+        t0 = time.perf_counter()
+        r = h.math(src)
+        first.append((time.perf_counter() - t0) * 1000)
+        if 'error' in r:
+            print('  %-12s ERROR %r' % (name, r['error']))
+        ts, tz = [], []
+        for k in range(3):
+            v = src + ' {}' * (k + 1)  # distinct source: the helper's cache is bypassed
+            t0 = time.perf_counter()
+            h.math(v)
+            ts.append((time.perf_counter() - t0) * 1000)
+            t0 = time.perf_counter()
+            h.math(v + '{}', size_only=True)
+            tz.append((time.perf_counter() - t0) * 1000)
+        warm.append(med(ts))
+        sizes.append(med(tz))
+    print('%d formulas: first use median %.1f ms (max %.0f ms, font files load on demand); '
+          'warm size+pixels median %.1f ms (max %.1f); size only median %.1f ms' % (
+              len(forms), med(first), max(first), med(warm), max(warm), med(sizes)))
+    st = h.stats()
+    print('after the formulas: RSS %.1f MB, math heap %.1f MB, source modules loaded %d' % (
+        rss_kb(h.p.pid) / 1024, st['math_heap'] / 1048576, st['math_loads']))
+    h.close()
+
+
 def leak(binary=None, jobs=250):
     srcs = {t: open(os.path.join(MMD, t + '.mmd')).read() for t in TYPES}
     h = Helper(binary)
@@ -218,6 +275,8 @@ if __name__ == '__main__':
         bench(a[2] if len(a) > 2 else None)
     elif len(a) >= 2 and a[1] == 'mermaid':
         bench_mermaid(a[2] if len(a) > 2 else None)
+    elif len(a) >= 2 and a[1] == 'math':
+        bench_math(a[2] if len(a) > 2 else None)
     elif len(a) >= 2 and a[1] == 'leak':
         leak(a[2] if len(a) > 2 and a[2] != '-' else None, int(a[3]) if len(a) > 3 else 250)
     elif len(a) >= 4 and a[1] == 'png':

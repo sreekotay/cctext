@@ -1,0 +1,1263 @@
+#!ccc ccs
+/*
+ * Math through cctext-render (docs/images.md, "Math"): the protocol's
+ * MATH_TEX / MATH_MML kinds (SIZE with the baseline then PIXELS from one
+ * script run, parse errors as ERROR with MathJax's message and the engine
+ * kept, \def kept inside its formula, the node cap, maxMacros, refused
+ * extensions, the engine's time budget and restart, the heap and
+ * job-count recycling, a pack whose bytecode or source modules are not
+ * this build's), the editor's third helper slot (lazy, apart from the SVG
+ * and Mermaid ones; a hung helper killed and respawned; a cancelled
+ * request's late reply dropped), the content-hash cache on disk with the
+ * baseline, formulas.json against our reference PNGs and TeX against
+ * MathML, and the Rich layout: display math as picture rows (centred,
+ * the caret revealing the source, the stale display while it changes),
+ * inline math as pictures on the text's baseline (rows growing to fit,
+ * the source until the size is known, the caret revealing it, a changed
+ * formula dimmed), a theme change that re-renders only what is laid out,
+ * terminal cells (block pictures; Unicode for simple inline math), and
+ * idle once settled.
+ *
+ * Needs bin/cctext-render, its pack and bin/cctext-render-selftest
+ * (./make.shcc @cctext_render; @smoke builds them first).
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/img.cch"
+#include "../core/img_svg.h"
+#include "../render/cr_proto.h"
+
+void rtx_safe_test_isol(void);
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static uint8_t *slurp(const char *path, size_t *n) {
+    FILE *fp = fopen(path, "rb");
+    long sz;
+    uint8_t *b;
+    *n = 0;
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    b = (uint8_t *)malloc((size_t)sz + 1);
+    if (b && fread(b, 1, (size_t)sz, fp) != (size_t)sz) {
+        free(b);
+        b = NULL;
+    }
+    fclose(fp);
+    if (b) {
+        b[sz] = 0;
+        *n = (size_t)sz;
+    }
+    return b;
+}
+
+static uint32_t ceilu(float v) {
+    uint32_t u;
+    if (!(v > 0)) return 0;
+    u = (uint32_t)v;
+    return (float)u < v ? u + 1 : u;
+}
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static char g_bin[1024], g_selftest[1024], g_pack[1024];
+
+static void cfg_math(RtxSvgCfg *c) {
+    memset(c, 0, sizeof *c);
+    c->input_max = 64u << 10;
+    c->px_max = 16000000u;
+    c->timeout_ms = 5000;
+    c->node_max = 4000;
+}
+
+static RtxMathOpt opt(int display, float em) {
+    RtxMathOpt o;
+    memset(&o, 0, sizeof o);
+    o.display = display;
+    o.em = em;
+    o.fg = 0x000000;
+    return o;
+}
+
+/* ---- raw protocol ---------------------------------------------------------- */
+
+typedef struct {
+    pid_t pid;
+    int fd;
+} Raw;
+
+static int raw_spawn(Raw *r, const char *bin, char *const *args) {
+    int sv[2], na = 0;
+    posix_spawn_file_actions_t fa;
+    char *argv[12];
+    char *envp[1] = {NULL};
+    memset(r, 0, sizeof *r);
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) return -1;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, sv[1], 0);
+    posix_spawn_file_actions_adddup2(&fa, sv[1], 1);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    argv[na++] = (char *)bin;
+    while (args && *args && na < 11) argv[na++] = *args++;
+    argv[na] = NULL;
+    if (posix_spawn(&r->pid, bin, &fa, NULL, argv, envp) != 0) {
+        posix_spawn_file_actions_destroy(&fa);
+        close(sv[0]);
+        close(sv[1]);
+        return -1;
+    }
+    posix_spawn_file_actions_destroy(&fa);
+    close(sv[1]);
+    r->fd = sv[0];
+    return 0;
+}
+
+static int raw_read(Raw *r, void *p, size_t n, int ms) {
+    uint8_t *b = (uint8_t *)p;
+    double dl = now_ms() + ms;
+    while (n) {
+        struct pollfd pf = {r->fd, POLLIN, 0};
+        ssize_t k;
+        int left = (int)(dl - now_ms());
+        if (left <= 0) return -2;
+        if (poll(&pf, 1, left) <= 0) continue;
+        k = read(r->fd, b, n);
+        if (k <= 0) return -1;
+        b += k;
+        n -= (size_t)k;
+    }
+    return 0;
+}
+
+static void raw_close(Raw *r) {
+    int st;
+    close(r->fd);
+    kill(r->pid, SIGKILL);
+    waitpid(r->pid, &st, 0);
+}
+
+static int raw_hello(Raw *r, uint32_t hello[3]) {
+    CrReply h;
+    if (raw_read(r, &h, sizeof h, 5000) != 0) return -1;
+    if (h.magic != CR_MAGIC_REP || h.type != CR_R_HELLO || h.len != 12) return -1;
+    return raw_read(r, hello, 12, 5000);
+}
+
+/* A request: kind, flags, the math options, the box, the limits. */
+typedef struct {
+    uint8_t kind, flags;
+    float em;
+    uint32_t fg;
+    uint16_t max_w;
+    uint32_t bw, bh, max_px, budget, node_max;
+} Rq;
+
+static void raw_send(Raw *r, uint32_t id, const Rq *o, const char *src) {
+    CrReq q;
+    size_t n = src ? strlen(src) : 0;
+    memset(&q, 0, sizeof q);
+    q.magic = CR_MAGIC_REQ;
+    q.id = id;
+    q.kind = o->kind;
+    q.flags = o->flags;
+    q.max_w = o->max_w;
+    q.scale = 1.0f;
+    q.em_px = o->em;
+    q.fg = o->fg;
+    q.box_w = o->bw;
+    q.box_h = o->bh;
+    q.max_px = o->max_px;
+    q.len = (uint32_t)n;
+    q.budget_ms = o->budget;
+    q.node_max = o->node_max;
+    if (send(r->fd, &q, sizeof q, MSG_NOSIGNAL) < 0) return;
+    if (n && send(r->fd, src, n, MSG_NOSIGNAL) < 0) return;
+}
+
+static int raw_frame(Raw *r, CrReply *h, uint8_t **pl, int ms) {
+    *pl = NULL;
+    if (raw_read(r, h, sizeof *h, ms) != 0) return -1;
+    if (h->magic != CR_MAGIC_REP) return -1;
+    *pl = (uint8_t *)malloc(h->len + 1);
+    if (!*pl) return -1;
+    if (raw_read(r, *pl, h->len, ms) != 0) return -1;
+    (*pl)[h->len] = 0;
+    return 0;
+}
+
+static long stat_of(Raw *r, uint32_t id, const char *key) {
+    CrReply h;
+    uint8_t *p;
+    char k[64];
+    long v = -1;
+    const char *at;
+    Rq o;
+    memset(&o, 0, sizeof o);
+    o.kind = CR_KIND_STATS;
+    raw_send(r, id, &o, NULL);
+    if (raw_frame(r, &h, &p, 5000) != 0 || h.type != CR_R_INFO) {
+        free(p);
+        return -1;
+    }
+    snprintf(k, sizeof k, "\"%s\":", key);
+    at = strstr((const char *)p, k);
+    if (at) v = strtol(at + strlen(k), NULL, 10);
+    free(p);
+    return v;
+}
+
+static Rq tex_rq(int display) {
+    Rq o;
+    memset(&o, 0, sizeof o);
+    o.kind = CR_KIND_TEX;
+    o.flags = (uint8_t)((display ? CR_F_DISPLAY : 0) | CR_F_SIZE_ONLY);
+    o.em = 20.0f;
+    o.fg = 0x000000ffu;
+    o.budget = 5000;
+    o.node_max = 4000;
+    return o;
+}
+
+/* A size-only request: 1 and *sz, or 0 (the ERROR's code and message). */
+static int raw_size(Raw *r, uint32_t id, const Rq *o, const char *src, CrSize *sz,
+                    uint32_t *code, char *msg, size_t cap) {
+    CrReply h;
+    uint8_t *p;
+    int ok = 0;
+    if (code) *code = 0;
+    if (msg && cap) msg[0] = 0;
+    raw_send(r, id, o, src);
+    if (raw_frame(r, &h, &p, 20000) == 0) {
+        if (h.type == CR_R_SIZE && h.len == sizeof *sz) {
+            memcpy(sz, p, sizeof *sz);
+            ok = 1;
+        } else if (h.type == CR_R_ERROR && h.len >= 4) {
+            if (code) memcpy(code, p, 4);
+            if (msg) snprintf(msg, cap, "%s", (const char *)p + 4);
+        }
+    }
+    free(p);
+    return ok;
+}
+
+static void test_protocol(void) {
+    Raw r;
+    uint32_t hello[3], code = 0;
+    CrReply h;
+    CrSize sz, sx, sy, sf;
+    uint8_t *p;
+    char msg[400], big[8192];
+    Rq o = tex_rq(1), oi = tex_rq(0);
+    long s0;
+    size_t k;
+    int i;
+    double t0;
+    expect(raw_spawn(&r, g_bin, NULL) == 0 && raw_hello(&r, hello) == 0, "proto: spawn, hello");
+    expect(hello[0] == CR_PROTO_VERSION && (hello[1] & (1u << CR_KIND_TEX)) &&
+               (hello[1] & (1u << CR_KIND_MATHML)) && (hello[2] & CR_H_SANDBOXED),
+           "proto: hello: TeX and MathML, sandboxed");
+    expect(stat_of(&r, 1, "math_engine") == 0, "proto: no math engine before the first formula");
+    t0 = now_ms();
+    expect(raw_size(&r, 2, &oi, "x^2", &sz, NULL, NULL, 0) && sz.w_css > 15 && sz.h_css > 12 &&
+               sz.baseline_css >= 0 && sz.baseline_css < sz.h_css,
+           "proto: an inline formula's SIZE");
+    printf("math_smoke: first formula (engine start included) %.1f ms, x^2 %gx%g base %g\n",
+           now_ms() - t0, sz.w_css, sz.h_css, sz.baseline_css);
+    expect(stat_of(&r, 3, "math_engine") == 1 && stat_of(&r, 4, "math_runs") == 1,
+           "proto: the engine started on the first formula");
+    /* The baseline: a descender sits below it, a fraction straddles it. */
+    expect(raw_size(&r, 5, &oi, "x", &sx, NULL, NULL, 0) &&
+               raw_size(&r, 6, &oi, "y", &sy, NULL, NULL, 0) &&
+               raw_size(&r, 7, &oi, "\\frac{a}{b}", &sf, NULL, NULL, 0),
+           "proto: x, y, a fraction");
+    expect(sx.baseline_css < 1.5f && sy.baseline_css > 3.0f && sy.baseline_css > sx.baseline_css,
+           "proto: baseline: y's descender is below it, x's is not");
+    expect(sf.baseline_css > sf.h_css * 0.2f && sf.baseline_css < sf.h_css * 0.7f,
+           "proto: baseline: a fraction's sits near its middle");
+    /* Size then pixels at the box: one script run. */
+    raw_size(&r, 8, &o, "\\frac{a+b}{c}", &sz, NULL, NULL, 0);
+    {
+        Rq px = o;
+        px.flags = CR_F_DISPLAY;
+        px.bw = ceilu(sz.w_css);
+        px.bh = ceilu(sz.h_css);
+        raw_send(&r, 9, &px, "\\frac{a+b}{c}");
+        expect(raw_frame(&r, &h, &p, 20000) == 0 && h.type == CR_R_SIZE && h.id == 9,
+               "proto: pixels: SIZE first");
+        free(p);
+        expect(raw_frame(&r, &h, &p, 20000) == 0 && h.type == CR_R_PIXELS &&
+                   h.len == 12 + px.bw * px.bh * 4,
+               "proto: pixels: PIXELS at the box");
+        if (p && h.type == CR_R_PIXELS) {
+            size_t ink = 0, j;
+            for (j = 0; j < (size_t)px.bw * px.bh; j++)
+                if (p[12 + j * 4 + 3] > 128) ink++;
+            expect(ink > 50, "proto: pixels: the formula has ink");
+        }
+        free(p);
+        expect(stat_of(&r, 10, "math_hits") == 1, "proto: the pixel request reused the SVG");
+    }
+    /* The colour: currentColor becomes fg. */
+    {
+        Rq red = o;
+        red.flags = CR_F_DISPLAY;
+        red.fg = 0xd02020ffu;
+        raw_size(&r, 11, &o, "x", &sz, NULL, NULL, 0);
+        red.bw = ceilu(sz.w_css);
+        red.bh = ceilu(sz.h_css);
+        raw_send(&r, 12, &red, "x");
+        if (raw_frame(&r, &h, &p, 20000) == 0) free(p);
+        if (raw_frame(&r, &h, &p, 20000) == 0 && h.type == CR_R_PIXELS) {
+            size_t j, reds = 0;
+            for (j = 0; j < (size_t)red.bw * red.bh; j++) {
+                const uint8_t *q = p + 12 + j * 4;
+                if (q[3] > 200 && q[0] > 150 && q[1] < 70 && q[2] < 70) reds++;
+            }
+            expect(reds > 10, "proto: fg colours the formula (currentColor)");
+        } else {
+            expect(0, "proto: fg: PIXELS");
+        }
+        free(p);
+    }
+    /* Errors: an answer with MathJax's message, the engine kept. */
+    s0 = stat_of(&r, 13, "math_starts");
+    expect(!raw_size(&r, 14, &o, "\\frac{a}{b", &sz, &code, msg, sizeof msg) &&
+               code == CR_E_SCRIPT && strstr(msg, "Missing close brace"),
+           "proto: a parse error: 'Missing close brace'");
+    expect(!raw_size(&r, 15, &o, "\\foo + 1", &sz, &code, msg, sizeof msg) &&
+               code == CR_E_SCRIPT && strstr(msg, "Undefined control sequence \\foo"),
+           "proto: an unknown macro is an error, not red text");
+    expect(!raw_size(&r, 16, &o, "\\def\\x{\\x}\\x", &sz, &code, msg, sizeof msg) &&
+               code == CR_E_SCRIPT && strstr(msg, "maximum macro substitution"),
+           "proto: \\def recursion ends at maxMacros");
+    expect(!raw_size(&r, 17, &o, "\\require{texhtml}x", &sz, &code, msg, sizeof msg) &&
+               code == CR_E_SCRIPT,
+           "proto: texhtml refused");
+    expect(!raw_size(&r, 18, &o, "\\href{https://example.com}{x}", &sz, &code, msg, sizeof msg) &&
+               code == CR_E_SCRIPT,
+           "proto: \\href (the html extension) refused");
+    expect(!raw_size(&r, 19, &o, "\\require{setoptions}\\setOptions{maxMacros=1000000}x", &sz, &code,
+                     msg, sizeof msg) &&
+               code == CR_E_SCRIPT,
+           "proto: setoptions refused");
+    expect(raw_size(&r, 20, &o, "\\def\\zz{A}\\zz", &sz, NULL, NULL, 0) &&
+               !raw_size(&r, 21, &o, "\\zz", &sz, &code, msg, sizeof msg) && code == CR_E_SCRIPT,
+           "proto: a \\def stays inside its formula");
+    expect(stat_of(&r, 22, "math_starts") == s0 && s0 > 0, "proto: errors keep the engine");
+    /* The node cap, counted on the MathML tree before any output. */
+    k = (size_t)snprintf(big, sizeof big, "a");
+    for (i = 0; i < 80; i++) k += (size_t)snprintf(big + k, sizeof big - k, "+a");
+    {
+        Rq cap = o;
+        cap.node_max = 100;
+        expect(!raw_size(&r, 23, &cap, big, &sz, &code, msg, sizeof msg) &&
+                   code == CR_E_TOO_LARGE && strstr(msg, "formula too large") &&
+                   strstr(msg, "limit 100"),
+               "proto: node cap: 'formula too large (N nodes, limit 100)'");
+        expect(stat_of(&r, 24, "math_starts") == s0, "proto: a node-cap refusal keeps the engine");
+    }
+    /* Huge sizes: the output is over the pixel cap, refused before a raster. */
+    {
+        Rq px = o;
+        px.flags = CR_F_DISPLAY;
+        px.max_px = 4000000;
+        raw_send(&r, 25, &px, "a\\hspace{100000em}b");
+        expect(raw_frame(&r, &h, &p, 20000) == 0 && h.type == CR_R_SIZE, "proto: hspace: SIZE");
+        free(p);
+        expect(raw_frame(&r, &h, &p, 20000) == 0 && h.type == CR_R_ERROR && p &&
+                   *(uint32_t *)p == CR_E_PIXELS,
+               "proto: hspace: over the pixel cap, refused");
+        free(p);
+    }
+    /* MathML input. */
+    {
+        Rq m = o;
+        m.kind = CR_KIND_MATHML;
+        expect(raw_size(&r, 26, &m, "<math><mi>x</mi><mo>=</mo><mn>1</mn></math>", &sz, NULL, NULL,
+                        0) &&
+                   sz.w_css > 30,
+               "proto: MathML renders");
+        expect(!raw_size(&r, 27, &m, "<math><mfrac><mi>x</mi></mfrac></math>", &sz, &code, msg,
+                         sizeof msg) &&
+                   code == CR_E_SCRIPT && strstr(msg, "Wrong number of children"),
+               "proto: MathML: a verify error is an error");
+        expect(!raw_size(&r, 28, &m, "<b>not math</b>", &sz, &code, msg, sizeof msg) &&
+                   code == CR_E_SCRIPT,
+               "proto: MathML: not a <math> element");
+    }
+    /* A display formula wider than max_w breaks its lines there. */
+    {
+        Rq wide = o;
+        CrSize a, b;
+        const char *src = "a+b+c+d+e+f+g+h+i+j+k+l+m+n+o+p+q+r+s+t+u+v=w";
+        raw_size(&r, 29, &wide, src, &a, NULL, NULL, 0);
+        wide.max_w = 200;
+        raw_size(&r, 30, &wide, src, &b, NULL, NULL, 0);
+        expect(a.w_css > 400 && b.w_css <= 205 && b.h_css > a.h_css * 2,
+               "proto: max_w: a wide display formula breaks its lines");
+    }
+    raw_close(&r);
+}
+
+static void test_budget_recycle(void) {
+    Raw r;
+    uint32_t hello[3], code;
+    CrSize sz;
+    char msg[400];
+    Rq o = tex_rq(1);
+    double t0;
+    int i;
+    expect(raw_spawn(&r, g_selftest, NULL) == 0 && raw_hello(&r, hello) == 0, "budget: spawn");
+    expect(raw_size(&r, 1, &o, "x", &sz, NULL, NULL, 0), "budget: a first formula");
+    t0 = now_ms();
+    o.budget = 300;
+    expect(!raw_size(&r, 2, &o, "%cr-selftest:jsloop", &sz, &code, msg, sizeof msg) &&
+               code == CR_E_TIMEOUT,
+           "budget: an endless script ends with CR_E_TIMEOUT");
+    expect(now_ms() - t0 < 1500, "budget: ... near its 300 ms budget");
+    expect(stat_of(&r, 3, "math_recycles") == 1 && stat_of(&r, 4, "math_heap") == 0,
+           "budget: the engine is freed after the timeout");
+    o.budget = 5000;
+    expect(raw_size(&r, 5, &o, "y", &sz, NULL, NULL, 0) && stat_of(&r, 6, "math_starts") == 2,
+           "budget: the next formula starts a fresh engine");
+    raw_close(&r);
+    {
+        static char *args[] = {"--recycle-mb", "64", NULL};
+        expect(raw_spawn(&r, g_selftest, args) == 0 && raw_hello(&r, hello) == 0, "heap: spawn");
+        expect(raw_size(&r, 1, &o, "x", &sz, NULL, NULL, 0) && stat_of(&r, 2, "math_recycles") == 0,
+               "heap: a formula's heap is under 64 MB");
+        expect(raw_size(&r, 3, &o, "%cr-selftest:jsheap 80", &sz, NULL, NULL, 0),
+               "heap: 80 MB retained");
+        expect(stat_of(&r, 4, "math_recycles") == 1 && stat_of(&r, 5, "math_heap") == 0,
+               "heap: past --recycle-mb the engine is recycled");
+        raw_close(&r);
+    }
+    {
+        static char *args[] = {"--recycle-jobs", "2", NULL};
+        char src[64];
+        expect(raw_spawn(&r, g_bin, args) == 0 && raw_hello(&r, hello) == 0, "jobs: spawn");
+        for (i = 0; i < 5; i++) {
+            snprintf(src, sizeof src, "x^{%d}", i + 2);
+            expect(raw_size(&r, (uint32_t)(1 + i), &o, src, &sz, NULL, NULL, 0), "jobs: formula");
+        }
+        expect(stat_of(&r, 9, "math_starts") == 3 && stat_of(&r, 10, "math_recycles") == 2,
+               "jobs: --recycle-jobs 2 restarts the engine every two formulas");
+        raw_close(&r);
+    }
+}
+
+/* ---- the pack: bytecode and source modules must be this build's ------------ */
+
+/* A copy of the pack with one bit flipped in entry `name`'s bytes (the
+ * trailer covers the table only: the pack opens). 1 when written. */
+static int tamper(const char *name, const char *out) {
+    size_t n, o = 12, nl0 = strlen(name);
+    uint8_t *b = slurp(g_pack, &n);
+    uint32_t cnt, i;
+    int done = 0;
+    if (!b || n < 20) {
+        free(b);
+        return 0;
+    }
+    memcpy(&cnt, b + 8, 4);
+    for (i = 0; i < cnt && o + 2 <= n; i++) {
+        uint16_t nl;
+        uint32_t cl, off;
+        memcpy(&nl, b + o, 2);
+        o += 2;
+        if (o + nl + 12 > n) break;
+        memcpy(&cl, b + o + nl + 4, 4);
+        memcpy(&off, b + o + nl + 8, 4);
+        if (nl == nl0 && memcmp(b + o, name, nl) == 0 && (size_t)off + cl <= n) {
+            b[off + cl / 2] ^= 0x10; /* the table (and its trailer) unchanged */
+            done = 1;
+        }
+        o += nl + 12;
+    }
+    if (done) {
+        FILE *fp;
+        fp = fopen(out, "wb");
+        if (!fp || fwrite(b, 1, n, fp) != n) done = 0;
+        if (fp) fclose(fp);
+    }
+    free(b);
+    return done;
+}
+
+static void test_pack_hash(void) {
+    Raw r;
+    uint32_t hello[3], code;
+    CrSize sz;
+    char msg[400];
+    Rq o = tex_rq(1);
+    expect(tamper("js:math", "testdata/generated/math_tampered.pack"), "pack: js:math tampered");
+    {
+        static char *args[] = {"--pack", "testdata/generated/math_tampered.pack", NULL};
+        expect(raw_spawn(&r, g_bin, args) == 0 && raw_hello(&r, hello) == 0,
+               "pack: the tampered pack opens");
+        expect(!raw_size(&r, 1, &o, "x", &sz, &code, msg, sizeof msg) && code == CR_E_ENGINE &&
+                   strstr(msg, "does not match"),
+               "pack: math bytecode that is not this build's is refused before QuickJS");
+        raw_close(&r);
+    }
+    expect(tamper("src:mathjax-newcm-font/svg/dynamic/double-struck",
+                  "testdata/generated/math_tampered_src.pack"),
+           "pack: a source module tampered");
+    {
+        static char *args[] = {"--pack", "testdata/generated/math_tampered_src.pack", NULL};
+        expect(raw_spawn(&r, g_bin, args) == 0 && raw_hello(&r, hello) == 0,
+               "pack: the second tampered pack opens");
+        expect(raw_size(&r, 1, &o, "x+1", &sz, NULL, NULL, 0),
+               "pack: formulas that need no other module still render");
+        expect(!raw_size(&r, 2, &o, "\\mathbb{R}", &sz, &code, msg, sizeof msg) &&
+                   code != 0,
+               "pack: a source module that is not this build's is never evaluated");
+        raw_close(&r);
+    }
+}
+
+/* ---- the editor's client: slot 2 ------------------------------------------- */
+
+static void test_client(void) {
+    RtxSvgCfg c;
+    RtxSvgStats s0, s1, v0, m0;
+    RtxMathOpt o = opt(1, 20.0f);
+    float w = 0, h = 0, b = 0;
+    uint8_t *px = NULL;
+    char msg[400];
+    int rc;
+    double t0;
+    static const char q[] = "x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}";
+    cfg_math(&c);
+    setenv("RTX_RENDER_BIN", g_bin, 1);
+    rtx_svg_shutdown();
+    rtx_svg_forget_memory();
+    rtx_render_stats(RTX_RENDER_MATH, &s0);
+    expect(s0.pid == 0, "client: no math helper before the first formula");
+    t0 = now_ms();
+    rc = rtx_math_size((const uint8_t *)q, sizeof q - 1, &o, &c, NULL, &w, &h, &b, msg, sizeof msg);
+    rtx_render_stats(RTX_RENDER_MATH, &s1);
+    rtx_render_stats(RTX_RENDER_SVG, &v0);
+    rtx_render_stats(RTX_RENDER_MERMAID, &m0);
+    expect(rc == RTX_SVG_OK && w > 150 && h > 40 && b > 5 && b < h, "client: size and baseline");
+    expect(s1.spawns == s0.spawns + 1 && s1.pid > 0 && v0.pid == 0 && m0.pid == 0,
+           "client: the math slot spawned, the SVG and Mermaid slots did not");
+    printf("math_smoke: client: spawn-to-ready %.1f ms, first formula %.0f ms (%gx%g base %g)\n",
+           s1.last_ready_ms, now_ms() - t0, w, h, b);
+    rc = rtx_math_render((const uint8_t *)q, sizeof q - 1, &o, &c, ceilu(w), ceilu(h), NULL, &px,
+                         msg, sizeof msg);
+    expect(rc == RTX_SVG_OK && px, "client: pixels");
+    free(px);
+    px = NULL;
+    rc = rtx_math_size((const uint8_t *)"\\frac{a}{", 9, &o, &c, NULL, &w, &h, &b, msg, sizeof msg);
+    expect(rc == RTX_SVG_ESCRIPT && strstr(msg, "Missing"), "client: parse error message");
+    {
+        RtxSvgCfg small = c;
+        small.input_max = 8;
+        rtx_render_stats(RTX_RENDER_MATH, &s0);
+        rc = rtx_math_size((const uint8_t *)q, sizeof q - 1, &o, &small, NULL, &w, &h, &b, msg,
+                           sizeof msg);
+        rtx_render_stats(RTX_RENDER_MATH, &s1);
+        expect(rc == RTX_SVG_EBIG && s1.requests == s0.requests,
+               "client: a formula over the length limit is not sent");
+    }
+    /* A hung helper: killed at the budget + grace; the next one respawns. */
+    setenv("RTX_RENDER_BIN", g_selftest, 1);
+    rtx_svg_shutdown();
+    {
+        RtxSvgCfg quick = c;
+        static const char hang[] = "<!--cr-selftest:hang-->x";
+        static const char loop[] = "%cr-selftest:jsloop";
+        quick.timeout_ms = 300;
+        rtx_render_stats(RTX_RENDER_MATH, &s0);
+        t0 = now_ms();
+        rc = rtx_math_size((const uint8_t *)hang, sizeof hang - 1, &o, &quick, NULL, &w, &h, &b,
+                           msg, sizeof msg);
+        rtx_render_stats(RTX_RENDER_MATH, &s1);
+        expect(rc == RTX_SVG_ETIMEOUT && s1.kills == s0.kills + 1 && s1.pid == 0,
+               "client: a hung helper is killed past its budget");
+        expect(now_ms() - t0 < 4500, "client: ... soon after (budget + grace)");
+        rtx_svg_forget_memory();
+        rc = rtx_math_size((const uint8_t *)"y", 1, &o, &c, NULL, &w, &h, &b, msg, sizeof msg);
+        rtx_render_stats(RTX_RENDER_MATH, &s0);
+        expect(rc == RTX_SVG_OK && s0.spawns == s1.spawns + 1, "client: the next formula respawns");
+        quick.timeout_ms = 400;
+        rc = rtx_math_size((const uint8_t *)loop, sizeof loop - 1, &o, &quick, NULL, &w, &h, &b,
+                           msg, sizeof msg);
+        rtx_render_stats(RTX_RENDER_MATH, &s1);
+        expect(rc == RTX_SVG_ETIMEOUT && s1.pid == s0.pid && s1.kills == s0.kills,
+               "client: an endless script ends in the engine, the helper lives");
+        /* A cancelled request returns at once; its late reply is dropped. */
+        {
+            static const char slow[] = "<!--cr-selftest:slow-->z";
+            _Atomic int cancel = 1;
+            rtx_render_stats(RTX_RENDER_MATH, &s0);
+            rc = rtx_math_size((const uint8_t *)slow, sizeof slow - 1, &o, &c, &cancel, &w, &h,
+                               &b, msg, sizeof msg);
+            expect(rc == RTX_SVG_ECANCEL, "client: a cancelled request returns");
+            rc = rtx_math_size((const uint8_t *)"w", 1, &o, &c, NULL, &w, &h, &b, msg, sizeof msg);
+            rtx_render_stats(RTX_RENDER_MATH, &s1);
+            expect(rc == RTX_SVG_OK && s1.stale >= s0.stale + 1 && s1.pid == s0.pid,
+                   "client: its late reply is dropped by its stamp, same helper");
+        }
+    }
+    setenv("RTX_RENDER_BIN", g_bin, 1);
+    rtx_svg_shutdown();
+}
+
+static void test_disk_cache(void) {
+    RtxSvgCfg c;
+    RtxSvgStats s0, s1;
+    RtxMathOpt o = opt(0, 18.0f), o2 = opt(0, 22.0f);
+    float w = 0, h = 0, b = 0, w2 = 0, h2 = 0, b2 = 0;
+    uint8_t *a = NULL, *px = NULL;
+    char msg[256];
+    static const char q[] = "\\sum_{i=1}^n x_i^2";
+    if (system("rm -rf testdata/generated/mathcache && mkdir -p testdata/generated/mathcache") != 0)
+        return;
+    cfg_math(&c);
+    c.cache_dir = "testdata/generated/mathcache";
+    c.cache_max = 8u << 20;
+    rtx_svg_forget_memory();
+    expect(rtx_math_size((const uint8_t *)q, sizeof q - 1, &o, &c, NULL, &w, &h, &b, msg,
+                         sizeof msg) == RTX_SVG_OK &&
+               b > 0,
+           "cache: size and baseline");
+    expect(rtx_math_render((const uint8_t *)q, sizeof q - 1, &o, &c, ceilu(w), ceilu(h), NULL, &a,
+                           msg, sizeof msg) == RTX_SVG_OK,
+           "cache: pixels");
+    /* A later session with no helper at all: layout and paint from disk. */
+    rtx_svg_shutdown();
+    rtx_svg_forget_memory();
+    setenv("RTX_RENDER_BIN", "/nonexistent/cctext-render", 1);
+    rtx_render_stats(RTX_RENDER_MATH, &s0);
+    expect(rtx_math_size((const uint8_t *)q, sizeof q - 1, &o, &c, NULL, &w2, &h2, &b2, msg,
+                         sizeof msg) == RTX_SVG_OK &&
+               w2 == w && h2 == h && b2 == b,
+           "cache: the size and the baseline from disk, no helper");
+    expect(rtx_math_render((const uint8_t *)q, sizeof q - 1, &o, &c, ceilu(w), ceilu(h), NULL, &px,
+                           msg, sizeof msg) == RTX_SVG_OK &&
+               px && a && memcmp(a, px, (size_t)ceilu(w) * ceilu(h) * 4) == 0,
+           "cache: identical pixels from disk");
+    rtx_render_stats(RTX_RENDER_MATH, &s1);
+    expect(s1.disk_size_hits == s0.disk_size_hits + 1 && s1.disk_px_hits == s0.disk_px_hits + 1 &&
+               s1.spawns == s0.spawns,
+           "cache: hits counted, nothing spawned");
+    expect(rtx_math_size((const uint8_t *)q, sizeof q - 1, &o2, &c, NULL, &w2, &h2, &b2, msg,
+                         sizeof msg) == RTX_SVG_ENONE,
+           "cache: the key holds the options (another size is another key)");
+    setenv("RTX_RENDER_BIN", g_bin, 1);
+    rtx_svg_shutdown();
+    free(a);
+    free(px);
+}
+
+/* ---- formulas.json: our references, TeX against MathML --------------------- */
+
+/* The next JSON string at *p (escapes \\ \" \/ \n \t \uXXXX), into out. */
+static int json_str(const char **p, char *out, size_t cap) {
+    const char *s = *p;
+    size_t k = 0;
+    while (*s && *s != '"') s++;
+    if (*s != '"') return 0;
+    s++;
+    while (*s && *s != '"') {
+        unsigned c = (unsigned char)*s++;
+        if (c == '\\') {
+            char e = *s++;
+            if (e == 'n') c = '\n';
+            else if (e == 't') c = '\t';
+            else if (e == 'u') {
+                unsigned v = 0;
+                int i;
+                for (i = 0; i < 4 && s[i]; i++) {
+                    char h = s[i];
+                    v = v * 16 + (unsigned)(h >= 'a' ? h - 'a' + 10 : h >= 'A' ? h - 'A' + 10 : h - '0');
+                }
+                s += 4;
+                if (v < 0x80) c = v;
+                else if (v < 0x800) {
+                    if (k + 2 < cap) {
+                        out[k++] = (char)(0xC0 | (v >> 6));
+                        out[k++] = (char)(0x80 | (v & 63));
+                    }
+                    continue;
+                } else {
+                    if (k + 3 < cap) {
+                        out[k++] = (char)(0xE0 | (v >> 12));
+                        out[k++] = (char)(0x80 | ((v >> 6) & 63));
+                        out[k++] = (char)(0x80 | (v & 63));
+                    }
+                    continue;
+                }
+            } else
+                c = (unsigned char)e;
+        }
+        if (k + 1 < cap) out[k++] = (char)c;
+    }
+    out[k] = 0;
+    if (*s == '"') s++;
+    *p = s;
+    return 1;
+}
+
+static void to_grey_white(const uint8_t *px, uint32_t w, uint32_t h, int premul, uint8_t *out) {
+    size_t i, npx = (size_t)w * h;
+    for (i = 0; i < npx; i++) {
+        const uint8_t *p = px + i * 4;
+        int a = p[3], r, g, b;
+        if (premul) {
+            r = p[0] + 255 - a;
+            g = p[1] + 255 - a;
+            b = p[2] + 255 - a;
+        } else {
+            r = (p[0] * a + 255 * (255 - a)) / 255;
+            g = (p[1] * a + 255 * (255 - a)) / 255;
+            b = (p[2] * a + 255 * (255 - a)) / 255;
+        }
+        out[i] = (uint8_t)((r * 299 + g * 587 + b * 114) / 1000);
+    }
+}
+
+/* Pixels of a and b (grey) more than 24 levels apart over their common box. */
+static size_t grey_diff(const uint8_t *a, uint32_t aw, uint32_t ah, const uint8_t *b, uint32_t bw,
+                        uint32_t bh) {
+    uint32_t w = aw < bw ? aw : bw, h = ah < bh ? ah : bh, x, y;
+    size_t bad = 0;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++)
+            if (abs((int)a[(size_t)y * aw + x] - (int)b[(size_t)y * bw + x]) > 24) bad++;
+    return bad;
+}
+
+static int g_mml_same;
+
+static int cmp_d(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void test_refs(void) {
+    RtxSvgCfg c;
+    RtxImgLimits lim;
+    RtxMathOpt o = opt(1, 20.0f), om = opt(1, 20.0f);
+    size_t jn, nref = 0;
+    uint8_t *json = slurp("testdata/math/formulas.json", &jn);
+    const char *p;
+    double times[64];
+    int nt = 0;
+    om.mml = 1;
+    cfg_math(&c);
+    rtx_img_limits_default(&lim);
+    rtx_svg_forget_memory();
+    if (!json) {
+        expect(0, "refs: formulas.json");
+        return;
+    }
+    p = (const char *)json;
+    while ((p = strchr(p, '[')) != NULL) {
+        char name[64], tex[1024], path[256], msg[400];
+        size_t rn, mn;
+        uint8_t *ref, *mml, *px = NULL, *mpx = NULL;
+        float w = 0, h = 0, b = 0, mw = 0, mh = 0, mb = 0;
+        RtxImgBmp want;
+        RtxImgInfo wi;
+        int rc;
+        double t0;
+        p++;
+        if (!json_str(&p, name, sizeof name) || !json_str(&p, tex, sizeof tex)) break;
+        if (!strncmp(name, "error", 5) || !strncmp(name, "undefined", 9)) {
+            rc = rtx_math_size((const uint8_t *)tex, strlen(tex), &o, &c, NULL, &w, &h, &b, msg,
+                               sizeof msg);
+            snprintf(path, sizeof path, "refs %s: an error with a message (%s)", name, msg);
+            expect(rc == RTX_SVG_ESCRIPT && msg[0], path);
+            continue;
+        }
+        t0 = now_ms();
+        rc = rtx_math_size((const uint8_t *)tex, strlen(tex), &o, &c, NULL, &w, &h, &b, msg,
+                           sizeof msg);
+        if (rc == RTX_SVG_OK)
+            rc = rtx_math_render((const uint8_t *)tex, strlen(tex), &o, &c, ceilu(w), ceilu(h),
+                                 NULL, &px, msg, sizeof msg);
+        if (nt < 64) times[nt++] = now_ms() - t0;
+        snprintf(path, sizeof path, "refs %s: renders (%d %s)", name, rc, msg);
+        expect(rc == RTX_SVG_OK && px, path);
+        snprintf(path, sizeof path, "testdata/math/ref/%s.png", name);
+        ref = slurp(path, &rn);
+        if (px && ref &&
+            rtx_img_decode(ref, rn, &lim, 0, 0, RTX_IMG_PIX_RGBA, 1, NULL, &want, &wi) ==
+                RTX_IMG_OK) {
+            uint32_t pw = ceilu(w), ph = ceilu(h);
+            uint8_t *g1 = (uint8_t *)malloc((size_t)pw * ph);
+            uint8_t *g2 = (uint8_t *)malloc((size_t)want.w * want.h);
+            size_t bad;
+            to_grey_white(px, pw, ph, 1, g1);
+            to_grey_white(want.px, want.w, want.h, 0, g2);
+            bad = grey_diff(g1, pw, ph, g2, want.w, want.h);
+            snprintf(msg, sizeof msg, "refs %s: %ux%u vs the reference %ux%u, %zu px off", name,
+                     pw, ph, want.w, want.h, bad);
+            expect(abs((int)pw - (int)want.w) <= 1 && abs((int)ph - (int)want.h) <= 1 &&
+                       bad * 200 <= (size_t)pw * ph,
+                   msg);
+            nref++;
+            /* The same formula as MathML (testdata/math/mml): the same picture. */
+            snprintf(path, sizeof path, "testdata/math/mml/%s.mml", name);
+            mml = slurp(path, &mn);
+            if (mml) {
+                rc = rtx_math_size(mml, mn, &om, &c, NULL, &mw, &mh, &mb, msg, sizeof msg);
+                if (rc == RTX_SVG_OK)
+                    rc = rtx_math_render(mml, mn, &om, &c, ceilu(mw), ceilu(mh), NULL, &mpx, msg,
+                                         sizeof msg);
+                if (rc == RTX_SVG_OK && mpx) {
+                    uint32_t qw = ceilu(mw), qh = ceilu(mh);
+                    uint8_t *g3 = (uint8_t *)malloc((size_t)qw * qh);
+                    to_grey_white(mpx, qw, qh, 1, g3);
+                    bad = grey_diff(g1, pw, ph, g3, qw, qh);
+                    snprintf(msg, sizeof msg,
+                             "refs %s: MathML draws what TeX draws (%ux%u vs %ux%u, base %g vs "
+                             "%g, %zu px off)",
+                             name, qw, qh, pw, ph, mb, b, bad);
+                    if (qw == pw && qh == ph && bad * 500 <= (size_t)pw * ph) {
+                        g_mml_same++;
+                    } else {
+                        /* MathJax's own difference: TeX's \binom delimiters
+                         * are OPEN / CLOSE atoms, MathML's <mo> get the
+                         * operator dictionary's spacing. Same height and
+                         * baseline, a little wider. */
+                        printf("math_smoke: %s\n", msg);
+                        expect(qh == ph && (int)qw - (int)pw <= (int)pw / 20 + 1 &&
+                                   (int)pw - (int)qw <= (int)pw / 20 + 1,
+                               msg);
+                    }
+                    expect(mb - b < 0.05f && b - mb < 0.05f, msg);
+                    free(g3);
+                } else {
+                    snprintf(msg, sizeof msg, "refs %s: its MathML renders (%d)", name, rc);
+                    expect(0, msg);
+                }
+                free(mml);
+                free(mpx);
+                mpx = NULL;
+            }
+            free(g1);
+            free(g2);
+            rtx_img_bmp_free(&want);
+        } else if (px) {
+            snprintf(msg, sizeof msg, "refs %s: reference PNG", name);
+            expect(0, msg);
+        }
+        free(ref);
+        free(px);
+    }
+    expect(nref >= 30, "refs: every formula compared");
+    expect(g_mml_same >= 29, "refs: MathML and TeX draw the same picture (all but \\binom)");
+    printf("math_smoke: MathML identical to TeX for %d of %zu formulas\n", g_mml_same, nref);
+    if (nt > 2) {
+        qsort(times, (size_t)nt, sizeof times[0], cmp_d);
+        printf("math_smoke: %zu formulas, size + pixels median %.1f ms, max %.1f ms (the first "
+               "includes a font file or two)\n",
+               nref, times[nt / 2], times[nt - 1]);
+    }
+    free(json);
+}
+
+/* ---- the Rich layout ------------------------------------------------------- */
+
+static double px_meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 8.0 * (double)bytes.len;
+}
+
+static double px_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 20.0;
+}
+
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return (double)bytes.len;
+}
+
+static double cell_lh(void *ctx, RtxStyle style, RtxSectionKind sec) {
+    (void)ctx;
+    (void)style;
+    (void)sec;
+    return 1.0;
+}
+
+#define MDIR "testdata/generated/mathdoc"
+
+static const char g_doc[] =
+    "# Formulas\n"
+    "\n"
+    "Inline $x^2 + 1$ and a fraction $\\frac{a+b}{c}$ in text.\n"
+    "\n"
+    "$$\n"
+    "x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}\n"
+    "$$\n"
+    "\n"
+    "One line: $$ e^{i\\pi} + 1 = 0 $$\n"
+    "\n"
+    "$$ \\int_0^1 f(x)\\,dx $$\n"
+    "\n"
+    "```math\n"
+    "\\sum_{k=1}^n k\n"
+    "```\n"
+    "\n"
+    "Broken $\\frac{a}{b$ stays.\n"
+    "\n"
+    "| cell | $y^2$ |\n"
+    "|------|-------|\n"
+    "| a    | b     |\n";
+
+static size_t off_of(const char *needle) {
+    const char *p = strstr(g_doc, needle);
+    return p ? (size_t)(p - g_doc) : 0;
+}
+
+static int row_of_off(RtxLayout *L, size_t off) {
+    size_t i;
+    for (i = 0; i < L->rows.len; i++)
+        if (off >= L->rows.data[i].byte_start &&
+            off < L->rows.data[i].byte_start + L->rows.data[i].byte_len + 1)
+            return (int)i;
+    return -1;
+}
+
+static int row_starting(RtxLayout *L, size_t off) {
+    size_t i;
+    for (i = 0; i < L->rows.len; i++)
+        if (L->rows.data[i].byte_start == off) return (int)i;
+    return -1;
+}
+
+static void settle(void) {
+    int k;
+    for (k = 0; k < 6; k++) rtx_img_finish();
+}
+
+/* The stand-in at an inline formula's opening dollar, from a row's bytes. */
+static int vis_at(RtxLayout *L, RtxDoc *d, size_t off, RtxHintVis *hv) {
+    char buf[512];
+    int r = row_of_off(L, off);
+    size_t lo, n, got;
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    if (r < 0) return 0;
+    lo = L->rows.data[r].byte_start;
+    n = L->rows.data[r].byte_len;
+    if (n > sizeof buf) n = sizeof buf;
+    got = d->read_at(lo, cc_slice_from_buffer(buf, n)) !>;
+    return rtx_layout_hint_vis(L, d, off, buf, off - lo, got, hv);
+}
+
+/* Where `needle` is in the document now (after edits). */
+static size_t doc_off(RtxDoc *d, const char *needle) {
+    char buf[4096];
+    size_t got;
+    const char *p;
+    @errhandler(CCError e) {
+        (void)e;
+        return 0;
+    }
+    got = d->read_at(0, cc_slice_from_buffer(buf, sizeof buf - 1)) !>;
+    buf[got] = 0;
+    p = strstr(buf, needle);
+    return p ? (size_t)(p - buf) : 0;
+}
+
+/* A painter's ask for a block record's pixels, settled (what makes a
+ * formula "one with pixels": the stale display's candidate). */
+static void want_rec(const RtxImgRec *rec) {
+    RtxImgSrc s;
+    RtxImgView v;
+    if (!rec) return;
+    rtx_img_src_math_key(rec->mm_h, rec->mm_n, rec->mm_theme, &s);
+    rtx_img_want(&s, (uint32_t)rec->w, (uint32_t)rec->h, &v);
+    settle();
+    rtx_img_want(&s, (uint32_t)rec->w, (uint32_t)rec->h, &v);
+}
+
+static const RtxImgRec *math_rec(RtxLayout *L, size_t lo) {
+    size_t i;
+    for (i = 0; i < L->img_recs.len; i++)
+        if (L->img_recs.data[i].math && L->img_recs.data[i].lo == lo) return &L->img_recs.data[i];
+    return NULL;
+}
+
+static void test_layout(void) {
+    char cwd[512], path[700];
+    FILE *fp;
+    RtxImgLimits *lim = rtx_img_limits();
+    RtxSvgStats s0, s1;
+    size_t in1 = off_of("$x^2"), in2 = off_of("$\\frac{a+b}"), blk = off_of("$$\nx ="),
+           blk_body = off_of("x = \\frac"), one = off_of("$$ e^"), own = off_of("$$ \\int"),
+           fence = off_of("```math"), broken = off_of("$\\frac{a}{b$"), cell = off_of("$y^2$");
+    rtx_img_reset();
+    setenv("RTX_RENDER_BIN", g_bin, 1);
+    rtx_svg_shutdown();
+    rtx_svg_forget_memory();
+    lim->svg_cache_max = 0; /* no disk cache: prove the helper path */
+    if (system("rm -rf " MDIR " && mkdir -p " MDIR "/.git") != 0) return;
+    if (!getcwd(cwd, sizeof cwd)) return;
+    snprintf(path, sizeof path, "%s/" MDIR "/doc.md", cwd);
+    fp = fopen(path, "wb");
+    if (!fp) return;
+    fwrite(g_doc, 1, sizeof g_doc - 1, fp);
+    fclose(fp);
+    {
+        @errhandler(CCError e) {
+            fprintf(stderr, "error: %s\n", e.message ? e.message : "?");
+            fails++;
+            return;
+        }
+        RtxDoc d = {0} @destroy;
+        RtxLayout R = {0} @destroy;
+        RtxMeasure pm = {0}, cm = {0};
+        const RtxImgRec *rec;
+        RtxHintVis hv;
+        double asc = 0.8;
+        pm.measure = px_meas;
+        pm.line_height = px_lh;
+        cm.measure = cell_meas;
+        cm.line_height = cell_lh;
+        rtx_layout_math_metrics_get(&asc, NULL);
+        d.from_path(cc_slice_cstr(path)) !>;
+        R.rich = 1;
+        R.wrap = 1;
+        R.doc(&d, &pm, 600.0) !>;
+        expect(R.math_on == 1 && R.mm_on && R.img_on, "layout: math seen (pictures: pixels)");
+        rec = math_rec(&R, blk);
+        expect(rec && rec->mm && rec->math && !rec->revealed, "layout: a $$ block is a picture row");
+        expect(row_starting(&R, blk_body) < 0, "layout: the block's other lines lay out nothing");
+        expect(math_rec(&R, own) != NULL, "layout: a one-line $$ block at a line start");
+        expect(math_rec(&R, fence) != NULL, "layout: a ```math fence");
+        expect(math_rec(&R, one) == NULL, "layout: $$ inside a line of text is inline");
+        /* Before any size: the inline source as text. */
+        expect(vis_at(&R, &d, in1, &hv) && !hv.pic && hv.gn >= 7 && memcmp(hv.g, "$x^2", 4) == 0,
+               "inline: the source shows until the size is known");
+        settle();
+        expect(rtx_img_layout_changed(), "layout: the sizes arrived");
+        R.doc(&d, &pm, 600.0) !>;
+        rec = math_rec(&R, blk);
+        expect(rec && rec->state == RTX_IMG_S_INFO && rec->w > 150 && rec->h > 30 &&
+                   rec->x > 0 && rec->x + rec->w <= 600.0,
+               "display: the formula's box, centred in the pane");
+        expect(vis_at(&R, &d, in1, &hv) && hv.pic && hv.pw > 20 && hv.ph > 10 && hv.pb >= 0,
+               "inline: the stand-in is the formula's picture");
+        {
+            int r = row_of_off(&R, in2);
+            RtxVisRow *row = r >= 0 ? &R.rows.data[r] : NULL;
+            RtxHintVis fv;
+            expect(vis_at(&R, &d, in2, &fv) && fv.pic && fv.ph > 20.0,
+                   "inline: a fraction taller than the line");
+            if (row && fv.pic) {
+                double text_h = row->height, base, top;
+                /* The row grew: the text moved down by ytop; the picture's
+                 * box, on the baseline, is inside the row. */
+                base = row->ytop + 20.0 * asc;
+                top = base - (fv.ph - fv.pb);
+                expect(row->height > 20.0 && row->ytop > 0 && top >= -0.5 &&
+                           base + fv.pb <= text_h + 0.5,
+                       "inline: the row grows to fit the fraction on the baseline");
+            }
+            expect(!vis_at(&R, &d, broken, &hv) || !hv.pic,
+                   "inline: a formula that does not parse stays source");
+            expect(!vis_at(&R, &d, cell, &hv) || !hv.pic, "inline: a table cell keeps the source");
+        }
+        /* Pixels for what is painted, then idle. */
+        {
+            RtxImgSrc s;
+            RtxImgView v;
+            vis_at(&R, &d, in1, &hv);
+            rtx_img_src_math_key(hv.pic_h, hv.pic_n, hv.pic_look, &s);
+            rtx_img_want(&s, (uint32_t)hv.pw, (uint32_t)hv.ph, &v);
+            settle();
+            rtx_img_want(&s, (uint32_t)hv.pw, (uint32_t)hv.ph, &v);
+            expect(v.state == RTX_IMG_S_OK && v.bmp && v.bmp->w == (uint32_t)hv.pw,
+                   "inline: the painter's bitmap at the box");
+            expect(!rtx_img_busy() && !rtx_img_pump() && !rtx_img_pump(),
+                   "idle: nothing queued, nothing changes once settled");
+        }
+        /* The caret in an inline formula: its source (the dollars too). */
+        expect(rtx_layout_reveal(&R, &d, in1 + 2, in1 + 2), "reveal: the caret in $x^2 + 1$");
+        R.doc(&d, &pm, 600.0) !>;
+        expect(rtx_layout_hidden_to(&R, &d, in1 + 1) == 0, "reveal: the inline source shows");
+        /* The caret in the block: the source, the formula under it. */
+        expect(rtx_layout_reveal(&R, &d, blk_body + 2, blk_body + 2), "reveal: the caret in $$");
+        R.doc(&d, &pm, 600.0) !>;
+        rec = math_rec(&R, blk);
+        expect(row_starting(&R, blk_body) >= 0 && rec && rec->revealed && rec->w > 150,
+               "reveal: the block's source rows, the formula under them");
+        /* Painted (it has pixels): the block's last good formula. */
+        want_rec(rec);
+        R.doc(&d, &pm, 600.0) !>;
+        rec = math_rec(&R, blk);
+        /* Edit the block: the old formula stays (stale) until the new one
+         * is sized; then it replaces it. */
+        if (rec) {
+            RtxImgRec keep = *rec;
+            d.replace(off_of("2a}\n$$"), 2, cc_slice_cstr("3a")) !>;
+            d.reparse_edit(d.last_off, d.last_markup) !>;
+            rtx_layout_reveal(&R, &d, blk_body + 2, blk_body + 2);
+            R.doc(&d, &pm, 600.0) !>;
+            rec = math_rec(&R, blk);
+            expect(rec && rec->mm_prev && rec->mm_stale && rec->mm_prev_h == keep.mm_h &&
+                       rec->mm_h != keep.mm_h,
+                   "stale: the edited block keeps the old formula meanwhile");
+            settle();
+            rtx_layout_reveal(&R, &d, blk_body + 2, blk_body + 2);
+            R.doc(&d, &pm, 600.0) !>;
+            rec = math_rec(&R, blk);
+            expect(rec && !rec->mm_stale && rec->state == RTX_IMG_S_INFO,
+                   "stale: the new formula replaces it once sized");
+            want_rec(rec);
+            R.doc(&d, &pm, 600.0) !>;
+        }
+        /* A block that does not parse: the last good formula, the message. */
+        d.replace(off_of("\\sqrt{b^2"), 5, cc_slice_cstr("\\sqrt{")) !>;
+        d.reparse_edit(d.last_off, d.last_markup) !>;
+        rtx_layout_reveal(&R, &d, 0, 0);
+        R.doc(&d, &pm, 600.0) !>;
+        settle();
+        R.doc(&d, &pm, 600.0) !>;
+        rec = math_rec(&R, blk);
+        expect(rec && rec->state == RTX_IMG_S_ERR && rec->mm_prev && rec->mm_stale,
+               "stale: an error keeps the last good formula");
+        if (rec) {
+            RtxImgSrc s;
+            RtxImgView v;
+            rtx_img_src_math_key(rec->mm_h, rec->mm_n, rec->mm_theme, &s);
+            rtx_img_info(&s, &v);
+            expect(v.state == RTX_IMG_S_ERR && v.msg && v.msg[0],
+                   "stale: the error's message reaches the painter");
+        }
+        /* An edited inline formula: the span's previous one, dimmed. */
+        {
+            size_t at = off_of("^2 + 1$") + 1;
+            d.replace(at, 1, cc_slice_cstr("3")) !>;
+            d.reparse_edit(d.last_off, d.last_markup) !>;
+            rtx_layout_reveal(&R, &d, 0, 0);
+            R.doc(&d, &pm, 600.0) !>;
+            expect(vis_at(&R, &d, in1, &hv) && hv.pic && hv.pic_dim,
+                   "stale: an edited inline formula shows the old one dimmed");
+            settle();
+            R.doc(&d, &pm, 600.0) !>;
+            expect(vis_at(&R, &d, in1, &hv) && hv.pic && !hv.pic_dim,
+                   "stale: then the new one");
+        }
+        /* The theme: only what is laid out re-renders; the old stays up. */
+        R.lines(&d, &pm, 600.0, 0, 3) !>;
+        settle();
+        rtx_render_stats(RTX_RENDER_MATH, &s0);
+        rtx_img_math_fg_set(0x80c0ff);
+        expect(rtx_img_layout_changed(), "theme: a change asks for a relayout");
+        R.lines(&d, &pm, 600.0, 0, 3) !>;
+        expect(vis_at(&R, &d, in1, &hv) && hv.pic && hv.pic_dim,
+               "theme: the old picture stays up meanwhile");
+        settle();
+        rtx_render_stats(RTX_RENDER_MATH, &s1);
+        expect(s1.requests == s0.requests + 2,
+               "theme: the two visible formulas re-render, not the ones below");
+        R.lines(&d, &pm, 600.0, 0, 3) !>;
+        expect(vis_at(&R, &d, in1, &hv) && hv.pic && !hv.pic_dim, "theme: the new colour lands");
+        rtx_img_math_fg_set(0xe6e6e6);
+        /* The terminal: cells. Display math is a block picture; inline
+         * math stays source unless math_unicode. */
+        rtx_img_cells_set(1, 8, 16, 30);
+        R.doc(&d, &cm, 80.0) !>;
+        rec = math_rec(&R, doc_off(&d, "$$ \\int"));
+        expect(rec && rec->h >= 1 && rec->w <= 80 && rec->h == (double)(int)rec->h,
+               "cells: a display formula in whole cells");
+        expect(R.math_on == 0 && (!vis_at(&R, &d, in1, &hv) || !hv.pic),
+               "cells: inline math stays source");
+        lim->math_unicode = 1;
+        R.doc(&d, &cm, 80.0) !>;
+        expect(R.math_on == 2 && vis_at(&R, &d, in1, &hv) && !hv.pic && hv.gn > 0 &&
+                   memcmp(hv.g, "x\xc2\xb3 + 1", 6) == 0,
+               "cells: math_unicode writes a simple formula as Unicode");
+        lim->math_unicode = 0;
+        rtx_img_cells_set(0, 8, 16, 30);
+        /* Off: math is source. */
+        lim->math = 0;
+        R.doc(&d, &pm, 600.0) !>;
+        expect(!R.math_on && math_rec(&R, blk) == NULL && row_starting(&R, blk_body) >= 0,
+               "setting: math off lays everything out as text");
+        lim->math = 1;
+        {
+            char buf[4096];
+            size_t got = d.read_at(0, cc_slice_from_buffer(buf, sizeof buf)) !>;
+            buf[got] = 0;
+            expect(strstr(buf, "Inline $x^3 + 1$ and") != NULL && strstr(buf, "$$\n") != NULL,
+                   "bytes: the document is its text");
+        }
+    }
+    rtx_svg_shutdown();
+    rtx_img_reset();
+}
+
+int main(void) {
+    char cwd[512];
+    rtx_safe_test_isol();
+    if (!getcwd(cwd, sizeof cwd)) return 1;
+    snprintf(g_bin, sizeof g_bin, "%s/bin/cctext-render", cwd);
+    snprintf(g_selftest, sizeof g_selftest, "%s/bin/cctext-render-selftest", cwd);
+    snprintf(g_pack, sizeof g_pack, "%s/bin/cctext-render.pack", cwd);
+    if (access(g_bin, X_OK) != 0 || access(g_selftest, X_OK) != 0) {
+        fprintf(stderr, "math_smoke: bin/cctext-render missing (./make.shcc @cctext_render)\n");
+        return 1;
+    }
+    if (system("mkdir -p testdata/generated") != 0) return 1;
+    test_protocol();
+    test_budget_recycle();
+    test_pack_hash();
+    test_client();
+    test_disk_cache();
+    test_refs();
+    test_layout();
+    rtx_svg_shutdown();
+    if (fails) {
+        fprintf(stderr, "math_smoke: %d failed\n", fails);
+        return 1;
+    }
+    printf("math_smoke: ok\n");
+    return 0;
+}

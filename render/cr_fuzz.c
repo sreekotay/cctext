@@ -25,6 +25,19 @@
  * and truncations. Each mutant has the editor's limits: 150 nodes and a
  * time budget (an interrupted script is an outcome, not a finding). The
  * engine restarts after every failure, as in the helper.
+ *
+ *   cctext-render-fuzz --math PACK testdata/math [ITERS] [SEED]
+ *
+ * --math: the TeX formulas of formulas.json and the MathML files of mml/
+ * are seeds for MathJax in QuickJS (the math bundle's bytecode and its
+ * source modules from the pack), then lunasvg on the SVG: byte flips,
+ * truncation, TeX / MathML token garbage (\def recursion, \newcommand,
+ * huge \hspace / \rule / \kern, \unicode, refused extensions, raw HTML,
+ * entities, CDATA), deep nesting (\frac, groups, \sqrt, subscripts,
+ * \left, <mrow>, <msqrt>), duplicated chunks, macro doubling chains,
+ * long \text and many terms, control bytes and invalid UTF-8, extreme
+ * numbers and splices; inline or display, some with a max width. The
+ * editor's limits apply (4000 nodes, maxMacros, the time budget).
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -607,6 +620,333 @@ static int mm_main(int argc, char **argv, CrPack *pack)
     return 0;
 }
 
+/* ---- math (--math): MathJax in QuickJS, then lunasvg ----------------------- */
+
+static CrJs *g_mj;
+static CrPack *g_fpack;
+static long g_mj_ok, g_mj_err, g_mj_timeout, g_mj_large;
+
+/* The helper's source modules (cctext-render.c checks their SHA-256; the
+ * fuzz build has no hash header: it reads its own pack). */
+static int fz_src_get(void *ctx, const char *key, const char **src, size_t *n, char *err,
+                      size_t cap)
+{
+    char name[300];
+    CrAsset *a;
+    (void)ctx;
+    (void)err;
+    (void)cap;
+    snprintf(name, sizeof name, "src:%s", key);
+    a = cr_pack_find(g_fpack, name);
+    if (!a || !(*src = (const char *)cr_asset_data(a))) return 1;
+    *n = a->raw_len;
+    return 0;
+}
+
+static void fz_src_put(void *ctx, const char *key)
+{
+    char name[300];
+    (void)ctx;
+    snprintf(name, sizeof name, "src:%s", key);
+    cr_asset_drop(cr_pack_find(g_fpack, name));
+}
+
+static void mj_one(const char *what, const char *src, size_t n, uint32_t budget_ms, int mml,
+                   int display)
+{
+    char err[1024], opts[160], *res, *z;
+    const char *a[3];
+    int to = 0;
+    double t0 = now_ms(), dt;
+    z = malloc(n + 1);
+    if (!z) abort();
+    memcpy(z, src, n);
+    z[n] = 0;
+    snprintf(opts, sizeof opts,
+             "{\"display\":%s,\"em\":16,\"fg\":\"#000000\",\"maxWidth\":%d,\"nodeMax\":4000}",
+             display ? "true" : "false", rndn(4) == 0 ? 300 : 0);
+    a[0] = mml ? "mml" : "tex";
+    a[1] = z;
+    a[2] = opts;
+    res = cr_js_call(g_mj, "mjRender", 3, a, budget_ms, err, sizeof err, &to);
+    if (res && !strncmp(res, "CCTEXT_TOO_LARGE", 16)) g_mj_large++;
+    else if (res && !strncmp(res, "CCTEXT_ERR ", 11)) g_mj_err++; /* engine kept */
+    else if (res) {
+        const char *nl = strchr(res, '\n');
+        g_mj_ok++;
+        if (nl) render_one(what, nl + 1, strlen(nl + 1));
+    } else if (to) g_mj_timeout++;
+    else g_mj_err++;
+    free(res);
+    free(z);
+    dt = now_ms() - t0;
+    if (dt > g_worst_ms) {
+        g_worst_ms = dt;
+        snprintf(g_worst, sizeof g_worst, "%s", what);
+    }
+}
+
+static const char *const MJ_TOK[] = {
+    "\\frac", "\\sqrt", "{", "}", "^", "_", "\\left(", "\\right)", "\\left.", "\\right|",
+    "\\begin{array}{c}", "\\end{array}", "\\begin{pmatrix}", "\\end{pmatrix}", "&", "\\\\",
+    "\\def\\a{\\a\\a}\\a", "\\def\\a#1{#1#1}", "\\newcommand{\\x}[1]{#1#1}", "\\let\\frac\\sqrt",
+    "\\hspace{1e6em}", "\\hspace{-1e6em}", "\\rule{1e5em}{1e5em}", "\\rule{-1em}{NaNem}",
+    "\\color{#zzz}", "\\color{red}", "\\text{", "\\mathbb", "\\require{", "\\require{html}",
+    "\\href{javascript:alert(1)}{", "\\unicode{0x10FFFF}", "\\unicode{0}", "\\char\"FFFFFF",
+    "\\mathchoice{a}{b}{c}{d}", "\\overbrace", "\\underbrace", "\\xrightarrow[", "\\operatorname",
+    "\\big", "\\Huge", "\\tiny", "\\kern-1e9em", "\\raise1e9em", "\\scriptstyle", "%", "#", "$",
+    "~", "\\", "\xef\xbf\xbf", "\xf0\x9f\x98\x80", "\xe2\x80\xae", "\xe9\x9d\xa2", "\\label{a}",
+    "\\tag{1}", "\\eqref{x}", "\\begin{align}", "\\end{align}", "\\cancel{", "\\boxed{",
+    "\\phantom{", "\\mathrm{", "\\begingroup", "\\endgroup", "\\global\\def\\q{q}", "\\mmlToken{mi}{x}",
+    "\\class{x}{", "\\style{color:red}{", "\\cssId{x}{", "\\mathtip{a}{b}", "\\verb|x|",
+    "\\ce{H2O}", "\\bbox[red,5px]{", "\\enclose{circle}{", "\\bra{a}", "\\qty(", "\\SI{3}{m}"};
+
+static const char *const MJ_MML[] = {
+    "<mrow>", "</mrow>", "<mi>x</mi>", "<mfrac>", "</mfrac>", "<msqrt>", "</msqrt>",
+    "<mspace width=\"1e9em\"/>", "<mpadded width=\"1e9em\" height=\"-1e9em\">", "</mpadded>",
+    "<mstyle mathsize=\"1e6em\">", "</mstyle>", "<mo stretchy=\"true\" minsize=\"1e9em\">(</mo>",
+    "<mtable><mtr><mtd>", "</mtd></mtr></mtable>", "<mmultiscripts>", "<mprescripts/>",
+    "<semantics><annotation-xml encoding=\"text/html\"><script>1</script></annotation-xml>",
+    "<maction actiontype=\"toggle\">", "<merror>", "&alpha;", "&NotExisting;", "&#x110000;",
+    "<![CDATA[", "]]>", "<!--", "-->", "<math", ">", "</math>", "href=\"javascript:1\"",
+    "<menclose notation=\"box circle\">", "<mglyph src=\"file:///etc/passwd\"/>"};
+
+static void mj_mutate(const Seed *s, int mml, Buf *o)
+{
+    const char *b = s->d;
+    size_t n = s->n, i, k;
+    const char *const *tok = mml ? MJ_MML : MJ_TOK;
+    size_t ntok = mml ? sizeof MJ_MML / sizeof MJ_MML[0] : sizeof MJ_TOK / sizeof MJ_TOK[0];
+    o->n = 0;
+    switch (rndn(10)) {
+    case 0: /* byte flips */
+        buf_add(o, b, n);
+        for (i = rndn(6) + 1; i-- && o->n;) o->b[rndn(o->n)] = (char)rnd();
+        break;
+    case 1: /* truncate */
+        buf_add(o, b, rndn(n + 1));
+        break;
+    case 2: /* tokens at random places */
+        buf_add(o, b, n);
+        for (i = rndn(6) + 1; i--;) {
+            const char *t = tok[rndn(ntok)];
+            size_t at = rndn(o->n + 1), tl = strlen(t);
+            buf_add(o, t, tl);
+            memmove(o->b + at + tl, o->b + at, o->n - tl - at);
+            memcpy(o->b + at, t, tl);
+        }
+        break;
+    case 3: { /* deep nesting */
+        static const size_t depths[] = {30, 200, 1000};
+        size_t d = depths[rndn(3)];
+        int kind = (int)rndn(5);
+        static const char *const open_tex[] = {"\\frac{", "{", "\\sqrt{", "x_{", "\\left("};
+        static const char *const close_tex[] = {"}{y}", "}", "}", "}", "\\right)"};
+        if (mml) {
+            buf_str(o, "<math>");
+            for (k = 0; k < d; k++) buf_str(o, kind & 1 ? "<mrow>" : "<msqrt>");
+            buf_str(o, "<mi>x</mi>");
+            for (k = 0; k < d; k++) buf_str(o, kind & 1 ? "</mrow>" : "</msqrt>");
+            buf_str(o, "</math>");
+        } else {
+            for (k = 0; k < d; k++) buf_str(o, open_tex[kind]);
+            buf_str(o, "x");
+            for (k = 0; k < d; k++) buf_str(o, close_tex[kind]);
+        }
+        break;
+    }
+    case 4: /* duplicated chunks */
+        for (i = rndn(12) + 2; i--;) buf_add(o, b, n);
+        break;
+    case 5: { /* macro blow-up: doubling chains, huge bodies */
+        size_t m = 4 + rndn(28);
+        char l[96];
+        if (mml) {
+            buf_add(o, b, n);
+            break;
+        }
+        buf_str(o, "\\def\\a0{xy}");
+        for (k = 1; k < m; k++) {
+            snprintf(l, sizeof l, "\\def\\a%c{\\a%c\\a%c}", (char)('0' + (k % 40)),
+                     (char)('0' + ((k - 1) % 40)), (char)('0' + ((k - 1) % 40)));
+            buf_str(o, l);
+        }
+        snprintf(l, sizeof l, "\\a%c", (char)('0' + ((m - 1) % 40)));
+        buf_str(o, l);
+        break;
+    }
+    case 6: { /* long text and many terms */
+        size_t L = (size_t)1 << (6 + rndn(8));
+        buf_str(o, mml ? "<math><mtext>" : "\\text{");
+        for (k = 0; k < L; k++) buf_add(o, rndn(8) ? "W" : " ", 1);
+        buf_str(o, mml ? "</mtext></math>" : "}");
+        if (!mml)
+            for (k = 0; k < L / 4; k++) buf_str(o, "+a_{k}^{2}");
+        break;
+    }
+    case 7: /* control bytes and invalid UTF-8 */
+        for (i = 0; i < n; i++) {
+            buf_add(o, b + i, 1);
+            if (rndn(30) == 0) {
+                static const char junk[] = "\x01\x7f\xc0\xff\xed\xa0\x80\x00\r\t\x1b";
+                buf_add(o, junk + rndn(sizeof junk - 1), 1);
+            }
+        }
+        break;
+    case 8: /* extreme numbers */
+        for (i = 0; i < n; i++) {
+            if (b[i] >= '0' && b[i] <= '9' && rndn(3) == 0) {
+                while (i + 1 < n && b[i + 1] >= '0' && b[i + 1] <= '9') i++;
+                buf_str(o, NUMS[rndn(sizeof NUMS / sizeof NUMS[0])]);
+            } else {
+                buf_add(o, b + i, 1);
+            }
+        }
+        break;
+    default: /* splice two seeds */
+    {
+        const Seed *t = &g_seed[rndn((size_t)g_nseed)];
+        size_t a = rndn(n + 1), f = rndn(t->n + 1), l = rndn(200) + 1;
+        if (f + l > t->n) l = t->n - f;
+        buf_add(o, b, a);
+        buf_add(o, t->d + f, l);
+        buf_add(o, b + a, n - a);
+        break;
+    }
+    }
+}
+
+/* TeX seeds: the second string of each ["name", "tex"] pair in
+ * formulas.json (JSON escapes \\ and \" undone; the file has no others). */
+static void load_tex_seeds(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    char *b, *p;
+    long len;
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    b = malloc((size_t)len + 1);
+    if (!b || fread(b, 1, (size_t)len, f) != (size_t)len) {
+        fclose(f);
+        free(b);
+        return;
+    }
+    fclose(f);
+    b[len] = 0;
+    p = b;
+    while ((p = strchr(p, '[')) != NULL && g_nseed < 512) {
+        char name[48], tex[2048];
+        size_t k;
+        int which;
+        p++;
+        for (which = 0; which < 2; which++) {
+            char *out = which ? tex : name;
+            size_t cap = which ? sizeof tex : sizeof name;
+            k = 0;
+            p = strchr(p, '"');
+            if (!p) break;
+            p++;
+            while (*p && *p != '"') {
+                char c = *p++;
+                if (c == '\\' && *p) c = *p++;
+                if (k + 1 < cap) out[k++] = c;
+            }
+            out[k] = 0;
+            if (*p) p++;
+        }
+        if (!p) break;
+        {
+            Seed *s = &g_seed[g_nseed];
+            s->n = strlen(tex);
+            s->d = malloc(s->n + 1);
+            memcpy(s->d, tex, s->n + 1);
+            snprintf(s->name, sizeof s->name, "tex:%s", name);
+            g_nseed++;
+        }
+    }
+    free(b);
+}
+
+/* --math PACK testdata/math [ITERS] [SEED] */
+static int mj_main(int argc, char **argv, CrPack *pack)
+{
+    long iters = argc > 3 ? atol(argv[3]) : 200, i;
+    uint32_t budget = getenv("CR_FUZZ_MM_BUDGET_MS") ? (uint32_t)atol(getenv("CR_FUZZ_MM_BUDGET_MS"))
+                                                     : 20000u;
+    CrAsset *a = cr_pack_find(pack, "js:math");
+    const uint8_t *bc = a ? cr_asset_data(a) : NULL;
+    CrJsPolicy pol = {(size_t)1 << 30, (size_t)256 << 20, 0, (size_t)16 << 20};
+    Buf o = {0};
+    double t0 = now_ms();
+    char p[2048];
+    int ntex;
+    long seed_ok = 0, seed_err = 0;
+    if (!bc) {
+        fprintf(stderr, "cctext-render-fuzz: no js:math in the pack\n");
+        return 2;
+    }
+    g_fpack = pack;
+    g_mj = cr_js_new("math", bc, a->raw_len, &pol);
+    cr_js_set_loader(g_mj, fz_src_get, fz_src_put, NULL);
+    snprintf(p, sizeof p, "%s/formulas.json", argv[2]);
+    load_tex_seeds(p);
+    ntex = g_nseed;
+    g_ext = ".mml";
+    snprintf(p, sizeof p, "%s/mml", argv[2]);
+    load_dir(p, 1);
+    if (!ntex || g_nseed == ntex) {
+        fprintf(stderr, "cctext-render-fuzz: no TeX or MathML seeds under %s\n", argv[2]);
+        return 2;
+    }
+    /* Seeds: the valid ones must render (the error cases in
+     * formulas.json are CCTEXT_ERR answers). */
+    for (i = 0; i < g_nseed; i++)
+        mj_one(g_seed[i].name, g_seed[i].d, g_seed[i].n, budget > 60000 ? budget : 60000,
+               i >= ntex, 1);
+    if (g_mj_ok + g_mj_err < g_nseed || g_mj_ok < g_nseed - 4) {
+        fprintf(stderr, "cctext-render-fuzz: only %ld of %d math seeds rendered\n", g_mj_ok,
+                g_nseed);
+        return 1;
+    }
+    seed_ok = g_mj_ok;
+    seed_err = g_mj_err;
+    for (i = 0; i < iters; i++) {
+        long si = (long)rndn((size_t)g_nseed);
+        const Seed *s = &g_seed[si];
+        char what[64];
+        int mml = si >= ntex;
+        mj_mutate(s, mml, &o);
+        snprintf(what, sizeof what, "math #%ld of %s", i, s->name);
+        if (getenv("CR_FUZZ_DUMP") && (atol(getenv("CR_FUZZ_DUMP")) == i ||
+                                       !strcmp(getenv("CR_FUZZ_DUMP"), "all"))) {
+            char dp[64];
+            FILE *df;
+            snprintf(dp, sizeof dp, "cr-fuzz-%ld.%s", i, mml ? "mml" : "tex");
+            df = fopen(dp, "wb");
+            if (df) {
+                fwrite(o.b ? o.b : "", 1, o.n, df);
+                fclose(df);
+            }
+        }
+        if (!getenv("CR_FUZZ_DUMP_ONLY"))
+            mj_one(what, o.b ? o.b : "", o.n, budget, mml, (int)rndn(2));
+    }
+    {
+        CrJsStats st;
+        cr_js_stats(g_mj, &st);
+        printf("cctext-render-fuzz --math: %d seeds, %ld mutants: %ld rendered, %ld errors, %ld "
+               "over the node cap, %ld timeouts, %u engine starts, %.1f s; slowest %.0f ms (%s)\n",
+               g_nseed, iters, g_mj_ok - seed_ok, g_mj_err - seed_err, g_mj_large, g_mj_timeout,
+               st.starts, (now_ms() - t0) / 1000.0, g_worst_ms, g_worst);
+    }
+    cr_js_stop(g_mj);
+    free(g_mj);
+    free(o.b);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     static CrPack pack;
@@ -618,13 +958,15 @@ int main(int argc, char **argv)
     Buf o = {0};
     double t0 = now_ms();
     int mermaid = argc > 1 && !strcmp(argv[1], "--mermaid");
-    if (mermaid) {
+    int math = argc > 1 && !strcmp(argv[1], "--math");
+    if (mermaid || math) {
         argv++;
         argc--;
     }
     iters = argc > 3 ? atol(argv[3]) : 2000;
     if (argc < 3) {
-        fprintf(stderr, "usage: cctext-render-fuzz [--mermaid] PACK CORPUS_DIR [ITERS] [SEED]\n");
+        fprintf(stderr,
+                "usage: cctext-render-fuzz [--mermaid | --math] PACK CORPUS_DIR [ITERS] [SEED]\n");
         return 2;
     }
     if (argc > 4) g_rng ^= (uint64_t)strtoull(argv[4], NULL, 10) * 0x9E3779B97F4A7C15ull;
@@ -641,6 +983,7 @@ int main(int argc, char **argv)
     fclose(f);
     if (fonts_init(&pack) < 1) return 2;
     if (mermaid) return mm_main(argc, argv, &pack);
+    if (math) return mj_main(argc, argv, &pack);
     load_dir(argv[2], 0);
     if (!g_nseed) {
         fprintf(stderr, "cctext-render-fuzz: no *.svg under %s\n", argv[2]);

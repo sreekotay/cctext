@@ -63,6 +63,17 @@ int cr_js_start(CrJs *e, char *err, size_t errcap);
 char *cr_js_call(CrJs *e, const char *fn, int argc, const char *const *argv, uint32_t budget_ms,
                  char *err, size_t errcap, int *timed_out);
 
+/* Source modules a bundle loads on demand (math: MathJax's extensions and
+ * dynamic font files): the engine gets a global __hostLoad(key) that asks
+ * `get` for the source (UTF-8, NUL-terminated at src[n]; 0 = ok, else a
+ * message in err), evaluates it as a global script, then calls `put`
+ * (the source may be freed). __hostLoad returns true, false when there is
+ * no such module, or throws the script's error. */
+typedef int (*CrJsSrcGet)(void *ctx, const char *key, const char **src, size_t *n, char *err,
+                          size_t errcap);
+typedef void (*CrJsSrcPut)(void *ctx, const char *key);
+void cr_js_set_loader(CrJs *e, CrJsSrcGet get, CrJsSrcPut put, void *ctx);
+
 /* Free the runtime now (the next call starts a fresh one). */
 void cr_js_stop(CrJs *e);
 void cr_js_stats(const CrJs *e, CrJsStats *out);
