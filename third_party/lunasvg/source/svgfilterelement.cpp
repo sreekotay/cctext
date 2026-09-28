@@ -91,6 +91,7 @@ struct Image {
     IRect sub;
     Rect userSub;
     size_t bytes = 0;
+    bool alphaOnly = false;  // colour channels all zero (SourceAlpha and its blurs)
     ~Image()
     {
         std::free(px);
@@ -181,7 +182,14 @@ ImageRef convert(const ImageRef& in, bool linear)
     auto out = newImage(in->w, in->h, linear, in->sub, in->userSub);
     if(!out)
         return nullptr;
+    if(in->alphaOnly) {
+        out->alphaOnly = true;
+        for(int y = in->sub.y0; y < in->sub.y1; y++)
+            std::memcpy(out->px + size_t(y) * in->w + in->sub.x0, in->px + size_t(y) * in->w + in->sub.x0, size_t(in->sub.x1 - in->sub.x0) * 4);
+        return out;
+    }
     const uint8_t* lut = linear ? luts().toLinear : luts().toSRGB;
+    uint32_t last = 0, lastOut = 0;  // runs of one colour convert once
     for(int y = in->sub.y0; y < in->sub.y1; y++) {
         const uint32_t* s = in->px + size_t(y) * in->w;
         uint32_t* d = out->px + size_t(y) * in->w;
@@ -190,10 +198,22 @@ ImageRef convert(const ImageRef& in, bool linear)
             uint32_t a = p >> 24;
             if(a == 0)
                 continue;
-            uint32_t r = lut[unpremul((p >> 16) & 255, a)];
-            uint32_t g = lut[unpremul((p >> 8) & 255, a)];
-            uint32_t b = lut[unpremul(p & 255, a)];
-            d[x] = pack(a, premul(r, a), premul(g, a), premul(b, a));
+            if(p == last) {
+                d[x] = lastOut;
+                continue;
+            }
+            uint32_t q;
+            if(a == 255) {
+                q = pack(255, lut[(p >> 16) & 255], lut[(p >> 8) & 255], lut[p & 255]);
+            } else {
+                uint32_t r = lut[unpremul((p >> 16) & 255, a)];
+                uint32_t g = lut[unpremul((p >> 8) & 255, a)];
+                uint32_t b = lut[unpremul(p & 255, a)];
+                q = pack(a, premul(r, a), premul(g, a), premul(b, a));
+            }
+            d[x] = q;
+            last = p;
+            lastOut = q;
         }
     }
     return out;
@@ -320,6 +340,7 @@ ImageRef copyImage(const ImageRef& in, const IRect& sub, const Rect& userSub)
     auto out = newImage(in->w, in->h, in->linear, sub, userSub);
     if(!out)
         return nullptr;
+    out->alphaOnly = in->alphaOnly;
     auto r = sub.intersected(in->sub);
     for(int y = r.y0; y < r.y1; y++)
         std::memcpy(out->px + size_t(y) * in->w + r.x0, in->px + size_t(y) * in->w + r.x0, size_t(r.x1 - r.x0) * 4);
@@ -429,7 +450,7 @@ void blurImage(Image& img, float sx, float sy, const IRect& out)
         int x0 = std::max(0, c.x0 - line.reach());
         int x1 = std::min(img.w, c.x1 + line.reach());
         for(int y = c.y0; y < c.y1; y++) {
-            for(int ch = 0; ch < 4; ch++)
+            for(int ch = img.alphaOnly ? 3 : 0; ch < 4; ch++)
                 line.run(bytes + size_t(y) * rowBytes + size_t(x0) * 4 + ch, 4, x1 - x0);
         }
         c.x0 = x0;
@@ -460,7 +481,7 @@ void blurImage(Image& img, float sx, float sy, const IRect& out)
                 }
                 for(size_t x = 0; x < cols; x++) {
                     auto* col = reinterpret_cast<uint8_t*>(t + x * size_t(n));
-                    for(int ch = 0; ch < 4; ch++)
+                    for(int ch = img.alphaOnly ? 3 : 0; ch < 4; ch++)
                         line.run(col + ch, 4, n);
                 }
                 for(int by = y0; by < y1; by += kBlock) {
@@ -568,6 +589,12 @@ inline uint8_t compositeChannel(Composite op, uint32_t c1, uint32_t a1, uint32_t
 uint32_t compositePixel(Composite op, uint32_t p1, uint32_t p2)
 {
     uint32_t a1 = p1 >> 24, a2 = p2 >> 24;
+    if(op == Composite::Over) {
+        if(a1 == 255 || a2 == 0)
+            return p1;
+        if(a1 == 0)
+            return p2;
+    }
     uint32_t out = 0;
     for(int shift = 0; shift < 32; shift += 8) {
         uint32_t c1 = (p1 >> shift) & 255, c2 = (p2 >> shift) & 255;
@@ -767,6 +794,7 @@ ColorMatrix luminanceToAlphaMatrix()
 
 void applyMatrix(Image& img, const ColorMatrix& m)
 {
+    img.alphaOnly = false;
     for(int y = img.sub.y0; y < img.sub.y1; y++) {
         uint32_t* row = img.px + size_t(y) * img.w;
         for(int x = img.sub.x0; x < img.sub.x1; x++) {
@@ -847,6 +875,7 @@ bool buildTransfer(const SVGElement* func, TransferFunction& tf)
 
 void applyTransfer(Image& img, const TransferFunction fn[4])
 {
+    img.alphaOnly = false;
     for(int y = img.sub.y0; y < img.sub.y1; y++) {
         uint32_t* row = img.px + size_t(y) * img.w;
         for(int x = img.sub.x0; x < img.sub.x1; x++) {
@@ -870,6 +899,7 @@ ImageRef offsetImage(const ImageRef& in, int dx, int dy, const IRect& sub, const
     auto out = newImage(in->w, in->h, in->linear, sub, userSub);
     if(!out)
         return nullptr;
+    out->alphaOnly = in->alphaOnly;
     IRect src = in->sub;
     IRect dst{src.x0 + dx, src.y0 + dy, src.x1 + dx, src.y1 + dy};
     dst = dst.intersected(sub);
@@ -896,6 +926,7 @@ ImageRef alphaOf(const ImageRef& in)
     auto out = newImage(in->w, in->h, in->linear, in->sub, in->userSub);
     if(!out)
         return nullptr;
+    out->alphaOnly = true;
     for(int y = in->sub.y0; y < in->sub.y1; y++) {
         for(int x = in->sub.x0; x < in->sub.x1; x++) {
             size_t i = size_t(y) * in->w + x;
@@ -940,6 +971,7 @@ ImageRef dropShadow(const Context& ctx, const ImageRef& in, float sdx, float sdy
     if(!shadow)
         return nullptr;
     Color c = convertColor(color, in->linear);
+    shadow->alphaOnly = false;
     float fa = c.alphaF() * std::clamp(finiteOr(opacity, 1.f), 0.f, 1.f);
     for(int y = sub.y0; y < sub.y1; y++) {
         uint32_t* row = shadow->px + size_t(y) * shadow->w;
@@ -1214,7 +1246,10 @@ bool FilterRun::run(const SVGFilterPrimitiveElement* p, bool first)
         ImageRef out;
         if(p->id() == ElementID::FeBlend) {
             auto mode = parseBlend(stringAttr(p, PropertyID::Mode));
-            out = combine(i1, i2, sub, userSub, [mode](uint32_t s, uint32_t d) { return blendPixel(mode, s, d); });
+            if(mode == Blend::Normal)  // source-over, in integers
+                out = combine(i1, i2, sub, userSub, [](uint32_t s, uint32_t d) { return compositePixel(Composite::Over, s, d); });
+            else
+                out = combine(i1, i2, sub, userSub, [mode](uint32_t s, uint32_t d) { return blendPixel(mode, s, d); });
         } else {
             auto op = stringAttr(p, PropertyID::Operator);
             Composite c = Composite::Over;
