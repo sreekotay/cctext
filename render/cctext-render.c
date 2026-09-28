@@ -212,6 +212,20 @@ static void default_pack(char *out, size_t n)
 }
 
 /* Entries "font:<family>:<bold>:<italic>". */
+/* A lazily loaded fallback face's data: inflated from the mapped pack on
+ * first use (memory only: fine after lockdown). */
+static const void *lazy_font(void *closure, size_t *n)
+{
+    CrAsset *a = (CrAsset *)closure;
+    const uint8_t *d = cr_asset_data(a);
+    *n = d ? a->raw_len : 0;
+    return d;
+}
+
+/* Faces over this are per-glyph fallbacks only, inflated on first use (the
+ * CJK face: 3.2 MiB and about 14 ms of every spawn otherwise). */
+#define CR_LAZY_FONT_BYTES (1u << 20)
+
 static int fonts_init(void)
 {
     int nf = 0;
@@ -228,6 +242,10 @@ static int fonts_init(void)
         memcpy(fam, p, (size_t)(c1 - p));
         fam[c1 - p] = 0;
         if (sscanf(c1 + 1, "%d:%d", &bold, &italic) != 2) continue;
+        if (a->raw_len > CR_LAZY_FONT_BYTES) {
+            if (cr_svg_add_lazy_fallback(lazy_font, a) == 0) nf++;
+            continue;
+        }
         d = cr_asset_data(a);
         if (d && cr_svg_add_font(fam, bold, italic, d, a->raw_len) == 0) nf++;
     }

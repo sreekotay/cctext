@@ -188,10 +188,27 @@ struct plutovg_font_face {
 };
 
 /* cctext patch 0005: per-glyph fallback faces, tried in order when a face
- * lacks a glyph (plutovg_font_face_add_fallback). */
+ * lacks a glyph (plutovg_font_face_add_fallback); a face added as a loader
+ * is loaded the first time it is tried (_add_fallback_loader). */
 #define PLUTOVG_MAX_FALLBACKS 16
-static plutovg_font_face_t* fallback_faces[PLUTOVG_MAX_FALLBACKS];
+typedef struct {
+    plutovg_font_face_t* face;
+    plutovg_font_face_loader_t load;
+    void* closure;
+} plutovg_fallback_t;
+static plutovg_fallback_t fallback_faces[PLUTOVG_MAX_FALLBACKS];
 static int fallback_count;
+
+static plutovg_font_face_t* plutovg_fallback_face(int i)
+{
+    plutovg_fallback_t* f = &fallback_faces[i];
+    if(f->face == NULL && f->load) {
+        plutovg_font_face_loader_t load = f->load;
+        f->load = NULL; /* one attempt */
+        f->face = load(f->closure);
+    }
+    return f->face;
+}
 
 /* Synthetic styles: a slant of tan(12 deg) (FreeType's FT_GlyphSlot_Oblique)
  * and an overstrike of size/24 .. size/32 (Skia's fake-bold ratios). */
@@ -407,16 +424,31 @@ void plutovg_font_face_add_fallback(plutovg_font_face_t* face)
     if(face == NULL || fallback_count >= PLUTOVG_MAX_FALLBACKS)
         return;
     for(int i = 0; i < fallback_count; i++) {
-        if(fallback_faces[i]->base == face->base)
+        if(fallback_faces[i].face && fallback_faces[i].face->base == face->base)
             return;
     }
-    fallback_faces[fallback_count++] = plutovg_font_face_reference(face->base);
+    fallback_faces[fallback_count].face = plutovg_font_face_reference(face->base);
+    fallback_faces[fallback_count].load = NULL;
+    fallback_faces[fallback_count].closure = NULL;
+    fallback_count++;
+}
+
+void plutovg_font_face_add_fallback_loader(plutovg_font_face_loader_t load, void* closure)
+{
+    if(load == NULL || fallback_count >= PLUTOVG_MAX_FALLBACKS)
+        return;
+    fallback_faces[fallback_count].face = NULL;
+    fallback_faces[fallback_count].load = load;
+    fallback_faces[fallback_count].closure = closure;
+    fallback_count++;
 }
 
 void plutovg_font_face_clear_fallbacks(void)
 {
-    for(int i = 0; i < fallback_count; i++)
-        plutovg_font_face_destroy(fallback_faces[i]);
+    for(int i = 0; i < fallback_count; i++) {
+        if(fallback_faces[i].face)
+            plutovg_font_face_destroy(fallback_faces[i].face);
+    }
     fallback_count = 0;
 }
 
@@ -597,8 +629,8 @@ static plutovg_font_face_t* plutovg_font_face_resolve(plutovg_font_face_t* face,
     if(glyph->index != 0 || codepoint < 0x20 || fallback_count == 0)
         return face;
     for(int i = 0; i < fallback_count; i++) {
-        plutovg_font_face_t* fallback = fallback_faces[i];
-        if(fallback->base == face->base)
+        plutovg_font_face_t* fallback = plutovg_fallback_face(i);
+        if(fallback == NULL || fallback->base == face->base)
             continue;
         plutovg_glyph_t* g = plutovg_font_face_get_glyph(fallback, codepoint);
         if(g->index != 0) {

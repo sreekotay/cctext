@@ -86,28 +86,6 @@ const Alias kAliases[] = {
     {"noto sans mono", "source code pro"},
     {"noto sans mono", "fira code"},
     {"noto sans mono", "fira mono"},
-    // CJK: the subset Noto Sans SC (Simplified Chinese glyph shapes; also
-    // the per-glyph fallback for CJK in any other family).
-    {"noto sans sc", "noto sans cjk sc"},
-    {"noto sans sc", "noto sans cjk jp"},
-    {"noto sans sc", "noto sans cjk tc"},
-    {"noto sans sc", "noto sans jp"},
-    {"noto sans sc", "noto sans tc"},
-    {"noto sans sc", "source han sans"},
-    {"noto sans sc", "source han sans sc"},
-    {"noto sans sc", "microsoft yahei"},
-    {"noto sans sc", "pingfang sc"},
-    {"noto sans sc", "hiragino sans"},
-    {"noto sans sc", "hiragino sans gb"},
-    {"noto sans sc", "heiti sc"},
-    {"noto sans sc", "simhei"},
-    {"noto sans sc", "simsun"},
-    {"noto sans sc", "songti sc"},
-    {"noto sans sc", "wenquanyi micro hei"},
-    {"noto sans sc", "meiryo"},
-    {"noto sans sc", "yu gothic"},
-    {"noto sans sc", "ms gothic"},
-    {"noto sans sc", "ms mincho"},
 };
 
 void lower(char* s)
@@ -218,6 +196,38 @@ extern "C" int cr_svg_add_font(const char* family, int bold, int italic, const v
         if(std::strcmp(a.face, fam) == 0)
             lunasvg_add_font_face_from_data(a.name, bold != 0, italic != 0, data, n, nullptr, nullptr);
     }
+    return 0;
+}
+
+namespace {
+
+struct LazyFace {
+    const void* (*load)(void*, size_t*);
+    void* closure;
+};
+
+LazyFace g_lazy[4];
+int g_nlazy;
+
+plutovg_font_face_t* load_lazy(void* closure)
+{
+    auto* lazy = static_cast<LazyFace*>(closure);
+    size_t n = 0;
+    const void* data = lazy->load(lazy->closure, &n);
+    if(!data || !n || n > 0x7fffffff)
+        return nullptr;
+    return plutovg_font_face_load_from_data(data, static_cast<unsigned>(n), 0, nullptr, nullptr);
+}
+
+} // namespace
+
+extern "C" int cr_svg_add_lazy_fallback(const void* (*load)(void*, size_t*), void* closure)
+{
+    if(!load || g_nlazy >= 4)
+        return -1;
+    g_lazy[g_nlazy] = LazyFace{load, closure};
+    plutovg_font_face_add_fallback_loader(load_lazy, &g_lazy[g_nlazy]);
+    g_nlazy++;
     return 0;
 }
 

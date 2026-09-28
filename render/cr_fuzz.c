@@ -401,6 +401,15 @@ static void mutate(const Seed *s, Buf *o)
     }
 }
 
+/* As in the helper: faces over 1 MiB are fallbacks loaded on first use. */
+static const void *lazy_font(void *closure, size_t *n)
+{
+    CrAsset *a = (CrAsset *)closure;
+    const uint8_t *d = cr_asset_data(a);
+    *n = d ? a->raw_len : 0;
+    return d;
+}
+
 static int fonts_init(CrPack *p)
 {
     int nf = 0;
@@ -417,6 +426,10 @@ static int fonts_init(CrPack *p)
         memcpy(fam, s, (size_t)(c1 - s));
         fam[c1 - s] = 0;
         if (sscanf(c1 + 1, "%d:%d", &bold, &italic) != 2) continue;
+        if (a->raw_len > (1u << 20)) {
+            if (cr_svg_add_lazy_fallback(lazy_font, a) == 0) nf++;
+            continue;
+        }
         d = cr_asset_data(a);
         if (d && cr_svg_add_font(fam, bold, italic, d, a->raw_len) == 0) nf++;
     }

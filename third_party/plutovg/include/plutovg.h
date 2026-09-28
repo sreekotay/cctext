@@ -902,6 +902,16 @@ PLUTOVG_API float plutovg_font_face_text_extents(plutovg_font_face_t* face, floa
 PLUTOVG_API void plutovg_font_face_add_fallback(plutovg_font_face_t* face);
 
 /**
+ * @brief cctext patch: a fallback face loaded the first time a glyph reaches
+ * it (a large face costs nothing until a text needs it).
+ *
+ * @param load Returns the face (its reference is kept) or NULL; called once.
+ * @param closure Passed to `load`.
+ */
+typedef plutovg_font_face_t* (*plutovg_font_face_loader_t)(void* closure);
+PLUTOVG_API void plutovg_font_face_add_fallback_loader(plutovg_font_face_loader_t load, void* closure);
+
+/**
  * @brief cctext patch: removes every fallback face.
  */
 PLUTOVG_API void plutovg_font_face_clear_fallbacks(void);

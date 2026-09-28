@@ -16,6 +16,12 @@ typedef struct cr_svg cr_svg;
  * the process (it is shared, not copied). 0 = ok. */
 int cr_svg_add_font(const char *family, int bold, int italic, const void *data, size_t n);
 
+/* A per-glyph fallback face loaded the first time a glyph reaches it
+ * (after every face cr_svg_add_font registered): `load` returns its data
+ * (which must outlive the process) and length, or NULL. The CJK face is
+ * one: its 3 MiB are inflated only when a text needs it. 0 = ok. */
+int cr_svg_add_lazy_fallback(const void *(*load)(void *closure, size_t *n), void *closure);
+
 /* Parse. Intrinsic size in CSS px (width / height, else the viewBox).
  * NULL when the bytes are not an SVG lunasvg reads. */
 cr_svg *cr_svg_parse(const char *data, size_t n, float *w_css, float *h_css);

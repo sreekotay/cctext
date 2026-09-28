@@ -38,5 +38,7 @@ Hangul (Noto Sans SC has none).
 Coverage: Latin, Greek, Cyrillic (about 2,960 code points each; Noto Sans
 Mono 3,490), and the CJK above. A glyph the chosen face lacks comes from
 the first regular face that has it, in the manifest's order (Noto Sans,
-Noto Serif, Noto Sans Mono, Noto Sans SC; plutovg patch 0005). No emoji,
-no Hangul.
+Noto Serif, Noto Sans Mono, Noto Sans SC; plutovg patch 0005). The CJK
+face is only a fallback (no family name maps to it) and, being over
+1 MiB, is inflated from the pack the first time a glyph needs it. No
+emoji, no Hangul.
