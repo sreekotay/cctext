@@ -21,11 +21,14 @@ public:
     const SVGClipPathElement* clipper() const { return m_clipper; }
     const SVGMaskElement* masker() const { return m_masker; }
     float opacity() const { return m_opacity; }
+    // cctext patch: the element whose filter (or invalid filter) applies.
+    const SVGElement* filtered() const { return m_filtered; }
 
 private:
     const SVGClipPathElement* m_clipper;
     const SVGMaskElement* m_masker;
     const float m_opacity;
+    const SVGElement* m_filtered = nullptr;
 };
 
 class SVGRenderState {

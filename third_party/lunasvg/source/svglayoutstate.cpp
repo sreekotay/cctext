@@ -439,12 +439,22 @@ SVGLayoutState::SVGLayoutState(const SVGLayoutState& parent, const SVGElement* e
     , m_marker_mid(parent.marker_mid())
     , m_marker_end(parent.marker_end())
     , m_font_family(parent.font_family())
+    , m_cif_linear(parent.color_interpolation_filters_linear())
 {
     for(const auto& attribute : element->attributes()) {
         std::string_view input(attribute.value());
         stripLeadingAndTrailingSpaces(input);
-        if(input.empty() || input.compare("inherit") == 0)
+        if(input.empty())
             continue;
+        if(input.compare("inherit") == 0) {
+            // cctext patch: the non-inherited filter properties can inherit
+            // explicitly.
+            if(attribute.id() == PropertyID::Flood_Color)
+                m_flood_color = parent.flood_color();
+            else if(attribute.id() == PropertyID::Flood_Opacity)
+                m_flood_opacity = parent.flood_opacity();
+            continue;
+        }
         switch(attribute.id()) {
         case PropertyID::Fill:
             m_fill = parsePaint(input, this, Color::Black);
@@ -547,6 +557,30 @@ SVGLayoutState::SVGLayoutState(const SVGLayoutState& parent, const SVGElement* e
             break;
         case PropertyID::Mask_Type:
             m_mask_type = parseMaskType(input);
+            break;
+        case PropertyID::Filter:
+            // cctext patch: "none", url(#id) or CSS filter functions (kept raw;
+            // svgfilterelement.cpp parses the functions).
+            if(input.compare("none") != 0) {
+                m_has_filter = true;
+                m_filter = parseUrl(input);
+                if(m_filter.empty())
+                    m_filter.assign(input);
+                else
+                    m_filter.insert(0, 1, '#');
+            }
+            break;
+        case PropertyID::Flood_Color:
+            m_flood_color = parseColor(input, this, Color::Black);
+            break;
+        case PropertyID::Flood_Opacity:
+            m_flood_opacity = parseNumberOrPercentage(input, true, 1.f);
+            break;
+        case PropertyID::Color_Interpolation_Filters:
+            if(input.compare("sRGB") == 0 || input.compare("auto") == 0)
+                m_cif_linear = false;
+            else if(input.compare("linearRGB") == 0)
+                m_cif_linear = true;
             break;
         case PropertyID::Mask:
             m_mask = parseUrl(input);

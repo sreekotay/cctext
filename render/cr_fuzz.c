@@ -178,7 +178,66 @@ static const char *const GARBAGE[] = {"", "(", "url(#", "calc(", "%", "e", "1e",
 
 static const char *snippet(Buf *o)
 {
-    switch (rndn(13)) {
+    switch (rndn(21)) {
+    case 13: /* filters: huge blur on a huge shape, huge offsets */
+        return "<filter id=\"fb\" filterUnits=\"userSpaceOnUse\" x=\"-1e9\" y=\"-1e9\" "
+               "width=\"2e9\" height=\"2e9\"><feGaussianBlur stdDeviation=\"1e30 3e38\"/>"
+               "<feOffset dx=\"1e38\" dy=\"-1e38\"/></filter><rect filter=\"url(#fb)\" "
+               "width=\"1e6\" height=\"1e6\"/><circle r=\"5\" filter=\"url(#fb)\"/>";
+    case 14: { /* many primitives, named results read back and forth */
+        int i;
+        char t[160];
+        buf_str(o, "<filter id=\"fm\">");
+        for (i = 0; i < 400; i++) {
+            snprintf(t, sizeof t,
+                     "<feGaussianBlur stdDeviation=\"%d\" result=\"r%d\"/><feComposite in=\"r%d\" "
+                     "in2=\"SourceAlpha\" operator=\"arithmetic\" k1=\"1e38\" k4=\"-1\"/>",
+                     i % 7, i, i / 2);
+            buf_str(o, t);
+        }
+        buf_str(o, "</filter><rect filter=\"url(#fm)\" width=\"50\" height=\"50\"/>");
+        return NULL;
+    }
+    case 15: /* recursive filter references: href cycles, filtered content inside */
+        return "<filter id=\"f1\" href=\"#f2\"/><filter id=\"f2\" xlink:href=\"#f1\" "
+               "filter=\"url(#f1)\"><feFlood filter=\"url(#f2)\"/></filter><filter id=\"f3\" "
+               "href=\"#f3\"/><g filter=\"url(#f1)\"><g filter=\"url(#f2)\"><rect "
+               "filter=\"url(#f3)\" width=\"9\" height=\"9\"/></g></g>";
+    case 16: /* zero / negative / inverted regions and subregions */
+        return "<filter id=\"fz\" x=\"0\" y=\"0\" width=\"0\" height=\"-5\"><feFlood/></filter>"
+               "<filter id=\"fn\" primitiveUnits=\"objectBoundingBox\"><feFlood x=\"-1e38\" "
+               "width=\"-1\"/><feOffset x=\"1e38\" width=\"1e38\" dx=\"NaN\"/><feMerge><feMergeNode/>"
+               "<feMergeNode in=\"nope\"/></feMerge></filter><rect filter=\"url(#fz)\" width=\"9\" "
+               "height=\"9\"/><line x2=\"9\" filter=\"url(#fn)\"/><rect filter=\"url(#fn)\" "
+               "width=\"9\" height=\"9\"/>";
+    case 17: { /* nested filtered groups */
+        int i;
+        for (i = 0; i < 60; i++) buf_str(o, "<g filter=\"url(#fd)\" opacity=\"0.9\">");
+        buf_str(o, "<rect width=\"100\" height=\"100\"/>");
+        for (i = 0; i < 60; i++) buf_str(o, "</g>");
+        buf_str(o, "<filter id=\"fd\"><feDropShadow stdDeviation=\"3\" dx=\"2\" dy=\"2\"/></filter>");
+        return NULL;
+    }
+    case 18: /* CSS filter functions with extreme values and bad urls */
+        return "<rect width=\"50\" height=\"50\" filter=\"blur(1e30px) drop-shadow(1e30 -1e30 1e30 "
+               "red) url(#nope) url(#fb) hue-rotate(1e30deg) contrast(1e38) saturate(-1) "
+               "opacity(NaN)\"/><rect width=\"9\" height=\"9\" style=\"filter: drop-shadow(\"/>";
+    case 19: { /* big lookup tables and matrices */
+        int i;
+        buf_str(o, "<filter id=\"ft\"><feComponentTransfer><feFuncR type=\"table\" tableValues=\"");
+        for (i = 0; i < 20000; i++) buf_str(o, i & 1 ? "1e38 " : "-1e38 ");
+        buf_str(o, "\"/><feFuncA type=\"gamma\" exponent=\"-1e38\" amplitude=\"1e38\"/>"
+                   "</feComponentTransfer><feColorMatrix values=\"1e38 1e38 1e38 1e38 1e38 1e38 1e38 1e38 "
+                   "1e38 1e38 1e38 1e38 1e38 1e38 1e38 1e38 1e38 1e38 1e38 1e38\"/><feColorMatrix "
+                   "type=\"hueRotate\" values=\"1e38\"/></filter><rect filter=\"url(#ft)\" "
+                   "width=\"20\" height=\"20\"/>");
+        return NULL;
+    }
+    case 20: /* a filter on the root, on a transformed and a zero-sized element */
+        return "<filter id=\"fr\"><feGaussianBlur stdDeviation=\"2\"/><feBlend mode=\"hue\" "
+               "in2=\"SourceGraphic\"/></filter><g transform=\"rotate(45) scale(1e-30 1e30)\" "
+               "filter=\"url(#fr)\"><rect width=\"10\" height=\"10\"/></g><rect width=\"0\" "
+               "height=\"0\" filter=\"url(#fr)\"/>";
     case 0: return "<g id=\"a\"><use href=\"#a\"/></g>";
     case 1: return "<use id=\"b\" href=\"#c\"/><use id=\"c\" href=\"#b\"/>";
     case 2:
@@ -1014,7 +1073,10 @@ int main(int argc, char **argv)
         buf_str(&o, "</svg>");
         render_one("nest-100k", o.b, o.n);
     }
-    for (i = 0; i < g_nseed; i++) render_one(g_seed[i].name, g_seed[i].d, g_seed[i].n);
+    for (i = 0; i < g_nseed; i++) {
+        if (getenv("CR_FUZZ_TRACE")) fprintf(stderr, "%s\n", g_seed[i].name);
+        render_one(g_seed[i].name, g_seed[i].d, g_seed[i].n);
+    }
     for (i = 0; i < iters; i++) {
         const Seed *s = &g_seed[rndn((size_t)g_nseed)];
         char what[64];
@@ -1031,6 +1093,8 @@ int main(int argc, char **argv)
                 fclose(df);
             }
         }
+        /* CR_FUZZ_TRACE: name each mutant before it runs (to find a crash) */
+        if (getenv("CR_FUZZ_TRACE")) fprintf(stderr, "%s\n", what);
         render_one(what, o.b ? o.b : "", o.n);
     }
     printf("cctext-render-fuzz: %d seeds, %ld mutants: %ld parsed, %ld rejected, %.1f s; slowest "

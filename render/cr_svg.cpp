@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 
+#include "cr_proto.h"
 #include "cr_svg.h"
 
 namespace {
@@ -159,6 +160,20 @@ struct cr_svg {
     std::unique_ptr<lunasvg::Document> doc;
 };
 
+namespace {
+
+// The helper's filter bounds (cr_proto.h), set before the first parse.
+void apply_limits()
+{
+    static bool done = false;
+    if(done)
+        return;
+    done = true;
+    lunasvg_set_filter_limits(double(CR_FILTER_PIXELS_MAX), CR_FILTER_BLUR_MAX, CR_FILTER_PRIMITIVES_MAX, size_t(CR_FILTER_BYTES_MAX));
+}
+
+} // namespace
+
 extern "C" int cr_svg_add_font(const char* family, int bold, int italic, const void* data, size_t n)
 {
     char fam[128];
@@ -177,6 +192,7 @@ extern "C" int cr_svg_add_font(const char* family, int bold, int italic, const v
 
 extern "C" cr_svg* cr_svg_parse(const char* data, size_t n, float* w, float* h)
 {
+    apply_limits();
     auto doc = lunasvg::Document::loadFromData(data, n);
     if(!doc)
         return nullptr;
@@ -216,6 +232,7 @@ extern "C" void cr_svg_free(cr_svg* s)
 
 extern "C" int cr_svg_png(const char* svg_path, const char* png_path, float scale)
 {
+    apply_limits();
     auto doc = lunasvg::Document::loadFromFile(svg_path);
     if(!doc)
         return -1;
@@ -231,6 +248,7 @@ extern "C" int cr_svg_png(const char* svg_path, const char* png_path, float scal
 
 extern "C" int cr_svg_png_data(const char* data, size_t n, const char* png_path, float scale, uint32_t bg)
 {
+    apply_limits();
     auto doc = lunasvg::Document::loadFromData(data, n);
     if(!doc)
         return -1;

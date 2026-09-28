@@ -242,6 +242,8 @@ static void warm_up(void)
         "<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'>"
         "<rect width='8' height='8' fill='#888' stroke='#000' stroke-dasharray='1'/>"
         "<text x='1' y='7' font-family='serif' font-weight='bold' font-size='6'>A</text>"
+        "<filter id='f'><feGaussianBlur stdDeviation='1'/></filter>"
+        "<circle cx='4' cy='4' r='2' filter='url(#f)'/>"
         "</svg>";
     float w = 0, h = 0;
     uint8_t px[8 * 8 * 4];

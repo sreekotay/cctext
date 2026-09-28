@@ -5,6 +5,7 @@
 #include "svgproperty.h"
 #include "svglayoutstate.h"
 #include "svgrenderstate.h"
+#include "svgfilterelement.h"
 
 #include <cassert>
 
@@ -21,6 +22,29 @@ ElementID elementid(std::string_view name)
         {"clipPath", ElementID::ClipPath},
         {"defs", ElementID::Defs},
         {"ellipse", ElementID::Ellipse},
+        {"feBlend", ElementID::FeBlend},
+        {"feColorMatrix", ElementID::FeColorMatrix},
+        {"feComponentTransfer", ElementID::FeComponentTransfer},
+        {"feComposite", ElementID::FeComposite},
+        {"feConvolveMatrix", ElementID::FeUnsupported},
+        {"feDiffuseLighting", ElementID::FeUnsupported},
+        {"feDisplacementMap", ElementID::FeUnsupported},
+        {"feDropShadow", ElementID::FeDropShadow},
+        {"feFlood", ElementID::FeFlood},
+        {"feFuncA", ElementID::FeFuncA},
+        {"feFuncB", ElementID::FeFuncB},
+        {"feFuncG", ElementID::FeFuncG},
+        {"feFuncR", ElementID::FeFuncR},
+        {"feGaussianBlur", ElementID::FeGaussianBlur},
+        {"feImage", ElementID::FeUnsupported},
+        {"feMerge", ElementID::FeMerge},
+        {"feMergeNode", ElementID::FeMergeNode},
+        {"feMorphology", ElementID::FeUnsupported},
+        {"feOffset", ElementID::FeOffset},
+        {"feSpecularLighting", ElementID::FeUnsupported},
+        {"feTile", ElementID::FeUnsupported},
+        {"feTurbulence", ElementID::FeUnsupported},
+        {"filter", ElementID::Filter},
         {"g", ElementID::G},
         {"image", ElementID::Image},
         {"line", ElementID::Line},
@@ -116,6 +140,24 @@ std::unique_ptr<SVGElement> SVGElement::create(Document* document, ElementID id)
         return std::make_unique<SVGTextElement>(document);
     case ElementID::Tspan:
         return std::make_unique<SVGTSpanElement>(document);
+    case ElementID::Filter:
+        return std::make_unique<SVGFilterElement>(document);
+    case ElementID::FeBlend:
+    case ElementID::FeColorMatrix:
+    case ElementID::FeComponentTransfer:
+    case ElementID::FeComposite:
+    case ElementID::FeDropShadow:
+    case ElementID::FeFlood:
+    case ElementID::FeFuncA:
+    case ElementID::FeFuncB:
+    case ElementID::FeFuncG:
+    case ElementID::FeFuncR:
+    case ElementID::FeGaussianBlur:
+    case ElementID::FeMerge:
+    case ElementID::FeMergeNode:
+    case ElementID::FeOffset:
+    case ElementID::FeUnsupported:
+        return std::make_unique<SVGFilterPrimitiveElement>(document, id);
     default:
         assert(false);
     }
@@ -320,9 +362,39 @@ Rect SVGElement::paintBoundingBox() const
         return m_paintBoundingBox;
     m_paintBoundingBox = Rect::Empty;
     m_paintBoundingBox = strokeBoundingBox();
-    assert(m_paintBoundingBox.isValid());
+    // cctext patch: a non-finite box (huge or NaN coordinates) is empty; the
+    // assertion fired once paint boxes of filtered descendants were asked.
+    if(!m_paintBoundingBox.isValid())
+        m_paintBoundingBox = Rect::Empty;
+    // cctext patch: a filter paints its whole filter region (clipped and
+    // masked below: the filter applies first); an invalid filter nothing.
+    // A container also covers its filtered descendants' regions.
+    if(m_invalidFilter) {
+        m_paintBoundingBox = Rect::Empty;
+        return m_paintBoundingBox;
+    }
+    if(m_filter)
+        m_paintBoundingBox = m_filter->filterRegion(this);
+    else if(!m_filterFunctions.empty())
+        m_paintBoundingBox = filterFunctionsRegion(this, m_paintBoundingBox);
+    else if(rootElement()->hasFilters()) {
+        for(const auto& child : m_children) {
+            if(auto element = toSVGElement(child); element && !element->isHiddenElement() && element->isGraphicsElement()) {
+                auto box = element->paintBoundingBox();
+                if(box.isEmpty())
+                    continue;
+                box = element->localTransform().mapRect(box);
+                if(m_paintBoundingBox.isEmpty())
+                    m_paintBoundingBox = box;
+                else
+                    m_paintBoundingBox.unite(box);
+            }
+        }
+    }
     if(m_clipper) m_paintBoundingBox.intersect(m_clipper->clipBoundingBox(this));
     if(m_masker) m_paintBoundingBox.intersect(m_masker->maskBoundingBox(this));
+    if(!m_paintBoundingBox.isValid())
+        m_paintBoundingBox = Rect::Empty;
     return m_paintBoundingBox;
 }
 
@@ -347,6 +419,14 @@ SVGMaskElement* SVGElement::getMasker(std::string_view id) const
     auto element = rootElement()->getElementById(id);
     if(element && element->id() == ElementID::Mask)
         return static_cast<SVGMaskElement*>(element);
+    return nullptr;
+}
+
+SVGFilterElement* SVGElement::getFilter(std::string_view id) const
+{
+    auto element = rootElement()->getElementById(id);
+    if(element && element->id() == ElementID::Filter)
+        return static_cast<SVGFilterElement*>(element);
     return nullptr;
 }
 
@@ -465,6 +545,21 @@ void SVGElement::layoutElement(const SVGLayoutState& state)
     m_clipper = getClipper(state.clip_path());
     m_masker = getMasker(state.mask());
     m_opacity = state.opacity();
+    m_filter = nullptr;
+    m_invalidFilter = false;
+    m_filterFunctions.clear();
+    if(state.has_filter()) {
+        const auto& value = state.filter();
+        if(!value.empty() && value.front() == '#') {
+            m_filter = getFilter(std::string_view(value).substr(1));
+            m_invalidFilter = m_filter == nullptr;
+        } else if(parseFilterFunctions(value, nullptr)) {
+            // CSS filter functions; an invalid list is ignored.
+            m_filterFunctions = value;
+            m_filterColor = state.color();
+        }
+        rootElement()->setHasFilters();
+    }
 
     m_font_size = state.font_size();
     m_display = state.display();
@@ -518,7 +613,8 @@ bool SVGElement::isHiddenElement() const
     case ElementID::Stop:
         return true;
     default:
-        return false;
+        // cctext patch: <filter> and its primitives never draw.
+        return m_id >= ElementID::Filter;
     }
 }
 

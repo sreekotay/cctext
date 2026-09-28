@@ -106,7 +106,24 @@ enum class ElementID : uint8_t {
     Symbol,
     Text,
     Tspan,
-    Use
+    Use,
+    // cctext patch: filter effects (svgfilterelement.h).
+    Filter,
+    FeBlend,
+    FeColorMatrix,
+    FeComponentTransfer,
+    FeComposite,
+    FeDropShadow,
+    FeFlood,
+    FeFuncA,
+    FeFuncB,
+    FeFuncG,
+    FeFuncR,
+    FeGaussianBlur,
+    FeMerge,
+    FeMergeNode,
+    FeOffset,
+    FeUnsupported
 };
 
 ElementID elementid(std::string_view name);
@@ -118,6 +135,7 @@ class SVGMarkerElement;
 class SVGClipPathElement;
 class SVGMaskElement;
 class SVGPaintElement;
+class SVGFilterElement;
 class SVGLayoutState;
 class SVGRenderState;
 
@@ -163,6 +181,7 @@ public:
     SVGMarkerElement* getMarker(std::string_view id) const;
     SVGClipPathElement* getClipper(std::string_view id) const;
     SVGMaskElement* getMasker(std::string_view id) const;
+    SVGFilterElement* getFilter(std::string_view id) const;
     SVGPaintElement* getPainter(std::string_view id) const;
 
     SVGElement* elementFromPoint(float x, float y);
@@ -196,6 +215,12 @@ public:
 
     const SVGClipPathElement* clipper() const { return m_clipper; }
     const SVGMaskElement* masker() const { return m_masker; }
+    const SVGFilterElement* filter() const { return m_filter; }
+    // cctext patch: a filter property that names no <filter> (or a filter
+    // whose region is empty): the element is not rendered (Filter Effects 1).
+    bool hasInvalidFilter() const { return m_invalidFilter; }
+    const std::string& filterFunctions() const { return m_filterFunctions; }
+    const Color& filterColor() const { return m_filterColor; }
     float opacity() const { return m_opacity; }
 
     bool isElement() const final { return true; }
@@ -204,6 +229,10 @@ private:
     mutable Rect m_paintBoundingBox = Rect::Invalid;
     const SVGClipPathElement* m_clipper = nullptr;
     const SVGMaskElement* m_masker = nullptr;
+    const SVGFilterElement* m_filter = nullptr;
+    bool m_invalidFilter = false;
+    std::string m_filterFunctions;
+    Color m_filterColor = Color::Black;
     float m_opacity = 1.f;
 
     float m_font_size = 12.f;
@@ -347,6 +376,11 @@ public:
 
     SVGRootElement* layoutIfNeeded();
 
+    // cctext patch: some element has a filter property (paint bounding
+    // boxes then include filtered descendants).
+    bool hasFilters() const { return m_hasFilters; }
+    void setHasFilters() { m_hasFilters = true; }
+
     SVGElement* getElementById(std::string_view id) const;
     void addElementById(const std::string& id, SVGElement* element);
     void layout(SVGLayoutState& state) final;
@@ -355,6 +389,7 @@ public:
 
 private:
     std::map<std::string, SVGElement*, std::less<>> m_idCache;
+    bool m_hasFilters = false;
     float m_intrinsicWidth{-1.f};
     float m_intrinsicHeight{-1.f};
 };

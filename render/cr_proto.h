@@ -69,6 +69,11 @@
 #define CR_INPUT_HARD_MAX (64u << 20)       /* request payload bytes */
 #define CR_PIXELS_HARD_MAX (64u << 20)      /* output pixels (w * h), 256 MiB RGBA */
 #define CR_SIDE_HARD_MAX 32768u             /* either output side */
+/* SVG filter effects (lunasvg_set_filter_limits, render/cr_svg.cpp). */
+#define CR_FILTER_PIXELS_MAX (16u << 20)    /* one filter region, device px; larger draws unfiltered */
+#define CR_FILTER_BLUR_MAX 512.0f           /* blur standard deviation, device px (clamped) */
+#define CR_FILTER_PRIMITIVES_MAX 64         /* primitives per filter (the rest are ignored) */
+#define CR_FILTER_BYTES_MAX (512u << 20)    /* live intermediate filter images; past it unfiltered */
 
 enum {
     CR_KIND_QUIT = 0,
