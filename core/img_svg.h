@@ -3,9 +3,10 @@
  * "Mermaid"). Owner: core/img_svg.c. Plain C (no ccc header), called by
  * core/img.ccs from its background jobs; any thread.
  *
- * A pool of two helper processes (bin/cctext-render, beside the editor
- * binary): slot 0 renders SVG, slot 1 Mermaid (and later math), so a
- * slow diagram never queues behind SVG and raster work. Each is spawned
+ * A pool of three helper processes (bin/cctext-render, beside the editor
+ * binary): slot 0 renders SVG, slot 1 Mermaid, slot 2 math, so a slow
+ * diagram never queues behind SVG and raster work, nor a formula behind
+ * a diagram. Each is spawned
  * on its first request, kept for later ones, respawned after a crash or a
  * timeout (the editor kills it), and told to quit at exit. Requests on a
  * slot are serialized; every request carries a generation stamp and a
@@ -49,12 +50,27 @@
  * mermaid.min.js, DOM shim or font). */
 #define RTX_MERMAID_VERSION "cctext-render 2; mermaid 12.0.0; dom 1"
 
-/* Helper slots. */
+/* The same for math cache keys (docs/images.md "Math"): a new MathJax,
+ * font, glue or shim changes the pictures. */
+#define RTX_MATH_VERSION "cctext-render 2; mathjax 4.1.3; newcm 4.1.3; glue 1"
+
+/* Helper slots: each its own process, lock and time budget, so a slow
+ * Mermaid diagram never delays a formula (and neither delays an SVG). */
 enum {
     RTX_RENDER_SVG = 0,
     RTX_RENDER_MERMAID = 1,
-    RTX_RENDER_SLOTS = 2
+    RTX_RENDER_MATH = 2,
+    RTX_RENDER_SLOTS = 3
 };
+
+/* A formula's options (render/cr_proto.h MATH_TEX / MATH_MML). */
+typedef struct {
+    int mml;               /* MathML source, else TeX */
+    int display;           /* display style, else inline */
+    float em;              /* font size, px */
+    uint32_t fg;           /* 0xRRGGBB: currentColor */
+    uint32_t max_w;        /* display line-break width, CSS px (0: none) */
+} RtxMathOpt;
 
 typedef struct {
     uint64_t input_max;    /* bytes one request may carry */
@@ -92,6 +108,20 @@ int rtx_mermaid_size(const uint8_t *payload, size_t n, const RtxSvgCfg *cfg,
 int rtx_mermaid_render(const uint8_t *payload, size_t n, const RtxSvgCfg *cfg, uint32_t pw,
                        uint32_t ph, const _Atomic int *cancel, uint8_t **out, char *msg,
                        size_t msgcap);
+
+/* Math: `src` is the formula (TeX without delimiters, or a <math>
+ * element). The size is CSS px at o->em; *baseline is the baseline's
+ * distance from the bottom (inline math sits on the text's baseline). The
+ * key is the renderer version, the options and the source; sizes (with
+ * the baseline) and pixels are cached like Mermaid's (<safe>/img/math).
+ * RTX_SVG_ESCRIPT: the formula does not parse (msg: MathJax's message);
+ * ELARGE: over cfg->node_max MathML nodes; ETIMEOUT: over the budget. */
+int rtx_math_size(const uint8_t *src, size_t n, const RtxMathOpt *o, const RtxSvgCfg *cfg,
+                  const _Atomic int *cancel, float *w_css, float *h_css, float *baseline,
+                  char *msg, size_t msgcap);
+int rtx_math_render(const uint8_t *src, size_t n, const RtxMathOpt *o, const RtxSvgCfg *cfg,
+                    uint32_t pw, uint32_t ph, const _Atomic int *cancel, uint8_t **out, char *msg,
+                    size_t msgcap);
 
 /* Quit every helper (atexit does it too). */
 void rtx_svg_shutdown(void);

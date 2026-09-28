@@ -14,6 +14,7 @@
 //   core/workspace.ccs, core/layout.ccs, core/document.ccs,
 //   core/img.ccs + core/img_wuffs.c (Wuffs, third_party/wuffs) + core/img_net.c (images)
 //   + core/img_term.c (terminal encoders: block art, sixel, PNG, zlib, kitty cells)
+//   + core/img_svg.c (the renderer helper client) + core/img_math.c (TeX as Unicode text)
 //   frontend/gui_draw.ccs, frontend/gui_input.ccs, frontend/gui_chrome.ccs,
 //   frontend/cctext_draw.ccs (+ cctext_present.ccs, cctext_img.ccs: terminal pictures),
 //   frontend/cctext_grid_draw.ccs,
@@ -137,7 +138,7 @@ CC_TARGET perf_matrix_smoke exe tests/perf_matrix_smoke.ccs
 CC_TARGET_INCLUDE perf_matrix_smoke .
 CC_TARGET_DEPS perf_matrix_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout
 
-CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c core/img_term.c core/img_svg.c
+CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c core/img_term.c core/img_svg.c core/img_math.c
 CC_TARGET_INCLUDE rtx_img .
 CC_TARGET_DEPS rtx_img rtx_safe
 

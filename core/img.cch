@@ -44,6 +44,10 @@
 #define RTX_IMG_MM_NODES 150u              /* nodes a diagram may have */
 #define RTX_IMG_MM_TIMEOUT_MS 10000u       /* one diagram (engine budget) */
 #define RTX_IMG_MM_MAX_H 720u              /* Rich: display height cap, px */
+/* Math through cctext-render (docs/images.md "Math"; settings math_*) */
+#define RTX_IMG_MATH_MAX (8ull << 10)      /* formula source bytes */
+#define RTX_IMG_MATH_NODES 4000u           /* MathML nodes a formula may have */
+#define RTX_IMG_MATH_TIMEOUT_MS 4000u      /* one formula (engine budget) */
 
 typedef struct {
     uint64_t file_max;
@@ -70,6 +74,14 @@ typedef struct {
     uint32_t mm_timeout_ms;    /* one diagram */
     uint32_t mm_recycle_jobs;  /* restart the helper's engine every N diagrams (0: never) */
     uint32_t mm_max_h;         /* Rich display height cap, px */
+    /* Math (appended; docs/images.md "Math") */
+    int math;                  /* render $...$, $$...$$ and ```math (0: they stay source) */
+    int math_inline;           /* inline $...$ as pictures in pixel layouts (cctext-ui) */
+    int math_unicode;          /* terminal: simple inline math as Unicode (x², √x, α) */
+    uint64_t math_max;         /* formula source bytes */
+    uint32_t math_nodes;       /* MathML node cap (0: none) */
+    uint32_t math_timeout_ms;  /* one formula */
+    uint32_t math_recycle_jobs; /* restart the helper's math engine every N formulas (0: never) */
 } RtxImgLimits;
 
 /* The process's limits (defaults above until settings change them). */
@@ -118,7 +130,8 @@ enum {
     RTX_IMG_FMT_WEBP,
     RTX_IMG_FMT_QOI,
     RTX_IMG_FMT_SVG,           /* vector: rendered by cctext-render (img_svg.c) */
-    RTX_IMG_FMT_MERMAID        /* a ```mermaid fence: rendered by cctext-render */
+    RTX_IMG_FMT_MERMAID,       /* a ```mermaid fence: rendered by cctext-render */
+    RTX_IMG_FMT_MATH           /* a formula ($...$, $$...$$, ```math): cctext-render */
 };
 const char *rtx_img_fmt_name(int fmt);
 
@@ -128,6 +141,8 @@ typedef struct {
     uint32_t cw, ch;       /* coded canvas */
     int orient;            /* EXIF 1-8; 1 = as coded */
     uint64_t workbuf;      /* decoder scratch the image needs */
+    float baseline;        /* math: the baseline's distance from the bottom of the
+                            * w x h box, px (0 for everything else) */
 } RtxImgInfo;
 
 /* Pixel layouts a caller can ask for. BGRA premultiplied is what cairo
@@ -193,7 +208,8 @@ enum {
     RTX_IMG_SRC_LOCAL,
     RTX_IMG_SRC_DATA,
     RTX_IMG_SRC_REMOTE,
-    RTX_IMG_SRC_MERMAID        /* a diagram's source (the caller's bytes) */
+    RTX_IMG_SRC_MERMAID,       /* a diagram's source (the caller's bytes) */
+    RTX_IMG_SRC_MATH           /* a formula's source (the caller's bytes) */
 };
 
 #define RTX_IMG_PATH 4096
@@ -365,14 +381,52 @@ void rtx_img_src_mermaid_key(uint64_t h, uint64_t n, uint32_t theme, RtxImgSrc *
 /* The key parts of a Mermaid source (0 when src is not one). */
 int rtx_img_mermaid_key(const RtxImgSrc *src, uint64_t *h, uint64_t *n, uint32_t *theme);
 
-/* Stale display: the last diagram of a fence that had a size, by (owner,
- * fence start). A fence whose source changed paints that one, dimmed,
- * until the new render has a size (the workbook's stale convention). */
+/* Stale display: the last diagram of a fence (or formula of a math
+ * block / inline span) that had a size, by (owner, start). One whose
+ * source changed paints that one, dimmed, until the new render has a size
+ * (the workbook's stale convention). Mermaid and math sources both. */
 void rtx_img_mm_note(const void *owner, size_t fence_lo, const RtxImgSrc *src);
 /* A decoded bitmap of src is held (any size, any layout): what the stale
  * display can paint at once. */
 int rtx_img_has_pixels(const RtxImgSrc *src);
 int rtx_img_mm_prev(const void *owner, size_t fence_lo, RtxImgSrc *out);
+
+/* ---- math (docs/images.md "Math") ---------------------------------------- */
+
+/* How a formula is drawn: its input, display or inline style, the font
+ * size (px) and the colour (0xRRGGBB, MathJax's currentColor). Part of
+ * every formula's key (by id, like a diagram's theme). */
+typedef struct {
+    int mml;               /* MathML source, else TeX */
+    int display;
+    float em;
+    uint32_t fg;
+} RtxMathLook;
+
+/* The editor panes' formula colour (the host sets it from its theme;
+ * default the theme's text colour). A change re-keys every formula:
+ * visible ones re-render, the old pictures stay up (dimmed) until then. */
+void rtx_img_math_fg_set(uint32_t fg);
+uint32_t rtx_img_math_fg(void);
+uint32_t rtx_img_math_look_id(const RtxMathLook *k);
+
+/* A formula from its source src[0, n) (TeX without delimiters, or a
+ * <math> element; the caller's bytes need only live through the call that
+ * first sees it). err: RTX_IMG_ESVGBIG past math_max, ESRC when empty. */
+int rtx_img_src_math(const char *src, size_t n, const RtxMathLook *k, RtxImgSrc *out);
+/* By key alone (a painter with the layout's record): the entry must exist. */
+void rtx_img_src_math_key(uint64_t h, uint64_t n, uint32_t look, RtxImgSrc *out);
+/* The key parts of a math source (0 when src is not one). */
+int rtx_img_math_key(const RtxImgSrc *src, uint64_t *h, uint64_t *n, uint32_t *look);
+/* A diagram or a formula: a source rendered by the helper's script engines
+ * (sizes and pixels on their own lanes; the stale display applies). */
+int rtx_img_src_scripted(const RtxImgSrc *src);
+
+/* Terminal: a simple TeX formula as Unicode text (x^2 -> x², \sqrt{x} ->
+ * √x, \alpha -> α, \frac{a}{b} -> a/b, \le -> ≤, ...). Returns the bytes
+ * written (< cap, NUL-terminated), 0 when the formula has anything this
+ * does not know (it then stays source). */
+size_t rtx_math_unicode(const char *src, size_t n, char *out, size_t cap);
 
 /* Policy generation: bumps on every allow / revoke / reload (a host that
  * cached resolutions or a laid-out stand-in refreshes). */
