@@ -9,7 +9,8 @@ SVG goes through the same cache and surfaces, rendered by a separate
 sandboxed process, `cctext-render`
 ([Renderer](#svg-the-renderer-cctext-render)); so do ` ```mermaid `
 fences, drawn by the official Mermaid in QuickJS inside that helper
-([Mermaid](#mermaid)).
+([Mermaid](#mermaid)), and TeX math (`$…$`, `$$…$$`, ` ```math `),
+typeset by the official MathJax in the same helper ([Math](#math)).
 
 Bytes stay the truth. `![alt](path)` stays in the file exactly as typed;
 the picture is a painted stand-in over those bytes (the Rich lens, the
@@ -32,7 +33,10 @@ the content-hash cache), `render/` (the helper), `scripts/render_build.cch`
 (our shims and entry point), `third_party/quickjs`, `third_party/mermaid`;
 in the editor the fence scan in `core/layout.ccs`, the diagram source,
 theme and stale display in `core/img.ccs`, the painters in
-`frontend/gui_img.ccs` and `frontend/cctext_img.ccs`.
+`frontend/gui_img.ccs` and `frontend/cctext_img.ccs`. Math:
+`render/js/mj_shim.js` / `mj_glue.js`, `third_party/mathjax*`; the `$$` /
+inline scan in `core/layout.ccs`, the formula source, look and cache in
+`core/img.ccs`, the Unicode approximation in `core/img_math.c`.
 
 ## Decoder
 
@@ -392,9 +396,8 @@ with fixed-point geometry): none of it runs in the editor. A separate
 helper, `cctext-render`, parses and draws; it is locked down before it
 reads its first request, and the editor treats everything it sends as
 untrusted. Step 1 of the renderer plan was SVG (C / C++ only); step 2
-is Mermaid, QuickJS in the same helper ([Mermaid](#mermaid)); TeX /
-MathML (MathJax in QuickJS) is a later step, and the protocol and the
-pack have room for it.
+is Mermaid, QuickJS in the same helper ([Mermaid](#mermaid)), then TeX /
+MathML, MathJax in the same QuickJS host ([Math](#math)).
 
 **Engine.** [lunasvg](https://github.com/sammycage/lunasvg) 3.5.0
 (`cf3594d`, MIT) over [plutovg](https://github.com/sammycage/plutovg)
@@ -428,10 +431,13 @@ compile per CPU, rebuilt when a source, a header or the flags change.
 The helper then builds its own font pack: `bin/cctext-render
 --build-pack render/manifest.txt bin/cctext-render.pack` (every entry
 zlib-compressed with stb's deflate and checked by a round trip through
-Wuffs, which inflates it at run time; an FNV-1a trailer guards the file).
+Wuffs, which inflates it at run time; format `CRPK0003`: the table of
+names, lengths and offsets at the front, guarded by an FNV-1a trailer;
+the helper maps the file read-only and pages in only what it uses).
 Outputs: `bin/cctext-render` (1.4 MiB stripped: ≈ 450 KiB of it
-the SVG engine, the rest QuickJS), the pack (5.3 MiB: 1.3 MiB of fonts,
-the Mermaid bytecode — [Mermaid](#mermaid) has the two-step build) and
+the SVG engine, the rest QuickJS), the pack (10.9 MiB: 1.3 MiB of fonts,
+4.2 MiB of Mermaid bytecode, 5.7 MiB of math — [Mermaid](#mermaid) has
+the two-step build, [Math](#math) the breakdown) and
 `bin/cctext-render-selftest` (tests only). `@dist_cctext` packs the
 helper and its pack beside the editors; the editor looks for the helper
 beside its own binary (`RTX_RENDER_BIN` overrides; `../bin/` is tried for
@@ -441,11 +447,12 @@ beside its own binary (`RTX_RENDER_BIN` overrides; `../bin/` is tried for
 a time over a socketpair on the helper's stdin / stdout. After lockdown
 the helper sends a hello (version 2, the kinds it carries, sandboxed
 or not). A request (`CRQ2`, 52 bytes, then the payload) carries a
-generation stamp, a kind (SVG, MERMAID, STATS; TeX / MathML reserved),
+generation stamp, a kind (SVG, MERMAID, TEX, MATHML, STATS),
 flags (size only), the output box or a scale, a pixel cap, the payload
 length, and for a script kind its time budget and node cap. The helper
-answers **SIZE** (the CSS size) or **ERROR** (a code and one line of
-text: parse, too large, timeout, script, engine, …); then, unless
+answers **SIZE** (the CSS size; for math also the baseline) or
+**ERROR** (a code and one line of text: parse, too large, timeout,
+script, engine, …); then, unless
 size-only, **PIXELS** (premultiplied RGBA8 at exactly the box) or
 **ERROR**. STATS answers **INFO** (the engine's counters as JSON, for
 tests and the bench). A box equal to the rounded-up CSS size draws 1:1
@@ -480,9 +487,10 @@ ends it cleanly.
   placeholder ("SVG renderer not available on this platform yet"); a
   helper built there says so in its hello and refuses every request.
 
-**The editor side** (`core/img_svg.c`, plain C). A pool of two
-helpers, one per slot — SVG and Mermaid, each with its own lock, process
-and stamps, so a slow diagram never holds back an SVG — each spawned
+**The editor side** (`core/img_svg.c`, plain C). A pool of three
+helpers, one per slot — SVG, Mermaid and math, each with its own lock,
+process and stamps, so a slow diagram never holds back an SVG or a
+formula — each spawned
 lazily by its first request (from a background job, never the UI
 thread), kept for the next ones, and told to quit at exit (it also exits
 on EOF when the editor dies). Its environment is empty (nothing of the
@@ -588,7 +596,6 @@ the editor's 5 s budget ends; not yet reduced).
   whose root follows a prolog previews as text there (cctext-ui reads
   2 KiB); left to the terminal-images work in `cctext_draw.ccs`.
 - Windows: the AppContainer launcher; macOS: run the self-tests.
-- Math (MathJax in QuickJS) through the same helper.
 
 ## Mermaid
 
@@ -745,7 +752,7 @@ boot binary changes. Bytecode is 8.5 MB raw (from 5.6 MB of source) and
 | Helper RSS: after hello (lazy) / engine loaded / after a flowchart | 12.1 / 38.6–40 / 46.5 MiB |
 | after the seven types / after 250 diagrams | 66 / 73 MiB (JS heap 33–47 MiB, stable) |
 | Parse error or node-cap refusal | a few ms, engine kept |
-| Pack / helper binary | 5.3 MiB / 1.4 MiB |
+| Pack / helper binary (before math; with it: [Math](#math)) | 5.3 MiB / 1.4 MiB |
 
 Lazy start is what keeps an SVG-only session at 12 MiB: starting the
 engine eagerly would put every helper at ≈ 39 MiB (the inflated bytecode
@@ -785,6 +792,232 @@ strings in labels draw as plain text; KaTeX in labels, icons (`@{ icon
 we test (mindmap, timeline, git graph, quadrant, sankey, XY, block,
 architecture, …) are rendered by Mermaid but not checked against a
 browser.
+
+## Math
+
+TeX in Markdown — `$…$` inline, `$$…$$` display, and ` ```math `
+fences — is typeset in the Rich lens and on slides in both frontends by
+the official MathJax 4.1.3, unmodified, in QuickJS inside
+`cctext-render`, behind the same sandbox as SVG and Mermaid. The SVG
+MathJax writes is drawn by the same lunasvg. Building still needs only a
+C / C++ compiler and ccc: no Node, npm, Rust or bundler.
+
+**Using it.**
+
+- **Display math**: a `$$` block (the `$$` lines and the lines between)
+  or a ` ```math ` / `~~~math` fence is one picture row, centred, in the
+  text colour; the other lines lay out nothing (like a Mermaid fence). A
+  formula wider than the pane is broken by MathJax at its operators to
+  fit (the pane's width, in 32 px steps, is part of the request); until
+  that one is sized, and when it cannot break, the formula is scaled
+  down to the pane. Put the caret into it and the source shows as text with
+  the formula under it; leave it and the picture is back.
+- **Inline math** in cctext-ui: `$…$` in a line of text is a picture on
+  the text's baseline (MathJax reports the depth below the baseline, so
+  `x_1`, `\frac{a}{b}` and `\sum` sit as in a typeset line); a line
+  holding a tall formula grows to fit it, a line without one keeps its
+  height. `$$…$$` inside a line of text is display style in the line.
+  The caret inside a formula shows its source (the Rich lens's reveal
+  rule); selection, copy, search and undo act on the bytes.
+- **Inline math in a terminal** stays source, styled as math
+  (`markup.math`: violet), with the caret or without. `"math_unicode":
+  true` shows a Unicode approximation when the formula has one (`x^2` →
+  `x²`, `\alpha \le \beta` → `α ≤ β`, `\sqrt{x}` → `√x`, `\frac{a}{b}` →
+  `a/b`, `\mathbb{R}` → `ℝ`; anything it cannot write — a fraction of
+  fractions, a matrix, an unknown command — stays source).
+- **Display math in a terminal** goes through the picture path (kitty,
+  sixel, iTerm2 or block art): block art draws formulas at 2.5 times the
+  text size (a cell is too coarse for text-sized glyphs), the others at
+  1.25 times.
+- **While it renders** a display formula is a small box
+  (`rendering math…` in cctext-ui, `[math: rendering...]` in a terminal);
+  an inline formula shows its source until its size is known (then the
+  line is laid out once, with the picture's box). Typing in a formula
+  keeps the previous one up, dimmed, until the new one has pixels (the
+  workbook's stale convention; inline and display alike).
+- **Errors**: a formula that does not parse is not drawn. MathJax's
+  message comes back as an ERROR (`math: Missing close brace`, `math:
+  Undefined control sequence \foo`): under the previous formula as a
+  caption while one is up, else in the box (`[math: Missing close
+  brace]`). An inline formula that does not parse stays source (the
+  source is what to fix). We chose this over MathJax's own red `merror`
+  rendering: a picture of an error in the text colour looks like
+  typeset math, and the source is right there.
+- **Slides** (both frontends): `$$` blocks and ` ```math ` fences are
+  formulas in the slide's text colour, fitted to the content box and
+  moved by transitions with everything else. A terminal slide without
+  pictures shows the Unicode approximation, else the source.
+- **Theme**: the formula takes the text colour (MathJax's
+  `currentColor` becomes the request's `fg`), which is part of its key:
+  a colour change (`rtx_img_math_fg_set`) re-keys every formula; the
+  visible ones render again (the old pictures stay up, dimmed,
+  meanwhile), the rest when scrolled to. The editor panes are dark in
+  both frontends (as for Mermaid: there is no light editor theme).
+- Settings (`settings.json`):
+
+| Setting | Default | |
+|---|---|---|
+| `math` | on | off: `$`, `$$` and math fences stay source |
+| `math_inline` | on | off: inline `$…$` stays source in cctext-ui too |
+| `math_unicode` | off | terminal: the Unicode approximation of inline math |
+| `math_max_kb` | 8 | a longer formula is not rendered (1–1024) |
+| `math_nodes` | 4000 | MathML nodes one formula may make (0: no cap) |
+| `math_timeout_ms` | 4000 | one formula (100–120000) |
+| `math_recycle_jobs` | 0 | a fresh engine every N formulas (0: never) |
+
+**The helper's third slot.** Math has a helper process and a job lane
+of its own (slot 2 in `core/img_svg.c`, lane 3 in `core/img.ccs`), so a
+formula never waits behind a Mermaid layout (which can take its whole
+10 s budget) or an SVG. A document with math and no diagrams starts only
+the math helper; each helper starts only the engine its requests need.
+
+**Protocol** (`render/cr_proto.h`, still version 2: the fields existed).
+`CR_KIND_TEX` (TeX source, no delimiters) and `CR_KIND_MATHML` (a
+`<math>` element). Flag bit 0 is display (else inline, `\textstyle`);
+`em_px` is the font size the formula is set at (the editor passes its
+text's em: from the GUI font's metrics; in a terminal from the cell
+size, larger for block art);
+`fg` is the colour (RGBA; MathJax's `currentColor`); `max_w` (the old
+reserved field) is the width display math breaks to fit (0: no limit).
+The reply is **SIZE** with a third float, the **baseline's distance from
+the bottom** of the box (the depth), then **PIXELS** at the box. The
+node cap and time budget are the script kinds' fields. The hello
+advertises TEX and MATHML.
+
+**The engine** (`render/js/mj_shim.js`, `mj_glue.js`). MathJax's own
+components — `startup`, `core`, `input/tex` (base packages), `input/mml`,
+`output/svg`, `adaptors/liteDOM`, the `mathjax-newcm` SVG font — are
+wrapped at build time in `__cctextMods[key] = function () {…}` and
+compiled with our loader shim into one bytecode bundle (`js:math`). Its
+startup is `mjRender(kind, source, options)`: TeX or MathML → MathJax's
+SVG (`fontCache: 'local'`, `currentColor`, inline line breaking off,
+display overflow `linebreak` at `max_w`) → `{w, h, baseline}` and the
+SVG → lunasvg. The configuration: every TeX extension in the pack
+autoloads on first use (`\require` and `autoload` go through
+`__mjRequire`, which only ever reads the pack), `noundefined` is off (an
+unknown macro is an error, not red text), `maxMacros` 1000 and
+`maxBuffer` 5 KiB (TeX's own guards against macro recursion and
+expansion; MathJax's default `maxMacros` is 10000: lower, a
+`\def\a{\a\a}` bomb ends long before the time budget),
+`formatError` throws, and each TeX formula runs inside
+`\begingroup … \endgroup` (the `begingroup` extension), so a `\def` or
+`\newcommand` in one formula never reaches the next. After the input
+jax, a filter counts the MathML nodes (`math_nodes`: "formula too large
+(N nodes, limit M)") and turns an `merror` into an ERROR.
+Engine lifetime is Mermaid's: lazy, recycled after a timeout, a script
+failure, 256 MiB of heap or `math_recycle_jobs` formulas; a parse error
+or a node-cap refusal keeps it. The helper keeps the last four formulas'
+SVG, so the pixel request after a size request does not typeset again.
+
+**What is in the pack, what is left out.** No speech rule engine (SRE),
+no assistive MathML, no menu, no HTML output: the editor has the source
+for a screen reader, and SRE alone is several MB. The TeX extensions are
+in the pack as **source** (`src:` entries), not in the bytecode: most
+formulas use none, and one is compiled only when a formula first needs
+it (`\require{…}`, or a macro that autoloads one: `\cancel`,
+`\boldsymbol`, `\bbox`, `\enclose`, `\mathtools` macros, `\color`
+with its extended forms, …). So are MathJax's **dynamic font files**
+(the glyph ranges past the base font: double-struck, script,
+fraktur, arrows, large operators, …, 40 files and 10 MB of source):
+loaded on first use of a glyph in their range, then freed with the
+engine. Left out: `html`, `texhtml` (HTML in math), `setoptions`
+(changes our configuration from a formula), and `mhchem`, `bbm`,
+`bboldx`, `dsfont` (they need MathJax font extensions, not vendored:
+`\ce{…}` is an unknown macro). The list is in `render/manifest.txt`.
+
+**Security.** Everything the SVG and Mermaid paths have (the seccomp
+sandbox, an empty environment, no fetches, every reply untrusted, the
+budget enforced twice: QuickJS's interrupt handler at the budget, a kill
+by the editor 2 s past it). `\href` (base TeX) lands as a link in an SVG
+that lunasvg draws and nothing follows; the `html` extension (`\class`,
+`\style`, `\cssId`, `\data`) is not in the pack. A formula too deep for
+QuickJS's stack is "formula too deeply nested" and the engine is
+recycled. **Bytecode and source alike are
+only ever read from this build's pack**: the `js:math` bundle and every
+`src:` module are checked against SHA-256 digests compiled into the
+helper (`CR_PACK_JS_HASHES`) before QuickJS sees them; a tampered module
+is refused ("the math engine does not match this renderer (rebuild the
+pack)"; for a `src:` module, "`<key>` does not match this renderer": the
+formula that needed it fails, the other formulas carry on). A module is read only through the
+host's `__hostLoad(key)`, which resolves keys in the pack and nowhere
+else (`__mjRequire` refuses `html`, `texhtml`, `setoptions` by name).
+The pack is mapped read-only before lockdown; nothing is read from a
+writable place.
+
+**Caches.** A formula is keyed by its source's FNV-1a 64 hash and
+length, its look (display or inline, em, colour, max width) and the
+renderer's version (`RTX_MATH_VERSION`: helper protocol, MathJax, font,
+glue). In memory: the size and baseline, and pixels (the image cache's
+LRU). On disk in the Safe home (`<safe>/img/math/`): a `.size` file
+(`RTXS 1 w h baseline`) apart from the `.px` files, so a later session
+lays out cached formulas — inline ones need their size and baseline
+before the line can be laid out — without starting the helper. The
+stale display remembers, per (document, formula start), the last formula
+that had pixels.
+
+**Never blocking.** Every formula is a job on lane 3, visible first,
+cancelled when scrolled away or typed past; the frame paints what is
+there (the source, the box, or the stale picture). An idle editor with
+formulas on screen does nothing (zero wakeups; `ui_math_test`).
+
+**Vendored, pinned.** `third_party/mathjax` (MathJax 4.1.3, the npm
+`mathjax@4.1.3` files byte for byte) and `third_party/mathjax-newcm-font`
+(`@mathjax/mathjax-newcm-font@4.1.3`), Apache-2.0, `LICENSE` beside
+them; `README.cctext.md` lists every file with its SHA-256 (checked
+against npm's sha512 integrity when vendored) and how to update. The
+manifest names each hash and the build refuses a different file. Our
+code around them, each file commented: `render/js/mj_shim.js` (the
+module loader and the configuration), `render/js/mj_glue.js` (the entry
+point, the node count, errors), and `render/js/rt_shim.js` (shared with
+Mermaid).
+
+**Measured** (Linux x86-64, this container, release build;
+`python3 bench/render_client.py math`, `math_smoke`):
+
+| | |
+|---|---|
+| Pack: before math / with math | 5.3 / 10.9 MiB (+0.9 MiB bytecode, +4.9 MiB source modules) |
+| `js:math` bytecode | 1.76 MB raw (from 1.49 MB of source), 0.96 MB in the pack |
+| Dynamic font files / TeX extensions (source) | 10.0 / 0.2 MB raw, 4.8 / 0.1 MB in the pack |
+| Helper binary | 1.4 MiB (unchanged: MathJax is data) |
+| Spawn to ready (any slot; the engine not started) | 12 ms (was 13.6 ms before math) |
+| Helper RSS after hello | 8.7 MiB |
+| First formula in a helper (inflate 6 ms + engine start 9 ms + `x^2+1`) | ≈ 50 ms |
+| First use of a formula (33 in `formulas.json`, fonts loading on demand) | median 11.6 ms, max 63–80 ms |
+| Warm formula, size + pixels / size only | median 9.8 / 8.8 ms (max 18 ms) |
+| Re-raster of a cached formula | ≈ 2 ms |
+| Helper RSS: first formula / after 33 formulas | 22 / 33 MiB (JS heap 6 / 14 MiB) |
+
+The pack doubled; a helper does not pay for it: the pack is mapped
+read-only, not read, and its table sits together at the front (format
+`CRPK0003`), so an SVG helper pages in the table and the fonts, a math
+helper the fonts, `js:math` and the source modules it loads. Reading the
+pack whole cost 36 ms and 17 MiB per spawn at 10.9 MiB. stb's deflate
+uses fixed Huffman codes; zlib -9 would store the font source in 3.1 MB
+instead of 4.8 MB (a better deflate in the build step is a follow-up).
+
+**Fuzzing.** `bin/cctext-render-fuzz --math PACK testdata/math [ITERS]
+[SEED]` runs the engine in process under ASan + UBSan: the TeX of
+`formulas.json` and hostile seeds mutated (byte flips, truncation,
+duplicated and swapped chunks, token garbage: `\def`, `\newcommand`
+bombs, `\require`, `\href{javascript:…}`, deep `{`/`\left` nesting,
+huge `\hspace`, `\rule`, `\unicode`, astral characters, control bytes,
+invalid UTF-8), MathML seeds likewise, each display or inline within a
+budget; a rendered SVG goes through the SVG path too. `@smoke` runs 40
+mutants; `@render_fuzz` runs `RENDER_FUZZ_MATH_ITERS` (1000). 300
+mutants run clean under ASan + UBSan (111 rendered, 174 errors, 3 node
+cap refusals, 12 budget timeouts; 180 s): no sanitizer finding in
+QuickJS, MathJax or our glue.
+
+**Leftovers.** Inline math on a slide stays source (display math is a
+picture). A glyph outside the NewCM font (CJK in `\text{…}`) is a box.
+`\binom` differs slightly between TeX and the equivalent MathML (width
+within 5 %: MathJax sets the TeX one with its own spacing). No
+`\ce{…}` (mhchem needs a font extension). The terminal's inline formula
+is never a picture (a line of text is cells); `math_unicode` is the
+approximation. macOS and Windows untested (Windows has no helper). The
+math helper's pack mapping means the pack file must not be rewritten
+under a running helper (the build writes a new file and renames it).
 
 ## Tests
 
@@ -877,9 +1110,10 @@ browser.
   (sniffing, the permission rules, `data:image/svg+xml` base64 and
   percent-encoded, a Rich picture row whose height is the same before and
   after the pixels, the terminal stand-in).
-- `render/cr_fuzz.c` (`@smoke`: 400 SVG and 16 Mermaid mutants;
-  `@render_fuzz`: 20000 and 1000): see
-  [Fuzzing](#svg-the-renderer-cctext-render) and [Mermaid](#mermaid).
+- `render/cr_fuzz.c` (`@smoke`: 400 SVG, 16 Mermaid and 40 math
+  mutants; `@render_fuzz`: 20000, 1000 and 1000): see
+  [Fuzzing](#svg-the-renderer-cctext-render), [Mermaid](#mermaid) and
+  [Math](#math).
 - `mermaid_smoke` (`@smoke`): the protocol raw (hello v2, no engine
   before the first diagram, SIZE then PIXELS at the box, the pixel
   request reusing the script's SVG, a parse error naming its line in one
@@ -917,6 +1151,58 @@ browser.
   process that exits with the editor; an `.svg` opens as text and
   `Ctrl-D` swaps its picture in and out; a slide's `![bg left:40%]`; the
   browse preview. It saves `testdata/generated/ui_svg_markdown.png`.
+- `math_smoke` (`@smoke`): the protocol raw (hello advertises TeX and
+  MathML, no engine before the first formula, SIZE with a baseline that
+  is ≈ 0 for `x` and the depth for `y`, `\frac` and subscripts, then
+  PIXELS at the box with ink, the helper's SVG cache, `fg` colouring the
+  formula); errors in one line with the engine kept (missing brace,
+  undefined macro), the `\def` recursion bomb ended by `maxMacros`,
+  `\require{texhtml}` and `\require{setoptions}` refused, `\href`
+  harmless, a `\def` not leaking into the next formula (`\begingroup`),
+  the node cap, a huge `\hspace` against the pixel caps, MathML (a
+  formula, an error, a non-`<math>` payload), `max_w` breaking a wide
+  display formula; the budget (an endless script times out, a fresh
+  engine), the heap recycle and `--recycle-jobs`; the pack hash (a pack
+  with other `js:math` bytecode, and one with another
+  `src:…/double-struck` font file: `\mathbb{R}` refused, `x+1` still
+  renders); the client (lazy spawn of the math slot only, size +
+  baseline, pixels, messages, the byte limit refused without a request,
+  the editor's kill past budget + grace and the respawn, a cancelled
+  request's late reply dropped); the disk cache (a later "session" with
+  no helper lays out and paints from it, the baseline included); the 31
+  formulas of `testdata/math/formulas.json` (fractions, continued
+  fractions, roots, sums, integrals, limits, matrices, `cases`, `align`,
+  accents, braces, text with Unicode and CJK, Greek, fonts, big
+  delimiters, arrows, relations, Maxwell's equations, `\color` with
+  `\cancel`, …; two must fail: a missing brace, an undefined macro)
+  against committed reference PNGs (±1 px in size, ≤ 0.5 % of pixels
+  more than 24 levels off) and against their MathML
+  (`testdata/math/mml`, same baseline within 0.05 px): 30 of 31
+  identical, `\binom` within 5 % in width; the layout (a `$$` block and
+  a ` ```math ` fence are picture rows, the other lines nothing, a
+  one-line block, `$$` inside text inline, inline sizes and baselines,
+  the grown line's `ytop`, a table cell keeps its source, the caret
+  reveal of both, the stale formula inline and display while an edit
+  renders and after a parse error, a theme change re-keys and keeps the
+  old one up, `math` off and the terminal's Unicode mode, idle once
+  settled).
+- `tests/tui_pty_test.py math_blocks` (`RTX_TUI_IMAGES=blocks`): a `$$`
+  block is block art under its line with the block's lines hidden; the
+  caret shows the source with the formula under it; typing keeps the old
+  formula up until the new one lands; inline math stays source, or
+  Unicode with `math_unicode`; idle once settled.
+- `tests/ui_math_test.py` (Xvfb, cctext-ui): a display formula centred
+  and still; an inline fraction on its line's baseline, reaching above
+  and below the text and centred on it; one helper (the math slot), idle
+  with formulas on screen, gone with the editor; the caret reveal; the
+  dimmed stale formula while an edit renders and the new, wider one
+  after; `"math": false` leaves source and starts no helper; a Marp
+  slide's `$$` in the slide's text colour. It saves
+  `testdata/generated/ui_math_markdown.png`.
+- `testdata/math`: `formulas.json`, `ref/` (our PNGs) and `mml/` (the
+  MathML of each formula, from MathJax's own `tex2mml`), regenerated by
+  `gen_refs.py` through the helper; `bench/render_client.py math`
+  measures.
 - `testdata/mermaid`: one source per type, `chromium/` (the browser's
   SVGs with `htmlLabels: false`), `ref/` (our PNGs), regenerated by
   `gen_refs.py`; `bench/render_client.py mermaid` / `leak` measure.
@@ -929,7 +1215,8 @@ browser.
 
 - Reference-style images (`![a][ref]`) and HTML `<img>` are text.
 - An image inside a line of text in cctext-ui is the text stand-in, not
-  a picture (only a line that is one image becomes a picture row).
+  a picture (only a line that is one image becomes a picture row;
+  inline math is the exception, [Math](#math)).
 - No AVIF, HEIC, TIFF or lossy-WebP guarantee (Wuffs 0.4's WebP is
   lossless; its VP8 support is partial). SVG goes through cctext-render
   (its own follow-ups are listed there); no `.svgz`.
