@@ -23,7 +23,7 @@ struct FilterLimits {
     float maxBlur = 512.f;                // stdDeviation, device px
     int maxPrimitives = 64;               // per <filter> (or function list)
     size_t maxBytes = size_t(512) << 20;  // live intermediate images
-    double maxWork = double(96 << 20);    // weighted primitive x region px per render
+    double maxWork = double(64 << 20);    // weighted primitive x region px per render
 };
 
 FilterLimits g_limits;
@@ -38,10 +38,10 @@ bool chargeWork(int w, int h, int weight = 1)
     return g_work <= g_limits.maxWork;
 }
 
-// Blurs and shadows cost a few passes more than a per-pixel primitive.
+// Relative cost (passes over the region, colour conversions included).
 int workWeight(ElementID id)
 {
-    return id == ElementID::FeGaussianBlur ? 3 : id == ElementID::FeDropShadow ? 4 : 1;
+    return id == ElementID::FeGaussianBlur ? 4 : id == ElementID::FeDropShadow ? 8 : 2;
 }
 
 constexpr float kMaxCoord = float(1 << 24);
@@ -1914,7 +1914,7 @@ bool applyFilter(const SVGElement* element, Canvas& canvas, const Transform& ctm
                 result = next;
                 continue;
             }
-            if(!chargeWork(w, h, fn.type == FunctionType::Blur ? 3 : fn.type == FunctionType::DropShadow ? 4 : 1))
+            if(!chargeWork(w, h, fn.type == FunctionType::Blur ? 4 : fn.type == FunctionType::DropShadow ? 8 : 2))
                 return true;
             result = runFunction(ctx, fn, result);
         }

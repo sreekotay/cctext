@@ -74,7 +74,7 @@
 #define CR_FILTER_BLUR_MAX 512.0f           /* blur standard deviation, device px (clamped) */
 #define CR_FILTER_PRIMITIVES_MAX 64         /* primitives per filter (the rest are ignored) */
 #define CR_FILTER_BYTES_MAX (512u << 20)    /* live intermediate filter images; past it unfiltered */
-#define CR_FILTER_WORK_MAX (96u << 20)      /* one render's weighted primitives x region px; then unfiltered */
+#define CR_FILTER_WORK_MAX (64u << 20)      /* one render's weighted primitives x region px; then unfiltered */
 
 enum {
     CR_KIND_QUIT = 0,
