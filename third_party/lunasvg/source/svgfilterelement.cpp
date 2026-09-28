@@ -23,10 +23,26 @@ struct FilterLimits {
     float maxBlur = 512.f;                // stdDeviation, device px
     int maxPrimitives = 64;               // per <filter> (or function list)
     size_t maxBytes = size_t(512) << 20;  // live intermediate images
+    double maxWork = double(96 << 20);    // weighted primitive x region px per render
 };
 
 FilterLimits g_limits;
 size_t g_liveBytes = 0;
+double g_work = 0.0;  // since the last resetFilterWork()
+
+// Charge one primitive over `region`; false once the render's budget is spent
+// (the rest of its filtered elements draw unfiltered).
+bool chargeWork(int w, int h, int weight = 1)
+{
+    g_work += double(std::max(w, 0)) * double(std::max(h, 0)) * weight;
+    return g_work <= g_limits.maxWork;
+}
+
+// Blurs and shadows cost a few passes more than a per-pixel primitive.
+int workWeight(ElementID id)
+{
+    return id == ElementID::FeGaussianBlur ? 3 : id == ElementID::FeDropShadow ? 4 : 1;
+}
 
 constexpr float kMaxCoord = float(1 << 24);
 constexpr float kPi = 3.14159265358979323846f;
@@ -357,6 +373,12 @@ struct BlurLine {
         }
     }
 
+    // How far (px) one run spreads a pixel.
+    int reach() const
+    {
+        return box ? 3 * (d / 2 + 1) : int(kernel.size() / 2) + 1;
+    }
+
     void run(uint8_t* data, size_t stride, int n)
     {
         a.resize(size_t(n));
@@ -391,30 +413,74 @@ struct BlurLine {
     }
 };
 
-// Blur `img` in place over `rows` x `cols` (IRect of the lines to touch).
+// Blur `img` in place. Only the content (img.sub, zero outside) grown by the
+// blur's reach is touched; the vertical pass runs on a transposed copy of
+// the columns `out` needs (cache-friendly rows).
 void blurImage(Image& img, float sx, float sy, const IRect& out)
 {
     BlurLine line;
     auto* bytes = reinterpret_cast<uint8_t*>(img.px);
     size_t rowBytes = size_t(img.w) * 4;
+    IRect c = img.sub.intersected(IRect{0, 0, img.w, img.h});
+    if(c.empty())
+        return;
     if(sx > 0.f) {
         line.setup(sx);
-        for(int y = img.sub.y0; y < img.sub.y1; y++) {
-            for(int c = 0; c < 4; c++)
-                line.run(bytes + size_t(y) * rowBytes + c, 4, img.w);
+        int x0 = std::max(0, c.x0 - line.reach());
+        int x1 = std::min(img.w, c.x1 + line.reach());
+        for(int y = c.y0; y < c.y1; y++) {
+            for(int ch = 0; ch < 4; ch++)
+                line.run(bytes + size_t(y) * rowBytes + size_t(x0) * 4 + ch, 4, x1 - x0);
         }
-        img.sub.x0 = 0;
-        img.sub.x1 = img.w;
+        c.x0 = x0;
+        c.x1 = x1;
     }
     if(sy > 0.f) {
         line.setup(sy);
-        for(int x = out.x0; x < out.x1; x++) {
-            for(int c = 0; c < 4; c++)
-                line.run(bytes + size_t(x) * 4 + c, rowBytes, img.h);
+        int y0 = std::max(0, c.y0 - line.reach());
+        int y1 = std::min(img.h, c.y1 + line.reach());
+        int cx0 = std::max(c.x0, out.x0);
+        int cx1 = std::min(c.x1, out.x1);
+        int n = y1 - y0;
+        if(cx1 > cx0 && n > 0) {
+            size_t cols = size_t(cx1 - cx0);
+            auto* t = static_cast<uint32_t*>(std::malloc(cols * size_t(n) * 4));
+            if(t) {
+                constexpr int kBlock = 32;
+                for(int by = y0; by < y1; by += kBlock) {
+                    int ey = std::min(y1, by + kBlock);
+                    for(int bx = cx0; bx < cx1; bx += kBlock) {
+                        int ex = std::min(cx1, bx + kBlock);
+                        for(int y = by; y < ey; y++) {
+                            const uint32_t* row = img.px + size_t(y) * img.w;
+                            for(int x = bx; x < ex; x++)
+                                t[size_t(x - cx0) * n + (y - y0)] = row[x];
+                        }
+                    }
+                }
+                for(size_t x = 0; x < cols; x++) {
+                    auto* col = reinterpret_cast<uint8_t*>(t + x * size_t(n));
+                    for(int ch = 0; ch < 4; ch++)
+                        line.run(col + ch, 4, n);
+                }
+                for(int by = y0; by < y1; by += kBlock) {
+                    int ey = std::min(y1, by + kBlock);
+                    for(int bx = cx0; bx < cx1; bx += kBlock) {
+                        int ex = std::min(cx1, bx + kBlock);
+                        for(int y = by; y < ey; y++) {
+                            uint32_t* row = img.px + size_t(y) * img.w;
+                            for(int x = bx; x < ex; x++)
+                                row[x] = t[size_t(x - cx0) * n + (y - y0)];
+                        }
+                    }
+                }
+                std::free(t);
+            }
         }
-        img.sub.y0 = 0;
-        img.sub.y1 = img.h;
+        c.y0 = y0;
+        c.y1 = y1;
     }
+    img.sub = c;
 }
 
 // Clear everything outside `sub`, then set it as the image's subregion.
@@ -946,8 +1012,29 @@ public:
                     r = r.intersected(m_given->sub);
                     from = m_given->px;
                 }
-                for(int y = r.y0; y < r.y1; y++)
-                    std::memcpy(m_source->px + size_t(y) * m_ctx.w + r.x0, from + size_t(y) * m_ctx.w + r.x0, size_t(r.x1 - r.x0) * 4);
+                // Copy, and shrink the subregion to the painted pixels (the
+                // blurs and scans then skip the empty rest).
+                IRect ink{r.x1, r.y1, r.x0, r.y0};
+                for(int y = r.y0; y < r.y1; y++) {
+                    const uint32_t* s = from + size_t(y) * m_ctx.w;
+                    uint32_t* d = m_source->px + size_t(y) * m_ctx.w;
+                    int first = -1, last = -1;
+                    for(int x = r.x0; x < r.x1; x++) {
+                        if(s[x]) {
+                            if(first < 0)
+                                first = x;
+                            last = x;
+                        }
+                    }
+                    if(first < 0)
+                        continue;
+                    std::memcpy(d + first, s + first, size_t(last + 1 - first) * 4);
+                    ink.x0 = std::min(ink.x0, first);
+                    ink.x1 = std::max(ink.x1, last + 1);
+                    ink.y0 = std::min(ink.y0, y);
+                    ink.y1 = std::max(ink.y1, y + 1);
+                }
+                m_source->sub = ink.empty() ? IRect() : ink;
             }
         }
         return m_source;
@@ -1639,6 +1726,8 @@ RunStatus runFilterElement(const Context& base, const SVGFilterElement* filter, 
             continue;
         if(++count > g_limits.maxPrimitives)
             break;
+        if(!chargeWork(ctx.region.x1 - ctx.region.x0, ctx.region.y1 - ctx.region.y0, workWeight(e->id())))
+            return RunStatus::Unfiltered;  // over the render's work budget
         if(!run.run(static_cast<const SVGFilterPrimitiveElement*>(e), count == 1))
             return RunStatus::Unfiltered;  // over the memory budget
     }
@@ -1649,6 +1738,11 @@ RunStatus runFilterElement(const Context& base, const SVGFilterElement* filter, 
 }
 
 } // namespace
+
+void resetFilterWork()
+{
+    g_work = 0.0;
+}
 
 bool parseFilterFunctions(const std::string& value, const SVGElement* element)
 {
@@ -1682,20 +1776,82 @@ Rect filterFunctionsRegion(const SVGElement* element, const Rect& box)
     return r;
 }
 
-Rect filterCanvasRect(const Rect& region, const Rect& extents)
+// How far (device px) a filter can move content: 3 deviations per blur plus
+// every offset, summed over the primitives (an upper bound).
+float filterReach(const SVGElement* element, const Transform& ctm)
+{
+    const auto& m = ctm.matrix();
+    float sx = std::sqrt(m.a * m.a + m.b * m.b);
+    float sy = std::sqrt(m.c * m.c + m.d * m.d);
+    float s = std::max(sx, sy);
+    Rect bbox = element->fillBoundingBox();
+    double reach = 0.0;
+    auto blur = [&](float sdx, float sdy, bool obb) {
+        if(obb) {
+            sdx *= bbox.w;
+            sdy *= bbox.h;
+        }
+        float d = std::max(std::abs(sdx) * sx, std::abs(sdy) * sy);
+        reach += 3.0 * std::min(g_limits.maxBlur, finiteOr(d, g_limits.maxBlur));
+    };
+    auto shift = [&](float dx, float dy, bool obb) {
+        if(obb) {
+            dx *= bbox.w;
+            dy *= bbox.h;
+        }
+        reach += double(finiteOr(std::abs(dx) + std::abs(dy), 1e9f)) * s;
+    };
+    auto walk = [&](const SVGFilterElement* filter) {
+        bool obb = filter->attributeSource(PropertyID::PrimitiveUnits)->primitiveUnits() == Units::ObjectBoundingBox;
+        int count = 0;
+        for(const auto& child : filter->primitivesSource()->children()) {
+            auto e = toSVGElement(child);
+            if(!e || !isPrimitive(e->id()) || ++count > g_limits.maxPrimitives)
+                continue;
+            float sdy;
+            bool ok;
+            if(e->id() == ElementID::FeGaussianBlur) {
+                float sdx = stdDeviationPair(e, 0.f, sdy, ok);
+                blur(sdx, sdy, obb);
+            } else if(e->id() == ElementID::FeDropShadow) {
+                float sdx = stdDeviationPair(e, 2.f, sdy, ok);
+                blur(sdx, sdy, obb);
+                shift(numberAttr(e, PropertyID::Dx, 2.f, true), numberAttr(e, PropertyID::Dy, 2.f, true), obb);
+            } else if(e->id() == ElementID::FeOffset) {
+                shift(numberAttr(e, PropertyID::Dx, 0.f, true), numberAttr(e, PropertyID::Dy, 0.f, true), obb);
+            }
+        }
+    };
+    if(auto filter = element->filter()) {
+        walk(filter);
+    } else {
+        std::vector<FilterFunction> fns;
+        parseFunctions(element->filterFunctions(), element, &fns);
+        for(const auto& fn : fns) {
+            if(fn.type == FunctionType::Blur) {
+                blur(fn.value, fn.value, false);
+            } else if(fn.type == FunctionType::DropShadow) {
+                blur(fn.value, fn.value, false);
+                shift(fn.dx, fn.dy, false);
+            } else if(fn.type == FunctionType::Url) {
+                if(auto f = element->getFilter(fn.id))
+                    walk(f);
+            }
+        }
+    }
+    return float(std::min(reach, 1e7));
+}
+
+Rect filterCanvasRect(const SVGElement* element, const Rect& region, const Rect& extents, const Transform& ctm)
 {
     if(!region.isValid() || region.isEmpty())
         return Rect::Empty;
-    if(double(region.w) * double(region.h) <= g_limits.maxPixels)
-        return region;
-    // Too large: keep what can reach the visible canvas (a margin around it
-    // for offsets and blurs), else the visible part only.
+    // Only what the filter can bring into the visible canvas: the canvas
+    // grown by the filter's reach (blurs, offsets), within the region.
     Rect near = extents;
-    near.inflate(std::min(256.f, std::max(extents.w, extents.h) / 4.f));
+    near.inflate(filterReach(element, ctm) + 1.f);
     near.intersect(region);
-    if(double(near.w) * double(near.h) <= g_limits.maxPixels)
-        return near;
-    return region.intersected(extents);
+    return near;
 }
 
 bool applyFilter(const SVGElement* element, Canvas& canvas, const Transform& ctm)
@@ -1758,6 +1914,8 @@ bool applyFilter(const SVGElement* element, Canvas& canvas, const Transform& ctm
                 result = next;
                 continue;
             }
+            if(!chargeWork(w, h, fn.type == FunctionType::Blur ? 3 : fn.type == FunctionType::DropShadow ? 4 : 1))
+                return true;
             result = runFunction(ctx, fn, result);
         }
     }
@@ -1781,7 +1939,7 @@ bool applyFilter(const SVGElement* element, Canvas& canvas, const Transform& ctm
 
 } // namespace lunasvg
 
-extern "C" void lunasvg_set_filter_limits(double max_region_pixels, float max_blur_px, int max_primitives, size_t max_bytes)
+extern "C" void lunasvg_set_filter_limits(double max_region_pixels, float max_blur_px, int max_primitives, size_t max_bytes, double max_work_pixels)
 {
     using lunasvg::g_limits;
     if(max_region_pixels > 0)
@@ -1792,4 +1950,6 @@ extern "C" void lunasvg_set_filter_limits(double max_region_pixels, float max_bl
         g_limits.maxPrimitives = max_primitives;
     if(max_bytes > 0)
         g_limits.maxBytes = max_bytes;
+    if(max_work_pixels > 0)
+        g_limits.maxWork = max_work_pixels;
 }

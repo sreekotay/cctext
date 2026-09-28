@@ -28,7 +28,8 @@ reapplies them onto a fresh upstream copy):
    feFlood, feMerge, feComposite, feColorMatrix, feBlend,
    feComponentTransfer, feDropShadow, color-interpolation-filters and the
    CSS filter functions; bounded by `lunasvg_set_filter_limits()`
-   (region pixels, blur deviation, primitives, live image bytes). Other
+   (region pixels, blur deviation, primitives, live image bytes, work per
+   render). Other
    primitives pass their input through.
 
 Build defines: `LUNASVG_BUILD_STATIC`, `LUNASVG_DISABLE_LOAD_SYSTEM_FONTS`,

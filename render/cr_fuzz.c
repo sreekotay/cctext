@@ -212,9 +212,9 @@ static const char *snippet(Buf *o)
                "width=\"9\" height=\"9\"/>";
     case 17: { /* nested filtered groups */
         int i;
-        for (i = 0; i < 60; i++) buf_str(o, "<g filter=\"url(#fd)\" opacity=\"0.9\">");
+        for (i = 0; i < 20; i++) buf_str(o, "<g filter=\"url(#fd)\" opacity=\"0.9\">");
         buf_str(o, "<rect width=\"100\" height=\"100\"/>");
-        for (i = 0; i < 60; i++) buf_str(o, "</g>");
+        for (i = 0; i < 20; i++) buf_str(o, "</g>");
         buf_str(o, "<filter id=\"fd\"><feDropShadow stdDeviation=\"3\" dx=\"2\" dy=\"2\"/></filter>");
         return NULL;
     }

@@ -169,7 +169,8 @@ void apply_limits()
     if(done)
         return;
     done = true;
-    lunasvg_set_filter_limits(double(CR_FILTER_PIXELS_MAX), CR_FILTER_BLUR_MAX, CR_FILTER_PRIMITIVES_MAX, size_t(CR_FILTER_BYTES_MAX));
+    lunasvg_set_filter_limits(double(CR_FILTER_PIXELS_MAX), CR_FILTER_BLUR_MAX, CR_FILTER_PRIMITIVES_MAX, size_t(CR_FILTER_BYTES_MAX),
+                              double(CR_FILTER_WORK_MAX));
 }
 
 } // namespace

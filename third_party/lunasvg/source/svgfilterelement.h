@@ -80,13 +80,17 @@ bool parseFilterFunctions(const std::string& value, const SVGElement* element);
 // The region filter functions paint for an element whose paint box is `box`.
 Rect filterFunctionsRegion(const SVGElement* element, const Rect& box);
 
-// The offscreen canvas rect (device) for a filtered group whose paint box
-// maps to `region`, drawn onto a canvas with `extents`.
-Rect filterCanvasRect(const Rect& region, const Rect& extents);
+// The offscreen canvas rect (device) for `element`, filtered, whose paint box
+// maps to `region`, drawn onto a canvas with `extents` under `ctm`: the part
+// of the region its blurs and offsets can bring into view.
+Rect filterCanvasRect(const SVGElement* element, const Rect& region, const Rect& extents, const Transform& ctm);
 
 // Run `element`'s filter on `canvas` (its SourceGraphic) in place; `ctm` maps
 // the element's user space to device pixels. False: draw nothing.
 bool applyFilter(const SVGElement* element, Canvas& canvas, const Transform& ctm);
+
+// Start a render's filter work budget (Document::render).
+void resetFilterWork();
 
 } // namespace lunasvg
 

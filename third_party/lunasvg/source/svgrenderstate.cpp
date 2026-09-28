@@ -37,7 +37,7 @@ void SVGRenderState::beginGroup(const SVGBlendInfo& blendInfo)
         // (offsets and blurs bring them in), so its canvas covers the whole
         // filter region when that fits the filter pixel limit.
         if(m_mode == SVGRenderMode::Painting && blendInfo.filtered())
-            boundingBox = filterCanvasRect(boundingBox, m_canvas->extents());
+            boundingBox = filterCanvasRect(blendInfo.filtered(), boundingBox, m_canvas->extents(), m_currentTransform);
         else
             boundingBox.intersect(m_canvas->extents());
         m_canvas = Canvas::create(boundingBox);
