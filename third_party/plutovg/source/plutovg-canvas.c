@@ -664,28 +664,37 @@ float plutovg_canvas_add_glyph(plutovg_canvas_t* canvas, plutovg_codepoint_t cod
     return 0.f;
 }
 
-/* cctext patch 0004: text goes through the face's layout (kerning; with
- * 0005, per-glyph fallback faces). */
-float plutovg_canvas_add_text(plutovg_canvas_t* canvas, const void* text, int length, plutovg_text_encoding_t encoding, float x, float y)
+/* cctext patch 0004: text goes through the face's layout (per-glyph
+ * fallback faces, kerning, synthetic styles). A stroked outline is not
+ * overstruck (the two copies would both show). */
+static float plutovg_canvas_add_text_ex(plutovg_canvas_t* canvas, const void* text, int length, plutovg_text_encoding_t encoding, float x, float y, bool embolden)
 {
     plutovg_state_t* state = canvas->state;
     if(state->font_face == NULL || state->font_size <= 0.f)
         return 0.f;
-    return plutovg_font_face_get_text_path(state->font_face, state->font_size, x, y, text, length, encoding, canvas->path);
+    return plutovg_font_face_get_text_path(state->font_face, state->font_size, x, y, text, length, encoding, embolden, canvas->path);
+}
+
+float plutovg_canvas_add_text(plutovg_canvas_t* canvas, const void* text, int length, plutovg_text_encoding_t encoding, float x, float y)
+{
+    return plutovg_canvas_add_text_ex(canvas, text, length, encoding, x, y, true);
 }
 
 float plutovg_canvas_fill_text(plutovg_canvas_t* canvas, const void* text, int length, plutovg_text_encoding_t encoding, float x, float y)
 {
     plutovg_canvas_new_path(canvas);
-    float advance_width = plutovg_canvas_add_text(canvas, text, length, encoding, x, y);
+    float advance_width = plutovg_canvas_add_text_ex(canvas, text, length, encoding, x, y, true);
+    plutovg_fill_rule_t winding = canvas->state->winding;
+    canvas->state->winding = PLUTOVG_FILL_RULE_NON_ZERO;
     plutovg_canvas_fill(canvas);
+    canvas->state->winding = winding;
     return advance_width;
 }
 
 float plutovg_canvas_stroke_text(plutovg_canvas_t* canvas, const void* text, int length, plutovg_text_encoding_t encoding, float x, float y)
 {
     plutovg_canvas_new_path(canvas);
-    float advance_width = plutovg_canvas_add_text(canvas, text, length, encoding, x, y);
+    float advance_width = plutovg_canvas_add_text_ex(canvas, text, length, encoding, x, y, false);
     plutovg_canvas_stroke(canvas);
     return advance_width;
 }

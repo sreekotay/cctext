@@ -908,12 +908,13 @@ PLUTOVG_API void plutovg_font_face_clear_fallbacks(void);
 
 /**
  * @brief cctext patch: the path of a text run as it is drawn: per-glyph
- * fallback faces and kerning.
+ * fallback faces, kerning, synthetic bold (an overstrike, when `embolden`)
+ * and italic (a slant).
  *
  * @return The total advance width of the text.
  */
-PLUTOVG_API float plutovg_font_face_get_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_path_t* path);
-PLUTOVG_API float plutovg_font_face_traverse_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_path_traverse_func_t traverse_func, void* closure);
+PLUTOVG_API float plutovg_font_face_get_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, bool embolden, plutovg_path_t* path);
+PLUTOVG_API float plutovg_font_face_traverse_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, bool embolden, plutovg_path_traverse_func_t traverse_func, void* closure);
 
 /**
  * @brief Represents a cache of loaded font faces.

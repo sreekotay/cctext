@@ -175,9 +175,16 @@ struct plutovg_font_face {
     plutovg_glyph_cache_t cache;
     plutovg_destroy_func_t destroy_func;
     void* closure;
-    /* cctext patch 0005: the face whose font data this face shares (itself;
-     * two registrations of one face are one fallback). */
+    /* cctext patch 0006: the face's own style (OS/2 weight and fsSelection,
+     * head.macStyle), synthetic emboldening / slant for a family that lacks
+     * the face (variants[] of the regular one, owned by it), and `base`, the
+     * face whose font data a variant shares. */
+    bool bold;
+    bool italic;
+    bool synth_bold;
+    bool synth_italic;
     struct plutovg_font_face* base;
+    struct plutovg_font_face* variants[4];
 };
 
 /* cctext patch 0005: per-glyph fallback faces, tried in order when a face
@@ -185,6 +192,24 @@ struct plutovg_font_face {
 #define PLUTOVG_MAX_FALLBACKS 16
 static plutovg_font_face_t* fallback_faces[PLUTOVG_MAX_FALLBACKS];
 static int fallback_count;
+
+/* Synthetic styles: a slant of tan(12 deg) (FreeType's FT_GlyphSlot_Oblique)
+ * and an overstrike of size/24 .. size/32 (Skia's fake-bold ratios). */
+#define PLUTOVG_SYNTH_SKEW 0.2126f
+#define PLUTOVG_GLYPH_BOLD 1
+#define PLUTOVG_GLYPH_ITALIC 2
+
+static float plutovg_synth_bold_offset(float size)
+{
+    float ratio;
+    if(size <= 9.f)
+        ratio = 1.f / 24.f;
+    else if(size >= 36.f)
+        ratio = 1.f / 32.f;
+    else
+        ratio = 1.f / 24.f + (size - 9.f) / 27.f * (1.f / 32.f - 1.f / 24.f);
+    return size * ratio;
+}
 
 static void plutovg_glyph_cache_init(plutovg_glyph_cache_t* cache)
 {
@@ -325,8 +350,56 @@ plutovg_font_face_t* plutovg_font_face_load_from_data(const void* data, unsigned
     plutovg_glyph_cache_init(&face->cache);
     face->destroy_func = destroy_func;
     face->closure = closure;
+    face->bold = false;
+    face->italic = false;
+    if(face->info.head && stbtt__find_table(face->info.data, face->info.fontstart, "head")) {
+        int mac_style = ttUSHORT(face->info.data + face->info.head + 44);
+        face->bold = (mac_style & 1) != 0;
+        face->italic = (mac_style & 2) != 0;
+    }
+    stbtt_uint32 os2 = stbtt__find_table(face->info.data, face->info.fontstart, "OS/2");
+    if(os2) {
+        int weight = ttUSHORT(face->info.data + os2 + 4);
+        int selection = ttUSHORT(face->info.data + os2 + 62);
+        face->bold = face->bold || weight >= 600 || (selection & 32) != 0;
+        face->italic = face->italic || (selection & 1) != 0;
+    }
+    face->synth_bold = false;
+    face->synth_italic = false;
     face->base = face;
+    for(int i = 0; i < 4; i++)
+        face->variants[i] = NULL;
     return face;
+}
+
+/* A synthetic bold and / or italic variant sharing `base`'s data (owned by
+ * base; created once). */
+static plutovg_font_face_t* plutovg_font_face_variant(plutovg_font_face_t* base, bool bold, bool italic)
+{
+    int index = (bold ? 1 : 0) | (italic ? 2 : 0);
+    if(index == 0 || base == NULL)
+        return base;
+    plutovg_mutex_lock(&base->mutex);
+    plutovg_font_face_t* face = base->variants[index];
+    if(face == NULL) {
+        face = malloc(sizeof(plutovg_font_face_t));
+        if(face) {
+            *face = *base;
+            plutovg_init_reference(face);
+            plutovg_mutex_init(&face->mutex);
+            plutovg_glyph_cache_init(&face->cache);
+            face->destroy_func = NULL;
+            face->closure = NULL;
+            face->synth_bold = bold;
+            face->synth_italic = italic;
+            face->base = base;
+            for(int i = 0; i < 4; i++)
+                face->variants[i] = NULL;
+            base->variants[index] = face;
+        }
+    }
+    plutovg_mutex_unlock(&base->mutex);
+    return face ? face : base;
 }
 
 void plutovg_font_face_add_fallback(plutovg_font_face_t* face)
@@ -356,6 +429,10 @@ plutovg_font_face_t* plutovg_font_face_reference(plutovg_font_face_t* face)
 void plutovg_font_face_destroy(plutovg_font_face_t* face)
 {
     if(plutovg_destroy_reference(face)) {
+        for(int i = 0; i < 4; i++) {
+            if(face->variants[i])
+                plutovg_font_face_destroy(face->variants[i]);
+        }
         plutovg_glyph_cache_finish(&face->cache, face);
         plutovg_mutex_destroy(&face->mutex);
         if(face->destroy_func)
@@ -430,16 +507,39 @@ float plutovg_font_face_get_glyph_path(plutovg_font_face_t* face, float size, fl
     return plutovg_font_face_traverse_glyph_path(face, size, x, y, codepoint, glyph_traverse_func, path);
 }
 
-float plutovg_font_face_traverse_glyph_path(plutovg_font_face_t* face, float size, float x, float y, plutovg_codepoint_t codepoint, plutovg_path_traverse_func_t traverse_func, void* closure)
+static void plutovg_glyph_traverse(const plutovg_glyph_t* glyph, float scale, float x, float y, float skew, plutovg_path_traverse_func_t traverse_func, void* closure);
+
+static int plutovg_font_face_own_style(const plutovg_font_face_t* face)
+{
+    return (face->synth_bold ? PLUTOVG_GLYPH_BOLD : 0) | (face->synth_italic ? PLUTOVG_GLYPH_ITALIC : 0);
+}
+
+/* One glyph's outline at (x, y) with `style` (PLUTOVG_GLYPH_*): slanted,
+ * and overstruck (a second copy size/24 .. size/32 to the right; filled
+ * non-zero, the copies unite). Returns the advance. */
+static float plutovg_glyph_outline(plutovg_font_face_t* face, plutovg_glyph_t* glyph, float size, float x, float y, int style, plutovg_path_traverse_func_t traverse_func, void* closure)
 {
     float scale = plutovg_font_face_get_scale(face, size);
+    float skew = (style & PLUTOVG_GLYPH_ITALIC) ? PLUTOVG_SYNTH_SKEW : 0.f;
+    plutovg_glyph_traverse(glyph, scale, x, y, skew, traverse_func, closure);
+    if(style & PLUTOVG_GLYPH_BOLD)
+        plutovg_glyph_traverse(glyph, scale, x + plutovg_synth_bold_offset(size), y, skew, traverse_func, closure);
+    return glyph->advance_width * scale;
+}
+
+float plutovg_font_face_traverse_glyph_path(plutovg_font_face_t* face, float size, float x, float y, plutovg_codepoint_t codepoint, plutovg_path_traverse_func_t traverse_func, void* closure)
+{
+    plutovg_glyph_t* glyph = plutovg_font_face_get_glyph(face, codepoint);
+    return plutovg_glyph_outline(face, glyph, size, x, y, plutovg_font_face_own_style(face), traverse_func, closure);
+}
+
+static void plutovg_glyph_traverse(const plutovg_glyph_t* glyph, float scale, float x, float y, float skew, plutovg_path_traverse_func_t traverse_func, void* closure)
+{
     plutovg_matrix_t matrix;
-    plutovg_matrix_init_translate(&matrix, x, y);
-    plutovg_matrix_scale(&matrix, scale, -scale);
+    plutovg_matrix_init(&matrix, scale, 0, skew * scale, -scale, x, y);
 
     plutovg_point_t points[3];
     plutovg_point_t current_point = {0, 0};
-    plutovg_glyph_t* glyph = plutovg_font_face_get_glyph(face, codepoint);
     for(int i = 0; i < glyph->nvertices; i++) {
         switch(glyph->vertices[i].type) {
         case STBTT_vmove:
@@ -482,17 +582,18 @@ float plutovg_font_face_traverse_glyph_path(plutovg_font_face_t* face, float siz
             assert(false);
         }
     }
-
-    return glyph->advance_width * scale;
 }
 
 /* cctext patch 0005: the face that draws `codepoint` for `face`: face itself
  * when it has the glyph, else the first fallback face that has it, else face
- * (its .notdef box). */
-static plutovg_font_face_t* plutovg_font_face_resolve(plutovg_font_face_t* face, plutovg_codepoint_t codepoint, plutovg_glyph_t** out)
+ * (its .notdef box). `style` gets the synthetic style the glyph needs: what
+ * `face` wants (its own style, real or synthetic) that the drawing face
+ * lacks. */
+static plutovg_font_face_t* plutovg_font_face_resolve(plutovg_font_face_t* face, plutovg_codepoint_t codepoint, plutovg_glyph_t** out, int* style)
 {
     plutovg_glyph_t* glyph = plutovg_font_face_get_glyph(face, codepoint);
     *out = glyph;
+    *style = plutovg_font_face_own_style(face);
     if(glyph->index != 0 || codepoint < 0x20 || fallback_count == 0)
         return face;
     for(int i = 0; i < fallback_count; i++) {
@@ -501,15 +602,18 @@ static plutovg_font_face_t* plutovg_font_face_resolve(plutovg_font_face_t* face,
             continue;
         plutovg_glyph_t* g = plutovg_font_face_get_glyph(fallback, codepoint);
         if(g->index != 0) {
+            bool want_bold = face->bold || face->synth_bold;
+            bool want_italic = face->italic || face->synth_italic;
             *out = g;
+            *style = (want_bold && !fallback->bold ? PLUTOVG_GLYPH_BOLD : 0) | (want_italic && !fallback->italic ? PLUTOVG_GLYPH_ITALIC : 0);
             return fallback;
         }
     }
     return face;
 }
 
-/* cctext patch 0004: kerning (the font's GPOS pair adjustments or its kern
- * table, through stb_truetype) between two glyphs of one face, font units. */
+/* Kerning (the font's GPOS pair adjustments or its kern table, through
+ * stb_truetype) between two glyphs of one face, in font units. */
 static int plutovg_font_face_kerning(plutovg_font_face_t* face, int glyph1, int glyph2)
 {
     if(glyph1 <= 0 || glyph2 <= 0 || (!face->info.gpos && !face->info.kern))
@@ -517,11 +621,11 @@ static int plutovg_font_face_kerning(plutovg_font_face_t* face, int glyph1, int 
     return stbtt_GetGlyphKernAdvance(&face->info, glyph1, glyph2);
 }
 
-typedef void (*plutovg_glyph_func_t)(void* closure, plutovg_font_face_t* face, plutovg_codepoint_t codepoint, plutovg_glyph_t* glyph, float x);
+typedef void (*plutovg_glyph_func_t)(void* closure, plutovg_font_face_t* face, plutovg_glyph_t* glyph, int style, float x, float advance);
 
-/* Lay out text: each glyph's face (fallback) and pen x, kerned against the
- * previous glyph when one face draws both; func is called per glyph.
- * Returns the total advance. */
+/* Lay out text: resolve each glyph (fallback), add kerning between glyphs
+ * drawn by the same face; call func per glyph at its pen x. Returns the
+ * total advance. */
 static float plutovg_font_face_layout(plutovg_font_face_t* face, float size, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_glyph_func_t func, void* closure)
 {
     plutovg_text_iterator_t it;
@@ -532,13 +636,15 @@ static float plutovg_font_face_layout(plutovg_font_face_t* face, float size, con
     while(plutovg_text_iterator_has_next(&it)) {
         plutovg_codepoint_t codepoint = plutovg_text_iterator_next(&it);
         plutovg_glyph_t* glyph;
-        plutovg_font_face_t* used = plutovg_font_face_resolve(face, codepoint, &glyph);
+        int style;
+        plutovg_font_face_t* used = plutovg_font_face_resolve(face, codepoint, &glyph, &style);
         float scale = plutovg_font_face_get_scale(used, size);
         if(last_face && last_face->base == used->base)
             x += plutovg_font_face_kerning(used, last_index, glyph->index) * scale;
+        float advance = glyph->advance_width * scale;
         if(func)
-            func(closure, used, codepoint, glyph, x);
-        x += glyph->advance_width * scale;
+            func(closure, used, glyph, style, x, advance);
+        x += advance;
         last_face = used;
         last_index = glyph->index;
     }
@@ -549,25 +655,26 @@ typedef struct {
     float size;
     float x;
     float y;
+    bool synthetic;
     plutovg_path_traverse_func_t traverse_func;
     void* closure;
 } plutovg_text_path_closure_t;
 
-static void plutovg_text_path_glyph(void* closure, plutovg_font_face_t* face, plutovg_codepoint_t codepoint, plutovg_glyph_t* glyph, float x)
+static void plutovg_text_path_glyph(void* closure, plutovg_font_face_t* face, plutovg_glyph_t* glyph, int style, float x, float advance)
 {
     plutovg_text_path_closure_t* c = closure;
-    plutovg_font_face_traverse_glyph_path(face, c->size, c->x + x, c->y, codepoint, c->traverse_func, c->closure);
+    plutovg_glyph_outline(face, glyph, c->size, c->x + x, c->y, c->synthetic ? style : (style & PLUTOVG_GLYPH_ITALIC), c->traverse_func, c->closure);
 }
 
-float plutovg_font_face_traverse_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_path_traverse_func_t traverse_func, void* closure)
+float plutovg_font_face_traverse_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, bool embolden, plutovg_path_traverse_func_t traverse_func, void* closure)
 {
-    plutovg_text_path_closure_t c = {size, x, y, traverse_func, closure};
+    plutovg_text_path_closure_t c = {size, x, y, embolden, traverse_func, closure};
     return plutovg_font_face_layout(face, size, text, length, encoding, plutovg_text_path_glyph, &c);
 }
 
-float plutovg_font_face_get_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_path_t* path)
+float plutovg_font_face_get_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, bool embolden, plutovg_path_t* path)
 {
-    return plutovg_font_face_traverse_text_path(face, size, x, y, text, length, encoding, glyph_traverse_func, path);
+    return plutovg_font_face_traverse_text_path(face, size, x, y, text, length, encoding, embolden, glyph_traverse_func, path);
 }
 
 typedef struct {
@@ -576,7 +683,7 @@ typedef struct {
     bool have;
 } plutovg_text_extents_closure_t;
 
-static void plutovg_text_extents_glyph(void* closure, plutovg_font_face_t* face, plutovg_codepoint_t codepoint, plutovg_glyph_t* glyph, float x)
+static void plutovg_text_extents_glyph(void* closure, plutovg_font_face_t* face, plutovg_glyph_t* glyph, int style, float x, float advance)
 {
     plutovg_text_extents_closure_t* c = closure;
     float scale = plutovg_font_face_get_scale(face, c->size);
@@ -585,6 +692,14 @@ static void plutovg_text_extents_glyph(void* closure, plutovg_font_face_t* face,
     g.y = glyph->y2 * -scale;
     g.w = (glyph->x2 - glyph->x1) * scale;
     g.h = (glyph->y1 - glyph->y2) * -scale;
+    if(style & PLUTOVG_GLYPH_BOLD)
+        g.w += plutovg_synth_bold_offset(c->size);
+    if(style & PLUTOVG_GLYPH_ITALIC) {
+        /* the slant moves the top right and the bottom left */
+        float top = -g.y, bottom = -(g.y + g.h);
+        g.x += plutovg_min(0.f, bottom * PLUTOVG_SYNTH_SKEW);
+        g.w += (top - plutovg_min(0.f, bottom)) * PLUTOVG_SYNTH_SKEW;
+    }
     if(!c->have) {
         *c->extents = g;
         c->have = true;
@@ -602,6 +717,7 @@ static void plutovg_text_extents_glyph(void* closure, plutovg_font_face_t* face,
 
 float plutovg_font_face_text_extents(plutovg_font_face_t* face, float size, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_rect_t* extents)
 {
+    /* cctext patch 0004: per-glyph fallback and kerning. */
     plutovg_text_extents_closure_t c = {size, extents, false};
     float advance = plutovg_font_face_layout(face, size, text, length, encoding, extents ? plutovg_text_extents_glyph : NULL, &c);
     if(extents && !c.have) {
@@ -726,6 +842,11 @@ void plutovg_font_face_cache_add(plutovg_font_face_cache_t* cache, const char* f
     entry->ttcindex = 0;
     entry->bold = bold;
     entry->italic = italic;
+    /* cctext patch 0006: the registration names the face's style. */
+    if(bold)
+        face->bold = true;
+    if(italic)
+        face->italic = true;
 
     plutovg_font_face_cache_add_entry(cache, entry);
 }
@@ -787,6 +908,10 @@ plutovg_font_face_t* plutovg_font_face_cache_get(plutovg_font_face_cache_t* cach
         if(selected->filename && selected->face == NULL)
             selected->face = plutovg_font_face_load_from_file(selected->filename, selected->ttcindex);
         face = selected->face;
+        /* cctext patch 0006: a family without the bold / italic face asked
+         * for gets a synthetic one (emboldened, slanted). */
+        if(face && ((bold && !selected->bold) || (italic && !selected->italic)))
+            face = plutovg_font_face_variant(face, bold && !selected->bold, italic && !selected->italic);
     }
 
     plutovg_mutex_unlock(&cache->mutex);

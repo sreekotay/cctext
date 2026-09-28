@@ -561,6 +561,159 @@ static void test_disk_cache(void) {
     free(svg);
 }
 
+/* ---- text styles and filters --------------------------------------------- */
+
+/* Ink (sum of alpha) of an SVG rendered at w x h; -1 on failure. */
+static double ink_of(const char *svg, uint32_t w, uint32_t h, uint8_t **keep) {
+    RtxSvgCfg c;
+    uint8_t *px = NULL;
+    double ink = 0;
+    size_t i;
+    cfg_default(&c);
+    if (rtx_svg_render((const uint8_t *)svg, strlen(svg), &c, w, h, NULL, &px) != RTX_SVG_OK || !px) return -1;
+    for (i = 0; i < (size_t)w * h; i++) ink += px[i * 4 + 3];
+    if (keep) *keep = px;
+    else free(px);
+    return ink;
+}
+
+static size_t px_differ(const uint8_t *a, const uint8_t *b, size_t npx) {
+    size_t i, n = 0;
+    for (i = 0; i < npx; i++) {
+        int d = (int)a[i * 4 + 3] - (int)b[i * 4 + 3];
+        if (d < 0) d = -d;
+        if (d > 64) n++;
+    }
+    return n;
+}
+
+static void test_text_and_filters(void) {
+    char svg[1024], msg[200];
+    uint8_t *reg = NULL, *bold = NULL, *ital = NULL, *a = NULL, *b = NULL;
+    double ir, ib, ii, t0;
+    static const char *const fmt =
+        "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='48'><text x='4' y='34' "
+        "font-size='28' font-family='%s' %s>Hamburg</text></svg>";
+    const char *fam[] = {"serif", "monospace"};
+    int f;
+    rtx_svg_forget_memory();
+    /* Synthetic bold / italic: Noto Serif and Noto Sans Mono have no bold or
+     * italic face (plutovg patch 0006 overstrikes and slants the regular). */
+    for (f = 0; f < 2; f++) {
+        snprintf(svg, sizeof svg, fmt, fam[f], "");
+        ir = ink_of(svg, 240, 48, &reg);
+        snprintf(svg, sizeof svg, fmt, fam[f], "font-weight='bold'");
+        ib = ink_of(svg, 240, 48, &bold);
+        snprintf(svg, sizeof svg, fmt, fam[f], "font-style='italic'");
+        ii = ink_of(svg, 240, 48, &ital);
+        snprintf(msg, sizeof msg, "styles %s: bold has more ink (%.0f vs %.0f)", fam[f], ib, ir);
+        expect(ir > 0 && ib > ir * 1.12, msg);
+        if (reg && ital) {
+            size_t d = px_differ(reg, ital, 240 * 48);
+            snprintf(msg, sizeof msg, "styles %s: italic is slanted (%zu px differ, ink %.0f vs %.0f)", fam[f], d,
+                     ii, ir);
+            expect(d > 300 && ii > ir * 0.9 && ii < ir * 1.1, msg);
+        }
+        free(reg);
+        free(bold);
+        free(ital);
+        reg = bold = ital = NULL;
+    }
+    /* Kerning: "AVAVAVAV" is narrower than the same letters apart. */
+    {
+        static const char k1[] = "<svg xmlns='http://www.w3.org/2000/svg' width='260' height='40'><text x='0' "
+                                 "y='30' font-size='28' font-family='sans-serif'>AVAVAVAV|</text></svg>";
+        static const char k2[] = "<svg xmlns='http://www.w3.org/2000/svg' width='260' height='40'><text x='0' "
+                                 "y='30' font-size='28' font-family='sans-serif' letter-spacing='0.001'>"
+                                 "AVAVAVAV|</text></svg>";
+        uint8_t *p1 = NULL, *p2 = NULL;
+        int x, y, r1 = -1, r2 = -1;
+        (void)ink_of(k1, 260, 40, &p1);
+        (void)ink_of(k2, 260, 40, &p2);
+        for (y = 0; p1 && p2 && y < 40; y++) {
+            for (x = 0; x < 260; x++) {
+                if (p1[(y * 260 + x) * 4 + 3] > 128 && x > r1) r1 = x;
+                if (p2[(y * 260 + x) * 4 + 3] > 128 && x > r2) r2 = x;
+            }
+        }
+        /* letter-spacing splits the run into one fragment per glyph: no kerning */
+        snprintf(msg, sizeof msg, "kerning: the kerned run ends %d px before the unkerned one", r2 - r1);
+        expect(r1 > 0 && r2 - r1 >= 8, msg);
+        free(p1);
+        free(p2);
+    }
+    /* Filters draw: a blurred square has soft edges, a drop shadow ink
+     * outside its shape; hostile chains stay bounded. */
+    {
+        static const char plain[] = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'>"
+                                    "<rect x='30' y='30' width='40' height='40'/></svg>";
+        static const char shadow[] = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'>"
+                                     "<filter id='s'><feDropShadow dx='6' dy='6' stdDeviation='2'/></filter>"
+                                     "<rect x='30' y='30' width='40' height='40' filter='url(#s)'/></svg>";
+        static const char blur[] = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'>"
+                                   "<filter id='b'><feGaussianBlur stdDeviation='5'/></filter>"
+                                   "<rect x='30' y='30' width='40' height='40' filter='url(#b)'/></svg>";
+        double ip = ink_of(plain, 100, 100, &a), is = ink_of(shadow, 100, 100, NULL);
+        int soft = 0, i;
+        (void)ink_of(blur, 100, 100, &b);
+        snprintf(msg, sizeof msg, "filters: a drop shadow adds ink (%.0f vs %.0f)", is, ip);
+        expect(ip > 0 && is > ip * 1.1, msg);
+        for (i = 0; b && i < 100; i++) {
+            int al = b[(50 * 100 + i) * 4 + 3];
+            if (al > 20 && al < 235) soft++;
+        }
+        snprintf(msg, sizeof msg, "filters: a blur has soft edges (%d partial px on a row)", soft);
+        expect(soft >= 10, msg);
+        free(a);
+        free(b);
+        a = b = NULL;
+    }
+    {
+        static const char *const hostile[] = {
+            /* huge deviation, huge region, huge offsets */
+            "<svg xmlns='http://www.w3.org/2000/svg' width='800' height='600'><filter id='f' "
+            "filterUnits='userSpaceOnUse' x='-1e9' y='-1e9' width='2e9' height='2e9'><feGaussianBlur "
+            "stdDeviation='1e30'/><feOffset dx='1e38'/></filter><rect width='1e6' height='1e6' filter='url(#f)'/></svg>",
+            /* 500 primitives */
+            NULL,
+            /* href cycle and a filter referencing itself from its content */
+            "<svg xmlns='http://www.w3.org/2000/svg' width='800' height='600'><filter id='a' href='#b'/><filter "
+            "id='b' href='#a'><feFlood filter='url(#b)'/></filter><g filter='url(#a)'><rect width='9' height='9' "
+            "filter='url(#b)'/></g></svg>",
+            /* zero and negative regions */
+            "<svg xmlns='http://www.w3.org/2000/svg' width='800' height='600'><filter id='z' width='0' "
+            "height='-4'><feFlood/></filter><rect width='50' height='50' filter='url(#z)'/><line x2='50' "
+            "filter='url(#z)'/></svg>",
+        };
+        RtxSvgCfg c;
+        char *many = (char *)malloc(1 << 16);
+        size_t k = 0;
+        int i, j, rc;
+        uint8_t *px = NULL;
+        cfg_default(&c);
+        k += (size_t)snprintf(many + k, (1 << 16) - k, "<svg xmlns='http://www.w3.org/2000/svg' width='800' "
+                              "height='600'><filter id='m'>");
+        for (j = 0; j < 500; j++)
+            k += (size_t)snprintf(many + k, (1 << 16) - k, "<feGaussianBlur stdDeviation='%d'/>", j % 9);
+        k += (size_t)snprintf(many + k, (1 << 16) - k, "</filter><rect width='800' height='600' filter='url(#m)'/>");
+        for (j = 0; j < 20; j++) k += (size_t)snprintf(many + k, (1 << 16) - k, "<g filter='url(#m)'>");
+        k += (size_t)snprintf(many + k, (1 << 16) - k, "<rect width='700' height='500'/>");
+        for (j = 0; j < 20; j++) k += (size_t)snprintf(many + k, (1 << 16) - k, "</g>");
+        k += (size_t)snprintf(many + k, (1 << 16) - k, "</svg>");
+        for (i = 0; i < 4; i++) {
+            const char *d = hostile[i] ? hostile[i] : many;
+            t0 = now_ms();
+            rc = rtx_svg_render((const uint8_t *)d, strlen(d), &c, 800, 600, NULL, &px);
+            snprintf(msg, sizeof msg, "filters: hostile chain %d renders in %.0f ms", i, now_ms() - t0);
+            expect(rc == RTX_SVG_OK && now_ms() - t0 < 4000, msg);
+            printf("svg_smoke: %s\n", msg);
+            free(px);
+            px = NULL;
+        }
+        free(many);
+    }
+}
+
 static void test_hostile(void) {
     RtxSvgCfg c;
     float w = 0, h = 0;
@@ -646,7 +799,8 @@ static void test_hostile(void) {
 static void test_refs(void) {
     static const char *names[] = {"drawio-pipeline", "drawio-shadow",      "features",
                                   "matplotlib-lines", "matplotlib-scatter", "mermaid-flow",
-                                  "mermaid-pie",      "mermaid-seq",        NULL};
+                                  "mermaid-pie",      "mermaid-seq",        "text-styles",
+                                  NULL};
     int i;
     RtxImgLimits lim;
     rtx_img_limits_default(&lim);
@@ -885,6 +1039,7 @@ int main(void) {
     test_client();
     test_disk_cache();
     test_hostile();
+    test_text_and_filters();
     test_refs();
     test_cache_and_layout();
     rtx_svg_shutdown();
