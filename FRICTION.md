@@ -153,3 +153,10 @@ loop of `replace` (that is n undo steps and n scan joins). Past
 patches the last record's caret sees one record, not k. A bulk build
 reads the tree and stages add bytes past `add_len`; it must not publish
 (`commit_add`) or touch nodes before its commit joins find.
+
+Two trees building at once (agent worktrees, a gate copy beside the
+main checkout) share ccc's script cache `/tmp/cc-script-<uid>`: one
+tree can pick up the other's compiled build script, which shows up as
+intermittent "unknown type" or garbled generated-header errors that
+vanish on a rerun. Build one tree at a time, or give each its own
+`TMPDIR`, before chasing such an error as a real one.

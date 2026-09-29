@@ -1,0 +1,2700 @@
+cctext patch 0006: filter effects.
+
+lunasvg 3.5.0 ignores <filter> and the filter property: a draw.io "Shadow",
+a Mermaid 12 node shadow (feDropShadow) or a CSS drop-shadow() drew flat,
+and a blurred or recoloured element drew unfiltered. resvg's test suite:
+82 of 398 filter tests "passed" (their expected output happens to be
+unfiltered); 257 now.
+
+New files source/svgfilterelement.{h,cpp}:
+- <filter> (x / y / width / height, filterUnits, primitiveUnits,
+  xlink:href inheritance of attributes and primitives, cycles ignored) and
+  the primitives feGaussianBlur (three box blurs as the spec describes, a
+  true Gaussian kernel below d = 2), feOffset, feFlood, feMerge,
+  feComposite (over / in / out / atop / xor / arithmetic / lighter),
+  feColorMatrix, feBlend (all separable and non-separable modes),
+  feComponentTransfer and feDropShadow; the other primitives (feImage,
+  feTile, feTurbulence, feMorphology, lighting, feConvolveMatrix,
+  feDisplacementMap) pass their input through.
+- in / in2 / result (SourceGraphic, SourceAlpha; BackgroundImage,
+  FillPaint and StrokePaint read as the source, as resvg does), primitive
+  subregions, color-interpolation-filters (linearRGB by default, sRGB),
+  flood-color / flood-opacity (with explicit inherit).
+- CSS filter functions: blur(), drop-shadow(), grayscale(), sepia(),
+  saturate(), hue-rotate(), invert(), opacity(), brightness(), contrast()
+  and url() in a list.
+- A filter runs on the element's offscreen canvas in device pixels
+  (deviations and offsets scaled by the current transform).
+- Its canvas is the filter region cut to what the filter can bring into
+  view: the parent canvas grown by the filter's reach (3 deviations per
+  blur plus every offset). Blurs touch only the painted pixels grown by
+  their reach, and run their vertical pass on a transposed copy.
+- Bounded by lunasvg_set_filter_limits() (include/lunasvg.h): the filter
+  region in device pixels (larger: drawn unfiltered), the blur deviation
+  (clamped), primitives per filter (the rest ignored), the bytes of live
+  intermediate images, and one render's filter work (primitives x region
+  pixels, blurs weighted; Document::render resets it): past the last two
+  the element draws unfiltered. Every buffer is a checked malloc;
+  coordinates are clamped before float -> int.
+
+Changes elsewhere: the element ids, attribute and CSS property names
+(svgelement / svgproperty), the filter / flood / color-interpolation-
+filters properties (svglayoutstate), SVGBlendInfo and begin/endGroup
+(svgrenderstate: the filter runs before clip-path, mask and opacity), a
+filtered element's paint box is its filter region and a container's
+includes its filtered descendants', an invalid filter reference draws
+nothing (Filter Effects 1), and paintBoundingBox's assertion on a
+non-finite box became "empty" (it fired on fuzzed coordinates once
+descendants' boxes were asked).
+
+Known gaps: a rotated or skewed element's filter runs along the device
+axes (resvg's complex-transform tests); feImage, feTile, feTurbulence,
+feMorphology, the lighting filters, feConvolveMatrix and
+feDisplacementMap are not implemented.
+
+Apply after 0005.
+
+--- a/include/lunasvg.h
++++ b/include/lunasvg.h
+@@ -124,6 +124,18 @@
+ * @param closure User-defined pointer passed to the `destroy_func` callback.
+ * @return `true` if the font face was successfully added to the cache, `false` otherwise.
+ */
++/**
++ * @brief cctext patch: bounds on filter effects (0 keeps a value).
++ *
++ * @param max_region_pixels a filter region (device pixels) over this draws unfiltered
++ * @param max_blur_px blur standard deviations are clamped to this (device pixels)
++ * @param max_primitives primitives past this many in one filter are ignored
++ * @param max_bytes live intermediate images past this draw the element unfiltered
++ * @param max_work_pixels one render's filter work (primitives x region pixels);
++ *        past it the remaining filtered elements draw unfiltered
++ */
++LUNASVG_API void lunasvg_set_filter_limits(double max_region_pixels, float max_blur_px, int max_primitives, size_t max_bytes, double max_work_pixels);
++
+ LUNASVG_API bool lunasvg_add_font_face_from_data(const char* family, bool bold, bool italic, const void* data, size_t length, lunasvg_destroy_func_t destroy_func, void* closure);
+ 
+ #ifdef __cplusplus
+--- a/source/lunasvg.cpp
++++ b/source/lunasvg.cpp
+@@ -1,4 +1,5 @@
+ #include "lunasvg.h"
++#include "svgfilterelement.h"
+ #include "svgelement.h"
+ #include "svgrenderstate.h"
+ 
+@@ -477,6 +478,7 @@
+         return;
+     auto canvas = Canvas::create(bitmap);
+     SVGRenderState state(nullptr, nullptr, matrix, SVGRenderMode::Painting, canvas);
++    resetFilterWork();  // cctext patch 0006: each render has its own filter budget
+     rootElement(true)->render(state);
+ }
+ 
+--- a/source/svgelement.cpp
++++ b/source/svgelement.cpp
+@@ -5,6 +5,7 @@
+ #include "svgproperty.h"
+ #include "svglayoutstate.h"
+ #include "svgrenderstate.h"
++#include "svgfilterelement.h"
+ 
+ #include <cassert>
+ 
+@@ -21,6 +22,29 @@
+         {"clipPath", ElementID::ClipPath},
+         {"defs", ElementID::Defs},
+         {"ellipse", ElementID::Ellipse},
++        {"feBlend", ElementID::FeBlend},
++        {"feColorMatrix", ElementID::FeColorMatrix},
++        {"feComponentTransfer", ElementID::FeComponentTransfer},
++        {"feComposite", ElementID::FeComposite},
++        {"feConvolveMatrix", ElementID::FeUnsupported},
++        {"feDiffuseLighting", ElementID::FeUnsupported},
++        {"feDisplacementMap", ElementID::FeUnsupported},
++        {"feDropShadow", ElementID::FeDropShadow},
++        {"feFlood", ElementID::FeFlood},
++        {"feFuncA", ElementID::FeFuncA},
++        {"feFuncB", ElementID::FeFuncB},
++        {"feFuncG", ElementID::FeFuncG},
++        {"feFuncR", ElementID::FeFuncR},
++        {"feGaussianBlur", ElementID::FeGaussianBlur},
++        {"feImage", ElementID::FeUnsupported},
++        {"feMerge", ElementID::FeMerge},
++        {"feMergeNode", ElementID::FeMergeNode},
++        {"feMorphology", ElementID::FeUnsupported},
++        {"feOffset", ElementID::FeOffset},
++        {"feSpecularLighting", ElementID::FeUnsupported},
++        {"feTile", ElementID::FeUnsupported},
++        {"feTurbulence", ElementID::FeUnsupported},
++        {"filter", ElementID::Filter},
+         {"g", ElementID::G},
+         {"image", ElementID::Image},
+         {"line", ElementID::Line},
+@@ -116,6 +140,24 @@
+         return std::make_unique<SVGTextElement>(document);
+     case ElementID::Tspan:
+         return std::make_unique<SVGTSpanElement>(document);
++    case ElementID::Filter:
++        return std::make_unique<SVGFilterElement>(document);
++    case ElementID::FeBlend:
++    case ElementID::FeColorMatrix:
++    case ElementID::FeComponentTransfer:
++    case ElementID::FeComposite:
++    case ElementID::FeDropShadow:
++    case ElementID::FeFlood:
++    case ElementID::FeFuncA:
++    case ElementID::FeFuncB:
++    case ElementID::FeFuncG:
++    case ElementID::FeFuncR:
++    case ElementID::FeGaussianBlur:
++    case ElementID::FeMerge:
++    case ElementID::FeMergeNode:
++    case ElementID::FeOffset:
++    case ElementID::FeUnsupported:
++        return std::make_unique<SVGFilterPrimitiveElement>(document, id);
+     default:
+         assert(false);
+     }
+@@ -320,9 +362,39 @@
+         return m_paintBoundingBox;
+     m_paintBoundingBox = Rect::Empty;
+     m_paintBoundingBox = strokeBoundingBox();
+-    assert(m_paintBoundingBox.isValid());
++    // cctext patch: a non-finite box (huge or NaN coordinates) is empty; the
++    // assertion fired once paint boxes of filtered descendants were asked.
++    if(!m_paintBoundingBox.isValid())
++        m_paintBoundingBox = Rect::Empty;
++    // cctext patch: a filter paints its whole filter region (clipped and
++    // masked below: the filter applies first); an invalid filter nothing.
++    // A container also covers its filtered descendants' regions.
++    if(m_invalidFilter) {
++        m_paintBoundingBox = Rect::Empty;
++        return m_paintBoundingBox;
++    }
++    if(m_filter)
++        m_paintBoundingBox = m_filter->filterRegion(this);
++    else if(!m_filterFunctions.empty())
++        m_paintBoundingBox = filterFunctionsRegion(this, m_paintBoundingBox);
++    else if(rootElement()->hasFilters()) {
++        for(const auto& child : m_children) {
++            if(auto element = toSVGElement(child); element && !element->isHiddenElement() && element->isGraphicsElement()) {
++                auto box = element->paintBoundingBox();
++                if(box.isEmpty())
++                    continue;
++                box = element->localTransform().mapRect(box);
++                if(m_paintBoundingBox.isEmpty())
++                    m_paintBoundingBox = box;
++                else
++                    m_paintBoundingBox.unite(box);
++            }
++        }
++    }
+     if(m_clipper) m_paintBoundingBox.intersect(m_clipper->clipBoundingBox(this));
+     if(m_masker) m_paintBoundingBox.intersect(m_masker->maskBoundingBox(this));
++    if(!m_paintBoundingBox.isValid())
++        m_paintBoundingBox = Rect::Empty;
+     return m_paintBoundingBox;
+ }
+ 
+@@ -350,6 +422,14 @@
+     return nullptr;
+ }
+ 
++SVGFilterElement* SVGElement::getFilter(std::string_view id) const
++{
++    auto element = rootElement()->getElementById(id);
++    if(element && element->id() == ElementID::Filter)
++        return static_cast<SVGFilterElement*>(element);
++    return nullptr;
++}
++
+ SVGPaintElement* SVGElement::getPainter(std::string_view id) const
+ {
+     auto element = rootElement()->getElementById(id);
+@@ -465,6 +545,21 @@
+     m_clipper = getClipper(state.clip_path());
+     m_masker = getMasker(state.mask());
+     m_opacity = state.opacity();
++    m_filter = nullptr;
++    m_invalidFilter = false;
++    m_filterFunctions.clear();
++    if(state.has_filter()) {
++        const auto& value = state.filter();
++        if(!value.empty() && value.front() == '#') {
++            m_filter = getFilter(std::string_view(value).substr(1));
++            m_invalidFilter = m_filter == nullptr;
++        } else if(parseFilterFunctions(value, nullptr)) {
++            // CSS filter functions; an invalid list is ignored.
++            m_filterFunctions = value;
++            m_filterColor = state.color();
++        }
++        rootElement()->setHasFilters();
++    }
+ 
+     m_font_size = state.font_size();
+     m_display = state.display();
+@@ -518,7 +613,8 @@
+     case ElementID::Stop:
+         return true;
+     default:
+-        return false;
++        // cctext patch: <filter> and its primitives never draw.
++        return m_id >= ElementID::Filter;
+     }
+ }
+ 
+--- a/source/svgelement.h
++++ b/source/svgelement.h
+@@ -106,7 +106,24 @@
+     Symbol,
+     Text,
+     Tspan,
+-    Use
++    Use,
++    // cctext patch: filter effects (svgfilterelement.h).
++    Filter,
++    FeBlend,
++    FeColorMatrix,
++    FeComponentTransfer,
++    FeComposite,
++    FeDropShadow,
++    FeFlood,
++    FeFuncA,
++    FeFuncB,
++    FeFuncG,
++    FeFuncR,
++    FeGaussianBlur,
++    FeMerge,
++    FeMergeNode,
++    FeOffset,
++    FeUnsupported
+ };
+ 
+ ElementID elementid(std::string_view name);
+@@ -118,6 +135,7 @@
+ class SVGClipPathElement;
+ class SVGMaskElement;
+ class SVGPaintElement;
++class SVGFilterElement;
+ class SVGLayoutState;
+ class SVGRenderState;
+ 
+@@ -163,6 +181,7 @@
+     SVGMarkerElement* getMarker(std::string_view id) const;
+     SVGClipPathElement* getClipper(std::string_view id) const;
+     SVGMaskElement* getMasker(std::string_view id) const;
++    SVGFilterElement* getFilter(std::string_view id) const;
+     SVGPaintElement* getPainter(std::string_view id) const;
+ 
+     SVGElement* elementFromPoint(float x, float y);
+@@ -196,6 +215,12 @@
+ 
+     const SVGClipPathElement* clipper() const { return m_clipper; }
+     const SVGMaskElement* masker() const { return m_masker; }
++    const SVGFilterElement* filter() const { return m_filter; }
++    // cctext patch: a filter property that names no <filter> (or a filter
++    // whose region is empty): the element is not rendered (Filter Effects 1).
++    bool hasInvalidFilter() const { return m_invalidFilter; }
++    const std::string& filterFunctions() const { return m_filterFunctions; }
++    const Color& filterColor() const { return m_filterColor; }
+     float opacity() const { return m_opacity; }
+ 
+     bool isElement() const final { return true; }
+@@ -204,6 +229,10 @@
+     mutable Rect m_paintBoundingBox = Rect::Invalid;
+     const SVGClipPathElement* m_clipper = nullptr;
+     const SVGMaskElement* m_masker = nullptr;
++    const SVGFilterElement* m_filter = nullptr;
++    bool m_invalidFilter = false;
++    std::string m_filterFunctions;
++    Color m_filterColor = Color::Black;
+     float m_opacity = 1.f;
+ 
+     float m_font_size = 12.f;
+@@ -347,6 +376,11 @@
+ 
+     SVGRootElement* layoutIfNeeded();
+ 
++    // cctext patch: some element has a filter property (paint bounding
++    // boxes then include filtered descendants).
++    bool hasFilters() const { return m_hasFilters; }
++    void setHasFilters() { m_hasFilters = true; }
++
+     SVGElement* getElementById(std::string_view id) const;
+     void addElementById(const std::string& id, SVGElement* element);
+     void layout(SVGLayoutState& state) final;
+@@ -355,6 +389,7 @@
+ 
+ private:
+     std::map<std::string, SVGElement*, std::less<>> m_idCache;
++    bool m_hasFilters = false;
+     float m_intrinsicWidth{-1.f};
+     float m_intrinsicHeight{-1.f};
+ };
+--- /dev/null
++++ b/source/svgfilterelement.cpp
+@@ -0,0 +1,1990 @@
++// cctext patch (0006-filters.patch): filter effects. See svgfilterelement.h.
++#include "svgfilterelement.h"
++#include "svglayoutstate.h"
++#include "svgparserutils.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <memory>
++#include <new>
++#include <vector>
++
++namespace lunasvg {
++
++namespace {
++
++// lunasvg_set_filter_limits(); defaults sized for the helper's own ceilings.
++struct FilterLimits {
++    double maxPixels = double(16 << 20);  // filter region, device px
++    float maxBlur = 512.f;                // stdDeviation, device px
++    int maxPrimitives = 64;               // per <filter> (or function list)
++    size_t maxBytes = size_t(512) << 20;  // live intermediate images
++    double maxWork = double(64 << 20);    // weighted primitive x region px per render
++};
++
++FilterLimits g_limits;
++size_t g_liveBytes = 0;
++double g_work = 0.0;  // since the last resetFilterWork()
++
++// Charge one primitive over `region`; false once the render's budget is spent
++// (the rest of its filtered elements draw unfiltered).
++bool chargeWork(int w, int h, int weight = 1)
++{
++    g_work += double(std::max(w, 0)) * double(std::max(h, 0)) * weight;
++    return g_work <= g_limits.maxWork;
++}
++
++// Relative cost (passes over the region, colour conversions included).
++int workWeight(ElementID id)
++{
++    return id == ElementID::FeGaussianBlur ? 4 : id == ElementID::FeDropShadow ? 8 : 2;
++}
++
++constexpr float kMaxCoord = float(1 << 24);
++constexpr float kPi = 3.14159265358979323846f;
++
++inline int clampToInt(double v)
++{
++    if(!(v == v))
++        return 0;
++    if(v < -kMaxCoord)
++        return -int(kMaxCoord);
++    if(v > kMaxCoord)
++        return int(kMaxCoord);
++    return int(v);
++}
++
++inline float finiteOr(float v, float fallback)
++{
++    return std::isfinite(v) ? v : fallback;
++}
++
++struct IRect {
++    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++    bool empty() const { return x1 <= x0 || y1 <= y0; }
++    IRect intersected(const IRect& o) const
++    {
++        IRect r{std::max(x0, o.x0), std::max(y0, o.y0), std::min(x1, o.x1), std::min(y1, o.y1)};
++        return r.empty() ? IRect() : r;
++    }
++    IRect united(const IRect& o) const
++    {
++        if(empty())
++            return o;
++        if(o.empty())
++            return *this;
++        return IRect{std::min(x0, o.x0), std::min(y0, o.y0), std::max(x1, o.x1), std::max(y1, o.y1)};
++    }
++};
++
++// A premultiplied ARGB32 image the size of the filter canvas; pixels outside
++// `sub` (its primitive subregion) are transparent.
++struct Image {
++    uint32_t* px = nullptr;
++    int w = 0;
++    int h = 0;
++    bool linear = false;
++    IRect sub;
++    Rect userSub;
++    size_t bytes = 0;
++    bool alphaOnly = false;  // colour channels all zero (SourceAlpha and its blurs)
++    ~Image()
++    {
++        std::free(px);
++        g_liveBytes -= bytes;
++    }
++};
++
++using ImageRef = std::shared_ptr<Image>;
++
++ImageRef newImage(int w, int h, bool linear, const IRect& sub, const Rect& userSub)
++{
++    size_t bytes = size_t(w) * size_t(h) * 4;
++    if(w <= 0 || h <= 0 || g_liveBytes + bytes > g_limits.maxBytes)
++        return nullptr;
++    auto px = static_cast<uint32_t*>(std::calloc(size_t(w) * size_t(h), 4));
++    if(!px)
++        return nullptr;
++    auto image = std::make_shared<Image>();
++    image->px = px;
++    image->w = w;
++    image->h = h;
++    image->linear = linear;
++    image->sub = sub;
++    image->userSub = userSub;
++    image->bytes = bytes;
++    g_liveBytes += bytes;
++    return image;
++}
++
++inline uint32_t pack(uint32_t a, uint32_t r, uint32_t g, uint32_t b)
++{
++    return a << 24 | r << 16 | g << 8 | b;
++}
++
++inline uint32_t premul(uint32_t c, uint32_t a)
++{
++    return (c * a + 127) / 255;
++}
++
++inline uint32_t unpremul(uint32_t c, uint32_t a)
++{
++    return a ? std::min<uint32_t>(255, (c * 255 + a / 2) / a) : 0;
++}
++
++inline uint32_t clamp255(float v)
++{
++    if(!(v > 0.f))
++        return 0;
++    if(v >= 255.f)
++        return 255;
++    return uint32_t(v + 0.5f);
++}
++
++struct ColorLuts {
++    uint8_t toLinear[256];
++    uint8_t toSRGB[256];
++    ColorLuts()
++    {
++        for(int i = 0; i < 256; i++) {
++            double c = i / 255.0;
++            double l = c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
++            toLinear[i] = uint8_t(std::lround(l * 255.0));
++            double s = c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055;
++            toSRGB[i] = uint8_t(std::lround(std::clamp(s, 0.0, 1.0) * 255.0));
++        }
++    }
++};
++
++const ColorLuts& luts()
++{
++    static const ColorLuts l;
++    return l;
++}
++
++Color convertColor(const Color& c, bool linear)
++{
++    if(!linear)
++        return c;
++    const auto& l = luts();
++    return Color(l.toLinear[c.red()], l.toLinear[c.green()], l.toLinear[c.blue()], c.alpha());
++}
++
++// The same image in the other color space (a copy), or `in` itself.
++ImageRef convert(const ImageRef& in, bool linear)
++{
++    if(!in || in->linear == linear)
++        return in;
++    auto out = newImage(in->w, in->h, linear, in->sub, in->userSub);
++    if(!out)
++        return nullptr;
++    if(in->alphaOnly) {
++        out->alphaOnly = true;
++        for(int y = in->sub.y0; y < in->sub.y1; y++)
++            std::memcpy(out->px + size_t(y) * in->w + in->sub.x0, in->px + size_t(y) * in->w + in->sub.x0, size_t(in->sub.x1 - in->sub.x0) * 4);
++        return out;
++    }
++    const uint8_t* lut = linear ? luts().toLinear : luts().toSRGB;
++    uint32_t last = 0, lastOut = 0;  // runs of one colour convert once
++    for(int y = in->sub.y0; y < in->sub.y1; y++) {
++        const uint32_t* s = in->px + size_t(y) * in->w;
++        uint32_t* d = out->px + size_t(y) * in->w;
++        for(int x = in->sub.x0; x < in->sub.x1; x++) {
++            uint32_t p = s[x];
++            uint32_t a = p >> 24;
++            if(a == 0)
++                continue;
++            if(p == last) {
++                d[x] = lastOut;
++                continue;
++            }
++            uint32_t q;
++            if(a == 255) {
++                q = pack(255, lut[(p >> 16) & 255], lut[(p >> 8) & 255], lut[p & 255]);
++            } else {
++                uint32_t r = lut[unpremul((p >> 16) & 255, a)];
++                uint32_t g = lut[unpremul((p >> 8) & 255, a)];
++                uint32_t b = lut[unpremul(p & 255, a)];
++                q = pack(a, premul(r, a), premul(g, a), premul(b, a));
++            }
++            d[x] = q;
++            last = p;
++            lastOut = q;
++        }
++    }
++    return out;
++}
++
++// ---- number parsing (attributes are read raw) ----
++
++bool parseNumberList(std::string_view input, std::vector<float>& out, size_t max = 4096)
++{
++    out.clear();
++    stripLeadingAndTrailingSpaces(input);
++    while(!input.empty()) {
++        float v;
++        if(!parseNumber(input, v) || !std::isfinite(v))
++            return false;
++        if(out.size() >= max)
++            return false;
++        out.push_back(v);
++        skipOptionalSpacesOrComma(input);
++    }
++    return true;
++}
++
++bool numberAttr(const SVGElement* e, PropertyID id, float& out)
++{
++    if(!e->hasAttribute(id))
++        return false;
++    std::string_view input(e->getAttribute(id));
++    stripLeadingAndTrailingSpaces(input);
++    float v;
++    if(!parseNumber(input, v) || !input.empty() || !std::isfinite(v))
++        return false;
++    out = v;
++    return true;
++}
++
++float numberAttr(const SVGElement* e, PropertyID id, float fallback, bool)
++{
++    float v = fallback;
++    numberAttr(e, id, v);
++    return v;
++}
++
++std::string_view stringAttr(const SVGElement* e, PropertyID id)
++{
++    std::string_view s(e->getAttribute(id));
++    stripLeadingAndTrailingSpaces(s);
++    return s;
++}
++
++// ---- the filter run ----
++
++struct Context {
++    const SVGElement* element;
++    Transform ctm;
++    int w;
++    int h;
++    float ox;  // canvas origin, device px
++    float oy;
++    IRect region;
++    Rect userRegion;
++    Rect bbox;
++    Units primitiveUnits = Units::UserSpaceOnUse;
++    float sx;  // |ctm| along x and y
++    float sy;
++    uint32_t* source;  // the canvas pixels (SourceGraphic)
++};
++
++IRect toPixels(const Context& ctx, const Rect& user)
++{
++    auto r = ctx.ctm.mapRect(user);
++    if(!r.isValid())
++        return IRect();
++    IRect ir{clampToInt(std::floor(r.x - ctx.ox)), clampToInt(std::floor(r.y - ctx.oy)),
++             clampToInt(std::ceil(r.x + r.w - ctx.ox)), clampToInt(std::ceil(r.y + r.h - ctx.oy))};
++    return ir.intersected(ctx.region);
++}
++
++// Horizontal / vertical length in primitive units -> user space.
++float primitiveLength(const Context& ctx, float v, LengthDirection dir)
++{
++    if(ctx.primitiveUnits == Units::ObjectBoundingBox) {
++        if(dir == LengthDirection::Horizontal)
++            return v * ctx.bbox.w;
++        return v * ctx.bbox.h;
++    }
++    return v;
++}
++
++// The primitive subregion (user space): x / y / width / height override the
++// default (the union of the inputs' subregions, or the filter region).
++Rect primitiveSubregion(const Context& ctx, const SVGFilterPrimitiveElement* p, const Rect& fallback)
++{
++    Rect r = fallback;
++    LengthContext lc(p, ctx.primitiveUnits);
++    bool obb = ctx.primitiveUnits == Units::ObjectBoundingBox;
++    // In objectBoundingBox units the missing values are 0, 0, 100%, 100% of
++    // the box (as resvg and Chromium do), not the default subregion's.
++    if(obb && (p->hasAttribute(PropertyID::X) || p->hasAttribute(PropertyID::Y) || p->hasAttribute(PropertyID::Width) || p->hasAttribute(PropertyID::Height)))
++        r = ctx.bbox;
++    if(p->hasAttribute(PropertyID::X)) {
++        float v = lc.valueForLength(p->x());
++        r.x = obb ? ctx.bbox.x + v * ctx.bbox.w : v;
++    }
++    if(p->hasAttribute(PropertyID::Y)) {
++        float v = lc.valueForLength(p->y());
++        r.y = obb ? ctx.bbox.y + v * ctx.bbox.h : v;
++    }
++    if(p->hasAttribute(PropertyID::Width)) {
++        float v = lc.valueForLength(p->width());
++        r.w = obb ? v * ctx.bbox.w : v;
++    }
++    if(p->hasAttribute(PropertyID::Height)) {
++        float v = lc.valueForLength(p->height());
++        r.h = obb ? v * ctx.bbox.h : v;
++    }
++    if(!std::isfinite(r.x) || !std::isfinite(r.y) || !std::isfinite(r.w) || !std::isfinite(r.h) || r.w <= 0.f || r.h <= 0.f)
++        return Rect::Empty;
++    return r.intersected(ctx.userRegion);
++}
++
++ImageRef copyImage(const ImageRef& in, const IRect& sub, const Rect& userSub)
++{
++    auto out = newImage(in->w, in->h, in->linear, sub, userSub);
++    if(!out)
++        return nullptr;
++    out->alphaOnly = in->alphaOnly;
++    auto r = sub.intersected(in->sub);
++    for(int y = r.y0; y < r.y1; y++)
++        std::memcpy(out->px + size_t(y) * in->w + r.x0, in->px + size_t(y) * in->w + r.x0, size_t(r.x1 - r.x0) * 4);
++    return out;
++}
++
++// ---- Gaussian blur ----
++
++// One line of `n` channel values at `stride` bytes: three box blurs (the
++// spec's approximation, d >= 2) or a true Gaussian kernel (small deviation).
++struct BlurLine {
++    std::vector<uint32_t> prefix;
++    std::vector<uint8_t> a;
++    std::vector<uint8_t> b;
++    std::vector<float> kernel;
++    int d = 0;
++    bool box = false;
++
++    void setup(float sigma)
++    {
++        d = int(std::floor(sigma * 3.f * std::sqrt(2.f * kPi) / 4.f + 0.5f));
++        box = d >= 2;
++        kernel.clear();
++        if(!box) {
++            int r = std::max(1, int(std::ceil(sigma * 3.f)));
++            float sum = 0.f;
++            for(int i = -r; i <= r; i++) {
++                float k = std::exp(-float(i * i) / (2.f * sigma * sigma));
++                kernel.push_back(k);
++                sum += k;
++            }
++            for(auto& k : kernel)
++                k /= sum;
++        }
++    }
++
++    // out[i] = mean(in[i - lo .. i + hi]) with zeros outside [0, n).
++    void boxPass(const uint8_t* in, uint8_t* out, int n, int lo, int hi)
++    {
++        prefix.resize(size_t(n) + 1);
++        prefix[0] = 0;
++        for(int i = 0; i < n; i++)
++            prefix[size_t(i) + 1] = prefix[size_t(i)] + in[i];
++        uint64_t size = uint64_t(lo) + uint64_t(hi) + 1;
++        uint64_t inv = (uint64_t(1) << 32) / size;
++        for(int i = 0; i < n; i++) {
++            int64_t l = std::max<int64_t>(0, int64_t(i) - lo);
++            int64_t r = std::min<int64_t>(n, int64_t(i) + hi + 1);
++            uint64_t s = l < r ? prefix[size_t(r)] - prefix[size_t(l)] : 0;
++            out[i] = uint8_t(std::min<uint64_t>(255, (s * inv + (uint64_t(1) << 31)) >> 32));
++        }
++    }
++
++    // How far (px) one run spreads a pixel.
++    int reach() const
++    {
++        return box ? 3 * (d / 2 + 1) : int(kernel.size() / 2) + 1;
++    }
++
++    void run(uint8_t* data, size_t stride, int n)
++    {
++        a.resize(size_t(n));
++        b.resize(size_t(n));
++        for(int i = 0; i < n; i++)
++            a[size_t(i)] = data[size_t(i) * stride];
++        if(box) {
++            if(d % 2 == 1) {
++                int r = (d - 1) / 2;
++                boxPass(a.data(), b.data(), n, r, r);
++                boxPass(b.data(), a.data(), n, r, r);
++                boxPass(a.data(), b.data(), n, r, r);
++            } else {
++                int r = d / 2;
++                boxPass(a.data(), b.data(), n, r, r - 1);
++                boxPass(b.data(), a.data(), n, r - 1, r);
++                boxPass(a.data(), b.data(), n, r, r);
++            }
++        } else {
++            int r = int(kernel.size() / 2);
++            for(int i = 0; i < n; i++) {
++                float s = 0.f;
++                int k0 = std::max(-r, -i);
++                int k1 = std::min(r, n - 1 - i);
++                for(int k = k0; k <= k1; k++)
++                    s += kernel[size_t(k + r)] * a[size_t(i + k)];
++                b[size_t(i)] = uint8_t(std::min(255.f, s + 0.5f));
++            }
++        }
++        for(int i = 0; i < n; i++)
++            data[size_t(i) * stride] = b[size_t(i)];
++    }
++};
++
++// Blur `img` in place. Only the content (img.sub, zero outside) grown by the
++// blur's reach is touched; the vertical pass runs on a transposed copy of
++// the columns `out` needs (cache-friendly rows).
++void blurImage(Image& img, float sx, float sy, const IRect& out)
++{
++    BlurLine line;
++    auto* bytes = reinterpret_cast<uint8_t*>(img.px);
++    size_t rowBytes = size_t(img.w) * 4;
++    IRect c = img.sub.intersected(IRect{0, 0, img.w, img.h});
++    if(c.empty())
++        return;
++    if(sx > 0.f) {
++        line.setup(sx);
++        int x0 = std::max(0, c.x0 - line.reach());
++        int x1 = std::min(img.w, c.x1 + line.reach());
++        for(int y = c.y0; y < c.y1; y++) {
++            for(int ch = img.alphaOnly ? 3 : 0; ch < 4; ch++)
++                line.run(bytes + size_t(y) * rowBytes + size_t(x0) * 4 + ch, 4, x1 - x0);
++        }
++        c.x0 = x0;
++        c.x1 = x1;
++    }
++    if(sy > 0.f) {
++        line.setup(sy);
++        int y0 = std::max(0, c.y0 - line.reach());
++        int y1 = std::min(img.h, c.y1 + line.reach());
++        int cx0 = std::max(c.x0, out.x0);
++        int cx1 = std::min(c.x1, out.x1);
++        int n = y1 - y0;
++        if(cx1 > cx0 && n > 0) {
++            size_t cols = size_t(cx1 - cx0);
++            auto* t = static_cast<uint32_t*>(std::malloc(cols * size_t(n) * 4));
++            if(t) {
++                constexpr int kBlock = 32;
++                for(int by = y0; by < y1; by += kBlock) {
++                    int ey = std::min(y1, by + kBlock);
++                    for(int bx = cx0; bx < cx1; bx += kBlock) {
++                        int ex = std::min(cx1, bx + kBlock);
++                        for(int y = by; y < ey; y++) {
++                            const uint32_t* row = img.px + size_t(y) * img.w;
++                            for(int x = bx; x < ex; x++)
++                                t[size_t(x - cx0) * n + (y - y0)] = row[x];
++                        }
++                    }
++                }
++                for(size_t x = 0; x < cols; x++) {
++                    auto* col = reinterpret_cast<uint8_t*>(t + x * size_t(n));
++                    for(int ch = img.alphaOnly ? 3 : 0; ch < 4; ch++)
++                        line.run(col + ch, 4, n);
++                }
++                for(int by = y0; by < y1; by += kBlock) {
++                    int ey = std::min(y1, by + kBlock);
++                    for(int bx = cx0; bx < cx1; bx += kBlock) {
++                        int ex = std::min(cx1, bx + kBlock);
++                        for(int y = by; y < ey; y++) {
++                            uint32_t* row = img.px + size_t(y) * img.w;
++                            for(int x = bx; x < ex; x++)
++                                row[x] = t[size_t(x - cx0) * n + (y - y0)];
++                        }
++                    }
++                }
++                std::free(t);
++            }
++        }
++        c.y0 = y0;
++        c.y1 = y1;
++    }
++    img.sub = c;
++}
++
++// Clear everything outside `sub`, then set it as the image's subregion.
++void clipTo(Image& img, const IRect& sub)
++{
++    for(int y = 0; y < img.h; y++) {
++        uint32_t* row = img.px + size_t(y) * img.w;
++        if(y < sub.y0 || y >= sub.y1) {
++            std::memset(row, 0, size_t(img.w) * 4);
++            continue;
++        }
++        std::memset(row, 0, size_t(sub.x0) * 4);
++        std::memset(row + sub.x1, 0, size_t(img.w - sub.x1) * 4);
++    }
++    img.sub = sub;
++}
++
++ImageRef gaussianBlur(const Context& ctx, const ImageRef& in, float sdx, float sdy, const IRect& sub, const Rect& userSub)
++{
++    auto out = copyImage(in, IRect{0, 0, in->w, in->h}, userSub);
++    if(!out)
++        return nullptr;
++    out->sub = in->sub.intersected(IRect{0, 0, in->w, in->h});
++    float bx = std::min(g_limits.maxBlur, std::abs(sdx) * ctx.sx);
++    float by = std::min(g_limits.maxBlur, std::abs(sdy) * ctx.sy);
++    if(!(bx > 0.f))
++        bx = 0.f;
++    if(!(by > 0.f))
++        by = 0.f;
++    if(!out->sub.empty() && (bx > 0.f || by > 0.f))
++        blurImage(*out, bx, by, sub);
++    clipTo(*out, sub);
++    return out;
++}
++
++// ---- per-pixel helpers ----
++
++struct RGBA {
++    float r, g, b, a;  // premultiplied, 0..1
++};
++
++inline RGBA load(uint32_t p)
++{
++    return RGBA{((p >> 16) & 255) / 255.f, ((p >> 8) & 255) / 255.f, (p & 255) / 255.f, (p >> 24) / 255.f};
++}
++
++inline uint32_t store(RGBA c)
++{
++    uint32_t a = clamp255(c.a * 255.f);
++    uint32_t r = std::min(a, clamp255(c.r * 255.f));
++    uint32_t g = std::min(a, clamp255(c.g * 255.f));
++    uint32_t b = std::min(a, clamp255(c.b * 255.f));
++    return pack(a, r, g, b);
++}
++
++inline uint32_t pixelAt(const ImageRef& img, int x, int y)
++{
++    if(x < img->sub.x0 || x >= img->sub.x1 || y < img->sub.y0 || y >= img->sub.y1)
++        return 0;
++    return img->px[size_t(y) * img->w + x];
++}
++
++enum class Composite { Over, In, Out, Atop, Xor, Arithmetic, Lighter };
++
++inline uint8_t compositeChannel(Composite op, uint32_t c1, uint32_t a1, uint32_t c2, uint32_t a2)
++{
++    switch(op) {
++    case Composite::Over:
++        return uint8_t(c1 + (c2 * (255 - a1) + 127) / 255);
++    case Composite::In:
++        return uint8_t((c1 * a2 + 127) / 255);
++    case Composite::Out:
++        return uint8_t((c1 * (255 - a2) + 127) / 255);
++    case Composite::Atop:
++        return uint8_t(std::min<uint32_t>(255, (c1 * a2 + c2 * (255 - a1) + 127) / 255));
++    case Composite::Xor:
++        return uint8_t(std::min<uint32_t>(255, (c1 * (255 - a2) + c2 * (255 - a1) + 127) / 255));
++    case Composite::Lighter:
++        return uint8_t(std::min<uint32_t>(255, c1 + c2));
++    default:
++        return 0;
++    }
++}
++
++uint32_t compositePixel(Composite op, uint32_t p1, uint32_t p2)
++{
++    uint32_t a1 = p1 >> 24, a2 = p2 >> 24;
++    if(op == Composite::Over) {
++        if(a1 == 255 || a2 == 0)
++            return p1;
++        if(a1 == 0)
++            return p2;
++    }
++    uint32_t out = 0;
++    for(int shift = 0; shift < 32; shift += 8) {
++        uint32_t c1 = (p1 >> shift) & 255, c2 = (p2 >> shift) & 255;
++        out |= uint32_t(compositeChannel(op, c1, a1, c2, a2)) << shift;
++    }
++    return out;
++}
++
++// Separable and non-separable blend modes (Compositing and Blending 1).
++enum class Blend { Normal, Multiply, Screen, Overlay, Darken, Lighten, ColorDodge, ColorBurn, HardLight, SoftLight, Difference, Exclusion, Hue, Saturation, Color, Luminosity };
++
++inline float blendChannel(Blend mode, float cb, float cs)
++{
++    switch(mode) {
++    case Blend::Multiply:
++        return cb * cs;
++    case Blend::Screen:
++        return cb + cs - cb * cs;
++    case Blend::Overlay:
++        return blendChannel(Blend::HardLight, cs, cb);
++    case Blend::Darken:
++        return std::min(cb, cs);
++    case Blend::Lighten:
++        return std::max(cb, cs);
++    case Blend::ColorDodge:
++        if(cb == 0.f)
++            return 0.f;
++        if(cs >= 1.f)
++            return 1.f;
++        return std::min(1.f, cb / (1.f - cs));
++    case Blend::ColorBurn:
++        if(cb >= 1.f)
++            return 1.f;
++        if(cs <= 0.f)
++            return 0.f;
++        return 1.f - std::min(1.f, (1.f - cb) / cs);
++    case Blend::HardLight:
++        if(cs <= 0.5f)
++            return cb * 2.f * cs;
++        return blendChannel(Blend::Screen, cb, 2.f * cs - 1.f);
++    case Blend::SoftLight: {
++        if(cs <= 0.5f)
++            return cb - (1.f - 2.f * cs) * cb * (1.f - cb);
++        float d = cb <= 0.25f ? ((16.f * cb - 12.f) * cb + 4.f) * cb : std::sqrt(cb);
++        return cb + (2.f * cs - 1.f) * (d - cb);
++    }
++    case Blend::Difference:
++        return std::abs(cb - cs);
++    case Blend::Exclusion:
++        return cb + cs - 2.f * cb * cs;
++    default:
++        return cs;
++    }
++}
++
++struct RGB {
++    float r, g, b;
++};
++
++inline float lum(RGB c)
++{
++    return 0.3f * c.r + 0.59f * c.g + 0.11f * c.b;
++}
++
++inline RGB clipColor(RGB c)
++{
++    float l = lum(c);
++    float n = std::min({c.r, c.g, c.b});
++    float x = std::max({c.r, c.g, c.b});
++    if(n < 0.f && l - n > 0.f) {
++        c.r = l + (c.r - l) * l / (l - n);
++        c.g = l + (c.g - l) * l / (l - n);
++        c.b = l + (c.b - l) * l / (l - n);
++    }
++    if(x > 1.f && x - l > 0.f) {
++        c.r = l + (c.r - l) * (1.f - l) / (x - l);
++        c.g = l + (c.g - l) * (1.f - l) / (x - l);
++        c.b = l + (c.b - l) * (1.f - l) / (x - l);
++    }
++    return c;
++}
++
++inline RGB setLum(RGB c, float l)
++{
++    float d = l - lum(c);
++    return clipColor(RGB{c.r + d, c.g + d, c.b + d});
++}
++
++inline float sat(RGB c)
++{
++    return std::max({c.r, c.g, c.b}) - std::min({c.r, c.g, c.b});
++}
++
++inline RGB setSat(RGB c, float s)
++{
++    float* ch[3] = {&c.r, &c.g, &c.b};
++    std::sort(ch, ch + 3, [](float* a, float* b) { return *a < *b; });
++    float& mn = *ch[0];
++    float& md = *ch[1];
++    float& mx = *ch[2];
++    if(mx > mn) {
++        md = (md - mn) * s / (mx - mn);
++        mx = s;
++    } else {
++        md = mx = 0.f;
++    }
++    mn = 0.f;
++    return c;
++}
++
++uint32_t blendPixel(Blend mode, uint32_t top, uint32_t bottom)
++{
++    RGBA s = load(top), b = load(bottom);
++    if(s.a == 0.f)
++        return bottom;
++    if(b.a == 0.f)
++        return top;
++    RGB cs{s.r / s.a, s.g / s.a, s.b / s.a};
++    RGB cb{b.r / b.a, b.g / b.a, b.b / b.a};
++    RGB mix;
++    switch(mode) {
++    case Blend::Hue:
++        mix = setLum(setSat(cs, sat(cb)), lum(cb));
++        break;
++    case Blend::Saturation:
++        mix = setLum(setSat(cb, sat(cs)), lum(cb));
++        break;
++    case Blend::Color:
++        mix = setLum(cs, lum(cb));
++        break;
++    case Blend::Luminosity:
++        mix = setLum(cb, lum(cs));
++        break;
++    default:
++        mix = RGB{blendChannel(mode, cb.r, cs.r), blendChannel(mode, cb.g, cs.g), blendChannel(mode, cb.b, cs.b)};
++        break;
++    }
++    RGBA r;
++    r.a = s.a + b.a - s.a * b.a;
++    r.r = (1.f - b.a) * s.r + (1.f - s.a) * b.r + s.a * b.a * mix.r;
++    r.g = (1.f - b.a) * s.g + (1.f - s.a) * b.g + s.a * b.a * mix.g;
++    r.b = (1.f - b.a) * s.b + (1.f - s.a) * b.b + s.a * b.a * mix.b;
++    return store(r);
++}
++
++Blend parseBlend(std::string_view s)
++{
++    static const struct {
++        const char* name;
++        Blend mode;
++    } modes[] = {
++        {"normal", Blend::Normal}, {"multiply", Blend::Multiply}, {"screen", Blend::Screen},
++        {"overlay", Blend::Overlay}, {"darken", Blend::Darken}, {"lighten", Blend::Lighten},
++        {"color-dodge", Blend::ColorDodge}, {"color-burn", Blend::ColorBurn}, {"hard-light", Blend::HardLight},
++        {"soft-light", Blend::SoftLight}, {"difference", Blend::Difference}, {"exclusion", Blend::Exclusion},
++        {"hue", Blend::Hue}, {"saturation", Blend::Saturation}, {"color", Blend::Color}, {"luminosity", Blend::Luminosity},
++    };
++    for(const auto& m : modes) {
++        if(s == m.name)
++            return m.mode;
++    }
++    return Blend::Normal;
++}
++
++// A 4x5 color matrix on unpremultiplied channels (0..1).
++using ColorMatrix = std::array<float, 20>;
++
++ColorMatrix identityMatrix()
++{
++    return ColorMatrix{1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0};
++}
++
++ColorMatrix saturateMatrix(float s)
++{
++    return ColorMatrix{
++        0.213f + 0.787f * s, 0.715f - 0.715f * s, 0.072f - 0.072f * s, 0, 0,
++        0.213f - 0.213f * s, 0.715f + 0.285f * s, 0.072f - 0.072f * s, 0, 0,
++        0.213f - 0.213f * s, 0.715f - 0.715f * s, 0.072f + 0.928f * s, 0, 0,
++        0, 0, 0, 1, 0};
++}
++
++ColorMatrix hueRotateMatrix(float degrees)
++{
++    float a = degrees * kPi / 180.f;
++    float c = std::cos(a), s = std::sin(a);
++    return ColorMatrix{
++        0.213f + c * 0.787f - s * 0.213f, 0.715f - c * 0.715f - s * 0.715f, 0.072f - c * 0.072f + s * 0.928f, 0, 0,
++        0.213f - c * 0.213f + s * 0.143f, 0.715f + c * 0.285f + s * 0.140f, 0.072f - c * 0.072f - s * 0.283f, 0, 0,
++        0.213f - c * 0.213f - s * 0.787f, 0.715f - c * 0.715f + s * 0.715f, 0.072f + c * 0.928f + s * 0.072f, 0, 0,
++        0, 0, 0, 1, 0};
++}
++
++ColorMatrix luminanceToAlphaMatrix()
++{
++    return ColorMatrix{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.2125f, 0.7154f, 0.0721f, 0, 0};
++}
++
++void applyMatrix(Image& img, const ColorMatrix& m)
++{
++    img.alphaOnly = false;
++    for(int y = img.sub.y0; y < img.sub.y1; y++) {
++        uint32_t* row = img.px + size_t(y) * img.w;
++        for(int x = img.sub.x0; x < img.sub.x1; x++) {
++            uint32_t p = row[x];
++            uint32_t a8 = p >> 24;
++            float a = a8 / 255.f;
++            float r = unpremul((p >> 16) & 255, a8) / 255.f;
++            float g = unpremul((p >> 8) & 255, a8) / 255.f;
++            float b = unpremul(p & 255, a8) / 255.f;
++            float nr = m[0] * r + m[1] * g + m[2] * b + m[3] * a + m[4];
++            float ng = m[5] * r + m[6] * g + m[7] * b + m[8] * a + m[9];
++            float nb = m[10] * r + m[11] * g + m[12] * b + m[13] * a + m[14];
++            float na = m[15] * r + m[16] * g + m[17] * b + m[18] * a + m[19];
++            uint32_t oa = clamp255(na * 255.f);
++            row[x] = pack(oa, premul(clamp255(nr * 255.f), oa), premul(clamp255(ng * 255.f), oa), premul(clamp255(nb * 255.f), oa));
++        }
++    }
++}
++
++// feComponentTransfer: one lookup table per channel (unpremultiplied).
++struct TransferFunction {
++    bool identity = true;
++    uint8_t table[256];
++};
++
++bool buildTransfer(const SVGElement* func, TransferFunction& tf)
++{
++    auto type = stringAttr(func, PropertyID::Type);
++    std::vector<float> values;
++    bool haveValues = parseNumberList(stringAttr(func, PropertyID::TableValues), values);
++    tf.identity = true;
++    for(int i = 0; i < 256; i++)
++        tf.table[i] = uint8_t(i);
++    if(type == "table" || type == "discrete") {
++        if(!haveValues || values.empty())
++            return true;
++        tf.identity = false;
++        size_t n = values.size();
++        for(int i = 0; i < 256; i++) {
++            float c = i / 255.f;
++            float v;
++            if(type == "table") {
++                if(n == 1) {
++                    v = values[0];
++                } else {
++                    float pos = c * float(n - 1);
++                    size_t k = std::min(n - 2, size_t(pos));
++                    v = values[k] + (pos - float(k)) * (values[k + 1] - values[k]);
++                }
++            } else {
++                size_t k = std::min(n - 1, size_t(c * float(n)));
++                v = values[k];
++            }
++            tf.table[i] = uint8_t(clamp255(v * 255.f));
++        }
++        return true;
++    }
++    if(type == "linear") {
++        float slope = numberAttr(func, PropertyID::Slope, 1.f, true);
++        float intercept = numberAttr(func, PropertyID::Intercept, 0.f, true);
++        tf.identity = false;
++        for(int i = 0; i < 256; i++)
++            tf.table[i] = uint8_t(clamp255((slope * (i / 255.f) + intercept) * 255.f));
++        return true;
++    }
++    if(type == "gamma") {
++        float amplitude = numberAttr(func, PropertyID::Amplitude, 1.f, true);
++        float exponent = numberAttr(func, PropertyID::Exponent, 1.f, true);
++        float offset = 0.f;
++        numberAttr(func, PropertyID::Offset, offset);
++        tf.identity = false;
++        for(int i = 0; i < 256; i++)
++            tf.table[i] = uint8_t(clamp255((amplitude * std::pow(i / 255.f, exponent) + offset) * 255.f));
++        return true;
++    }
++    return true;
++}
++
++void applyTransfer(Image& img, const TransferFunction fn[4])
++{
++    img.alphaOnly = false;
++    for(int y = img.sub.y0; y < img.sub.y1; y++) {
++        uint32_t* row = img.px + size_t(y) * img.w;
++        for(int x = img.sub.x0; x < img.sub.x1; x++) {
++            uint32_t p = row[x];
++            uint32_t a = p >> 24;
++            uint32_t r = unpremul((p >> 16) & 255, a);
++            uint32_t g = unpremul((p >> 8) & 255, a);
++            uint32_t b = unpremul(p & 255, a);
++            r = fn[0].table[r];
++            g = fn[1].table[g];
++            b = fn[2].table[b];
++            a = fn[3].table[a];
++            row[x] = pack(a, premul(r, a), premul(g, a), premul(b, a));
++        }
++    }
++}
++
++// A shifted copy (device px).
++ImageRef offsetImage(const ImageRef& in, int dx, int dy, const IRect& sub, const Rect& userSub)
++{
++    auto out = newImage(in->w, in->h, in->linear, sub, userSub);
++    if(!out)
++        return nullptr;
++    out->alphaOnly = in->alphaOnly;
++    IRect src = in->sub;
++    IRect dst{src.x0 + dx, src.y0 + dy, src.x1 + dx, src.y1 + dy};
++    dst = dst.intersected(sub);
++    for(int y = dst.y0; y < dst.y1; y++)
++        std::memcpy(out->px + size_t(y) * in->w + dst.x0, in->px + size_t(y - dy) * in->w + (dst.x0 - dx), size_t(dst.x1 - dst.x0) * 4);
++    return out;
++}
++
++ImageRef floodImage(const Context& ctx, const Color& color, float opacity, bool linear, const IRect& sub, const Rect& userSub)
++{
++    auto out = newImage(ctx.w, ctx.h, linear, sub, userSub);
++    if(!out)
++        return nullptr;
++    Color c = convertColor(color, linear);
++    uint32_t a = clamp255(c.alpha() * std::clamp(finiteOr(opacity, 1.f), 0.f, 1.f));
++    uint32_t p = pack(a, premul(c.red(), a), premul(c.green(), a), premul(c.blue(), a));
++    for(int y = sub.y0; y < sub.y1; y++)
++        std::fill(out->px + size_t(y) * ctx.w + sub.x0, out->px + size_t(y) * ctx.w + sub.x1, p);
++    return out;
++}
++
++ImageRef alphaOf(const ImageRef& in)
++{
++    auto out = newImage(in->w, in->h, in->linear, in->sub, in->userSub);
++    if(!out)
++        return nullptr;
++    out->alphaOnly = true;
++    for(int y = in->sub.y0; y < in->sub.y1; y++) {
++        for(int x = in->sub.x0; x < in->sub.x1; x++) {
++            size_t i = size_t(y) * in->w + x;
++            out->px[i] = in->px[i] & 0xff000000u;
++        }
++    }
++    return out;
++}
++
++// Two inputs combined per pixel into a new image clipped to `sub`.
++template<typename F>
++ImageRef combine(const ImageRef& i1, const ImageRef& i2, const IRect& sub, const Rect& userSub, F f)
++{
++    auto out = newImage(i1->w, i1->h, i1->linear, sub, userSub);
++    if(!out)
++        return nullptr;
++    for(int y = sub.y0; y < sub.y1; y++) {
++        uint32_t* row = out->px + size_t(y) * out->w;
++        for(int x = sub.x0; x < sub.x1; x++)
++            row[x] = f(pixelAt(i1, x, y), pixelAt(i2, x, y));
++    }
++    return out;
++}
++
++// Colour a (blurred, offset) alpha image with a flood colour, then draw the
++// input over it: feDropShadow and drop-shadow().
++ImageRef dropShadow(const Context& ctx, const ImageRef& in, float sdx, float sdy, float dxUser, float dyUser, const Color& color, float opacity,
++                    const IRect& sub, const Rect& userSub)
++{
++    auto alpha = alphaOf(in);
++    if(!alpha)
++        return nullptr;
++    auto blurred = gaussianBlur(ctx, alpha, sdx, sdy, IRect{0, 0, ctx.w, ctx.h}.intersected(ctx.region), userSub);
++    alpha.reset();
++    if(!blurred)
++        return nullptr;
++    const auto& m = ctx.ctm.matrix();
++    int dx = clampToInt(std::lround(finiteOr(m.a * dxUser + m.c * dyUser, 0.f)));
++    int dy = clampToInt(std::lround(finiteOr(m.b * dxUser + m.d * dyUser, 0.f)));
++    auto shadow = offsetImage(blurred, dx, dy, sub, userSub);
++    blurred.reset();
++    if(!shadow)
++        return nullptr;
++    Color c = convertColor(color, in->linear);
++    shadow->alphaOnly = false;
++    float fa = c.alphaF() * std::clamp(finiteOr(opacity, 1.f), 0.f, 1.f);
++    for(int y = sub.y0; y < sub.y1; y++) {
++        uint32_t* row = shadow->px + size_t(y) * shadow->w;
++        for(int x = sub.x0; x < sub.x1; x++) {
++            uint32_t a = clamp255((row[x] >> 24) * fa);
++            row[x] = pack(a, premul(c.red(), a), premul(c.green(), a), premul(c.blue(), a));
++        }
++    }
++    return combine(in, shadow, sub, userSub, [](uint32_t s, uint32_t d) { return compositePixel(Composite::Over, s, d); });
++}
++
++float stdDeviationPair(const SVGElement* p, float fallback, float& sy, bool& ok)
++{
++    ok = true;
++    std::vector<float> v;
++    if(!p->hasAttribute(PropertyID::StdDeviation)) {
++        sy = fallback;
++        return fallback;
++    }
++    if(!parseNumberList(stringAttr(p, PropertyID::StdDeviation), v, 2) || v.empty()) {
++        ok = v.empty() && stringAttr(p, PropertyID::StdDeviation).empty();
++        sy = 0.f;
++        return 0.f;
++    }
++    sy = v.size() > 1 ? v[1] : v[0];
++    return v[0];
++}
++
++class FilterRun {
++public:
++    // `source`: the SourceGraphic when not the canvas (a filter list's
++    // earlier result).
++    FilterRun(Context& ctx, ImageRef source = nullptr) : m_ctx(ctx), m_given(std::move(source)) {}
++
++    // The input `name` in `linear` colour space; null on budget failure.
++    ImageRef input(std::string_view name, bool linear)
++    {
++        ImageRef img;
++        // FillPaint / StrokePaint / BackgroundImage (removed in Filter
++        // Effects 1) read as the source, as resvg does.
++        if(name == "SourceGraphic" || name == "FillPaint" || name == "StrokePaint" || name == "BackgroundImage") {
++            img = sourceGraphic();
++        } else if(name == "SourceAlpha" || name == "BackgroundAlpha") {
++            if(!m_sourceAlpha) {
++                auto src = sourceGraphic();
++                if(src)
++                    m_sourceAlpha = alphaOf(src);
++            }
++            img = m_sourceAlpha;
++        } else {
++            auto it = name.empty() ? m_results.end() : m_results.find(std::string(name));
++            if(it != m_results.end())
++                img = it->second;
++            else if(m_last)
++                img = m_last;
++            else
++                img = sourceGraphic();
++        }
++        return convert(img, linear);
++    }
++
++    ImageRef sourceGraphic()
++    {
++        if(!m_source) {
++            m_source = newImage(m_ctx.w, m_ctx.h, false, m_ctx.region, m_ctx.userRegion);
++            if(m_source) {
++                IRect r = m_ctx.region;
++                const uint32_t* from = m_ctx.source;
++                if(m_given) {
++                    r = r.intersected(m_given->sub);
++                    from = m_given->px;
++                }
++                // Copy, and shrink the subregion to the painted pixels (the
++                // blurs and scans then skip the empty rest).
++                IRect ink{r.x1, r.y1, r.x0, r.y0};
++                for(int y = r.y0; y < r.y1; y++) {
++                    const uint32_t* s = from + size_t(y) * m_ctx.w;
++                    uint32_t* d = m_source->px + size_t(y) * m_ctx.w;
++                    int first = -1, last = -1;
++                    for(int x = r.x0; x < r.x1; x++) {
++                        if(s[x]) {
++                            if(first < 0)
++                                first = x;
++                            last = x;
++                        }
++                    }
++                    if(first < 0)
++                        continue;
++                    std::memcpy(d + first, s + first, size_t(last + 1 - first) * 4);
++                    ink.x0 = std::min(ink.x0, first);
++                    ink.x1 = std::max(ink.x1, last + 1);
++                    ink.y0 = std::min(ink.y0, y);
++                    ink.y1 = std::max(ink.y1, y + 1);
++                }
++                m_source->sub = ink.empty() ? IRect() : ink;
++            }
++        }
++        return m_source;
++    }
++
++    // The default subregion for inputs `ins` (user space).
++    Rect defaultSubregion(std::initializer_list<const ImageRef*> ins, bool standard)
++    {
++        if(standard)
++            return m_ctx.userRegion;
++        Rect r = Rect::Invalid;
++        for(auto* in : ins) {
++            if(*in)
++                r.unite((*in)->userSub);
++        }
++        return r.isValid() ? r : m_ctx.userRegion;
++    }
++
++    static bool isStandard(std::string_view name, bool first)
++    {
++        return name == "SourceGraphic" || name == "SourceAlpha" || name == "BackgroundImage" || name == "BackgroundAlpha"
++            || name == "FillPaint" || name == "StrokePaint" || (name.empty() && first);
++    }
++
++    bool refersToResult(std::string_view name) const
++    {
++        return !name.empty() && m_results.count(std::string(name));
++    }
++
++    bool run(const SVGFilterPrimitiveElement* p, bool first);
++
++    void setResult(const SVGElement* p, ImageRef img)
++    {
++        auto name = stringAttr(p, PropertyID::Result);
++        if(!name.empty())
++            m_results[std::string(name)] = img;
++        m_last = std::move(img);
++    }
++
++    ImageRef last() const { return m_last; }
++    Context& ctx() { return m_ctx; }
++
++private:
++    Context& m_ctx;
++    ImageRef m_given;
++    ImageRef m_source;
++    ImageRef m_sourceAlpha;
++    ImageRef m_last;
++    std::map<std::string, ImageRef> m_results;
++};
++
++bool FilterRun::run(const SVGFilterPrimitiveElement* p, bool first)
++{
++    const bool linear = p->linearRGB();
++    auto in1Name = stringAttr(p, PropertyID::In);
++    // The default subregion is the filter region, except that feOffset keeps
++    // the subregion of a named result it reads (resvg's rule; the spec's
++    // union of the inputs' subregions clips more than the browsers do).
++    auto inputStandard = [&](std::string_view name) {
++        if(p->id() != ElementID::FeOffset || isStandard(name, first))
++            return true;
++        return !refersToResult(name);
++    };
++
++    switch(p->id()) {
++    case ElementID::FeFlood: {
++        auto userSub = primitiveSubregion(m_ctx, p, m_ctx.userRegion);
++        auto sub = toPixels(m_ctx, userSub);
++        auto out = floodImage(m_ctx, p->floodColor(), p->floodOpacity(), linear, sub, userSub);
++        if(!out)
++            return false;
++        setResult(p, out);
++        return true;
++    }
++    case ElementID::FeGaussianBlur:
++    case ElementID::FeOffset:
++    case ElementID::FeColorMatrix:
++    case ElementID::FeComponentTransfer:
++    case ElementID::FeDropShadow:
++    case ElementID::FeUnsupported: {
++        auto in = input(in1Name, linear);
++        if(!in)
++            return false;
++        auto userSub = primitiveSubregion(m_ctx, p, defaultSubregion({&in}, inputStandard(in1Name)));
++        auto sub = toPixels(m_ctx, userSub);
++        ImageRef out;
++        if(p->id() == ElementID::FeGaussianBlur) {
++            float sy;
++            bool ok;
++            float sx = stdDeviationPair(p, 0.f, sy, ok);
++            if(sx < 0.f || sy < 0.f || (sx == 0.f && sy == 0.f))
++                out = copyImage(in, sub, userSub);
++            else
++                out = gaussianBlur(m_ctx, in, primitiveLength(m_ctx, sx, LengthDirection::Horizontal),
++                                   primitiveLength(m_ctx, sy, LengthDirection::Vertical), sub, userSub);
++        } else if(p->id() == ElementID::FeOffset) {
++            float dx = primitiveLength(m_ctx, numberAttr(p, PropertyID::Dx, 0.f, true), LengthDirection::Horizontal);
++            float dy = primitiveLength(m_ctx, numberAttr(p, PropertyID::Dy, 0.f, true), LengthDirection::Vertical);
++            const auto& m = m_ctx.ctm.matrix();
++            int ix = clampToInt(std::lround(finiteOr(m.a * dx + m.c * dy, 0.f)));
++            int iy = clampToInt(std::lround(finiteOr(m.b * dx + m.d * dy, 0.f)));
++            out = offsetImage(in, ix, iy, sub, userSub);
++        } else if(p->id() == ElementID::FeColorMatrix) {
++            out = copyImage(in, sub, userSub);
++            if(!out)
++                return false;
++            auto type = stringAttr(p, PropertyID::Type);
++            std::vector<float> values;
++            bool haveValues = p->hasAttribute(PropertyID::Values) && parseNumberList(stringAttr(p, PropertyID::Values), values, 20);
++            ColorMatrix m = identityMatrix();
++            if(type == "saturate") {
++                if(haveValues && values.size() == 1)
++                    m = saturateMatrix(std::max(0.f, values[0]));
++            } else if(type == "hueRotate") {
++                if(haveValues && values.size() == 1)
++                    m = hueRotateMatrix(values[0]);
++            } else if(type == "luminanceToAlpha") {
++                m = luminanceToAlphaMatrix();
++            } else if(haveValues && values.size() == 20) {
++                // "matrix", and an unknown type (its initial value).
++                std::copy(values.begin(), values.end(), m.begin());
++            }
++            applyMatrix(*out, m);
++        } else if(p->id() == ElementID::FeComponentTransfer) {
++            out = copyImage(in, sub, userSub);
++            if(!out)
++                return false;
++            TransferFunction fn[4];
++            for(auto& f : fn) {
++                f.identity = true;
++                for(int i = 0; i < 256; i++)
++                    f.table[i] = uint8_t(i);
++            }
++            for(const auto& child : p->children()) {
++                auto e = toSVGElement(child);
++                if(!e)
++                    continue;
++                int index = -1;
++                switch(e->id()) {
++                case ElementID::FeFuncR: index = 0; break;
++                case ElementID::FeFuncG: index = 1; break;
++                case ElementID::FeFuncB: index = 2; break;
++                case ElementID::FeFuncA: index = 3; break;
++                default: break;
++                }
++                if(index >= 0)
++                    buildTransfer(e, fn[index]);
++            }
++            applyTransfer(*out, fn);
++        } else if(p->id() == ElementID::FeDropShadow) {
++            float sy;
++            bool ok;
++            float sx = stdDeviationPair(p, 2.f, sy, ok);
++            if(sx < 0.f || sy < 0.f)
++                sx = sy = 0.f;
++            float dx = primitiveLength(m_ctx, numberAttr(p, PropertyID::Dx, 2.f, true), LengthDirection::Horizontal);
++            float dy = primitiveLength(m_ctx, numberAttr(p, PropertyID::Dy, 2.f, true), LengthDirection::Vertical);
++            out = dropShadow(m_ctx, in, primitiveLength(m_ctx, sx, LengthDirection::Horizontal), primitiveLength(m_ctx, sy, LengthDirection::Vertical), dx, dy,
++                             p->floodColor(), p->floodOpacity(), sub, userSub);
++        } else {
++            out = copyImage(in, sub, userSub);
++        }
++        if(!out)
++            return false;
++        setResult(p, out);
++        return true;
++    }
++    case ElementID::FeComposite:
++    case ElementID::FeBlend: {
++        auto in2Name = stringAttr(p, PropertyID::In2);
++        auto i1 = input(in1Name, linear);
++        auto i2 = input(in2Name, linear);
++        if(!i1 || !i2)
++            return false;
++        auto userSub = primitiveSubregion(m_ctx, p, defaultSubregion({&i1, &i2}, inputStandard(in1Name) || inputStandard(in2Name)));
++        auto sub = toPixels(m_ctx, userSub);
++        ImageRef out;
++        if(p->id() == ElementID::FeBlend) {
++            auto mode = parseBlend(stringAttr(p, PropertyID::Mode));
++            if(mode == Blend::Normal)  // source-over, in integers
++                out = combine(i1, i2, sub, userSub, [](uint32_t s, uint32_t d) { return compositePixel(Composite::Over, s, d); });
++            else
++                out = combine(i1, i2, sub, userSub, [mode](uint32_t s, uint32_t d) { return blendPixel(mode, s, d); });
++        } else {
++            auto op = stringAttr(p, PropertyID::Operator);
++            Composite c = Composite::Over;
++            if(op == "in")
++                c = Composite::In;
++            else if(op == "out")
++                c = Composite::Out;
++            else if(op == "atop")
++                c = Composite::Atop;
++            else if(op == "xor")
++                c = Composite::Xor;
++            else if(op == "arithmetic")
++                c = Composite::Arithmetic;
++            else if(op == "lighter")
++                c = Composite::Lighter;
++            if(c == Composite::Arithmetic) {
++                float k1 = numberAttr(p, PropertyID::K1, 0.f, true), k2 = numberAttr(p, PropertyID::K2, 0.f, true);
++                float k3 = numberAttr(p, PropertyID::K3, 0.f, true), k4 = numberAttr(p, PropertyID::K4, 0.f, true);
++                out = combine(i1, i2, sub, userSub, [=](uint32_t a, uint32_t b) {
++                    RGBA x = load(a), y = load(b);
++                    auto f = [&](float u, float v) { return std::clamp(k1 * u * v + k2 * u + k3 * v + k4, 0.f, 1.f); };
++                    return store(RGBA{f(x.r, y.r), f(x.g, y.g), f(x.b, y.b), f(x.a, y.a)});
++                });
++            } else {
++                out = combine(i1, i2, sub, userSub, [c](uint32_t a, uint32_t b) { return compositePixel(c, a, b); });
++            }
++        }
++        if(!out)
++            return false;
++        setResult(p, out);
++        return true;
++    }
++    case ElementID::FeMerge: {
++        std::vector<ImageRef> nodes;
++        bool standard = false;
++        Rect deflt = Rect::Invalid;
++        for(const auto& child : p->children()) {
++            auto e = toSVGElement(child);
++            if(!e || e->id() != ElementID::FeMergeNode)
++                continue;
++            auto name = stringAttr(e, PropertyID::In);
++            auto img = input(name, linear);
++            if(!img)
++                return false;
++            standard = standard || inputStandard(name);
++            deflt.unite(img->userSub);
++            nodes.push_back(img);
++        }
++        auto userSub = primitiveSubregion(m_ctx, p, standard || !deflt.isValid() ? m_ctx.userRegion : deflt);
++        auto sub = toPixels(m_ctx, userSub);
++        auto out = newImage(m_ctx.w, m_ctx.h, linear, sub, userSub);
++        if(!out)
++            return false;
++        for(const auto& node : nodes) {
++            auto r = sub.intersected(node->sub);
++            for(int y = r.y0; y < r.y1; y++) {
++                uint32_t* d = out->px + size_t(y) * m_ctx.w;
++                const uint32_t* s = node->px + size_t(y) * m_ctx.w;
++                for(int x = r.x0; x < r.x1; x++)
++                    d[x] = compositePixel(Composite::Over, s[x], d[x]);
++            }
++        }
++        setResult(p, out);
++        return true;
++    }
++    default:
++        return true;
++    }
++}
++
++bool isPrimitive(ElementID id)
++{
++    switch(id) {
++    case ElementID::FeBlend:
++    case ElementID::FeColorMatrix:
++    case ElementID::FeComponentTransfer:
++    case ElementID::FeComposite:
++    case ElementID::FeDropShadow:
++    case ElementID::FeFlood:
++    case ElementID::FeGaussianBlur:
++    case ElementID::FeMerge:
++    case ElementID::FeOffset:
++    case ElementID::FeUnsupported:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// ---- CSS filter functions ----
++
++enum class FunctionType { Blur, Brightness, Contrast, DropShadow, Grayscale, HueRotate, Invert, Opacity, Saturate, Sepia, Url };
++
++struct FilterFunction {
++    FunctionType type;
++    float value = 0.f;      // amount, angle (deg), or blur deviation (user px)
++    float dx = 0.f;         // drop-shadow
++    float dy = 0.f;
++    Color color = Color::Black;
++    bool hasColor = false;
++    std::string id;         // url(#id)
++};
++
++bool parseAmount(std::string_view& in, float& out, float fallback)
++{
++    skipOptionalSpaces(in);
++    if(in.empty() || in.front() == ')') {
++        out = fallback;
++        return true;
++    }
++    float v;
++    if(!parseNumber(in, v) || !std::isfinite(v))
++        return false;
++    if(!in.empty() && in.front() == '%') {
++        in.remove_prefix(1);
++        v /= 100.f;
++    }
++    if(v < 0.f)
++        return false;
++    out = v;
++    skipOptionalSpaces(in);
++    return true;
++}
++
++bool parseLengthValue(std::string_view& in, const SVGElement* element, float& out)
++{
++    skipOptionalSpaces(in);
++    size_t n = 0;
++    while(n < in.size() && !IS_WS(in[n]) && in[n] != ')' && in[n] != ',')
++        ++n;
++    if(n == 0)
++        return false;
++    Length length;
++    if(!length.parse(in.substr(0, n), LengthNegativeMode::Allow) || length.units() == LengthUnits::Percent)
++        return false;
++    in.remove_prefix(n);
++    out = element ? LengthContext(element).valueForLength(length, LengthDirection::Diagonal) : length.value();
++    skipOptionalSpaces(in);
++    return std::isfinite(out);
++}
++
++bool parseAngle(std::string_view& in, float& out)
++{
++    skipOptionalSpaces(in);
++    if(in.empty() || in.front() == ')') {
++        out = 0.f;
++        return true;
++    }
++    float v;
++    if(!parseNumber(in, v) || !std::isfinite(v))
++        return false;
++    if(skipString(in, "deg")) {
++    } else if(v != 0.f && (in.empty() || in.front() != 'g') && (in.empty() || (in.front() != 'r' && in.front() != 't'))) {
++        return false;  // a non-zero angle needs a unit
++    } else if(skipString(in, "grad")) {
++        v = v * 360.f / 400.f;
++    } else if(skipString(in, "rad")) {
++        v = v * 180.f / kPi;
++    } else if(skipString(in, "turn")) {
++        v = v * 360.f;
++    }
++    out = v;
++    skipOptionalSpaces(in);
++    return true;
++}
++
++bool parseFunctionColor(std::string_view& in, const SVGElement* element, Color& out)
++{
++    skipOptionalSpaces(in);
++    if(skipString(in, "currentColor")) {
++        out = element ? element->filterColor() : Color::Black;
++        return true;
++    }
++    plutovg_color_t color;
++    int length = plutovg_color_parse(&color, in.data(), int(in.length()));
++    if(length <= 0)
++        return false;
++    in.remove_prefix(size_t(length));
++    out = Color(plutovg_color_to_argb32(&color));
++    return true;
++}
++
++bool parseFunctions(std::string_view in, const SVGElement* element, std::vector<FilterFunction>* out)
++{
++    static const struct {
++        const char* name;
++        FunctionType type;
++    } names[] = {
++        {"blur", FunctionType::Blur}, {"brightness", FunctionType::Brightness}, {"contrast", FunctionType::Contrast},
++        {"drop-shadow", FunctionType::DropShadow}, {"grayscale", FunctionType::Grayscale}, {"hue-rotate", FunctionType::HueRotate},
++        {"invert", FunctionType::Invert}, {"opacity", FunctionType::Opacity}, {"saturate", FunctionType::Saturate},
++        {"sepia", FunctionType::Sepia},
++    };
++    int count = 0;
++    skipOptionalSpaces(in);
++    if(in.empty())
++        return false;
++    while(!in.empty()) {
++        if(++count > g_limits.maxPrimitives)
++            return false;
++        FilterFunction fn{};
++        if(skipString(in, "url(")) {
++            skipOptionalSpaces(in);
++            char quote = 0;
++            if(!in.empty() && (in.front() == '\'' || in.front() == '"')) {
++                quote = in.front();
++                in.remove_prefix(1);
++            }
++            if(!skipDelimiter(in, '#'))
++                return false;
++            while(!in.empty() && in.front() != ')' && in.front() != quote && !IS_WS(in.front())) {
++                fn.id += in.front();
++                in.remove_prefix(1);
++            }
++            if(quote && !skipDelimiter(in, quote))
++                return false;
++            skipOptionalSpaces(in);
++            if(fn.id.empty() || !skipDelimiter(in, ')'))
++                return false;
++            skipOptionalSpaces(in);
++            fn.type = FunctionType::Url;
++            if(out)
++                out->push_back(fn);
++            continue;
++        }
++        bool found = false;
++        for(const auto& n : names) {
++            if(skipString(in, n.name)) {
++                fn.type = n.type;
++                found = true;
++                break;
++            }
++        }
++        if(!found || !skipDelimiter(in, '('))
++            return false;
++        skipOptionalSpaces(in);
++        switch(fn.type) {
++        case FunctionType::Blur:
++            if(!in.empty() && in.front() == ')')
++                fn.value = 0.f;
++            else if(!parseLengthValue(in, element, fn.value) || fn.value < 0.f)
++                return false;
++            break;
++        case FunctionType::HueRotate:
++            if(!parseAngle(in, fn.value))
++                return false;
++            break;
++        case FunctionType::DropShadow: {
++            if(parseFunctionColor(in, element, fn.color))
++                fn.hasColor = true;
++            float v[3] = {0, 0, 0};
++            int n = 0;
++            while(n < 3 && !in.empty() && in.front() != ')') {
++                std::string_view save = in;
++                if(!parseLengthValue(in, element, v[n])) {
++                    in = save;
++                    break;
++                }
++                skipOptionalSpacesOrComma(in);
++                ++n;
++            }
++            if(n < 2 || v[2] < 0.f)
++                return false;
++            skipOptionalSpaces(in);
++            if(!fn.hasColor && !in.empty() && in.front() != ')') {
++                if(!parseFunctionColor(in, element, fn.color))
++                    return false;
++                fn.hasColor = true;
++            }
++            if(!fn.hasColor)
++                fn.color = element ? element->filterColor() : Color::Black;
++            fn.dx = v[0];
++            fn.dy = v[1];
++            fn.value = v[2];
++            break;
++        }
++        default:
++            if(!parseAmount(in, fn.value, 1.f))
++                return false;
++            if(fn.type == FunctionType::Grayscale || fn.type == FunctionType::Invert || fn.type == FunctionType::Opacity || fn.type == FunctionType::Sepia)
++                fn.value = std::min(fn.value, 1.f);
++            break;
++        }
++        skipOptionalSpaces(in);
++        if(!skipDelimiter(in, ')'))
++            return false;
++        skipOptionalSpaces(in);
++        if(out)
++            out->push_back(fn);
++    }
++    return true;
++}
++
++ImageRef runFunction(Context& ctx, const FilterFunction& fn, const ImageRef& in)
++{
++    const IRect& sub = ctx.region;
++    switch(fn.type) {
++    case FunctionType::Blur:
++        return gaussianBlur(ctx, in, fn.value, fn.value, sub, ctx.userRegion);
++    case FunctionType::DropShadow:
++        return dropShadow(ctx, in, fn.value, fn.value, fn.dx, fn.dy, fn.color, 1.f, sub, ctx.userRegion);
++    default:
++        break;
++    }
++    auto out = copyImage(in, sub, ctx.userRegion);
++    if(!out)
++        return nullptr;
++    float v = fn.value;
++    if(fn.type == FunctionType::HueRotate) {
++        applyMatrix(*out, hueRotateMatrix(v));
++    } else if(fn.type == FunctionType::Saturate) {
++        applyMatrix(*out, saturateMatrix(v));
++    } else if(fn.type == FunctionType::Grayscale) {
++        float s = 1.f - v;
++        applyMatrix(*out, ColorMatrix{
++            0.2126f + 0.7874f * s, 0.7152f - 0.7152f * s, 0.0722f - 0.0722f * s, 0, 0,
++            0.2126f - 0.2126f * s, 0.7152f + 0.2848f * s, 0.0722f - 0.0722f * s, 0, 0,
++            0.2126f - 0.2126f * s, 0.7152f - 0.7152f * s, 0.0722f + 0.9278f * s, 0, 0,
++            0, 0, 0, 1, 0});
++    } else if(fn.type == FunctionType::Sepia) {
++        float s = 1.f - v;
++        applyMatrix(*out, ColorMatrix{
++            0.393f + 0.607f * s, 0.769f - 0.769f * s, 0.189f - 0.189f * s, 0, 0,
++            0.349f - 0.349f * s, 0.686f + 0.314f * s, 0.168f - 0.168f * s, 0, 0,
++            0.272f - 0.272f * s, 0.534f - 0.534f * s, 0.131f + 0.869f * s, 0, 0,
++            0, 0, 0, 1, 0});
++    } else {
++        TransferFunction fns[4];
++        for(int c = 0; c < 4; c++) {
++            for(int i = 0; i < 256; i++)
++                fns[c].table[i] = uint8_t(i);
++        }
++        for(int i = 0; i < 256; i++) {
++            float x = i / 255.f;
++            float y = x;
++            switch(fn.type) {
++            case FunctionType::Brightness: y = x * v; break;
++            case FunctionType::Contrast: y = x * v + 0.5f - 0.5f * v; break;
++            case FunctionType::Invert: y = v + x * (1.f - 2.f * v); break;
++            default: break;
++            }
++            uint8_t t = uint8_t(clamp255(y * 255.f));
++            if(fn.type == FunctionType::Opacity)
++                fns[3].table[i] = uint8_t(clamp255(x * v * 255.f));
++            else
++                fns[0].table[i] = fns[1].table[i] = fns[2].table[i] = t;
++        }
++        applyTransfer(*out, fns);
++    }
++    return out;
++}
++
++} // namespace
++
++// ---- elements ----
++
++SVGFilterElement::SVGFilterElement(Document* document)
++    : SVGElement(document, ElementID::Filter)
++    , SVGURIReference(this)
++    , m_x(PropertyID::X, LengthDirection::Horizontal, LengthNegativeMode::Allow, -10.f, LengthUnits::Percent)
++    , m_y(PropertyID::Y, LengthDirection::Vertical, LengthNegativeMode::Allow, -10.f, LengthUnits::Percent)
++    , m_width(PropertyID::Width, LengthDirection::Horizontal, LengthNegativeMode::Forbid, 120.f, LengthUnits::Percent)
++    , m_height(PropertyID::Height, LengthDirection::Vertical, LengthNegativeMode::Forbid, 120.f, LengthUnits::Percent)
++    , m_filterUnits(PropertyID::FilterUnits, Units::ObjectBoundingBox)
++    , m_primitiveUnits(PropertyID::PrimitiveUnits, Units::UserSpaceOnUse)
++{
++    addProperty(m_x);
++    addProperty(m_y);
++    addProperty(m_width);
++    addProperty(m_height);
++    addProperty(m_filterUnits);
++    addProperty(m_primitiveUnits);
++}
++
++namespace {
++
++template<typename F>
++const SVGFilterElement* walkHref(const SVGFilterElement* start, F match)
++{
++    const SVGFilterElement* chain[32];
++    int n = 0;
++    for(auto e = start; e && n < 32; ) {
++        for(int i = 0; i < n; i++) {
++            if(chain[i] == e)
++                return nullptr;
++        }
++        chain[n++] = e;
++        if(match(e))
++            return e;
++        auto target = e->getTargetElement(e->document());
++        e = target && target->id() == ElementID::Filter ? static_cast<const SVGFilterElement*>(target) : nullptr;
++    }
++    return nullptr;
++}
++
++bool hasPrimitiveChild(const SVGElement* e);
++
++} // namespace
++
++const SVGFilterElement* SVGFilterElement::attributeSource(PropertyID id) const
++{
++    auto e = walkHref(this, [id](const SVGFilterElement* f) { return f->hasAttribute(id); });
++    return e ? e : this;
++}
++
++const SVGFilterElement* SVGFilterElement::primitivesSource() const
++{
++    auto e = walkHref(this, [](const SVGFilterElement* f) { return hasPrimitiveChild(f); });
++    return e ? e : this;
++}
++
++Rect SVGFilterElement::filterRegion(const SVGElement* element) const
++{
++    auto units = attributeSource(PropertyID::FilterUnits)->m_filterUnits.value();
++    const auto* ex = attributeSource(PropertyID::X);
++    const auto* ey = attributeSource(PropertyID::Y);
++    const auto* ew = attributeSource(PropertyID::Width);
++    const auto* eh = attributeSource(PropertyID::Height);
++    // A negative or unparsable width / height disables the element.
++    for(const auto* e : {ew, eh}) {
++        auto id = e == ew ? PropertyID::Width : PropertyID::Height;
++        if(e->hasAttribute(id)) {
++            Length length;
++            std::string_view value(e->getAttribute(id));
++            stripLeadingAndTrailingSpaces(value);
++            if(!length.parse(value, LengthNegativeMode::Forbid))
++                return Rect::Empty;
++        }
++    }
++    LengthContext lengthContext(this, units);
++    Rect region = {
++        lengthContext.valueForLength(ex->m_x),
++        lengthContext.valueForLength(ey->m_y),
++        lengthContext.valueForLength(ew->m_width),
++        lengthContext.valueForLength(eh->m_height)
++    };
++
++    if(units == Units::ObjectBoundingBox) {
++        auto bbox = element->fillBoundingBox();
++        if(bbox.isEmpty())
++            return Rect::Empty;
++        region.x = region.x * bbox.w + bbox.x;
++        region.y = region.y * bbox.h + bbox.y;
++        region.w = region.w * bbox.w;
++        region.h = region.h * bbox.h;
++    }
++
++    if(!std::isfinite(region.x) || !std::isfinite(region.y) || !std::isfinite(region.w) || !std::isfinite(region.h) || region.w <= 0.f || region.h <= 0.f)
++        return Rect::Empty;
++    return region;
++}
++
++SVGFilterPrimitiveElement::SVGFilterPrimitiveElement(Document* document, ElementID id)
++    : SVGElement(document, id)
++    , m_x(PropertyID::X, LengthDirection::Horizontal, LengthNegativeMode::Allow)
++    , m_y(PropertyID::Y, LengthDirection::Vertical, LengthNegativeMode::Allow)
++    , m_width(PropertyID::Width, LengthDirection::Horizontal, LengthNegativeMode::Forbid)
++    , m_height(PropertyID::Height, LengthDirection::Vertical, LengthNegativeMode::Forbid)
++{
++    addProperty(m_x);
++    addProperty(m_y);
++    addProperty(m_width);
++    addProperty(m_height);
++}
++
++void SVGFilterPrimitiveElement::layoutElement(const SVGLayoutState& state)
++{
++    m_floodColor = state.flood_color();
++    m_floodOpacity = state.flood_opacity();
++    m_linearRGB = state.color_interpolation_filters_linear();
++    SVGElement::layoutElement(state);
++}
++
++// ---- entry points ----
++
++namespace {
++
++bool hasPrimitiveChild(const SVGElement* e)
++{
++    for(const auto& child : e->children()) {
++        auto c = toSVGElement(child);
++        if(c && isPrimitive(c->id()))
++            return true;
++    }
++    return false;
++}
++
++enum class RunStatus { Ok, Nothing, Unfiltered };
++
++// Run one <filter> with `given` (or the canvas) as its SourceGraphic.
++RunStatus runFilterElement(const Context& base, const SVGFilterElement* filter, const ImageRef& given, ImageRef& result)
++{
++    Context ctx = base;
++    ctx.region = IRect{0, 0, ctx.w, ctx.h};
++    ctx.userRegion = filter->filterRegion(ctx.element);
++    if(ctx.userRegion.isEmpty())
++        return RunStatus::Nothing;
++    ctx.region = toPixels(ctx, ctx.userRegion);
++    if(ctx.region.empty())
++        return RunStatus::Nothing;
++    ctx.primitiveUnits = filter->attributeSource(PropertyID::PrimitiveUnits)->primitiveUnits();
++    if(ctx.primitiveUnits == Units::ObjectBoundingBox && ctx.bbox.isEmpty())
++        return RunStatus::Nothing;
++    FilterRun run(ctx, given);
++    int count = 0;
++    for(const auto& child : filter->primitivesSource()->children()) {
++        auto e = toSVGElement(child);
++        if(!e || !isPrimitive(e->id()))
++            continue;
++        if(++count > g_limits.maxPrimitives)
++            break;
++        if(!chargeWork(ctx.region.x1 - ctx.region.x0, ctx.region.y1 - ctx.region.y0, workWeight(e->id())))
++            return RunStatus::Unfiltered;  // over the render's work budget
++        if(!run.run(static_cast<const SVGFilterPrimitiveElement*>(e), count == 1))
++            return RunStatus::Unfiltered;  // over the memory budget
++    }
++    if(count == 0)
++        return RunStatus::Nothing;  // an empty filter: transparent
++    result = convert(run.last(), false);
++    return result ? RunStatus::Ok : RunStatus::Unfiltered;
++}
++
++} // namespace
++
++void resetFilterWork()
++{
++    g_work = 0.0;
++}
++
++bool parseFilterFunctions(const std::string& value, const SVGElement* element)
++{
++    return parseFunctions(value, element, nullptr);
++}
++
++Rect filterFunctionsRegion(const SVGElement* element, const Rect& box)
++{
++    // Filter functions have no filter region: the paint box grown by what
++    // blurs and shadows can reach (and a url()'s filter region).
++    std::vector<FilterFunction> fns;
++    if(!parseFunctions(element->filterFunctions(), element, &fns))
++        return box;
++    Rect r = box;
++    for(const auto& fn : fns) {
++        if(fn.type == FunctionType::Blur) {
++            r.inflate(3.f * fn.value);
++        } else if(fn.type == FunctionType::DropShadow) {
++            Rect s = r;
++            s.x += fn.dx;
++            s.y += fn.dy;
++            s.inflate(3.f * fn.value);
++            r.unite(s);
++        } else if(fn.type == FunctionType::Url) {
++            if(auto filter = element->getFilter(fn.id))
++                r.unite(filter->filterRegion(element));
++        }
++    }
++    if(!std::isfinite(r.x) || !std::isfinite(r.y) || !std::isfinite(r.w) || !std::isfinite(r.h))
++        return box;
++    return r;
++}
++
++// How far (device px) a filter can move content: 3 deviations per blur plus
++// every offset, summed over the primitives (an upper bound).
++float filterReach(const SVGElement* element, const Transform& ctm)
++{
++    const auto& m = ctm.matrix();
++    float sx = std::sqrt(m.a * m.a + m.b * m.b);
++    float sy = std::sqrt(m.c * m.c + m.d * m.d);
++    float s = std::max(sx, sy);
++    Rect bbox = element->fillBoundingBox();
++    double reach = 0.0;
++    auto blur = [&](float sdx, float sdy, bool obb) {
++        if(obb) {
++            sdx *= bbox.w;
++            sdy *= bbox.h;
++        }
++        float d = std::max(std::abs(sdx) * sx, std::abs(sdy) * sy);
++        reach += 3.0 * std::min(g_limits.maxBlur, finiteOr(d, g_limits.maxBlur));
++    };
++    auto shift = [&](float dx, float dy, bool obb) {
++        if(obb) {
++            dx *= bbox.w;
++            dy *= bbox.h;
++        }
++        reach += double(finiteOr(std::abs(dx) + std::abs(dy), 1e9f)) * s;
++    };
++    auto walk = [&](const SVGFilterElement* filter) {
++        bool obb = filter->attributeSource(PropertyID::PrimitiveUnits)->primitiveUnits() == Units::ObjectBoundingBox;
++        int count = 0;
++        for(const auto& child : filter->primitivesSource()->children()) {
++            auto e = toSVGElement(child);
++            if(!e || !isPrimitive(e->id()) || ++count > g_limits.maxPrimitives)
++                continue;
++            float sdy;
++            bool ok;
++            if(e->id() == ElementID::FeGaussianBlur) {
++                float sdx = stdDeviationPair(e, 0.f, sdy, ok);
++                blur(sdx, sdy, obb);
++            } else if(e->id() == ElementID::FeDropShadow) {
++                float sdx = stdDeviationPair(e, 2.f, sdy, ok);
++                blur(sdx, sdy, obb);
++                shift(numberAttr(e, PropertyID::Dx, 2.f, true), numberAttr(e, PropertyID::Dy, 2.f, true), obb);
++            } else if(e->id() == ElementID::FeOffset) {
++                shift(numberAttr(e, PropertyID::Dx, 0.f, true), numberAttr(e, PropertyID::Dy, 0.f, true), obb);
++            }
++        }
++    };
++    if(auto filter = element->filter()) {
++        walk(filter);
++    } else {
++        std::vector<FilterFunction> fns;
++        parseFunctions(element->filterFunctions(), element, &fns);
++        for(const auto& fn : fns) {
++            if(fn.type == FunctionType::Blur) {
++                blur(fn.value, fn.value, false);
++            } else if(fn.type == FunctionType::DropShadow) {
++                blur(fn.value, fn.value, false);
++                shift(fn.dx, fn.dy, false);
++            } else if(fn.type == FunctionType::Url) {
++                if(auto f = element->getFilter(fn.id))
++                    walk(f);
++            }
++        }
++    }
++    return float(std::min(reach, 1e7));
++}
++
++Rect filterCanvasRect(const SVGElement* element, const Rect& region, const Rect& extents, const Transform& ctm)
++{
++    if(!region.isValid() || region.isEmpty())
++        return Rect::Empty;
++    // Only what the filter can bring into the visible canvas: the canvas
++    // grown by the filter's reach (blurs, offsets), within the region.
++    Rect near = extents;
++    near.inflate(filterReach(element, ctm) + 1.f);
++    near.intersect(region);
++    return near;
++}
++
++bool applyFilter(const SVGElement* element, Canvas& canvas, const Transform& ctm)
++{
++    if(element->hasInvalidFilter())
++        return false;
++    auto* surface = canvas.surface();
++    int w = plutovg_surface_get_width(surface);
++    int h = plutovg_surface_get_height(surface);
++    if(double(w) * double(h) > g_limits.maxPixels || w <= 1 || h <= 1)
++        return true;  // over the limit (or no canvas): drawn unfiltered
++    if(plutovg_surface_get_stride(surface) != w * 4)
++        return true;
++
++    Context ctx;
++    ctx.element = element;
++    ctx.ctm = ctm;
++    ctx.w = w;
++    ctx.h = h;
++    ctx.ox = float(canvas.x());
++    ctx.oy = float(canvas.y());
++    const auto& m = ctm.matrix();
++    ctx.sx = std::sqrt(m.a * m.a + m.b * m.b);
++    ctx.sy = std::sqrt(m.c * m.c + m.d * m.d);
++    ctx.source = reinterpret_cast<uint32_t*>(plutovg_surface_get_data(surface));
++    ctx.bbox = element->fillBoundingBox();
++    ctx.region = IRect{0, 0, w, h};
++
++    ImageRef result;
++    if(const auto* filter = element->filter()) {
++        auto status = runFilterElement(ctx, filter, nullptr, result);
++        if(status == RunStatus::Nothing)
++            return false;
++        if(status == RunStatus::Unfiltered)
++            return true;
++    } else {
++        std::vector<FilterFunction> fns;
++        if(!parseFunctions(element->filterFunctions(), element, &fns))
++            return true;
++        auto inverse = ctm;
++        inverse.invert();
++        ctx.userRegion = inverse.mapRect(Rect(ctx.ox, ctx.oy, float(w), float(h)));
++        FilterRun run(ctx);
++        result = run.sourceGraphic();
++        for(const auto& fn : fns) {
++            if(!result)
++                return true;
++            if(fn.type == FunctionType::Url) {
++                // A url() in a list runs that filter on the result so far; one
++                // that names no <filter> is skipped.
++                auto filter = element->getFilter(fn.id);
++                if(!filter)
++                    continue;
++                ImageRef next;
++                auto status = runFilterElement(ctx, filter, result, next);
++                if(status == RunStatus::Unfiltered)
++                    return true;
++                if(status == RunStatus::Nothing)
++                    return false;
++                result = next;
++                continue;
++            }
++            if(!chargeWork(w, h, fn.type == FunctionType::Blur ? 4 : fn.type == FunctionType::DropShadow ? 8 : 2))
++                return true;
++            result = runFunction(ctx, fn, result);
++        }
++    }
++    if(!result)
++        return true;
++
++    auto* px = ctx.source;
++    for(int y = 0; y < h; y++) {
++        uint32_t* row = px + size_t(y) * w;
++        if(y < result->sub.y0 || y >= result->sub.y1) {
++            std::memset(row, 0, size_t(w) * 4);
++            continue;
++        }
++        const uint32_t* src = result->px + size_t(y) * w;
++        std::memset(row, 0, size_t(result->sub.x0) * 4);
++        std::memcpy(row + result->sub.x0, src + result->sub.x0, size_t(result->sub.x1 - result->sub.x0) * 4);
++        std::memset(row + result->sub.x1, 0, size_t(w - result->sub.x1) * 4);
++    }
++    return true;
++}
++
++} // namespace lunasvg
++
++extern "C" void lunasvg_set_filter_limits(double max_region_pixels, float max_blur_px, int max_primitives, size_t max_bytes, double max_work_pixels)
++{
++    using lunasvg::g_limits;
++    if(max_region_pixels > 0)
++        g_limits.maxPixels = max_region_pixels;
++    if(max_blur_px > 0)
++        g_limits.maxBlur = max_blur_px;
++    if(max_primitives > 0)
++        g_limits.maxPrimitives = max_primitives;
++    if(max_bytes > 0)
++        g_limits.maxBytes = max_bytes;
++    if(max_work_pixels > 0)
++        g_limits.maxWork = max_work_pixels;
++}
+--- /dev/null
++++ b/source/svgfilterelement.h
+@@ -0,0 +1,97 @@
++// cctext patch (0006-filters.patch): SVG / CSS filter effects for lunasvg.
++//
++// <filter> with feGaussianBlur, feOffset, feFlood, feMerge, feComposite,
++// feColorMatrix, feBlend, feComponentTransfer and feDropShadow, filter
++// regions and primitive subregions in objectBoundingBox or userSpaceOnUse
++// units, color-interpolation-filters (linearRGB / sRGB), and the CSS filter
++// functions (blur(), drop-shadow(), grayscale(), ...). The other primitives
++// (feImage, feTile, feTurbulence, feMorphology, lighting, ...) pass their
++// input through.
++//
++// A filter runs in device pixels on the element's offscreen canvas: blur
++// deviations and offsets are scaled by the current transform (a rotated or
++// skewed element blurs along the device axes). Its cost is bounded by
++// lunasvg_set_filter_limits(): the filter region's pixels, the blur
++// deviation, the primitives per filter and the bytes of live intermediate
++// images.
++#ifndef LUNASVG_SVGFILTERELEMENT_H
++#define LUNASVG_SVGFILTERELEMENT_H
++
++#include "svgelement.h"
++
++namespace lunasvg {
++
++class SVGFilterElement final : public SVGElement, public SVGURIReference {
++public:
++    SVGFilterElement(Document* document);
++
++    // xlink:href: attributes and primitives missing here come from the
++    // referenced <filter> (a chain, cycles ignored).
++    const SVGFilterElement* attributeSource(PropertyID id) const;
++    const SVGFilterElement* primitivesSource() const;
++
++    const SVGLength& x() const { return m_x; }
++    const SVGLength& y() const { return m_y; }
++    const SVGLength& width() const { return m_width; }
++    const SVGLength& height() const { return m_height; }
++    Units filterUnits() const { return m_filterUnits.value(); }
++    Units primitiveUnits() const { return m_primitiveUnits.value(); }
++
++    // The filter region in the user space of `element` (empty: not rendered).
++    Rect filterRegion(const SVGElement* element) const;
++
++private:
++    SVGLength m_x;
++    SVGLength m_y;
++    SVGLength m_width;
++    SVGLength m_height;
++    SVGEnumeration<Units> m_filterUnits;
++    SVGEnumeration<Units> m_primitiveUnits;
++};
++
++class SVGFilterPrimitiveElement final : public SVGElement {
++public:
++    SVGFilterPrimitiveElement(Document* document, ElementID id);
++
++    const SVGLength& x() const { return m_x; }
++    const SVGLength& y() const { return m_y; }
++    const SVGLength& width() const { return m_width; }
++    const SVGLength& height() const { return m_height; }
++
++    const Color& floodColor() const { return m_floodColor; }
++    float floodOpacity() const { return m_floodOpacity; }
++    bool linearRGB() const { return m_linearRGB; }
++
++    void layoutElement(const SVGLayoutState& state) final;
++
++private:
++    SVGLength m_x;
++    SVGLength m_y;
++    SVGLength m_width;
++    SVGLength m_height;
++    Color m_floodColor = Color::Black;
++    float m_floodOpacity = 1.f;
++    bool m_linearRGB = true;
++};
++
++// CSS filter functions ("blur(2px) grayscale(50%)"): true when `value` is a
++// valid list (`element` resolves lengths; may be null to only validate).
++bool parseFilterFunctions(const std::string& value, const SVGElement* element);
++// The region filter functions paint for an element whose paint box is `box`.
++Rect filterFunctionsRegion(const SVGElement* element, const Rect& box);
++
++// The offscreen canvas rect (device) for `element`, filtered, whose paint box
++// maps to `region`, drawn onto a canvas with `extents` under `ctm`: the part
++// of the region its blurs and offsets can bring into view.
++Rect filterCanvasRect(const SVGElement* element, const Rect& region, const Rect& extents, const Transform& ctm);
++
++// Run `element`'s filter on `canvas` (its SourceGraphic) in place; `ctm` maps
++// the element's user space to device pixels. False: draw nothing.
++bool applyFilter(const SVGElement* element, Canvas& canvas, const Transform& ctm);
++
++// Start a render's filter work budget (Document::render).
++void resetFilterWork();
++
++} // namespace lunasvg
++
++#endif // LUNASVG_SVGFILTERELEMENT_H
+--- a/source/svglayoutstate.cpp
++++ b/source/svglayoutstate.cpp
+@@ -439,12 +439,22 @@
+     , m_marker_mid(parent.marker_mid())
+     , m_marker_end(parent.marker_end())
+     , m_font_family(parent.font_family())
++    , m_cif_linear(parent.color_interpolation_filters_linear())
+ {
+     for(const auto& attribute : element->attributes()) {
+         std::string_view input(attribute.value());
+         stripLeadingAndTrailingSpaces(input);
+-        if(input.empty() || input.compare("inherit") == 0)
++        if(input.empty())
+             continue;
++        if(input.compare("inherit") == 0) {
++            // cctext patch: the non-inherited filter properties can inherit
++            // explicitly.
++            if(attribute.id() == PropertyID::Flood_Color)
++                m_flood_color = parent.flood_color();
++            else if(attribute.id() == PropertyID::Flood_Opacity)
++                m_flood_opacity = parent.flood_opacity();
++            continue;
++        }
+         switch(attribute.id()) {
+         case PropertyID::Fill:
+             m_fill = parsePaint(input, this, Color::Black);
+@@ -548,6 +558,30 @@
+         case PropertyID::Mask_Type:
+             m_mask_type = parseMaskType(input);
+             break;
++        case PropertyID::Filter:
++            // cctext patch: "none", url(#id) or CSS filter functions (kept raw;
++            // svgfilterelement.cpp parses the functions).
++            if(input.compare("none") != 0) {
++                m_has_filter = true;
++                m_filter = parseUrl(input);
++                if(m_filter.empty())
++                    m_filter.assign(input);
++                else
++                    m_filter.insert(0, 1, '#');
++            }
++            break;
++        case PropertyID::Flood_Color:
++            m_flood_color = parseColor(input, this, Color::Black);
++            break;
++        case PropertyID::Flood_Opacity:
++            m_flood_opacity = parseNumberOrPercentage(input, true, 1.f);
++            break;
++        case PropertyID::Color_Interpolation_Filters:
++            if(input.compare("sRGB") == 0 || input.compare("auto") == 0)
++                m_cif_linear = false;
++            else if(input.compare("linearRGB") == 0)
++                m_cif_linear = true;
++            break;
+         case PropertyID::Mask:
+             m_mask = parseUrl(input);
+             break;
+--- a/source/svglayoutstate.h
++++ b/source/svglayoutstate.h
+@@ -58,6 +58,13 @@
+     PointerEvents pointer_events() const { return m_pointer_events; }
+     MaskType mask_type() const { return m_mask_type; }
+ 
++    // cctext patch: filter effects.
++    const std::string& filter() const { return m_filter; }
++    bool has_filter() const { return m_has_filter; }
++    const Color& flood_color() const { return m_flood_color; }
++    float flood_opacity() const { return m_flood_opacity; }
++    bool color_interpolation_filters_linear() const { return m_cif_linear; }
++
+     const std::string& mask() const { return m_mask; }
+     const std::string& clip_path() const { return m_clip_path; }
+     const std::string& marker_start() const { return m_marker_start; }
+@@ -116,6 +123,12 @@
+     PointerEvents m_pointer_events = PointerEvents::Auto;
+     MaskType m_mask_type = MaskType::Luminance;
+ 
++    std::string m_filter;
++    bool m_has_filter = false;
++    Color m_flood_color = Color::Black;
++    float m_flood_opacity = 1.f;
++    bool m_cif_linear = true;
++
+     std::string m_mask;
+     std::string m_clip_path;
+     std::string m_marker_start;
+--- a/source/svgproperty.cpp
++++ b/source/svgproperty.cpp
+@@ -12,6 +12,7 @@
+         std::string_view name;
+         PropertyID value;
+     } table[] = {
++        {"amplitude", PropertyID::Amplitude},
+         {"class", PropertyID::Class},
+         {"clipPathUnits", PropertyID::ClipPathUnits},
+         {"cx", PropertyID::Cx},
+@@ -19,6 +20,8 @@
+         {"d", PropertyID::D},
+         {"dx", PropertyID::Dx},
+         {"dy", PropertyID::Dy},
++        {"exponent", PropertyID::Exponent},
++        {"filterUnits", PropertyID::FilterUnits},
+         {"fx", PropertyID::Fx},
+         {"fy", PropertyID::Fy},
+         {"gradientTransform", PropertyID::GradientTransform},
+@@ -26,29 +29,46 @@
+         {"height", PropertyID::Height},
+         {"href", PropertyID::Href},
+         {"id", PropertyID::Id},
++        {"in", PropertyID::In},
++        {"in2", PropertyID::In2},
++        {"intercept", PropertyID::Intercept},
++        {"k1", PropertyID::K1},
++        {"k2", PropertyID::K2},
++        {"k3", PropertyID::K3},
++        {"k4", PropertyID::K4},
+         {"lengthAdjust", PropertyID::LengthAdjust},
+         {"markerHeight", PropertyID::MarkerHeight},
+         {"markerUnits", PropertyID::MarkerUnits},
+         {"markerWidth", PropertyID::MarkerWidth},
+         {"maskContentUnits", PropertyID::MaskContentUnits},
+         {"maskUnits", PropertyID::MaskUnits},
++        {"mode", PropertyID::Mode},
+         {"offset", PropertyID::Offset},
++        {"operator", PropertyID::Operator},
+         {"orient", PropertyID::Orient},
+         {"patternContentUnits", PropertyID::PatternContentUnits},
+         {"patternTransform", PropertyID::PatternTransform},
+         {"patternUnits", PropertyID::PatternUnits},
+         {"points", PropertyID::Points},
+         {"preserveAspectRatio", PropertyID::PreserveAspectRatio},
++        {"primitiveUnits", PropertyID::PrimitiveUnits},
+         {"r", PropertyID::R},
++        {"radius", PropertyID::Radius},
+         {"refX", PropertyID::RefX},
+         {"refY", PropertyID::RefY},
++        {"result", PropertyID::Result},
+         {"rotate", PropertyID::Rotate},
+         {"rx", PropertyID::Rx},
+         {"ry", PropertyID::Ry},
++        {"slope", PropertyID::Slope},
+         {"spreadMethod", PropertyID::SpreadMethod},
++        {"stdDeviation", PropertyID::StdDeviation},
+         {"style", PropertyID::Style},
++        {"tableValues", PropertyID::TableValues},
+         {"textLength", PropertyID::TextLength},
+         {"transform", PropertyID::Transform},
++        {"type", PropertyID::Type},
++        {"values", PropertyID::Values},
+         {"viewBox", PropertyID::ViewBox},
+         {"width", PropertyID::Width},
+         {"x", PropertyID::X},
+@@ -78,12 +98,16 @@
+         {"clip-path", PropertyID::Clip_Path},
+         {"clip-rule", PropertyID::Clip_Rule},
+         {"color", PropertyID::Color},
++        {"color-interpolation-filters", PropertyID::Color_Interpolation_Filters},
+         {"direction", PropertyID::Direction},
+         {"display", PropertyID::Display},
+         {"dominant-baseline", PropertyID::Dominant_Baseline},
+         {"fill", PropertyID::Fill},
+         {"fill-opacity", PropertyID::Fill_Opacity},
+         {"fill-rule", PropertyID::Fill_Rule},
++        {"filter", PropertyID::Filter},
++        {"flood-color", PropertyID::Flood_Color},
++        {"flood-opacity", PropertyID::Flood_Opacity},
+         {"font-family", PropertyID::Font_Family},
+         {"font-size", PropertyID::Font_Size},
+         {"font-style", PropertyID::Font_Style},
+--- a/source/svgproperty.h
++++ b/source/svgproperty.h
+@@ -93,7 +93,32 @@
+     X2,
+     Y,
+     Y1,
+-    Y2
++    Y2,
++    // cctext patch: filter effects (svgfilterelement.cpp reads these raw).
++    Amplitude,
++    Color_Interpolation_Filters,
++    Exponent,
++    Filter,
++    FilterUnits,
++    Flood_Color,
++    Flood_Opacity,
++    In,
++    In2,
++    Intercept,
++    K1,
++    K2,
++    K3,
++    K4,
++    Mode,
++    Operator,
++    PrimitiveUnits,
++    Radius,
++    Result,
++    Slope,
++    StdDeviation,
++    TableValues,
++    Type,
++    Values
+ };
+ 
+ PropertyID propertyid(std::string_view name);
+--- a/source/svgrenderstate.cpp
++++ b/source/svgrenderstate.cpp
+@@ -1,4 +1,5 @@
+ #include "svgrenderstate.h"
++#include "svgfilterelement.h"
+ 
+ namespace lunasvg {
+ 
+@@ -7,11 +8,13 @@
+     , m_masker(element->masker())
+     , m_opacity(element->opacity())
+ {
++    if(element->filter() || element->hasInvalidFilter() || !element->filterFunctions().empty())
++        m_filtered = element;
+ }
+ 
+ bool SVGBlendInfo::requiresCompositing(SVGRenderMode mode) const
+ {
+-    return (m_clipper && m_clipper->requiresMasking()) || (mode == SVGRenderMode::Painting && (m_masker || m_opacity < 1.f));
++    return (m_clipper && m_clipper->requiresMasking()) || (mode == SVGRenderMode::Painting && (m_masker || m_opacity < 1.f || m_filtered));
+ }
+ 
+ bool SVGRenderState::hasCycleReference(const SVGElement* element) const
+@@ -30,7 +33,13 @@
+     auto requiresCompositing = blendInfo.requiresCompositing(m_mode);
+     if(requiresCompositing) {
+         auto boundingBox = m_currentTransform.mapRect(m_element->paintBoundingBox());
+-        boundingBox.intersect(m_canvas->extents());
++        // cctext patch: a filter reads pixels outside the visible canvas
++        // (offsets and blurs bring them in), so its canvas covers the whole
++        // filter region when that fits the filter pixel limit.
++        if(m_mode == SVGRenderMode::Painting && blendInfo.filtered())
++            boundingBox = filterCanvasRect(blendInfo.filtered(), boundingBox, m_canvas->extents(), m_currentTransform);
++        else
++            boundingBox.intersect(m_canvas->extents());
+         m_canvas = Canvas::create(boundingBox);
+     } else {
+         m_canvas->save();
+@@ -49,6 +58,12 @@
+     }
+ 
+     auto opacity = m_mode == SVGRenderMode::Clipping ? 1.f : blendInfo.opacity();
++    if(m_mode == SVGRenderMode::Painting && blendInfo.filtered()) {
++        // cctext patch: the filter runs first, then clipping, masking and
++        // opacity (Filter Effects 1, 2 and CSS Masking 1).
++        if(!applyFilter(blendInfo.filtered(), *m_canvas, m_currentTransform))
++            return;
++    }
+     if(blendInfo.clipper())
+         blendInfo.clipper()->applyClipMask(*this);
+     if(m_mode == SVGRenderMode::Painting && blendInfo.masker()) {
+--- a/source/svgrenderstate.h
++++ b/source/svgrenderstate.h
+@@ -21,11 +21,14 @@
+     const SVGClipPathElement* clipper() const { return m_clipper; }
+     const SVGMaskElement* masker() const { return m_masker; }
+     float opacity() const { return m_opacity; }
++    // cctext patch: the element whose filter (or invalid filter) applies.
++    const SVGElement* filtered() const { return m_filtered; }
+ 
+ private:
+     const SVGClipPathElement* m_clipper;
+     const SVGMaskElement* m_masker;
+     const float m_opacity;
++    const SVGElement* m_filtered = nullptr;
+ };
+ 
+ class SVGRenderState {

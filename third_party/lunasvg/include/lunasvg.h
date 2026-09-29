@@ -124,6 +124,18 @@ LUNASVG_API bool lunasvg_add_font_face_from_file(const char* family, bool bold, 
 * @param closure User-defined pointer passed to the `destroy_func` callback.
 * @return `true` if the font face was successfully added to the cache, `false` otherwise.
 */
+/**
+ * @brief cctext patch: bounds on filter effects (0 keeps a value).
+ *
+ * @param max_region_pixels a filter region (device pixels) over this draws unfiltered
+ * @param max_blur_px blur standard deviations are clamped to this (device pixels)
+ * @param max_primitives primitives past this many in one filter are ignored
+ * @param max_bytes live intermediate images past this draw the element unfiltered
+ * @param max_work_pixels one render's filter work (primitives x region pixels);
+ *        past it the remaining filtered elements draw unfiltered
+ */
+LUNASVG_API void lunasvg_set_filter_limits(double max_region_pixels, float max_blur_px, int max_primitives, size_t max_bytes, double max_work_pixels);
+
 LUNASVG_API bool lunasvg_add_font_face_from_data(const char* family, bool bold, bool italic, const void* data, size_t length, lunasvg_destroy_func_t destroy_func, void* closure);
 
 #ifdef __cplusplus

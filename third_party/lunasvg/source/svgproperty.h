@@ -93,7 +93,32 @@ enum class PropertyID : uint8_t {
     X2,
     Y,
     Y1,
-    Y2
+    Y2,
+    // cctext patch: filter effects (svgfilterelement.cpp reads these raw).
+    Amplitude,
+    Color_Interpolation_Filters,
+    Exponent,
+    Filter,
+    FilterUnits,
+    Flood_Color,
+    Flood_Opacity,
+    In,
+    In2,
+    Intercept,
+    K1,
+    K2,
+    K3,
+    K4,
+    Mode,
+    Operator,
+    PrimitiveUnits,
+    Radius,
+    Result,
+    Slope,
+    StdDeviation,
+    TableValues,
+    Type,
+    Values
 };
 
 PropertyID propertyid(std::string_view name);

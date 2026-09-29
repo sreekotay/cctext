@@ -1,0 +1,202 @@
+cctext patch 0004: kerning.
+
+plutovg advanced every glyph by its advance width alone: text came out a
+little wider than a browser's, labels ("AV", "To", "y.") visibly loose, and
+Mermaid's box sizes (measured through the same code) drifted from
+Chromium's. Text now goes through one layout function
+(plutovg_font_face_layout) that adds the pair adjustment stb_truetype
+reads from the font -- GPOS pair positioning (formats 1 and 2), else the
+kern table -- between consecutive glyphs; drawing
+(plutovg_canvas_add_text / fill_text / stroke_text) and measuring
+(plutovg_font_face_text_extents) share it, so what lunasvg measures is
+what it draws. New API: plutovg_font_face_get_text_path and
+plutovg_font_face_traverse_text_path (a run's outline as drawn).
+
+resvg's test suite: text 59 -> 188 of 379 (the suite renders with kerning
+on, as browsers do).
+
+Apply after 0003.
+
+--- a/include/plutovg.h
++++ b/include/plutovg.h
+@@ -894,6 +894,14 @@
+ PLUTOVG_API float plutovg_font_face_text_extents(plutovg_font_face_t* face, float size, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_rect_t* extents);
+ 
+ /**
++ * @brief cctext patch: the path of a text run as it is drawn (kerned).
++ *
++ * @return The total advance width of the text.
++ */
++PLUTOVG_API float plutovg_font_face_get_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_path_t* path);
++PLUTOVG_API float plutovg_font_face_traverse_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_path_traverse_func_t traverse_func, void* closure);
++
++/**
+  * @brief Represents a cache of loaded font faces.
+  */
+ typedef struct plutovg_font_face_cache plutovg_font_face_cache_t;
+--- a/source/plutovg-canvas.c
++++ b/source/plutovg-canvas.c
+@@ -664,20 +664,14 @@
+     return 0.f;
+ }
+ 
++/* cctext patch 0004: text goes through the face's layout (kerning; with
++ * 0005, per-glyph fallback faces). */
+ float plutovg_canvas_add_text(plutovg_canvas_t* canvas, const void* text, int length, plutovg_text_encoding_t encoding, float x, float y)
+ {
+     plutovg_state_t* state = canvas->state;
+     if(state->font_face == NULL || state->font_size <= 0.f)
+         return 0.f;
+-    plutovg_text_iterator_t it;
+-    plutovg_text_iterator_init(&it, text, length, encoding);
+-    float advance_width = 0.f;
+-    while(plutovg_text_iterator_has_next(&it)) {
+-        plutovg_codepoint_t codepoint = plutovg_text_iterator_next(&it);
+-        advance_width += plutovg_font_face_get_glyph_path(state->font_face, state->font_size, x + advance_width, y, codepoint, canvas->path);
+-    }
+-
+-    return advance_width;
++    return plutovg_font_face_get_text_path(state->font_face, state->font_size, x, y, text, length, encoding, canvas->path);
+ }
+ 
+ float plutovg_canvas_fill_text(plutovg_canvas_t* canvas, const void* text, int length, plutovg_text_encoding_t encoding, float x, float y)
+--- a/source/plutovg-font.c
++++ b/source/plutovg-font.c
+@@ -458,52 +458,104 @@
+     return glyph->advance_width * scale;
+ }
+ 
+-float plutovg_font_face_text_extents(plutovg_font_face_t* face, float size, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_rect_t* extents)
++/* cctext patch 0004: kerning (the font's GPOS pair adjustments or its kern
++ * table, through stb_truetype) between two glyphs of one face, font units. */
++static int plutovg_font_face_kerning(plutovg_font_face_t* face, int glyph1, int glyph2)
++{
++    if(glyph1 <= 0 || glyph2 <= 0 || (!face->info.gpos && !face->info.kern))
++        return 0;
++    return stbtt_GetGlyphKernAdvance(&face->info, glyph1, glyph2);
++}
++
++typedef void (*plutovg_glyph_func_t)(void* closure, plutovg_font_face_t* face, plutovg_codepoint_t codepoint, plutovg_glyph_t* glyph, float x);
++
++/* Lay out text: each glyph's pen x, kerned against the previous glyph;
++ * func is called per glyph. Returns the total advance. */
++static float plutovg_font_face_layout(plutovg_font_face_t* face, float size, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_glyph_func_t func, void* closure)
+ {
+     plutovg_text_iterator_t it;
+     plutovg_text_iterator_init(&it, text, length, encoding);
+-    plutovg_rect_t* text_extents = NULL;
+-    float total_advance_width = 0.f;
++    float x = 0.f;
++    float scale = plutovg_font_face_get_scale(face, size);
++    int last_index = 0;
+     while(plutovg_text_iterator_has_next(&it)) {
+         plutovg_codepoint_t codepoint = plutovg_text_iterator_next(&it);
++        plutovg_glyph_t* glyph = plutovg_font_face_get_glyph(face, codepoint);
++        x += plutovg_font_face_kerning(face, last_index, glyph->index) * scale;
++        if(func)
++            func(closure, face, codepoint, glyph, x);
++        x += glyph->advance_width * scale;
++        last_index = glyph->index;
++    }
++    return x;
++}
++
++typedef struct {
++    float size;
++    float x;
++    float y;
++    plutovg_path_traverse_func_t traverse_func;
++    void* closure;
++} plutovg_text_path_closure_t;
++
++static void plutovg_text_path_glyph(void* closure, plutovg_font_face_t* face, plutovg_codepoint_t codepoint, plutovg_glyph_t* glyph, float x)
++{
++    plutovg_text_path_closure_t* c = closure;
++    plutovg_font_face_traverse_glyph_path(face, c->size, c->x + x, c->y, codepoint, c->traverse_func, c->closure);
++}
+ 
+-        float advance_width;
+-        if(extents == NULL) {
+-            plutovg_font_face_get_glyph_metrics(face, size, codepoint, &advance_width, NULL, NULL);
+-            total_advance_width += advance_width;
+-            continue;
+-        }
+-
+-        plutovg_rect_t glyph_extents;
+-        plutovg_font_face_get_glyph_metrics(face, size, codepoint, &advance_width, NULL, &glyph_extents);
+-
+-        glyph_extents.x += total_advance_width;
+-        total_advance_width += advance_width;
+-        if(text_extents == NULL) {
+-            text_extents = extents;
+-            *text_extents = glyph_extents;
+-            continue;
+-        }
+-
+-        float x1 = plutovg_min(text_extents->x, glyph_extents.x);
+-        float y1 = plutovg_min(text_extents->y, glyph_extents.y);
+-        float x2 = plutovg_max(text_extents->x + text_extents->w, glyph_extents.x + glyph_extents.w);
+-        float y2 = plutovg_max(text_extents->y + text_extents->h, glyph_extents.y + glyph_extents.h);
+-
+-        text_extents->x = x1;
+-        text_extents->y = y1;
+-        text_extents->w = x2 - x1;
+-        text_extents->h = y2 - y1;
++float plutovg_font_face_traverse_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_path_traverse_func_t traverse_func, void* closure)
++{
++    plutovg_text_path_closure_t c = {size, x, y, traverse_func, closure};
++    return plutovg_font_face_layout(face, size, text, length, encoding, plutovg_text_path_glyph, &c);
++}
++
++float plutovg_font_face_get_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_path_t* path)
++{
++    return plutovg_font_face_traverse_text_path(face, size, x, y, text, length, encoding, glyph_traverse_func, path);
++}
++
++typedef struct {
++    float size;
++    plutovg_rect_t* extents;
++    bool have;
++} plutovg_text_extents_closure_t;
++
++static void plutovg_text_extents_glyph(void* closure, plutovg_font_face_t* face, plutovg_codepoint_t codepoint, plutovg_glyph_t* glyph, float x)
++{
++    plutovg_text_extents_closure_t* c = closure;
++    float scale = plutovg_font_face_get_scale(face, c->size);
++    plutovg_rect_t g;
++    g.x = glyph->x1 * scale + x;
++    g.y = glyph->y2 * -scale;
++    g.w = (glyph->x2 - glyph->x1) * scale;
++    g.h = (glyph->y1 - glyph->y2) * -scale;
++    if(!c->have) {
++        *c->extents = g;
++        c->have = true;
++        return;
+     }
++    float x1 = plutovg_min(c->extents->x, g.x);
++    float y1 = plutovg_min(c->extents->y, g.y);
++    float x2 = plutovg_max(c->extents->x + c->extents->w, g.x + g.w);
++    float y2 = plutovg_max(c->extents->y + c->extents->h, g.y + g.h);
++    c->extents->x = x1;
++    c->extents->y = y1;
++    c->extents->w = x2 - x1;
++    c->extents->h = y2 - y1;
++}
+ 
+-    if(extents && !text_extents) {
++float plutovg_font_face_text_extents(plutovg_font_face_t* face, float size, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_rect_t* extents)
++{
++    plutovg_text_extents_closure_t c = {size, extents, false};
++    float advance = plutovg_font_face_layout(face, size, text, length, encoding, extents ? plutovg_text_extents_glyph : NULL, &c);
++    if(extents && !c.have) {
+         extents->x = 0;
+         extents->y = 0;
+         extents->w = 0;
+         extents->h = 0;
+     }
+-
+-    return total_advance_width;
++    return advance;
+ }
+ 
+ typedef struct plutovg_font_face_entry {

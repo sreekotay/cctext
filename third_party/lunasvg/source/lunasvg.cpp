@@ -1,4 +1,5 @@
 #include "lunasvg.h"
+#include "svgfilterelement.h"
 #include "svgelement.h"
 #include "svgrenderstate.h"
 
@@ -477,6 +478,7 @@ void Document::render(Bitmap& bitmap, const Matrix& matrix) const
         return;
     auto canvas = Canvas::create(bitmap);
     SVGRenderState state(nullptr, nullptr, matrix, SVGRenderMode::Painting, canvas);
+    resetFilterWork();  // cctext patch 0006: each render has its own filter budget
     rootElement(true)->render(state);
 }
 

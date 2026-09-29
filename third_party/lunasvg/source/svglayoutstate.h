@@ -58,6 +58,13 @@ public:
     PointerEvents pointer_events() const { return m_pointer_events; }
     MaskType mask_type() const { return m_mask_type; }
 
+    // cctext patch: filter effects.
+    const std::string& filter() const { return m_filter; }
+    bool has_filter() const { return m_has_filter; }
+    const Color& flood_color() const { return m_flood_color; }
+    float flood_opacity() const { return m_flood_opacity; }
+    bool color_interpolation_filters_linear() const { return m_cif_linear; }
+
     const std::string& mask() const { return m_mask; }
     const std::string& clip_path() const { return m_clip_path; }
     const std::string& marker_start() const { return m_marker_start; }
@@ -115,6 +122,12 @@ private:
     Overflow m_overflow = Overflow::Visible;
     PointerEvents m_pointer_events = PointerEvents::Auto;
     MaskType m_mask_type = MaskType::Luminance;
+
+    std::string m_filter;
+    bool m_has_filter = false;
+    Color m_flood_color = Color::Black;
+    float m_flood_opacity = 1.f;
+    bool m_cif_linear = true;
 
     std::string m_mask;
     std::string m_clip_path;

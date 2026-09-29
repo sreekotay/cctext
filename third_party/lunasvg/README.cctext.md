@@ -23,6 +23,14 @@ reapplies them onto a fresh upstream copy):
 5. `0005-bounded-offscreen-canvas.patch`: offscreen (group, mask,
    pattern) canvases capped at 2^26 px; a failed allocation draws nothing
    instead of dereferencing NULL.
+6. `0006-filters.patch`: filter effects (new `source/svgfilterelement.*`):
+   `<filter>` regions and units, `xlink:href`, feGaussianBlur, feOffset,
+   feFlood, feMerge, feComposite, feColorMatrix, feBlend,
+   feComponentTransfer, feDropShadow, color-interpolation-filters and the
+   CSS filter functions; bounded by `lunasvg_set_filter_limits()`
+   (region pixels, blur deviation, primitives, live image bytes, work per
+   render). Other
+   primitives pass their input through.
 
 Build defines: `LUNASVG_BUILD_STATIC`, `LUNASVG_DISABLE_LOAD_SYSTEM_FONTS`,
 `LUNASVG_DISABLE_EXTERNAL_RESOURCES` (only `data:` images load; an

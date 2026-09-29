@@ -894,6 +894,39 @@ PLUTOVG_API float plutovg_font_face_traverse_glyph_path(plutovg_font_face_t* fac
 PLUTOVG_API float plutovg_font_face_text_extents(plutovg_font_face_t* face, float size, const void* text, int length, plutovg_text_encoding_t encoding, plutovg_rect_t* extents);
 
 /**
+ * @brief cctext patch: adds a face tried, in the order added, for a glyph the
+ * drawing face lacks (text drawing and measuring; at most 16).
+ *
+ * @param face A pointer to a `plutovg_font_face_t` object (referenced).
+ */
+PLUTOVG_API void plutovg_font_face_add_fallback(plutovg_font_face_t* face);
+
+/**
+ * @brief cctext patch: a fallback face loaded the first time a glyph reaches
+ * it (a large face costs nothing until a text needs it).
+ *
+ * @param load Returns the face (its reference is kept) or NULL; called once.
+ * @param closure Passed to `load`.
+ */
+typedef plutovg_font_face_t* (*plutovg_font_face_loader_t)(void* closure);
+PLUTOVG_API void plutovg_font_face_add_fallback_loader(plutovg_font_face_loader_t load, void* closure);
+
+/**
+ * @brief cctext patch: removes every fallback face.
+ */
+PLUTOVG_API void plutovg_font_face_clear_fallbacks(void);
+
+/**
+ * @brief cctext patch: the path of a text run as it is drawn: per-glyph
+ * fallback faces, kerning, synthetic bold (an overstrike, when `embolden`)
+ * and italic (a slant).
+ *
+ * @return The total advance width of the text.
+ */
+PLUTOVG_API float plutovg_font_face_get_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, bool embolden, plutovg_path_t* path);
+PLUTOVG_API float plutovg_font_face_traverse_text_path(plutovg_font_face_t* face, float size, float x, float y, const void* text, int length, plutovg_text_encoding_t encoding, bool embolden, plutovg_path_traverse_func_t traverse_func, void* closure);
+
+/**
  * @brief Represents a cache of loaded font faces.
  */
 typedef struct plutovg_font_face_cache plutovg_font_face_cache_t;

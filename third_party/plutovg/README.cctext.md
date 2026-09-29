@@ -25,6 +25,18 @@ cctext-render fuzz run (ASan + UBSan):
    texture / gradient coordinates clamped before float -> integer
    conversion (a 1e38 translation computed `0 - INT_MIN`); the
    transformed blenders step in 64-bit.
+4. `0004-kerning.patch`: text is laid out by one function shared by
+   drawing and measuring, which adds the font's GPOS pair adjustment (or
+   its kern table) between consecutive glyphs (stb_truetype);
+   `plutovg_font_face_get_text_path` / `_traverse_text_path`.
+5. `0005-glyph-fallback.patch`: a glyph the drawing face lacks comes from
+   the first face registered with `plutovg_font_face_add_fallback` that
+   has it (cctext-render: its regular faces in manifest order, the CJK
+   face last); kerning only within one face.
+6. `0006-synthetic-styles.patch`: a family without the bold / italic
+   face asked for gets a synthetic variant of its closest face (a slant of
+   tan 12 deg, an overstrike of size/24 .. size/32), created once and
+   sharing its data; fallback glyphs get the style their own face lacks.
 
 Build defines: `PLUTOVG_BUILD_STATIC`, `PLUTOVG_DISABLE_FONT_FACE_CACHE_LOAD`
 (no system font scan), `STBI_MAX_DIMENSIONS=16384` (a `data:` image inside
