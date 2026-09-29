@@ -135,7 +135,7 @@ v2.18 (public domain / MIT, `third_party/stb`, pinned in its
   input region set so a partial last block keeps the geometry. The box
   pass is one read of the canvas; below 6:1 it costs more than it saves.
   Against the cubic alone the result differs by at most 6 levels on a
-  sharp-edged test image (12 on the smoke's synthetic 4096² pattern).
+  sharp-edged test image (the smoke allows 12 on its synthetic 4096² pattern).
 - **Orientation after resampling.** The canvas is resized in its coded
   orientation and only the small result is flipped / transposed (a flip
   or transpose commutes with a symmetric separable filter), so no
