@@ -150,6 +150,44 @@ def case_markdown(exe, env, tmp):
         U.stop(p)
 
 
+def case_relative(exe, env, tmp):
+    """Image paths are document relative, not cwd or project-root relative:
+    notes/deck/doc.md opened as `deck/doc.md` from notes/ shows
+    ../../pics/big.png (inside the project: no prompt). img_smoke checks
+    that a project-root-style path does not resolve."""
+    d = os.path.join(tmp, "rel")
+    os.makedirs(os.path.join(d, ".git"), exist_ok=True)
+    os.makedirs(os.path.join(d, "pics"), exist_ok=True)
+    os.makedirs(os.path.join(d, "notes", "deck"), exist_ok=True)
+    shutil.copy(os.path.join(IMG, "big.png"), os.path.join(d, "pics"))
+    with open(os.path.join(d, "notes", "deck", "doc.md"), "wb") as f:
+        f.write(b"# Relative\n\n![up two](../../pics/big.png)\n\nThe end.\n")
+    log = os.path.join(d, "doc.log")
+    e = dict(env)
+    e.update({"RTX_UI_LOG": log, "RTX_SAFE_HOME": os.path.join(tmp, "safe_rel"),
+              "RTX_BLINK_IDLE_MS": "300"})
+    e.pop("RTX_UI_SCRIPT", None)
+    p = subprocess.Popen([exe, os.path.join("deck", "doc.md")], env=e,
+                         cwd=os.path.join(d, "notes"), stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    try:
+        win = window(env, p)
+        if not win:
+            print("skip: relative (no window)")
+            return
+        time.sleep(1.2)
+        a = P.Shot(env, tmp, win, "rel_a")
+        if not a.ok:
+            print("skip: relative (no screenshot)")
+            return
+        r, g, bl = count(a, RED), count(a, GREEN), count(a, BLUE)
+        check(r > 2000 and g > 2000 and bl > 2000,
+              "relative: ../../pics/big.png from a nested doc opened by a relative path",
+              "red %d green %d blue %d px" % (r, g, bl))
+    finally:
+        U.stop(p)
+
+
 def case_anim(exe, env, tmp):
     """`image_animate`: an animated GIF paints its frames (and only while
     on screen); off (case_markdown) a GIF is its first frame, no paints."""
@@ -379,7 +417,7 @@ def main(argv):
     env, xvfb = got
     try:
         with tempfile.TemporaryDirectory(prefix="cctext_img_") as tmp:
-            for case in (case_markdown, case_anim, case_slide, case_viewer, case_browse,
+            for case in (case_markdown, case_relative, case_anim, case_slide, case_viewer, case_browse,
                          case_remote, case_idle_threads):
                 case(exe, env, tmp)
     finally:
