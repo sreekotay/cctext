@@ -315,10 +315,13 @@ text.
   decision, even when it draws pictures).
 - **cctext, a line that is one image**: a picture row of cell rows
   ([Terminal](#terminal-cctext)), no padding; revealed, the picture sits
-  under the source line.
+  under the source line. A deck's `w:` / `h:` hint sizes it in cells
+  (px over the cell size).
 - **cctext-ui, a line that is one image** (blanks around it allowed) is
   a **picture row**: its height is the picture's box (the pane's width
-  and `image_max_height`, never upscaled) plus 3 px above and below. The
+  and `image_max_height`, never upscaled; in a Marp deck the alt's
+  `w:` / `h:` size replaces the natural one first — [slides.md
+  "Images"](slides.md#images)) plus 3 px above and below. The
   row paints the picture, or a placeholder (a dim frame with the alt and
   the size, the reason or the host). Revealed, the source lays out as
   text rows and the picture joins the last one under the text; the caret
@@ -1517,6 +1520,16 @@ under a running helper (the build writes a new file and renames it).
 ## Limits and leftovers
 
 - Reference-style images (`![a][ref]`) and HTML `<img>` are text.
+- Size hints are Marp's alt keywords only, and only in a deck
+  ([slides.md "Images"](slides.md#images)); a percentage is no hint.
+  Pandoc's attribute `![a](p.png){width=50%}` is not read: the grammar
+  lexes `{width=50%}` as text after the image, so the line is no longer
+  "one image" and it stays text. Reading it would take the image-line
+  matcher (`rtx_img_md_line`) accepting a trailing `{…}` attribute block
+  (and the stand-in hiding it), a Pandoc-attribute parser (`width` /
+  `height` in px, `in`, `cm`, `mm`, `%` of the pane width), a way to know
+  the document wants Pandoc extensions (any Markdown? a setting?), and
+  `%` resolved against the pane width at fill time.
 - An image inside a line of text in cctext-ui is the text stand-in, not
   a picture (only a line that is one image becomes a picture row;
   inline math is the exception, [Math](#math)).
