@@ -20,7 +20,11 @@ Coarse properties of screenshots, never exact pixels:
 - `"image_animate": true`: an animated GIF paints its frames;
 - HiDPI: under GDK_SCALE=2 a picture is decoded at its device size, drawn
   1:1, and as sharp as an offline Lanczos resize (needs PIL; skips
-  otherwise).
+  otherwise);
+- Marp size hints: in a deck (`marp: true`) `![w:320](shot.png)` of a
+  960 x 640 picture is about 320 px wide in the editor (a 320 x 213
+  bitmap; 640 x 427 under GDK_SCALE=2, drawn 640 px wide); the same line
+  in plain Markdown is the pane-wide picture.
 
     python3 tests/ui_img_test.py [path/to/cctext-ui]
 
@@ -559,6 +563,63 @@ def case_hidpi(exe, env, tmp):
               "mean |diff| %.1f, edge energy %.2f of the reference" % (mad, ratio))
 
 
+def magenta_span(png):
+    """Width and height of the magenta frame in a screenshot file (PIL when
+    there, else ImageMagick's text dump of a crop-free scan)."""
+    try:
+        from PIL import Image
+        box = magenta_box(Image.open(png).convert("RGB"))
+        return (box[2] - box[0] + 1, box[3] - box[1] + 1) if box else None
+    except ImportError:
+        pass
+    out = subprocess.run(["convert", png, "-fx", "(r>0.78&&b>0.78&&g<0.24)?1:0",
+                          "-trim", "-format", "%w %h", "info:"], capture_output=True, text=True)
+    try:
+        w, h = (int(v) for v in out.stdout.split())
+        return (w, h) if w > 1 and h > 1 else None
+    except ValueError:
+        return None
+
+
+def case_marp_hint(exe, env, tmp):
+    """Marp `w:320` in a deck's image alt sizes the editor's picture
+    (docs/slides.md "Images"); outside a deck it is alt text."""
+    d = proj(tmp, "marphint")
+    text_png(os.path.join(d, "shot.png"), 960, 640)
+    deck = b"---\nmarp: true\n---\n\n# Deck\n\n![w:320](shot.png)\n\nend\n"
+    plain = b"# Plain\n\n![w:320](shot.png)\n\nend\n"
+    for name, body, scale, want in (("deck.md", deck, 1, 320), ("plain.md", plain, 1, None),
+                                    ("deck2.md", deck, 2, 640)):
+        p, log = launch_in(exe, env, d, name, body, extra={"GDK_SCALE": str(scale)})
+        try:
+            win = window(env, p)
+            if not win:
+                print("skip: marp hint (no window)")
+                return
+            bm = None
+            for _ in range(40):
+                time.sleep(0.2)
+                news = [l for l in U.read_log(log) if l.startswith("image new ")]
+                if news:
+                    bm = tuple(int(v) for v in news[-1].split()[2].split("x"))
+                    break
+            time.sleep(0.6)
+            png = os.path.join(tmp, "marphint_%s.png" % name)
+            subprocess.run(["import", "-window", "root", png], env=env, capture_output=True)
+            span = magenta_span(png)
+        finally:
+            U.stop(p)
+        if want is None:
+            check(bm is not None and bm[0] > 400 and span is not None and span[0] > 400,
+                  "marp hint: plain Markdown ignores w:320", "bitmap %s, on screen %s" % (bm, span))
+            continue
+        check(bm is not None and abs(bm[0] - want) <= 2 and abs(bm[1] - want * 2 // 3) <= 2,
+              "marp hint %dx: the bitmap is the hinted size" % scale, "bitmap %s" % (bm,))
+        check(span is not None and abs(span[0] - want) <= 3,
+              "marp hint %dx: the picture is ~%d px wide on screen" % (scale, want),
+              "on screen %s" % (span,))
+
+
 def main(argv):
     exe = os.path.abspath(argv[1] if len(argv) > 1 else "bin/cctext-ui")
     if not os.path.exists(exe):
@@ -577,7 +638,7 @@ def main(argv):
         with tempfile.TemporaryDirectory(prefix="cctext_img_") as tmp:
             only = os.environ.get("IMG_CASE")
             for case in (case_markdown, case_relative, case_anim, case_slide, case_viewer,
-                         case_browse, case_remote, case_idle_threads, case_hidpi):
+                         case_browse, case_remote, case_idle_threads, case_hidpi, case_marp_hint):
                 if only and only not in case.__name__:
                     continue
                 case(exe, env, tmp)
