@@ -19,7 +19,8 @@ of the document, and selection, copy, search and undo all act on the
 text.
 
 Code: `core/img.cch` / `img.ccs` (loader, limits, policy, cache, jobs),
-`core/img_wuffs.c` / `.h` (the decoder), `core/img_net.c` / `.h` (fetch
+`core/img_wuffs.c` / `.h` (the decoder), `core/img_resize.c` / `.h` (the
+resampler, over `third_party/stb`), `core/img_net.c` / `.h` (fetch
 shim), `core/layout.ccs` (stand-ins and picture rows),
 `frontend/gui_img.ccs` (pictures, placeholders, dialog, viewer, preview),
 `frontend/gui_present.ccs` (slides), `frontend/ui_os_*` (the blit),
@@ -79,20 +80,111 @@ from their headers in well under a millisecond.
 
 **Display size.** A picture is decoded at the size it paints (Rich: the
 pane width, capped at `image_max_height`; slides: its box at the slide's
-own scale; the viewer: fit or zoom, never above natural size). Wuffs
-0.4 has no scaled JPEG (IDCT) decode, so every format decodes to a
-full-size canvas and then box-filters down (`rtx_img_scale`, at most
-~5×5 samples per output pixel); only the scaled result is kept, the
+own scale; the viewer: fit or zoom, never above natural size), in device
+pixels in cctext-ui ([HiDPI](#hidpi)). Wuffs 0.4 has no scaled JPEG
+(IDCT) decode, so every format decodes to a full-size canvas and is then
+resampled ([Scaling](#scaling)); only the scaled result is kept, the
 canvas is freed before the job returns, and one decode runs at a time,
 so the transient peak is one canvas (4 bytes a pixel of the header's
-size, within the megapixel limit). A cached bitmap within 10 % of a new
-size is reused; a bigger one is shown scaled while the right one
-decodes.
+size, within the megapixel limit) plus the resampler's scratch (below). A
+cached bitmap within 10 % of a new size is reused; a bigger one is shown
+scaled while the right one decodes.
 
 **EXIF orientation** (tags 1-8 from a JPEG APP1, a PNG `eXIf` chunk or a
-WebP `EXIF` chunk) is applied in the same scaling pass; the reported size
+WebP `EXIF` chunk) is applied to the resampled result; the reported size
 is the displayed one. No other metadata is read (no ICC, no XMP, no
 colour management).
+
+### Scaling
+
+`core/img_resize.c` (`rtx_img_resize`; `rtx_img_scale` in `img.cch` is
+the same call) turns a decoded canvas into the bitmap that paints. It is
+the only file that includes [stb_image_resize2](https://github.com/nothings/stb)
+v2.18 (public domain / MIT, `third_party/stb`, pinned in its
+`README.cctext.md`), used through its extended API:
+
+- **Premultiplied alpha.** Wuffs decodes to BGRA premultiplied and the
+  filter runs on those values (`STBIR_BGRA_PM`: no extra weighting), so a
+  transparent pixel contributes nothing and an edge next to transparency
+  keeps its colour with less alpha — no dark fringe after the straight
+  conversion a terminal protocol wants. The cubic's small overshoot is
+  clamped so every colour stays within its alpha (valid premultiplied
+  pixels for cairo / Core Graphics).
+- **Catmull-Rom** (B = 0, C = ½) on both axes, both ways, scaled with the
+  ratio when shrinking (every source pixel covered: a 1 px checkerboard
+  becomes an even 127-128 grey inside the edges). Chosen for UI
+  screenshots and text: it is interpolating (1:1 is the image itself) and
+  the sharpest of the cubics without Lanczos' second lobe. Measured on a
+  slanted dark edge (a glyph's stroke) shrunk 960 → 720: edge position
+  error (RMS over rows, output pixels) 0.032 against 0.254 for the old
+  sparse box filter, 0.028 for Mitchell and 0.030 for bilinear; 10-90 %
+  rise 1.49 px against 1.59 (Mitchell) and 1.62 (bilinear). The old
+  filter's rise (1.33) looked crisper but its rows stepped by a quarter
+  pixel: that is the jagged, shimmering text it drew. On a text-like test
+  image the result is within 0.23 of PIL's `BICUBIC` (the same kernel)
+  and 2.7 of PIL's Lanczos (mean absolute difference, 0-255).
+- **In sRGB values, not linear light.** The bytes are filtered as stored,
+  as browsers, cairo and Core Graphics scale them: linear-light
+  resampling thins dark text on light backgrounds (UI screenshots are
+  mostly that), and costs more (stb's sRGB path: 3.8 against 3.0 ms for
+  960 × 640 → 720 × 480). The terminal encoders keep their own
+  linear-light area average (`core/img_term.c`) for cell colours.
+- **Big shrinks** (6:1 or more an axis): first an exact box average of
+  k × k blocks (k = ratio / 2, integer sums, vectorised row additions)
+  down to 2-3× the target, then the cubic on that small image, with the
+  input region set so a partial last block keeps the geometry. The box
+  pass is one read of the canvas; below 6:1 it costs more than it saves.
+  Against the cubic alone the result differs by at most 6 levels on a
+  sharp-edged test image (12 on the smoke's synthetic 4096² pattern).
+- **Orientation after resampling.** The canvas is resized in its coded
+  orientation and only the small result is flipped / transposed (a flip
+  or transpose commutes with a symmetric separable filter), so no
+  rotated copy of the canvas is made.
+- **Cancel and memory.** Output is produced in bands of about 64 rows
+  (`stbir_resize_extended_split`) and the box pass polls per block row,
+  so a decode scrolled away stops within a band. Transient memory beyond
+  the canvas: the prefiltered image (at most about 9× the bitmap), the
+  bitmap's size again when turned, and the filter's ring buffers. Each
+  animation frame is resampled the same way.
+
+Measured (this container, x86-64 SSE2, best of 3-5; the old filter is
+the sparse box it replaced — it skipped most pixels of a big canvas, so
+it was faster there, and wrong):
+
+| canvas → bitmap | old | new |
+|---|---|---|
+| 960 × 640 → 720 × 480 | 5.8 ms | 3.0 ms |
+| 4000 × 3000 → 800 × 600 | 24 ms | 32 ms |
+| 4000 × 3000 → 500 × 375 | 7 ms | 17 ms |
+| 10000 × 10000 → 800 × 800 | 31 ms | 118 ms |
+| 16384 × 6000 → 800 × 293 | 13 ms | 85 ms |
+
+Decode + resample end to end (`RTX_IMG_BENCH=file img_smoke`, box 800 ×
+600 unless noted; best of 5, two interleaved runs) — the decoder
+dominates, so the better filter costs little in practice:
+
+| file | old | new |
+|---|---|---|
+| `docs/cctext-ui-linux-md.png` 960 × 640 PNG | 13 ms | 7.9 ms |
+| same, into a 2x screen's 1440 × 960 box (natural size: no resample) | — | 4.6 ms |
+| 4000 × 3000 PNG (UI-like) | 129 ms | 131 ms |
+| 4000 × 3000 JPEG | 107 ms | 107 ms |
+| same, 1600 × 1200 (a 2x box) | — | 130 ms |
+| 12000 × 8000 PNG (96 MP) | 865 ms | 955 ms |
+
+Peak RSS of those runs: 10.2 → 10.3 MiB (960 × 640), 67.7 → 79.1 MiB
+(4000 × 3000 JPEG: the filter's buffers), 646 → 656 MiB (96 MP: the
+canvas). First paint of `docs/cctext-ui-linux-md.png` in a Rich pane
+(the first whole paint to the paint that shows the picture, cctext-ui
+under Xvfb, best of 4): 20 ms at 1x and 27 ms at `GDK_SCALE=2`, against
+22 and 29 ms before.
+
+`img_smoke` checks the resampler: a constant translucent colour stays
+constant (every size, both ways, orientations 1-8, 1 × N, N × 1, 1 × 1),
+checkerboards shrink to grey, the slanted edge beats the old filter by
+3× or more, no dark fringe at a transparent edge, orientations exact at
+1:1 and commuting when resampled, a 4096² → 40² shrink (11 ms) close to
+the cubic alone, and cancel.
 
 **Animation.** Off by default: a GIF (or animated WebP) shows its first
 frame and costs nothing more. `"image_animate": true` decodes up to
@@ -393,13 +485,56 @@ terminal frame budget), each frame one cached encode.
 
 libui-ng's draw context has no image call; `ui_os_image_new` /
 `_draw` / `_free` add one. GTK: a cairo image surface over the bitmap's
-own pixels (ARGB32 is premultiplied BGRA on little-endian hosts), drawn
-with `cairo_scale` and a GOOD / BILINEAR filter, clipped to the scissor.
-macOS: a `CGImage` over the same pixels (`kCGBitmapByteOrder32Little |
-kCGImageAlphaPremultipliedFirst`), drawn through a flip because the area
-view is flipped — **not built or run here** (no macOS in this
+own pixels (ARGB32 is premultiplied BGRA on little-endian hosts), clipped
+to the scissor: a bitmap the size of the rect in device pixels is drawn
+1:1 (NEAREST, its origin snapped to a whole device pixel), anything else
+scaled with `CAIRO_FILTER_GOOD` (a box filter shrinking, bilinear
+enlarging past the natural size). macOS: a `CGImage` over the same
+pixels (`kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst`),
+drawn through a flip because the area view is flipped, with
+`kCGInterpolationHigh`; a device-size bitmap is snapped to the device
+grid the same way — **not built or run here** (no macOS in this
 environment). Windows: a stub (placeholders only). One platform image is
 kept per decoded bitmap (per frame when animated) and freed with it.
+
+### HiDPI
+
+Layout is in logical units (points: AppKit's, GTK's under `GDK_SCALE`),
+and so are picture boxes; pixels are not. `ui_os_device_scale()` — the
+window's `backingScaleFactor` on macOS, `gtk_widget_get_scale_factor` on
+GTK, 1 on Windows (no image blit there yet; `GetDpiForWindow` / 96 is the
+value once there is one) — is read at every Draw (`gui_device_scale`),
+so a window moved to a screen of another scale picks it up at the
+repaint the toolkit does for the move (and the host relayouts as after
+a resize; `RTX_UI_LOG` notes `device scale 2.00`).
+
+Every picture cctext-ui paints (Rich picture rows, inline and display
+math, Mermaid, SVG, slides and their transitions, the browse preview,
+the viewer) asks the loader for its **logical box × the device scale**:
+
+- a raster is still capped at its natural size by the loader (decode at
+  most at the natural size; the blit enlarges beyond — a 960 px
+  screenshot in a 720 pt box on a 2x screen is a 960 px bitmap drawn
+  into 1440 device pixels, not a 720 px one stretched twice);
+- vectors (SVG, Mermaid, math) render at the device size, within
+  `svg_max_mp` (16 megapixels: four times the pixels at 2x, so a very
+  large diagram reaches the cap sooner and the blit scales the rest);
+  inline math keeps its baseline and box in logical units, only its
+  bitmap is denser;
+- the pixel budget (`image_budget_mb`) is memory and stays in bytes: a
+  2x bitmap costs four times a 1x one, and a device-size request that
+  would take more than half the budget falls back to the logical size
+  (the blit scales it) rather than failing.
+
+The blit then draws the device-size bitmap into the logical rect 1:1
+(above). `RTX_UI_LOG` notes each platform image made (`image new 640x400
+scale 2.00`); `tests/ui_img_test.py` (`case_hidpi`) runs a text-like
+1600 × 1000 picture at `GDK_SCALE=1` and `2`: the 2x bitmap is twice the
+1x one, its frame on screen is the bitmap's size, and the screen matches
+an offline PIL Lanczos resize of the source to that size (mean absolute
+difference 2.7 at both scales, edge energy 0.95 / 0.93 of the
+reference). The build before this work: 14.8 at 1x and 32.5 at 2x, edge
+energy 0.35 at 2x (a logical-size bitmap stretched by cairo).
 
 ## SVG: the renderer (cctext-render)
 
@@ -678,7 +813,6 @@ expected output is unfiltered).
   draw.io's `<switch>` fallback text shows instead); `textPath`,
   vertical writing modes; kerning across `letter-spacing` and per-glyph
   `x` / `dx`, `font-kerning: none`; Hangul (no Korean face).
-- HiDPI: cctext-ui has no device scale yet; pixels are at 1x.
 - More than one helper per kind; `.svgz`; previewing an unsaved SVG
   buffer.
 - Pixel jobs share one lane: a slow SVG render (up to its budget) holds
