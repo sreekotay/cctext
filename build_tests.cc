@@ -16,7 +16,7 @@ CC_TARGET_INCLUDE rtx_hex .
 CC_TARGET rtx_grid obj core/grid.ccs
 CC_TARGET_INCLUDE rtx_grid .
 
-CC_TARGET rtx_md_table obj core/md_table.ccs core/md_block.ccs core/md_refs.ccs
+CC_TARGET rtx_md_table obj core/md_table.ccs core/md_block.ccs core/md_refs.ccs core/mmd_sniff.c
 CC_TARGET_INCLUDE rtx_md_table .
 
 CC_TARGET rtx_browse obj core/browse.ccs

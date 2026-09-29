@@ -17,6 +17,7 @@
 #include "nav.cch"
 #include "lf.cch"
 #include "wb.cch"
+#include "mmd_sniff.h"
 
 
 static int rtx_cstr_eq(const char *a, const char *b) {
@@ -1405,11 +1406,52 @@ static int rtx_sec_lexed(RtxSectionKind k) {
     return k == RTX_SEC_CODE || k == RTX_SEC_MARKUP;
 }
 
+/* The first bytes of a `.mmd` document decide Mermaid or MultiMarkdown
+ * (mmd_sniff.h); RTX_MMD_UNSURE answers `keep`. */
+static int rtx_doc_mmd_sniff(const RtxDoc *d, int keep) {
+    char head[RTX_MMD_PROBE];
+    size_t n, got = 0;
+    int k;
+    n = d->len();
+    if (n > sizeof head) n = sizeof head;
+    if (n) {
+        @errhandler(CCError e) {
+            (void)e;
+            return keep;
+        }
+        got = d->read_at(0, cc_slice_from_buffer(head, n)) !>;
+    }
+    k = rtx_mmd_sniff(head, got, d->len() <= sizeof head);
+    return k == RTX_MMD_UNSURE ? keep : k;
+}
+
+/* The document's grammar: its path's, except that a `.mmd` whose first
+ * word is not a Mermaid diagram keyword is MultiMarkdown (Markdown). The
+ * answer is kept on the document (d->mmd) and asked again when an edit
+ * touches its first RTX_MMD_PROBE bytes (RtxDoc_reparse_edit). */
+static const RtxTmRt *rtx_doc_grammar(const RtxDoc *d) {
+    const RtxTmRt *rt;
+    if (!d || !d->path.ptr) return NULL;
+    rt = rtx_tm_for_path(d->path.ptr);
+    if (rt && rtx_mmd_path_ambiguous(d->path.ptr)) {
+        RtxDoc *m = (RtxDoc *)d; /* a memo: the same bytes give the same answer */
+        /* Nothing to go by (a new, empty file): Mermaid. */
+        if (!m->mmd) m->mmd = rtx_doc_mmd_sniff(d, RTX_MMD_MERMAID);
+        if (m->mmd == RTX_MMD_MARKDOWN) return rtx_tm_md_rt();
+    }
+    return rt;
+}
+
+int RtxDoc_is_mermaid(const RtxDoc *d) {
+    const RtxTmRt *rt = rtx_doc_grammar(d);
+    return rt && rt->scope && strcmp(rt->scope, "source.mermaid") == 0;
+}
+
 /* Root section is the path kind: a grammar match is CODE, or MARKUP when
  * that grammar declares `"cctext": { "kind": "markup" }`; no grammar is
  * PROSE. The shipped markdown grammar does not opt in, so `.md` is CODE. */
 static RtxSectionKind rtx_doc_path_kind(const RtxDoc *d) {
-    const RtxTmRt *rt = d && d->path.ptr ? rtx_tm_for_path(d->path.ptr) : NULL;
+    const RtxTmRt *rt = rtx_doc_grammar(d);
     if (!rt) return RTX_SEC_PROSE;
     return rt->markup ? RTX_SEC_MARKUP : RTX_SEC_CODE;
 }
@@ -1422,7 +1464,7 @@ int RtxDoc_is_markup(const RtxDoc *d) {
  * each): the grammar's own (`cctext.pairs` / `autoClosingPairs`), else a
  * built-in one by kind. Grammarless prose pairs nothing. */
 const char *RtxDoc_autopairs(const RtxDoc *d) {
-    const RtxTmRt *rt = d && d->path.ptr ? rtx_tm_for_path(d->path.ptr) : NULL;
+    const RtxTmRt *rt = rtx_doc_grammar(d);
     if (!rt) return "";
     if (rt->pairs_set) return rt->pairs;
     if (rt->markup) return "``**__\"\"[]()";
@@ -1819,7 +1861,7 @@ static void !>(CCError) rtx_doc_mdref_update(RtxDoc *d) {
         if (m->sweep_on) {
             if (m->dirty) return rtx_doc_mdref_sweep(d, 0);
         } else if (!m->swept) {
-            const RtxTmRt *rt = rtx_tm_for_path(d->path.ptr);
+            const RtxTmRt *rt = rtx_doc_grammar(d);
             m->swept = 1;
             if (rt && rt->blocks) return rtx_doc_mdref_sweep(d, 1);
         }
@@ -2818,7 +2860,7 @@ static const RtxRun *rtx_doc_line_prefix(const RtxDoc *d, size_t off) {
 }
 
 static const RtxTmRt *rtx_doc_tm(const RtxDoc *d) {
-    return d && d->path.ptr ? rtx_tm_for_path(d->path.ptr) : NULL;
+    return rtx_doc_grammar(d);
 }
 
 /* Grammar of this path, not the caret. Untitled / no grammar → 0. */
@@ -3750,7 +3792,7 @@ static int rtx_mdb_role_code(int role) {
 static int rtx_doc_md_known(const RtxDoc *d, size_t *klo, size_t *khi) {
     const RtxTmRt *rt;
     if (!d || !d->path.ptr) return 0;
-    rt = rtx_tm_for_path(d->path.ptr);
+    rt = rtx_doc_grammar(d);
     if (!rt || !rt->blocks) return 0;
     if (d->hl_full) {
         *klo = 0;
@@ -8297,7 +8339,7 @@ static void !>(CCError) rtx_hl_range(RtxDoc *d, char[:] buf, size_t base,
                                     const RtxMdStart *ms) {
     const RtxTmRt *rt;
     if (!d || !buf.ptr || buf.len == 0) return cc_ok();
-    rt = rtx_tm_for_path(d->path.ptr);
+    rt = rtx_doc_grammar(d);
     if (rt) return rtx_doc_lex(d, rt, buf, base, emit_from, seed, walk, NULL, ms);
     return rtx_hl_spike(d, buf, base, emit_from);
 }
@@ -10549,7 +10591,10 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
         if (close(fd) != 0) return cc_err(CC_ERR_IO, "save close");
         rtx_save_fsync_dir(p, n);
         if (alias) RtxPageStore_set_disk_len(&d->tree.store, newn);
-        if (new_path.ptr) d->path = new_path;
+        if (new_path.ptr) {
+            d->path = new_path;
+            d->mmd = 0;
+        }
         d->mark_saved();
         rtx_doc_ident_stamp(d, path);
         return cc_ok();
@@ -10574,7 +10619,10 @@ void !>(CCError) RtxDoc_save_as(RtxDoc *d, char[:0] path) {
     if (rename(tmp, p) != 0) return cc_err(CC_ERR_IO, "save rename");
     /* Best-effort directory fsync so the rename itself is durable. */
     rtx_save_fsync_dir(p, n);
-    if (new_path.ptr) d->path = new_path;
+    if (new_path.ptr) {
+        d->path = new_path;
+        d->mmd = 0;
+    }
     d->mark_saved();
     rtx_doc_ident_stamp(d, path);
     return cc_ok();
@@ -10630,7 +10678,7 @@ static void !>(CCError) rtx_doc_highlight_span_raw(RtxDoc *d, size_t floor,
     int md;
     if (!d || hi <= lo) return cc_ok();
     if (hi - lo > (size_t)RTX_HL_WIN_MAX) hi = lo + (size_t)RTX_HL_WIN_MAX;
-    rt = rtx_tm_for_path(d->path.ptr);
+    rt = rtx_doc_grammar(d);
     md = rt && rt->blocks;
     saved_runs = d->runs.len;
     saved_ckpt = d->tm_ckpt.len;
@@ -10877,7 +10925,7 @@ static int !>(CCError) rtx_doc_relex_edit(RtxDoc *d, size_t lo, size_t hi,
     char[:] bytes;
     if (!d || hi <= lo || !d->span.live || d->span.lo < lo || d->span.hi > hi)
         return cc_ok(0);
-    rt = rtx_tm_for_path(d->path.ptr);
+    rt = rtx_doc_grammar(d);
     if (!rt) return cc_ok(0);
     if (win) keep = *win;
     else if (lo > 0 && rtx_doc_sec_floor(d, lo) != lo) return cc_ok(0);
@@ -10980,6 +11028,15 @@ static void !>(CCError) rtx_doc_reparse_edit_once(RtxDoc *d, size_t off,
     if (!d) return cc_err(CC_ERR_INVALID_ARG, "null doc");
     /* Root section is path kind. Only `=` / a large delete can move === headers. */
     if (full_markup) return d->reparse();
+    /* An edit near the top of a `.mmd` can turn it from a Mermaid diagram
+     * into MultiMarkdown or back (mmd_sniff.h): another grammar, lex all. */
+    if (off < (size_t)RTX_MMD_PROBE && d->mmd && rtx_mmd_path_ambiguous(d->path.ptr)) {
+        int k = rtx_doc_mmd_sniff(d, d->mmd);
+        if (k != d->mmd) {
+            d->mmd = k;
+            return d->reparse();
+        }
+    }
     /* An edit in the front matter that turns `marp: true` on or off changes
      * every top-level break (slide / hr): the block state in every
      * checkpoint is stale, so lex again from scratch. */
@@ -11110,7 +11167,7 @@ static int !>(CCError) rtx_doc_hl_extend(RtxDoc *d, size_t rlo, size_t rhi,
     char[:] bytes;
     if (!d || !d->hl_cov.live) return cc_ok(0);
     cov = d->hl_cov;
-    rt = rtx_tm_for_path(d->path.ptr);
+    rt = rtx_doc_grammar(d);
     if (!rt) return cc_ok(0);
     {
         /* The lex's end checkpoint is that lex's state only if its last
