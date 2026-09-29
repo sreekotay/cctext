@@ -35,7 +35,7 @@ CC_TARGET rtx_document obj core/document.ccs core/slides.ccs core/wb.ccs core/wb
 CC_TARGET_INCLUDE rtx_document .
 CC_TARGET_DEPS rtx_document rtx_piece_tree rtx_nav rtx_scope rtx_rx rtx_md_table
 
-CC_TARGET rtx_layout obj core/layout.ccs
+CC_TARGET rtx_layout obj core/layout.ccs core/mmd_view.ccs
 CC_TARGET_INCLUDE rtx_layout .
 CC_TARGET_DEPS rtx_layout rtx_document rtx_hex rtx_grid rtx_md_table rtx_img
 
