@@ -491,7 +491,13 @@ class Tui:
     def send(self, data, settle=0.25):
         if isinstance(data, str):
             data = data.encode()
-        os.write(self.fd, data)
+        try:
+            os.write(self.fd, data)
+        except OSError as e:
+            # macOS: EIO once the child has exited (a quit key before this one).
+            if e.errno != errno.EIO:
+                raise
+            return
         self.pump(settle)
 
     def wait_exit(self, secs=5.0):
@@ -1670,6 +1676,34 @@ def case_cursor_browse(exe, tmp):
         t.kill()
     check(bool(c) and not c[2] and row[:c[0]].endswith("glob: al"),
           "browse: cursor in the glob field", repr((c, row[:24])))
+
+
+def case_browse_crumb(exe, tmp):
+    """Browse: a click on a segment of the header path goes to that folder."""
+    if pyte is None:
+        print("skip: browse crumb (no pyte)")
+        return
+    d = os.path.realpath(os.path.join(tmp, "crumbs"))
+    sub = os.path.join(d, "sub")
+    os.makedirs(sub, exist_ok=True)
+    scratch_file(sub, "x.txt", b"x\n")
+    t = Tui(exe, [sub], {"RTX_SAFE_HOME": os.path.join(tmp, "safe")},
+            cols=max(COLS, len(sub) + 8))
+    try:
+        t.pump(0.8)
+        rows = t.screen().display
+        y = next((i for i, r in enumerate(rows) if r.strip().endswith("/crumbs/sub")), -1)
+        x = rows[y].find("/crumbs/") + 2 if y >= 0 else -1
+        if y >= 0:
+            t.send(b"\x1b[<0;%d;%dM\x1b[<0;%d;%dm" % (x + 1, y + 1, x + 1, y + 1), 0.6)
+        head = t.screen().display[y].strip() if y >= 0 else ""
+        t.send(b"\x11", 0.2)
+        t.send(b"q", 0.2)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    check(y >= 0 and head == d, "browse: clicking a path segment opens that folder",
+          repr((y, head)))
 
 
 def case_caret_cell_fallback(exe, tmp):
@@ -3865,6 +3899,7 @@ CASES = {
     "cursor_hex": case_cursor_hex,
     "cursor_grid": case_cursor_grid,
     "cursor_browse": case_cursor_browse,
+    "browse_crumb": case_browse_crumb,
     "caret_cell_fallback": case_caret_cell_fallback,
     "cursor_restored": case_cursor_restored,
     "md_enter_continues": case_md_enter_continues,
