@@ -905,6 +905,57 @@ bundler to build: a C / C++ compiler and ccc.
   `mermaid_max_height` (720 px: taller diagrams are scaled down),
   `mermaid_recycle_jobs` (0: a fresh engine every N diagrams when set).
 
+<a id="mermaid-files"></a>**Mermaid files.** A file of Mermaid source is a
+diagram too, in both frontends:
+
+- `.mermaid` is always Mermaid. `.mmd` is ambiguous (Mermaid Live saves
+  `.mmd`; so does MultiMarkdown), so the document's first bytes decide
+  (`core/mmd_sniff.c`, one bounded read of at most 4 KiB): blank lines,
+  `%%` comments and `%%{init}%%` directives and one `---` front-matter
+  block are skipped, and if the first word is a diagram keyword of
+  Mermaid 12 (its own detector list: `graph`, `flowchart`,
+  `sequenceDiagram`, `classDiagram`, `stateDiagram(-v2)`, `erDiagram`,
+  `journey`, `gantt`, `pie`, `quadrantChart`, `requirementDiagram`,
+  `gitGraph`, `C4Context` … `C4Deployment`, `mindmap`, `timeline`,
+  `zenuml`, `sankey(-beta)`, `xychart(-beta)`, `block(-beta)`,
+  `packet(-beta)`, `kanban`, `architecture(-beta)`, `radar(-beta)`,
+  `treemap(-beta)`, `info`, and the newer betas; case matters, as it does
+  to Mermaid, except for the ones Mermaid matches in any case) the file is
+  Mermaid, else MultiMarkdown, which opens as Markdown (Rich, the block
+  pass, all of it). The extension matches in any case (`.MMD`). The answer
+  is kept on the document and asked again when an edit touches the first
+  4 KiB (a changed answer relexes the file with the other grammar). A word
+  still being typed at the end of the file that begins a keyword (`seq`),
+  an unclosed front matter and a file with nothing but blanks and
+  comments keep the last answer, so a new, empty `.mmd` is Mermaid and
+  stays Mermaid while its first line is typed. A prose file that starts
+  with a bare lowercase keyword (`graph paper …`) is read as Mermaid.
+- The source is text with syntax colours
+  (`testdata/grammars/mermaid.tmLanguage.json`: `%%` comments, diagram
+  and statement keywords, arrows, strings, node brackets, numbers,
+  `:::class`); the same grammar colours a ` ```mermaid ` fence's source in
+  Markdown.
+- `Ctrl-D` swaps in the diagram and back, as for an `.svg`: fitted to the
+  pane (scaled up too: it is a vector), `+` / `-` zoom, `0` fits, `1` is
+  natural size, the arrows pan; typing does not edit it. The diagram is of
+  the text as it is now (not the file on disk), keyed like a fence (the
+  source's hash and length, the Rich theme), so an edit made in the text
+  renders on the Mermaid lane when the diagram is next looked at, with the
+  last diagram that had pixels up, dimmed, meanwhile (the fence's stale
+  display, owned by the document); a source that does not parse keeps it
+  up with `mermaid: Parse error …` as the caption, or says why in a box
+  when there is none. In a terminal the diagram goes through the picture
+  path (kitty, sixel, iTerm2, block art) or is `[diagram: Mermaid WxH]`
+  where the terminal draws no pictures. The browse preview of a Mermaid
+  file is its diagram (a terminal without pictures: its size line).
+- The fences' settings apply: `mermaid_nodes`, `mermaid_timeout_ms`,
+  `mermaid_max_kb` (a longer file is not rendered: "diagram source over
+  mermaid_max_kb"), light / dark theme; `mermaid: false` leaves the file
+  as text (`Ctrl-D` is then the usual Rich toggle). Code:
+  `core/mmd_sniff.c` (the sniff), `core/mmd_view.ccs` (the diagram of a
+  document, for the viewers and previews of both frontends),
+  `RtxDoc_is_mermaid`.
+
 <a id="themes"></a>**Themes.** A diagram is keyed by its source's hash, its length, the
 theme and the renderer version (`RTX_MERMAID_VERSION`). The theme is
 Mermaid's `dark` (the dark editor theme) or `default` (the light one),
@@ -1444,6 +1495,17 @@ under a running helper (the build writes a new file and renames it).
   still, two helper processes (SVG and Mermaid), the dimmed stale
   diagram while an edit renders and the new one after, the helpers exit
   with the editor, a slide's diagram in the slide's light theme.
+- Mermaid files: `tm_grammar_smoke` (`.mermaid` and `.MERMAID`, `.mmd`
+  and `.MMD` with a diagram, after comments and a directive, after front
+  matter, `xychart-beta`, an empty `.mmd`; MultiMarkdown metadata,
+  Markdown after front matter, `graphs`, `Graph`; the styling; an edit
+  at the top flipping the grammar and back; a keyword being typed);
+  `tests/tui_pty_test.py mermaid_file` (text, `Ctrl-D` block art with its
+  caption, typing does not edit, back to text, bytes unchanged, the
+  `[diagram: Mermaid WxH]` stand-in, the browse preview);
+  `tests/ui_mermaid_file_test.py` (Xvfb: a `.mmd` opens as text, `Ctrl-D`
+  diagram and back, an edit shows the old diagram dimmed then the new,
+  a MultiMarkdown `.mmd` is Markdown, a `.mermaid` browse preview).
 - `tests/ui_theme_test.py` (Xvfb): the light theme's Markdown (Mermaid's
   light theme with the palette's fill, no SVG plate — the dark theme
   keeps it), formulas in the theme's text colour, a light slide's
