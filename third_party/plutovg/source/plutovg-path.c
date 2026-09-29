@@ -188,6 +188,12 @@ void plutovg_path_arc_to(plutovg_path_t* path, float rx, float ry, float angle, 
         th_arc += PLUTOVG_TWO_PI;
     else if(th_arc > 0.f && !sweep_flag)
         th_arc -= PLUTOVG_TWO_PI;
+    /* cctext patch: a non-finite sweep (a radius or endpoint at inf / NaN)
+     * would be converted to a segment count: draw the chord. */
+    if(!isfinite(th_arc) || !isfinite(cx1) || !isfinite(cy1)) {
+        plutovg_path_line_to(path, x, y);
+        return;
+    }
     plutovg_matrix_init_rotate(&matrix, angle);
     plutovg_matrix_scale(&matrix, rx, ry);
     int segments = (int)(ceilf(fabsf(th_arc / (PLUTOVG_HALF_PI + 0.001f))));

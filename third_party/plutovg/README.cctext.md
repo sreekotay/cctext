@@ -37,6 +37,9 @@ cctext-render fuzz run (ASan + UBSan):
    face asked for gets a synthetic variant of its closest face (a slant of
    tan 12 deg, an overstrike of size/24 .. size/32), created once and
    sharing its data; fallback glyphs get the style their own face lacks.
+7. `0007-arc-nonfinite.patch`: an arc whose centre or sweep is not finite
+   (a radius or endpoint at inf / NaN) is drawn as its chord instead of
+   converting the NaN sweep to a segment count.
 
 Build defines: `PLUTOVG_BUILD_STATIC`, `PLUTOVG_DISABLE_FONT_FACE_CACHE_LOAD`
 (no system font scan), `STBI_MAX_DIMENSIONS=16384` (a `data:` image inside
