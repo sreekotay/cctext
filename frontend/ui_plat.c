@@ -314,10 +314,31 @@ static void caret_apply(void) {
     ui_os_caret_set(g_caret_cur, g_caret_nc);
 }
 
+/* Device pixels per logical unit (ui_os_device_scale), read at every
+ * Draw: a window moved to a screen of another scale repaints whole, and
+ * that paint already sees the new scale. */
+static double g_dscale = 1.0;
+
+static void dscale_update(void) {
+    double s = ui_os_device_scale();
+    if (!(s >= 1.0)) s = 1.0;
+    if (s > 4.0) s = 4.0;
+    if (s != g_dscale) {
+        char msg[64];
+        g_dscale = s;
+        g_resized = 1;
+        snprintf(msg, sizeof msg, "device scale %.2f", s);
+        script_note(msg);
+    }
+}
+
+double gui_device_scale(void) { return g_dscale; }
+
 static void on_draw(uiAreaHandler *h, uiArea *a, uiAreaDrawParams *p) {
     (void)h;
     (void)a;
     if (!p) return;
+    dscale_update();
     if (p->AreaWidth > 1 && p->AreaHeight > 1) {
         int ww = (int)p->AreaWidth;
         int hh = (int)p->AreaHeight;
@@ -1765,7 +1786,7 @@ void *GetWindowHandle(void) {
 int GetScreenWidth(void) { return g_ww; }
 int GetScreenHeight(void) { return g_hh; }
 Vector2 GetWindowScaleDPI(void) {
-    return (Vector2){1, 1};
+    return (Vector2){(float)g_dscale, (float)g_dscale};
 }
 
 void BeginDrawing(void) { }
@@ -2033,6 +2054,13 @@ int gui_alert_image(int remote, const char *msg) {
 }
 
 void *gui_image_new(const unsigned char *bgra, int w, int h, int stride) {
+    if (draw_log_on()) {
+        /* RTX_UI_LOG: the bitmap sizes the blit gets (tests/ui_img_test.py
+         * checks they are device pixels under GDK_SCALE=2). */
+        char msg[80];
+        snprintf(msg, sizeof msg, "image new %dx%d scale %.2f", w, h, g_dscale);
+        script_note(msg);
+    }
     return ui_os_image_new(bgra, w, h, stride);
 }
 

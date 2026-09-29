@@ -17,7 +17,10 @@ Coarse properties of screenshots, never exact pixels:
   "Load this image" through RTX_UI_SCRIPT) and the picture arrives from a
   local HTTP server that saw no request before the click;
 - idle with pictures on screen: no paints and (almost) no CPU;
-- `"image_animate": true`: an animated GIF paints its frames.
+- `"image_animate": true`: an animated GIF paints its frames;
+- HiDPI: under GDK_SCALE=2 a picture is decoded at its device size, drawn
+  1:1, and as sharp as an offline Lanczos resize (needs PIL; skips
+  otherwise).
 
     python3 tests/ui_img_test.py [path/to/cctext-ui]
 
@@ -401,6 +404,161 @@ def case_remote(exe, env, tmp):
         httpd.shutdown()
 
 
+MAGENTA = (255, 0, 255)
+
+
+def text_png(path, w, h, border=12):
+    """A deterministic text-like picture (rows of 1-4 px dark strokes on
+    white, like a UI screenshot's glyphs) inside a magenta frame, written
+    with zlib only."""
+    import struct
+    import zlib
+    seed = 12345
+    rows = []
+    for y in range(h):
+        row = bytearray(b"\xff" * (w * 3))
+        rows.append(row)
+    for y in range(h):
+        for x in range(w):
+            if x < border or y < border or x >= w - border or y >= h - border:
+                rows[y][x * 3:x * 3 + 3] = bytes(MAGENTA)
+    y = border + 10
+    while y + 24 < h - border:
+        x = border + 12
+        while x + 40 < w - border:
+            seed = (seed * 1103515245 + 12345) & 0x7fffffff
+            word = 3 + seed % 7
+            for _ in range(word):
+                seed = (seed * 1103515245 + 12345) & 0x7fffffff
+                sw = 1 + seed % 4
+                sh = 10 + (seed >> 8) % 12
+                top = y + (22 - sh)
+                for yy in range(top, top + sh):
+                    rows[yy][x * 3:(x + sw) * 3] = b"\x10" * (sw * 3)
+                x += sw + 2 + (seed >> 12) % 4
+            x += 10
+        y += 30
+    raw = b"".join(b"\x00" + bytes(r) for r in rows)
+
+    def chunk(t, d):
+        c = struct.pack(">I", len(d)) + t + d
+        return c + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+           chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def magenta_box(img):
+    """Bounding box (x0, y0, x1, y1 inclusive) of the magenta frame in a PIL
+    image, or None."""
+    from PIL import ImageChops
+    r, g, b = img.split()
+    m = ImageChops.multiply(ImageChops.multiply(r.point(lambda v: 255 if v > 200 else 0),
+                                                b.point(lambda v: 255 if v > 200 else 0)),
+                            g.point(lambda v: 255 if v < 60 else 0))
+    box = m.getbbox()
+    if not box:
+        return None
+    return box[0], box[1], box[2] - 1, box[3] - 1
+
+
+def pic_match(shot, ref, x0, y0, m):
+    """Mean |difference| of the green channel between the screen at
+    (x0, y0) and `ref` inside a margin m, and the ratio of their edge
+    energy (mean |horizontal step|); the best of +-1 px of registration."""
+    sp, rp = shot.load(), ref.load()
+    w, h = ref.size
+    best = None
+    for oy in (-1, 0, 1):
+        for ox in (-1, 0, 1):
+            n = diff = e_s = e_r = 0
+            for y in range(m, h - m, 2):
+                sy = y0 + oy + y
+                if sy < 0 or sy >= shot.size[1]:
+                    continue
+                for x in range(m, w - m - 1):
+                    sx = x0 + ox + x
+                    if sx < 0 or sx + 1 >= shot.size[0]:
+                        continue
+                    a, b = sp[sx, sy][1], rp[x, y][1]
+                    diff += abs(a - b)
+                    e_s += abs(sp[sx + 1, sy][1] - a)
+                    e_r += abs(rp[x + 1, y][1] - b)
+                    n += 1
+            if n and (best is None or diff / n < best[0]):
+                best = (diff / n, e_s / max(e_r, 1))
+    return best or (999, 0)
+
+
+def case_hidpi(exe, env, tmp):
+    """HiDPI (docs/images.md "HiDPI"): under GDK_SCALE=2 a picture is
+    decoded at its device size (twice the 1x bitmap), drawn 1:1 (its frame
+    on screen is the bitmap's size), and matches a high-quality offline
+    resize (PIL Lanczos) of the source: sharp text, where decoding at the
+    logical size and letting the blit double it is soft."""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("skip: hidpi (no PIL)")
+        return
+    d = proj(tmp, "hidpi")
+    src = os.path.join(d, "text.png")
+    text_png(src, 1600, 1000)
+    settings = os.path.join(d, "settings.json")
+    with open(settings, "w") as f:
+        f.write('{ "image_max_height": 200 }\n')
+    got = {}
+    for scale in (1, 2):
+        p, log = launch_in(exe, env, d, "doc%d.md" % scale, b"# Hi\n\n![text](text.png)\n\nend\n",
+                           extra={"GDK_SCALE": str(scale)}, args=("--settings", settings))
+        try:
+            win = window(env, p)
+            if not win:
+                print("skip: hidpi (no window)")
+                return
+            bm = None
+            for _ in range(40):
+                time.sleep(0.2)
+                news = [l for l in U.read_log(log) if l.startswith("image new ")]
+                if news:
+                    bm = tuple(int(v) for v in news[-1].split()[2].split("x"))
+                    break
+            time.sleep(0.6)
+            png = os.path.join(tmp, "hidpi%d.png" % scale)
+            subprocess.run(["import", "-window", "root", png], env=env, capture_output=True)
+            if os.environ.get("IMG_SHOTS"):
+                shutil.copy(png, os.environ["IMG_SHOTS"])
+            got[scale] = (bm, png)
+        finally:
+            U.stop(p)
+    (b1, png1), (b2, png2) = got.get(1, (None, None)), got.get(2, (None, None))
+    if not b1 or not b2:
+        check(False, "hidpi: a bitmap was made", "1x %s, 2x %s" % (b1, b2))
+        return
+    check(abs(b2[0] - 2 * b1[0]) <= 2 and abs(b2[1] - 2 * b1[1]) <= 2,
+          "hidpi: GDK_SCALE=2 decodes at the device size", "1x %dx%d, 2x %dx%d" % (b1 + b2))
+    ref_src = Image.open(src).convert("RGB")
+    for scale, bm, png in ((1, b1, png1), (2, b2, png2)):
+        shot = Image.open(png).convert("RGB")
+        box = magenta_box(shot)
+        if not box:
+            check(False, "hidpi %dx: the picture is on screen" % scale)
+            continue
+        bw, bh = box[2] - box[0] + 1, box[3] - box[1] + 1
+        check(abs(bw - bm[0]) <= 3 and abs(bh - bm[1]) <= 3,
+              "hidpi %dx: drawn 1:1 (frame %dx%d, bitmap %dx%d)" % (scale, bw, bh, bm[0], bm[1]))
+        # The screen's picture against an offline resize of the source at
+        # the bitmap's size (PIL, in sRGB like the loader): Lanczos, a
+        # different good filter, so the match shows sharpness, not an
+        # identical kernel.
+        ref = ref_src.resize(bm, Image.LANCZOS)
+        mad, ratio = pic_match(shot, ref, box[0], box[1], int(round(12 * bm[0] / 1600.0)) + 3)
+        check(mad < 8 and 0.8 < ratio < 1.25,
+              "hidpi %dx: as sharp as an offline Lanczos resize" % scale,
+              "mean |diff| %.1f, edge energy %.2f of the reference" % (mad, ratio))
+
+
 def main(argv):
     exe = os.path.abspath(argv[1] if len(argv) > 1 else "bin/cctext-ui")
     if not os.path.exists(exe):
@@ -417,8 +575,11 @@ def main(argv):
     env, xvfb = got
     try:
         with tempfile.TemporaryDirectory(prefix="cctext_img_") as tmp:
-            for case in (case_markdown, case_relative, case_anim, case_slide, case_viewer, case_browse,
-                         case_remote, case_idle_threads):
+            only = os.environ.get("IMG_CASE")
+            for case in (case_markdown, case_relative, case_anim, case_slide, case_viewer,
+                         case_browse, case_remote, case_idle_threads, case_hidpi):
+                if only and only not in case.__name__:
+                    continue
                 case(exe, env, tmp)
     finally:
         if xvfb:

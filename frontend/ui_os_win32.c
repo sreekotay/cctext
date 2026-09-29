@@ -191,6 +191,10 @@ void ui_os_menu_slot(uiMenuItem *it, int slot, const char *title) {
  * DPI is DirectWrite's job, not this factor. */
 double ui_os_pt_per_px(void) { return 0.75; }
 
+/* Images are placeholders on Windows (below), so pictures need no device
+ * scale yet; GetDpiForWindow / 96 is the value once the blit exists. */
+double ui_os_device_scale(void) { return 1.0; }
+
 const char *ui_os_font_family(const char *path) {
     if (!path) return "Consolas";
     if (strncmp(path, "family:", 7) == 0 && path[7]) return path + 7;
