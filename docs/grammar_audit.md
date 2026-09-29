@@ -1,6 +1,7 @@
 # Grammar audit: what the lowered TM table can and cannot express
 
-Scope: the ten grammars in `testdata/grammars/*.tmLanguage.json`, the lowering
+Scope: the ten grammars in `testdata/grammars/*.tmLanguage.json` at the time
+(`mermaid.tmLanguage.json`, added later, is not audited here), the lowering
 in `core/document.ccs` (`rtx_tm_lower_rule` → `RtxTmRule`, `core/tm.cch`), and
 what "grammar injection at a span" needs on top of them. Fixtures that drive
 each requirement live next to this file; see `README.md` for line-level
