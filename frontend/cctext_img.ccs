@@ -765,7 +765,16 @@ static void ti_job_run(TiJob *j) {
         }
     } else {
         /* Sixel / iTerm2: the crop of the picture at its display size. */
+        static int delay_ms = -1;
         uint32_t x0 = (uint32_t)j->cx * j->cw, y0 = (uint32_t)j->cy * j->ch;
+        if (delay_ms < 0) {
+            /* Tests: a slow encoder, so a frame meets a crop still on its
+             * way (the block art meanwhile). */
+            const char *d = getenv("RTX_TUI_ENC_DELAY_MS");
+            delay_ms = d && d[0] ? atoi(d) : 0;
+            if (delay_ms > 5000) delay_ms = 5000;
+        }
+        if (delay_ms > 0) usleep((useconds_t)delay_ms * 1000u);
         uint32_t x1 = (uint32_t)(j->cx + j->cn) * j->cw, y1 = (uint32_t)(j->cy + j->rn) * j->ch;
         uint8_t *crop;
         if (x1 > j->dw) x1 = j->dw;
@@ -1093,6 +1102,15 @@ typedef struct {
 #define TI_OV 64
 static TiOv g_ov_old[TI_OV], g_ov_new[TI_OV];
 static int g_nov_old, g_nov_new;
+/* Overlay groups whose crop is still encoding: the rows show the picture
+ * as block art meanwhile (a scroll inside a picture asks for a new crop
+ * at every step). The rows written that way are rewritten the next
+ * frame, so the overlay never lands on leftover cells. */
+static TiLine g_pend[TI_OV];
+static int g_pend_rn[TI_OV];
+static int g_npend;
+static int g_fb_old[TI_OV][2], g_fb_new[TI_OV][2]; /* row, rows */
+static int g_nfb_old, g_nfb_new;
 static TiEnc *g_ov_enc[TI_OV];
 static int g_ov_built;
 
@@ -1173,7 +1191,12 @@ static void ti_fill(const CctiPic *p, int li, int c0, int n, int srow, int scol,
         return;
     }
     if (kind == CCTI_SIXEL || kind == CCTI_ITERM) {
-        /* Blanks under the overlay; the lines group at publish. */
+        /* Blanks under the overlay; the lines group at publish. The
+         * picture's block art is asked for now, so it is there when a
+         * scroll needs a crop that is still encoding (ti_pend_emit). */
+        if (li == 0 || !g_nlines || g_lines[g_nlines - 1].bmp != bmp->id)
+            (void)ti_enc_get(bmp, frame, CCTI_BLOCKS, p->cols, p->rows, dw, dh, 0, 0, p->cols,
+                             p->rows);
         if (g_nlines < TI_LINES) {
             TiLine *L = &g_lines[g_nlines++];
             L->bmp = bmp->id;
@@ -1292,6 +1315,7 @@ static void ti_ov_build(void) {
     if (g_ov_built) return;
     g_ov_built = 1;
     g_nov_new = 0;
+    g_npend = 0;
     for (i = 0; i < g_nlines; i++) {
         TiLine *a = &g_lines[i];
         int k = i + 1, rn = 1;
@@ -1310,7 +1334,14 @@ static void ti_ov_build(void) {
         if (g_nov_new >= TI_OV) break;
         e = ti_enc_get(a->bp, a->frame, a->kind, a->cols, a->rows, a->dw, a->dh, a->c0, a->li,
                        a->n, rn);
-        if (!e || e->state != TE_OK || !e->bytes) continue;
+        if (!e || e->state != TE_OK || !e->bytes) {
+            if (g_npend < TI_OV && (!e || e->state != TE_FAIL)) {
+                g_pend[g_npend] = *a;
+                g_pend_rn[g_npend] = rn;
+                g_npend++;
+            }
+            continue;
+        }
         g_ov_new[g_nov_new].row = a->srow - 1;
         g_ov_new[g_nov_new].col = a->scol - 1;
         g_ov_new[g_nov_new].cn = a->n;
@@ -1404,9 +1435,53 @@ void cctext_img_ov_rows(unsigned char *touch, int rows) {
      * protect there. */
 }
 
+/* The pending groups as block art: the whole picture's cells encode once
+ * (cheap next to a sixel crop) and each line of the group writes its
+ * slice. A group whose block art is not ready either stays blank. */
+static void ti_pend_emit(int rows) {
+    int i, k;
+    g_nfb_new = 0;
+    for (i = 0; i < g_npend; i++) {
+        const TiLine *a = &g_pend[i];
+        TiEnc *e = ti_enc_get(a->bp, a->frame, CCTI_BLOCKS, a->cols, a->rows, a->dw, a->dh, 0,
+                              0, a->cols, a->rows);
+        if (!e || e->state != TE_OK || !e->cells) continue;
+        for (k = 0; k < g_pend_rn[i]; k++) {
+            int li = a->li + k, c, cf = -2, cb = -2;
+            if (li >= a->rows || a->srow + k - 1 >= rows) break;
+            fprintf(stdout, "\x1b[0m\x1b[%d;%dH", a->srow + k, a->scol);
+            for (c = a->c0; c < a->c0 + a->n && c < a->cols; c++) {
+                const RtxTimgCell *tc = &e->cells[(size_t)li * (size_t)a->cols + (size_t)c];
+                char u[8];
+                int un;
+                if (tc->fg != cf || tc->bg != cb) {
+                    char sgr[64];
+                    int sn = rtx_timg_sgr(tc->fg, tc->bg, sgr, sizeof sgr);
+                    fwrite(sgr, 1, (size_t)sn, stdout);
+                    cf = tc->fg;
+                    cb = tc->bg;
+                }
+                un = rtx_timg_utf8(tc->cp, u);
+                fwrite(u, 1, (size_t)un, stdout);
+            }
+            fputs("\x1b[0m", stdout);
+        }
+        if (g_nfb_new < TI_OV) {
+            g_fb_new[g_nfb_new][0] = a->srow - 1;
+            g_fb_new[g_nfb_new][1] = g_pend_rn[i];
+            g_nfb_new++;
+        }
+    }
+    memcpy(g_fb_old, g_fb_new, sizeof(g_fb_new[0]) * (size_t)g_nfb_new);
+    g_nfb_old = g_nfb_new;
+}
+
 void cctext_img_ov_force(unsigned char *force, int rows) {
     int i, j, r;
     ti_ov_build();
+    for (i = 0; i < g_nfb_old; i++)
+        for (r = g_fb_old[i][0]; r < g_fb_old[i][0] + g_fb_old[i][1]; r++)
+            if (r >= 0 && r < rows) force[r] = 1;
     for (i = 0; i < g_nov_old; i++) {
         for (j = 0; j < g_nov_new; j++)
             if (ti_ov_same(&g_ov_old[i], &g_ov_new[j])) break;
@@ -1436,12 +1511,15 @@ void cctext_img_ov_emit(const unsigned char *written, int rows) {
     }
     memcpy(g_ov_old, g_ov_new, sizeof(TiOv) * (size_t)g_nov_new);
     g_nov_old = g_nov_new;
+    ti_pend_emit(rows);
 }
 
 void cctext_img_invalidate(int lost) {
     TiEnc *e;
-    /* The screen is being cleared: old overlays are gone with it. */
+    /* The screen is being cleared: old overlays are gone with it, and so
+     * is block art drawn for crops still encoding. */
     g_nov_old = 0;
+    g_nfb_old = 0;
     if (!lost) return;
     /* Our kitty images were deleted (^Z): send each again when painted
      * (a temp file the terminal already read is written anew). */

@@ -24,8 +24,10 @@ void ui_os_init(uiWindow *win, uiArea *area) {
      * WM_KILLFOCUS on the toplevel (or WM_ACTIVATE) → ui_plat_focus, WM_CHAR /
      * WM_UNICHAR (typed text, IME commits arrive as WM_CHAR after
      * WM_IME_COMPOSITION) and WM_MOUSEWHEEL / WM_MOUSEHWHEEL
-     * (GET_WHEEL_DELTA_WPARAM / WHEEL_DELTA notches → ui_plat_wheel;
-     * vertical is +up already, horizontal +right). Then SetFocus(hwnd).
+     * (GET_WHEEL_DELTA_WPARAM / (float)WHEEL_DELTA → ui_plat_wheel: a
+     * fraction, not whole notches — a precision touchpad sends deltas
+     * under 120 and text panes scroll by that much of a notch; vertical is
+     * +up already, horizontal +right). Then SetFocus(hwnd).
      * libui's area already handles WM_MOUSEWHEEL for scrolling areas only;
      * cctext uses a non-scrolling area, so the subclass sees them. */
 }

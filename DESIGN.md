@@ -155,7 +155,11 @@ camera with `edit_gen` (`cam_sig`). If the next one finds them
 unchanged, the rows were rebuilt for something else (a resize, Rich /
 Source, a reveal span, a picture's size) and `top_wrap` becomes the row
 that now holds the anchor; the anchor itself stays, so repeated
-relayouts do not creep. An edit or a camera move records a new anchor.
+relayouts do not creep. An edit carries the anchor through the doc's
+edit span (before `span_reset`): after the edit it moves by what went
+in or out, inside it it goes to the edit's start, at its start it stays
+(text typed at the top shows there); lines added or removed above move
+`top` to the anchor's line. A camera move records a new anchor.
 
 `line_of` is a covered lookup. Uncovered is an error — it does not scan.
 `RtxDocLayout` does not grant it. Box select is two floors and columns,

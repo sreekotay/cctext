@@ -3180,6 +3180,59 @@ def case_image_sixel(exe, tmp):
         t.kill()
 
 
+def art_cells(sc, t):
+    """Cells painted as the quadrants' colours (block art: a glyph in the
+    foreground, or a solid area as a blank on that background)."""
+    quads = ((220, 30, 30), (30, 200, 40), (40, 60, 220))
+    n = 0
+    for y in range(t.rows):
+        for x in range(t.cols):
+            c = sc.buffer[y][x]
+            for col in (c.fg, c.bg):
+                try:
+                    rgb = fg_rgb(col)
+                except (ValueError, IndexError):
+                    rgb = None
+                if rgb and any(near(rgb, q, 30) for q in quads):
+                    n += 1
+                    break
+    return n
+
+
+def case_image_sixel_scroll(exe, tmp):
+    """A sixel picture scrolled so the pane's top cuts it: each wheel step
+    needs a crop that starts lower in the picture. While that crop is
+    still encoding (a slow encoder here), its rows show the picture as
+    block art, not blank; once it lands the sixel covers them and the
+    frame equals a full repaint, with no block art left under it."""
+    if pyte is None:
+        print("skip: image sixel scroll (no pyte)")
+        return
+    proj, path, body = img_project(tmp, "sixs")
+    fake = FakeTerm("sixel")
+    t = Tui(exe, ["--no-blink", path], img_env(tmp, "sixs", RTX_TUI_ENC_DELAY_MS="700"),
+            fake=fake)
+    try:
+        t.pump(3.0)
+        for _ in range(5):
+            t.send(b"\x1b[<65;10;10M", 0.05)
+        t.pump(0.25)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        art = art_cells(sc, t)
+        check(art > 20, "image sixel scroll: block art while the crop encodes", repr(art))
+        t.pump(3.0)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        left = art_cells(sc, t)
+        check(sc.nimg >= 1 and left == 0, "image sixel scroll: the sixel lands, no block art left",
+              repr((sc.nimg, left)))
+        ok, why = full_repaint_equal(t, fake)
+        check(ok, "image sixel scroll: equals a full repaint", why)
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
 def case_image_iterm(exe, tmp):
     """iTerm2 (XTVERSION): OSC 1337 inline PNGs sized in cells, over blank
     cells; scrolling equals a full repaint."""
@@ -3860,6 +3913,7 @@ CASES = {
     "mermaid_blocks": case_mermaid_blocks,
     "image_kitty": case_image_kitty,
     "image_sixel": case_image_sixel,
+    "image_sixel_scroll": case_image_sixel_scroll,
     "image_iterm": case_image_iterm,
     "image_tmux": case_image_tmux,
     "present": case_present,

@@ -75,8 +75,15 @@ def case_wheel_picture(exe, env, tmp):
             U.xdo(env, "click", "5")
             time.sleep(0.35)
         print("picture rows per notch:", spans)
-        bottoms = [sp[1] for sp in spans if sp]
-        steps = [a - b for a, b in zip(bottoms, bottoms[1:])]
+        shown = [sp for sp in spans if sp]
+        bottoms = [sp[1] for sp in shown]
+        # How far each notch moved it: by its bottom edge, except while the
+        # pane's bottom cuts it off (that edge is the pane's, not its own);
+        # then by its top edge.
+        clip = max(bottoms) if bottoms else 0
+        steps = []
+        for a, b in zip(shown, shown[1:]):
+            steps.append(a[1] - b[1] if a[1] != clip else a[0] - b[0])
         check(len(bottoms) >= 4, "wheel picture: on screen for several notches",
               "%d shots" % len(bottoms))
         # Cut at the top: its top edge stays at the pane's top while the
@@ -85,9 +92,8 @@ def case_wheel_picture(exe, env, tmp):
         cut = [sp for sp in spans if sp and sp[1] - sp[0] < full - 10]
         check(len(cut) >= 3, "wheel picture: slides out through the pane's top",
               "%d shots with the picture cut at the top" % len(cut))
-        # The first notch may be part of one (the platform's first delta);
-        # after it, every notch is GUI_WHEEL_LINES lines.
-        big = [st for st in steps[1:] if st > 0]
+        # Every notch is GUI_WHEEL_LINES lines, through the picture too.
+        big = [st for st in steps if st > 0]
         if big:
             lo, hi = min(big), max(big)
             check(hi <= lo + 4, "wheel picture: every notch moves it the same distance",
