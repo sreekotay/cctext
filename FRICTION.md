@@ -98,17 +98,13 @@ the process: 50 wakeups a second at idle, the only thread that wakes
 (measured 99-100 in 2 s, TUI and cctext-ui; the UI thread, GTK threads
 and the parked workers stay at 0). Not a cctext loop, and nothing on
 the cctext side can stop it (static, `pthread_once` init, no quiesce
-API). `scripts/ccc_sysmon_quiescent.patch` (concurrent-c
-`cc/runtime/sched_v2.c`; applies to e59f6b9 and later): sysmon waits
-with no timeout while nothing is queued / running / growing / due and
-the pool is settled; a ready push, a worklet or a park deadline pokes
-it (store / fence / load both sides). With it every thread is at 0
-wakeups idle in every case below. Until the pin carries it,
-`tests/tui_pty_test.py idle_threads` and `tests/ui_img_test.py`'s idle
-case count every thread and fail on any wakeup except that tick, which
-they recognise (a raw `FUTEX_WAIT_PRIVATE` with a timeout in
-`/proc/<tid>/syscall`) and print as a note; `RTX_IDLE_STRICT=1` fails
-on it too.
+API). Fixed upstream in concurrent-c #162 (in the pin since 7c19121):
+sysmon waits with no timeout while nothing is queued / running /
+growing / due and the pool is settled; a ready push, a worklet or a
+park deadline pokes it. Every thread is now at 0 wakeups idle, and
+`tests/tui_pty_test.py idle_threads`, `tests/ui_img_test.py` and
+`tests/ui_blink_test.py` fail on the old 20 ms tick too
+(`RTX_IDLE_STRICT=0` makes it a note, for an older runtime).
 
 `@parallel wait` body locals' `@destroy` does not run when the body's
 `@stage` wait fails (the lowering jumps to the construct's done label).
@@ -158,5 +154,7 @@ Two trees building at once (agent worktrees, a gate copy beside the
 main checkout) share ccc's script cache `/tmp/cc-script-<uid>`: one
 tree can pick up the other's compiled build script, which shows up as
 intermittent "unknown type" or garbled generated-header errors that
-vanish on a rerun. Build one tree at a time, or give each its own
-`TMPDIR`, before chasing such an error as a real one.
+vanish on a rerun. Fixed in concurrent-c 7c19121 (the pin): each
+`.shcc` script stages under its own `$TMPDIR/cc-script-<uid>/<hash>/`.
+With an older ccc, build one tree at a time or give each its own
+`TMPDIR`.

@@ -250,9 +250,8 @@ def case_browse(exe, env, tmp):
 
 def check_idle(tag, pid, secs=3.0):
     """Zero wakeups on every thread once work settles (U.idle_threads).
-    The pinned ccc's sysmon ticks 50 times a second once any `@parallel`
-    ran (the image lanes, browse): a note, a failure with
-    RTX_IDLE_STRICT=1 (a runtime whose sysmon sleeps has no such tick)."""
+    The ccc runtime's sysmon counts too (it sleeps at idle since
+    concurrent-c #162); RTX_IDLE_STRICT=0 makes its tick a note."""
     own, tick, detail = U.idle_threads(pid, secs)
     check(own == 0, "%s: idle, no thread wakes" % tag,
           "%d wakeups in %.1f s: %s" % (own, secs, detail))

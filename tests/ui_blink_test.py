@@ -98,7 +98,9 @@ def runtime_tick(pid, tid):
     return False
 
 
-IDLE_STRICT = os.environ.get("RTX_IDLE_STRICT", "") not in ("", "0")
+# The pinned ccc (concurrent-c #162) sleeps its sysmon at idle: a tick is a
+# failure. RTX_IDLE_STRICT=0 turns it back into a note (an older runtime).
+IDLE_STRICT = os.environ.get("RTX_IDLE_STRICT", "1") not in ("", "0")
 
 
 def idle_threads(pid, secs=3.0):

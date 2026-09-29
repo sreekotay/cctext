@@ -1246,7 +1246,9 @@ def runtime_tick(pid, tid):
     return False
 
 
-IDLE_STRICT = os.environ.get("RTX_IDLE_STRICT", "") not in ("", "0")
+# The pinned ccc (concurrent-c #162) sleeps its sysmon at idle: a tick is a
+# failure. RTX_IDLE_STRICT=0 turns it back into a note (an older runtime).
+IDLE_STRICT = os.environ.get("RTX_IDLE_STRICT", "1") not in ("", "0")
 
 
 def idle_threads(pid, secs, pump):
@@ -1285,11 +1287,10 @@ def idle_threads(pid, secs, pump):
 
 
 def check_idle(tag, pid, pump, secs=3.0):
-    """Zero wakeups on every thread over `secs` of idle. The pinned ccc's
-    sysmon ticks 50 times a second once any `@parallel` ran (the image
-    lanes, browse, find); that is a note, and a failure with
-    RTX_IDLE_STRICT=1 or a runtime whose sysmon sleeps (then it has no
-    such tick to excuse)."""
+    """Zero wakeups on every thread over `secs` of idle, the ccc runtime's
+    sysmon included (it sleeps while the scheduler is quiescent since
+    concurrent-c #162); RTX_IDLE_STRICT=0 makes its 20 ms tick a note,
+    for an older runtime."""
     own, tick, detail = idle_threads(pid, secs, pump)
     check(own == 0, "%s: idle, no thread wakes" % tag,
           "%d wakeups in %.1f s: %s" % (own, secs, detail))

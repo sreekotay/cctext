@@ -99,10 +99,9 @@ frame and costs nothing more. `"image_animate": true` decodes up to
 `image_anim_frames` frames (each scaled; the whole set counts against the
 budget) with their delays; cctext-ui wakes for the next frame only while
 an animated picture was painted in the last pass (`rtx_img_next_ms`), so
-a still window stays at zero wakeups. (The editor's threads do; the
-ccc runtime's scheduler monitor, started by the loader's first job, ticks
-every 20 ms on the pinned ccc until it carries
-`scripts/ccc_sysmon_quiescent.patch` — FRICTION.md.)
+a still window stays at zero wakeups — every thread, the ccc runtime's
+scheduler monitor included (it sleeps while nothing is queued since
+concurrent-c #162; FRICTION.md).
 
 ## Sources and permissions
 
