@@ -87,6 +87,9 @@ static int g_mouse_down, g_mouse_pressed, g_mouse_released;
 static int g_mouse_mid_pressed; /* middle button (a tab close) */
 static float g_wheel_x, g_wheel_y;
 static float g_wheel_carry_x, g_wheel_carry_y;
+/* The vertical wheel as the device reported it, not cut into notches: a
+ * trackpad's small deltas scroll a text pane by pixels. */
+static float g_wheel_fine_y, g_wheel_fine_acc_y;
 
 static char *g_clip;
 static int g_menu_cmd;
@@ -612,6 +615,7 @@ void ui_plat_wheel(float dx, float dy) {
     if (script_open()) return;
     g_wheel_carry_x += dx;
     g_wheel_carry_y += dy;
+    g_wheel_fine_acc_y += dy;
 }
 
 static int on_should_quit(void *data) {
@@ -818,9 +822,12 @@ static void script_arm_frame(void) {
         return;
     }
     if (strncmp(g_script_line, "wheel ", 6) == 0) {
-        /* wheel <dy> [dx]: notches this frame, +dy = up. */
+        /* wheel <dy> [dx]: notches this frame, +dy = up. A fraction
+         * (wheel -0.25) is a trackpad's delta: lists see whole notches
+         * only, a text pane scrolls by that much of a notch. */
         char *end = NULL;
-        g_wheel_y = (float)strtol(g_script_line + 6, &end, 10);
+        g_wheel_fine_y = (float)strtod(g_script_line + 6, &end);
+        g_wheel_y = (float)(int)g_wheel_fine_y;
         g_wheel_x = end ? (float)strtol(end, NULL, 10) : 0.0f;
         g_script_have = 0;
         return;
@@ -1559,6 +1566,8 @@ static void wheel_commit(void) {
     }
     g_wheel_x = (float)sx;
     g_wheel_y = (float)sy;
+    g_wheel_fine_y = g_wheel_fine_acc_y;
+    g_wheel_fine_acc_y = 0;
 }
 
 static void clear_edges(void) {
@@ -1568,6 +1577,7 @@ static void clear_edges(void) {
     g_mouse_mid_pressed = 0;
     g_mouse_released = 0;
     g_wheel_x = g_wheel_y = 0;
+    g_wheel_fine_y = 0;
     g_nchar = g_char_rd = 0;
     g_resized = 0;
 }
@@ -1928,6 +1938,7 @@ Vector2 GetMouseWheelMoveV(void) {
     return (Vector2){g_wheel_x, g_wheel_y};
 }
 float GetMouseWheelMove(void) { return g_wheel_y; }
+float GetMouseWheelMoveFine(void) { return g_wheel_fine_y; }
 
 void SetClipboardText(const char *text) {
     ui_os_clip_set(text ? text : "");

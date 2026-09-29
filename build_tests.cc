@@ -123,6 +123,10 @@ CC_TARGET scroll_smoke exe tests/scroll_smoke.ccs
 CC_TARGET_INCLUDE scroll_smoke .
 CC_TARGET_DEPS scroll_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
 
+CC_TARGET cam_smooth_smoke exe tests/cam_smooth_smoke.ccs
+CC_TARGET_INCLUDE cam_smooth_smoke .
+CC_TARGET_DEPS cam_smooth_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_browse rtx_nav rtx_scope rtx_find rtx_safe rtx_document rtx_layout rtx_workspace rtx_batch rtx_ui
+
 CC_TARGET rx_perf exe tests/rx_perf.ccs
 CC_TARGET_INCLUDE rx_perf .
 CC_TARGET_DEPS rx_perf rtx_rx

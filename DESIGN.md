@@ -137,7 +137,25 @@ its exact line (the scan counted it), so that land keys the gutter
 origin on the hit's floor and plants no island. Apply and **pump**
 keep the camera. Wheel and the scroll rail stay live while find is open.
 `if (seek) land else reveal` is the bug: seeking is a camera mode, not
-“index incomplete”. After handoff, wrap follow owns `top_wrap` again.
+“index incomplete”. Both modes step `top_wrap` one screen row at a
+time under soft wrap (the wheel never skips the rest of a wrapped
+line). Reveal above the pane puts the caret's row at the top, not its
+line's first row (`cam_row`, resolved by the next ensure_view, which
+lays that line out); just below it scrolls until the caret's row is the
+bottom one.
+
+The pane's top edge may rest inside its first row: `top_dy` is how far
+(cells, or px in cctext-ui), set on one row (`top_dy_at`) and read
+through `rtx_buf_dy`, which is 0 on any other row — so a jump, a reveal
+or a fold drops it without a reset at each site. A wheel step is one
+screen line of the row it is in (a picture takes as many as it is
+tall); `scroll_by` moves any distance (a trackpad's pixels). Each
+ensure_view records the top row's first byte (`cam_anchor`) and the
+camera with `edit_gen` (`cam_sig`). If the next one finds them
+unchanged, the rows were rebuilt for something else (a resize, Rich /
+Source, a reveal span, a picture's size) and `top_wrap` becomes the row
+that now holds the anchor; the anchor itself stays, so repeated
+relayouts do not creep. An edit or a camera move records a new anchor.
 
 `line_of` is a covered lookup. Uncovered is an error — it does not scan.
 `RtxDocLayout` does not grant it. Box select is two floors and columns,

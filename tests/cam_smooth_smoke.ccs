@@ -1,0 +1,306 @@
+#!ccc ccs
+/*
+ * The camera moves by screen lines, not by lines of the file.
+ *
+ * One wheel step moves what the pane shows by exactly one screen line:
+ * the lines on screen after a step down are the ones that were on screen
+ * from the second line on, and a step up puts back the line that left.
+ * That holds for a wrapped line (seeking and lined cameras alike), for a
+ * Rich table record whose cells wrap (one row, several screen lines), and
+ * for text above and below them.
+ *
+ * Revealing a caret above the pane scrolls only as far as its row: Up
+ * into a wrapped paragraph over the pane shows the paragraph's last row,
+ * not its first.
+ *
+ * A relayout (a narrower or wider pane, soft wrap toggled back) keeps the
+ * byte at the top of the pane on screen.
+ */
+#include <ccc/std/prelude.cch>
+#include <ccc/stdio.cch>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../core/utf8.cch"
+#include "../core/document.cch"
+#include "../core/layout.cch"
+#include "../core/workspace.cch"
+
+#define CS_W 100.0
+#define CS_VIS 20
+#define CS_MAX 64
+
+static int fails = 0;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL: %s\n", msg);
+        fails++;
+    }
+}
+
+static double cell_meas(void *ctx, char[:] bytes, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return (double)rtx_utf8_cols(bytes);
+}
+
+static double cell_lh(void *ctx, RtxStyle st, RtxSectionKind sec) {
+    (void)ctx;
+    (void)st;
+    (void)sec;
+    return 1.0;
+}
+
+/* One screen line: the row it belongs to (by its first byte) and which of
+ * that row's screen lines it is. */
+typedef struct {
+    size_t row;
+    int li;
+} CsLine;
+
+/* What the pane shows, top to bottom, as the painters walk it: rows from
+ * top_wrap, the first one entered top_dy lines down. */
+static size_t shown(const RtxBuf *b, CsLine *out, size_t max) {
+    size_t n = 0, i;
+    int li = (int)(rtx_buf_dy(b) + 0.5);
+    for (i = b->top_wrap; i < b->layout.rows.len && n < max; i++) {
+        const RtxVisRow *r = &b->layout.rows.data[i];
+        int h = rtx_layout_row_lines(&b->layout, r);
+        for (; li < h && n < max; li++) {
+            out[n].row = r->byte_start;
+            out[n].li = li;
+            n++;
+        }
+        li = 0;
+    }
+    return n;
+}
+
+static int same(const CsLine *a, const CsLine *b) {
+    return a->row == b->row && a->li == b->li;
+}
+
+/* Paragraphs that wrap three to five times at CS_W, short lines between,
+ * and (for Rich) tables whose long cells wrap inside one record. */
+static void write_doc(const char *path, int tables, size_t blocks) {
+    FILE *fp = fopen(path, "w");
+    size_t b;
+    const char *lng = "a long description that keeps going well past the width a fitted "
+                      "column gets in a hundred-column pane, so the cell wraps to several "
+                      "lines of its own record, and then some more words so that it takes "
+                      "at least three or four of them at the width the fit leaves it";
+    if (!fp) return;
+    for (b = 0; b < blocks; b++) {
+        fprintf(fp, "Paragraph %zu opens a line that wraps in a hundred-column pane. ", b);
+        fprintf(fp, "It keeps going with more words so the soft wrap splits it into ");
+        fprintf(fp, "several screen rows, and it goes on for a good while longer than ");
+        fprintf(fp, "that so there are at least three of them, maybe four or five.\n");
+        fprintf(fp, "short %zu\n\n", b);
+        if (tables && b % 4 == 1)
+            fprintf(fp, "| Key | Description | N |\n|---|---|--:|\n| k%zu | %s | 1 |\n"
+                        "| s%zu | short | 2 |\n\n",
+                    b, lng, b);
+    }
+    fclose(fp);
+}
+
+static void !>(CCError) frame(RtxBuf *b, RtxMeasure *m) {
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    b->ensure_view(m, CS_W, CS_VIS) !>;
+    return cc_ok();
+}
+
+/* Wheel down `steps` single steps, then back up as many; each one moves
+ * the screen by exactly one line. */
+static void !>(CCError) wheel_steps(const char *path, int rich, int seek, size_t steps) {
+    int seeking = 0;
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    CsLine was[CS_MAX], now[CS_MAX];
+    size_t nw, nn, k, i, bad = 0, first_bad = 0;
+    char msg[256];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    m.measure = cell_meas;
+    m.line_height = cell_lh;
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.wrap = 1;
+    b.layout.rich = rich;
+    b.pin_view = 1;
+    if (seek) {
+        /* the middle of a file the line index does not cover yet */
+        size_t mid = rtx_doc_line_floor_local(&b.doc, b.doc.len() / 2) !>(ie) {
+            return cc_err(CC_ERR_IO, "floor");
+        };
+        rtx_buf_seek_set(&b, mid);
+    }
+    frame(&b, &m) !>;
+    seeking = b.seek_valid;
+    for (k = 0; k < 2 * steps; k++) {
+        int dir = k < steps ? 1 : -1;
+        int ok = 1;
+        if (b.seek_valid) seeking++;
+        nw = shown(&b, was, CS_VIS);
+        b.scroll_vis(&m, CS_W, dir) !>;
+        frame(&b, &m) !>;
+        nn = shown(&b, now, CS_VIS);
+        if (nw < CS_VIS || nn < CS_VIS) break; /* near EOF: nothing to compare */
+        for (i = 0; i + 1 < CS_VIS; i++) {
+            if (dir > 0 ? !same(&now[i], &was[i + 1]) : !same(&now[i + 1], &was[i])) ok = 0;
+        }
+        if (!ok && getenv("CS_VERBOSE")) {
+            fprintf(stderr, "step %zu dir %d: was %zu.%d %zu.%d now %zu.%d %zu.%d\n", k, dir,
+                    was[0].row, was[0].li, was[1].row, was[1].li, now[0].row, now[0].li,
+                    now[1].row, now[1].li);
+        }
+        if (!ok) {
+            if (!bad) first_bad = k;
+            bad++;
+        }
+    }
+    snprintf(msg, sizeof msg,
+             "wheel rich %d seek %d: %zu of %zu steps did not move by one screen line "
+             "(first at step %zu)",
+             rich, seek, bad, 2 * steps, first_bad);
+    expect(bad == 0, msg);
+    if (seek) expect(seeking > 0, "wheel seek: the camera never seeked");
+    return cc_ok();
+}
+
+/* The caret goes to the last row of the wrapped paragraph right above the
+ * pane; revealing it shows that row at the top, the rest of the screen
+ * as it was. */
+static void !>(CCError) reveal_above(const char *path) {
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    CsLine was[CS_MAX], now[CS_MAX];
+    size_t nw, nn, i, top_line_start, last_row_start;
+    int ok = 1;
+    char msg[256];
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    m.measure = cell_meas;
+    m.line_height = cell_lh;
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.wrap = 1;
+    b.top = 4; /* the second paragraph: lines 0-2 are paragraph, short, blank */
+    b.top_wrap = 0;
+    b.top_dy = 0;
+    frame(&b, &m) !>;
+    nw = shown(&b, was, CS_VIS);
+    /* the last row of line 3 (the blank line is 2; paragraph 1 is 3) */
+    top_line_start = b.doc.line_start(3) !>(ie) { return cc_err(CC_ERR_IO, "line_start"); };
+    {
+        RtxLayout tmp = {0} @destroy;
+        tmp.wrap = 1;
+        tmp.lines(&b.doc, &m, CS_W, 3, 1) !>;
+        expect(tmp.rows.len >= 3, "reveal_above: paragraph wraps");
+        last_row_start = tmp.rows.data[tmp.rows.len - 1].byte_start;
+    }
+    b.doc.caret = last_row_start + 2;
+    b.doc.sel_anchor = b.doc.caret;
+    b.reveal(CS_VIS) !>(ie) { return cc_err(CC_ERR_IO, "reveal"); };
+    frame(&b, &m) !>;
+    nn = shown(&b, now, CS_VIS);
+    expect(nn == CS_VIS && nw == CS_VIS, "reveal_above: full panes");
+    if (now[0].row != last_row_start) ok = 0;
+    for (i = 0; i + 1 < CS_VIS; i++)
+        if (!same(&now[i + 1], &was[i])) ok = 0;
+    snprintf(msg, sizeof msg,
+             "reveal_above: the caret's row %zu should be the only new line at the top "
+             "(top shows %zu; the line starts at %zu)",
+             last_row_start, now[0].row, top_line_start);
+    expect(ok, msg);
+    return cc_ok();
+}
+
+/* The byte at the top of the pane before a relayout the camera did not
+ * ask for (a narrower or wider pane, Rich / Source) is in the top row
+ * after it. */
+static int holds(const RtxBuf *b, size_t at) {
+    const RtxVisRow *r;
+    if (b->top_wrap >= b->layout.rows.len) return 0;
+    r = &b->layout.rows.data[b->top_wrap];
+    return at >= r->byte_start && at <= r->byte_start + r->byte_len;
+}
+
+static void !>(CCError) relayout_keeps(const char *path, int rich) {
+    RtxBuf b = {0} @destroy;
+    RtxMeasure m = {0};
+    size_t at, k;
+    char msg[256];
+    static const double widths[] = {60.0, 140.0, 100.0, 47.0};
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    m.measure = cell_meas;
+    m.line_height = cell_lh;
+    b.doc.from_path(cc_slice_cstr(path)) !>;
+    b.layout.wrap = 1;
+    b.layout.rich = rich;
+    b.pin_view = 1;
+    frame(&b, &m) !>;
+    /* into the third row of a wrapped paragraph a few screens down */
+    for (k = 0; k < 42; k++) b.scroll_vis(&m, CS_W, 1) !>;
+    frame(&b, &m) !>;
+    while (b.top_wrap < 2) {
+        b.scroll_vis(&m, CS_W, 1) !>;
+        frame(&b, &m) !>;
+    }
+    at = b.layout.rows.data[b.top_wrap].byte_start;
+    for (k = 0; k < sizeof widths / sizeof widths[0]; k++) {
+        b.ensure_view(&m, widths[k], CS_VIS) !>;
+        snprintf(msg, sizeof msg, "relayout rich %d: width %.0f keeps byte %zu at the top "
+                 "(top row starts at %zu)", rich, widths[k], at,
+                 b.top_wrap < b.layout.rows.len ? b.layout.rows.data[b.top_wrap].byte_start : 0);
+        expect(holds(&b, at), msg);
+        if (getenv("CS_VERBOSE"))
+            fprintf(stderr, "w %.0f top %zu tw %zu from %zu rows %zu sig %d r0 %zu\n", widths[k], b.top,
+                    b.top_wrap, b.layout.from_line, b.layout.rows.len, b.cam_sig != 0,
+                    b.layout.rows.data[0].byte_start);
+    }
+    b.toggle_rich();
+    b.ensure_view(&m, CS_W, CS_VIS) !>;
+    snprintf(msg, sizeof msg, "relayout rich %d: Rich / Source keeps byte %zu at the top", rich,
+             at);
+    expect(holds(&b, at), msg);
+    b.toggle_rich();
+    b.ensure_view(&m, CS_W, CS_VIS) !>;
+    expect(holds(&b, at), "relayout: and back");
+    return cc_ok();
+}
+
+int main(void) {
+    const char *plain = "testdata/generated/cam_smooth.txt";
+    const char *md = "testdata/generated/cam_smooth.md";
+    const char *big = "testdata/generated/cam_smooth_big.txt";
+    const char *bigmd = "testdata/generated/cam_smooth_big.md";
+    @errhandler(CCError e) {
+        cc_error_log(e);
+        return 1;
+    }
+    (void)!system("mkdir -p testdata/generated");
+    write_doc(plain, 0, 40);
+    write_doc(md, 1, 40);
+    write_doc(big, 0, 40000);
+    write_doc(bigmd, 1, 40000);
+    wheel_steps(plain, 0, 0, 60) !>;
+    wheel_steps(md, 1, 0, 120) !>;
+    wheel_steps(big, 0, 1, 60) !>;
+    wheel_steps(bigmd, 1, 1, 120) !>;
+    reveal_above(plain) !>;
+    relayout_keeps(plain, 0) !>;
+    relayout_keeps(md, 1) !>;
+    if (fails) {
+        fprintf(stderr, "cam_smooth_smoke: %d failure(s)\n", fails);
+        return 1;
+    }
+    printf("cam_smooth_smoke: ok\n");
+    return 0;
+}

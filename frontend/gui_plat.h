@@ -152,6 +152,8 @@ float GetMouseX(void);
 float GetMouseY(void);
 Vector2 GetMouseWheelMoveV(void);
 float GetMouseWheelMove(void);
+/* Vertical wheel this frame in notches, fractional (trackpads). */
+float GetMouseWheelMoveFine(void);
 
 void DrawRectangle(int x, int y, int w, int h, Color color);
 void DrawRectangleLines(int x, int y, int w, int h, Color color);

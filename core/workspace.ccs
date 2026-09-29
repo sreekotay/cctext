@@ -742,7 +742,16 @@ static void rtx_buf_swap_cam(RtxBuf *b, RtxPaneSnap *s) {
     i = b->unlock; b->unlock = s->unlock; s->unlock = i;
     i = b->hex_nib; b->hex_nib = s->hex_nib; s->hex_nib = i;
     i = b->cam_bottom; b->cam_bottom = s->cam_bottom; s->cam_bottom = i;
-    d = b->scroll; b->scroll = s->scroll; s->scroll = d;
+    i = b->cam_row; b->cam_row = s->cam_row; s->cam_row = i;
+    z = b->cam_row_off; b->cam_row_off = s->cam_row_off; s->cam_row_off = z;
+    d = b->top_dy; b->top_dy = s->top_dy; s->top_dy = d;
+    z = b->top_dy_at; b->top_dy_at = s->top_dy_at; s->top_dy_at = z;
+    z = b->cam_anchor; b->cam_anchor = s->cam_anchor; s->cam_anchor = z;
+    {
+        uint64_t g = b->cam_sig;
+        b->cam_sig = s->cam_sig;
+        s->cam_sig = g;
+    }
     d = b->layout_width; b->layout_width = s->layout_width; s->layout_width = d;
     pr = b->pref; b->pref = s->pref; s->pref = pr;
 }
@@ -769,6 +778,8 @@ static void rtx_ws_cam_seed(RtxPaneSnap *s, const RtxBuf *b) {
     s->of = b;
     s->top = b->top;
     s->top_wrap = b->top_wrap;
+    s->top_dy = b->top_dy;
+    s->top_dy_at = b->top_dy_at;
     s->left_col = b->left_col;
     s->top_byte = b->top_byte;
     s->seek_valid = b->seek_valid;
@@ -4676,7 +4687,99 @@ static void rtx_buf_origin_from_row(RtxBuf *b, size_t origin) {
     first = origin;
     while (first > 0 && b->layout.rows.data[first - 1].line == b->top) first--;
     b->top_wrap = origin - first;
+    b->top_dy = 0;
     if (rtx_layout_is_grid(&b->layout)) b->top_wrap = 0;
+}
+
+/* A seeking camera on row `i` of its rows: the line holding it becomes
+ * seek_off (its first row starts the line), the rest is top_wrap. */
+static void rtx_buf_seek_origin_from_row(RtxBuf *b, size_t i) {
+    size_t first;
+    if (!b || !b->layout.rows.len) return;
+    if (i >= b->layout.rows.len) i = b->layout.rows.len - 1;
+    first = i;
+    while (first > 0 && b->layout.rows.data[first - 1].line == b->layout.rows.data[i].line)
+        first--;
+    if (b->layout.rows.data[first].byte_start != b->seek_off)
+        rtx_buf_seek_set(b, b->layout.rows.data[first].byte_start);
+    b->top_wrap = i - first;
+    b->top_dy = 0;
+}
+
+/* The row to start the pane at so row `ri` is at its bottom, by screen
+ * height (a tall row counts all its screen lines). */
+static size_t rtx_buf_row_up_from(const RtxBuf *b, size_t ri, int vis) {
+    size_t screen;
+    size_t i = ri < b->layout.rows.len ? ri : b->layout.rows.len - 1;
+    int h = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i]);
+    if (h < 1) h = 1;
+    screen = (size_t)h;
+    while (i > 0 && screen < (size_t)vis) {
+        int nh;
+        i--;
+        nh = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i]);
+        if (nh < 1) nh = 1;
+        if (screen + (size_t)nh > (size_t)vis && screen > 0) {
+            i++;
+            break;
+        }
+        screen += (size_t)nh;
+    }
+    return i;
+}
+
+/* Reveal above the rows: `top` (or seek_off) is already the caret's line;
+ * the next ensure_view, which lays that line out, starts the pane at the
+ * caret's row instead of the line's first. */
+static void rtx_buf_want_row(RtxBuf *b, size_t off) {
+    b->top_wrap = 0;
+    b->top_dy = 0;
+    b->cam_bottom = 0;
+    b->cam_row = 1;
+    b->cam_row_off = off;
+}
+
+/* The pane's rows start at the camera's line: put the requested row at
+ * the top. */
+static void rtx_buf_land_row(RtxBuf *b) {
+    size_t ri, first;
+    if (!b->cam_row) return;
+    b->cam_row = 0;
+    if (!b->layout.rows.len) return;
+    ri = b->layout.row_of(b->cam_row_off);
+    if (ri >= b->layout.rows.len) return;
+    first = ri;
+    while (first > 0 && b->layout.rows.data[first - 1].line == b->layout.rows.data[ri].line)
+        first--;
+    if (first != 0) return;
+    b->top_wrap = ri;
+    b->top_dy = 0;
+}
+
+/* The camera as a frame leaves it, and the document it looks at. */
+static uint64_t rtx_buf_cam_sig(const RtxBuf *b) {
+    uint64_t h = 1469598103934665603ull;
+    h = (h ^ (uint64_t)b->top) * 1099511628211ull;
+    h = (h ^ (uint64_t)b->top_wrap) * 1099511628211ull;
+    h = (h ^ (uint64_t)b->seek_off) * 1099511628211ull;
+    h = (h ^ (uint64_t)b->seek_valid) * 1099511628211ull;
+    h = (h ^ (uint64_t)b->doc.edit_gen) * 1099511628211ull;
+    h = (h ^ (uint64_t)b->layout.view) * 1099511628211ull;
+    h = (h ^ (uint64_t)b->layout.wrap) * 1099511628211ull;
+    return h | 1;
+}
+
+/* The pane's rows start at the camera's line and were laid out again:
+ * start the pane at the row that now holds the anchor byte. */
+static void rtx_buf_anchor_row(RtxBuf *b) {
+    size_t i, line;
+    if (!b->cam_keep || !b->layout.rows.len) return;
+    line = b->layout.rows.data[0].line;
+    for (i = 0; i < b->layout.rows.len && b->layout.rows.data[i].line == line; i++) {
+        if (b->layout.rows.data[i].byte_start > b->cam_anchor) break;
+    }
+    if (i == 0) return;
+    b->top_wrap = i - 1;
 }
 
 size_t RtxBuf_view_off(const RtxBuf *b) {
@@ -4730,11 +4833,25 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
                 a = b->layout.rows.data[i0].byte_start;
                 z = b->layout.rows.data[i1 - 1].byte_start +
                     b->layout.rows.data[i1 - 1].byte_len;
-                if (off >= a && off <= z) return cc_ok();
+                if (off >= a && off <= z) {
+                    if (off < a + b->layout.rows.data[i0].byte_len + 1 && rtx_buf_dy(b) > 0)
+                        b->top_dy = 0; /* its row is the top one, cut off */
+                    return cc_ok();
+                }
+                /* Just below the pane, on rows already laid out: scroll
+                 * until its row is the bottom one, as a lined camera does. */
+                if (off > z && i1 < b->layout.rows.len) {
+                    const RtxVisRow *last = &b->layout.rows.data[b->layout.rows.len - 1];
+                    if (off < last->byte_start + last->byte_len) {
+                        size_t ri = b->layout.row_of(off);
+                        rtx_buf_seek_origin_from_row(b, rtx_buf_row_up_from(b, ri, vis));
+                        return cc_ok();
+                    }
+                }
             }
         }
         rtx_buf_seek_set(b, floor);
-        b->top_wrap = 0;
+        rtx_buf_want_row(b, off);
         return cc_ok();
     }
     if (!b->doc.index_covers(off)) {
@@ -4779,7 +4896,7 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
     }
     if (cl < b->top || off < b->layout.rows.data[0].byte_start) {
         b->top = cl;
-        b->top_wrap = 0;
+        rtx_buf_want_row(b, off);
         return cc_ok();
     }
     {
@@ -4802,6 +4919,8 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
             }
             b->top = cl;
             b->top_wrap = 0;
+            b->top_dy = 0;
+            b->cam_row = 0;
             b->cam_bottom = 1;
             return cc_ok();
         }
@@ -4813,15 +4932,23 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
         rtx_buf_origin_from_row(b, ri);
         return cc_ok();
     }
+    if (ri == b->top_wrap && rtx_buf_dy(b) > 0) {
+        /* The caret's row is the top one, its top above the pane. */
+        b->top_dy = 0;
+        return cc_ok();
+    }
     {
         size_t screen = 0;
         size_t i;
         int rh;
+        double u = b->layout.unit_h > 0 ? b->layout.unit_h : 1.0;
+        size_t hid = (size_t)(rtx_buf_dy(b) / u + 0.5);
         for (i = b->top_wrap; i < ri && i < b->layout.rows.len; i++) {
             int h = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i]);
             if (h < 1) h = 1;
             screen += (size_t)h;
         }
+        screen = screen > hid ? screen - hid : 0;
         rh = 1;
         if (ri < b->layout.rows.len) {
             rh = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[ri]);
@@ -4831,26 +4958,8 @@ void !>(RtxIndexErr) RtxBuf_reveal_off(RtxBuf *b, size_t off, int vis) {
         if (screen < (size_t)vis) return cc_ok();
         (void)rh;
     }
-    {
-        /* Scroll so `ri` sits near the bottom of the pane by screen height. */
-        size_t screen = 0;
-        size_t i = ri < b->layout.rows.len ? ri : b->layout.rows.len - 1;
-        int h = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i]);
-        if (h < 1) h = 1;
-        screen = (size_t)h;
-        while (i > 0 && screen < (size_t)vis) {
-            int nh;
-            i--;
-            nh = rtx_layout_row_lines(&b->layout, &b->layout.rows.data[i]);
-            if (nh < 1) nh = 1;
-            if (screen + (size_t)nh > (size_t)vis && screen > 0) {
-                i++;
-                break;
-            }
-            screen += (size_t)nh;
-        }
-        rtx_buf_origin_from_row(b, i);
-    }
+    /* Scroll so `ri` sits near the bottom of the pane by screen height. */
+    rtx_buf_origin_from_row(b, rtx_buf_row_up_from(b, ri, vis));
     return cc_ok();
 }
 
@@ -5072,6 +5181,244 @@ static void !>(CCError) rtx_buf_grid_scroll(RtxBuf *b, const RtxMeasure *m,
     return cc_ok();
 }
 
+/* The camera's line in the pane's rows: the index of its first row and how
+ * many it wraps into. A step past what the last frame laid out refills
+ * the pane from the camera's line (one line; ensure_view fills the rest). */
+static size_t !>(CCError) rtx_buf_cam_rows(RtxBuf *b, const RtxMeasure *m, double width,
+                                         size_t *first) {
+    size_t i, n = 0, line = 0;
+    int found = 0;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    for (i = 0; i < b->layout.rows.len; i++) {
+        const RtxVisRow *r = &b->layout.rows.data[i];
+        if (b->seek_valid ? r->byte_start == b->seek_off : r->line == b->top) {
+            found = 1;
+            line = r->line;
+            break;
+        }
+    }
+    if (!found) {
+        /* As many rows as the pane held, so a caller reading the rows
+         * before the next ensure_view still finds what it did. */
+        size_t keep = b->layout.rows.len > 16 ? b->layout.rows.len : 16;
+        if (b->seek_valid) b->layout.fill_off(&b->doc, m, width, b->seek_off, keep) !>;
+        else b->layout.fill(&b->doc, m, width, b->top, keep) !>;
+        b->layout_width = width;
+        i = 0;
+        if (!b->layout.rows.len) {
+            *first = 0;
+            return cc_ok(1);
+        }
+        line = b->layout.rows.data[0].line;
+    }
+    while (i + n < b->layout.rows.len && b->layout.rows.data[i + n].line == line) n++;
+    *first = i;
+    return cc_ok(n ? n : 1);
+}
+
+/* Move the camera's line one line up / down; 0 at the file's edge. */
+static int !>(RtxIndexErr) rtx_buf_cam_line_step(RtxBuf *b, int dir) {
+    size_t nlen = b->len();
+    @errhandler(RtxIndexErr e) {
+        return cc_err(e);
+    }
+    if (b->seek_valid) {
+        if (dir < 0) {
+            if (!b->seek_off) return cc_ok(0);
+            rtx_buf_seek_set(b, rtx_doc_line_floor(&b->doc, b->seek_off - 1) !>);
+            return cc_ok(1);
+        }
+        if (b->seek_off < nlen) {
+            size_t next;
+            int has = rtx_doc_next_line_start(&b->doc, b->seek_off, &next) !>;
+            if (has && next < nlen) {
+                rtx_buf_seek_set(b, next);
+                return cc_ok(1);
+            }
+        }
+        return cc_ok(0);
+    }
+    if (dir < 0) {
+        if (!b->top) return cc_ok(0);
+        b->top--;
+        return cc_ok(1);
+    }
+    if (b->top < rtx_buf_last_top(b, b->line_count())) {
+        b->top++;
+        return cc_ok(1);
+    }
+    return cc_ok(0);
+}
+
+/* One row down / up, the same for a seeking camera and a lined one, soft
+ * wrap or not. Up from a line's first row lands on the last row of the
+ * line above, laid out by the pane itself (Rich, pictures and all).
+ * 1 when the camera moved; 0 at the file's edge. */
+static int !>(CCError) rtx_buf_row_step(RtxBuf *b, const RtxMeasure *m, double width, int dir) {
+    size_t wraps, first;
+    int moved;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    if (dir < 0) {
+        if (b->top_wrap > 0) {
+            b->top_wrap--;
+            return cc_ok(1);
+        }
+        moved = rtx_buf_cam_line_step(b, -1) !>;
+        if (!moved) return cc_ok(0);
+        wraps = rtx_buf_cam_rows(b, m, width, &first) !>;
+        b->top_wrap = wraps - 1;
+        return cc_ok(1);
+    }
+    wraps = rtx_buf_cam_rows(b, m, width, &first) !>;
+    if (b->top_wrap + 1 < wraps) {
+        b->top_wrap++;
+        return cc_ok(1);
+    }
+    moved = rtx_buf_cam_line_step(b, 1) !>;
+    b->top_wrap = moved ? 0 : wraps - 1;
+    return cc_ok(moved);
+}
+
+/* The camera's row in the pane's rows (laying its line out if needed). */
+static const RtxVisRow *!>(CCError) rtx_buf_cam_row(RtxBuf *b, const RtxMeasure *m,
+                                                  double width) {
+    size_t wraps, first;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    wraps = rtx_buf_cam_rows(b, m, width, &first) !>;
+    if (b->top_wrap >= wraps) b->top_wrap = wraps - 1;
+    if (first + b->top_wrap >= b->layout.rows.len) return cc_ok((const RtxVisRow *)NULL);
+    return cc_ok((const RtxVisRow *)&b->layout.rows.data[first + b->top_wrap]);
+}
+
+/* Move the pane's top edge by `d` (rows' units, + is down), row by row:
+ * past a row's height into the next one, above a row's top into the one
+ * before. A row taller than one line (a picture, a Rich table record
+ * whose cells wrap) scrolls through, not past. The file's first row stops
+ * it at 0; its last row stops at that row's top. */
+static void !>(CCError) rtx_buf_scroll_by(RtxBuf *b, const RtxMeasure *m, double width, double d) {
+    double u = b->layout.unit_h > 0 ? b->layout.unit_h : 1.0;
+    double eps = u * 1e-6;
+    double dy;
+    const RtxVisRow *r;
+    int guard, moved;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    r = rtx_buf_cam_row(b, m, width) !>;
+    dy = (r && r->byte_start == b->top_dy_at && b->top_dy < r->height) ? b->top_dy : 0;
+    dy += d;
+    for (guard = 0; guard < 1 << 20 && r; guard++) {
+        double h = r->height > eps ? r->height : u;
+        if (dy >= h - eps) {
+            moved = rtx_buf_row_step(b, m, width, 1) !>;
+            if (!moved) {
+                dy = 0;
+                break;
+            }
+            dy -= h;
+            r = rtx_buf_cam_row(b, m, width) !>;
+            continue;
+        }
+        if (dy < -eps) {
+            moved = rtx_buf_row_step(b, m, width, -1) !>;
+            if (!moved) {
+                dy = 0;
+                break;
+            }
+            r = rtx_buf_cam_row(b, m, width) !>;
+            if (r) dy += r->height > eps ? r->height : u;
+            continue;
+        }
+        break;
+    }
+    if (dy < eps) dy = 0;
+    b->top_dy = dy;
+    b->top_dy_at = r ? r->byte_start : 0;
+    return cc_ok();
+}
+
+/* One screen line down / up: a row is rtx_layout_row_lines lines of
+ * height / lines each, so a text row goes in one step and a picture or a
+ * tall table record in as many as it has lines. An offset between lines
+ * (after pixel scrolling) goes to the line above it first. */
+static void !>(CCError) rtx_buf_line_step(RtxBuf *b, const RtxMeasure *m, double width, int dir) {
+    const RtxVisRow *r;
+    double dy, per;
+    int n, li, moved;
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    r = rtx_buf_cam_row(b, m, width) !>;
+    if (!r) return cc_ok();
+    n = rtx_layout_row_lines(&b->layout, r);
+    per = r->height > 0 ? r->height / (double)n : 1.0;
+    dy = (r->byte_start == b->top_dy_at && b->top_dy < r->height) ? b->top_dy : 0;
+    li = (int)(dy / per + 1e-6);
+    if (dir > 0) {
+        if (li + 1 < n) {
+            dy = (double)(li + 1) * per;
+        } else {
+            moved = rtx_buf_row_step(b, m, width, 1) !>;
+            if (moved) dy = 0;
+            r = rtx_buf_cam_row(b, m, width) !>;
+        }
+    } else if (dy > per * 1e-6) {
+        double at = (double)li * per;
+        dy = at < dy - per * 1e-6 ? at : (double)(li - 1) * per;
+        if (dy < 0) dy = 0;
+    } else {
+        moved = rtx_buf_row_step(b, m, width, -1) !>;
+        r = rtx_buf_cam_row(b, m, width) !>;
+        if (moved && r) {
+            n = rtx_layout_row_lines(&b->layout, r);
+            dy = r->height > 0 ? r->height / (double)n * (double)(n - 1) : 0;
+        } else {
+            dy = 0;
+        }
+    }
+    b->top_dy = dy;
+    b->top_dy_at = r ? r->byte_start : 0;
+    return cc_ok();
+}
+
+void !>(CCError) RtxBuf_scroll_by(RtxBuf *b, const RtxMeasure *m, double width, double d) {
+    @errhandler(CCError e) {
+        return cc_err(e);
+    }
+    @errhandler(RtxIndexErr ie) {
+        return cc_err(CC_ERR_IO, ie.message ? ie.message : "line index");
+    }
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "scroll");
+    if (rtx_layout_is_hex(&b->layout) || rtx_layout_is_grid(&b->layout)) {
+        double u = b->layout.unit_h > 0 ? b->layout.unit_h : 1.0;
+        long n = (long)(d / u + (d < 0 ? -0.5 : 0.5));
+        while (n > 0) {
+            RtxBuf_scroll_vis(b, m, width, 1) !>;
+            n--;
+        }
+        while (n < 0) {
+            RtxBuf_scroll_vis(b, m, width, -1) !>;
+            n++;
+        }
+        return cc_ok();
+    }
+    b->pin_view = 1;
+    b->cam_bottom = 0;
+    b->cam_row = 0;
+    rtx_buf_scroll_by(b, m, width, d) !>;
+    rtx_buf_fold_skip_cam(b, d < 0 ? -1 : 1) !>;
+    return cc_ok();
+}
+
 void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double width, int dir) {
     size_t nlines;
     size_t n;
@@ -5115,17 +5462,8 @@ void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double width,
             rtx_buf_fold_skip_cam(b, dir) !>;
             return cc_ok();
         }
-        if (dir < 0) {
-            if (b->seek_off > 0) {
-                size_t floor = rtx_doc_line_floor(&b->doc, b->seek_off - 1) !>;
-                rtx_buf_seek_set(b, floor);
-            }
-        } else if (b->seek_off < nlen) {
-            size_t next;
-            int has = rtx_doc_next_line_start(&b->doc, b->seek_off, &next) !>;
-            if (has) rtx_buf_seek_set(b, next);
-        }
-        b->top_wrap = 0;
+        b->cam_row = 0;
+        rtx_buf_line_step(b, m, width, dir) !>;
         rtx_buf_fold_skip_cam(b, dir) !>;
         return cc_ok();
     }
@@ -5135,38 +5473,10 @@ void !>(CCError) RtxBuf_scroll_vis(RtxBuf *b, const RtxMeasure *m, double width,
         rtx_buf_fold_skip_cam(b, dir) !>;
         return cc_ok();
     }
+    (void)nlines;
     b->cam_bottom = 0;
-    if (!b->layout.wrap) {
-        b->top_wrap = 0;
-        if (dir < 0 && b->top > 0) b->top--;
-        if (dir > 0 && b->top < rtx_buf_last_top(b, nlines)) b->top++;
-        rtx_buf_fold_skip_cam(b, dir) !>;
-        return cc_ok();
-    }
-    if (dir < 0) {
-        if (b->top_wrap > 0) b->top_wrap--;
-        else if (b->top > 0) {
-            RtxLayout tmp = {0} @destroy;
-            size_t wraps;
-            b->top--;
-            tmp.wrap = 1;
-            tmp.lines(&b->doc, m, width, b->top, 1) !>;
-            wraps = tmp.rows.len ? tmp.rows.len : 1;
-            b->top_wrap = wraps - 1;
-        }
-    } else {
-        size_t wraps = b->layout.rows_for_line(b->top);
-        if (wraps == 0) wraps = 1;
-        b->top_wrap++;
-        if (b->top_wrap >= wraps) {
-            if (b->top < rtx_buf_last_top(b, nlines)) {
-                b->top++;
-                b->top_wrap = 0;
-            } else {
-                b->top_wrap = wraps - 1;
-            }
-        }
-    }
+    b->cam_row = 0;
+    rtx_buf_line_step(b, m, width, dir) !>;
     rtx_buf_fold_skip_cam(b, dir) !>;
     return cc_ok();
 }
@@ -5347,7 +5657,35 @@ static void !>(CCError) rtx_buf_cam_bottom(RtxBuf *b, RtxMeasure *m, double widt
     return cc_ok();
 }
 
+static void !>(CCError) rtx_buf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int vis);
+
+/* Lays out what the pane shows. A camera the frame left where it was
+ * keeps its top byte on screen through a relayout (cam_sig). */
 void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int vis) {
+    @errhandler(CCError e) {
+        if (b) b->cam_keep = 0;
+        return cc_err(e);
+    }
+    if (!b) return cc_err(CC_ERR_INVALID_ARG, "null buf");
+    b->cam_keep = b->cam_sig != 0 && b->cam_sig == rtx_buf_cam_sig(b) &&
+                  !rtx_layout_is_hex(&b->layout) && !rtx_layout_is_grid(&b->layout);
+    rtx_buf_ensure_view(b, m, width, vis) !>;
+    if (!rtx_layout_is_hex(&b->layout) && !rtx_layout_is_grid(&b->layout) &&
+        b->top_wrap < b->layout.rows.len) {
+        /* A kept camera keeps its anchor: the row that holds it may start
+         * earlier now, and taking that start would creep back a little on
+         * every relayout. */
+        if (!b->cam_keep) b->cam_anchor = b->layout.rows.data[b->top_wrap].byte_start;
+        b->cam_keep = 0;
+        b->cam_sig = rtx_buf_cam_sig(b);
+    } else {
+        b->cam_keep = 0;
+        b->cam_sig = 0;
+    }
+    return cc_ok();
+}
+
+static void !>(CCError) rtx_buf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int vis) {
     size_t nlines;
     size_t want;
     size_t avail;
@@ -5412,6 +5750,21 @@ void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int 
                 b->layout_width = width;
                 filled = 1;
             }
+            if (b->cam_keep && b->layout.rows.len &&
+                b->layout.rows.data[0].byte_start == b->seek_off) {
+                rtx_buf_anchor_row(b);
+                if (b->layout.rows.len < (size_t)vis + b->top_wrap)
+                    b->layout.fill_off(&b->doc, m, width, b->seek_off,
+                                       (size_t)vis + 8 + b->top_wrap) !>;
+            }
+            if (b->cam_row && b->layout.rows.len &&
+                b->layout.rows.data[0].byte_start == b->seek_off) {
+                rtx_buf_land_row(b);
+                if (b->layout.rows.len < (size_t)vis + b->top_wrap)
+                    b->layout.fill_off(&b->doc, m, width, b->seek_off,
+                                       (size_t)vis + 8 + b->top_wrap) !>;
+            }
+            b->cam_row = 0;
             rtx_buf_seek_label(b) !>;
             if (b->seek_valid) {
                 if (filled && rtx_line_mark_ok(&b->doc.tree) && b->layout.rows.len)
@@ -5445,6 +5798,17 @@ void !>(CCError) RtxBuf_ensure_view(RtxBuf *b, RtxMeasure *m, double width, int 
         b->layout.fill(&b->doc, m, width, b->top, min_rows) !>;
         b->layout_width = width;
     }
+    if (b->cam_keep && b->layout.from_line == b->top) {
+        rtx_buf_anchor_row(b);
+        if (rtx_layout_soft_wrap(&b->layout) && b->layout.rows.len < want + b->top_wrap)
+            b->layout.fill(&b->doc, m, width, b->top, want + b->top_wrap) !>;
+    }
+    if (b->cam_row && b->layout.from_line == b->top) {
+        rtx_buf_land_row(b);
+        if (b->layout.rows.len < want + b->top_wrap)
+            b->layout.fill(&b->doc, m, width, b->top, want + b->top_wrap) !>;
+    }
+    b->cam_row = 0;
     if (!b->unlock && !b->pin_view) rtx_buf_reveal_x(b, m, width);
     else if (!rtx_buf_uses_left(b)) b->left_col = 0;
     return cc_ok();
