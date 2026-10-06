@@ -105,6 +105,14 @@ const char *ui_os_font_family(const char *path);
  * screen resolution (96 by default), so 16 px is 12 pt there. */
 double ui_os_pt_per_px(void);
 
+/* Device pixels per logical unit of the area (docs/images.md "HiDPI"):
+ * AppKit the window's backingScaleFactor, GTK the widget's scale factor
+ * (GDK_SCALE, the monitor's integer scale); Win32 1 (images are
+ * placeholders there). Read at every Draw, so a window moved to a screen
+ * of another scale picks it up at its next paint (the toolkit repaints
+ * the whole area on such a move). 1 when unknown. */
+double ui_os_device_scale(void);
+
 /*
  * Images (docs/images.md). libui's draw context has no image call; these
  * add the one blit cctext needs. A platform image wraps a decoded bitmap
@@ -115,6 +123,10 @@ double ui_os_pt_per_px(void);
  * PremultipliedFirst); Win32: stub (NULL, draws nothing).
  * draw scales the whole image into (x, y, w, h), area coordinates y
  * down, with `alpha` (0-1), smooth filtering, clipped to the scissor.
+ * The rect is logical (points); the image's pixels are device pixels
+ * when the caller asked for them at ui_os_device_scale(): an image whose
+ * size is the rect's device size to within a pixel is drawn 1:1 on the
+ * device pixel grid (no resampling, no blur).
  */
 void *ui_os_image_new(const unsigned char *bgra, int w, int h, int stride);
 void ui_os_image_free(void *img);

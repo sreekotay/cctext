@@ -814,6 +814,14 @@ const char *ui_os_font_family(const char *path) {
     return "Monospace";
 }
 
+double ui_os_device_scale(void) {
+    GtkWidget *w = area_widget();
+    int s;
+    if (!w) return 1.0;
+    s = gtk_widget_get_scale_factor(w);
+    return s >= 1 ? (double)s : 1.0;
+}
+
 /* ---- images (ui_os.h) ---------------------------------------------------- */
 
 typedef struct {
@@ -852,17 +860,46 @@ void ui_os_image_draw(uiDrawContext *ctx, void *img, double x, double y, double 
     UiImg *im = (UiImg *)img;
     cairo_t *cr;
     cairo_pattern_t *pat;
+    double dw, dh, dx, dy, sx = 1, sy = 1;
+    int one;
     if (!ctx || !im || w <= 0 || h <= 0 || alpha <= 0) return;
     cr = ctx->cr;
     cairo_save(cr);
     cairo_rectangle(cr, x, y, w, h);
     cairo_clip(cr);
-    cairo_translate(cr, x, y);
-    cairo_scale(cr, w / (double)im->w, h / (double)im->h);
+    /* The rect in device pixels: cairo's "device space" leaves out the
+     * surface's device scale (GDK_SCALE), so apply it here. */
+    cairo_surface_get_device_scale(cairo_get_group_target(cr), &sx, &sy);
+    if (!(sx > 0)) sx = 1;
+    if (!(sy > 0)) sy = 1;
+    dw = w;
+    dh = h;
+    cairo_user_to_device_distance(cr, &dw, &dh);
+    dw = fabs(dw) * sx;
+    dh = fabs(dh) * sy;
+    one = fabs(dw - im->w) <= 1.0 && fabs(dh - im->h) <= 1.0;
+    if (one) {
+        /* The bitmap is the rect's device size (the loader decoded it at
+         * that size): 1:1 on the device grid, the origin snapped to a
+         * whole device pixel. A pixel's rounding difference is clipped. */
+        dx = x;
+        dy = y;
+        cairo_user_to_device(cr, &dx, &dy);
+        dx = floor(dx * sx + 0.5) / sx;
+        dy = floor(dy * sy + 0.5) / sy;
+        cairo_device_to_user(cr, &dx, &dy);
+        cairo_translate(cr, dx, dy);
+        cairo_scale(cr, w / dw, h / dh); /* one bitmap pixel = one device pixel */
+    } else {
+        cairo_translate(cr, x, y);
+        cairo_scale(cr, w / (double)im->w, h / (double)im->h);
+    }
     cairo_set_source_surface(cr, im->s, 0, 0);
     pat = cairo_get_source(cr);
-    cairo_pattern_set_filter(pat, (w < im->w * 0.75 || w > im->w * 1.5) ? CAIRO_FILTER_GOOD
-                                                                       : CAIRO_FILTER_BILINEAR);
+    /* 1:1: nearest is exact. Otherwise GOOD: a box filter when shrinking
+     * (a bigger bitmap standing in, a zoom transition), bilinear when
+     * enlarging past the natural size. */
+    cairo_pattern_set_filter(pat, one ? CAIRO_FILTER_NEAREST : CAIRO_FILTER_GOOD);
     cairo_pattern_set_extend(pat, CAIRO_EXTEND_PAD);
     if (alpha >= 1.0) cairo_paint(cr);
     else cairo_paint_with_alpha(cr, alpha);

@@ -32,7 +32,7 @@ as styled lines, the presenter state), `core/md_block.ccs`
 | Spot directives `_key` | Apply to their slide only (`<!-- _class: lead -->`). |
 | HTML comment directives | `<!-- key: value -->`, one or many `key: value` lines, block level. A comment that is not all directives is a presenter note: not drawn, not applied. Inline comments are not read. |
 | `![bg](url)` | Background image of its slide, drawn under the text in cctext-ui ([images.md](images.md)). Keywords in the alt text: `bg`, `left` / `right` with an optional `:N%` (split background: the image fills its side, the content keeps the other), `fit` / `contain` (letterboxed), `cover` (the default: fills, cropped), `auto` (natural size). Several `bg` images are counted; the first is drawn. The terminal hatches the split side. |
-| `![alt](url)` | A content image is a line of its own: the picture in cctext-ui at its natural size, or Marp's `w:320` / `h:200` (`width:` / `height:`) from the alt, fitted to the content width and what is left of the slide (a placeholder box until its header is read); `[image: alt WxH]` in cctext. Sources, permissions and limits are the editor's ([images.md](images.md)). |
+| `![alt](url)` | A content image is a line of its own: the picture at its natural size, or Marp's `w:320` / `h:200` (`width:` / `height:`) from the alt ([Images](#images)), fitted to the content width and what is left of the slide (a placeholder box until its header is read); `[image: alt WxH]` in a terminal that cannot draw pictures. The editor's Rich picture row honours the same size in a deck. Sources, permissions and limits are the editor's ([images.md](images.md)). |
 | Fragmented lists | `*` bullets and `1)` ordered items are build steps (Marp's fragmented list); `-`, `+` and `1.` are always shown. Everything inside a stepped item (continuation lines, nested non-stepped items) appears with it. Hidden steps keep their space, as Marp's inactive fragments do. |
 | `transition` (Marp CLI) | `none`, `fade`, `fade-out`, `slide`, `push`, `cover`, `reveal`, `wipe`, `zoom` are drawn as named; the rest of Marp CLI's set maps to the nearest (`wiper`, `melt`, `clockwise` → wipe; `cube`, `cylinder`, `swap` → push; `swoosh` → slide; `pull` → reveal; `drop` → cover; `implode`, `explode`, `iris-in/out`, `diamond`, `star` → zoom; `in-out` → fade-out; `overlap`, `glow`, `flip`, `pivot`, `rotate` → fade). An unknown name is a fade. `morph` / `magic-move` are cctext names (below). A duration follows the name: `fade 0.5s`, `push 400ms` (default 300 ms). |
 | Markdown | Everything the block pass and the Rich lens know: headings, paragraphs (every newline breaks, as Marp's `breaks: true`), lists with task boxes, block quotes, fences with the info string's grammar, indented code, `$$` math (as code), GFM tables with alignment, thematic breaks, emphasis / strong / strike / code spans / links (hints and link destinations hidden). |
@@ -180,6 +180,40 @@ with a 16 ms median gap; afterwards 0 paints, 0 wakeups and 0 CPU ticks in
 2 s. In the terminal (`tests/tui_pty_test.py present`) a still slide
 writes 0 bytes.
 
+## Images
+
+Marp's image size keywords are read by one parser in core
+(`rtx_img_marp_kw`, core/img.ccs) for both presenters and the editor:
+
+- Words of the alt, split at blanks: `w:N` / `width:N` and `h:N` /
+  `height:N`. N is a CSS length as Marpit's keyword regexp takes it: a
+  number (`320`, `12.5`) with no unit or `px`, or `pt`, `pc`, `in`, `cm`,
+  `mm`, all in CSS px (96 per inch). `auto`, `%`, `em`, `ch`, `ex` and
+  anything else give no hint for that side (a percentage has no box to
+  refer to in the Rich lens; the presenters ignore it too). A later word
+  wins. The other words stay alt text; `bg` and its keywords are the
+  background parser's (`slides.ccs`).
+- One side keeps the aspect ratio. **Both** give that box: Marpit writes
+  them as the `<img>`'s CSS `width` and `height`, with no `object-fit`,
+  so the picture stretches; cctext stretches too
+  (`rtx_img_marp_size`).
+- The hinted size stands in for the natural size and is then fitted like
+  any picture: to the slide's content box and what is left of it in the
+  presenters; to the pane width and `image_max_height` in the editor
+  (aspect kept by that fit, never above the hinted size — a hint may
+  enlarge a small picture).
+- **Editor (Rich lens)**: only in a deck (front matter `marp: true`,
+  `RtxDoc_marp`); in plain Markdown `![w:320](…)` is just an alt. The
+  box is in logical px (cctext-ui), so HiDPI decodes it at logical ×
+  device scale: `w:320` of a 960 px screenshot at 2× is a 640 px bitmap,
+  a downscale. The terminal maps px to cells with the cell size the
+  picture code already uses (the measured one, else 8 × 16 px; the
+  presenter scales deck px to its slide box instead) and draws the
+  hinted pixels in that box (a stretched box stays stretched).
+
+Pandoc's `![](a.png){width=50%}` is not read: see
+[images.md](images.md#limits-and-leftovers).
+
 ## Tests
 
 - `tests/slides_smoke.ccs` (`@smoke`): block-pass classification in Marp
@@ -198,6 +232,13 @@ writes 0 bytes.
   field, `--batch -c slides`.
 - `tests/ui_img_test.py`: a `![bg left:40%]` picture fills the left of
   the slide, the text side has none.
+- `tests/img_layout_smoke.ccs` (`@smoke`): the size keyword parser
+  (units, `auto`, `%`, the later word), and the Rich picture row of a
+  deck's `w:` / `h:` / both / clamped lines in pixels and in cells, and
+  the same line ignored outside a deck. `tests/ui_img_test.py`
+  (`case_marp_hint`): a deck's `![w:320]` of a 960 × 640 picture is a
+  320 px picture on screen (a 640 px bitmap drawn 640 px wide under
+  `GDK_SCALE=2`); plain Markdown draws it pane-wide.
 - `tests/ui_present_test.py`: cctext-ui under Xvfb — 16:9 letterbox, no
   editor chrome, heading colour, a step adds ink and Left removes it, a
   spot background, frames during a transition and none after, the code

@@ -3630,6 +3630,96 @@ def case_mermaid_blocks(exe, tmp):
         t.kill()
 
 
+def case_mermaid_file(exe, tmp):
+    """A Mermaid file in the terminal (docs/images.md "Mermaid files"): a
+    `.mmd` opens as text; Ctrl-D is its diagram (block art here) with a
+    caption, typing does not edit it, Ctrl-D again is the text. With
+    tui_images off the diagram is its stand-in; the browse preview of a
+    `.mermaid` is the diagram's line."""
+    if pyte is None:
+        print("skip: mermaid file (no pyte)")
+        return
+    if not os.path.exists(os.path.join(os.path.dirname(exe), "cctext-render")):
+        print("skip: mermaid file (no cctext-render)")
+        return
+    proj = os.path.join(tmp, "mmf")
+    os.makedirs(os.path.join(proj, ".git"), exist_ok=True)
+    body = b"flowchart LR\n  A[Start] --> B{Ok?}\n  B --> C[Done]\n"
+    path = os.path.join(proj, "flow.mmd")
+    with open(path, "wb") as f:
+        f.write(body)
+    with open(os.path.join(proj, "seq.mermaid"), "wb") as f:
+        f.write(b"sequenceDiagram\n  A->>B: hi\n")
+
+    def art_rows(sc):
+        return sum(1 for y in range(sc.lines)
+                   if any(ch in "".join(sc.buffer[y][x].data for x in range(sc.columns))
+                          for ch in "\u2580\u2584\u2588"))
+    env = img_env(tmp, "mmf")
+    env["RTX_TUI_IMAGES"] = "blocks"
+    t = Tui(exe, ["--no-blink", path], env, fake=FakeTerm("silent"))
+    try:
+        t.pump(1.0)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        check(find_row(sc, "flowchart LR") >= 0 and art_rows(sc) == 0,
+              "mermaid file: a .mmd opens as text", "\n".join(sc.display))
+        t.send(b"\x04", 0.2)
+        t.pump(3.0)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        txt = "\n".join(sc.display)
+        check(art_rows(sc) >= 3 and "flowchart LR" not in txt and "Mermaid" in txt and
+              "Ctrl-D text" in txt, "mermaid file: Ctrl-D shows the diagram (block art)", txt)
+        t.send(b"xyz", 0.3)
+        t.send(b"\x04", 0.6)
+        sc = fake_screen(t.out, t.cols, t.rows)
+        txt = "\n".join(sc.display)
+        check(find_row(sc, "flowchart LR") >= 0 and "xyz" not in txt and art_rows(sc) == 0,
+              "mermaid file: typing does not edit the diagram; Ctrl-D is the text again", txt)
+        t.send(b"\x11", 0.3)
+        t.send(b"q", 0.2)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    with open(path, "rb") as f:
+        check(f.read() == body, "mermaid file: bytes unchanged")
+    env = img_env(tmp, "mmf2")
+    env["RTX_TUI_IMAGES"] = "off"
+    t = Tui(exe, ["--no-blink", path], env, fake=FakeTerm("silent"))
+    try:
+        t.pump(0.8)
+        t.send(b"\x04", 0.2)
+        t.pump(3.0)
+        txt = "\n".join(fake_screen(t.out, t.cols, t.rows).display)
+        check("[diagram: Mermaid " in txt, "mermaid file: no pictures, the stand-in", txt)
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+    env = img_env(tmp, "mmf3")
+    env["RTX_TUI_IMAGES"] = "off"
+    t = Tui(exe, ["--no-blink", proj], env, fake=FakeTerm("silent"), cols=120)
+    try:
+        t.pump(1.0)
+        y = -1
+        for _ in range(4):
+            t.send(b"\x1b[B", 0.5)
+            for _ in range(8):
+                sc = fake_screen(t.out, t.cols, t.rows)
+                y = find_row(sc, "[diagram: Mermaid")
+                if y >= 0:
+                    break
+                t.pump(0.4)
+            if y >= 0:
+                break
+        check(y >= 0, "mermaid file: the browse preview names the diagram",
+              "\n".join(fake_screen(t.out, t.cols, t.rows).display))
+        t.send(b"\x1b", 0.3)
+        t.send(b"\x11", 0.3)
+        t.wait_exit(5.0)
+    finally:
+        t.kill()
+
+
 def case_math_blocks(exe, tmp):
     """Math in the terminal (docs/images.md "Math"): RTX_TUI_IMAGES=blocks,
     so a `$$` block is Unicode block art under its line with the block's
@@ -3912,6 +4002,7 @@ CASES = {
     "image_present": case_image_present,
     "image_blocks": case_image_blocks,
     "mermaid_blocks": case_mermaid_blocks,
+    "mermaid_file": case_mermaid_file,
     "image_kitty": case_image_kitty,
     "image_sixel": case_image_sixel,
     "image_sixel_scroll": case_image_sixel_scroll,

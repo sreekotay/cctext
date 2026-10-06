@@ -218,6 +218,9 @@ int gui_alert_image(int remote, const char *msg);
  * (BGRA premultiplied; the pixels outlive it), drawn scaled into a rect
  * inside the current Draw. */
 void *gui_image_new(const unsigned char *bgra, int w, int h, int stride);
+/* Device pixels per logical unit (ui_os_device_scale, as of the last
+ * Draw): pictures are asked for at their device size. */
+double gui_device_scale(void);
 void gui_image_free(void *img);
 void gui_image_draw(void *img, double x, double y, double w, double h, float alpha);
 

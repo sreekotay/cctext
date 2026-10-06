@@ -16,7 +16,7 @@ CC_TARGET_INCLUDE rtx_hex .
 CC_TARGET rtx_grid obj core/grid.ccs
 CC_TARGET_INCLUDE rtx_grid .
 
-CC_TARGET rtx_md_table obj core/md_table.ccs core/md_block.ccs core/md_refs.ccs
+CC_TARGET rtx_md_table obj core/md_table.ccs core/md_block.ccs core/md_refs.ccs core/mmd_sniff.c
 CC_TARGET_INCLUDE rtx_md_table .
 
 CC_TARGET rtx_browse obj core/browse.ccs
@@ -35,7 +35,7 @@ CC_TARGET rtx_document obj core/document.ccs core/slides.ccs core/wb.ccs core/wb
 CC_TARGET_INCLUDE rtx_document .
 CC_TARGET_DEPS rtx_document rtx_piece_tree rtx_nav rtx_scope rtx_rx rtx_md_table
 
-CC_TARGET rtx_layout obj core/layout.ccs
+CC_TARGET rtx_layout obj core/layout.ccs core/mmd_view.ccs
 CC_TARGET_INCLUDE rtx_layout .
 CC_TARGET_DEPS rtx_layout rtx_document rtx_hex rtx_grid rtx_md_table rtx_img
 
@@ -57,7 +57,7 @@ CC_TARGET_INCLUDE rtx_scope .
 CC_TARGET rtx_rx obj core/rx.ccs
 CC_TARGET_INCLUDE rtx_rx .
 
-CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c core/img_term.c core/img_svg.c core/img_math.c
+CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_resize.c core/img_net.c core/img_term.c core/img_svg.c core/img_math.c
 CC_TARGET_INCLUDE rtx_img .
 CC_TARGET_DEPS rtx_img rtx_safe
 

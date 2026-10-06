@@ -21,6 +21,8 @@
 #include <time.h>
 #include <unistd.h>
 #include "../core/img.cch"
+#include "../core/img_resize.h"
+#include "../core/img_wuffs.h"
 void rtx_safe_test_isol(void);
 
 static int fails = 0;
@@ -692,12 +694,312 @@ static void test_remote(void) {
     rtx_img_reset();
 }
 
+/* ---- the resampler (core/img_resize.c) ------------------------------- */
+
+/* The scaler this one replaced (at most ~5 point samples an axis per
+ * output pixel, truncated spans): the baseline the edge checks beat. */
+static void old_scale(const uint8_t *src, uint32_t W, uint32_t H, uint8_t *dst, uint32_t w,
+                      uint32_t h) {
+    uint32_t dx, dy;
+    for (dy = 0; dy < h; dy++) {
+        uint32_t y0 = (uint32_t)((uint64_t)dy * H / h), y1 = (uint32_t)((uint64_t)(dy + 1) * H / h);
+        uint32_t ys;
+        if (y1 <= y0) y1 = y0 + 1;
+        if (y1 > H) y1 = H;
+        ys = (y1 - y0 + 4) / 5;
+        if (ys < 1) ys = 1;
+        for (dx = 0; dx < w; dx++) {
+            uint32_t x0 = (uint32_t)((uint64_t)dx * W / w), x1 = (uint32_t)((uint64_t)(dx + 1) * W / w);
+            uint32_t xs, x, y, cnt = 0, acc[4] = {0, 0, 0, 0}, c;
+            uint8_t *o = dst + ((size_t)dy * w + dx) * 4;
+            if (x1 <= x0) x1 = x0 + 1;
+            if (x1 > W) x1 = W;
+            xs = (x1 - x0 + 4) / 5;
+            if (xs < 1) xs = 1;
+            for (y = y0; y < y1; y += ys)
+                for (x = x0; x < x1; x += xs) {
+                    const uint8_t *p = src + ((size_t)y * W + x) * 4;
+                    for (c = 0; c < 4; c++) acc[c] += p[c];
+                    cnt++;
+                }
+            for (c = 0; c < 4; c++) o[c] = (uint8_t)((acc[c] + cnt / 2) / cnt);
+        }
+    }
+}
+
+static uint8_t *rs_img(uint32_t w, uint32_t h) {
+    return (uint8_t *)calloc((size_t)w * h, 4);
+}
+
+static void rs_put(uint8_t *p, uint32_t w, uint32_t x, uint32_t y, int b, int g, int r, int a) {
+    uint8_t *q = p + ((size_t)y * w + x) * 4;
+    q[0] = (uint8_t)b;
+    q[1] = (uint8_t)g;
+    q[2] = (uint8_t)r;
+    q[3] = (uint8_t)a;
+}
+
+/* A dark, slightly slanted edge (text's stroke side), coverage-exact:
+ * the pixel's dark fraction is the part of it left of the edge. */
+static uint8_t *rs_slant(uint32_t W, uint32_t H, double slope) {
+    uint8_t *s = rs_img(W, H);
+    uint32_t x, y;
+    for (y = 0; y < H; y++)
+        for (x = 0; x < W; x++) {
+            double e = W * 0.5 + ((double)y - H * 0.5) * slope, cov = e - x;
+            int v;
+            if (cov < 0) cov = 0;
+            if (cov > 1) cov = 1;
+            v = (int)(255 * (1 - cov) + 0.5);
+            rs_put(s, W, x, y, v, v, v, 255);
+        }
+    return s;
+}
+
+/* Jaggedness: per row, the edge position from the row's total darkness
+ * against the true edge, RMS in output pixels (0 = every row's edge where
+ * it belongs; a point-sampled scaler steps). Also the mean 10-90 % rise
+ * width in pixels (softness). */
+/* No libm in this link. */
+static double rs_sqrt(double v) {
+    double r = v > 1 ? v : 1;
+    int k;
+    if (v <= 0) return 0;
+    for (k = 0; k < 60; k++) r = 0.5 * (r + v / r);
+    return r;
+}
+
+static void rs_edge(const uint8_t *d, uint32_t w, uint32_t h, uint32_t W, uint32_t H, double slope,
+                    double *jag, double *rise) {
+    double se = 0, rs = 0;
+    int n = 0, nr = 0;
+    uint32_t x, y;
+    for (y = 2; y + 2 < h; y++) {
+        double dark = 0, ys = (y + 0.5) * H / (double)h;
+        double truth = (W * 0.5 + (ys - H * 0.5) * slope) / ((double)W / w), x10 = -1, x90 = -1;
+        for (x = 0; x < w; x++) dark += (255 - d[((size_t)y * w + x) * 4]) / 255.0;
+        se += (dark - truth) * (dark - truth);
+        n++;
+        for (x = 0; x + 1 < w; x++) {
+            double a = d[((size_t)y * w + x) * 4], b = d[((size_t)y * w + x + 1) * 4];
+            if (a <= 25.5 && b > 25.5 && x10 < 0) x10 = x + (25.5 - a) / (b - a);
+            if (a <= 229.5 && b > 229.5) x90 = x + (229.5 - a) / (b - a);
+        }
+        if (x10 >= 0 && x90 >= x10) {
+            rs += x90 - x10;
+            nr++;
+        }
+    }
+    *jag = n ? rs_sqrt(se / n) : 0;
+    *rise = nr ? rs / nr : 99;
+}
+
+static void test_resize(void) {
+    char msg[160];
+    uint32_t x, y, i;
+    /* A constant translucent colour stays that colour, every direction,
+     * orientation and shape (the filter's weights sum to one). */
+    {
+        static const uint32_t sz[][4] = {{37, 23, 11, 7}, {37, 23, 50, 31}, {37, 23, 37, 23},
+                                         {1, 40, 1, 9},   {40, 1, 9, 1},    {1, 1, 1, 1},
+                                         {1, 1, 5, 3},    {300, 200, 7, 5}, {9, 9, 1, 1}};
+        for (i = 0; i < sizeof sz / sizeof sz[0]; i++) {
+            uint32_t W = sz[i][0], H = sz[i][1];
+            int o;
+            uint8_t *s = rs_img(W, H);
+            for (y = 0; y < H; y++)
+                for (x = 0; x < W; x++) rs_put(s, W, x, y, 20, 40, 60, 128);
+            for (o = 1; o <= 8; o++) {
+                uint32_t w = o >= 5 ? sz[i][3] : sz[i][2], h = o >= 5 ? sz[i][2] : sz[i][3], k;
+                uint8_t *d = rs_img(w, h);
+                int ok = rtx_img_resize(s, W, H, (size_t)W * 4, o, d, w, h, NULL, NULL) == 0;
+                for (k = 0; ok && k < w * h; k++)
+                    ok = abs(d[k * 4] - 20) <= 1 && abs(d[k * 4 + 1] - 40) <= 1 &&
+                         abs(d[k * 4 + 2] - 60) <= 1 && abs(d[k * 4 + 3] - 128) <= 1;
+                snprintf(msg, sizeof msg, "resize: constant %ux%u -> %ux%u orient %d", W, H, w, h, o);
+                expect(ok, msg);
+                free(d);
+            }
+            free(s);
+        }
+    }
+    /* A 1 px checkerboard shrunk 2:1 (and 3:1, 2.5:1) is an even grey, not
+     * stripes or a moire: every source pixel is covered. */
+    {
+        static const uint32_t to[] = {32, 21, 25};
+        uint8_t *s = rs_img(64, 64);
+        for (y = 0; y < 64; y++)
+            for (x = 0; x < 64; x++) {
+                int v = ((x + y) & 1) ? 255 : 0;
+                rs_put(s, 64, x, y, v, v, v, 255);
+            }
+        for (i = 0; i < 3; i++) {
+            uint32_t w = to[i], k;
+            int lo = 255, hi = 0, ilo = 255, ihi = 0;
+            uint8_t *d = rs_img(w, w);
+            expect(rtx_img_resize(s, 64, 64, 64 * 4, 1, d, w, w, NULL, NULL) == 0, "resize: checker");
+            for (k = 0; k < w * w; k++) {
+                int v = d[k * 4], in = k % w && k % w != w - 1 && k / w && k / w != w - 1;
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+                if (in && v < ilo) ilo = v;
+                if (in && v > ihi) ihi = v;
+            }
+            /* The outermost pixels lean toward their own column (the edge
+             * is clamped: the kernel's outer taps repeat it). */
+            snprintf(msg, sizeof msg, "resize: checkerboard 64 -> %u is grey (%d..%d, inside %d..%d)",
+                     w, lo, hi, ilo, ihi);
+            expect(lo >= 110 && hi <= 145 && ilo >= (i ? 124 : 126) && ihi <= (i ? 131 : 129), msg);
+            if (getenv("RTX_IMG_RS_VERBOSE")) printf("%s\n", msg);
+            free(d);
+        }
+        free(s);
+    }
+    /* A slanted hard edge at 4:3 and 3:2 (the demo screenshot at a Rich
+     * pane's width): where the old scaler's rows stepped by a quarter
+     * pixel or more, this one's edge sits within a few hundredths, and it
+     * is no softer than a two-pixel ramp. */
+    {
+        uint32_t W = 960, H = 640, k;
+        static const uint32_t ws[] = {720, 640};
+        uint8_t *s = rs_slant(W, H, 0.07);
+        for (k = 0; k < 2; k++) {
+            uint32_t w = ws[k], h = (uint32_t)((double)H * w / W + 0.5);
+            uint8_t *d = rs_img(w, h), *od = rs_img(w, h);
+            double jn, rn, jo, ro;
+            expect(rtx_img_resize(s, W, H, (size_t)W * 4, 1, d, w, h, NULL, NULL) == 0, "resize: edge");
+            old_scale(s, W, H, od, w, h);
+            rs_edge(d, w, h, W, H, 0.07, &jn, &rn);
+            rs_edge(od, w, h, W, H, 0.07, &jo, &ro);
+            snprintf(msg, sizeof msg, "resize: edge 960 -> %u: jag %.3f (old %.3f), rise %.2f px", w,
+                     jn, jo, rn);
+            expect(jn < 0.06 && jo > 3 * jn && rn < 1.8, msg);
+            if (getenv("RTX_IMG_RS_VERBOSE")) printf("%s (old rise %.2f)\n", msg, ro);
+            free(d);
+            free(od);
+        }
+        free(s);
+    }
+    /* Transparent next to opaque red: filtered premultiplied, the edge
+     * pixels are red with less alpha, never darker red (no fringe), and
+     * the cubic's overshoot never leaves a colour above its alpha. */
+    {
+        uint32_t W = 45, H = 9, w = 13, h = 3, k;
+        uint8_t *s = rs_img(W, H), *d = rs_img(w, h);
+        int ok = 1, partial = 0;
+        for (y = 0; y < H; y++)
+            for (x = 0; x < W; x++)
+                if (x >= 20) rs_put(s, W, x, y, 0, 0, 255, 255);
+        expect(rtx_img_resize(s, W, H, (size_t)W * 4, 1, d, w, h, NULL, NULL) == 0, "resize: fringe");
+        for (k = 0; k < w * h; k++) {
+            uint8_t *p = d + k * 4;
+            if (p[0] > p[3] || p[1] > p[3] || p[2] > p[3]) ok = 0;
+            if (p[3] >= 16) {
+                /* straight red = r * 255 / a */
+                int r = (p[2] * 255 + p[3] / 2) / p[3];
+                if (r < 240 || p[0] > 2 || p[1] > 2) ok = 0;
+                if (p[3] < 250) partial++;
+            }
+        }
+        expect(ok && partial > 0, "resize: no dark fringe at a transparent edge");
+        free(s);
+        free(d);
+    }
+    /* Orientation: 1:1 it is exactly the EXIF turn; resampled it matches
+     * resampling the turned image (a flip or transpose commutes). */
+    {
+        uint32_t W = 60, H = 36;
+        int o;
+        uint8_t *s = rs_img(W, H);
+        for (y = 0; y < H; y++)
+            for (x = 0; x < W; x++)
+                rs_put(s, W, x, y, (int)(x * 4), (int)(y * 7), (int)((x * y) & 255), 255);
+        for (o = 1; o <= 8; o++) {
+            uint32_t dw = o >= 5 ? H : W, dh = o >= 5 ? W : H, w = dw / 3 + 1, h = dh / 3 + 1;
+            uint8_t *t = rs_img(dw, dh), *d = rs_img(w, h), *e = rs_img(w, h);
+            int ok = rtx_img_resize(s, W, H, (size_t)W * 4, o, t, dw, dh, NULL, NULL) == 0, md = 0;
+            for (y = 0; ok && y < dh; y++)
+                for (x = 0; ok && x < dw; x++) {
+                    uint32_t cx, cy;
+                    switch (o) {
+                    case 2: cx = W - 1 - x; cy = y; break;
+                    case 3: cx = W - 1 - x; cy = H - 1 - y; break;
+                    case 4: cx = x; cy = H - 1 - y; break;
+                    case 5: cx = y; cy = x; break;
+                    case 6: cx = y; cy = H - 1 - x; break;
+                    case 7: cx = W - 1 - y; cy = H - 1 - x; break;
+                    case 8: cx = W - 1 - y; cy = x; break;
+                    default: cx = x; cy = y; break;
+                    }
+                    ok = memcmp(t + ((size_t)y * dw + x) * 4, s + ((size_t)cy * W + cx) * 4, 4) == 0;
+                }
+            snprintf(msg, sizeof msg, "resize: orientation %d at 1:1", o);
+            expect(ok, msg);
+            expect(rtx_img_resize(s, W, H, (size_t)W * 4, o, d, w, h, NULL, NULL) == 0 &&
+                       rtx_img_resize(t, dw, dh, (size_t)dw * 4, 1, e, w, h, NULL, NULL) == 0,
+                   "resize: oriented");
+            for (i = 0; i < w * h * 4; i++)
+                if (abs(d[i] - e[i]) > md) md = abs(d[i] - e[i]);
+            snprintf(msg, sizeof msg, "resize: orientation %d resampled (max diff %d)", o, md);
+            expect(md <= 2, msg);
+            free(t);
+            free(d);
+            free(e);
+        }
+        free(s);
+    }
+    /* A huge shrink goes through the box prefilter: fast, and close to the
+     * cubic alone; cancel stops it. */
+    {
+        uint32_t W = 4096, H = 4096, w = 40, h = 40, k;
+        uint8_t *s = (uint8_t *)malloc((size_t)W * H * 4), *d = rs_img(w, h), *e = rs_img(w, h);
+        RtxResizeOpt np = {RTX_RS_CATROM, 0, 1};
+        _Atomic int stop = 1;
+        long t0, best = -1;
+        int md = 0;
+        if (!s) {
+            expect(0, "resize: huge alloc");
+            free(d);
+            free(e);
+            return;
+        }
+        for (y = 0; y < H; y++)
+            for (x = 0; x < W; x++) {
+                int v = (int)(((x / 64) + (y / 64)) & 1) * 200 + (int)(x & 31);
+                rs_put(s, W, x, y, v, v / 2, 255 - v / 2, 255);
+            }
+        for (k = 0; k < 3; k++) {
+            t0 = now_ms();
+            expect(rtx_img_resize(s, W, H, (size_t)W * 4, 6, d, w, h, NULL, NULL) == 0, "resize: huge");
+            if (best < 0 || now_ms() - t0 < best) best = now_ms() - t0;
+        }
+        snprintf(msg, sizeof msg, "resize: 4096x4096 -> 40x40 in %ld ms", best);
+        expect(best < 250, msg);
+        if (getenv("RTX_IMG_RS_VERBOSE")) printf("%s\n", msg);
+        expect(rtx_img_resize(s, W, H, (size_t)W * 4, 6, e, w, h, NULL, &np) == 0, "resize: no prefilter");
+        for (k = 0; k < w * h * 4; k++)
+            if (abs(d[k] - e[k]) > md) md = abs(d[k] - e[k]);
+        snprintf(msg, sizeof msg, "resize: prefilter close to the cubic alone (max diff %d)", md);
+        expect(md <= 12, msg);
+        t0 = now_ms();
+        expect(rtx_img_resize(s, W, H, (size_t)W * 4, 1, d, w, h, &stop, NULL) == RTX_WUFFS_CANCEL,
+               "resize: cancel");
+        expect(now_ms() - t0 < 20, "resize: cancel is prompt");
+        free(s);
+        free(d);
+        free(e);
+    }
+}
+
 /* RTX_IMG_BENCH=file: best of 5 header probes and decodes to fit
- * 800x600 (a Rich pane), printed; not a check. */
+ * 800x600 (a Rich pane; RTX_IMG_BENCH_W / _H: another box, e.g. a 2x
+ * screen's device size), printed; not a check. */
 static void bench(const char *path) {
     size_t n;
     uint8_t *b = slurp(path, &n);
     int k;
+    uint32_t bw = getenv("RTX_IMG_BENCH_W") ? (uint32_t)atoi(getenv("RTX_IMG_BENCH_W")) : 800;
+    uint32_t bh = getenv("RTX_IMG_BENCH_H") ? (uint32_t)atoi(getenv("RTX_IMG_BENCH_H")) : 600;
     long best_p = -1, best_d = -1;
     RtxImgLimits lim = *rtx_img_limits();
     struct timespec t0, t1;
@@ -713,7 +1015,7 @@ static void bench(const char *path) {
         us = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
         if (best_p < 0 || us < best_p) best_p = us;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        if (rtx_img_decode(b, n, &lim, 800, 600, RTX_IMG_PIX_BGRA_PREMUL, 1, NULL, &bmp,
+        if (rtx_img_decode(b, n, &lim, bw, bh, RTX_IMG_PIX_BGRA_PREMUL, 1, NULL, &bmp,
                            &info) != RTX_IMG_OK) {
             printf("bench: %s does not decode\n", path);
             free(b);
@@ -724,8 +1026,9 @@ static void bench(const char *path) {
         if (best_d < 0 || us < best_d) best_d = us;
         rtx_img_bmp_free(&bmp);
     }
-    printf("bench: %s %s %ux%u (%zu bytes): header %ld us, decode to 800x600 %ld ms\n", path,
-           rtx_img_fmt_name(info.fmt), info.w, info.h, n, best_p, best_d / 1000);
+    printf("bench: %s %s %ux%u (%zu bytes): header %ld us, decode to %ux%u: %ld.%ld ms\n",
+           path, rtx_img_fmt_name(info.fmt), info.w, info.h, n, best_p, bw, bh, best_d / 1000,
+           (best_d % 1000) / 100);
     free(b);
 }
 
@@ -735,6 +1038,7 @@ int main(void) {
         bench(getenv("RTX_IMG_BENCH"));
         return 0;
     }
+    test_resize();
     test_formats();
     test_broken();
     test_exif();

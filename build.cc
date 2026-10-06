@@ -12,7 +12,8 @@
 //   core/ui_help.ccs (+ cmd.ccs, keymap.ccs, palette.ccs, fuzzy.ccs: the command
 //   table, keys.json / settings.json, the palette model, the fuzzy scorer),
 //   core/workspace.ccs, core/layout.ccs, core/document.ccs,
-//   core/img.ccs + core/img_wuffs.c (Wuffs, third_party/wuffs) + core/img_net.c (images)
+//   core/img.ccs + core/img_wuffs.c (Wuffs, third_party/wuffs) + core/img_resize.c
+//   (stb_image_resize2, third_party/stb) + core/img_net.c (images)
 //   + core/img_term.c (terminal encoders: block art, sixel, PNG, zlib, kitty cells)
 //   + core/img_svg.c (the renderer helper client) + core/img_math.c (TeX as Unicode text)
 //   frontend/gui_draw.ccs, frontend/gui_input.ccs, frontend/gui_chrome.ccs,
@@ -34,7 +35,7 @@ CC_TARGET_INCLUDE rtx_hex .
 CC_TARGET rtx_grid obj core/grid.ccs
 CC_TARGET_INCLUDE rtx_grid .
 
-CC_TARGET rtx_md_table obj core/md_table.ccs core/md_block.ccs core/md_refs.ccs
+CC_TARGET rtx_md_table obj core/md_table.ccs core/md_block.ccs core/md_refs.ccs core/mmd_sniff.c
 CC_TARGET_INCLUDE rtx_md_table .
 
 CC_TARGET rtx_browse obj core/browse.ccs
@@ -53,7 +54,7 @@ CC_TARGET rtx_document obj core/document.ccs core/slides.ccs core/wb.ccs core/wb
 CC_TARGET_INCLUDE rtx_document .
 CC_TARGET_DEPS rtx_document rtx_piece_tree rtx_nav rtx_scope rtx_rx rtx_md_table
 
-CC_TARGET rtx_layout obj core/layout.ccs
+CC_TARGET rtx_layout obj core/layout.ccs core/mmd_view.ccs
 CC_TARGET_INCLUDE rtx_layout .
 CC_TARGET_DEPS rtx_layout rtx_document rtx_hex rtx_grid rtx_md_table rtx_img
 
@@ -138,7 +139,7 @@ CC_TARGET perf_matrix_smoke exe tests/perf_matrix_smoke.ccs
 CC_TARGET_INCLUDE perf_matrix_smoke .
 CC_TARGET_DEPS perf_matrix_smoke rtx_piece_tree rtx_hex rtx_grid rtx_md_table rtx_nav rtx_scope rtx_find rtx_document rtx_layout
 
-CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_net.c core/img_term.c core/img_svg.c core/img_math.c
+CC_TARGET rtx_img obj core/img.ccs core/img_wuffs.c core/img_resize.c core/img_net.c core/img_term.c core/img_svg.c core/img_math.c
 CC_TARGET_INCLUDE rtx_img .
 CC_TARGET_DEPS rtx_img rtx_safe
 

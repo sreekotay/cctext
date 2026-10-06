@@ -11,6 +11,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CATransaction.h>
 #include "ui_os.h"
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -430,6 +431,14 @@ const char *ui_os_font_family(const char *path) {
     return "Menlo";
 }
 
+double ui_os_device_scale(void) {
+    NSWindow *w = ns_window();
+    CGFloat s;
+    if (!w) return 1.0;
+    s = w.backingScaleFactor;
+    return s >= 1.0 ? (double)s : 1.0;
+}
+
 /* ---- images (ui_os.h) ----------------------------------------------------
  * UNTESTED here (no macOS build in this environment): mirrors the GTK
  * path. libui's darwin draw context is { CGContextRef c; CGFloat height; }
@@ -464,10 +473,30 @@ void ui_os_image_free(void *img) {
 void ui_os_image_draw(uiDrawContext *ctx, void *img, double x, double y, double w,
                       double h, double alpha) {
     CGContextRef c;
+    CGRect dev;
+    size_t iw, ih;
     if (!ctx || !img || w <= 0 || h <= 0 || alpha <= 0) return;
     c = ctx->c;
     CGContextSaveGState(c);
     CGContextClipToRect(c, CGRectMake(x, y, w, h));
+    /* A bitmap at the rect's device size (backingScaleFactor): draw it
+     * 1:1 on the device pixel grid (origin snapped, size exact). */
+    iw = CGImageGetWidth((CGImageRef)img);
+    ih = CGImageGetHeight((CGImageRef)img);
+    dev = CGContextConvertRectToDeviceSpace(c, CGRectMake(x, y, w, h));
+    if (fabs(fabs(dev.size.width) - (double)iw) <= 1.0 &&
+        fabs(fabs(dev.size.height) - (double)ih) <= 1.0) {
+        CGRect r;
+        dev.origin.x = floor(dev.origin.x + 0.5);
+        dev.origin.y = floor(dev.origin.y + 0.5);
+        dev.size.width = dev.size.width < 0 ? -(CGFloat)iw : (CGFloat)iw;
+        dev.size.height = dev.size.height < 0 ? -(CGFloat)ih : (CGFloat)ih;
+        r = CGContextConvertRectToUserSpace(c, dev);
+        x = r.origin.x;
+        y = r.origin.y;
+        w = r.size.width;
+        h = r.size.height;
+    }
     /* The area view is flipped (y down); CGContextDrawImage assumes y up. */
     CGContextTranslateCTM(c, x, y + h);
     CGContextScaleCTM(c, 1.0, -1.0);
