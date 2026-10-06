@@ -4,11 +4,19 @@
 Local headers then fail: they resolve outside that root and outside the
 unit directory. Rewrite --root to this repo (the directory that contains
 build.cc) and add it as an include path.
+
+cclower_cc rewrites every face a unit includes into the shared --h-root
+in place (fopen "wb", then write). A host compile of another unit that
+opens the same `.h` meanwhile reads it empty or cut short (`unknown type
+name 'RtxRx'`, a different face and target each run). The faces are
+lowered into a private stage instead and renamed into --h-root.
 """
+import filecmp
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 def repo_root():
@@ -53,10 +61,25 @@ def find_lowerer():
     sys.exit(127)
 
 
+def place_headers(stage, h_root):
+    """Rename each staged file over its --h-root twin; same bytes stay put."""
+    for d, _, files in os.walk(stage):
+        rel_dir = os.path.relpath(d, stage)
+        dst_dir = os.path.normpath(os.path.join(h_root, rel_dir))
+        for name in files:
+            src = os.path.join(d, name)
+            dst = os.path.join(dst_dir, name)
+            if os.path.isfile(dst) and filecmp.cmp(src, dst, shallow=False):
+                continue
+            os.makedirs(dst_dir, exist_ok=True)
+            os.replace(src, dst)
+
+
 def main():
     root = repo_root()
     lower = find_lowerer()
     out = []
+    h_root = None
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -64,10 +87,26 @@ def main():
             out.extend(["--root", root])
             i += 2
             continue
+        if args[i] == "--h-root" and i + 1 < len(args):
+            h_root = args[i + 1]
+            i += 2
+            continue
         out.append(args[i])
         i += 1
     out.extend(["-I", root])
-    rc = subprocess.call([lower] + out)
+    stage = None
+    if h_root:
+        os.makedirs(h_root, exist_ok=True)
+        parent = os.path.dirname(os.path.abspath(h_root))
+        stage = tempfile.mkdtemp(prefix=".hstage-", dir=parent)
+        out.extend(["--h-root", stage])
+    try:
+        rc = subprocess.call([lower] + out)
+        if stage:
+            place_headers(stage, h_root)
+    finally:
+        if stage:
+            shutil.rmtree(stage, ignore_errors=True)
     sys.exit(rc)
 
 

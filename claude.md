@@ -161,6 +161,19 @@ APFS rejects file names that are not valid UTF-8 (`EILSEQ`), so
 `/var` → `/private/var`; compare against `realpath` output
 (`proj_smoke` canonicalizes its root).
 
+## Faces vanish mid-build on Linux CI (2026-10-06)
+
+Smoke and TSan runs failed at random with a face's types missing:
+`unknown type name 'RtxRx'` in `find.ccs`, `RtxScope` in
+`scan_race_smoke`, `RTX_CLOSE_OTHERS` in `workspace_smoke` — another
+face and target each run, never on macOS. `cclower_cc` rewrites every
+face a unit includes into the shared `out*/.cc-build/clean/` in place
+(`write_product`: `fopen "wb"`, then write), so a host compile of
+another unit that opens the `.h` then reads it empty or cut short.
+`scripts/cclower_root.py` passes the lowerer a private `--h-root` and
+renames each `.h` into place (identical bytes are left alone). Upstream
+fix: write to a temp file and `rename` in `write_product`.
+
 ## Static functions in a face's file-scope initializer (2026-09-26)
 
 A file-scope `static const RtxCmdDef rows[] = { …, my_static_fn }` in a
