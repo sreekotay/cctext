@@ -15,8 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define UI_WHEEL_PREC_X 10.0f
-#define UI_WHEEL_PREC_Y 16.0f
 
 static uiWindow *g_win;
 static uiArea *g_area;
@@ -49,8 +47,7 @@ static void note_scroll(NSEvent *ev) {
         dy = ev.deltaY;
     }
     if (ev.hasPreciseScrollingDeltas)
-        ui_plat_wheel((float)(dx / (double)UI_WHEEL_PREC_X),
-                      (float)(dy / (double)UI_WHEEL_PREC_Y));
+        ui_plat_wheel_px((float)dx, (float)dy);
     else
         ui_plat_wheel((float)dx, (float)dy);
 }

@@ -149,6 +149,13 @@ void ui_plat_appearance(int dark);
  * user); +x = scroll_x(+1), the view moves right. Fractions accumulate. */
 void ui_plat_wheel(float dx, float dy);
 
+/* Toolkit → portable: a precise delta in pixels (points), from a device
+ * that reports them; +y = up. Text panes scroll by exactly this; lists
+ * see notches of UI_WHEEL_PREC_X / _Y pixels. */
+#define UI_WHEEL_PREC_X 10.0f
+#define UI_WHEEL_PREC_Y 16.0f
+void ui_plat_wheel_px(float dx, float dy);
+
 /* Toolkit → portable: the window gained (1) or lost (0) keyboard focus.
  * libui reports neither. */
 void ui_plat_focus(int in);

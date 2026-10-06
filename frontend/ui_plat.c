@@ -87,9 +87,14 @@ static int g_mouse_down, g_mouse_pressed, g_mouse_released;
 static int g_mouse_mid_pressed; /* middle button (a tab close) */
 static float g_wheel_x, g_wheel_y;
 static float g_wheel_carry_x, g_wheel_carry_y;
-/* The vertical wheel as the device reported it, not cut into notches: a
+/* The wheel as the device reported it, not cut into notches: a
  * trackpad's small deltas scroll a text pane by pixels. */
+static float g_wheel_fine_x, g_wheel_fine_acc_x;
 static float g_wheel_fine_y, g_wheel_fine_acc_y;
+/* Precise (pixel) deltas this frame, from a device that reports them
+ * (a macOS trackpad / Magic Mouse): a text pane scrolls by exactly that. */
+static float g_wheel_px_x, g_wheel_px_y, g_wheel_px_acc_x, g_wheel_px_acc_y;
+static int g_wheel_px_on, g_wheel_px_acc_on;
 
 static char *g_clip;
 static int g_menu_cmd;
@@ -636,7 +641,17 @@ void ui_plat_wheel(float dx, float dy) {
     if (script_open()) return;
     g_wheel_carry_x += dx;
     g_wheel_carry_y += dy;
+    g_wheel_fine_acc_x += dx;
     g_wheel_fine_acc_y += dy;
+}
+
+void ui_plat_wheel_px(float dx, float dy) {
+    if (script_open()) return;
+    /* Lists and menus still step by notches: 10 px across, 16 px down. */
+    ui_plat_wheel(dx / UI_WHEEL_PREC_X, dy / UI_WHEEL_PREC_Y);
+    g_wheel_px_acc_x += dx;
+    g_wheel_px_acc_y += dy;
+    g_wheel_px_acc_on = 1;
 }
 
 static int on_should_quit(void *data) {
@@ -849,7 +864,22 @@ static void script_arm_frame(void) {
         char *end = NULL;
         g_wheel_fine_y = (float)strtod(g_script_line + 6, &end);
         g_wheel_y = (float)(int)g_wheel_fine_y;
-        g_wheel_x = end ? (float)strtol(end, NULL, 10) : 0.0f;
+        g_wheel_fine_x = end ? (float)strtod(end, NULL) : 0.0f;
+        g_wheel_x = (float)(int)g_wheel_fine_x;
+        g_script_have = 0;
+        return;
+    }
+    if (strncmp(g_script_line, "wheelpx ", 8) == 0) {
+        /* wheelpx <dy> [dx]: a precise (pixel) delta this frame, +dy = up,
+         * as a macOS trackpad reports it; notches follow at 16 / 10 px. */
+        char *end = NULL;
+        g_wheel_px_y = (float)strtod(g_script_line + 8, &end);
+        g_wheel_px_x = end ? (float)strtod(end, NULL) : 0.0f;
+        g_wheel_px_on = 1;
+        g_wheel_fine_y = g_wheel_px_y / UI_WHEEL_PREC_Y;
+        g_wheel_fine_x = g_wheel_px_x / UI_WHEEL_PREC_X;
+        g_wheel_y = (float)(int)g_wheel_fine_y;
+        g_wheel_x = (float)(int)g_wheel_fine_x;
         g_script_have = 0;
         return;
     }
@@ -1587,8 +1617,15 @@ static void wheel_commit(void) {
     }
     g_wheel_x = (float)sx;
     g_wheel_y = (float)sy;
+    g_wheel_fine_x = g_wheel_fine_acc_x;
+    g_wheel_fine_acc_x = 0;
     g_wheel_fine_y = g_wheel_fine_acc_y;
     g_wheel_fine_acc_y = 0;
+    g_wheel_px_x = g_wheel_px_acc_x;
+    g_wheel_px_y = g_wheel_px_acc_y;
+    g_wheel_px_on = g_wheel_px_acc_on;
+    g_wheel_px_acc_x = g_wheel_px_acc_y = 0;
+    g_wheel_px_acc_on = 0;
 }
 
 static void clear_edges(void) {
@@ -1598,7 +1635,9 @@ static void clear_edges(void) {
     g_mouse_mid_pressed = 0;
     g_mouse_released = 0;
     g_wheel_x = g_wheel_y = 0;
-    g_wheel_fine_y = 0;
+    g_wheel_fine_x = g_wheel_fine_y = 0;
+    g_wheel_px_x = g_wheel_px_y = 0;
+    g_wheel_px_on = 0;
     g_nchar = g_char_rd = 0;
     g_resized = 0;
 }
@@ -1960,6 +1999,11 @@ Vector2 GetMouseWheelMoveV(void) {
 }
 float GetMouseWheelMove(void) { return g_wheel_y; }
 float GetMouseWheelMoveFine(void) { return g_wheel_fine_y; }
+Vector2 GetMouseWheelMoveFineV(void) { return (Vector2){g_wheel_fine_x, g_wheel_fine_y}; }
+int GetMouseWheelPx(Vector2 *px) {
+    if (px) *px = (Vector2){g_wheel_px_x, g_wheel_px_y};
+    return g_wheel_px_on;
+}
 
 void SetClipboardText(const char *text) {
     ui_os_clip_set(text ? text : "");

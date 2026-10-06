@@ -67,7 +67,7 @@ From source: `./make.shcc @cctext` then `./bin/cctext`, `./bin/cctext .`, or `./
 | Linux | yes | GTK 3 window, Pango / cairo text |
 | Windows | — | not yet (`frontend/ui_os_win32.c` is a stub listing the Win32 pieces) |
 
-Both hosts run the same paint / input TUIs over the same core. cctext-ui is portable libui code (`frontend/ui_plat.c`) plus one small shim per toolkit behind `frontend/ui_os.h` (`ui_os_darwin.m`, `ui_os_gtk.c`) for what libui does not expose: typed text, the wheel, the clipboard, retitling the Apply menu, and an event step with a deadline. Fonts: Menlo / Georgia on macOS; the fontconfig `Monospace` / `Serif` aliases on Linux.
+Both hosts run the same paint / input TUIs over the same core. cctext-ui is portable libui code (`frontend/ui_plat.c`) plus one small shim per toolkit behind `frontend/ui_os.h` (`ui_os_darwin.m`, `ui_os_gtk.c`) for what libui does not expose: typed text, the wheel, the clipboard, retitling the Apply menu, and an event step with a deadline. Scrolling a text pane follows the device: a macOS trackpad or Magic Mouse scrolls by its pixels 1:1, a smooth-scrolling touchpad by its fraction of a notch, a wheel notch by 3 lines; every delta paints the frame it arrives in, and a swipe that is mostly vertical stays vertical. Fonts: Menlo / Georgia on macOS; the fontconfig `Monospace` / `Serif` aliases on Linux.
 
 ![cctext-ui on Linux — browse with the preview pane](docs/cctext-ui-linux-browse.png)
 
@@ -321,6 +321,7 @@ Recipes live in `make.shcc` (`ccc --as=shcc`). There is no Makefile.
 python3 tests/tui_pty_test.py bin/cctext   # drive the TUI in a pty (paste, keys, caret, tty restore)
 python3 tests/ui_blink_test.py             # cctext-ui under Xvfb: caret layer, idle, focus
 python3 tests/ui_present_test.py           # cctext-ui presentation mode under Xvfb (screenshots, frame clock, idle)
+python3 tests/ui_wheel_test.py             # cctext-ui wheel / trackpad scrolling under Xvfb (sub-notch paints, 1:1 pixels, axis lock)
 python3 bench/rg_subtitles.py --bin bin     # ripgrep benchsuite OpenSubtitles queries: engine / find vs rg, counts checked
 python3 bench/editors/run.py bench --editors cctext --into bench/editors/results/2026-09-23.json --dir DIR   # bench/editors/README.md
 ./make.shcc @dist_cctext    # dist/cctext-<os>-<arch>.tar.gz (binaries + cctext-render + grammars/)
@@ -356,7 +357,7 @@ sudo apt install build-essential pkg-config libgtk-3-dev meson ninja-build
 ./make.shcc @cctext_ui && ./bin/cctext-ui .
 ```
 
-`RTX_UI_SCRIPT=file` drives cctext-ui headlessly for checks (one line per frame: `key X`, `cmd X`, `enter`, `esc`, `wheel N`, `wait N`, `dlg N`); `RTX_UI_LOG=file` records state changes.
+`RTX_UI_SCRIPT=file` drives cctext-ui headlessly for checks (one line per frame: `key X`, `cmd X`, `enter`, `esc`, `wheel N [X]` (notches, fractions too), `wheelpx N [X]` (a precise device's pixels), `wait N`, `dlg N`); `RTX_UI_LOG=file` records state changes.
 
 Install `ccc` with Homebrew (`brew tap sreekotay/concurrent-c` / `brew install --HEAD …/ccc`) or from a concurrent-c checkout (`PREFIX=$HOME/.local ./cc-install.sh`). TextMate schema parse uses `<ccc/std/json.cch>` / `include JsonKeep` (closed `TmGrammar` stays in-tree). cctext-ui links libui-ng (`scripts/build_libui.sh` fetches a pinned commit into `third_party/`) through `frontend/ui_plat.c` and one `frontend/ui_os_*` shim.
 
